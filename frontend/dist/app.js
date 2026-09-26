@@ -3062,6 +3062,87 @@ var Amaterasu;
         return parsed;
     }
     Amaterasu.parsePlayniteSettings = parsePlayniteSettings;
+    function parsePlayniteSettingsReply(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Playnite settings reply is invalid.");
+        const reply = value;
+        if (reply.ok !== true || !Number.isSafeInteger(reply.revision) ||
+            reply.revision < 0 || !reply.values ||
+            typeof reply.values !== "object" || Array.isArray(reply.values))
+            throw new Error("Playnite settings reply is invalid.");
+        const values = reply.values;
+        const parsed = parsePlayniteSettings(values);
+        if (!sameConfigurationValue(values, parsed))
+            throw new Error("Playnite settings reply contains unexpected values.");
+        return { ok: true, revision: reply.revision, values: parsed };
+    }
+    Amaterasu.parsePlayniteSettingsReply = parsePlayniteSettingsReply;
+    async function readPlayniteSettings(api) {
+        for (let attempt = 0;; attempt += 1) {
+            try {
+                return parsePlayniteSettingsReply(await api.post("playnite/settings"));
+            }
+            catch (error) {
+                if (!(error instanceof Amaterasu.ApiError) ||
+                    !["settings_loading", "settings_busy"].includes(error.code) || attempt >= 7)
+                    throw error;
+                await new Promise((resolve) => window.setTimeout(resolve, 50 * (attempt + 1)));
+            }
+        }
+    }
+    Amaterasu.readPlayniteSettings = readPlayniteSettings;
+    async function savePlayniteSettings(api, current, values) {
+        if (!Number.isSafeInteger(current.revision) || current.revision < 0 ||
+            current.revision >= Number.MAX_SAFE_INTEGER)
+            throw new Error("Playnite settings revision is invalid.");
+        const requested = parsePlayniteSettings(values);
+        const confirms = (reply) => reply.revision === current.revision + 1 &&
+            sameConfigurationValue(reply.values, requested);
+        let updated;
+        try {
+            updated = parsePlayniteSettingsReply(await api.post("playnite/settings_update", {
+                ...requested,
+                expected_revision: current.revision,
+            }));
+        }
+        catch (error) {
+            if (!(error instanceof Amaterasu.ApiError) || error.code !== "update_outcome_unknown")
+                throw error;
+            const reconciled = await readPlayniteSettings(api);
+            if (!confirms(reconciled))
+                throw new Error("Playnite update outcome is uncertain. Refresh and check the current values.");
+            return reconciled;
+        }
+        if (!confirms(updated))
+            throw new Error("Playnite update could not be confirmed. Refresh and check the current values.");
+        const saved = await readPlayniteSettings(api);
+        if (!confirms(saved))
+            throw new Error("Playnite settings could not be confirmed after saving. Refresh and check the current values.");
+        return saved;
+    }
+    Amaterasu.savePlayniteSettings = savePlayniteSettings;
+    class PlayniteSettingsLoadGate {
+        generation = 0;
+        invalidate() {
+            this.generation += 1;
+        }
+        async read(loadSettings, loadStatus) {
+            const generation = ++this.generation;
+            try {
+                const settings = await loadSettings();
+                if (generation !== this.generation)
+                    return null;
+                const runtime = await loadStatus();
+                return generation === this.generation ? { settings, runtime } : null;
+            }
+            catch (error) {
+                if (generation !== this.generation)
+                    return null;
+                throw error;
+            }
+        }
+    }
+    Amaterasu.PlayniteSettingsLoadGate = PlayniteSettingsLoadGate;
     function playniteStatusDescription(status) {
         if (!status.settings_ready)
             return "Playnite settings are still loading; runtime state is not confirmed.";
@@ -3081,15 +3162,12 @@ var Amaterasu;
         if (!Array.isArray(value) || value.length > 256)
             throw new Error(`${label} must contain at most 256 strings.`);
         const encoder = new TextEncoder();
-        const unique = new Set();
         for (const item of value) {
             if (typeof item !== "string" ||
                 item.trim().length === 0 ||
                 encoder.encode(item).length > 512 ||
-                /[\u0000-\u001f\u007f-\u009f]/.test(item) ||
-                unique.has(item.toLowerCase()))
-                throw new Error(`${label} must contain unique, printable strings of at most 512 UTF-8 bytes.`);
-            unique.add(item.toLowerCase());
+                /[\u0000-\u001f\u007f-\u009f]/.test(item))
+                throw new Error(`${label} must contain printable strings of at most 512 UTF-8 bytes.`);
         }
         return [...value];
     }
@@ -3141,6 +3219,7 @@ var Amaterasu;
         const steamArea = Amaterasu.el("div");
         const lutrisArea = Amaterasu.el("div");
         const playniteArea = Amaterasu.el("div");
+        const playniteLoads = new PlayniteSettingsLoadGate();
         const inputArea = Amaterasu.el("div");
         const historyArea = Amaterasu.el("div");
         const historyLoads = new HistorySettingsLoadGate();
@@ -3433,8 +3512,10 @@ var Amaterasu;
         async function loadPlaynite() {
             playniteArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Playnite settings…"));
             try {
-                const settings = await loadPlayniteSettings();
-                const runtime = await context.api.post("playnite/status");
+                const loaded = await playniteLoads.read(() => readPlayniteSettings(context.api), () => context.api.post("playnite/status"));
+                if (loaded === null)
+                    return;
+                const { settings, runtime } = loaded;
                 if (!context.content.isConnected)
                     return;
                 const form = Amaterasu.el("form", "settings-form");
@@ -3470,7 +3551,7 @@ var Amaterasu;
                 const recentGames = Amaterasu.input("playnite_recent_games", String(settings.values.recent_games), "number");
                 recentGames.required = true;
                 recentGames.min = "0";
-                recentGames.max = "50";
+                recentGames.max = "10000";
                 recentGames.step = "1";
                 const recentMaxAgeDays = Amaterasu.input("playnite_recent_max_age_days", String(settings.values.recent_max_age_days), "number");
                 recentMaxAgeDays.required = true;
@@ -3491,7 +3572,10 @@ var Amaterasu;
                 const syncPlugins = filterList("playnite_sync_plugins", settings.values.sync_plugins);
                 const excludePlugins = filterList("playnite_exclude_plugins", settings.values.exclude_plugins);
                 const excludeGames = filterList("playnite_exclude_games", settings.values.exclude_games);
-                const runtimeStatus = Amaterasu.el("p", runtime.last_error ? "error" : "muted", playniteStatusDescription(runtime));
+                const runtimeStatus = Amaterasu.el("p", runtime.last_error ? "error" : "muted", runtime.revision !== settings.revision || runtime.enabled !== settings.values.enabled ||
+                    runtime.auto_sync !== settings.values.auto_sync
+                    ? "Saved Playnite settings are not yet reflected in runtime status. Refresh to check application."
+                    : playniteStatusDescription(runtime));
                 const saveStatus = Amaterasu.el("div");
                 const refreshStatus = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save Playnite settings");
@@ -3511,10 +3595,12 @@ var Amaterasu;
                 };
                 updateRefreshAvailability();
                 enabled.addEventListener("change", updateRefreshAvailability);
-                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Delete expired Playnite games after (days)", deleteAfterDays, "Remove eligible Playnite imports after this age when they have not been played since import. Zero disables this cleanup."), Amaterasu.field("Require a replacement for recent-game cleanup", requireReplacement, "Limit removal of unselected recent imports to the count of newly selected games."), Amaterasu.field("Focus attempts after game start", focusAttempts, "Try to focus the confirmed Playnite game process this many times. Zero disables focus."), Amaterasu.field("Focus timeout (seconds)", focusTimeoutSecs, "Stop trying after this many seconds. Zero disables focus."), Amaterasu.field("Stop focus attempts after first success", focusExitOnFirst, "When enabled, stop retrying once the game is confirmed in the foreground."), Amaterasu.field("Show Playnite Fullscreen in the catalog", fullscreenEntryEnabled, "Add or remove the provider-managed Playnite Fullscreen launch entry. Manual Fullscreen entries remain available."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–50); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Delete expired Playnite games after (days)", deleteAfterDays, "Remove eligible Playnite imports after this age when they have not been played since import. Zero disables this cleanup."), Amaterasu.field("Require a replacement for recent-game cleanup", requireReplacement, "Limit removal of unselected recent imports to the count of newly selected games."), Amaterasu.field("Focus attempts after game start", focusAttempts, "Try to focus the confirmed Playnite game process this many times. Zero disables focus."), Amaterasu.field("Focus timeout (seconds)", focusTimeoutSecs, "Stop trying after this many seconds. Zero disables focus."), Amaterasu.field("Stop focus attempts after first success", focusExitOnFirst, "When enabled, stop retrying once the game is confirmed in the foreground."), Amaterasu.field("Show Playnite Fullscreen in the catalog", fullscreenEntryEnabled, "Add or remove the provider-managed Playnite Fullscreen launch entry. Manual Fullscreen entries remain available."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, saveStatus, async () => {
+                        playniteLoads.invalidate();
+                        let saveStarted = false;
                         try {
                             const values = parsePlayniteSettings({
                                 enabled: enabled.checked,
@@ -3535,17 +3621,20 @@ var Amaterasu;
                                 exclude_plugins: parsePlayniteFilterList(excludePlugins.value, "Excluded plugin IDs"),
                                 exclude_games: parsePlayniteFilterList(excludeGames.value, "Excluded game IDs"),
                             });
-                            await context.api.post("playnite/settings_update", {
-                                ...values,
-                                expected_revision: settings.revision,
-                            });
-                            context.notify("Playnite settings saved.");
+                            saveStarted = true;
+                            await savePlayniteSettings(context.api, settings, values);
                             await loadPlaynite();
+                            context.notify("Playnite settings saved and confirmed. Runtime status is shown below.");
                         }
                         catch (error) {
                             if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
                                 context.notify("Playnite settings changed elsewhere. The latest values have been reloaded.");
                                 await loadPlaynite();
+                                return;
+                            }
+                            if (saveStarted) {
+                                await loadPlaynite();
+                                context.notify("Playnite save could not be confirmed. Review the latest values before saving again.");
                                 return;
                             }
                             throw error;
@@ -3558,23 +3647,6 @@ var Amaterasu;
             catch (error) {
                 if (context.content.isConnected)
                     playniteArea.replaceChildren(Amaterasu.errorPanel(error, loadPlaynite));
-            }
-        }
-        async function loadPlayniteSettings() {
-            for (let attempt = 0;; attempt += 1) {
-                try {
-                    return await context.api.post("playnite/settings");
-                }
-                catch (error) {
-                    if (!(error instanceof Amaterasu.ApiError) ||
-                        !["settings_loading", "settings_busy"].includes(error.code) ||
-                        attempt >= 7) {
-                        throw error;
-                    }
-                    await new Promise((resolve) => {
-                        window.setTimeout(resolve, 50 * (attempt + 1));
-                    });
-                }
             }
         }
         async function loadPairing() {

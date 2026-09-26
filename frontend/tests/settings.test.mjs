@@ -872,10 +872,13 @@ test("Playnite editor validates complete sparse settings and bounded filter list
     ordinary(context.Amaterasu.parsePlayniteFilterList(JSON.stringify(["é".repeat(256)]), "Filters")),
     ["é".repeat(256)],
   );
+  assert.deepEqual(
+    ordinary(context.Amaterasu.parsePlayniteFilterList('["Action","action"]', "Filters")),
+    ["Action", "action"],
+  );
   for (const source of [
     "not JSON",
     "{}",
-    JSON.stringify(["Action", "action"]),
     JSON.stringify(["  "]),
     JSON.stringify(["bad\nname"]),
     JSON.stringify(["é".repeat(257)]),
@@ -905,7 +908,123 @@ test("Playnite editor validates complete sparse settings and bounded filter list
   }
 });
 
-test("recent-games UI keeps the Playnite limit at 50 and Steam limit at 10000", () => {
+test("Playnite save confirms the signed update and exact durable settings", async () => {
+  const values = {
+    enabled: true, auto_sync: true, sync_all_installed: false,
+    autosync_remove_uninstalled: true, autosync_delete_after_days: 14,
+    autosync_require_replacement: true, focus_attempts: 3,
+    focus_timeout_secs: 15, focus_exit_on_first: false,
+    fullscreen_entry_enabled: false, recent_games: 10,
+    recent_max_age_days: 30, sync_categories: [], exclude_categories: [],
+    sync_plugins: [], exclude_plugins: [], exclude_games: [],
+  };
+  const current = { ok: true, revision: 7, values };
+  const requested = { ...values, recent_games: 120, exclude_games: ["first", "FIRST"] };
+  const next = { ok: true, revision: 8, values: requested };
+  const calls = [];
+  const api = { async post(route, body) {
+    calls.push(route);
+    if (route === "playnite/settings_update") {
+      assert.deepEqual(ordinary(body), { ...requested, expected_revision: 7 });
+      return next;
+    }
+    assert.equal(route, "playnite/settings");
+    return next;
+  } };
+  assert.deepEqual(ordinary(await context.Amaterasu.savePlayniteSettings(api, current, requested)), next);
+  assert.deepEqual(calls, ["playnite/settings_update", "playnite/settings"]);
+});
+
+test("Playnite save rejects mismatched replies, unrelated values and revision drift", async () => {
+  const values = {
+    enabled: true, auto_sync: true, sync_all_installed: false,
+    autosync_remove_uninstalled: true, autosync_delete_after_days: 14,
+    autosync_require_replacement: true, focus_attempts: 3,
+    focus_timeout_secs: 15, focus_exit_on_first: false,
+    fullscreen_entry_enabled: false, recent_games: 10,
+    recent_max_age_days: 30, sync_categories: [], exclude_categories: [],
+    sync_plugins: [], exclude_plugins: [], exclude_games: [],
+  };
+  const current = { ok: true, revision: 7, values };
+  const requested = { ...values, recent_games: 12 };
+  const confirmed = { ok: true, revision: 8, values: requested };
+  for (const update of [
+    { ...confirmed, revision: 9 },
+    { ...confirmed, values: { ...requested, focus_attempts: 4 } },
+    { ...confirmed, ok: false },
+    { ...confirmed, values: { ...requested, unexpected: true } },
+  ]) {
+    const calls = [];
+    await assert.rejects(context.Amaterasu.savePlayniteSettings({ async post(route) {
+      calls.push(route);
+      return update;
+    } }, current, requested));
+    assert.deepEqual(calls, ["playnite/settings_update"]);
+  }
+  for (const readback of [
+    { ...confirmed, revision: 9 },
+    { ...confirmed, values: { ...requested, auto_sync: false } },
+    { ...confirmed, values: { ...requested, exclude_games: ["changed"] } },
+    { ...confirmed, values: { ...requested, unexpected: true } },
+  ]) {
+    await assert.rejects(context.Amaterasu.savePlayniteSettings({ async post(route) {
+      return route === "playnite/settings_update" ? confirmed : readback;
+    } }, current, requested));
+  }
+});
+
+test("Playnite reconciles an unknown update outcome only with exact durable readback", async () => {
+  class ApiError extends Error {
+    constructor(code) { super(code); this.code = code; }
+  }
+  context.ApiError = ApiError;
+  const values = {
+    enabled: true, auto_sync: true, sync_all_installed: false,
+    autosync_remove_uninstalled: true, autosync_delete_after_days: 14,
+    autosync_require_replacement: true, focus_attempts: 3,
+    focus_timeout_secs: 15, focus_exit_on_first: false,
+    fullscreen_entry_enabled: false, recent_games: 10,
+    recent_max_age_days: 30, sync_categories: [], exclude_categories: [],
+    sync_plugins: [], exclude_plugins: [], exclude_games: [],
+  };
+  const current = { ok: true, revision: 7, values };
+  const requested = { ...values, recent_games: 11 };
+  const committed = { ok: true, revision: 8, values: requested };
+  const api = (readback) => ({ async post(route) {
+    if (route === "playnite/settings_update") throw new ApiError("update_outcome_unknown");
+    assert.equal(route, "playnite/settings");
+    return readback;
+  } });
+  assert.deepEqual(ordinary(await context.Amaterasu.savePlayniteSettings(
+    api(committed), current, requested)), committed);
+  await assert.rejects(context.Amaterasu.savePlayniteSettings(
+    api({ ...committed, values: { ...requested, focus_attempts: 4 } }), current, requested),
+  /uncertain/);
+});
+
+test("Playnite settings and runtime load discards stale success and failure", async () => {
+  const gate = new context.Amaterasu.PlayniteSettingsLoadGate();
+  let resolveOld;
+  const old = gate.read(() => new Promise((resolve) => { resolveOld = resolve; }), async () => ({}));
+  const latest = gate.read(async () => ({ revision: 9 }), async () => ({ revision: 9 }));
+  resolveOld({ revision: 8 });
+  assert.equal(await old, null);
+  assert.equal((await latest).settings.revision, 9);
+  let rejectOld;
+  const failing = gate.read(() => new Promise((_, reject) => { rejectOld = reject; }), async () => ({}));
+  gate.invalidate();
+  rejectOld(new Error("old load failed"));
+  assert.equal(await failing, null);
+  let resolveStatus;
+  const statusPending = gate.read(async () => ({ revision: 9 }),
+    () => new Promise((resolve) => { resolveStatus = resolve; }));
+  await new Promise(setImmediate);
+  gate.invalidate();
+  resolveStatus({ revision: 9 });
+  assert.equal(await statusPending, null);
+});
+
+test("recent-games UI preserves the provider's 10000 Playnite range", () => {
   const settingsSource = readFileSync("src/settings.ts", "utf8");
   const steamSettingsUi = settingsSource.slice(
     settingsSource.indexOf("async function loadSteam(): Promise<void>"),
@@ -914,7 +1033,7 @@ test("recent-games UI keeps the Playnite limit at 50 and Steam limit at 10000", 
   const playniteSettingsUi = settingsSource.slice(
     settingsSource.indexOf("async function loadPlaynite(): Promise<void>"),
     settingsSource.indexOf(
-      "async function loadPlayniteSettings(): Promise<PlayniteSettings>",
+      "async function loadPairing(): Promise<void>",
     ),
   );
 
@@ -924,10 +1043,10 @@ test("recent-games UI keeps the Playnite limit at 50 and Steam limit at 10000", 
     /Maximum number of recently played games \(0–10000\); zero imports none in recent-only mode\./,
   );
   assert.match(playniteSettingsUi, /recentGames\.min = "0";/);
-  assert.match(playniteSettingsUi, /recentGames\.max = "50";/);
+  assert.match(playniteSettingsUi, /recentGames\.max = "10000";/);
   assert.match(
     playniteSettingsUi,
-    /Maximum number of recent games \(0–50\); zero disables recent-game selection\./,
+    /Maximum number of recent games \(0–10000\); zero disables recent-game selection\./,
   );
 });
 

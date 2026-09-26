@@ -1133,6 +1133,91 @@ namespace Amaterasu {
     return parsed;
   }
 
+  export function parsePlayniteSettingsReply(value: unknown): PlayniteSettings {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Playnite settings reply is invalid.");
+    const reply = value as Record<string, unknown>;
+    if (reply.ok !== true || !Number.isSafeInteger(reply.revision) ||
+        (reply.revision as number) < 0 || !reply.values ||
+        typeof reply.values !== "object" || Array.isArray(reply.values))
+      throw new Error("Playnite settings reply is invalid.");
+    const values = reply.values as PlayniteSettings["values"];
+    const parsed = parsePlayniteSettings(values);
+    if (!sameConfigurationValue(values, parsed))
+      throw new Error("Playnite settings reply contains unexpected values.");
+    return { ok: true, revision: reply.revision as number, values: parsed };
+  }
+
+  export async function readPlayniteSettings(api: Pick<Api, "post">): Promise<PlayniteSettings> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return parsePlayniteSettingsReply(await api.post<unknown>("playnite/settings"));
+      } catch (error) {
+        if (!(error instanceof ApiError) ||
+            !["settings_loading", "settings_busy"].includes(error.code) || attempt >= 7)
+          throw error;
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 50 * (attempt + 1)));
+      }
+    }
+  }
+
+  export async function savePlayniteSettings(
+    api: Pick<Api, "post">,
+    current: PlayniteSettings,
+    values: PlayniteSettings["values"],
+  ): Promise<PlayniteSettings> {
+    if (!Number.isSafeInteger(current.revision) || current.revision < 0 ||
+        current.revision >= Number.MAX_SAFE_INTEGER)
+      throw new Error("Playnite settings revision is invalid.");
+    const requested = parsePlayniteSettings(values);
+    const confirms = (reply: PlayniteSettings): boolean =>
+      reply.revision === current.revision + 1 &&
+      sameConfigurationValue(reply.values, requested);
+    let updated: PlayniteSettings;
+    try {
+      updated = parsePlayniteSettingsReply(await api.post<unknown>("playnite/settings_update", {
+        ...requested,
+        expected_revision: current.revision,
+      }));
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.code !== "update_outcome_unknown") throw error;
+      const reconciled = await readPlayniteSettings(api);
+      if (!confirms(reconciled))
+        throw new Error("Playnite update outcome is uncertain. Refresh and check the current values.");
+      return reconciled;
+    }
+    if (!confirms(updated))
+      throw new Error("Playnite update could not be confirmed. Refresh and check the current values.");
+    const saved = await readPlayniteSettings(api);
+    if (!confirms(saved))
+      throw new Error("Playnite settings could not be confirmed after saving. Refresh and check the current values.");
+    return saved;
+  }
+
+  export class PlayniteSettingsLoadGate {
+    private generation = 0;
+
+    invalidate(): void {
+      this.generation += 1;
+    }
+
+    async read(
+      loadSettings: () => Promise<PlayniteSettings>,
+      loadStatus: () => Promise<PlayniteStatus>,
+    ): Promise<{ settings: PlayniteSettings; runtime: PlayniteStatus } | null> {
+      const generation = ++this.generation;
+      try {
+        const settings = await loadSettings();
+        if (generation !== this.generation) return null;
+        const runtime = await loadStatus();
+        return generation === this.generation ? { settings, runtime } : null;
+      } catch (error) {
+        if (generation !== this.generation) return null;
+        throw error;
+      }
+    }
+  }
+
   export function playniteStatusDescription(status: PlayniteStatus): string {
     if (!status.settings_ready)
       return "Playnite settings are still loading; runtime state is not confirmed.";
@@ -1152,19 +1237,16 @@ namespace Amaterasu {
     if (!Array.isArray(value) || value.length > 256)
       throw new Error(`${label} must contain at most 256 strings.`);
     const encoder = new TextEncoder();
-    const unique = new Set<string>();
     for (const item of value) {
       if (
         typeof item !== "string" ||
         item.trim().length === 0 ||
         encoder.encode(item).length > 512 ||
-        /[\u0000-\u001f\u007f-\u009f]/.test(item) ||
-        unique.has(item.toLowerCase())
+        /[\u0000-\u001f\u007f-\u009f]/.test(item)
       )
         throw new Error(
-          `${label} must contain unique, printable strings of at most 512 UTF-8 bytes.`,
+          `${label} must contain printable strings of at most 512 UTF-8 bytes.`,
         );
-      unique.add(item.toLowerCase());
     }
     return [...value];
   }
@@ -1232,6 +1314,7 @@ namespace Amaterasu {
     const steamArea = el("div");
     const lutrisArea = el("div");
     const playniteArea = el("div");
+    const playniteLoads = new PlayniteSettingsLoadGate();
     const inputArea = el("div");
     const historyArea = el("div");
     const historyLoads = new HistorySettingsLoadGate();
@@ -1678,8 +1761,12 @@ namespace Amaterasu {
     async function loadPlaynite(): Promise<void> {
       playniteArea.replaceChildren(el("p", "muted", "Loading Playnite settings…"));
       try {
-        const settings = await loadPlayniteSettings();
-        const runtime = await context.api.post<PlayniteStatus>("playnite/status");
+        const loaded = await playniteLoads.read(
+          () => readPlayniteSettings(context.api),
+          () => context.api.post<PlayniteStatus>("playnite/status"),
+        );
+        if (loaded === null) return;
+        const { settings, runtime } = loaded;
         if (!context.content.isConnected) return;
         const form = el("form", "settings-form");
         const enabled = input("playnite_enabled", "", "checkbox");
@@ -1742,7 +1829,7 @@ namespace Amaterasu {
         );
         recentGames.required = true;
         recentGames.min = "0";
-        recentGames.max = "50";
+        recentGames.max = "10000";
         recentGames.step = "1";
         const recentMaxAgeDays = input(
           "playnite_recent_max_age_days",
@@ -1785,7 +1872,10 @@ namespace Amaterasu {
         const runtimeStatus = el(
           "p",
           runtime.last_error ? "error" : "muted",
-          playniteStatusDescription(runtime),
+          runtime.revision !== settings.revision || runtime.enabled !== settings.values.enabled ||
+          runtime.auto_sync !== settings.values.auto_sync
+            ? "Saved Playnite settings are not yet reflected in runtime status. Refresh to check application."
+            : playniteStatusDescription(runtime),
         );
         const saveStatus = el("div");
         const refreshStatus = el("div");
@@ -1863,7 +1953,7 @@ namespace Amaterasu {
           field(
             "Recent games to import",
             recentGames,
-            "Maximum number of recent games (0–50); zero disables recent-game selection.",
+            "Maximum number of recent games (0–10000); zero disables recent-game selection.",
           ),
           field(
             "Recent game age limit (days)",
@@ -1902,6 +1992,8 @@ namespace Amaterasu {
         form.addEventListener("submit", (event) => {
           event.preventDefault();
           void runAction(save, saveStatus, async () => {
+            playniteLoads.invalidate();
+            let saveStarted = false;
             try {
               const values = parsePlayniteSettings({
                 enabled: enabled.checked,
@@ -1937,16 +2029,19 @@ namespace Amaterasu {
                   "Excluded game IDs",
                 ),
               });
-              await context.api.post("playnite/settings_update", {
-                ...values,
-                expected_revision: settings.revision,
-              });
-              context.notify("Playnite settings saved.");
+              saveStarted = true;
+              await savePlayniteSettings(context.api, settings, values);
               await loadPlaynite();
+              context.notify("Playnite settings saved and confirmed. Runtime status is shown below.");
             } catch (error) {
               if (error instanceof ApiError && error.code === "revision_conflict") {
                 context.notify("Playnite settings changed elsewhere. The latest values have been reloaded.");
                 await loadPlaynite();
+                return;
+              }
+              if (saveStarted) {
+                await loadPlaynite();
+                context.notify("Playnite save could not be confirmed. Review the latest values before saving again.");
                 return;
               }
               throw error;
@@ -1964,24 +2059,6 @@ namespace Amaterasu {
       } catch (error) {
         if (context.content.isConnected)
           playniteArea.replaceChildren(errorPanel(error, loadPlaynite));
-      }
-    }
-    async function loadPlayniteSettings(): Promise<PlayniteSettings> {
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          return await context.api.post<PlayniteSettings>("playnite/settings");
-        } catch (error) {
-          if (
-            !(error instanceof ApiError) ||
-            !["settings_loading", "settings_busy"].includes(error.code) ||
-            attempt >= 7
-          ) {
-            throw error;
-          }
-          await new Promise<void>((resolve) => {
-            window.setTimeout(resolve, 50 * (attempt + 1));
-          });
-        }
       }
     }
     async function loadPairing(): Promise<void> {
