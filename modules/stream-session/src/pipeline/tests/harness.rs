@@ -91,6 +91,8 @@ pub struct Broker {
     pub limiter_restore_failures: usize,
     pub limiter_lease: Option<String>,
     pub limiter_session: Option<String>,
+    pub limiter_executable_path: Option<String>,
+    pub limiter_status_executable_override: Option<String>,
     pub limiter_malformed_status: bool,
     pub display_lease: Option<String>,
     pub display_operation: Option<String>,
@@ -634,6 +636,8 @@ impl Broker {
                 let lease = format!("limiter-{session}");
                 self.limiter_session = Some(session.into());
                 self.limiter_lease = Some(lease.clone());
+                self.limiter_executable_path =
+                    payload["executable_path"].as_str().map(str::to_owned);
                 json!({"ok":true,"version":1,"action":"apply","session_id":session,
                     "state":"applied","applied":true,"lease":lease})
             }
@@ -645,6 +649,8 @@ impl Broker {
                 let leases = if self.limiter_session.as_deref() == payload["session_id"].as_str() {
                     vec![
                         json!({"session_id":self.limiter_session,"lease":self.limiter_lease,
+                        "executable_path":self.limiter_status_executable_override.as_ref()
+                            .or(self.limiter_executable_path.as_ref()),"provider":"rtss",
                         "state":"applied","applied":true}),
                     ]
                 } else {
@@ -662,6 +668,7 @@ impl Broker {
                 assert_eq!(payload["lease"], json!(self.limiter_lease));
                 self.limiter_lease = None;
                 self.limiter_session = None;
+                self.limiter_executable_path = None;
                 json!({"ok":true,"version":1,"action":"restore",
                     "state":"restored","applied":false})
             }

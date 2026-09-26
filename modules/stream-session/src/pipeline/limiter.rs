@@ -54,7 +54,10 @@ pub(super) fn accept_status(record: &mut Record, response: &Value) {
         record.limiter_state = "status_unverified".into();
         return;
     }
-    adopt_cleanup_lease(record, response);
+    if !adopt_cleanup_lease(record, response) {
+        record.limiter_state = "status_unverified".into();
+        return;
+    }
     if record.limiter_lease.is_none() {
         record.limiter_state = response["state"]
             .as_str()
@@ -73,22 +76,37 @@ pub(super) fn status_confirms_no_lease(record: &Record, response: &Value) -> boo
         && response["leases"].as_array().is_some_and(Vec::is_empty)
 }
 
-fn adopt_cleanup_lease(record: &mut Record, response: &Value) {
-    if let Some(entries) = response["leases"].as_array() {
-        for entry in entries {
-            if entry["session_id"] == record.limiter_session()
-                && let Some(lease) = entry["lease"].as_str().filter(|lease| !lease.is_empty())
-            {
-                record.limiter_lease = Some(lease.into());
-                record.limiter_state = if entry["applied"] == true {
-                    "applied".into()
-                } else {
-                    "cleanup_pending".into()
-                };
-                break;
-            }
-        }
+fn adopt_cleanup_lease(record: &mut Record, response: &Value) -> bool {
+    let Some(entries) = response["leases"].as_array() else {
+        return false;
+    };
+    if entries.is_empty() {
+        return true;
     }
+    // A status result is used to recover ownership after an uncertain Apply.
+    // Require the provider's exact executable identity, not just the session ID.
+    let Some(entry) = entries.first().filter(|_| entries.len() == 1) else {
+        return false;
+    };
+    if entry["session_id"] != record.limiter_session()
+        || entry["executable_path"].as_str()
+            != record.config.frame_limiter_executable_path.as_deref()
+        || entry["provider"] != "rtss"
+        || !matches!(entry["state"].as_str(), Some("applied" | "stale_lease"))
+        || entry["applied"] != (entry["state"] == "applied")
+    {
+        return false;
+    }
+    let Some(lease) = entry["lease"].as_str().filter(|lease| !lease.is_empty()) else {
+        return false;
+    };
+    record.limiter_lease = Some(lease.into());
+    record.limiter_state = if entry["applied"] == true {
+        "applied".into()
+    } else {
+        "cleanup_pending".into()
+    };
+    true
 }
 
 pub(super) fn accept_restore(record: &mut Record, response: &Value) -> bool {

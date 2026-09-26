@@ -274,6 +274,34 @@ fn malformed_status_does_not_clear_uncertain_apply_ownership() {
 }
 
 #[test]
+fn uncertain_apply_does_not_restore_a_lease_for_another_executable() {
+    let mut host = Harness::new();
+    let (request, _) = limiter_prepare();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    host.broker.fault = Some(("amaterasu.frame-limiter/1".into(), Fault::AfterMutation));
+    host.broker.limiter_status_executable_override = Some(r"C:\Games\Other.exe".into());
+
+    let started = host.response(2, start(id));
+    assert_eq!(started["state"], "active");
+    assert_eq!(started["frame_limiter_applied"], false);
+    assert_eq!(started["frame_limiter_state"], "status_unverified");
+    assert_eq!(host.pipeline.records[&id].limiter_lease, None);
+
+    let stopped = host.response(3, json!({"action":"stop","session":id}));
+    assert_eq!(stopped["state"], "cleanup_failed");
+    assert_eq!(host.pipeline.records[&id].limiter_lease, None);
+    assert!(host.broker.limiter_lease.is_some());
+    assert!(!host.broker.calls.iter().any(|call| {
+        call.service == "amaterasu.frame-limiter/1" && call.payload["action"] == "restore"
+    }));
+
+    host.broker.limiter_status_executable_override = None;
+    let retried = host.response(4, json!({"action":"stop","session":id}));
+    assert_eq!(retried["state"], "stopped");
+    assert!(host.broker.limiter_lease.is_none());
+}
+
+#[test]
 fn shutdown_does_not_dispatch_an_unsent_apply() {
     let mut host = Harness::new();
     let (request, _) = limiter_prepare();
