@@ -926,9 +926,6 @@ fn valid_display_request(request: &serde_json::Value) -> bool {
         if !targets.contains(&id)
             || !policy_targets.insert(id)
             || (fields.get("mode_policies").is_some() && policy.configuration_option.is_some())
-            || (targets.len() > 1
-                && fields.get("mode_policy").is_some()
-                && policy.configuration_option.as_deref() != Some("ensure_only_display"))
             || policy
                 .resolution_option
                 .as_deref()
@@ -1362,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn singular_selected_only_policy_keeps_full_multimonitor_topology() {
+    fn singular_policy_keeps_full_multimonitor_topology() {
         let mut input = open_json();
         let full_request = json!({
             "expected_topology_revision":"aa".repeat(16),
@@ -1391,14 +1388,23 @@ mod tests {
         );
         let selected_digest = accepted.display_request_sha256().unwrap();
 
-        for (field, replacement) in [
-            ("configuration_option", json!("ensure_active")),
-            ("display_id", json!("missing")),
+        let mut invalid = input.clone();
+        invalid["display_request"]["mode_policy"]["display_id"] = json!("missing");
+        let invalid: Open = serde_json::from_value(invalid).unwrap();
+        assert_eq!(invalid.validate(false), Err("display_request_unattested"));
+        for option in [
+            "disabled",
+            "verify_only",
+            "ensure_active",
+            "ensure_primary",
+            "ensure_only_display",
         ] {
-            let mut invalid = input.clone();
-            invalid["display_request"]["mode_policy"][field] = replacement;
-            let invalid: Open = serde_json::from_value(invalid).unwrap();
-            assert_eq!(invalid.validate(false), Err("display_request_unattested"));
+            let mut supported = input.clone();
+            supported["display_request"]["mode_policy"]["configuration_option"] = json!(option);
+            serde_json::from_value::<Open>(supported)
+                .unwrap()
+                .validate(false)
+                .unwrap();
         }
         let mut changed = input.clone();
         changed["display_request"]["mode_policy"]["display_id"] = json!("one");
