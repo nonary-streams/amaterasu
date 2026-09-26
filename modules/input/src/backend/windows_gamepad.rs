@@ -995,7 +995,9 @@ mod tests {
         disconnects: usize,
         removals: usize,
         fail_next_update: Option<VigemError>,
+        fail_updates: Vec<VigemError>,
         fail_remove: bool,
+        fail_remove_on_attempt: Option<usize>,
         updates: Vec<(u8, u16)>,
     }
 
@@ -1007,6 +1009,7 @@ mod tests {
     struct FakeTarget {
         generation: u8,
         trace: Option<Rc<RefCell<FakeBusTrace>>>,
+        uncertain: bool,
     }
 
     unsafe extern "C" fn fake_alloc() -> VigemClient {
@@ -1034,6 +1037,7 @@ mod tests {
         Box::into_raw(Box::new(FakeTarget {
             generation: 0,
             trace: None,
+            uncertain: false,
         }))
         .cast()
     }
@@ -1062,7 +1066,7 @@ mod tests {
         let client = unsafe { &*client.cast::<FakeClient>() };
         let mut trace = client.trace.borrow_mut();
         trace.removals += 1;
-        if trace.fail_remove {
+        if trace.fail_remove || trace.fail_remove_on_attempt == Some(trace.removals) {
             return 0xE000_0004;
         }
         trace.attached -= 1;
@@ -1071,13 +1075,24 @@ mod tests {
 
     unsafe extern "C" fn fake_x360_update(
         client: VigemClient,
-        _: VigemTarget,
+        target: VigemTarget,
         report: XusbReport,
     ) -> VigemError {
         // SAFETY: the client remains owned by its VigemConnection.
         let client = unsafe { &*client.cast::<FakeClient>() };
+        // SAFETY: the target remains allocated until a successful removal.
+        let target = unsafe { &mut *target.cast::<FakeTarget>() };
+        assert!(
+            !target.uncertain,
+            "stale target received another X360 report"
+        );
         let mut trace = client.trace.borrow_mut();
-        if let Some(status) = trace.fail_next_update.take() {
+        if let Some(status) = trace
+            .fail_next_update
+            .take()
+            .or_else(|| (!trace.fail_updates.is_empty()).then(|| trace.fail_updates.remove(0)))
+        {
+            target.uncertain = true;
             return status;
         }
         trace.updates.push((client.generation, report.buttons));
@@ -1086,13 +1101,24 @@ mod tests {
 
     unsafe extern "C" fn fake_ds4_update(
         client: VigemClient,
-        _: VigemTarget,
+        target: VigemTarget,
         report: Ds4Report,
     ) -> VigemError {
         // SAFETY: the client remains owned by its VigemConnection.
         let client = unsafe { &*client.cast::<FakeClient>() };
+        // SAFETY: the target remains allocated until a successful removal.
+        let target = unsafe { &mut *target.cast::<FakeTarget>() };
+        assert!(
+            !target.uncertain,
+            "stale target received another DS4 report"
+        );
         let mut trace = client.trace.borrow_mut();
-        if let Some(status) = trace.fail_next_update.take() {
+        if let Some(status) = trace
+            .fail_next_update
+            .take()
+            .or_else(|| (!trace.fail_updates.is_empty()).then(|| trace.fail_updates.remove(0)))
+        {
+            target.uncertain = true;
             return status;
         }
         trace.updates.push((client.generation, report.buttons));
@@ -1335,6 +1361,48 @@ mod tests {
         assert_eq!(trace.borrow().attached, 0);
         assert_eq!(trace.borrow().freed, 1);
         assert_eq!(trace.borrow().disconnects, 1);
+    }
+
+    #[test]
+    fn failed_replacement_replay_keeps_its_target_for_stop_without_stale_report() {
+        let trace = Rc::new(RefCell::new(FakeBusTrace::default()));
+        let mut gamepads = WindowsGamepads::new();
+        gamepads
+            .start_with_profile(GamepadProfile::X360, || {
+                Ok(fake_connection(1, trace.clone()))
+            })
+            .unwrap();
+        gamepads.inject(&controller_event(0, 1, 1 << 12)).unwrap();
+        gamepads.inject(&controller_event(1, 3, 1 << 13)).unwrap();
+
+        {
+            let mut bus = trace.borrow_mut();
+            bus.fail_updates = vec![0xE000_0004, 0xE000_0004];
+            bus.fail_remove_on_attempt = Some(2);
+        }
+        assert!(gamepads.inject(&controller_event(0, 3, 1 << 14)).is_err());
+        assert!(gamepads.supported());
+        assert_eq!(trace.borrow().removals, 2);
+        assert_eq!(trace.borrow().attached, 2);
+        assert_eq!(trace.borrow().freed, 1);
+        assert_eq!(trace.borrow().updates, [(1, 0x1000), (1, 0x2000)]);
+
+        // The failed replay must not retire the peer controller or prevent
+        // another report from reaching it before lease cleanup.
+        gamepads.inject(&controller_event(1, 3, 1 << 15)).unwrap();
+        assert_eq!(trace.borrow().updates.last(), Some(&(1, 0x8000)));
+
+        // Stop before a timer retry. The uncertain replacement is detached
+        // directly, without a neutral report sent through that target.
+        gamepads.stop().unwrap();
+        assert_eq!(trace.borrow().removals, 4);
+        assert_eq!(trace.borrow().attached, 0);
+        assert_eq!(trace.borrow().freed, 3);
+        assert_eq!(trace.borrow().disconnects, 1);
+        assert_eq!(
+            trace.borrow().updates,
+            [(1, 0x1000), (1, 0x2000), (1, 0x8000), (1, 0)]
+        );
     }
 
     #[test]
