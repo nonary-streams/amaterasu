@@ -79,9 +79,16 @@ impl HostLoggingConfig {
         })
     }
 
-    /// Injects trusted host configuration after package verification. Global
-    /// policy is not a component principal and is normally absent at runtime.
+    /// Injects trusted host configuration after package verification, only when
+    /// Diagnostics belongs to the verified package. Global policy is not a
+    /// component principal and is normally absent at runtime.
     pub(crate) fn inject(&self, runtime_config: &mut RuntimeConfig) -> Result<(), String> {
+        if !runtime_config
+            .principals
+            .contains_key(DIAGNOSTICS_COMPONENT)
+        {
+            return Ok(());
+        }
         let settings = runtime_config
             .settings
             .entry(DIAGNOSTICS_COMPONENT.to_owned())
@@ -179,6 +186,9 @@ mod tests {
 
         let mut runtime = RuntimeConfig::default();
         runtime
+            .principals
+            .insert(DIAGNOSTICS_COMPONENT.into(), Default::default());
+        runtime
             .settings
             .insert(DIAGNOSTICS_COMPONENT.into(), json!({"other":"kept"}));
         config.inject(&mut runtime).unwrap();
@@ -192,6 +202,26 @@ mod tests {
                     "state_root": r"C:\private\state",
                 }
             })
+        );
+    }
+
+    #[test]
+    fn absent_diagnostics_principal_receives_no_host_logging_settings() {
+        let config = HostLoggingConfig::from_global(None, Path::new(r"C:\private\state")).unwrap();
+        let mut runtime = RuntimeConfig::default();
+        runtime
+            .principals
+            .insert("amaterasu.console".into(), Default::default());
+        runtime
+            .settings
+            .insert("unexpected.principal".into(), json!({"kept": true}));
+
+        config.inject(&mut runtime).unwrap();
+
+        assert!(!runtime.settings.contains_key(DIAGNOSTICS_COMPONENT));
+        assert_eq!(
+            runtime.settings["unexpected.principal"],
+            json!({"kept": true})
         );
     }
 
