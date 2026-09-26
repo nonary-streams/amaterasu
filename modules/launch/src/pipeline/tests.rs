@@ -870,6 +870,52 @@ fn frame_limiter_snapshot() -> Value {
 }
 
 #[test]
+fn client_frame_limiter_overrides_require_a_frozen_preflight_row() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    let mut launch = launch_export("client-policy-without-preflight");
+    launch["client_frame_limiter_overrides"] = json!({"frame_limiter_enable":false});
+
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch)["code"],
+        "preflight_required"
+    );
+    assert!(harness.commands.is_empty());
+    assert!(harness.sessions.is_empty());
+    assert!(harness.processes.is_empty());
+
+    let mut snapshot_without_preflight = launch_export("snapshot-without-preflight");
+    snapshot_without_preflight["frame_limiter_settings"] = frame_limiter_snapshot();
+    assert_eq!(
+        harness.request(
+            &mut pipeline,
+            "amaterasu.nvhttp",
+            snapshot_without_preflight
+        )["code"],
+        "preflight_required"
+    );
+    assert!(harness.commands.is_empty());
+
+    let preflight = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        json!({"action":"preflight_export","operation_id":"client-policy-without-preflight","app_id":"app-0000000000000001"}),
+    );
+    assert_eq!(preflight["ok"], true, "{preflight}");
+    let mut launch = launch_export("client-policy-without-preflight");
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["frame_limiter_settings"] = frame_limiter_snapshot();
+    launch["frame_limiter_settings"]["settings"]["frame_limiter_enable"] = json!(false);
+    launch["client_frame_limiter_overrides"] = json!({"frame_limiter_enable":false});
+    let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch);
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    assert_eq!(
+        started["launch"]["client_frame_limiter_overrides"],
+        json!({"frame_limiter_enable":false})
+    );
+}
+
+#[test]
 fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() {
     let mut harness = Harness::new();
     harness.catalog_config_overrides = Some(json!({"frame_limiter_enable":true}));

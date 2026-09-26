@@ -507,6 +507,9 @@ impl Pipeline {
                 if frame_limiter_settings.is_some() && preflight_token.is_none() {
                     return complete(send, request, error("preflight_required"));
                 }
+                if client_frame_limiter_overrides.is_some() && preflight_token.is_none() {
+                    return complete(send, request, error("preflight_required"));
+                }
                 if preflight_token.is_some() && frame_limiter_settings.is_none() {
                     return complete(send, request, error("invalid_frame_limiter_snapshot"));
                 }
