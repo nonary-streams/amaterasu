@@ -906,6 +906,142 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
 }
 
 #[test]
+fn imported_credential_replaces_stale_session_only_namespace_and_authenticates_after_restart() {
+    let source = std::env::temp_dir().join(format!(
+        "amaterasu-auth-import-consumer-source-{}",
+        std::process::id()
+    ));
+    let state_root = std::env::temp_dir().join(format!(
+        "amaterasu-auth-import-consumer-state-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&source);
+    let _ = std::fs::remove_dir_all(&state_root);
+    std::fs::create_dir_all(source.join("credentials")).unwrap();
+
+    let mut previous_state = StateHarness::new();
+    let mut previous_pipeline = Pipeline::new(settings());
+    previous_state.setup(&mut previous_pipeline);
+    let previous_login = previous_state.request(
+        &mut previous_pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple"}),
+        100,
+    );
+    let namespace_path = crate::migration::namespace_path(&state_root);
+    std::fs::create_dir_all(namespace_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &namespace_path,
+        json!({"format_version":1,"revision":1,"values":{
+            (SESSION_STATE_KEY): previous_state.session_stored
+        }})
+        .to_string(),
+    )
+    .unwrap();
+
+    let password = "imported administrator password";
+    let salt = "AbCdEfGhIjKlMnOp";
+    std::fs::write(
+        source.join("credentials/login.json"),
+        json!({"username":"ImportedAdmin","password":crate::crypto::token_digest(&format!("{password}{salt}")),"salt":salt}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("sunshine.conf"),
+        "credentials_file = credentials/login.json\n",
+    )
+    .unwrap();
+    let import = crate::migration::import_legacy_authentication(&source).unwrap();
+    assert_eq!(
+        crate::migration::seed_authentication_state(&state_root, &import).unwrap(),
+        crate::migration::AuthenticationSeedOutcome::Seeded
+    );
+    let saved: Value = serde_json::from_slice(&std::fs::read(&namespace_path).unwrap()).unwrap();
+    assert_eq!(saved["revision"], 2);
+    assert_eq!(
+        saved["values"][SESSION_STATE_KEY],
+        previous_state.session_stored.as_ref().unwrap().clone()
+    );
+
+    let mut state = StateHarness::new();
+    state.revision = saved["revision"].as_u64().unwrap();
+    state.stored = Some(saved["values"][STATE_KEY].clone());
+    state.session_stored = Some(saved["values"][SESSION_STATE_KEY].clone());
+    let mut pipeline = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({"action":"verify","bearer":previous_login["bearer"],"required_scopes":[]}),
+            101,
+        )["code"],
+        "unauthorized"
+    );
+    let login = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"importedadmin","password":password,"remember_me":true}),
+        102,
+    );
+    assert_eq!(login["ok"], true);
+    assert!(
+        state.stored.as_ref().unwrap()["credential"]
+            .get("legacy_salt")
+            .is_none()
+    );
+
+    let mut restarted = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":login["bearer"],"required_scopes":["catalog.read"]}),
+            103,
+        )["ok"],
+        true
+    );
+    let refreshed = state.request(
+        &mut restarted,
+        "frontend",
+        json!({"action":"refresh","refresh_token":login["refresh_token"]}),
+        104,
+    );
+    assert_eq!(refreshed["ok"], true);
+    let mut after_refresh = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut after_refresh,
+            "frontend",
+            json!({"action":"verify","bearer":refreshed["bearer"],"required_scopes":["catalog.read"]}),
+            105,
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut after_refresh,
+            "frontend",
+            json!({"action":"logout","refresh_token":refreshed["refresh_token"]}),
+            106,
+        )["ok"],
+        true
+    );
+    let mut after_logout = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut after_logout,
+            "frontend",
+            json!({"action":"verify","bearer":refreshed["bearer"],"required_scopes":[]}),
+            107,
+        )["code"],
+        "unauthorized"
+    );
+
+    std::fs::remove_dir_all(source).unwrap();
+    std::fs::remove_dir_all(state_root).unwrap();
+}
+
+#[test]
 fn scope_digest_mismatch_invalidates_hydrated_sessions() {
     let mut state = StateHarness::new();
     let mut pipeline = Pipeline::new(settings());

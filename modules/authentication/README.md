@@ -97,7 +97,8 @@ sessions by merely presenting a login bearer.
 `username`, `password`, and 16-character alphanumeric `salt` record, where
 `password` is lowercase SHA-256 hex of password followed by salt. It rejects
 ambiguous, external, malformed, or API-token-bearing records. Its `seed` mode
-writes the ordinary authentication state namespace only when empty. The retained
+writes the credential only when `authentication/v1` is absent, preserving other
+authentication namespace values such as a stale session sidecar. The retained
 legacy verifier is constant-time checked at login and, after the first successful
 password proof, is replaced in the same durable write with the native Argon2id
 credential. Passwords and verifier values are never printed. The installer must

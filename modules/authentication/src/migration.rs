@@ -89,7 +89,7 @@ pub fn seed_authentication_state(
     let _lock = RootLock::acquire(state_root).map_err(|_| "legacy_authentication_state_busy")?;
     let path = namespace_path(state_root);
     let mut namespace = read_namespace(&path)?;
-    if !namespace.values.is_empty() {
+    if namespace.values.contains_key(STATE_KEY) {
         return Ok(AuthenticationSeedOutcome::ExistingAmaterasuState);
     }
     namespace.revision = namespace
@@ -473,7 +473,7 @@ fn read_namespace(path: &Path) -> Result<Namespace, &'static str> {
     Ok(namespace)
 }
 
-fn namespace_path(root: &Path) -> PathBuf {
+pub(crate) fn namespace_path(root: &Path) -> PathBuf {
     let encoded: String = PRINCIPAL
         .as_bytes()
         .iter()
