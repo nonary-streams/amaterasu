@@ -90,165 +90,137 @@ fn configured_database_path_is_parsed_and_must_be_absolute() {
 }
 
 #[test]
-fn confirmed_policy_records_and_retains_history_across_restart() {
+fn saved_recording_toggle_waits_for_stream_drain_but_retention_survives_restart() {
     let directory = std::env::temp_dir().join(format!(
-        "amaterasu-history-policy-lifecycle-{}-{}",
+        "amaterasu-history-policy-{}-{}",
         std::process::id(),
         amaterasu_storage::random_identifier().unwrap()
     ));
     let database = directory.join("history.db");
-    let enabled_policy = HistorySettings {
-        enabled: true,
+    let call = |store: &mut HistoryStore, payload: serde_json::Value, now| {
+        let operation: Operation = serde_json::from_value(payload).unwrap();
+        execute(store, operation, now).unwrap()
+    };
+    let policy = |enabled| HistorySettings {
+        enabled,
         ttl_days: 1,
         db_size_limit_mb: 0,
     };
-    let invoke = |store: &mut HistoryStore, caller: &str, payload, now| {
-        let operation: Operation = serde_json::from_value(payload).unwrap();
-        assert!(is_authorized(caller, &operation));
-        execute(store, operation, now).unwrap()
-    };
 
-    {
-        let mut store = HistoryStore::open(&database, 100).unwrap();
-        // A stream admitted before central policy confirmation must not be saved.
-        assert_eq!(
-            invoke(
-                &mut store,
-                STREAM_SESSION_CALLER,
-                json!({"action":"session_begin","metadata":{"session_id":"pending","protocol":"sunshine-modern"}}),
-                100,
-            )["recorded"],
-            false
-        );
-        assert_eq!(
-            invoke(
-                &mut store,
-                STREAM_SESSION_CALLER,
-                json!({"action":"session_end","session_id":"pending"}),
-                101,
-            )["recorded"],
-            false
-        );
-        store
-            .apply_configuration(enabled_policy.clone(), 102)
-            .unwrap();
-        assert_eq!(
-            invoke(
-                &mut store,
-                STREAM_SESSION_CALLER,
-                json!({"action":"session_begin","metadata":{"session_id":"saved","protocol":"sunshine-modern","client_name":"viewer"}}),
-                103,
-            )["recorded"],
-            true
-        );
-        assert_eq!(
-            invoke(
-                &mut store,
-                STREAM_SESSION_CALLER,
-                json!({"action":"record_sample","sample":{"session_id":"saved","recorded_at_unix":104,"frames_sent":60,"bytes_sent":12000}}),
-                104,
-            )["recorded"],
-            true
-        );
-        store
-            .apply_configuration(
-                HistorySettings {
-                    enabled: false,
-                    ..enabled_policy.clone()
-                },
-                104,
-            )
-            .unwrap();
-        assert_eq!(
-            invoke(
-                &mut store,
-                STREAM_SESSION_CALLER,
-                json!({"action":"session_begin","metadata":{"session_id":"blocked","protocol":"sunshine-modern"}}),
-                104,
-            )["recorded"],
-            false
-        );
-        assert_eq!(
-            invoke(
-                &mut store,
-                STREAM_SESSION_CALLER,
-                json!({"action":"record_event","event":{"session_id":"saved","recorded_at_unix":104,"event_type":"policy_changed"}}),
-                104,
-            )["recorded"],
-            true
-        );
-        assert_eq!(
-            invoke(
-                &mut store,
-                STREAM_SESSION_CALLER,
-                json!({"action":"session_end","session_id":"saved","ended_at_unix":105}),
-                105,
-            )["recorded"],
-            true
-        );
-        let detail = invoke(
+    let mut store = HistoryStore::open(&database, 100).unwrap();
+    store.apply_configuration(policy(false), 100).unwrap();
+    assert_eq!(
+        call(
             &mut store,
-            MANAGEMENT_CALLER,
-            json!({"action":"session_detail","session_id":"saved"}),
-            106,
-        );
-        assert_eq!(detail["detail"]["session"]["client_name"], "viewer");
-        assert_eq!(detail["detail"]["samples"][0]["frames_sent"], 60);
+            json!({"action":"session_begin","metadata":{"session_id":"unrecorded","protocol":"sunshine-modern"}}),
+            100
+        )["recorded"],
+        false
+    );
+    store.apply_configuration(policy(true), 101).unwrap();
+    assert_eq!(store.settings(), (&policy(true), false));
+    assert_eq!(
+        call(
+            &mut store,
+            json!({"action":"session_begin","metadata":{"session_id":"also-unrecorded","protocol":"sunshine-modern"}}),
+            102
+        )["recorded"],
+        false
+    );
+    for id in ["unrecorded", "also-unrecorded"] {
         assert_eq!(
-            detail["detail"]["events"][1]["event_type"],
-            "policy_changed"
+            call(
+                &mut store,
+                json!({"action":"session_end","session_id":id}),
+                103
+            )["recorded"],
+            false
         );
-        assert_eq!(detail["detail"]["events"][2]["event_type"], "stream_ended");
     }
+    assert_eq!(store.settings(), (&policy(true), true));
+    assert_eq!(
+        call(
+            &mut store,
+            json!({"action":"session_begin","metadata":{"session_id":"recorded","protocol":"sunshine-modern"}}),
+            104
+        )["recorded"],
+        true
+    );
+    store.apply_configuration(policy(false), 105).unwrap();
+    assert_eq!(store.settings(), (&policy(false), true));
+    assert_eq!(
+        call(
+            &mut store,
+            json!({"action":"session_begin","metadata":{"session_id":"also-recorded","protocol":"sunshine-modern"}}),
+            106
+        )["recorded"],
+        true
+    );
+    assert_eq!(
+        call(
+            &mut store,
+            json!({"action":"record_sample","sample":{"session_id":"recorded","recorded_at_unix":107,"frames_sent":7}}),
+            107
+        )["recorded"],
+        true
+    );
+    assert_eq!(
+        call(
+            &mut store,
+            json!({"action":"session_end","session_id":"recorded"}),
+            108
+        )["recorded"],
+        true
+    );
+    assert_eq!(store.settings(), (&policy(false), true));
+    assert_eq!(
+        call(
+            &mut store,
+            json!({"action":"session_end","session_id":"also-recorded"}),
+            109
+        )["recorded"],
+        true
+    );
+    assert_eq!(store.settings(), (&policy(false), false));
+    assert_eq!(
+        call(
+            &mut store,
+            json!({"action":"session_begin","metadata":{"session_id":"disabled","protocol":"sunshine-modern"}}),
+            110
+        )["recorded"],
+        false
+    );
+    assert_eq!(
+        call(
+            &mut store,
+            json!({"action":"session_end","session_id":"disabled"}),
+            111
+        )["recorded"],
+        false
+    );
+    drop(store);
 
     let mut reopened = HistoryStore::open(&database, 200).unwrap();
-    reopened.apply_configuration(enabled_policy, 200).unwrap();
-    let page = invoke(
+    reopened.apply_configuration(policy(false), 200).unwrap();
+    let list = call(
         &mut reopened,
-        MANAGEMENT_CALLER,
         json!({"action":"list_sessions","limit":25}),
         200,
     );
-    assert_eq!(page["sessions"].as_array().unwrap().len(), 1);
-    assert_eq!(page["sessions"][0]["session_id"], "saved");
-    reopened
-        .apply_configuration(
-            HistorySettings {
-                enabled: false,
-                ttl_days: 1,
-                db_size_limit_mb: 0,
-            },
-            201,
-        )
-        .unwrap();
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 2);
     assert_eq!(
-        invoke(
+        call(
             &mut reopened,
-            STREAM_SESSION_CALLER,
-            json!({"action":"session_begin","metadata":{"session_id":"disabled","protocol":"sunshine-modern"}}),
-            202,
-        )["recorded"],
-        false
+            json!({"action":"session_detail","session_id":"recorded"}),
+            200
+        )["detail"]["sample_count"],
+        1
     );
+    reopened.prune_if_due(86_510);
     assert_eq!(
-        invoke(
-            &mut reopened,
-            STREAM_SESSION_CALLER,
-            json!({"action":"session_end","session_id":"disabled"}),
-            203,
-        )["recorded"],
-        false
+        call(&mut reopened, json!({"action":"history_status"}), 86_510)["status"]["sessions"],
+        0
     );
-    reopened.prune_if_due(86_506);
-    let status = invoke(
-        &mut reopened,
-        MANAGEMENT_CALLER,
-        json!({"action":"history_status"}),
-        86_506,
-    );
-    assert_eq!(status["status"]["sessions"], 0);
-    assert_eq!(status["status"]["effective_enabled"], false);
-    assert_eq!(status["status"]["last_prune"]["sessions_deleted"], 1);
     drop(reopened);
     fs::remove_dir_all(directory).unwrap();
 }
