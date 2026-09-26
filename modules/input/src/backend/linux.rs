@@ -85,22 +85,31 @@ thread_local! {
 }
 
 impl Device {
+    #[cfg(test)]
+    fn fake_create() -> Option<InputResult<Self>> {
+        FAKE_INPUT_ADAPTER
+            .with(|slot| slot.borrow().clone())
+            .map(|adapter| {
+                let id = {
+                    let mut state = adapter.borrow_mut();
+                    if std::mem::take(&mut state.fail_create) {
+                        return Err(InputError::new("acquire_failed", "fake create failure"));
+                    }
+                    state.next_id += 1;
+                    state.next_id
+                };
+                Ok(Self {
+                    file: File::open("/dev/null").map_err(system_error)?,
+                    created: true,
+                    fake: Some((id, adapter)),
+                })
+            })
+    }
+
     fn create(path: &str, keyboard: bool) -> InputResult<Self> {
         #[cfg(test)]
-        if let Some(adapter) = FAKE_INPUT_ADAPTER.with(|slot| slot.borrow().clone()) {
-            let id = {
-                let mut state = adapter.borrow_mut();
-                if std::mem::take(&mut state.fail_create) {
-                    return Err(InputError::new("acquire_failed", "fake create failure"));
-                }
-                state.next_id += 1;
-                state.next_id
-            };
-            return Ok(Self {
-                file: File::open("/dev/null").map_err(system_error)?,
-                created: true,
-                fake: Some((id, adapter)),
-            });
+        if let Some(device) = Self::fake_create() {
+            return device;
         }
         let file = open_uinput(path)?;
         let fd = file.as_raw_fd();
@@ -185,6 +194,10 @@ impl Device {
     }
 
     fn create_gamepad(path: &str, controller_number: u8) -> InputResult<Self> {
+        #[cfg(test)]
+        if let Some(device) = Self::fake_create() {
+            return device;
+        }
         let file = open_uinput(path)?;
         let fd = file.as_raw_fd();
         set_bit(fd, UI_SET_EVBIT, u32::from(EV_KEY))?;
@@ -389,6 +402,10 @@ impl GamepadDevice for UinputGamepad {
                 if events.is_empty() {
                     return Ok(());
                 }
+                // A failed neutral frame may have stopped before SYN_REPORT.
+                // If destruction also fails, the next cleanup must detach this
+                // descriptor directly instead of completing that partial frame.
+                self.recovery_required = true;
                 let native_events = events
                     .iter()
                     .map(|event| (event.event_type, event.code, event.value))
@@ -1074,6 +1091,55 @@ mod tests {
             std::time::Instant::now(),
             &mut || Ok(()),
         )
+    }
+
+    fn gamepad_event(active_mask: u16, buttons: u32) -> Event {
+        Event::Controller {
+            number: 0,
+            active_mask,
+            buttons,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        }
+    }
+
+    #[test]
+    fn failed_neutral_frame_and_destroy_retry_detaches_before_reacquisition() {
+        let adapter = FakeAdapterGuard::install();
+        let _guard = FakeAdapterGuard;
+        let mut backend = LinuxBackend::new("/missing/uinput".into());
+        backend.start().unwrap();
+        assert_eq!(backend.effective_gamepad_profile(), Some("xone"));
+        backend.inject(&gamepad_event(1, 1 << 12)).unwrap();
+        assert_eq!(adapter.borrow().writes, [4]);
+
+        {
+            let mut fake = adapter.borrow_mut();
+            fake.fail_write = Some(4);
+            fake.fail_destroy = Some(4);
+        }
+        assert_eq!(
+            backend.inject(&gamepad_event(0, 0)).unwrap_err().code,
+            "release_failed"
+        );
+        assert_eq!(adapter.borrow().writes, [4, 4]);
+        assert_eq!(adapter.borrow().destroys, [3, 4]);
+
+        // The keyboard and pointer continue to work while the old gamepad is
+        // owned for cleanup. Releasing it must not replay the uncertain frame.
+        backend.inject(&Event::Relative { dx: 2, dy: 3 }).unwrap();
+        backend.advance(std::time::Instant::now()).unwrap();
+        assert_eq!(adapter.borrow().writes, [4, 4, 2]);
+        assert_eq!(adapter.borrow().destroys, [3, 4, 4]);
+
+        backend.inject(&gamepad_event(1, 1 << 13)).unwrap();
+        assert_eq!(adapter.borrow().writes, [4, 4, 2, 5]);
+        backend.stop().unwrap();
+        assert_eq!(adapter.borrow().destroys, [3, 4, 4, 5, 1, 2]);
     }
 
     #[test]
