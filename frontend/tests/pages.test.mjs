@@ -84,6 +84,7 @@ function createPageContext() {
     },
     timers,
     Error,
+    TextEncoder,
   });
 }
 
@@ -581,6 +582,101 @@ function historySummary(sessionId) {
     duration_seconds: 20,
   };
 }
+
+test("recorded session pages reject malformed signed rows before exposing delete", () => {
+  const valid = { ok: true, sessions: [historySummary("stored")], next_offset: null };
+  assert.equal(pages.parseHistoryListReply(valid, 0).sessions[0].session_id, "stored");
+  for (const reply of [
+    { ...valid, sessions: [{ ...historySummary("stored"), session_id: "" }] },
+    { ...valid, sessions: [{ ...historySummary("stored"), session_id: "bad\nkey" }] },
+    { ...valid, sessions: [{ ...historySummary("stored"), ended_at_unix: "yesterday" }] },
+    { ...valid, sessions: [{ ...historySummary("stored"), app_name: null }] },
+    { ...valid, next_offset: 0 },
+  ]) assert.throws(() => pages.parseHistoryListReply(reply, 0));
+});
+
+test("recorded delete requires an explicit successful signed reply", () => {
+  assert.equal(pages.parseHistoryDeleteReply({ ok: true }), undefined);
+  for (const reply of [null, {}, { ok: false, code: "active_session" }, { ok: "true" }])
+    assert.throws(() => pages.parseHistoryDeleteReply(reply));
+});
+
+test("recorded deletion readback requires the signed not-found result", async () => {
+  const absent = { post: async () => { throw { code: "not_found" }; } };
+  await pages.confirmHistoryDeletion(absent, "stored");
+  for (const result of [
+    { post: async () => historyDetail("stored") },
+    { post: async () => { throw { code: "storage_error" }; } },
+  ]) await assert.rejects(() => pages.confirmHistoryDeletion(result, "stored"));
+});
+
+test("malformed successful delete reply preserves the selected history and reports failure", async () => {
+  const calls = [];
+  const notices = [];
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  pages.renderSessions({ content, notify: (message) => notices.push(message), navigate() {}, api: {
+    allows: (scope) => scope === "session.write",
+    async post(route) {
+      calls.push(route);
+      if (route === "session/list") return { sessions: [], next_offset: null };
+      if (route === "history/history_status") return historyStatus();
+      if (route === "history/list_sessions")
+        return { ok: true, sessions: [historySummary("stored")], next_offset: null };
+      if (route === "history/session_detail") return historyDetail("stored");
+      if (route === "history/delete_session") return {};
+      throw new Error(`Unexpected route ${route}`);
+    },
+  } });
+  await waitFor(() => findButton(content, "Delete")?.disabled === false, "enabled delete");
+  findButton(content, "Details").click();
+  await waitFor(() => content.textContent.includes("History for stored"), "selected detail");
+  const previousConfirm = pageTestContext.confirmAction;
+  pageTestContext.confirmAction = async () => true;
+  try {
+    findButton(content, "Delete").click();
+    await waitFor(() => calls.includes("history/delete_session") &&
+      content.textContent.includes("History deletion was not confirmed"), "unconfirmed deletion");
+  } finally {
+    pageTestContext.confirmAction = previousConfirm;
+  }
+  assert.match(content.textContent, /History for stored/);
+  assert.deepEqual(notices, []);
+});
+
+test("confirmed recorded delete waits for signed absence before reporting success", async () => {
+  let deleted = false;
+  let finishReadback;
+  const notices = [];
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  pages.renderSessions({ content, notify: (message) => notices.push(message), navigate() {}, api: {
+    allows: (scope) => scope === "session.write",
+    async post(route) {
+      if (route === "session/list") return { sessions: [], next_offset: null };
+      if (route === "history/history_status") return historyStatus();
+      if (route === "history/list_sessions")
+        return { ok: true, sessions: deleted ? [] : [historySummary("stored")], next_offset: null };
+      if (route === "history/delete_session") { deleted = true; return { ok: true }; }
+      if (route === "history/session_detail")
+        return new Promise((resolve, reject) => { finishReadback = () => reject({ code: "not_found" }); });
+      throw new Error(`Unexpected route ${route}`);
+    },
+  } });
+  await waitFor(() => findButton(content, "Delete")?.disabled === false, "enabled delete");
+  const previousConfirm = pageTestContext.confirmAction;
+  pageTestContext.confirmAction = async () => true;
+  try {
+    findButton(content, "Delete").click();
+    await waitFor(() => deleted && finishReadback, "pending signed readback");
+    assert.deepEqual(notices, []);
+    finishReadback();
+    await waitFor(() => notices.length === 1 && content.textContent.includes("No recorded streams"), "confirmed delete");
+  } finally {
+    pageTestContext.confirmAction = previousConfirm;
+  }
+  assert.deepEqual(notices, ["Recorded session deleted."]);
+});
 
 test("recorded deletion follows signed runtime status while list and detail stay readable", async () => {
   let runtime = historyStatus({ enabled: false, effective_enabled: false });

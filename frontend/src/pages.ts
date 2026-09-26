@@ -232,6 +232,48 @@ namespace Amaterasu {
     return reply as unknown as HistoryDetailReply;
   }
 
+  export function parseHistoryListReply(value: unknown, offset: number): HistoryListReply {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("History session page is invalid.");
+    const reply = value as Record<string, unknown>;
+    if (reply.ok !== true || !Array.isArray(reply.sessions) || reply.sessions.length > 25 ||
+        (reply.next_offset !== null && (!Number.isSafeInteger(reply.next_offset) ||
+          (reply.next_offset as number) <= offset)))
+      throw new Error("History session page is invalid.");
+    for (const entry of reply.sessions) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry))
+        throw new Error("History session row is invalid.");
+      const session = entry as Record<string, unknown>;
+      if (typeof session.session_id !== "string" || session.session_id.length === 0 ||
+          new TextEncoder().encode(session.session_id).length > 128 ||
+          /[\u0000-\u001f\u007f-\u009f]/u.test(session.session_id) ||
+          ["app_name", "client_name", "protocol"].some((key) => typeof session[key] !== "string") ||
+          !Number.isSafeInteger(session.started_at_unix) ||
+          (session.ended_at_unix !== null && !Number.isSafeInteger(session.ended_at_unix)) ||
+          (session.duration_seconds !== null &&
+            (!Number.isSafeInteger(session.duration_seconds) || (session.duration_seconds as number) < 0)))
+        throw new Error("History session row is invalid.");
+    }
+    return reply as unknown as HistoryListReply;
+  }
+
+  export function parseHistoryDeleteReply(value: unknown): void {
+    if (!value || typeof value !== "object" || Array.isArray(value) ||
+        (value as Record<string, unknown>).ok !== true)
+      throw new Error("History deletion was not confirmed. Refresh the recorded sessions before trying again.");
+  }
+
+  export async function confirmHistoryDeletion(api: Pick<Api, "post">, sessionId: string): Promise<void> {
+    try {
+      await api.post<unknown>("history/session_detail", { session_id: sessionId });
+    } catch (error) {
+      if (error && typeof error === "object" &&
+          (error as { code?: unknown }).code === "not_found") return;
+      throw error;
+    }
+    throw new Error("History deletion could not be confirmed by readback. Refresh the recorded sessions.");
+  }
+
   export function renderSessions(context: PageContext): void {
     const area = el("div");
     const status = el("div");
@@ -380,21 +422,18 @@ namespace Amaterasu {
       const request = ++savedListRequest;
       savedArea.replaceChildren(el("p", "muted", "Loading recorded sessions…"));
       try {
-        const reply = await context.api.post<HistoryListReply>(
+        const reply = parseHistoryListReply(await context.api.post<unknown>(
           "history/list_sessions",
           { limit: 25, offset: savedOffset },
-        );
+        ), savedOffset);
         if (!context.content.isConnected || request !== savedListRequest) return;
-        if (reply.ok !== true || !Array.isArray(reply.sessions) ||
-          (reply.next_offset != null && (!Number.isSafeInteger(reply.next_offset) || reply.next_offset <= savedOffset)))
-          throw new Error("History session page is invalid.");
         const currentDeleteControls: typeof deleteControls = [];
         const rows = reply.sessions.map((session) => {
           const details = button("Details", () => loadSavedDetail(session.session_id));
           const remove = button(
             "Delete",
             async () => {
-              if (!historyDeleteAvailable || !(await loadHistoryRuntime())) return;
+              if (!context.api.allows("session.write") || !historyDeleteAvailable || !(await loadHistoryRuntime())) return;
               if (
                 !(await confirmAction(
                   "Delete this recorded session?",
@@ -404,11 +443,12 @@ namespace Amaterasu {
               )
                 return;
               // The writer may have drained while the confirmation was open.
-              if (!historyDeleteAvailable || !(await loadHistoryRuntime())) return;
+              if (!context.api.allows("session.write") || !historyDeleteAvailable || !(await loadHistoryRuntime())) return;
               await runAction(remove, savedStatus, async () => {
-                await context.api.post("history/delete_session", {
+                parseHistoryDeleteReply(await context.api.post<unknown>("history/delete_session", {
                   session_id: session.session_id,
-                });
+                }));
+                await confirmHistoryDeletion(context.api, session.session_id);
                 if (selectedSavedSession === session.session_id) {
                   ++savedDetailRequest;
                   selectedSavedSession = null;
