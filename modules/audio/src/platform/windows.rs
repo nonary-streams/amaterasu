@@ -42,6 +42,7 @@ const POLICY_CONFIG_CLASS: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63d
 const POLICY_CONFIG_INTERFACE: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
 const HRESULT_NOT_FOUND: HRESULT = HRESULT(0x80070490u32 as i32);
 const DEFAULT_ENDPOINT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const BUFFER_ERROR_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const ROUTE_RESTORE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 static ROUTE_POLICY: OnceLock<Mutex<RoutePolicy>> = OnceLock::new();
@@ -923,6 +924,7 @@ pub struct Capture {
     follow_console_default: bool,
     route_virtual_sink: bool,
     next_endpoint_check: Instant,
+    buffer_error_since: Option<Instant>,
     format: Format,
     timeline: Timeline,
     recovery_config: RecoveryConfig,
@@ -1191,6 +1193,7 @@ impl Capture {
                 follow_console_default,
                 route_virtual_sink,
                 next_endpoint_check: Instant::now() + DEFAULT_ENDPOINT_POLL_INTERVAL,
+                buffer_error_since: None,
                 format,
                 timeline: Timeline::new(),
                 recovery_config,
@@ -1231,16 +1234,25 @@ impl Capture {
         // copy_samples never borrows uninitialized padding or silent pointers.
         unsafe {
             if self.capture.GetNextPacketSize().map_err(capture_error)? == 0 {
+                self.buffer_error_since = None;
                 return Ok(None);
             }
             let mut pointer = std::ptr::null_mut();
             let mut frames = 0;
             let mut flags = 0;
             let mut qpc = 0;
-            self.capture
-                .GetBuffer(&mut pointer, &mut frames, &mut flags, None, Some(&mut qpc))
-                .map_err(capture_error)?;
-            let buffer = BorrowedPacket::new(&self.capture, frames);
+            let acquired =
+                self.capture
+                    .GetBuffer(&mut pointer, &mut frames, &mut flags, None, Some(&mut qpc));
+            let Some(buffer) = borrowed_packet_after_acquisition(
+                &self.capture,
+                acquired,
+                frames,
+                &mut self.buffer_error_since,
+            )?
+            else {
+                return Ok(None);
+            };
             if frames == 0 {
                 buffer.release()?;
                 return Ok(None);
@@ -1359,6 +1371,30 @@ impl<C: CaptureBufferRelease + ?Sized> Drop for BorrowedPacket<'_, C> {
     }
 }
 
+fn borrowed_packet_after_acquisition<'a, C: CaptureBufferRelease + ?Sized>(
+    capture: &'a C,
+    acquired: windows::core::Result<()>,
+    frames: u32,
+    first_error: &mut Option<Instant>,
+) -> AudioResult<Option<BorrowedPacket<'a, C>>> {
+    match acquired {
+        Ok(()) => {
+            *first_error = None;
+            Ok(Some(BorrowedPacket::new(capture, frames)))
+        }
+        // WASAPI may briefly return no buffer even after reporting frames.
+        // A failed GetBuffer owns no buffer, so there is nothing to release.
+        Err(error) if transient_buffer_error(error.code()) => {
+            if buffer_error_requires_recovery(first_error, Instant::now()) {
+                Err("device_lost")
+            } else {
+                Ok(None)
+            }
+        }
+        Err(error) => Err(capture_error(error)),
+    }
+}
+
 fn packet_flags(flags: u32) -> u32 {
     let mut result = 0;
     if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 {
@@ -1385,6 +1421,15 @@ fn capture_error(error: windows::core::Error) -> &'static str {
     } else {
         "audio_capture_failed"
     }
+}
+
+fn transient_buffer_error(code: HRESULT) -> bool {
+    code == AUDCLNT_E_BUFFER_ERROR
+}
+
+fn buffer_error_requires_recovery(first_error: &mut Option<Instant>, now: Instant) -> bool {
+    let first_error = first_error.get_or_insert(now);
+    now.saturating_duration_since(*first_error) >= BUFFER_ERROR_RECOVERY_DELAY
 }
 
 #[cfg(test)]
@@ -1477,6 +1522,38 @@ mod tests {
             capture_error(windows::core::Error::from_hresult(AUDCLNT_E_OUT_OF_ORDER)),
             "audio_capture_failed"
         );
+    }
+
+    #[test]
+    fn temporary_capture_buffer_error_waits_for_next_poll() {
+        assert!(transient_buffer_error(AUDCLNT_E_BUFFER_ERROR));
+        assert!(!transient_buffer_error(AUDCLNT_E_DEVICE_INVALIDATED));
+        let started = Instant::now();
+        let mut first_error = None;
+        assert!(!buffer_error_requires_recovery(&mut first_error, started));
+        assert!(!buffer_error_requires_recovery(
+            &mut first_error,
+            started + BUFFER_ERROR_RECOVERY_DELAY - Duration::from_nanos(1)
+        ));
+        assert!(buffer_error_requires_recovery(
+            &mut first_error,
+            started + BUFFER_ERROR_RECOVERY_DELAY
+        ));
+        first_error = None; // A successful acquisition clears the failure streak.
+        assert!(!buffer_error_requires_recovery(
+            &mut first_error,
+            started + BUFFER_ERROR_RECOVERY_DELAY
+        ));
+
+        let capture = FakeCaptureBuffer::default();
+        let acquisition = borrowed_packet_after_acquisition(
+            &capture,
+            Err(windows::core::Error::from_hresult(AUDCLNT_E_BUFFER_ERROR)),
+            8,
+            &mut None,
+        );
+        assert!(matches!(acquisition, Ok(None)));
+        assert!(capture.released.lock().unwrap().is_empty());
     }
 
     #[test]

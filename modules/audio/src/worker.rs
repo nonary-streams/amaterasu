@@ -614,6 +614,58 @@ mod tests {
     }
 
     #[test]
+    fn temporary_empty_capture_poll_preserves_pcm_and_later_device_recovery() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let capture = FakeCapture::new(
+            format,
+            [Ok(None), Ok(Some(packet(1_000, 0))), Err("device_lost")],
+        )
+        .with_drop_counter(drops.clone());
+        let (sender, packets) = mpsc::sync_channel(3);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_health = health.clone();
+        let thread_stop = stop.clone();
+        let runner_drops = drops.clone();
+        let runner = thread::spawn(move || {
+            run_capture_loop(
+                Box::new(capture),
+                || {
+                    Ok(Box::new(
+                        FakeCapture::new(
+                            format,
+                            [Ok(Some(packet(0, 0))), Err("audio_capture_failed")],
+                        )
+                        .with_drop_counter(runner_drops.clone()),
+                    ) as Box<dyn CaptureDevice>)
+                },
+                &sender,
+                &thread_health,
+                &thread_stop,
+                RecoveryPolicy {
+                    expected_endpoint: "render.fixed".into(),
+                    expected_format: format,
+                    follow_console_default: false,
+                    retry_delay: Duration::ZERO,
+                },
+            );
+        });
+
+        let captured = packets.recv_timeout(Duration::from_secs(1)).unwrap();
+        let recovered = packets.recv_timeout(Duration::from_secs(1)).unwrap();
+        runner.join().unwrap();
+        assert_eq!((captured.sequence, captured.timestamp_us), (0, 1_000));
+        assert_eq!(recovered.sequence, 1);
+        assert!(recovered.timestamp_us > captured.timestamp_us);
+        assert_ne!(recovered.flags & AUDIO_DISCONTINUITY, 0);
+        let health = health.lock().unwrap();
+        assert_eq!(health.failure, Some("audio_capture_failed"));
+        assert!(!health.recovering);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn device_loss_retries_open_and_preserves_packet_clock() {
         let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
