@@ -64,6 +64,8 @@ pub struct Record {
     pub client_frame_limiter_overrides: Option<BTreeMap<String, Value>>,
     pub application_display_overrides: BTreeMap<String, Value>,
     #[serde(skip)]
+    pub display_admission: Option<DisplayAdmission>,
+    #[serde(skip)]
     pub preflight_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub catalog_revision: Option<u64>,
@@ -90,6 +92,20 @@ pub struct Record {
     // Retained until cancellation and broker release are confirmed.
     #[serde(skip)]
     pub outstanding_request: Option<u64>,
+}
+
+pub struct DisplayAdmission {
+    pub token: String,
+    pub certificate_id: String,
+    pub rtsp_operation_id: String,
+    pub request_sha256: String,
+    pub snapshot: Value,
+}
+
+pub fn random_display_admission_token() -> Result<String, &'static str> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|_| "entropy_unavailable")?;
+    Ok(hex(&bytes))
 }
 impl Record {
     pub fn response(&self) -> Value {
@@ -206,6 +222,7 @@ impl Records {
                 frame_limiter_settings: None,
                 client_frame_limiter_overrides: None,
                 application_display_overrides: BTreeMap::new(),
+                display_admission: None,
                 preflight_token: None,
                 catalog_revision: None,
                 preflight_ready: false,

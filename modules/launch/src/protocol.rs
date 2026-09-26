@@ -50,6 +50,26 @@ pub enum Operation {
         #[serde(default)]
         application_display_overrides: Option<BTreeMap<String, Value>>,
     },
+    PrepareDisplayAdmission {
+        application_operation_id: String,
+        global_revision: Option<u64>,
+        global_overrides: BTreeMap<String, Value>,
+        catalog_revision: u64,
+        application_display_overrides: BTreeMap<String, Value>,
+        certificate_id: String,
+        client_display_overrides: BTreeMap<String, Value>,
+        rtsp_operation_id: String,
+        request_sha256: String,
+    },
+    VerifyDisplayAdmission {
+        token: String,
+        application_operation_id: String,
+        rtsp_operation_id: String,
+        request_sha256: String,
+        display_policy_snapshot: Value,
+        certificate_id: String,
+        catalog_revision: u64,
+    },
     Lookup {
         operation_id: String,
     },
@@ -100,11 +120,61 @@ impl Operation {
             Self::Lookup { operation_id } if !valid_operation_id(operation_id) => {
                 return Err("invalid_request");
             }
+            Self::PrepareDisplayAdmission {
+                application_operation_id,
+                global_revision: _,
+                global_overrides,
+                catalog_revision: _,
+                application_display_overrides,
+                certificate_id,
+                client_display_overrides,
+                rtsp_operation_id,
+                request_sha256,
+            } => {
+                if !valid_operation_id(application_operation_id)
+                    || !valid_operation_id(rtsp_operation_id)
+                    || !valid_sha256(certificate_id)
+                    || !valid_sha256(request_sha256)
+                    || !valid_application_display_overrides(global_overrides)
+                    || !valid_application_display_overrides(application_display_overrides)
+                    || !valid_application_display_overrides(client_display_overrides)
+                {
+                    return Err("invalid_request");
+                }
+            }
+            Self::VerifyDisplayAdmission {
+                token,
+                application_operation_id,
+                rtsp_operation_id,
+                request_sha256,
+                display_policy_snapshot,
+                certificate_id,
+                catalog_revision: _,
+            } => {
+                if !valid_sha256(token)
+                    || !valid_operation_id(application_operation_id)
+                    || !valid_operation_id(rtsp_operation_id)
+                    || !valid_sha256(request_sha256)
+                    || !valid_sha256(certificate_id)
+                    || !display_policy_snapshot.is_object()
+                    || !serde_json::to_vec(display_policy_snapshot)
+                        .is_ok_and(|bytes| bytes.len() <= 32_768)
+                {
+                    return Err("invalid_request");
+                }
+            }
             Self::List { limit, .. } if !(1..=16).contains(limit) => return Err("invalid_limit"),
             _ => {}
         }
         Ok(())
     }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Clone, Deserialize)]

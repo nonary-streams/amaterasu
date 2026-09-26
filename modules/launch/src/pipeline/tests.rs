@@ -1018,6 +1018,205 @@ fn display_export_is_bound_to_frozen_catalog_policy_and_retained_on_retry() {
 }
 
 #[test]
+fn display_admission_attests_frozen_policy_and_rejects_changed_or_revoked_use() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    let application = json!({"dd_resolution_option":"manual","dd_manual_resolution":"2560x1440"});
+    harness.catalog_config_overrides = Some(application.clone());
+    let preflight = harness.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({
+            "action":"preflight_export","operation_id":"admitted-application",
+            "app_id":"app-0000000000000001"
+        }),
+    );
+    let certificate_id = "cd".repeat(32);
+    let request_sha256 = "ab".repeat(32);
+    let prepare = json!({
+        "action":"prepare_display_admission",
+        "application_operation_id":"admitted-application",
+        "global_revision":7,
+        "global_overrides":{"dd_hdr_option":"disabled","dd_resolution_option":"auto"},
+        "catalog_revision":preflight["catalog_revision"],
+        "application_display_overrides":application,
+        "certificate_id":certificate_id,
+        "client_display_overrides":{"dd_resolution_option":"disabled"},
+        "rtsp_operation_id":"admitted-rtsp",
+        "request_sha256":request_sha256,
+    });
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", prepare.clone())["code"],
+        "display_admission_denied"
+    );
+    let mut launch = launch_export("admitted-application");
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["frame_limiter_settings"] = frame_limiter_snapshot();
+    launch["application_display_overrides"] = application.clone();
+    let started = harness.request(&mut pipeline, "nvhttp", launch);
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    harness.catalog_config_overrides = Some(json!({"dd_hdr_option":"auto"}));
+    assert_eq!(
+        harness.request(&mut pipeline, "other-service", prepare.clone())["code"],
+        "display_admission_denied"
+    );
+    let admission = harness.request(&mut pipeline, "nvhttp", prepare.clone());
+    assert_eq!(admission["ok"], true, "{admission}");
+    let token = admission["display_admission_token"].as_str().unwrap();
+    assert_eq!(token.len(), 64);
+    assert_eq!(
+        admission["display_policy_snapshot"]["catalog_revision"],
+        preflight["catalog_revision"]
+    );
+    assert_eq!(admission["display_policy_snapshot"]["global_revision"], 7);
+    assert_eq!(
+        admission["display_policy_snapshot"]["effective_overrides"],
+        json!({
+            "dd_hdr_option":"disabled", "dd_resolution_option":"disabled", "dd_manual_resolution":"2560x1440"
+        })
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", prepare.clone()),
+        admission
+    );
+    for (field, value) in [
+        ("request_sha256", json!("ef".repeat(32))),
+        ("certificate_id", json!("12".repeat(32))),
+        ("rtsp_operation_id", json!("other-rtsp")),
+        ("catalog_revision", json!(2)),
+    ] {
+        let mut changed = prepare.clone();
+        changed[field] = value;
+        assert_eq!(
+            harness.request(&mut pipeline, "nvhttp", changed)["code"],
+            "display_admission_denied"
+        );
+    }
+    let verify = json!({
+        "action":"verify_display_admission",
+        "token":token,
+        "application_operation_id":"admitted-application",
+        "rtsp_operation_id":"admitted-rtsp",
+        "request_sha256":request_sha256,
+        "display_policy_snapshot":admission["display_policy_snapshot"],
+        "certificate_id":certificate_id,
+        "catalog_revision":preflight["catalog_revision"],
+    });
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", verify.clone())["code"],
+        "display_admission_denied"
+    );
+    let verified = harness.request(&mut pipeline, "rtsp", verify.clone());
+    assert_eq!(verified["verified"], true, "{verified}");
+    assert_eq!(
+        harness.request(&mut pipeline, "rtsp", verify.clone()),
+        verified
+    );
+    for (field, value) in [
+        ("token", json!("00".repeat(32))),
+        ("request_sha256", json!("ef".repeat(32))),
+        ("certificate_id", json!("12".repeat(32))),
+        ("rtsp_operation_id", json!("other-rtsp")),
+        ("application_operation_id", json!("other-app")),
+        ("catalog_revision", json!(2)),
+    ] {
+        let mut changed = verify.clone();
+        changed[field] = value;
+        assert_eq!(
+            harness.request(&mut pipeline, "rtsp", changed)["code"],
+            "display_admission_denied"
+        );
+    }
+    let mut changed_snapshot = verify.clone();
+    changed_snapshot["display_policy_snapshot"]["effective_overrides"]["dd_hdr_option"] =
+        json!("auto");
+    assert_eq!(
+        harness.request(&mut pipeline, "rtsp", changed_snapshot)["code"],
+        "display_admission_denied"
+    );
+    let status = harness.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"status","launch_id":started["launch"]["launch_id"]}),
+    );
+    assert!(!status.to_string().contains(token));
+    let lookup = harness.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"lookup","operation_id":"admitted-application"}),
+    );
+    assert!(!lookup.to_string().contains(token));
+    let _stopped = harness.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "rtsp", verify)["code"],
+        "display_admission_denied"
+    );
+}
+
+#[test]
+fn display_admission_is_unavailable_to_legacy_launches() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    let started = harness.request(&mut pipeline, "nvhttp", launch_export("legacy-admission"));
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let prepare = json!({
+        "action":"prepare_display_admission",
+        "application_operation_id":"legacy-admission",
+        "global_revision":null,
+        "global_overrides":{},
+        "catalog_revision":started["launch"]["catalog_revision"],
+        "application_display_overrides":{},
+        "certificate_id":"cd".repeat(32),
+        "client_display_overrides":{},
+        "rtsp_operation_id":"legacy-rtsp",
+        "request_sha256":"ab".repeat(32),
+    });
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", prepare)["code"],
+        "display_admission_denied"
+    );
+
+    let mut failed_harness = Harness::new();
+    failed_harness.catalog_config_overrides = Some(json!({"dd_hdr_option":"invalid"}));
+    let mut failed_pipeline = Pipeline::new(BTreeMap::new()).unwrap();
+    let failed = failed_harness.request(
+        &mut failed_pipeline,
+        "nvhttp",
+        json!({
+            "action":"preflight_export", "operation_id":"failed-admission",
+            "app_id":"app-0000000000000001"
+        }),
+    );
+    assert_eq!(failed["code"], "invalid_catalog_response");
+    assert!(failed.get("display_admission_token").is_none());
+    let mut failed_prepare = json!({
+        "action":"prepare_display_admission",
+        "application_operation_id":"failed-admission",
+        "global_revision":null,
+        "global_overrides":{},
+        "catalog_revision":1,
+        "application_display_overrides":{},
+        "certificate_id":"cd".repeat(32),
+        "client_display_overrides":{},
+        "rtsp_operation_id":"failed-rtsp",
+        "request_sha256":"ab".repeat(32),
+    });
+    assert_eq!(
+        failed_harness.request(&mut failed_pipeline, "nvhttp", failed_prepare.clone())["code"],
+        "display_admission_denied"
+    );
+    failed_prepare["application_operation_id"] = json!("missing-admission");
+    assert_eq!(
+        failed_harness.request(&mut failed_pipeline, "nvhttp", failed_prepare)["code"],
+        "display_admission_denied"
+    );
+}
+
+#[test]
 fn display_preflight_treats_absent_and_null_as_sparse_and_rejects_bad_catalog_values() {
     for (case, overrides) in [
         ("absent", None),

@@ -1,7 +1,10 @@
 use crate::{
     SERVICE,
     protocol::*,
-    records::{CatalogSelection, GlobalPreparation, Records},
+    records::{
+        CatalogSelection, DisplayAdmission, GlobalPreparation, Records,
+        random_display_admission_token,
+    },
     responses,
     workflow::{Step, Workflow, first_cleanup_step},
 };
@@ -13,6 +16,27 @@ use std::{
 };
 
 type Transport = ModuleResult<Response>;
+
+fn display_policy_snapshot(
+    global_revision: Option<u64>,
+    global_overrides: &BTreeMap<String, Value>,
+    record: &crate::records::Record,
+    certificate_id: &str,
+    client_overrides: &BTreeMap<String, Value>,
+) -> Value {
+    let mut effective = global_overrides.clone();
+    effective.extend(record.application_display_overrides.clone());
+    effective.extend(client_overrides.clone());
+    serde_json::json!({
+        "global_revision":global_revision,
+        "global_overrides":global_overrides,
+        "catalog_revision":record.catalog_revision,
+        "certificate_id":certificate_id,
+        "application_overrides":record.application_display_overrides,
+        "client_overrides":client_overrides,
+        "effective_overrides":effective,
+    })
+}
 
 fn valid_frame_limiter_snapshot(snapshot: &BTreeMap<String, Value>) -> bool {
     let Some(settings) = snapshot.get("settings").and_then(Value::as_object) else {
@@ -556,6 +580,128 @@ impl Pipeline {
                     Err(code) => complete(send, request, error(code)),
                 }
             }
+            Operation::PrepareDisplayAdmission {
+                application_operation_id,
+                global_revision,
+                global_overrides,
+                catalog_revision,
+                application_display_overrides,
+                certificate_id,
+                client_display_overrides,
+                rtsp_operation_id,
+                request_sha256,
+            } => {
+                if caller != "nvhttp" {
+                    return complete(send, request, error("display_admission_denied"));
+                }
+                let Some(record) = self.records.values.values_mut().find(|record| {
+                    record.owner == caller && record.operation_id == application_operation_id
+                }) else {
+                    return complete(send, request, error("display_admission_denied"));
+                };
+                if record.state != State::Active
+                    || !record.launch_started
+                    || record.catalog_selection != CatalogSelection::Exported
+                    || record.preflight_token.is_none()
+                    || record.catalog_revision != Some(catalog_revision)
+                    || record.application_display_overrides != application_display_overrides
+                {
+                    return complete(send, request, error("display_admission_denied"));
+                }
+                let snapshot = display_policy_snapshot(
+                    global_revision,
+                    &global_overrides,
+                    record,
+                    &certificate_id,
+                    &client_display_overrides,
+                );
+                if !serde_json::to_vec(&snapshot).is_ok_and(|bytes| bytes.len() <= 32_768) {
+                    return complete(send, request, error("display_admission_denied"));
+                }
+                if let Some(admission) = &record.display_admission {
+                    if admission.certificate_id != certificate_id
+                        || admission.rtsp_operation_id != rtsp_operation_id
+                        || admission.request_sha256 != request_sha256
+                        || admission.snapshot != snapshot
+                    {
+                        return complete(send, request, error("display_admission_denied"));
+                    }
+                    return complete(
+                        send,
+                        request,
+                        serde_json::json!({
+                            "ok":true,
+                            "display_admission_token":admission.token,
+                            "display_policy_snapshot":admission.snapshot,
+                            "application_operation_id":application_operation_id,
+                            "rtsp_operation_id":rtsp_operation_id,
+                            "request_sha256":request_sha256,
+                        }),
+                    );
+                }
+                let token = match random_display_admission_token() {
+                    Ok(token) => token,
+                    Err(code) => return complete(send, request, error(code)),
+                };
+                record.display_admission = Some(DisplayAdmission {
+                    token: token.clone(),
+                    certificate_id,
+                    rtsp_operation_id: rtsp_operation_id.clone(),
+                    request_sha256: request_sha256.clone(),
+                    snapshot: snapshot.clone(),
+                });
+                complete(
+                    send,
+                    request,
+                    serde_json::json!({
+                        "ok":true,
+                        "display_admission_token":token,
+                        "display_policy_snapshot":snapshot,
+                        "application_operation_id":application_operation_id,
+                        "rtsp_operation_id":rtsp_operation_id,
+                        "request_sha256":request_sha256,
+                    }),
+                )
+            }
+            Operation::VerifyDisplayAdmission {
+                token,
+                application_operation_id,
+                rtsp_operation_id,
+                request_sha256,
+                display_policy_snapshot,
+                certificate_id,
+                catalog_revision,
+            } => {
+                if caller != "rtsp" {
+                    return complete(send, request, error("display_admission_denied"));
+                }
+                let verified = self.records.values.values().any(|record| {
+                    record.owner == "nvhttp"
+                        && record.operation_id == application_operation_id
+                        && record.state == State::Active
+                        && record.catalog_revision == Some(catalog_revision)
+                        && record.display_admission.as_ref().is_some_and(|admission| {
+                            admission.token == token
+                                && admission.certificate_id == certificate_id
+                                && admission.rtsp_operation_id == rtsp_operation_id
+                                && admission.request_sha256 == request_sha256
+                                && admission.snapshot == display_policy_snapshot
+                        })
+                });
+                if !verified {
+                    return complete(send, request, error("display_admission_denied"));
+                }
+                complete(
+                    send,
+                    request,
+                    serde_json::json!({
+                        "ok":true,
+                        "verified":true,
+                        "rtsp_operation_id":rtsp_operation_id,
+                        "request_sha256":request_sha256,
+                    }),
+                )
+            }
             Operation::Lookup { operation_id } => {
                 let response = self
                     .records
@@ -577,6 +723,11 @@ impl Pipeline {
                 } else {
                     Outcome::Completed
                 };
+                self.records
+                    .values
+                    .get_mut(&launch_id)
+                    .expect("owned launch record")
+                    .display_admission = None;
                 let mut job = Workflow::launch(launch_id, request, remaining_ms);
                 job.begin_cleanup(
                     self.records
