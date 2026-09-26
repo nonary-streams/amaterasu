@@ -437,12 +437,31 @@ impl Transaction {
 #[derive(Default)]
 pub struct CatalogSync {
     transaction: Option<Transaction>,
+    cancel_request: Option<(u64, u8)>,
+    finish_obsolete: bool,
     last_error: Option<String>,
     last_import_count: usize,
     skipped_steam_count: usize,
 }
 
 impl CatalogSync {
+    /// Stop publishing an obsolete snapshot. An accepted Finish may already be
+    /// executing its complete cleanup, so its result must still be observed.
+    pub fn cancel_stale(&mut self) {
+        let Some(transaction) = self.transaction.take() else {
+            return;
+        };
+        if transaction.stage == Stage::Finish && matches!(transaction.call, Call::Waiting { .. }) {
+            self.finish_obsolete = true;
+            self.transaction = Some(transaction);
+            return;
+        }
+        if let Call::Waiting { request } = transaction.call {
+            self.cancel_request = Some((request, 0));
+        }
+        self.last_error = Some("Lutris catalog snapshot superseded by settings".into());
+    }
+
     pub fn start(
         &mut self,
         snapshot: &Snapshot,
@@ -489,6 +508,10 @@ impl CatalogSync {
     }
 
     pub fn advance(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
+        if self.cancel_request.is_some() {
+            self.settle_cancel_with(|command| runtime.send(command));
+            return Ok(());
+        }
         let Some(mut transaction) = self.transaction.take() else {
             return Ok(());
         };
@@ -509,7 +532,18 @@ impl CatalogSync {
     }
 
     pub fn busy(&self) -> bool {
-        self.transaction.is_some()
+        self.transaction.is_some() || self.cancel_request.is_some()
+    }
+
+    fn settle_cancel_with(&mut self, mut send: impl FnMut(Command) -> ModuleResult<Response>) {
+        let Some((request, attempts)) = self.cancel_request.take() else {
+            return;
+        };
+        let canceled = child_settled(send(Command::Cancel { request }));
+        let released = canceled && child_settled(send(Command::ReleaseResult { request }));
+        if !released && attempts < 3 {
+            self.cancel_request = Some((request, attempts + 1));
+        }
     }
 
     pub fn succeeded(&self) -> bool {
@@ -605,6 +639,12 @@ impl CatalogSync {
             self.transaction = Some(transaction);
             return Ok(());
         };
+        if self.finish_obsolete {
+            self.finish_obsolete = false;
+            self.last_error =
+                Some("Lutris catalog finish completed under obsolete settings".into());
+            return Ok(());
+        }
         match response {
             Response::Result { payload } => self.consume_response(transaction, payload),
             Response::Error { code, message } => {
@@ -653,6 +693,14 @@ impl CatalogSync {
             .min(MAX_RETRY_TICKS);
         transaction.call = Call::Delay { ticks };
         self.transaction = Some(transaction);
+    }
+}
+
+fn child_settled(response: ModuleResult<Response>) -> bool {
+    match response {
+        Ok(Response::Ok) => true,
+        Ok(Response::Error { code, .. }) if code == "not_found" => true,
+        _ => false,
     }
 }
 
@@ -957,6 +1005,94 @@ mod tests {
     use crate::settings::{Exclusion, ExclusionMetadata};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn settings_change_cancels_accepted_batch_before_any_finish_submission() {
+        let mut catalog = CatalogSync::default();
+        catalog
+            .start(
+                &snapshot(vec![game(7, "Example", "wine", "", "")]),
+                &ProductSettings::default(),
+                &BTreeSet::new(),
+                1,
+            )
+            .unwrap();
+        catalog.respond_for_test(json!({"ok":true,"revision":8,"generation":3,"next_sequence":0}));
+        let transaction = catalog.transaction.as_mut().unwrap();
+        assert_eq!(transaction.stage, Stage::Batch);
+        transaction.call = Call::Waiting { request: 42 };
+
+        catalog.cancel_stale();
+        assert!(catalog.busy());
+        assert!(catalog.transaction.is_none());
+        let mut commands = Vec::new();
+        catalog.settle_cancel_with(|command| {
+            commands.push(command);
+            Ok(Response::Ok)
+        });
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                Command::Cancel { request: 42 },
+                Command::ReleaseResult { request: 42 }
+            ]
+        ));
+        assert!(!catalog.busy());
+        assert!(!catalog.succeeded());
+        assert!(
+            catalog
+                .start(
+                    &snapshot(vec![]),
+                    &ProductSettings::default(),
+                    &BTreeSet::new(),
+                    2
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            catalog.pending_payload_for_test()["action"],
+            "provider_snapshot_begin"
+        );
+    }
+
+    #[test]
+    fn settings_change_drops_undispatched_finish() {
+        let mut catalog = CatalogSync::default();
+        catalog
+            .start(
+                &snapshot(vec![]),
+                &ProductSettings::default(),
+                &BTreeSet::new(),
+                1,
+            )
+            .unwrap();
+        let transaction = catalog.transaction.as_mut().unwrap();
+        transaction.stage = Stage::Finish;
+        transaction.call = Call::Submit;
+        catalog.cancel_stale();
+        assert!(!catalog.busy());
+        assert!(catalog.transaction.is_none());
+    }
+
+    #[test]
+    fn accepted_finish_remains_pending_after_settings_change() {
+        let mut catalog = CatalogSync::default();
+        catalog
+            .start(
+                &snapshot(vec![]),
+                &ProductSettings::default(),
+                &BTreeSet::new(),
+                1,
+            )
+            .unwrap();
+        let transaction = catalog.transaction.as_mut().unwrap();
+        transaction.stage = Stage::Finish;
+        transaction.call = Call::Waiting { request: 43 };
+        catalog.cancel_stale();
+        assert!(catalog.busy());
+        assert!(catalog.finish_obsolete);
+        assert!(catalog.cancel_request.is_none());
+    }
 
     fn game(id: i64, name: &str, runner: &str, service: &str, service_id: &str) -> Game {
         Game {

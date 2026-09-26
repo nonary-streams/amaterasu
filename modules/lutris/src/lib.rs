@@ -280,6 +280,7 @@ impl LutrisModule {
         self.last_artwork_revisions.clear();
         self.last_reconciled_source = None;
         self.last_reconciled_at = None;
+        self.catalog.cancel_stale();
         let settings = self.configuration.settings();
         schedule_settings_scan(
             settings,
@@ -346,6 +347,13 @@ impl LutrisModule {
         let Some(mut pending) = self.steam_read.take() else {
             return Ok(());
         };
+        if (pending.scan.settings_epoch != self.settings_epoch
+            || !self.configuration.settings().enabled)
+            && pending.reader.cancel()
+        {
+            self.reschedule_stale_scan(pending.scan.settings_epoch);
+            return Ok(());
+        }
         let progress = pending.reader.advance(&self.runtime)?;
         match progress {
             SteamProgress::Pending => self.steam_read = Some(pending),

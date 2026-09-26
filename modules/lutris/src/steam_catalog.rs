@@ -39,6 +39,21 @@ pub struct SteamCatalogRead {
 }
 
 impl SteamCatalogRead {
+    /// Abandon pages from the old settings, settling an accepted child first.
+    pub fn cancel(&mut self) -> bool {
+        match self.call {
+            Call::Waiting { request, .. } => {
+                self.call = Call::Settling {
+                    request,
+                    attempts: 0,
+                };
+                false
+            }
+            Call::Settling { .. } => false,
+            _ => true,
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             revision: None,
@@ -288,6 +303,33 @@ impl Default for SteamCatalogRead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_change_settles_accepted_export_without_reading_pages() {
+        let mut read = SteamCatalogRead::new();
+        let now = Instant::now();
+        read.advance_with(now, |_| Ok(Response::Accepted { id: 9 }))
+            .unwrap();
+        assert!(!read.cancel());
+        let mut commands = Vec::new();
+        let result = read
+            .advance_with(now, |command| {
+                commands.push(command);
+                Ok(Response::Ok)
+            })
+            .unwrap();
+        assert_eq!(
+            result,
+            Progress::Failed("Steam-ID catalog result timed out".into())
+        );
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                Command::Cancel { request: 9 },
+                Command::ReleaseResult { request: 9 }
+            ]
+        ));
+    }
 
     #[test]
     fn lost_child_result_fails_instead_of_blocking_future_scans() {
