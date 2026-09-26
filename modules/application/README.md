@@ -36,7 +36,8 @@ settings. Both forms may appear in one list. Before argv parsing, `$(NAME)`
 expands from the command override, then the launch environment, then the
 host process environment; `$$` produces a literal dollar sign, and absent names
 produce an empty string. Other dollar text remains literal, and an unclosed
-`$(...)` reference is invalid. Expansion is bounded and is not shell evaluation:
+`$(...)` reference is rejected before any preparation step starts. Expansion is
+bounded and is not shell evaluation:
 the expanded string still goes through the host platform's argv parser and
 existing count, length, and argument limits. All overrides are validated before
 any command starts. Optional stdout/stderr paths append child output without a

@@ -1469,6 +1469,41 @@ fn raw_preparation_commands_execute_and_undo_through_the_existing_lifecycle() {
 }
 
 #[test]
+fn malformed_later_raw_preparation_rejects_before_any_step_runs() {
+    let directory = test_directory("invalid-raw-preparation");
+    let trace = directory.join("events");
+    let steps = json!([
+        {"run": lifecycle_command(&trace, "first-step", "trace")},
+        {"do": "tool $(UNCLOSED"}
+    ]);
+    let mut manager = ProcessManager::default();
+    let mut launch_request = launch("invalid-raw-launch", "sleep");
+    launch_request["preparation"] = steps.clone();
+
+    assert_eq!(
+        manager.handle("alice", launch_request)["code"],
+        "invalid_launch"
+    );
+    assert_eq!(
+        manager.handle(
+            "alice",
+            json!({
+                "action": "prepare",
+                "operation_id": "invalid-raw-lease",
+                "preparation": steps
+            })
+        )["code"],
+        "invalid_preparation"
+    );
+    assert_eq!(
+        manager.handle("alice", json!({"action": "list"}))["processes"],
+        json!([])
+    );
+    assert!(!trace.exists(), "earlier preparation ran before validation");
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn prepare_only_lease_is_idempotent_and_undoes_in_reverse_without_launching_a_process() {
     let directory = test_directory("prepare-only-lease");
     let trace = directory.join("events");

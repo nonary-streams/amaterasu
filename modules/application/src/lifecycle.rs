@@ -127,6 +127,8 @@ impl PreparationStep {
             Self::Raw(step) => {
                 for command in [&step.do_command, &step.undo] {
                     if !command.is_empty() {
+                        validate_environment_reference_syntax(command)
+                            .map_err(|_| "raw preparation environment reference is not closed")?;
                         parse_detached_commands(vec![command.clone()])?;
                     }
                 }
@@ -269,27 +271,7 @@ fn expand_environment_references(
                 cursor = after_dollar + 1;
             }
             Some(b'(') => {
-                let mut depth = 0usize;
-                let mut closing_parenthesis = None;
-                for (offset, character) in command[after_dollar..].char_indices() {
-                    match character {
-                        '(' => depth += 1,
-                        ')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                closing_parenthesis = Some(after_dollar + offset);
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                let closing_parenthesis = closing_parenthesis.ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "raw preparation environment reference is not closed",
-                    )
-                })?;
+                let closing_parenthesis = reference_end(command, after_dollar)?;
                 let name = &command[after_dollar + 1..closing_parenthesis];
                 let value = preparation_environment_value(name, environment);
                 append_bounded(&mut expanded, value.as_deref().unwrap_or_default())?;
@@ -304,6 +286,39 @@ fn expand_environment_references(
 
     append_bounded(&mut expanded, &command[cursor..])?;
     Ok(expanded)
+}
+
+fn validate_environment_reference_syntax(command: &str) -> Result<(), std::io::Error> {
+    let mut cursor = 0;
+    while let Some(relative_dollar) = command[cursor..].find('$') {
+        let after_dollar = cursor + relative_dollar + 1;
+        cursor = match command.as_bytes().get(after_dollar) {
+            Some(b'$') => after_dollar + 1,
+            Some(b'(') => reference_end(command, after_dollar)? + 1,
+            _ => after_dollar,
+        };
+    }
+    Ok(())
+}
+
+fn reference_end(command: &str, opening_parenthesis: usize) -> Result<usize, std::io::Error> {
+    let mut depth = 0usize;
+    for (offset, character) in command[opening_parenthesis..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(opening_parenthesis + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "raw preparation environment reference is not closed",
+    ))
 }
 
 fn append_bounded(output: &mut String, value: &str) -> Result<(), std::io::Error> {
