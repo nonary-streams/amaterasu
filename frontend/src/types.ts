@@ -363,6 +363,7 @@ namespace Amaterasu {
     degraded: boolean;
     failed_operations: number;
     active_streams: number;
+    pending_activities: number;
     sessions: number;
     samples: number;
     events: number;

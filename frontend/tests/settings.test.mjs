@@ -720,7 +720,7 @@ test("history editor confirms deferred toggles and durable restart readback", as
     ok: true,
     status: {
       available: true, configuration_ready: true, enabled: false, effective_enabled: false,
-      degraded: false, failed_operations: 0, active_streams: 1, sessions: 0, samples: 0,
+      degraded: false, failed_operations: 0, active_streams: 1, pending_activities: 0, sessions: 0, samples: 0,
       events: 0, live_bytes: 0,
       last_prune: { sessions_deleted: 0, live_bytes: 0, size_limit_bytes: 0, size_limit_unmet: false },
     },
@@ -754,6 +754,13 @@ test("history editor confirms deferred toggles and durable restart readback", as
   assert.equal(saved.runtime.effective_enabled, false);
   assert.equal(saved.runtime.last_prune.size_limit_bytes, 20 * 1048576);
   assert.match(context.Amaterasu.historySettingsRuntimeDescription(saved.settings, saved.runtime), /enable is deferred until active streams end; new streams still use the disabled policy/);
+  runtime = { ...runtime, status: { ...runtime.status, active_streams: 0, pending_activities: 1 } };
+  const pendingLaunch = context.Amaterasu.historySettingsRuntimeDescription(saved.settings,
+    context.Amaterasu.parseHistoryRuntimeStatus(runtime));
+  assert.match(pendingLaunch, /enable is deferred until 1 pending launch resolves/);
+  assert.match(pendingLaunch, /0 active streams · 1 pending launches/);
+  assert.doesNotMatch(pendingLaunch, /new streams/);
+  runtime = { ...runtime, status: { ...runtime.status, active_streams: 1, pending_activities: 0 } };
   assert.deepEqual(calls.map(([route]) => route), [
     "history/settings_get", "history/history_status", "history/settings_update",
     "history/settings_get", "history/history_status",
@@ -910,7 +917,7 @@ test("history form keeps retention controls visible and saves them while recordi
   enabled.fire("change");
   assert.notEqual(find(form, (node) => node.children?.includes(ttl)).hidden, true);
   assert.notEqual(find(form, (node) => node.children?.includes(size)).hidden, true);
-  assert.match(form.textContent, /New streams started while a change is pending use the previous recording policy/);
+  assert.match(form.textContent, /Recording changes wait for active streams to end and pending launches to resolve/);
   assert.match(form.textContent, /automatic pruning and deletion resume only after recording is enabled/);
   ttl.value = "7";
   size.value = "10";

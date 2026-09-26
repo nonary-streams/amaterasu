@@ -171,19 +171,14 @@ namespace Amaterasu {
       return "Saved history settings confirmed. History configuration is not ready; recording is not confirmed.";
     if (runtime.enabled !== settings.settings.enabled)
       return "Saved history settings confirmed. Runtime reports a different recording policy from this saved readback; refresh to check the current settings.";
-    const policy = runtime.effective_enabled !== runtime.enabled
-      ? runtime.enabled
-        ? "Recording enable is deferred until active streams end; new streams still use the disabled policy."
-        : "Recording disable is deferred until active streams end; new streams still use the enabled policy."
-      : runtime.effective_enabled
-        ? "Recording is enabled for new streams."
-        : "Recording is disabled for new streams.";
+    const policy = Amaterasu.historyRecordingPolicyDescription(runtime);
+    const activity = ` ${runtime.active_streams} active streams · ${runtime.pending_activities} pending launches.`;
     const retention = runtime.effective_enabled
       ? ""
       : " Stored sessions remain readable. Automatic retention and deletion are paused until recording is enabled.";
     return runtime.degraded
-      ? `Saved history settings confirmed. ${policy}${retention} History runtime is degraded; check failed operations and retention status.`
-      : `Saved history settings confirmed. ${policy}${retention}`;
+      ? `Saved history settings confirmed. ${policy}${activity}${retention} History runtime is degraded; check failed operations and retention status.`
+      : `Saved history settings confirmed. ${policy}${activity}${retention}`;
   }
 
   export async function saveAuthTokenLifetimes(
@@ -2820,7 +2815,7 @@ namespace Amaterasu {
           field(
             "Record session history",
             enabled,
-            "If streams are active, recording changes wait until all of them end. New streams started while a change is pending use the previous recording policy.",
+            "Recording changes wait for active streams to end and pending launches to resolve. Check the runtime status for the effective policy.",
           ),
           el("p", "muted", "Retention limits are saved while recording is disabled. Stored sessions remain readable, but automatic pruning and deletion resume only after recording is enabled."),
           ttlField,

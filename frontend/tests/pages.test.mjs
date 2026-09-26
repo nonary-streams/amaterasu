@@ -100,6 +100,7 @@ function historyStatus(overrides = {}) {
       degraded: false,
       failed_operations: 0,
       active_streams: 1,
+      pending_activities: 0,
       sessions: 4,
       samples: 20,
       events: 3,
@@ -123,10 +124,24 @@ test("history runtime status reports readiness, deferred settings, failures and 
   assert.match(describe(historyStatus()), /deleted 2 sessions/);
   assert.match(describe(historyStatus({ enabled: false, effective_enabled: true })), /disable is deferred until active streams end; new streams still use the enabled policy/);
   assert.match(describe(historyStatus({ enabled: true, effective_enabled: false })), /enable is deferred until active streams end; new streams still use the disabled policy/);
+  const waitingEnable = describe(historyStatus({ enabled: true, effective_enabled: false,
+    active_streams: 0, pending_activities: 1 }));
+  assert.match(waitingEnable, /enable is deferred until 1 pending launch resolves; the effective policy remains disabled/);
+  assert.match(waitingEnable, /0 active streams · 1 pending launches/);
+  assert.doesNotMatch(waitingEnable, /new streams/);
+  const waitingDisable = describe(historyStatus({ enabled: false, effective_enabled: true,
+    active_streams: 1, pending_activities: 2 }));
+  assert.match(waitingDisable, /disable is deferred until 1 active stream ends and 2 pending launches resolve/);
+  assert.match(waitingDisable, /1 active streams · 2 pending launches/);
+  assert.doesNotMatch(waitingDisable, /new streams/);
+  assert.match(describe(historyStatus({ enabled: true, effective_enabled: true,
+    active_streams: 0, pending_activities: 0 })), /Recording is enabled for new streams.*0 pending launches/);
   assert.match(describe(historyStatus({ enabled: false, effective_enabled: false })), /Automatic retention and deletion are paused/);
   assert.doesNotMatch(describe(historyStatus()), /retention and deletion are paused/);
   assert.match(describe(historyStatus({ configuration_ready: false, degraded: true })), /configuration is not ready/);
   assert.match(describe(historyStatus({ available: false, configuration_ready: false })), /storage is unavailable/);
+  assert.doesNotMatch(describe(historyStatus({ available: false, configuration_ready: false,
+    pending_activities: 0 })), /pending launches|active streams/);
   assert.match(describe(historyStatus({ degraded: true, failed_operations: 3 })), /3 history storage operations have failed/);
   assert.doesNotMatch(describe(historyStatus({ degraded: true, failed_operations: 3 })), /successfully recorded|writes are healthy/);
   assert.match(describe(historyStatus({ degraded: true, last_prune: {
@@ -136,8 +151,14 @@ test("history runtime status reports readiness, deferred settings, failures and 
 
 test("history runtime status rejects malformed signed replies and counters", () => {
   const parse = pages.parseHistoryRuntimeStatus;
+  const legacy = historyStatus();
+  delete legacy.status.pending_activities;
+  assert.equal(parse(legacy).pending_activities, 0);
   for (const reply of [null, {}, { ...historyStatus(), ok: false },
     historyStatus({ available: "true" }), historyStatus({ failed_operations: -1 }),
+    historyStatus({ pending_activities: -1 }), historyStatus({ pending_activities: 1.5 }),
+    historyStatus({ pending_activities: "1" }),
+    historyStatus({ pending_activities: Number.MAX_SAFE_INTEGER + 1 }),
     historyStatus({ sessions: 1.5 }), historyStatus({ live_bytes: Number.MAX_SAFE_INTEGER + 1 }),
     historyStatus({ last_prune: null }),
     historyStatus({ last_prune: { ...historyStatus().status.last_prune, size_limit_unmet: "false" } }),

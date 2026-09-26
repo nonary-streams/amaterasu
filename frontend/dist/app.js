@@ -2218,19 +2218,14 @@ var Amaterasu;
             return "Saved history settings confirmed. History configuration is not ready; recording is not confirmed.";
         if (runtime.enabled !== settings.settings.enabled)
             return "Saved history settings confirmed. Runtime reports a different recording policy from this saved readback; refresh to check the current settings.";
-        const policy = runtime.effective_enabled !== runtime.enabled
-            ? runtime.enabled
-                ? "Recording enable is deferred until active streams end; new streams still use the disabled policy."
-                : "Recording disable is deferred until active streams end; new streams still use the enabled policy."
-            : runtime.effective_enabled
-                ? "Recording is enabled for new streams."
-                : "Recording is disabled for new streams.";
+        const policy = Amaterasu.historyRecordingPolicyDescription(runtime);
+        const activity = ` ${runtime.active_streams} active streams · ${runtime.pending_activities} pending launches.`;
         const retention = runtime.effective_enabled
             ? ""
             : " Stored sessions remain readable. Automatic retention and deletion are paused until recording is enabled.";
         return runtime.degraded
-            ? `Saved history settings confirmed. ${policy}${retention} History runtime is degraded; check failed operations and retention status.`
-            : `Saved history settings confirmed. ${policy}${retention}`;
+            ? `Saved history settings confirmed. ${policy}${activity}${retention} History runtime is degraded; check failed operations and retention status.`
+            : `Saved history settings confirmed. ${policy}${activity}${retention}`;
     }
     Amaterasu.historySettingsRuntimeDescription = historySettingsRuntimeDescription;
     async function saveAuthTokenLifetimes(api, revision, sessionTokenTtlSeconds, rememberMeRefreshTokenTtlSeconds) {
@@ -4293,7 +4288,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save history settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Record session history", enabled, "If streams are active, recording changes wait until all of them end. New streams started while a change is pending use the previous recording policy."), Amaterasu.el("p", "muted", "Retention limits are saved while recording is disabled. Stored sessions remain readable, but automatic pruning and deletion resume only after recording is enabled."), ttlField, sizeField, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${reply.revision}`)));
+                form.append(Amaterasu.field("Record session history", enabled, "Recording changes wait for active streams to end and pending launches to resolve. Check the runtime status for the effective policy."), Amaterasu.el("p", "muted", "Retention limits are saved while recording is disabled. Stored sessions remain readable, but automatic pruning and deletion resume only after recording is enabled."), ttlField, sizeField, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${reply.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
@@ -5112,27 +5107,45 @@ var Amaterasu;
         for (const key of ["failed_operations", "active_streams", "sessions", "samples", "events", "live_bytes"])
             if (!Number.isSafeInteger(status[key]) || status[key] < 0)
                 throw new Error(`History ${key} count is invalid.`);
+        if (status.pending_activities !== undefined &&
+            (!Number.isSafeInteger(status.pending_activities) || status.pending_activities < 0))
+            throw new Error("History pending activities count is invalid.");
         for (const key of ["sessions_deleted", "live_bytes", "size_limit_bytes"])
             if (!Number.isSafeInteger(retention[key]) || retention[key] < 0)
                 throw new Error(`History retention ${key} count is invalid.`);
         if (typeof retention.size_limit_unmet !== "boolean")
             throw new Error("History retention limit status is invalid.");
-        return status;
+        return { ...status, pending_activities: status.pending_activities ?? 0 };
     }
     Amaterasu.parseHistoryRuntimeStatus = parseHistoryRuntimeStatus;
+    function historyRecordingPolicyDescription(status) {
+        if (!status.configuration_ready)
+            return "History configuration is not ready; recording is not confirmed.";
+        if (status.effective_enabled !== status.enabled) {
+            const action = status.enabled ? "enable" : "disable";
+            const effective = status.effective_enabled ? "enabled" : "disabled";
+            if (status.pending_activities > 0) {
+                const pending = status.pending_activities === 1
+                    ? "1 pending launch resolves"
+                    : `${status.pending_activities} pending launches resolve`;
+                const active = status.active_streams > 0
+                    ? `${status.active_streams} active ${status.active_streams === 1 ? "stream ends" : "streams end"} and `
+                    : "";
+                return `Recording ${action} is deferred until ${active}${pending}; the effective policy remains ${effective}.`;
+            }
+            return `Recording ${action} is deferred until active streams end; new streams still use the ${effective} policy.`;
+        }
+        const effective = status.effective_enabled ? "enabled" : "disabled";
+        return status.pending_activities > 0
+            ? `Recording is ${effective} under the current policy; pending launches have not joined yet.`
+            : `Recording is ${effective} for new streams.`;
+    }
+    Amaterasu.historyRecordingPolicyDescription = historyRecordingPolicyDescription;
     function historyRuntimeDescription(status) {
         if (!status.available)
             return ["History storage is unavailable; recording and recorded session reads cannot run."];
-        const lines = [status.configuration_ready
-                ? status.effective_enabled === status.enabled
-                    ? status.effective_enabled
-                        ? "Recording is enabled for new streams."
-                        : "Recording is disabled for new streams."
-                    : status.enabled
-                        ? "Recording enable is deferred until active streams end; new streams still use the disabled policy."
-                        : "Recording disable is deferred until active streams end; new streams still use the enabled policy."
-                : "History configuration is not ready; recording is not confirmed."];
-        lines.push(`${status.active_streams} active streams · ${status.sessions} stored sessions · ${status.samples} samples · ${status.events} events · ${status.live_bytes} live bytes.`);
+        const lines = [historyRecordingPolicyDescription(status)];
+        lines.push(`${status.active_streams} active streams · ${status.pending_activities} pending launches · ${status.sessions} stored sessions · ${status.samples} samples · ${status.events} events · ${status.live_bytes} live bytes.`);
         if (status.configuration_ready && !status.effective_enabled)
             lines.push("Stored sessions remain readable. Automatic retention and deletion are paused until recording is enabled.");
         lines.push(`Last retention pass deleted ${status.last_prune.sessions_deleted} sessions; ${status.last_prune.live_bytes} live bytes against ${status.last_prune.size_limit_bytes === 0 ? "no size limit" : `${status.last_prune.size_limit_bytes} byte limit`}.`);
