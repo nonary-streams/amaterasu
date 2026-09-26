@@ -227,7 +227,37 @@ pub fn available_modes(id: &str) -> DisplayResult<Vec<AvailableMode>> {
         // SAFETY: name is NUL-terminated; the initialized DEVMODEW owns dmSize
         // bytes, and no driver-private trailing storage is requested.
         if unsafe { EnumDisplaySettingsExW(name.as_ptr(), index, &mut mode, 0) } == 0 {
-            return Ok(modes.into_values().collect());
+            let mut available: Vec<AvailableMode> = modes.into_values().collect();
+            if let Some(current) = current {
+                let refresh = current.refresh;
+                if refresh.denominator != 0
+                    && current.source.pixel_format == DISPLAYCONFIG_PIXELFORMAT_32BPP
+                {
+                    let nominal = (u64::from(refresh.numerator)
+                        + u64::from(refresh.denominator) / 2)
+                        / u64::from(refresh.denominator);
+                    if let Ok(nominal) = u32::try_from(nominal)
+                        && available.iter().any(|mode| {
+                            mode.width == current.source.width
+                                && mode.height == current.source.height
+                                && mode.bits_per_pixel == 32
+                                && mode.nominal_refresh_hz == nominal
+                        })
+                    {
+                        // CCD provides the exact rate of this active setting.
+                        // GDI's other rows expose only integer nominal rates.
+                        available.push(AvailableMode {
+                            width: current.source.width,
+                            height: current.source.height,
+                            refresh,
+                            nominal_refresh_hz: nominal,
+                            bits_per_pixel: 32,
+                            exact_current: true,
+                        });
+                    }
+                }
+            }
+            return Ok(available);
         }
         if mode.dmPelsWidth == 0 || mode.dmPelsHeight == 0 {
             continue;
@@ -235,24 +265,6 @@ pub fn available_modes(id: &str) -> DisplayResult<Vec<AvailableMode>> {
         if mode.dmDisplayFrequency == 0 {
             continue;
         }
-        let refresh = current
-            .as_ref()
-            .filter(|current| {
-                current.source.width == mode.dmPelsWidth
-                    && current.source.height == mode.dmPelsHeight
-                    && current.refresh.denominator != 0
-                    && (u64::from(current.refresh.numerator)
-                        + u64::from(current.refresh.denominator) / 2)
-                        / u64::from(current.refresh.denominator)
-                        == u64::from(mode.dmDisplayFrequency)
-            })
-            .map_or(
-                Rational {
-                    numerator: mode.dmDisplayFrequency,
-                    denominator: 1,
-                },
-                |current| current.refresh,
-            );
         modes.insert(
             (
                 mode.dmPelsWidth,
@@ -263,9 +275,13 @@ pub fn available_modes(id: &str) -> DisplayResult<Vec<AvailableMode>> {
             AvailableMode {
                 width: mode.dmPelsWidth,
                 height: mode.dmPelsHeight,
-                refresh,
+                refresh: Rational {
+                    numerator: mode.dmDisplayFrequency,
+                    denominator: 1,
+                },
                 nominal_refresh_hz: mode.dmDisplayFrequency,
                 bits_per_pixel: mode.dmBitsPerPel,
+                exact_current: false,
             },
         );
     }

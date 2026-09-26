@@ -83,6 +83,7 @@ pub struct AvailableMode {
     pub refresh: Rational,
     pub nominal_refresh_hz: u32,
     pub bits_per_pixel: u32,
+    pub exact_current: bool,
 }
 impl Rational {
     #[cfg(any(windows, test))]
@@ -184,18 +185,30 @@ impl Configuration {
             })?;
             let highest = modes
                 .iter()
-                .filter(|mode| mode.width == resolution.width && mode.height == resolution.height)
+                .filter(|mode| {
+                    mode.width == resolution.width
+                        && mode.height == resolution.height
+                        && mode.bits_per_pixel == 32
+                })
                 .filter(|mode| mode.refresh.denominator != 0 && mode.refresh.numerator != 0)
                 .max_by(|left, right| {
-                    (u64::from(left.refresh.numerator) * u64::from(right.refresh.denominator)).cmp(
-                        &(u64::from(right.refresh.numerator) * u64::from(left.refresh.denominator)),
-                    )
+                    left.nominal_refresh_hz
+                        .cmp(&right.nominal_refresh_hz)
+                        .then_with(|| left.exact_current.cmp(&right.exact_current))
+                        .then_with(|| {
+                            (u64::from(left.refresh.numerator)
+                                * u64::from(right.refresh.denominator))
+                            .cmp(
+                                &(u64::from(right.refresh.numerator)
+                                    * u64::from(left.refresh.denominator)),
+                            )
+                        })
                 })
                 .ok_or_else(|| {
                     DisplayError::new(
                         "unsupported_display",
                         format!(
-                            "display has no available mode at {}x{}",
+                            "display has no available 32bpp mode at {}x{}",
                             resolution.width, resolution.height
                         ),
                     )

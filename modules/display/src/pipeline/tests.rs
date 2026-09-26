@@ -394,6 +394,7 @@ fn highest_refresh_uses_final_resolution_and_reaches_durable_apply() {
             height: 720,
             bits_per_pixel: 32,
             nominal_refresh_hz: 240,
+            exact_current: false,
             refresh: Rational {
                 numerator: 240,
                 denominator: 1,
@@ -404,6 +405,7 @@ fn highest_refresh_uses_final_resolution_and_reaches_durable_apply() {
             height: 1080,
             bits_per_pixel: 32,
             nominal_refresh_hz: 60,
+            exact_current: false,
             refresh: Rational {
                 numerator: 60,
                 denominator: 1,
@@ -414,6 +416,18 @@ fn highest_refresh_uses_final_resolution_and_reaches_durable_apply() {
             height: 1080,
             bits_per_pixel: 32,
             nominal_refresh_hz: 120,
+            exact_current: false,
+            refresh: Rational {
+                numerator: 120,
+                denominator: 1,
+            },
+        },
+        crate::model::AvailableMode {
+            width: 1920,
+            height: 1080,
+            bits_per_pixel: 32,
+            nominal_refresh_hz: 120,
+            exact_current: true,
             refresh: Rational {
                 numerator: 120000,
                 denominator: 1001,
@@ -474,6 +488,7 @@ fn missing_highest_mode_rejects_before_prepare_and_journal() {
         height: 1080,
         bits_per_pixel: 32,
         nominal_refresh_hz: 240,
+        exact_current: false,
         refresh: Rational {
             numerator: 240,
             denominator: 1,
@@ -495,6 +510,68 @@ fn missing_highest_mode_rejects_before_prepare_and_journal() {
     let result = state.run(&mut pipeline, "owner", request);
     assert_eq!(result["error"]["code"], "unsupported_display");
     assert_eq!(pipeline.platform.mode_queries, 1);
+    assert!(pipeline.platform.prepared_mode.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+    assert!(state.journal.is_none());
+}
+
+#[test]
+fn highest_refresh_ignores_modes_incompatible_with_native_32bpp_apply() {
+    let request = json!({
+        "action":"apply", "configuration":configuration(),
+        "mode_policy":{
+            "display_id":"monitor.one",
+            "context":{
+                "resolution_is_automatic":false,
+                "refresh_rate_is_automatic":false,
+                "client_display_mode_override":false,
+                "optimize_game_settings":true
+            },
+            "remapping":{}, "refresh_rate_option":"prefer_highest"
+        }
+    });
+    let incompatible = crate::model::AvailableMode {
+        width: 1280,
+        height: 720,
+        nominal_refresh_hz: 240,
+        refresh: Rational {
+            numerator: 240,
+            denominator: 1,
+        },
+        bits_per_pixel: 16,
+        exact_current: false,
+    };
+    let compatible = crate::model::AvailableMode {
+        width: 1280,
+        height: 720,
+        nominal_refresh_hz: 120,
+        refresh: Rational {
+            numerator: 120,
+            denominator: 1,
+        },
+        bits_per_pixel: 32,
+        exact_current: false,
+    };
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    pipeline.platform.available_modes = vec![incompatible, compatible];
+    let result = state.run(&mut pipeline, "owner", request.clone());
+    assert_eq!(result["applied"], true);
+    assert_eq!(
+        pipeline.platform.prepared_mode,
+        Some((1280, 720, compatible.refresh))
+    );
+    assert_eq!(
+        pipeline.platform.applied_mode,
+        pipeline.platform.prepared_mode
+    );
+    assert!(state.journal.is_some());
+
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    pipeline.platform.available_modes = vec![incompatible];
+    let result = state.run(&mut pipeline, "owner", request);
+    assert_eq!(result["error"]["code"], "unsupported_display");
     assert!(pipeline.platform.prepared_mode.is_none());
     assert!(pipeline.platform.effects.is_empty());
     assert!(state.journal.is_none());

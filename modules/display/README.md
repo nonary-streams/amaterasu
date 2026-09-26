@@ -108,8 +108,13 @@ path, not a transient adapter LUID. Driver reinstallation or a connection change
 can replace that identity; it is not a universal portable monitor UUID.
 
 Enumeration with `display` returns GDI modes for that **active** source. These
-records expose integer `refresh_hz`; CCD apply accepts rational refresh rates and
-validates the exact request with Windows. Inactive-target mode enumeration is
+records expose integer nominal `refresh_hz`. The active CCD mode contributes its
+exact rational `refresh` only when a matching 32bpp GDI mode exists; other GDI
+modes retain their integer nominal rates. `prefer_highest` considers only 32bpp
+modes, prefers the exact current rate when nominal rates tie, and requires native
+CCD validation before journaling. Drivers may report fractional rates only as
+rounded integers, so selection on other modes needs hardware qualification.
+CCD apply validates the exact request with Windows. Inactive-target mode enumeration is
 explicitly unsupported. Results are `entries` and `next_offset`; limits are 1–32
 and pages also cap encoded rows at 12,000 bytes. Offsets are not immutable
 snapshot cursors; restart enumeration after hotplug or external display changes.
