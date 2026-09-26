@@ -42,10 +42,126 @@ pub(super) fn release_input_pair<Device>(
     pointer_result
 }
 
+/// A failed frame may have reached uinput without its SYN_REPORT. Destroy the
+/// uncertain device before writing another frame, and retain it if destruction
+/// fails so the next update or lease cleanup can retry that exact descriptor.
+pub(super) fn recover_input_device<Device>(
+    device: &mut Option<Device>,
+    recovery_required: &mut bool,
+    mut destroy: impl FnMut(&mut Device) -> InputResult<()>,
+    mut create: impl FnMut() -> InputResult<Device>,
+) -> InputResult<()> {
+    if !*recovery_required {
+        return Ok(());
+    }
+    if let Some(owned) = device.as_mut() {
+        destroy(owned)?;
+        *device = None;
+    }
+    *device = Some(create()?);
+    *recovery_required = false;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::InputError;
+
+    #[test]
+    fn failed_frame_recovery_retries_destroy_then_recreates_before_update() {
+        let mut device = Some(1_u8);
+        let mut recovery_required = true;
+        let mut fail_destroy = true;
+        let creations = std::cell::Cell::new(0);
+        let mut destroy = |owned: &mut u8| {
+            assert_eq!(*owned, 1);
+            if std::mem::take(&mut fail_destroy) {
+                Err(InputError::new("release_failed", "destroy failed"))
+            } else {
+                Ok(())
+            }
+        };
+        let mut create = || {
+            creations.set(creations.get() + 1);
+            Ok(2_u8)
+        };
+        assert_eq!(
+            recover_input_device(
+                &mut device,
+                &mut recovery_required,
+                &mut destroy,
+                &mut create
+            )
+            .unwrap_err()
+            .code,
+            "release_failed"
+        );
+        assert_eq!(device, Some(1));
+        assert!(recovery_required);
+        assert_eq!(creations.get(), 0);
+
+        recover_input_device(
+            &mut device,
+            &mut recovery_required,
+            &mut destroy,
+            &mut create,
+        )
+        .unwrap();
+        assert_eq!(device, Some(2));
+        assert!(!recovery_required);
+        assert_eq!(creations.get(), 1);
+        recover_input_device(
+            &mut device,
+            &mut recovery_required,
+            &mut destroy,
+            &mut create,
+        )
+        .unwrap();
+        assert_eq!(creations.get(), 1);
+    }
+
+    #[test]
+    fn failed_reacquisition_keeps_recovery_pending_without_old_device() {
+        let mut device = Some(1_u8);
+        let mut recovery_required = true;
+        let mut fail_create = true;
+        let mut destroy_count = 0;
+        let mut destroy = |_: &mut u8| {
+            destroy_count += 1;
+            Ok(())
+        };
+        let mut create = || {
+            if std::mem::take(&mut fail_create) {
+                Err(InputError::new("acquire_failed", "create failed"))
+            } else {
+                Ok(2_u8)
+            }
+        };
+        assert_eq!(
+            recover_input_device(
+                &mut device,
+                &mut recovery_required,
+                &mut destroy,
+                &mut create
+            )
+            .unwrap_err()
+            .code,
+            "acquire_failed"
+        );
+        assert!(device.is_none());
+        assert!(recovery_required);
+        recover_input_device(
+            &mut device,
+            &mut recovery_required,
+            &mut destroy,
+            &mut create,
+        )
+        .unwrap();
+        assert_eq!(device, Some(2));
+        assert_eq!(destroy_count, 1);
+        assert!(!recovery_required);
+    }
 
     #[test]
     fn partial_startup_retains_keyboard_through_failed_cleanup_and_reacquires() {

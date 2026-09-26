@@ -1,5 +1,5 @@
 use super::Backend;
-use super::owned_devices::{acquire_input_pair, release_input_pair};
+use super::owned_devices::{acquire_input_pair, recover_input_device, release_input_pair};
 use crate::gamepad::{
     ControllerSnapshot, GAMEPAD_ABSOLUTE_AXES, GamepadDevice, GamepadSlots, NativeGamepadEvent,
     controller_state_events, gamepad_key_codes, possible_controller_state_after_write_failure,
@@ -358,6 +358,8 @@ pub struct LinuxBackend {
     path: String,
     keyboard: Option<Device>,
     pointer: Option<Device>,
+    keyboard_recovery_required: bool,
+    pointer_recovery_required: bool,
     key_rightalt_to_key_win: bool,
     held_virtual_keycodes: HashMap<u8, u16>,
     vertical_scroll_remainder: i32,
@@ -377,6 +379,8 @@ impl LinuxBackend {
             path,
             keyboard: None,
             pointer: None,
+            keyboard_recovery_required: false,
+            pointer_recovery_required: false,
             key_rightalt_to_key_win: false,
             held_virtual_keycodes: HashMap::new(),
             vertical_scroll_remainder: 0,
@@ -497,6 +501,8 @@ impl Backend for LinuxBackend {
         self.vertical_scroll_remainder = 0;
         self.horizontal_scroll_remainder = 0;
         self.held_virtual_keycodes.clear();
+        self.keyboard_recovery_required = false;
+        self.pointer_recovery_required = false;
         self.controller_input_supported = false;
         self.effective_profile = None;
         self.controller_unavailable_reason = None;
@@ -568,6 +574,15 @@ impl Backend for LinuxBackend {
                 .map_err(|error| InputError::new("controller_unavailable", error.message));
         }
         if let Event::Key { key, state } = event {
+            if self.keyboard_recovery_required {
+                recover_input_device(
+                    &mut self.keyboard,
+                    &mut self.keyboard_recovery_required,
+                    Device::destroy,
+                    || Device::create(&self.path, true),
+                )?;
+                self.held_virtual_keycodes.clear();
+            }
             let code = match key {
                 Key::LinuxEvdev { code } => *code,
                 Key::MoonlightVk {
@@ -604,7 +619,7 @@ impl Backend for LinuxBackend {
                     code_for_virtual_key(*code, *normalized, self.key_rightalt_to_key_win)?,
                 );
             }
-            keyboard.emit(&[(
+            let result = keyboard.emit(&[(
                 EV_KEY,
                 code,
                 match state {
@@ -612,14 +627,28 @@ impl Backend for LinuxBackend {
                     KeyState::Down => 1,
                     KeyState::Repeat => 2,
                 },
-            )])?;
+            )]);
+            if result.is_err() {
+                self.keyboard_recovery_required = true;
+            }
+            result?;
             if let (Some(identity), KeyState::Up) = (identity, state) {
                 self.held_virtual_keycodes.remove(&identity);
             }
             return Ok(());
         }
+        if self.pointer_recovery_required {
+            recover_input_device(
+                &mut self.pointer,
+                &mut self.pointer_recovery_required,
+                Device::destroy,
+                || Device::create(&self.path, false),
+            )?;
+            self.vertical_scroll_remainder = 0;
+            self.horizontal_scroll_remainder = 0;
+        }
         let pointer = self.pointer.as_ref().ok_or_else(not_started)?;
-        match event {
+        let result = match event {
             Event::Button { button, pressed } => pointer.emit(&[(
                 EV_KEY,
                 match button {
@@ -643,11 +672,17 @@ impl Backend for LinuxBackend {
                 *steps,
             )]),
             Event::ScrollUnits { axis, amount } => self.scroll_units(*axis, *amount),
-            _ => Err(InputError::new(
-                "unsupported_event",
-                "unsupported uinput event",
-            )),
+            _ => {
+                return Err(InputError::new(
+                    "unsupported_event",
+                    "unsupported uinput event",
+                ));
+            }
+        };
+        if result.is_err() {
+            self.pointer_recovery_required = true;
         }
+        result
     }
     fn stop(&mut self) -> InputResult<()> {
         let pen_touch_result = self.pen_touch.stop();
@@ -659,6 +694,8 @@ impl Backend for LinuxBackend {
         let input_result =
             release_input_pair(&mut self.keyboard, &mut self.pointer, Device::destroy);
         self.held_virtual_keycodes.clear();
+        self.keyboard_recovery_required = false;
+        self.pointer_recovery_required = false;
         self.vertical_scroll_remainder = 0;
         self.horizontal_scroll_remainder = 0;
         self.controller_input_supported = false;
@@ -740,6 +777,19 @@ mod profile_tests {
             backend.pen_touch_max_contacts(PenTouchDevice::Touch),
             Some(usize::from(MAX_TOUCH_SLOTS))
         );
+    }
+
+    #[test]
+    fn unsupported_event_does_not_attempt_pointer_recovery() {
+        let mut backend = LinuxBackend::new("/missing/uinput".into());
+        backend.pointer_recovery_required = true;
+        let event = Event::Absolute { x: 10, y: 20 };
+        assert_eq!(
+            backend.inject(&event).unwrap_err().code,
+            "unsupported_event"
+        );
+        assert!(backend.pointer_recovery_required);
+        assert!(backend.pointer.is_none());
     }
 }
 
