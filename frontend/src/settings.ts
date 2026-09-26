@@ -81,6 +81,27 @@ namespace Amaterasu {
     };
   }
 
+  export async function saveHistorySettings(
+    api: Pick<Api, "post">,
+    current: HistorySettingsReply,
+    enabled: boolean,
+    ttlDays: number,
+    sizeLimitMb: number,
+  ): Promise<HistorySettingsReply> {
+    const settings = parseHistorySettings(enabled, ttlDays, sizeLimitMb);
+    await api.post("history/settings_update", {
+      settings,
+      expected_revision: current.revision,
+    });
+    const saved = parseHistorySettingsReply(await api.post<unknown>("history/settings_get"));
+    if (saved.revision !== current.revision + 1 ||
+        saved.settings.enabled !== settings.enabled ||
+        saved.settings.ttl_days !== settings.ttl_days ||
+        saved.settings.db_size_limit_mb !== settings.db_size_limit_mb)
+      throw new Error("Session history settings could not be confirmed after saving. Refresh and check the current values.");
+    return saved;
+  }
+
   export async function saveAuthTokenLifetimes(
     api: Pick<Api, "post">,
     revision: number,
@@ -175,6 +196,32 @@ namespace Amaterasu {
         ))
       throw new Error("Host logging settings could not be confirmed after saving. Refresh and check the current values.");
     return saved;
+  }
+
+  export function parseDiagnosticsLoggingStatus(value: unknown): DiagnosticsLoggingStatus {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Diagnostics status is invalid.");
+    const status = value as Record<string, unknown>;
+    const revision = status.logging_configuration_revision;
+    if (status.ok !== true || typeof status.ready !== "boolean" ||
+        (revision !== null && (!Number.isSafeInteger(revision) || (revision as number) < 1)))
+      throw new Error("Diagnostics logging status is invalid.");
+    return status as unknown as DiagnosticsLoggingStatus;
+  }
+
+  export function diagnosticsLoggingDescription(
+    savedRevision: number,
+    status: DiagnosticsLoggingStatus | null,
+  ): string {
+    if (!status)
+      return "Saved host logging policy; diagnostics status is unavailable. Refresh to check whether it applied.";
+    if (!status.ready)
+      return "Saved host logging policy; diagnostics is not ready. Refresh after it starts.";
+    if (status.logging_configuration_revision === savedRevision)
+      return `Diagnostics is using saved host logging revision ${savedRevision}.`;
+    if (status.logging_configuration_revision === null || status.logging_configuration_revision < savedRevision)
+      return `Saved host logging revision ${savedRevision} is pending in diagnostics. Refresh to check again.`;
+    return `Diagnostics is using a newer host logging revision ${status.logging_configuration_revision}. Refresh the saved policy.`;
   }
 
   export function parseInputPolicy(
@@ -913,6 +960,9 @@ namespace Amaterasu {
         const settings = parseHostConfigurationReply(
           await context.api.post<unknown>("host-configuration/get"),
         );
+        const diagnosticsStatus = await context.api.post<unknown>("diagnostics/status")
+          .then(parseDiagnosticsLoggingStatus, () => null)
+          .catch(() => null);
         if (!context.content.isConnected) return;
         const form = el("form", "settings-form");
         const level = el("select");
@@ -927,14 +977,24 @@ namespace Amaterasu {
         path.required = true;
         path.maxLength = 4096;
         const status = el("div");
+        const applicationStatus = el("p", "muted", diagnosticsLoggingDescription(settings.revision, diagnosticsStatus));
         const save = el("button", "button primary", "Save host logging settings");
         save.type = "submit";
         save.disabled = !context.api.allows("configuration.write");
+        const refresh = button("Refresh diagnostics status", () => {
+          void runAction(refresh, status, async () => {
+            const current = parseDiagnosticsLoggingStatus(await context.api.post<unknown>("diagnostics/status"));
+            applicationStatus.textContent = diagnosticsLoggingDescription(settings.revision, current);
+          });
+        });
+        refresh.disabled = !context.api.allows("diagnostics.read");
         form.append(
           field("Minimum log level", level, "Product default uses the release channel's policy. Diagnostic records below this level are filtered."),
           field("Log path", path, "A relative path stays beneath the private host state root. The setting applies to diagnostic records after the reader refreshes its policy."),
           el("p", "muted", `Effective host policy: ${settings.effective.min_log_level} · ${settings.effective.log_path}`),
           el("p", "muted", "The diagnostics reader applies saved changes asynchronously. Other host and native logs do not use this sink; a host restart may be required for their separate logging policies."),
+          applicationStatus,
+          refresh,
           status,
           el("div", "actions", save, badge(`Revision ${settings.revision}`)),
         );
@@ -953,7 +1013,7 @@ namespace Amaterasu {
               throw error;
             }
             await loadHostLogging();
-            context.notify("Host logging settings saved and confirmed.");
+            context.notify("Host logging policy saved and confirmed. Check diagnostics status for application.");
           });
         });
         hostLoggingArea.replaceChildren(panel("Host logging", form));
@@ -1803,15 +1863,12 @@ namespace Amaterasu {
         form.addEventListener("submit", (event) => {
           event.preventDefault();
           void runAction(save, status, async () => {
-            const updated = parseHistorySettingsReply(
-              await context.api.post<unknown>("history/settings_update", {
-                settings: parseHistorySettings(
-                  enabled.checked,
-                  ttl.valueAsNumber,
-                  size.valueAsNumber,
-                ),
-                expected_revision: reply.revision,
-              }),
+            const updated = await saveHistorySettings(
+              context.api,
+              reply,
+              enabled.checked,
+              ttl.valueAsNumber,
+              size.valueAsNumber,
             );
             context.notify(
               updated.effective_enabled === updated.settings.enabled

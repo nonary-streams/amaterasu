@@ -158,6 +158,11 @@ pub fn resolve(path: &str) -> Option<Route> {
             ("amaterasu.session-history/1", action, Some(scope))
         }
         ("diagnostics", "query") => ("amaterasu.diagnostics/1", "query", Some("diagnostics.read")),
+        ("diagnostics", "status") => (
+            "amaterasu.diagnostics/1",
+            "status",
+            Some("diagnostics.read"),
+        ),
         ("diagnostics", "counters") => (
             "amaterasu.diagnostics/1",
             "counters",
@@ -334,6 +339,21 @@ mod tests {
         let detail = resolve("/v1/history/session_detail").unwrap();
         assert!(payload(detail, br#"{"session_id":"session-1"}"#).is_ok());
         assert!(payload(detail, br#"{"session_id":""}"#).is_err());
+    }
+
+    #[test]
+    fn diagnostics_status_is_read_scoped_and_accepts_only_an_empty_object() {
+        let route = resolve("/v1/diagnostics/status").unwrap();
+        assert_eq!(route.service, "amaterasu.diagnostics/1");
+        assert_eq!(route.scope, Some("diagnostics.read"));
+        assert_eq!(payload(route, b"{}").unwrap()["action"], "status");
+        for body in [
+            br#"{"scope":"diagnostics.write"}"#.as_slice(),
+            br#"{"action":"query"}"#,
+            br#"{"limit":1}"#,
+        ] {
+            assert!(payload(route, body).is_err());
+        }
     }
 
     #[test]

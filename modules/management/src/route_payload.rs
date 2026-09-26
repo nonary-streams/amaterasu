@@ -26,6 +26,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.playnite/1" => playnite(route.action, object),
         "amaterasu.input/1" => input(route.action, object),
         "amaterasu.session-history/1" => history(route.action, object),
+        "amaterasu.diagnostics/1" if route.action == "status" => fields(object, &[], &[]),
         _ => Ok(()),
     }
 }

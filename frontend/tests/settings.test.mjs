@@ -208,6 +208,41 @@ test("host logging editor rejects invalid values, stale revisions and changed un
   }
 });
 
+test("diagnostics status distinguishes saved, pending, unavailable and newer logging revisions", () => {
+  const parseStatus = context.Amaterasu.parseDiagnosticsLoggingStatus;
+  const describe = context.Amaterasu.diagnosticsLoggingDescription;
+  assert.match(describe(7, parseStatus({ ok: true, ready: true, logging_configuration_revision: 7 })), /using saved host logging revision 7/);
+  assert.match(describe(7, parseStatus({ ok: true, ready: true, logging_configuration_revision: 6 })), /pending/);
+  assert.match(describe(7, parseStatus({ ok: true, ready: true, logging_configuration_revision: null })), /pending/);
+  assert.match(describe(7, parseStatus({ ok: true, ready: false, logging_configuration_revision: null })), /not ready/);
+  assert.match(describe(7, parseStatus({ ok: true, ready: true, logging_configuration_revision: 8 })), /newer/);
+  assert.match(describe(7, null), /unavailable/);
+  for (const value of [null, {}, { ok: false, ready: true, logging_configuration_revision: 1 },
+    { ok: true, ready: "yes", logging_configuration_revision: 1 },
+    { ok: true, ready: true, logging_configuration_revision: 0 },
+    { ok: true, ready: true, logging_configuration_revision: 1.5 },
+    { ok: true, ready: true }]) assert.throws(() => parseStatus(value));
+});
+
+test("history editor confirms exact signed revision and settings readback", async () => {
+  const current = { ok: true, revision: 4, settings: { enabled: true, ttl_days: 30, db_size_limit_mb: 50 }, effective_enabled: true };
+  const calls = [];
+  const saved = { ...current, revision: 5, settings: { enabled: false, ttl_days: 14, db_size_limit_mb: 20 }, effective_enabled: true };
+  const api = { async post(route, body) {
+    calls.push([route, ordinary(body ?? {})]);
+    return route === "history/settings_get" ? saved : { ok: true };
+  } };
+  assert.deepEqual(ordinary(await context.Amaterasu.saveHistorySettings(api, current, false, 14, 20)), saved);
+  assert.deepEqual(calls, [
+    ["history/settings_update", { settings: saved.settings, expected_revision: 4 }],
+    ["history/settings_get", {}],
+  ]);
+  for (const stale of [current, { ...saved, revision: 6 }, { ...saved, settings: { ...saved.settings, ttl_days: 15 } }]) {
+    const staleApi = { async post(route) { return route === "history/settings_get" ? stale : { ok: true }; } };
+    await assert.rejects(context.Amaterasu.saveHistorySettings(staleApi, current, false, 14, 20), /could not be confirmed/);
+  }
+});
+
 test("virtual sink selector editor preserves unset and explicit empty distinctly", () => {
   const parseSelection = context.Amaterasu.parseVirtualSinkSelection;
   assert.equal(parseSelection(false, "unused value"), null);

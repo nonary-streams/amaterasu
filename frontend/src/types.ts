@@ -254,6 +254,11 @@ namespace Amaterasu {
     };
     effective: { log_path: string; min_log_level: HostLogLevel };
   }
+  export interface DiagnosticsLoggingStatus {
+    ok: true;
+    ready: boolean;
+    logging_configuration_revision: number | null;
+  }
   export interface PairingClient {
     certificate_id: string;
     client_id: string;
