@@ -69,10 +69,16 @@ previous instance cannot restore eligibility.
 Discovery changes also cancel an unfinished catalog reconciliation, so entries
 from an earlier Playnite instance are not submitted after a restart. A request
 already accepted by the catalog is drained before the next snapshot starts.
+Manual refresh forces current process discovery, including during the normal
+discovery throttle. Focus and Fullscreen entry setting changes preserve launch
+eligibility from the current completed import, including when auto-sync is off;
+disabling the provider or changing automatic selection policy revokes it.
 Vibeshine instead requests a sync when its configuration is applied and
 otherwise reconciles snapshots sent by the Playnite extension, which coalesces
 library changes with a three-second debounce. The 30-second polling interval
-and retry behavior are known timing differences.
+and retry behavior are known timing differences. The extension's shared
+Sunshine-role connection and single outbox require connector multiplexing
+before its unsolicited snapshots can safely replace polling.
 
 The typed GUID launch route uses the bounded extension connection and ticket
 protocol. Fullscreen entry is a separate Windows-only launch action, authorized

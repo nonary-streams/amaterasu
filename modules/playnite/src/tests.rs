@@ -269,6 +269,174 @@ fn process_restart_revokes_launch_eligibility_until_a_current_import_completes()
 }
 
 #[test]
+fn manual_mode_keeps_imported_launches_on_focus_change_but_revokes_on_disable() {
+    let now = Instant::now();
+    let playnite = process(41, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+    let mut current = ProductSettings {
+        enabled: true,
+        auto_sync: false,
+        ..ProductSettings::default()
+    };
+    let game_id = "a1b2c3d4-1234-5678-9abc-0123456789ab".to_owned();
+    let mut eligible = [game_id.clone()].into_iter().collect();
+    let mut catalog_processes = Some(vec![playnite.clone()]);
+    let mut next_auto_sync = None;
+
+    let previous = current.clone();
+    current.focus_attempts += 1;
+    current.fullscreen_entry_enabled = true;
+    let same_catalog_policy = apply_settings_transition(
+        Some(&previous),
+        &current,
+        &mut eligible,
+        &mut catalog_processes,
+        &mut next_auto_sync,
+        now,
+    );
+    let (_sender, receiver) = mpsc::channel();
+    let mut in_flight = SnapshotWorker {
+        receiver: Some(receiver),
+        _thread: None,
+        settings_epoch: 7,
+        processes: vec![playnite.clone()],
+    };
+    in_flight.retain_for_settings_epoch(8, same_catalog_policy);
+    assert_eq!(in_flight.settings_epoch, 8);
+    assert!(eligible.contains(&game_id));
+    assert_eq!(catalog_processes, Some(vec![playnite.clone()]));
+    assert_eq!(next_auto_sync, None);
+
+    let previous = current.clone();
+    current.enabled = false;
+    let same_catalog_policy = apply_settings_transition(
+        Some(&previous),
+        &current,
+        &mut eligible,
+        &mut catalog_processes,
+        &mut next_auto_sync,
+        now,
+    );
+    in_flight.retain_for_settings_epoch(9, same_catalog_policy);
+    assert_eq!(in_flight.settings_epoch, 8);
+    assert!(eligible.is_empty());
+    assert_eq!(catalog_processes, None);
+
+    let previous = current.clone();
+    current.enabled = true;
+    current.auto_sync = true;
+    let same_catalog_policy = apply_settings_transition(
+        Some(&previous),
+        &current,
+        &mut eligible,
+        &mut catalog_processes,
+        &mut next_auto_sync,
+        now,
+    );
+    in_flight.retain_for_settings_epoch(10, same_catalog_policy);
+    assert_eq!(in_flight.settings_epoch, 8);
+    assert!(eligible.is_empty());
+    assert_eq!(next_auto_sync, Some(now));
+}
+
+#[test]
+fn auto_sync_policy_change_revokes_eligibility_and_schedules_reconciliation() {
+    let now = Instant::now();
+    let mut previous = ProductSettings {
+        enabled: true,
+        auto_sync: true,
+        ..ProductSettings::default()
+    };
+    let mut eligible = ["a1b2c3d4-1234-5678-9abc-0123456789ab".to_owned()]
+        .into_iter()
+        .collect();
+    let mut catalog_processes = Some(vec![process(
+        41,
+        r"C:\Program Files\Playnite\Playnite.DesktopApp.exe",
+    )]);
+    let mut next_auto_sync = Some(now + Duration::from_secs(30));
+
+    let mut current = previous.clone();
+    current.focus_timeout_secs += 1;
+    apply_settings_transition(
+        Some(&previous),
+        &current,
+        &mut eligible,
+        &mut catalog_processes,
+        &mut next_auto_sync,
+        now,
+    );
+    assert_eq!(eligible.len(), 1);
+    assert_eq!(next_auto_sync, Some(now + Duration::from_secs(30)));
+
+    previous = current.clone();
+    current.recent_games += 1;
+    apply_settings_transition(
+        Some(&previous),
+        &current,
+        &mut eligible,
+        &mut catalog_processes,
+        &mut next_auto_sync,
+        now,
+    );
+    assert!(eligible.is_empty());
+    assert!(catalog_processes.is_none());
+    assert_eq!(next_auto_sync, Some(now));
+}
+
+#[test]
+fn in_flight_snapshot_cannot_restore_launches_after_disable_or_process_restart() {
+    let now = Instant::now();
+    let old_process = process(41, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+    let new_process = process(73, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+    let old_discovery = discovery::Discovery {
+        running: true,
+        processes: vec![old_process.clone()],
+        executable_paths: vec![old_process.path.clone()],
+    };
+    let new_discovery = discovery::Discovery {
+        running: true,
+        processes: vec![new_process.clone()],
+        executable_paths: vec![new_process.path.clone()],
+    };
+    let previous = ProductSettings {
+        enabled: true,
+        auto_sync: true,
+        ..ProductSettings::default()
+    };
+    let mut disabled = previous.clone();
+    disabled.enabled = false;
+    let mut eligible = ["a1b2c3d4-1234-5678-9abc-0123456789ab".to_owned()]
+        .into_iter()
+        .collect();
+    let mut catalog_processes = Some(vec![old_process.clone()]);
+    let mut next_auto_sync = Some(now + Duration::from_secs(30));
+    apply_settings_transition(
+        Some(&previous),
+        &disabled,
+        &mut eligible,
+        &mut catalog_processes,
+        &mut next_auto_sync,
+        now,
+    );
+
+    assert!(eligible.is_empty());
+    assert!(catalog_processes.is_none());
+    assert_eq!(next_auto_sync, None);
+    assert!(snapshot_processes_match_instance(
+        std::slice::from_ref(&old_process),
+        &old_discovery,
+    ));
+    assert!(!snapshot_processes_match_instance(
+        std::slice::from_ref(&old_process),
+        &new_discovery,
+    ));
+    assert!(!can_publish_eligibility(
+        Some(std::slice::from_ref(&old_process)),
+        &new_discovery,
+    ));
+}
+
+#[test]
 fn discovery_retries_automatic_sync_immediately_only_for_a_new_running_process() {
     let now = Instant::now();
     let next_attempt = Some(now + Duration::from_secs(30));

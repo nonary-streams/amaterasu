@@ -173,6 +173,12 @@ impl SnapshotWorker {
     fn busy(&self) -> bool {
         self.receiver.is_some()
     }
+
+    fn retain_for_settings_epoch(&mut self, settings_epoch: u64, same_catalog_policy: bool) {
+        if same_catalog_policy && self.busy() {
+            self.settings_epoch = settings_epoch;
+        }
+    }
 }
 
 struct PlayniteModule {
@@ -182,6 +188,7 @@ struct PlayniteModule {
     snapshot_worker: SnapshotWorker,
     settings_epoch: u64,
     observed_settings_epoch: u64,
+    observed_settings: Option<ProductSettings>,
     next_auto_sync: Option<Instant>,
     last_error: Option<String>,
     last_snapshot_games: usize,
@@ -206,6 +213,7 @@ impl ManagedModule for PlayniteModule {
             snapshot_worker: SnapshotWorker::default(),
             settings_epoch: 0,
             observed_settings_epoch: u64::MAX,
+            observed_settings: None,
             next_auto_sync: None,
             last_error: None,
             last_snapshot_games: 0,
@@ -257,16 +265,22 @@ impl PlayniteModule {
             return;
         }
         self.observed_settings_epoch = self.settings_epoch;
-        self.eligible_launch_ids.clear();
-        self.catalog_processes = None;
         let settings = self.configuration.settings();
+        let same_catalog_policy = apply_settings_transition(
+            self.observed_settings.as_ref(),
+            settings,
+            &mut self.eligible_launch_ids,
+            &mut self.catalog_processes,
+            &mut self.next_auto_sync,
+            Instant::now(),
+        );
+        // A snapshot from this Playnite instance remains usable when only
+        // focus or Fullscreen entry behavior changed while it was in flight.
+        self.snapshot_worker
+            .retain_for_settings_epoch(self.settings_epoch, same_catalog_policy);
+        self.observed_settings = Some(settings.clone());
         self.fullscreen_entry_sync
             .set_desired(cfg!(windows) && settings.enabled && settings.fullscreen_entry_enabled);
-        self.next_auto_sync = if settings.enabled && settings.auto_sync {
-            Some(Instant::now())
-        } else {
-            None
-        };
     }
 
     fn refresh_discovery(&mut self) {
@@ -321,12 +335,14 @@ impl PlayniteModule {
         let Some(result) = self.snapshot_worker.take_result() else {
             return;
         };
-        if self.snapshot_worker.settings_epoch != self.settings_epoch {
+        if !self.configuration.ready()
+            || !self.configuration.settings().enabled
+            || self.snapshot_worker.settings_epoch != self.settings_epoch
+        {
             self.last_error = Some("discarded a Playnite snapshot after settings changed".into());
             return;
         }
-        if self.snapshot_worker.processes != self.last_discovery.processes
-            || !self.last_discovery.running
+        if !snapshot_processes_match_instance(&self.snapshot_worker.processes, &self.last_discovery)
         {
             self.last_error =
                 Some("discarded a Playnite snapshot after its process changed".into());
@@ -595,7 +611,7 @@ impl PlayniteModule {
                 if self.snapshot_worker.busy() || self.catalog.busy() {
                     return self.complete(id, json!({"ok":false,"code":"refresh_busy"}));
                 }
-                self.refresh_discovery();
+                self.refresh_discovery_now();
                 if !self.last_discovery.running {
                     return self.complete(id, json!({"ok":false,"code":"playnite_not_running"}));
                 }
@@ -676,11 +692,56 @@ fn update_discovery_state(
     }
 }
 
+fn apply_settings_transition(
+    previous: Option<&ProductSettings>,
+    current: &ProductSettings,
+    eligible_launch_ids: &mut std::collections::BTreeSet<String>,
+    catalog_processes: &mut Option<Vec<discovery::ProcessImage>>,
+    next_auto_sync: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
+    let same_catalog_policy = previous.is_some_and(|previous| {
+        previous.enabled
+            && current.enabled
+            && previous.auto_sync == current.auto_sync
+            && (!current.auto_sync
+                || (previous.sync_all_installed == current.sync_all_installed
+                    && previous.autosync_remove_uninstalled == current.autosync_remove_uninstalled
+                    && previous.autosync_delete_after_days == current.autosync_delete_after_days
+                    && previous.autosync_require_replacement
+                        == current.autosync_require_replacement
+                    && previous.recent_games == current.recent_games
+                    && previous.recent_max_age_days == current.recent_max_age_days
+                    && previous.sync_categories == current.sync_categories
+                    && previous.exclude_categories == current.exclude_categories
+                    && previous.sync_plugins == current.sync_plugins
+                    && previous.exclude_plugins == current.exclude_plugins
+                    && previous.exclude_games == current.exclude_games))
+    });
+    if !same_catalog_policy {
+        eligible_launch_ids.clear();
+        *catalog_processes = None;
+    }
+    if !current.enabled || !current.auto_sync {
+        *next_auto_sync = None;
+    } else if !same_catalog_policy {
+        *next_auto_sync = Some(now);
+    }
+    same_catalog_policy
+}
+
 fn can_publish_eligibility(
     catalog_processes: Option<&[discovery::ProcessImage]>,
     discovery: &discovery::Discovery,
 ) -> bool {
     discovery.running && catalog_processes == Some(discovery.processes.as_slice())
+}
+
+fn snapshot_processes_match_instance(
+    snapshot_processes: &[discovery::ProcessImage],
+    discovery: &discovery::Discovery,
+) -> bool {
+    discovery.running && snapshot_processes == discovery.processes
 }
 
 fn settings_caller_is_authorized(caller: &str) -> bool {
