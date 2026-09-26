@@ -129,8 +129,10 @@ Console-default change starts an immediate reopen only for a stream that follows
 that default; capture-only default opens stay pinned. Failed reopen attempts
 retry every five seconds. Retry delays are cancelled by close or module
 shutdown. A reopened capture must keep the published PCM format; an incompatible
-format fails the stream with `audio_format_changed`. The first packet after
-recovery is marked discontinuous, and sequence/timestamp values continue across
+format fails the stream with `audio_format_changed`. A temporarily unsupported
+mix format during recovery is retried until it becomes compatible or the stream
+closes. The first packet after recovery is marked discontinuous, and
+sequence/timestamp values continue across
 the new capture's timeline. In status, `endpoint` reports the active capture
 endpoint and updates after a followed Console-default change successfully
 reopens capture;

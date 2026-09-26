@@ -344,15 +344,16 @@ fn run_capture_loop<F>(
 }
 
 fn permanent_reopen_error(error: &str) -> bool {
-    // Format policy access can fail briefly after a previously working virtual
-    // endpoint resets; keep retrying that acquisition during recovery.
+    // A previously working endpoint can expose an unsupported mix format
+    // temporarily during a device reset or format update. Retry its acquisition
+    // until the published format is available again; configuration errors
+    // cannot be repaired by another device poll.
     matches!(
         error,
         "invalid_endpoint"
             | "not_render_endpoint"
             | "invalid_channel_layout"
             | "unsupported_channel_layout"
-            | "unsupported_format"
     )
 }
 
@@ -1224,8 +1225,8 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_reopened_format_fails_instead_of_retrying_forever() {
-        for error in ["unsupported_format", "unsupported_channel_layout"] {
+    fn invalid_reopened_channel_layout_fails_instead_of_retrying_forever() {
+        for error in ["invalid_channel_layout", "unsupported_channel_layout"] {
             let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
             let initial = FakeCapture::new(format, [Err("device_lost")]);
             let (sender, _packets) = mpsc::sync_channel(1);
@@ -1252,6 +1253,59 @@ mod tests {
             assert_eq!(health.failure, Some(error));
             assert!(!health.recovering);
         }
+    }
+
+    #[test]
+    fn temporary_unsupported_mix_retries_and_releases_recovered_capture() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let initial =
+            FakeCapture::new(format, [Err("device_lost")]).with_drop_counter(drops.clone());
+        let (sender, packets) = mpsc::sync_channel(1);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runner = thread::spawn({
+            let health = health.clone();
+            let stop = stop.clone();
+            let attempts = attempts.clone();
+            let drops = drops.clone();
+            move || {
+                run_capture_loop(
+                    Box::new(initial),
+                    || {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            assert!(health.lock().unwrap().recovering);
+                            return Err("unsupported_format");
+                        }
+                        Ok(Box::new(
+                            FakeCapture::new(format, [Ok(Some(packet(0, 0)))])
+                                .with_drop_counter(drops.clone()),
+                        ) as Box<dyn CaptureDevice>)
+                    },
+                    &sender,
+                    &health,
+                    &stop,
+                    RecoveryPolicy {
+                        expected_endpoint: "render.fixed".into(),
+                        expected_format: format,
+                        follow_console_default: false,
+                        retry_delay: Duration::from_millis(1),
+                    },
+                );
+            }
+        });
+
+        let recovered = packets.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop.store(true, Ordering::Release);
+        runner.thread().unpark();
+        runner.join().unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_ne!(recovered.flags & AUDIO_DISCONTINUITY, 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        let health = health.lock().unwrap();
+        assert_eq!(health.failure, None);
+        assert!(!health.recovering);
     }
 
     #[test]
