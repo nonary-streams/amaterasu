@@ -839,6 +839,17 @@ impl Backend for LinuxBackend {
     }
 
     fn advance(&mut self, now: std::time::Instant) -> InputResult<()> {
+        // A failed probe teardown keeps the original descriptor owned by this
+        // lease. Retry that detach before advertising controller input; no
+        // second gamepad may be allocated while the probe still exists.
+        if let Some(probe) = self.gamepad_probe.as_mut()
+            && probe.destroy().is_ok()
+        {
+            self.gamepad_probe = None;
+            self.controller_input_supported = true;
+            self.effective_profile = Some("xone");
+            self.controller_unavailable_reason = None;
+        }
         // Timer-driven controller writes are retried by GamepadSlots while
         // their effective state remains dirty. A transient write failure must
         // not tear down the keyboard, pointer, or stream lease before retry.
@@ -1140,6 +1151,42 @@ mod tests {
         assert_eq!(adapter.borrow().writes, [4, 4, 2, 5]);
         backend.stop().unwrap();
         assert_eq!(adapter.borrow().destroys, [3, 4, 4, 5, 1, 2]);
+    }
+
+    #[test]
+    fn failed_gamepad_probe_destroy_recovers_without_allocating_another_probe() {
+        let adapter = FakeAdapterGuard::install();
+        let _guard = FakeAdapterGuard;
+        let mut backend = LinuxBackend::new("/missing/uinput".into());
+        adapter.borrow_mut().fail_destroy = Some(3);
+
+        backend.start().unwrap();
+        assert!(!backend.controller_input_supported());
+        assert_eq!(backend.effective_gamepad_profile(), None);
+        assert_eq!(adapter.borrow().next_id, 3);
+        assert_eq!(adapter.borrow().destroys, [3]);
+        assert_eq!(
+            backend.inject(&gamepad_event(1, 1 << 12)).unwrap_err().code,
+            "controller_unavailable"
+        );
+        backend.inject(&Event::Relative { dx: 1, dy: 2 }).unwrap();
+
+        adapter.borrow_mut().fail_destroy = Some(3);
+        backend.advance(std::time::Instant::now()).unwrap();
+        assert!(!backend.controller_input_supported());
+        assert_eq!(adapter.borrow().next_id, 3);
+        assert_eq!(adapter.borrow().destroys, [3, 3]);
+
+        backend.advance(std::time::Instant::now()).unwrap();
+        assert!(backend.controller_input_supported());
+        assert_eq!(backend.effective_gamepad_profile(), Some("xone"));
+        assert!(backend.gamepad_unavailable_reason().is_none());
+        assert_eq!(adapter.borrow().next_id, 3);
+        assert_eq!(adapter.borrow().destroys, [3, 3, 3]);
+        backend.inject(&gamepad_event(1, 1 << 12)).unwrap();
+        assert_eq!(adapter.borrow().next_id, 4);
+        backend.stop().unwrap();
+        assert_eq!(adapter.borrow().destroys, [3, 3, 3, 4, 1, 2]);
     }
 
     #[test]
