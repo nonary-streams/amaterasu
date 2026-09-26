@@ -894,7 +894,9 @@ namespace Amaterasu {
 
     private handleStorageChange(event: StorageEvent): void {
       if (this.loggingOut) return;
-      if (event.key !== this.storageKey) return;
+      // Storage.clear() broadcasts a null key. Re-read our record below so a
+      // peer tab cannot keep using a remembered bearer after that clear.
+      if (event.key !== null && event.key !== this.storageKey) return;
       let currentRaw: string | null;
       try {
         currentRaw = this.readStoredSessionRaw();

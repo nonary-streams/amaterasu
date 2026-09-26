@@ -1073,7 +1073,7 @@ var Amaterasu;
         handleStorageChange(event) {
             if (this.loggingOut)
                 return;
-            if (event.key !== this.storageKey)
+            if (event.key !== null && event.key !== this.storageKey)
                 return;
             let currentRaw;
             try {

@@ -795,6 +795,57 @@ test("peer logout clears a remembered session after its storage event", async ()
   await assert.rejects(second.api.post("catalog/list"), /Sign in to continue/);
 });
 
+test("peer storage clear signs out a remembered tab", async () => {
+  const storage = memoryStorage();
+  const bearer = secret("a");
+  const refreshToken = secret("b");
+  const responder = (url) => Response.json(
+    url.endsWith("/auth/login")
+      ? sessionReply(bearer, refreshToken, future(3600), future(7200), {
+          remember_me: true,
+        })
+      : { ok: true },
+  );
+  const first = apiHarness(responder, { storage });
+  await first.api.login("admin", "password", true);
+  const second = apiHarness(responder, { storage });
+  assert.equal(await second.api.restoreSession(), true);
+  let lost = 0;
+  second.api.onAuthenticationLost = () => lost += 1;
+
+  storage.values.clear();
+  second.dispatchStorage(null, null);
+
+  assert.equal(second.api.subject, "");
+  assert.equal(lost, 1);
+  await assert.rejects(second.api.post("catalog/list"), /Sign in to continue/);
+});
+
+test("storage clear notification preserves a still-present remembered record", async () => {
+  const storage = memoryStorage();
+  const bearer = secret("c");
+  const refreshToken = secret("d");
+  const { api, dispatchStorage } = apiHarness(
+    (url) => Response.json(
+      url.endsWith("/auth/login")
+        ? sessionReply(bearer, refreshToken, future(3600), future(7200), {
+            remember_me: true,
+          })
+        : { ok: true },
+    ),
+    { storage },
+  );
+  await api.login("admin", "password", true);
+  let lost = 0;
+  api.onAuthenticationLost = () => lost += 1;
+
+  dispatchStorage(null, null);
+
+  assert.equal(api.subject, "admin");
+  assert.equal(lost, 0);
+  await api.post("catalog/list");
+});
+
 test("delayed cleanup and stale storage events preserve a newer remembered login", async () => {
   const firstBearer = secret("a");
   const firstRefresh = secret("b");
