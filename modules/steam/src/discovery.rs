@@ -260,11 +260,16 @@ pub fn default_library_roots() -> Vec<PathBuf> {
         )
     }
 
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_default_library_roots(std::env::var_os("HOME").as_deref().map(Path::new))
+    }
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     Vec::new()
 }
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 fn existing_library_roots(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut seen = BTreeSet::new();
@@ -277,6 +282,14 @@ fn existing_library_roots(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
         }
     }
     roots
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_default_library_roots(home: Option<&Path>) -> Vec<PathBuf> {
+    let Some(home) = home.filter(|path| path.is_absolute()) else {
+        return Vec::new();
+    };
+    existing_library_roots(vec![home.join("Library/Application Support/Steam")])
 }
 
 #[cfg(any(target_os = "linux", test))]

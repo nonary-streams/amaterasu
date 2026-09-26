@@ -192,6 +192,45 @@ fn configured_windows_roots_override_install_defaults() {
 }
 
 #[test]
+fn macos_user_root_defaults_recover_and_explicit_roots_override_them() {
+    let fixture = Libraries::new();
+    let home = fixture.0.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let steam_root = home.join("Library/Application Support/Steam");
+    let mut provider = Provider {
+        enabled: true,
+        automatic_roots: true,
+        ..Provider::default()
+    };
+    let defaults = || macos_default_library_roots(Some(&home));
+
+    assert!(defaults().is_empty());
+    assert!(macos_default_library_roots(None).is_empty());
+    assert!(macos_default_library_roots(Some(Path::new("relative"))).is_empty());
+    assert!(provider.start_scan_with_defaults(defaults));
+    finish_provider(&mut provider);
+    assert_eq!(provider.status()["complete"], false);
+    assert_eq!(provider.status()["warnings"], json!(["no_library_roots"]));
+
+    let installed_root = fixture.library("home/Library/Application Support/Steam");
+    fixture.manifest(&installed_root, 42, "Installed later", 4);
+    assert_eq!(defaults(), vec![steam_root.canonicalize().unwrap()]);
+    assert!(provider.start_scan_with_defaults(defaults));
+    finish_provider(&mut provider);
+    assert_eq!(provider.status()["complete"], true);
+    assert_eq!(provider.games[&42].name, "Installed later");
+
+    let configured = fixture.library("configured");
+    fixture.manifest(&configured, 7, "Explicit game", 4);
+    let mut explicit = Provider::new(vec![configured.clone()]);
+    explicit.set_enabled(true);
+    assert!(explicit.start_scan_with_defaults(|| panic!("defaults must not be read")));
+    finish_provider(&mut explicit);
+    assert_eq!(explicit.roots, vec![configured]);
+    assert_eq!(explicit.games.keys().copied().collect::<Vec<_>>(), vec![7]);
+}
+
+#[test]
 fn linux_user_root_policy_rejects_machine_and_privileged_processes() {
     let user_status = "Uid:\t1000\t1000\t1000\t1000\nCapEff:\t0000000000000000\n";
     let root_status = "Uid:\t0\t0\t0\t0\nCapEff:\t0000000000000000\n";

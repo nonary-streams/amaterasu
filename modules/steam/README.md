@@ -19,10 +19,12 @@ effective user ID and lacks effective `CAP_SYS_ADMIN`. A nonprivileged machine
 service must set `AMATERASU_MACHINE_HOST` (or legacy `VIBESHINE_MACHINE_HOST`)
 to suppress this fallback; the repository does not set either flag itself.
 Such a service needs a session-owned discovery broker or explicit roots.
-Explicit roots override these defaults;
-macOS still needs explicit roots. Up to 32 configured roots and 64 discovered
-libraries are supported. Paths must be native absolute paths. Root symlinks are
-canonicalized to support ordinary Linux Steam layouts; manifest symlinks are
+On macOS, absent roots search the current process's
+`HOME/Library/Application Support/Steam` when that root contains `steamapps`.
+This is current-user discovery and has not been smoke-tested on macOS.
+Explicit roots override platform defaults. Up to 32 configured roots and 64
+discovered libraries are supported. Paths must be native absolute paths. Root
+symlinks are canonicalized to support ordinary Steam layouts; manifest symlinks are
 rejected. This is trusted local-user discovery, not a filesystem sandbox or a
 cross-user session broker. Every caller granted `call` for this service can read
 the configured library metadata and initiate refresh. Payloads cannot supply new
@@ -225,7 +227,7 @@ filesystem call can still block on unavailable storage.
 
 Behavior reference: sibling Vibeshine `src/steam_integration.h` and
 `src/steam_artwork.cpp`; source was not copied or translated. Other missing
-parity includes machine-host session-broker discovery and macOS default roots,
+parity includes machine-host session-broker discovery,
 persistent artwork caching and conversion, uninstalled owned games,
 app type filtering, play-history selection, launch options/Proton resolution,
 launch/process tracking, watchers, and Steam broker environment handling. This
