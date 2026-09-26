@@ -15,7 +15,7 @@ BUNDLE = (ROOT / "installer" / "Bundle.wxs").read_text(encoding="utf-8")
 BUILD = (ROOT / "installer" / "build-installer.ps1").read_text(encoding="utf-8")
 PLAYNITE_HASHES = {
     "extension.yaml": "0E3507A22AC5C24F1E0573CAAFF52F572BC1AF9C1C18270905B2694EBFEBA72D",
-    "AmaterasuPlaynite.psm1": "96B57FBABD7D98F09BE9A939E1EFB2E8BE7735CBE47C91D223D18EB5175387EF",
+    "AmaterasuPlaynite.psm1": "72CD5AADFCA739F345CC82BC989D438E7B31F432BC89B1F069B785E953D43906",
 }
 MIGRATION = (ROOT / "crates" / "package" / "src" / "migration.rs").read_text(encoding="utf-8")
 MIGRATION_TESTS = (
