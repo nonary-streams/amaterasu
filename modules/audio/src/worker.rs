@@ -278,6 +278,11 @@ fn run_capture_loop<F>(
                 if !enqueue(sender, health, packet) {
                     break;
                 }
+                // Activation alone does not prove a reopened device can
+                // capture. Keep reporting recovery until PCM enters the queue.
+                if recovery_without_packet {
+                    set_recovering(health, false);
+                }
                 recovery_without_packet = false;
             }
             Ok(None) => thread::park_timeout(POLL_INTERVAL),
@@ -315,7 +320,6 @@ fn run_capture_loop<F>(
                                 set_active_endpoint(health, reopened.endpoint());
                             }
                             capture = reopened;
-                            set_recovering(health, false);
                             break;
                         }
                         Err(error) if error == "audio_endpoint_changed" => {
@@ -448,6 +452,32 @@ mod tests {
 
         fn read(&mut self) -> AudioResult<Option<Packet>> {
             self.events.pop_front().unwrap_or(Ok(None))
+        }
+    }
+
+    struct SignaledCapture {
+        format: Format,
+        events: Receiver<AudioResult<Option<Packet>>>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for SignaledCapture {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl CaptureDevice for SignaledCapture {
+        fn endpoint(&self) -> &str {
+            "render.fixed"
+        }
+
+        fn format(&self) -> Format {
+            self.format
+        }
+
+        fn read(&mut self) -> AudioResult<Option<Packet>> {
+            self.events.try_recv().unwrap_or(Ok(None))
         }
     }
 
@@ -787,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn quiet_reopened_capture_is_active_and_released_on_shutdown() {
+    fn quiet_reopened_capture_stays_recovering_and_is_released_on_shutdown() {
         let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
         let initial =
@@ -829,15 +859,82 @@ mod tests {
         }
         assert!(reopened.load(Ordering::Acquire));
         let deadline = Instant::now() + Duration::from_secs(1);
-        while (drops.load(Ordering::SeqCst) == 0 || health.lock().unwrap().recovering)
-            && Instant::now() < deadline
-        {
+        while drops.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             thread::yield_now();
         }
         let snapshot = health.lock().unwrap().clone();
-        assert!(!snapshot.recovering);
+        assert!(snapshot.recovering);
         assert_eq!(snapshot.failure, None);
         assert_eq!(snapshot.active_endpoint.as_deref(), Some("render.fixed"));
+        stop.store(true, Ordering::Release);
+        runner.thread().unpark();
+        runner.join().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn failed_reopen_then_quiet_capture_recovers_only_after_pcm_is_queued() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let initial =
+            FakeCapture::new(format, [Err("device_lost")]).with_drop_counter(drops.clone());
+        let (capture_sender, capture_events) = mpsc::channel();
+        let (sender, packets) = mpsc::sync_channel(1);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runner = thread::spawn({
+            let health = health.clone();
+            let stop = stop.clone();
+            let attempts = attempts.clone();
+            let drops = drops.clone();
+            move || {
+                let mut capture_events = Some(capture_events);
+                run_capture_loop(
+                    Box::new(initial),
+                    move || {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return Err("endpoint_not_found");
+                        }
+                        Ok(Box::new(SignaledCapture {
+                            format,
+                            events: capture_events.take().expect("capture reopens only once"),
+                            drops: drops.clone(),
+                        }) as Box<dyn CaptureDevice>)
+                    },
+                    &sender,
+                    &health,
+                    &stop,
+                    RecoveryPolicy {
+                        expected_endpoint: "render.fixed".into(),
+                        expected_format: format,
+                        follow_console_default: false,
+                        retry_delay: Duration::ZERO,
+                    },
+                );
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while attempts.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(health.lock().unwrap().recovering);
+        capture_sender.send(Ok(Some(packet(5_000, 0)))).unwrap();
+        assert_eq!(
+            packets
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .sequence,
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while health.lock().unwrap().recovering && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(!health.lock().unwrap().recovering);
         stop.store(true, Ordering::Release);
         runner.thread().unpark();
         runner.join().unwrap();
