@@ -11,6 +11,7 @@ mod workflow;
 mod tests {
     include!("launch/tests.rs");
     include!("launch/audio_tests.rs");
+    include!("launch/display_mutation_tests.rs");
 }
 
 use crate::frame_limiter::FrameLimiterSettings;

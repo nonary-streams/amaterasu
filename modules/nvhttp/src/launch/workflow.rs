@@ -9,6 +9,7 @@ use crate::frame_limiter::FrameLimiterSettings;
 use crate::wire::Reply;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 const LAUNCH_SERVICE: &str = "amaterasu.launch/1";
@@ -23,6 +24,7 @@ pub enum Phase {
     ConfirmDisplay,
     LaunchApplication,
     LookupApplication,
+    PrepareDisplayAdmission,
     OpenRtsp,
     LookupRtsp,
     MonitorApplication,
@@ -110,6 +112,7 @@ impl Controller {
                         record.rtsp_cleanup_blocked = true;
                     }
                     Phase::LaunchApplication
+                    | Phase::PrepareDisplayAdmission
                     | Phase::StopApplication
                     | Phase::LookupApplication => {
                         record.application_cleanup_blocked = true;
@@ -192,6 +195,33 @@ impl Controller {
                 }),
                 5_000,
             ),
+            Phase::PrepareDisplayAdmission => {
+                let snapshot = record
+                    .display_policy_snapshot
+                    .as_ref()
+                    .expect("frozen display policy");
+                let request = record
+                    .display_request
+                    .as_ref()
+                    .expect("complete display request");
+                let request_sha256 = request_sha256(request).expect("serialized display request");
+                (
+                    LAUNCH_SERVICE,
+                    json!({
+                        "action":"prepare_display_admission",
+                        "application_operation_id":record.application_operation,
+                        "global_revision":snapshot["global_revision"],
+                        "global_overrides":snapshot["global_overrides"],
+                        "catalog_revision":snapshot["catalog_revision"],
+                        "application_display_overrides":snapshot["application_overrides"],
+                        "certificate_id":snapshot["certificate_id"],
+                        "client_display_overrides":snapshot["client_overrides"],
+                        "rtsp_operation_id":record.rtsp_operation,
+                        "request_sha256":request_sha256,
+                    }),
+                    5_000,
+                )
+            }
             Phase::OpenRtsp => {
                 record.rtsp_requested = true;
                 let config = self.config.as_ref().expect("enabled streaming config");
@@ -304,6 +334,10 @@ impl Controller {
                 .expect("RTSP open payload")
                 .remove("display_request");
         }
+        if matches!(phase, Phase::OpenRtsp) && record.display_request.is_some() {
+            payload["display_admission_token"] = json!(record.display_admission_token);
+            payload["application_operation_id"] = json!(record.application_operation);
+        }
         let operation = self.next_operation(record, phase.name());
         Call::new(service, payload, operation, timeout_ms)
     }
@@ -338,7 +372,18 @@ impl Controller {
                         .and_then(|snapshot| {
                             snapshot["effective_overrides"]["dd_configuration_option"].as_str()
                         }) {
-                        Some("verify_only") => record.stage = Stage::SnapshotDisplay,
+                        Some(
+                            "verify_only"
+                            | "ensure_active"
+                            | "ensure_primary"
+                            | "ensure_only_display",
+                        ) => {
+                            if capture_source(record).is_ok() {
+                                record.stage = Stage::SnapshotDisplay;
+                            } else {
+                                fail_record(record, "invalid_capture_output", now);
+                            }
+                        }
                         None | Some("disabled") => record.stage = Stage::LaunchApplication,
                         Some(_) => fail_record(record, "display_mutation_unavailable", now),
                     }
@@ -347,8 +392,9 @@ impl Controller {
                 Err(code) => fail_record(record, code, now),
             },
             Phase::SnapshotDisplay => match display_snapshot(&payload) {
-                Ok((revision, ids)) if record.state == State::Starting => {
+                Ok((revision, configuration, ids)) if record.state == State::Starting => {
                     record.display_topology_revision = Some(revision);
+                    record.display_snapshot_configuration = Some(configuration);
                     record.display_snapshot_ids = ids;
                     record.stage = Stage::EnumerateDisplay;
                 }
@@ -366,14 +412,22 @@ impl Controller {
             }
             Phase::EnumerateDisplay => fail_record(record, "display_enumeration_unavailable", now),
             Phase::ConfirmDisplay => match display_snapshot(&payload) {
-                Ok((revision, ids))
+                Ok((revision, configuration, ids))
                     if record.state == State::Starting
                         && record.display_match_id.is_some()
                         && record.display_topology_revision.as_deref() == Some(&revision)
-                        && ids == record.display_snapshot_ids =>
+                        && ids == record.display_snapshot_ids
+                        && record.display_snapshot_configuration.as_ref()
+                            == Some(&configuration) =>
                 {
                     record.verified_display_id = record.display_match_id.clone();
-                    record.stage = Stage::LaunchApplication;
+                    match build_display_request(record) {
+                        Ok(request) => {
+                            record.display_request = request;
+                            record.stage = Stage::LaunchApplication;
+                        }
+                        Err(code) => fail_record(record, code, now),
+                    }
                 }
                 Ok(_) => fail_record(record, "display_topology_changed", now),
                 Err(code) => fail_record(record, code, now),
@@ -556,7 +610,11 @@ impl Controller {
                                 {
                                     fail_record(record, "max_bitrate_below_encoder_minimum", now);
                                 } else if profile.validate().is_ok() {
-                                    record.stage = Stage::OpenRtsp;
+                                    record.stage = if record.display_request.is_some() {
+                                        Stage::PrepareDisplayAdmission
+                                    } else {
+                                        Stage::OpenRtsp
+                                    };
                                 } else {
                                     fail_record(record, "invalid_streaming_profile_override", now);
                                 }
@@ -586,6 +644,14 @@ impl Controller {
                     Err(code) => fail_record(record, code, now),
                 }
             }
+            Phase::PrepareDisplayAdmission => match display_admission_response(record, &payload) {
+                Ok(token) if record.state == State::Starting => {
+                    record.display_admission_token = Some(token);
+                    record.stage = Stage::OpenRtsp;
+                }
+                Ok(_) => fail_record(record, "display_admission_unavailable", now),
+                Err(code) => fail_record(record, code, now),
+            },
             Phase::OpenRtsp | Phase::LookupRtsp => match rtsp_response(record, &payload) {
                 Ok((ticket, url, "ready", true)) if record.state == State::Starting => {
                     record.rtsp_ticket = Some(ticket);
@@ -676,6 +742,9 @@ impl Controller {
                 record.application_requested = false;
                 fail_record(record, "application_launch_rejected", now);
             }
+            Phase::PrepareDisplayAdmission => {
+                fail_record(record, "display_admission_unavailable", now);
+            }
             Phase::PreflightApplication => {
                 fail_record(record, "application_preflight_rejected", now)
             }
@@ -709,6 +778,12 @@ impl Controller {
             Phase::LaunchApplication => {
                 record.application_cleanup_blocked = false;
                 record.application_reconcile = Some(Phase::LookupApplication);
+            }
+            Phase::PrepareDisplayAdmission => {
+                record.request_cleanup(
+                    Some("display_admission_unavailable"),
+                    now + CLEANUP_DEADLINE,
+                );
             }
             Phase::OpenRtsp => {
                 record.rtsp_cleanup_blocked = false;
@@ -787,6 +862,7 @@ impl Phase {
             Self::ConfirmDisplay => "confirm-display",
             Self::LaunchApplication => "launch",
             Self::LookupApplication => "find-launch",
+            Self::PrepareDisplayAdmission => "prepare-display-admission",
             Self::OpenRtsp => "open-rtsp",
             Self::LookupRtsp => "find-rtsp",
             Self::MonitorApplication => "application-status",
@@ -813,6 +889,7 @@ fn needs_work(record: &Record, now: Instant) -> bool {
             | Stage::EnumerateDisplay
             | Stage::ConfirmDisplay
             | Stage::LaunchApplication
+            | Stage::PrepareDisplayAdmission
             | Stage::OpenRtsp
     ) || (record.stage == Stage::Live && now >= record.next_monitor)
         || matches!(
@@ -834,6 +911,7 @@ fn next_phase(record: &Record) -> Phase {
         Stage::EnumerateDisplay => Phase::EnumerateDisplay,
         Stage::ConfirmDisplay => Phase::ConfirmDisplay,
         Stage::LaunchApplication => Phase::LaunchApplication,
+        Stage::PrepareDisplayAdmission => Phase::PrepareDisplayAdmission,
         Stage::OpenRtsp => Phase::OpenRtsp,
         Stage::Live if record.monitor_application_next => Phase::MonitorApplication,
         Stage::Live => Phase::MonitorRtsp,
@@ -865,7 +943,33 @@ fn next_phase(record: &Record) -> Phase {
     }
 }
 
-fn display_snapshot(payload: &Value) -> Result<(String, Vec<String>), &'static str> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotConfiguration {
+    displays: Vec<SnapshotDisplay>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotDisplay {
+    id: String,
+    width: u32,
+    height: u32,
+    refresh: SnapshotRefresh,
+    x: i32,
+    y: i32,
+    rotation: Option<String>,
+    hdr_enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotRefresh {
+    numerator: u32,
+    denominator: u32,
+}
+
+fn display_snapshot(payload: &Value) -> Result<(String, Value, Vec<String>), &'static str> {
     if payload["ok"] != true {
         return Err("display_snapshot_unavailable");
     }
@@ -878,44 +982,205 @@ fn display_snapshot(payload: &Value) -> Result<(String, Vec<String>), &'static s
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         })
         .ok_or("invalid_display_snapshot")?;
-    let displays = payload["configuration"]["displays"]
-        .as_array()
-        .filter(|displays| !displays.is_empty() && displays.len() <= 16)
+    let configuration = payload
+        .get("configuration")
         .ok_or("invalid_display_snapshot")?;
-    let mut ids = Vec::with_capacity(displays.len());
-    for display in displays {
-        let id = display["id"]
-            .as_str()
-            .filter(|id| !id.is_empty() && id.len() <= 512)
-            .ok_or("invalid_display_snapshot")?;
-        let positive_u32 = |value: &Value| {
-            value
-                .as_u64()
-                .is_some_and(|number| number > 0 && number <= u32::MAX as u64)
-        };
-        if !positive_u32(&display["width"])
-            || !positive_u32(&display["height"])
-            || !positive_u32(&display["refresh"]["numerator"])
-            || !positive_u32(&display["refresh"]["denominator"])
-            || !display["x"]
-                .as_i64()
-                .is_some_and(|number| i32::try_from(number).is_ok())
-            || !display["y"]
-                .as_i64()
-                .is_some_and(|number| i32::try_from(number).is_ok())
+    if configuration["displays"]
+        .as_array()
+        .is_some_and(|displays| {
+            displays
+                .iter()
+                .any(|display| display["rotation"].is_null() && display.get("rotation").is_some())
+        })
+    {
+        return Err("invalid_display_snapshot");
+    }
+    let parsed: SnapshotConfiguration =
+        serde_json::from_value(configuration.clone()).map_err(|_| "invalid_display_snapshot")?;
+    if parsed.displays.is_empty() || parsed.displays.len() > 16 {
+        return Err("invalid_display_snapshot");
+    }
+    let mut ids = Vec::with_capacity(parsed.displays.len());
+    for display in parsed.displays {
+        if display.id.is_empty()
+            || display.id.len() > 512
+            || display.id.chars().any(char::is_control)
+            || display.width == 0
+            || display.height == 0
+            || display.refresh.numerator == 0
+            || display.refresh.denominator == 0
+            || display.rotation.as_deref().is_some_and(|rotation| {
+                !matches!(
+                    rotation,
+                    "identity" | "rotate90" | "rotate180" | "rotate270"
+                )
+            })
         {
             return Err("invalid_display_snapshot");
         }
+        let _ = (display.x, display.y, display.hdr_enabled);
         if ids
             .iter()
-            .any(|known: &String| known.eq_ignore_ascii_case(id))
+            .any(|known: &String| known.eq_ignore_ascii_case(&display.id))
         {
             return Err("invalid_display_snapshot");
         }
-        ids.push(id.to_owned());
+        ids.push(display.id);
     }
     ids.sort_by_key(|id| id.to_ascii_lowercase());
-    Ok((revision.to_owned(), ids))
+    Ok((revision.to_owned(), configuration.clone(), ids))
+}
+
+fn build_display_request(record: &Record) -> Result<Option<Value>, &'static str> {
+    let snapshot = record
+        .display_policy_snapshot
+        .as_ref()
+        .ok_or("display_policy_unavailable")?;
+    let effective = snapshot["effective_overrides"]
+        .as_object()
+        .ok_or("display_policy_unavailable")?;
+    let option = effective
+        .get("dd_configuration_option")
+        .and_then(Value::as_str)
+        .ok_or("display_policy_unavailable")?;
+    if option == "verify_only" {
+        return Ok(None);
+    }
+    if !matches!(
+        option,
+        "ensure_active" | "ensure_primary" | "ensure_only_display"
+    ) {
+        return Err("display_mutation_unavailable");
+    }
+    let selected = record
+        .verified_display_id
+        .as_deref()
+        .ok_or("display_selection_unavailable")?;
+    let revision = record
+        .display_topology_revision
+        .as_deref()
+        .ok_or("display_snapshot_unavailable")?;
+    let mut configuration = record
+        .display_snapshot_configuration
+        .clone()
+        .ok_or("display_snapshot_unavailable")?;
+    let displays = configuration["displays"]
+        .as_array_mut()
+        .ok_or("display_snapshot_unavailable")?;
+    let client_mode_override = record.peer.client_display_mode.is_some();
+    let remapping = effective
+        .get("dd_mode_remapping")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let has_remapping_rules = remapping.as_object().is_some_and(|rules| {
+        rules.values().any(|entries| {
+            entries
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty())
+        })
+    });
+    let resolution_option = effective
+        .get("dd_resolution_option")
+        .and_then(Value::as_str);
+    let refresh_rate_option = effective
+        .get("dd_refresh_rate_option")
+        .and_then(Value::as_str);
+    if effective.get("dd_hdr_option").and_then(Value::as_str) == Some("auto")
+        || matches!(
+            effective
+                .get("dd_hdr_request_override")
+                .and_then(Value::as_str),
+            Some("auto" | "force_on")
+        )
+    {
+        return Err("display_hdr_fact_unavailable");
+    }
+    // The current authenticated launch request carries no optimize-game-settings
+    // choice. Only policies that cannot observe that choice are projected.
+    if !client_mode_override
+        && (has_remapping_rules
+            || matches!(resolution_option, Some("auto" | "manual"))
+            || effective.contains_key("dd_manual_resolution"))
+    {
+        return Err("display_optimize_fact_unavailable");
+    }
+    if !client_mode_override
+        && (refresh_rate_option == Some("manual")
+            || effective.contains_key("dd_manual_refresh_rate"))
+    {
+        return Err("display_mutation_unavailable");
+    }
+    let selected_display = displays
+        .iter_mut()
+        .find(|display| display["id"].as_str() == Some(selected))
+        .ok_or("display_selection_unavailable")?;
+    selected_display["width"] = json!(record.physical_display_mode.width);
+    selected_display["height"] = json!(record.physical_display_mode.height);
+    selected_display["refresh"] = json!({
+        "numerator":record.physical_display_mode.refresh_millihz,
+        "denominator":1000,
+    });
+    let mut policy = json!({
+        "display_id":selected,
+        "configuration_option":option,
+        "remapping":remapping,
+        "context":{
+            "resolution_is_automatic":resolution_option == Some("auto"),
+            "refresh_rate_is_automatic":matches!(refresh_rate_option, Some("auto" | "prefer_highest")),
+            "client_display_mode_override":client_mode_override,
+            "optimize_game_settings":false,
+        },
+    });
+    for (source, target) in [
+        ("dd_resolution_option", "resolution_option"),
+        ("dd_manual_resolution", "manual_resolution"),
+        ("dd_refresh_rate_option", "refresh_rate_option"),
+        ("dd_manual_refresh_rate", "manual_refresh_rate"),
+        ("dd_hdr_option", "hdr_option"),
+    ] {
+        if let Some(value) = effective.get(source) {
+            policy[target] = value.clone();
+        }
+    }
+    Ok(Some(json!({
+        "configuration":configuration,
+        "expected_topology_revision":revision,
+        "mode_policy":policy,
+    })))
+}
+
+fn request_sha256(request: &Value) -> Result<String, &'static str> {
+    let bytes = serde_json::to_vec(request).map_err(|_| "display_request_unavailable")?;
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn display_admission_response(record: &Record, payload: &Value) -> Result<String, &'static str> {
+    let request = record
+        .display_request
+        .as_ref()
+        .ok_or("display_admission_unavailable")?;
+    let hash = request_sha256(request)?;
+    let token = payload["display_admission_token"]
+        .as_str()
+        .filter(|token| {
+            token.len() == 64
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or("display_admission_unavailable")?;
+    if payload["ok"] != true
+        || payload.get("display_policy_snapshot") != record.display_policy_snapshot.as_ref()
+        || payload["application_operation_id"] != record.application_operation
+        || payload["rtsp_operation_id"] != record.rtsp_operation
+        || payload["request_sha256"] != hash
+    {
+        return Err("display_admission_unavailable");
+    }
+    Ok(token.to_owned())
 }
 
 fn capture_source(record: &Record) -> Result<&str, &'static str> {

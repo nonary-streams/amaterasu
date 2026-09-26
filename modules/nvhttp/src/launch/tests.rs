@@ -989,14 +989,19 @@ struct Broker {
     application_catalog_revision: u64,
     rtsp_snapshot: Option<Value>,
     rtsp_display_policy_snapshot: Option<Value>,
+    rtsp_display_request: Option<Value>,
     rtsp_executable_path: Option<String>,
     wrong_rtsp_snapshot: bool,
     wrong_rtsp_display_policy_snapshot: bool,
     wrong_application_display_overrides: bool,
     display_entries: Vec<Value>,
     display_snapshot_ids: Vec<String>,
+    display_snapshot_configuration: Option<Value>,
+    display_configuration_drift: bool,
     display_revision_drift: bool,
     display_snapshot_calls: usize,
+    reject_display_admission: bool,
+    forge_display_admission_hash: bool,
 }
 
 impl Default for Broker {
@@ -1036,14 +1041,19 @@ impl Default for Broker {
             application_catalog_revision: 1,
             rtsp_snapshot: None,
             rtsp_display_policy_snapshot: None,
+            rtsp_display_request: None,
             rtsp_executable_path: None,
             wrong_rtsp_snapshot: false,
             wrong_rtsp_display_policy_snapshot: false,
             wrong_application_display_overrides: false,
             display_entries: Vec::new(),
             display_snapshot_ids: Vec::new(),
+            display_snapshot_configuration: None,
+            display_configuration_drift: false,
             display_revision_drift: false,
             display_snapshot_calls: 0,
+            reject_display_admission: false,
+            forge_display_admission_hash: false,
         }
     }
 }
@@ -1111,14 +1121,18 @@ impl Broker {
                     } else {
                         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     };
+                    let mut configuration = self.display_snapshot_configuration.clone().unwrap_or_else(|| json!({"displays":self.display_snapshot_ids.iter().map(|id| json!({
+                        "id":id,"width":1920,"height":1080,
+                        "refresh":{"numerator":60,"denominator":1},
+                        "x":0,"y":0
+                    })).collect::<Vec<_>>()}));
+                    if self.display_configuration_drift && self.display_snapshot_calls > 1 {
+                        configuration["displays"][0]["width"] = json!(1680);
+                    }
                     json!({
                         "ok":true,
                         "topology_revision":revision,
-                        "configuration":{"displays":self.display_snapshot_ids.iter().map(|id| json!({
-                            "id":id,"width":1920,"height":1080,
-                            "refresh":{"numerator":60,"denominator":1},
-                            "x":0,"y":0
-                        })).collect::<Vec<_>>()}
+                        "configuration":configuration
                     })
                 }
                 "enumerate" => {
@@ -1140,6 +1154,7 @@ impl Broker {
         if service == "amaterasu.rtsp/1" && action == "open" {
             self.rtsp_snapshot = payload.get("frame_limiter_settings").cloned();
             self.rtsp_display_policy_snapshot = payload.get("display_policy_snapshot").cloned();
+            self.rtsp_display_request = payload.get("display_request").cloned();
             self.rtsp_executable_path = payload["frame_limiter_executable_path"]
                 .as_str()
                 .map(str::to_owned);
@@ -1167,6 +1182,30 @@ impl Broker {
             return json!({"ok":false,"code":"ticket_not_found"});
         }
         if service == "amaterasu.launch/1" {
+            if action == "prepare_display_admission" {
+                if self.reject_display_admission {
+                    return json!({"ok":false,"code":"display_admission_denied"});
+                }
+                let mut effective = payload["global_overrides"].as_object().unwrap().clone();
+                effective.extend(payload["application_display_overrides"].as_object().unwrap().clone());
+                effective.extend(payload["client_display_overrides"].as_object().unwrap().clone());
+                return json!({
+                    "ok":true,
+                    "display_admission_token":"ab".repeat(32),
+                    "display_policy_snapshot":{
+                        "catalog_revision":payload["catalog_revision"],
+                        "global_revision":payload["global_revision"],
+                        "global_overrides":payload["global_overrides"],
+                        "certificate_id":payload["certificate_id"],
+                        "application_overrides":payload["application_display_overrides"],
+                        "client_overrides":payload["client_display_overrides"],
+                        "effective_overrides":effective,
+                    },
+                    "application_operation_id":payload["application_operation_id"],
+                    "rtsp_operation_id":payload["rtsp_operation_id"],
+                    "request_sha256":if self.forge_display_admission_hash { json!("00".repeat(32)) } else { payload["request_sha256"].clone() },
+                });
+            }
             if action == "preflight_export" {
                 let launch = self.response(
                     service,
@@ -1316,7 +1355,7 @@ impl Broker {
             } else {
                 self.rtsp_display_policy_snapshot.clone().unwrap_or(Value::Null)
             },
-            "display_request": Value::Null,
+            "display_request": self.rtsp_display_request.clone().unwrap_or(Value::Null),
             "failure": null,
             "cleanup_error": if state == "cleanup_failed" {
                 Value::String("fixture_failure".into())
