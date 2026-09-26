@@ -97,7 +97,12 @@ can call `artwork_get` with a numeric `game_id` to obtain an opaque revision,
 MIME type, and byte count, then `artwork_read` with that ID, revision, and an
 8 KiB aligned offset for base64 chunks. Changed images reject stale revisions;
 paths are never accepted or returned. Disabling Lutris also disables these
-reads. Catalog artwork references and image delivery still require the Catalog
+reads and clears the discovered image source. Re-enabling requires a new scan,
+even when automatic sync is off; a late scan captured under older settings
+cannot publish image sources. Linux reads verify the opened file descriptor's
+resolved target under the discovered data tree and use that same descriptor for
+metadata and bytes. Other platforms fail closed. Catalog artwork references and
+image delivery still require the Catalog
 consumer contract, so imported rows currently contain no artwork.
 
 Other remaining gaps are trusted per-session discovery for machine services,

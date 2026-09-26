@@ -258,6 +258,7 @@ impl LutrisModule {
             return;
         }
         self.observed_settings_epoch = self.settings_epoch;
+        self.artwork.clear();
         self.last_reconciled_source = None;
         self.last_reconciled_at = None;
         let settings = self.configuration.settings();
@@ -276,7 +277,12 @@ impl LutrisModule {
         match result {
             Ok(snapshot) => {
                 self.last_snapshot_games = snapshot.games.len();
-                self.artwork.update(&snapshot);
+                self.artwork.update_if_current(
+                    &snapshot,
+                    settings_epoch,
+                    self.settings_epoch,
+                    self.configuration.settings().enabled,
+                );
                 let signature = SourceSignature::from(&snapshot);
                 if !should_reconcile(
                     &signature,
@@ -594,8 +600,10 @@ mod tests {
     use super::*;
     use crate::discovery::{Game, Snapshot};
     use crate::settings::Exclusion;
+    #[cfg(target_os = "linux")]
     use std::fs::File;
     use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn game(id: i64, runner: &str, service: &str, service_id: &str) -> Game {
@@ -628,6 +636,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn artwork_actions_read_bounded_current_images_without_exposing_paths() {
         let nonce = SystemTime::now()
@@ -667,6 +676,16 @@ mod tests {
             "invalid_cursor"
         );
 
+        let replacement_path = cover.with_extension("replacement");
+        std::fs::write(
+            &replacement_path,
+            [b"\x89PNG\r\n\x1a\n".as_slice(), b"other"].concat(),
+        )
+        .unwrap();
+        std::fs::rename(&replacement_path, &cover).unwrap();
+        let same_size_revision = artwork_response(&store, true, MANAGEMENT_CALLER, 10, None);
+        assert_ne!(same_size_revision["revision"], revision);
+
         std::fs::write(
             &cover,
             [b"\x89PNG\r\n\x1a\n".as_slice(), b"replacement"].concat(),
@@ -702,6 +721,26 @@ mod tests {
             "artwork_unavailable"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn artwork_sources_require_a_current_enabled_scan_after_disable() {
+        let source = snapshot();
+        let mut store = artwork::ArtworkStore::default();
+        store.update_if_current(&source, 3, 3, true);
+        assert!(store.contains_game_for_test(10));
+
+        // A disable clears the source, and a late scan captured before it cannot republish it.
+        store.clear();
+        store.update_if_current(&source, 3, 4, false);
+        assert!(!store.contains_game_for_test(10));
+
+        // Re-enable with auto-sync off still requires a new manual discovery.
+        store.clear();
+        store.update_if_current(&source, 3, 5, true);
+        assert!(!store.contains_game_for_test(10));
+        store.update_if_current(&source, 5, 5, true);
+        assert!(store.contains_game_for_test(10));
     }
 
     fn completed_snapshot_worker(settings: ProductSettings, snapshot: Snapshot) -> SnapshotWorker {

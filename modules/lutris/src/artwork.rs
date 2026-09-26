@@ -19,12 +19,34 @@ pub struct ArtworkStore {
 
 struct ArtworkFile {
     path: PathBuf,
+    file: File,
     revision: String,
     size: u64,
     mime: &'static str,
 }
 
 impl ArtworkStore {
+    #[cfg(test)]
+    pub fn contains_game_for_test(&self, game_id: i64) -> bool {
+        self.slugs.contains_key(&game_id)
+    }
+    pub fn clear(&mut self) {
+        self.lutris_data.clear();
+        self.slugs.clear();
+    }
+
+    pub fn update_if_current(
+        &mut self,
+        snapshot: &Snapshot,
+        captured_epoch: u64,
+        current_epoch: u64,
+        enabled: bool,
+    ) {
+        if enabled && captured_epoch == current_epoch {
+            self.update(snapshot);
+        }
+    }
+
     pub fn update(&mut self, snapshot: &Snapshot) {
         self.lutris_data = snapshot
             .database_path
@@ -54,34 +76,31 @@ impl ArtworkStore {
         {
             return Err("invalid_cursor");
         }
-        let source = self.resolve(game_id)?;
-        if source.revision != revision {
+        let ArtworkFile {
+            path,
+            mut file,
+            revision: current_revision,
+            size,
+            mime,
+        } = self.resolve(game_id)?;
+        if current_revision != revision {
             return Err("artwork_changed");
         }
-        if offset >= source.size {
+        if offset >= size {
             return Err("invalid_cursor");
-        }
-        let mut file = File::open(&source.path).map_err(|_| "artwork_unavailable")?;
-        let opened = file.metadata().map_err(|_| "artwork_unavailable")?;
-        if revision_for(&source.path, &opened) != revision {
-            return Err("artwork_changed");
         }
         file.seek(SeekFrom::Start(offset))
             .map_err(|_| "artwork_unavailable")?;
-        let mut bytes = vec![0; (source.size - offset).min(CHUNK_BYTES) as usize];
+        let mut bytes = vec![0; (size - offset).min(CHUNK_BYTES) as usize];
         file.read_exact(&mut bytes).map_err(|_| "artwork_changed")?;
-        if revision_for(
-            &source.path,
-            &file.metadata().map_err(|_| "artwork_changed")?,
-        ) != revision
-        {
+        if revision_for(&path, &file.metadata().map_err(|_| "artwork_changed")?) != revision {
             return Err("artwork_changed");
         }
         let next = offset + bytes.len() as u64;
         Ok(json!({
             "ok":true,"game_id":game_id,"revision":revision,"offset":offset,
-            "next_offset":(next < source.size).then_some(next),
-            "total_bytes":source.size,"mime_type":source.mime,"data":base64(&bytes)
+            "next_offset":(next < size).then_some(next),
+            "total_bytes":size,"mime_type":mime,"data":base64(&bytes)
         }))
     }
 
@@ -129,28 +148,44 @@ fn valid_revision(revision: &str) -> bool {
 }
 
 fn inspect(path: &Path, root: &Path) -> Option<ArtworkFile> {
-    if !fs::symlink_metadata(path).ok()?.file_type().is_file() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, root);
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        inspect_open_file(path, root, File::open(path).ok()?)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_open_file(path: &Path, root: &Path, mut file: File) -> Option<ArtworkFile> {
+    use std::os::fd::AsRawFd;
+
+    // The descriptor target, not a separately resolved pathname, is the
+    // object whose bytes we will return. Unknown descriptor identity fails closed.
+    let opened_path = fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
+    if !opened_path.starts_with(root) || !fs::symlink_metadata(path).ok()?.file_type().is_file() {
         return None;
     }
-    let path = path.canonicalize().ok()?;
-    if !path.starts_with(root) {
-        return None;
-    }
-    let metadata = fs::metadata(&path).ok()?;
+    let metadata = file.metadata().ok()?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_ARTWORK_BYTES {
         return None;
     }
     let mut header = [0; 12];
-    let count = File::open(&path).ok()?.read(&mut header).ok()?;
+    let count = file.read(&mut header).ok()?;
     let mime = mime(&header[..count])?;
     Some(ArtworkFile {
-        revision: revision_for(&path, &metadata),
+        revision: revision_for(&opened_path, &metadata),
         size: metadata.len(),
-        path,
+        path: opened_path,
+        file,
         mime,
     })
 }
 
+#[cfg(target_os = "linux")]
 fn mime(header: &[u8]) -> Option<&'static str> {
     if header.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
@@ -179,6 +214,21 @@ fn revision_for(path: &Path, metadata: &fs::Metadata) -> String {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(1_099_511_628_211);
     }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for byte in metadata
+            .dev()
+            .to_le_bytes()
+            .into_iter()
+            .chain(metadata.ino().to_le_bytes())
+            .chain(metadata.ctime().to_le_bytes())
+            .chain(metadata.ctime_nsec().to_le_bytes())
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(1_099_511_628_211);
+        }
+    }
     hash.to_string()
 }
 
@@ -203,4 +253,38 @@ fn base64(bytes: &[u8]) -> String {
         });
     }
     result
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn opened_descriptor_outside_allowed_root_is_rejected_after_path_swap() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!("amaterasu-lutris-fd-{nonce}"));
+        let root = parent.join("allowed");
+        fs::create_dir_all(&root).unwrap();
+        let candidate = root.join("cover.png");
+        let outside = parent.join("outside.png");
+        let image = [b"\x89PNG\r\n\x1a\n".as_slice(), b"image"].concat();
+        fs::write(&candidate, &image).unwrap();
+        fs::write(&outside, &image).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        // Model a swap between candidate selection and open: the requested
+        // path still looks valid, but the descriptor points to an outside file.
+        assert!(
+            inspect_open_file(&candidate, &canonical_root, File::open(&outside).unwrap()).is_none()
+        );
+        fs::remove_file(&candidate).unwrap();
+        symlink(&outside, &candidate).unwrap();
+        assert!(inspect(&candidate, &canonical_root).is_none());
+        fs::remove_dir_all(parent).unwrap();
+    }
 }
