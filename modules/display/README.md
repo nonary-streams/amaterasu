@@ -139,6 +139,11 @@ On a multi-monitor desktop they rebuild only that target's requested mode and
 translate untouched source positions for a primary change, while retaining the
 saved source/target modes, timing, scaling, pixel format, and route flags of
 other targets. Full native readback verifies those untouched paths after HDR.
+When the selected target shares an active clone source, its resolved resolution
+and source position apply to the whole clone group. The provider preserves each
+peer's target refresh and timing, places the selected target first in CCD path
+priority for `ensure_primary`, and journals the exact prior clone topology.
+
 `ensure_active` and `ensure_primary` can also activate an inactive physical
 target when QDC reports
 exactly one available free source route for one physical target. The provider
@@ -291,16 +296,16 @@ This implementation uses the classic CCD compatibility view and journals the
 queryable HDR on/off state of active paths. Active HDR can be restored; enforced
 wide-color-gamut state, indirect/virtual/wireless displays, and unsupported or
 incomplete path data remain outside this provider. Virtual-mode/virtual-refresh
-awareness, DPI scaling, color profiles, driver configuration, primary clone-group
-requests, virtual-display drivers, display-stack resets, and broader topology
-transition retries remain unimplemented. After native apply or restore, bounded
-CCD readbacks wait for the exact requested state and reject foreign physical
-routes immediately. Existing clone sources can be remapped and
-restored while keeping each target's refresh, rotation and HDR state. A revisioned
-Apply can add one inactive physical target as a clone of an active source when its
-route is uniquely bound and journaled; detected route drift fails before native
-mutation.
-Arbitrary clone-group reconfiguration remains unsupported. Windows service-session,
+awareness, DPI scaling, color profiles, driver configuration, virtual-display
+drivers, display-stack resets, and broader topology transition retries remain
+unimplemented. After native apply or restore, bounded CCD readbacks wait for the
+exact requested state and reject foreign physical routes immediately. Existing
+clone sources can be remapped and restored while keeping each target's refresh,
+rotation and HDR state. An active clone target can become primary while retaining
+its shared source and peer target state. A revisioned Apply can add one inactive
+physical target as a clone of an active source when its route is uniquely bound
+and journaled; detected route drift fails before native mutation. Arbitrary
+clone-group reconfiguration remains unsupported. Windows service-session,
 privilege, display-driver and HDR hardware behavior still require native acceptance.
 
 The behavioral reference was Vibeshine commit

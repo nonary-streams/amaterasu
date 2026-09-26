@@ -312,6 +312,14 @@ pub fn preserving(
         (None, super::super::TopologyShape::PreserveActive) => {
             preserve_bound(restoration(before)?, configuration, before, selected)
         }
+        (None, super::super::TopologyShape::PrimaryActive) => {
+            let bound = preserve_bound(restoration(before)?, configuration, before, selected)?;
+            promote_primary_path(bound, before, selected)
+        }
+        (Some(_), super::super::TopologyShape::PrimaryActive) => Err(DisplayError::new(
+            "unsupported_topology",
+            "active primary topology cannot bind an inactive route",
+        )),
         (None, super::super::TopologyShape::OnlySelected) => Err(DisplayError::new(
             "unsupported_topology",
             "selected-only inactive topology requires a bound route",
@@ -325,6 +333,26 @@ pub fn preserving(
             "clone activation requires a bound target route",
         )),
     }
+}
+
+pub(super) fn promote_primary_path(
+    mut bound: ConfigurationBuffers,
+    before: &Snapshot,
+    selected: &str,
+) -> DisplayResult<ConfigurationBuffers> {
+    let selected_index = before
+        .paths
+        .iter()
+        .position(|path| path.id.eq_ignore_ascii_case(selected))
+        .ok_or_else(|| {
+            DisplayError::new("unsupported_display", "selected monitor is not active")
+        })?;
+    // CCD active path order gives the first path primary priority. Move only
+    // the selected target; clone peers retain their shared SOURCE index and
+    // their own saved TARGET state.
+    let primary = bound.paths.remove(selected_index);
+    bound.paths.insert(0, primary);
+    Ok(bound)
 }
 
 pub fn bind_clone(

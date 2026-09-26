@@ -444,8 +444,12 @@ fn apply_configuration(
             if let Some(route) = route {
                 verify_activated_route(route, current)?;
             }
-            if let Some((selected, TopologyShape::PreserveActive | TopologyShape::TranslateActive)) =
-                selected
+            if let Some((
+                selected,
+                TopologyShape::PreserveActive
+                | TopologyShape::PrimaryActive
+                | TopologyShape::TranslateActive,
+            )) = selected
                 && !apply::verifies_untouched(configuration, before, current, selected)
             {
                 return Err(DisplayError::new(
@@ -913,6 +917,58 @@ mod tests {
                 selected
             ));
         }
+    }
+
+    #[test]
+    fn active_clone_primary_promotes_selected_path_without_splitting_source() {
+        let first = readback_path("monitor.one", 1920, Some(false));
+        let mut second = readback_path("monitor.two", 1920, Some(false));
+        second.source_name = first.source_name.clone();
+        second.source_address = first.source_address.clone();
+        second.target_address.id = 99;
+        second.scaling = 3;
+        second.refresh.numerator = 75;
+        let mut third = readback_path("monitor.three", 0, Some(false));
+        third.target_address.id = 100;
+        let before = Snapshot {
+            format_version: 1,
+            paths: vec![first, second, third],
+        };
+        let mut configuration = before.configuration().unwrap();
+        for display in &mut configuration.displays {
+            display.x -= 1920;
+        }
+        let bound = apply::preserve_bound(
+            synthetic_bound(&before),
+            &configuration,
+            &before,
+            "monitor.two",
+        )
+        .unwrap();
+        let bound = apply::promote_primary_path(bound, &before, "monitor.two").unwrap();
+        assert_eq!(bound.paths[0].targetInfo.id, 99);
+        assert_eq!(
+            bound.paths[1].targetInfo.id,
+            before.paths[0].target_address.id
+        );
+        assert_eq!(bound.paths[2].targetInfo.id, 100);
+        assert_eq!(
+            bound.paths[0].targetInfo.scaling,
+            DISPLAYCONFIG_SCALING_PREFERRED
+        );
+        assert_eq!(bound.paths[1].targetInfo.scaling, before.paths[0].scaling);
+        assert_eq!(bound.paths[0].targetInfo.refreshRate.Numerator, 75);
+        assert_eq!(
+            unsafe { bound.paths[0].sourceInfo.Anonymous.modeInfoIdx },
+            unsafe { bound.paths[1].sourceInfo.Anonymous.modeInfoIdx }
+        );
+        let index = unsafe { bound.paths[0].sourceInfo.Anonymous.modeInfoIdx } as usize;
+        let source = unsafe { bound.modes[index].Anonymous.sourceMode };
+        assert_eq!(source.position.x, 0);
+        assert_eq!(
+            bound.paths[2].sourceInfo.id,
+            before.paths[2].source_address.id
+        );
     }
 
     #[test]

@@ -488,7 +488,16 @@ impl<P: Platform> Pipeline<P> {
                     ) && snapshot.paths.len() > 1
                     {
                         native_target = mode_policy.as_ref().map(|policy| {
-                            (policy.display_id.clone(), TopologyShape::PreserveActive)
+                            (
+                                policy.display_id.clone(),
+                                if topology_option
+                                    == Some(DisplayConfigurationOption::EnsurePrimary)
+                                {
+                                    TopologyShape::PrimaryActive
+                                } else {
+                                    TopologyShape::PreserveActive
+                                },
+                            )
                         });
                     }
                     if matches!(

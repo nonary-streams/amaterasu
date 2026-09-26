@@ -4,6 +4,7 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TopologyShape {
     PreserveActive,
+    PrimaryActive,
     TranslateActive,
     OnlySelected,
     CloneActive,

@@ -143,6 +143,87 @@ fn selected_clone_mode_policy_updates_shared_source_and_restores_for_either_targ
 }
 
 #[test]
+fn ensure_primary_on_active_clone_translates_shared_source_and_recovers_exact_baseline() {
+    let mut baseline = cloned_snapshot();
+    baseline.paths[0].source.x = 1920;
+    baseline.paths[1].source.x = 1920;
+    baseline.paths[1].refresh.numerator = 75;
+    let mut third = two_display_snapshot().paths.remove(1);
+    third.id = "monitor.three".into();
+    third.source.x = 0;
+    third.source_address.id = 4;
+    third.target_address.id = 5;
+    baseline.paths.push(third);
+    let revision = json!(baseline.revision().unwrap());
+    let mut selected = configuration();
+    selected["displays"][0]["id"] = json!("monitor.two");
+    let mut request = mutating_option_request("ensure_primary", "monitor.two", selected, &revision);
+    request["mode_policy"]["remapping"] =
+        policy("monitor.two", "1600x900", "75")["remapping"].clone();
+    request["mode_policy"]["context"]["optimize_game_settings"] = true.into();
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline.clone()),
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(&mut pipeline, "owner", request.clone());
+    assert_eq!(applied["applied"], true, "{applied}");
+    let prepared = pipeline.platform.prepared_configuration.as_ref().unwrap();
+    assert_eq!(prepared.displays.len(), 3);
+    assert_eq!(prepared.displays[0].x, 0);
+    assert_eq!(prepared.displays[1].x, 0);
+    assert_eq!(prepared.displays[2].x, -1920);
+    assert_eq!(
+        (prepared.displays[0].width, prepared.displays[0].height),
+        (1600, 900)
+    );
+    assert_eq!(
+        (prepared.displays[1].width, prepared.displays[1].height),
+        (1600, 900)
+    );
+    assert_eq!(prepared.displays[1].refresh.numerator, 75);
+    assert_eq!(
+        pipeline.platform.preserving_selected,
+        [
+            "prepare:monitor.two:PrimaryActive",
+            "apply:monitor.two:PrimaryActive"
+        ]
+    );
+    let denied = state.run(
+        &mut pipeline,
+        "foreign",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(denied["error"]["code"], "permission_denied");
+    assert_eq!(pipeline.platform.effects, ["apply"]);
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert_eq!(pipeline.platform.effects, ["apply", "restore"]);
+    assert!(state.journal.is_none());
+
+    let mut stale = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline.clone()),
+            ..Default::default()
+        },
+        true,
+    );
+    let mut old_request = request;
+    old_request["expected_topology_revision"] = json!("00000000000000000000000000000000");
+    let rejected = state.run(&mut stale, "owner", old_request);
+    assert_eq!(rejected["error"]["code"], "topology_changed");
+    assert!(stale.platform.effects.is_empty());
+}
+
+#[test]
 fn conflicting_clone_mode_policies_fail_before_journal_or_native_effect() {
     let baseline = cloned_snapshot();
     let mut state = State::default();
@@ -1006,8 +1087,8 @@ fn ensure_primary_translates_two_monitor_topology_through_preserving_path() {
     assert_eq!(
         pipeline.platform.preserving_selected,
         [
-            "prepare:monitor.two:PreserveActive",
-            "apply:monitor.two:PreserveActive"
+            "prepare:monitor.two:PrimaryActive",
+            "apply:monitor.two:PrimaryActive"
         ]
     );
     let prepared = pipeline.platform.prepared_configuration.as_ref().unwrap();
@@ -1058,8 +1139,8 @@ fn preserving_primary_hotplug_and_partial_failure_keep_exact_recovery_rules() {
         assert_eq!(
             pipeline.platform.preserving_selected,
             [
-                "prepare:monitor.two:PreserveActive",
-                "apply:monitor.two:PreserveActive"
+                "prepare:monitor.two:PrimaryActive",
+                "apply:monitor.two:PrimaryActive"
             ]
         );
         assert!(state.journal.is_none());
