@@ -188,6 +188,10 @@ impl Router {
         self.launches.set_global_frame_limiter_settings(settings);
     }
 
+    pub fn set_global_display_policy(&mut self, revision: u64, policy: serde_json::Value) {
+        self.launches.set_global_display_policy(revision, policy);
+    }
+
     pub fn set_audio_sink_capture_only(&mut self, enabled: bool) {
         self.launches.set_audio_sink_capture_only(enabled);
     }

@@ -924,13 +924,22 @@ fn display_policy_snapshot(record: &Record) -> Value {
         .as_ref()
         .expect("display overrides captured at preflight");
     let client = &record.peer.client_display_overrides;
-    let mut effective = application
+    let mut effective = record
+        .global_display_policy
         .as_object()
-        .expect("application overrides object")
+        .expect("global overrides object")
         .clone();
+    effective.extend(
+        application
+            .as_object()
+            .expect("application overrides object")
+            .clone(),
+    );
     effective.extend(client.as_object().expect("client overrides object").clone());
     json!({
         "catalog_revision":record.application_catalog_revision,
+        "global_revision":record.global_display_revision,
+        "global_overrides":record.global_display_policy,
         "certificate_id":record.peer.certificate_id,
         "application_overrides":application,
         "client_overrides":client,

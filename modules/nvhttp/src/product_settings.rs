@@ -32,9 +32,20 @@ const GLOBAL_PREPARATION_SETTINGS_VERSION: u64 = 16;
 const GLOBAL_RAW_PREPARATION_SETTINGS_VERSION: u64 = 17;
 const FRAME_LIMITER_SETTINGS_VERSION: u64 = 17;
 const ENCRYPTION_MODE_SETTINGS_VERSION: u64 = 17;
+const DISPLAY_POLICY_SETTINGS_VERSION: u64 = 18;
 const DEFAULT_LAN_ENCRYPTION_MODE: u8 = 0;
 const DEFAULT_WAN_ENCRYPTION_MODE: u8 = 1;
-const SETTINGS_VERSION: u64 = GLOBAL_RAW_PREPARATION_SETTINGS_VERSION;
+const SETTINGS_VERSION: u64 = DISPLAY_POLICY_SETTINGS_VERSION;
+const DISPLAY_POLICY_KEYS: [&str; 8] = [
+    "dd_mode_remapping",
+    "dd_resolution_option",
+    "dd_manual_resolution",
+    "dd_refresh_rate_option",
+    "dd_manual_refresh_rate",
+    "dd_hdr_option",
+    "dd_configuration_option",
+    "dd_hdr_request_override",
+];
 const DEFAULT_MINIMUM_FPS_TARGET: f64 = 20.0;
 const DEFAULT_PING_TIMEOUT_MS: u32 = 10_000;
 const MAX_OUTPUT_NAME_BYTES: usize = 512;
@@ -68,10 +79,243 @@ pub(crate) enum AdminAction {
         global_preparation: FieldUpdate<Vec<PreparationStep>>,
         legacy_global_preparation: FieldUpdate<Vec<LegacyPreparationStep>>,
         frame_limiter: FrameLimiterUpdate,
+        display_policy: DisplayPolicyUpdate,
         encryption_modes: EncryptionModeUpdate,
         expected_revision: u64,
         require_listener_apply: bool,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DisplayPolicyUpdate {
+    pub(crate) dd_mode_remapping: FieldUpdate<Value>,
+    pub(crate) dd_resolution_option: FieldUpdate<String>,
+    pub(crate) dd_manual_resolution: FieldUpdate<String>,
+    pub(crate) dd_refresh_rate_option: FieldUpdate<String>,
+    pub(crate) dd_manual_refresh_rate: FieldUpdate<String>,
+    pub(crate) dd_hdr_option: FieldUpdate<String>,
+    pub(crate) dd_configuration_option: FieldUpdate<String>,
+    pub(crate) dd_hdr_request_override: FieldUpdate<String>,
+}
+
+fn empty_display_policy() -> Value {
+    let mut policy = serde_json::Map::new();
+    for key in DISPLAY_POLICY_KEYS {
+        policy.insert(key.into(), Value::Null);
+    }
+    Value::Object(policy)
+}
+
+fn sparse_display_policy(policy: &Value) -> Value {
+    Value::Object(
+        policy
+            .as_object()
+            .expect("display policy object")
+            .iter()
+            .filter(|(_, value)| !value.is_null())
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+fn apply_display_policy_update(
+    update: DisplayPolicyUpdate,
+    current: &Value,
+) -> Result<Value, &'static str> {
+    let mut policy = current.clone();
+    let fields = policy.as_object_mut().expect("display policy object");
+    macro_rules! apply {
+        ($name:ident) => {
+            match update.$name {
+                FieldUpdate::Omitted => {}
+                FieldUpdate::Null => {
+                    fields.insert(stringify!($name).into(), Value::Null);
+                }
+                FieldUpdate::Value(value) => {
+                    fields.insert(stringify!($name).into(), json!(value));
+                }
+            }
+        };
+    }
+    apply!(dd_mode_remapping);
+    apply!(dd_resolution_option);
+    apply!(dd_manual_resolution);
+    apply!(dd_refresh_rate_option);
+    apply!(dd_manual_refresh_rate);
+    apply!(dd_hdr_option);
+    apply!(dd_configuration_option);
+    apply!(dd_hdr_request_override);
+    validate_display_policy_values(&policy)?;
+    Ok(policy)
+}
+
+fn valid_manual_resolution(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    if value.len() > 32 {
+        return false;
+    }
+    let Some((width, height)) = value
+        .replace('×', "x")
+        .split_once('x')
+        .map(|(width, height)| (width.to_owned(), height.to_owned()))
+    else {
+        return false;
+    };
+    [width.as_str(), height.as_str()].iter().all(|part| {
+        !part.is_empty()
+            && part.bytes().all(|byte| byte.is_ascii_digit())
+            && part.parse::<u32>().is_ok_and(|size| size > 0)
+    })
+}
+
+fn valid_manual_refresh(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let mut parts = value.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fractional = parts.next();
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fractional.is_some_and(|fraction| {
+            fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return false;
+    }
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let fraction = fractional.unwrap_or_default().trim_end_matches('0');
+    if fraction.is_empty() {
+        return whole
+            .parse::<u32>()
+            .is_ok_and(|rate| rate > 0 && rate <= 1000);
+    }
+    if fraction.len() > 31 {
+        return false;
+    }
+    let Ok(numerator) = format!("{whole}{fraction}").parse::<u128>() else {
+        return false;
+    };
+    let Some(denominator) = 10_u128.checked_pow(fraction.len() as u32) else {
+        return false;
+    };
+    let mut a = numerator;
+    let mut b = denominator;
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    let numerator = numerator / a;
+    let denominator = denominator / a;
+    numerator > 0
+        && numerator <= u32::MAX as u128
+        && denominator <= u32::MAX as u128
+        && numerator <= 1000 * denominator
+}
+
+fn valid_display_remapping(value: &Value) -> bool {
+    value.as_object().is_some_and(|groups| {
+        groups.iter().all(|(kind, entries)| {
+            matches!(
+                kind.as_str(),
+                "mixed" | "resolution_only" | "refresh_rate_only"
+            ) && entries.as_array().is_some_and(|rules| {
+                rules.len() <= 128 && rules.iter().all(|rule| valid_display_rule(kind, rule))
+            })
+        })
+    })
+}
+
+fn valid_display_rule(kind: &str, rule: &Value) -> bool {
+    let Some(fields) = rule.as_object() else {
+        return false;
+    };
+    if !fields.iter().all(|(name, value)| {
+        matches!(
+            name.as_str(),
+            "requested_resolution" | "requested_fps" | "final_resolution" | "final_refresh_rate"
+        ) && value
+            .as_str()
+            .is_some_and(|text| text.len() <= 64 && !text.chars().any(char::is_control))
+    }) {
+        return false;
+    }
+    let field = |name: &str| fields.get(name).and_then(Value::as_str).unwrap_or("");
+    let requested_resolution = field("requested_resolution");
+    let requested_fps = field("requested_fps");
+    let final_resolution = field("final_resolution");
+    let final_refresh_rate = field("final_refresh_rate");
+    let uses_resolution = kind != "refresh_rate_only";
+    let uses_refresh = kind != "resolution_only";
+    if (!uses_resolution && (!requested_resolution.is_empty() || !final_resolution.is_empty()))
+        || (!uses_refresh && (!requested_fps.is_empty() || !final_refresh_rate.is_empty()))
+        || (uses_resolution
+            && (!valid_manual_resolution(requested_resolution)
+                || !valid_manual_resolution(final_resolution)))
+        || (uses_refresh
+            && (!requested_fps.is_empty()
+                && !requested_fps.bytes().all(|byte| byte.is_ascii_digit())
+                || (!requested_fps.is_empty() && requested_fps.parse::<u32>().is_err())
+                || !valid_manual_refresh(final_refresh_rate)))
+    {
+        return false;
+    }
+    (uses_resolution && !final_resolution.is_empty())
+        || (uses_refresh && !final_refresh_rate.is_empty())
+}
+
+fn validate_display_policy_values(policy: &Value) -> Result<(), &'static str> {
+    let fields = policy.as_object().ok_or("invalid_display_policy")?;
+    if fields.len() != DISPLAY_POLICY_KEYS.len()
+        || DISPLAY_POLICY_KEYS
+            .iter()
+            .any(|key| !fields.contains_key(*key))
+    {
+        return Err("invalid_display_policy");
+    }
+    let valid_choice = |key: &str, choices: &[&str]| {
+        fields[key].is_null()
+            || fields[key]
+                .as_str()
+                .is_some_and(|value| choices.contains(&value))
+    };
+    if !valid_choice("dd_resolution_option", &["auto", "disabled", "manual"])
+        || !valid_choice(
+            "dd_refresh_rate_option",
+            &["auto", "disabled", "manual", "prefer_highest"],
+        )
+        || !valid_choice("dd_hdr_option", &["auto", "disabled"])
+        || !valid_choice(
+            "dd_configuration_option",
+            &[
+                "disabled",
+                "verify_only",
+                "ensure_active",
+                "ensure_primary",
+                "ensure_only_display",
+            ],
+        )
+        || !valid_choice(
+            "dd_hdr_request_override",
+            &["auto", "force_on", "force_off"],
+        )
+        || (!fields["dd_manual_resolution"].is_null()
+            && !fields["dd_manual_resolution"]
+                .as_str()
+                .is_some_and(valid_manual_resolution))
+        || (!fields["dd_manual_refresh_rate"].is_null()
+            && !fields["dd_manual_refresh_rate"]
+                .as_str()
+                .is_some_and(valid_manual_refresh))
+        || (!fields["dd_mode_remapping"].is_null()
+            && !valid_display_remapping(&fields["dd_mode_remapping"]))
+    {
+        return Err("invalid_display_policy");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -152,6 +396,7 @@ struct UpdatePurpose {
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
     frame_limiter: FrameLimiterSettings,
+    display_policy: Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
     expected_revision: u64,
@@ -197,6 +442,7 @@ struct ProductDocument {
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
     frame_limiter: FrameLimiterSettings,
+    display_policy: Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
 }
@@ -218,6 +464,7 @@ struct ProductStreamingSettings {
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
     frame_limiter: FrameLimiterSettings,
+    display_policy: Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
 }
@@ -272,6 +519,7 @@ pub struct ProductSettings {
     configured_global_preparation: Vec<PreparationStep>,
     configured_legacy_global_preparation: Vec<LegacyPreparationStep>,
     configured_frame_limiter: FrameLimiterSettings,
+    configured_display_policy: Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
     stream_audio: bool,
@@ -377,6 +625,7 @@ impl ProductSettings {
             configured_global_preparation: Vec::new(),
             configured_legacy_global_preparation: Vec::new(),
             configured_frame_limiter: FrameLimiterSettings::default(),
+            configured_display_policy: empty_display_policy(),
             lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
             wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
             stream_audio: true,
@@ -782,6 +1031,15 @@ impl ProductSettings {
         self.loaded.then_some(self.revision)
     }
 
+    pub fn display_policy_snapshot(&self) -> Option<(u64, Value)> {
+        self.loaded.then(|| {
+            (
+                self.revision,
+                sparse_display_policy(&self.configured_display_policy),
+            )
+        })
+    }
+
     pub fn last_error(&self) -> Option<&str> {
         self.listener_error
             .as_deref()
@@ -1003,6 +1261,7 @@ impl ProductSettings {
                 global_preparation,
                 legacy_global_preparation,
                 frame_limiter,
+                display_policy,
                 encryption_modes,
                 expected_revision,
                 require_listener_apply,
@@ -1196,6 +1455,19 @@ impl ProductSettings {
                         return;
                     }
                 };
+                let display_policy = match apply_display_policy_update(
+                    display_policy,
+                    &self.configured_display_policy,
+                ) {
+                    Ok(policy) => policy,
+                    Err(code) => {
+                        self.queue_completion(
+                            request.request,
+                            failure(code, "display policy is invalid"),
+                        );
+                        return;
+                    }
+                };
                 let lan_encryption_mode = match apply_encryption_mode_update(
                     encryption_modes.lan_encryption_mode,
                     self.lan_encryption_mode,
@@ -1304,6 +1576,7 @@ impl ProductSettings {
                             global_preparation: global_preparation.clone(),
                             legacy_global_preparation: legacy_global_preparation.clone(),
                             frame_limiter: frame_limiter.clone(),
+                            display_policy: display_policy.clone(),
                             lan_encryption_mode,
                             wan_encryption_mode,
                         },
@@ -1330,6 +1603,7 @@ impl ProductSettings {
                         global_preparation,
                         legacy_global_preparation,
                         frame_limiter,
+                        display_policy,
                         lan_encryption_mode,
                         wan_encryption_mode,
                         expected_revision,
@@ -1459,6 +1733,7 @@ impl ProductSettings {
                     global_preparation,
                     legacy_global_preparation,
                     frame_limiter,
+                    display_policy,
                     lan_encryption_mode,
                     wan_encryption_mode,
                     expected_revision,
@@ -1486,6 +1761,7 @@ impl ProductSettings {
                             global_preparation: &global_preparation,
                             legacy_global_preparation: &legacy_global_preparation,
                             frame_limiter: &frame_limiter,
+                            display_policy: &display_policy,
                             lan_encryption_mode,
                             wan_encryption_mode,
                         };
@@ -1699,6 +1975,8 @@ impl ProductSettings {
     }
 
     fn validate_document(&self, document: &ProductDocument) -> Result<(), SettingFailure> {
+        validate_display_policy_values(&document.display_policy)
+            .map_err(|_| invalid_state("persisted display policy is invalid"))?;
         if document
             .output_name
             .as_deref()
@@ -1802,6 +2080,7 @@ impl ProductSettings {
         self.configured_global_preparation = document.global_preparation;
         self.configured_legacy_global_preparation = document.legacy_global_preparation;
         self.configured_frame_limiter = document.frame_limiter;
+        self.configured_display_policy = document.display_policy;
         self.lan_encryption_mode = document.lan_encryption_mode;
         self.wan_encryption_mode = document.wan_encryption_mode;
         self.loaded = true;
@@ -1834,6 +2113,10 @@ impl ProductSettings {
                 "configured_legacy_global_preparation":self.configured_legacy_global_preparation,
                 "configured_frame_limiter":self.configured_frame_limiter,
                 "effective_frame_limiter":self.configured_frame_limiter.effective(),
+            }),
+            json!({
+                "configured_display_policy":sparse_display_policy(&self.configured_display_policy),
+                "display_policy_revision":self.revision,
             }),
             json!({
                 "lan_encryption_mode":self.lan_encryption_mode,
@@ -1955,6 +2238,16 @@ fn product_update_payload(
         "lan_encryption_mode":streaming.lan_encryption_mode,
         "wan_encryption_mode":streaming.wan_encryption_mode,
     });
+    values
+        .as_object_mut()
+        .expect("product settings values")
+        .extend(
+            streaming
+                .display_policy
+                .as_object()
+                .expect("display policy values")
+                .clone(),
+        );
     let frame_limiter_values =
         serde_json::to_value(streaming.frame_limiter).expect("frame-limiter settings serialize");
     values
@@ -2066,6 +2359,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             global_preparation: Vec::new(),
             legacy_global_preparation: Vec::new(),
             frame_limiter: FrameLimiterSettings::default(),
+            display_policy: empty_display_policy(),
             lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
             wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
         });
@@ -2094,6 +2388,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | VIRTUAL_SINK_SETTINGS_VERSION
             | GLOBAL_PREPARATION_SETTINGS_VERSION
             | GLOBAL_RAW_PREPARATION_SETTINGS_VERSION
+            | DISPLAY_POLICY_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -2118,6 +2413,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         VIRTUAL_SINK_SETTINGS_VERSION => 16,
         GLOBAL_PREPARATION_SETTINGS_VERSION => 17,
         GLOBAL_RAW_PREPARATION_SETTINGS_VERSION => 32,
+        DISPLAY_POLICY_SETTINGS_VERSION => 40,
         _ => unreachable!(),
     };
     let matches_expected_value_count = values.len() == expected_value_count
@@ -2153,6 +2449,10 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         || (version >= ENCRYPTION_MODE_SETTINGS_VERSION
             && (!values.contains_key("lan_encryption_mode")
                 || !values.contains_key("wan_encryption_mode")))
+        || (version >= DISPLAY_POLICY_SETTINGS_VERSION
+            && DISPLAY_POLICY_KEYS
+                .iter()
+                .any(|key| !values.contains_key(*key)))
     {
         return Err(invalid_state(
             "product settings contain unknown or missing values",
@@ -2389,6 +2689,18 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     frame_limiter
         .validate()
         .map_err(|_| invalid_state("persisted frame-limiter settings are invalid"))?;
+    let display_policy = if version >= DISPLAY_POLICY_SETTINGS_VERSION {
+        let mut policy = serde_json::Map::new();
+        for key in DISPLAY_POLICY_KEYS {
+            policy.insert(key.to_owned(), values[key].clone());
+        }
+        let policy = Value::Object(policy);
+        validate_display_policy_values(&policy)
+            .map_err(|_| invalid_state("persisted display policy is invalid"))?;
+        policy
+    } else {
+        empty_display_policy()
+    };
     let lan_encryption_mode = persisted_encryption_mode(
         values,
         version,
@@ -2423,6 +2735,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         global_preparation,
         legacy_global_preparation,
         frame_limiter,
+        display_policy,
         lan_encryption_mode,
         wan_encryption_mode,
     })
@@ -2449,6 +2762,7 @@ struct UpdateExpectation<'a> {
     global_preparation: &'a [PreparationStep],
     legacy_global_preparation: &'a [LegacyPreparationStep],
     frame_limiter: &'a FrameLimiterSettings,
+    display_policy: &'a Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
 }
@@ -2461,7 +2775,7 @@ fn update_result(
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
-        return Err(invalid_state("product_update did not confirm v17 settings"));
+        return Err(invalid_state("product_update did not confirm v18 settings"));
     }
     let document = parse_document(payload)?;
     if document.hostname.as_deref() != Some(expected.hostname)
@@ -2484,6 +2798,7 @@ fn update_result(
         || document.global_preparation != expected.global_preparation
         || document.legacy_global_preparation != expected.legacy_global_preparation
         || &document.frame_limiter != expected.frame_limiter
+        || &document.display_policy != expected.display_policy
         || document.lan_encryption_mode != expected.lan_encryption_mode
         || document.wan_encryption_mode != expected.wan_encryption_mode
         || expected.revision.checked_add(1) != Some(document.revision)
@@ -2850,7 +3165,169 @@ mod tests {
         values
             .entry("nvenc_spatial_aq")
             .or_insert_with(|| json!(false));
+        for key in DISPLAY_POLICY_KEYS {
+            values.entry(key.to_owned()).or_insert(Value::Null);
+        }
         payload
+    }
+
+    fn display_update_action(
+        display_policy: DisplayPolicyUpdate,
+        expected_revision: u64,
+    ) -> AdminAction {
+        AdminAction::Update {
+            hostname: "Host".into(),
+            port: settings::DEFAULT_PORT,
+            address_family: FieldUpdate::Omitted,
+            bind_address: FieldUpdate::Omitted,
+            output_name: FieldUpdate::Omitted,
+            audio_sink: FieldUpdate::Omitted,
+            virtual_sink: FieldUpdate::Omitted,
+            audio_sink_capture_only: FieldUpdate::Omitted,
+            nvenc_spatial_aq: FieldUpdate::Omitted,
+            external_ip: FieldUpdate::Omitted,
+            stream_audio: FieldUpdate::Omitted,
+            capture: FieldUpdate::Omitted,
+            video_max_batch_size_kb: FieldUpdate::Omitted,
+            max_bitrate: FieldUpdate::Omitted,
+            minimum_fps_target: FieldUpdate::Omitted,
+            wgc_pacing_smoothing: FieldUpdate::Omitted,
+            ping_timeout_ms: FieldUpdate::Omitted,
+            global_preparation: FieldUpdate::Omitted,
+            legacy_global_preparation: FieldUpdate::Omitted,
+            frame_limiter: FrameLimiterUpdate::default(),
+            display_policy,
+            encryption_modes: EncryptionModeUpdate::default(),
+            expected_revision,
+            require_listener_apply: false,
+        }
+    }
+
+    fn display_v18_document(revision: u64) -> Value {
+        v17_update_confirmation(json!({
+            "ok":true,"found":true,"version":SETTINGS_VERSION,"revision":revision,
+            "values":{"hostname":"Host","port":settings::DEFAULT_PORT,
+                "address_family":null,"bind_address":null,"output_name":null,
+                "audio_sink":null,"virtual_sink":null,"external_ip":null,
+                "stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,
+                "max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,
+                "ping_timeout_ms":null,"audio_sink_capture_only":false,
+                "global_preparation":[]}
+        }))
+    }
+
+    #[test]
+    fn global_display_fields_use_v18_cas_and_survive_restart() {
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(parse_document(&display_v18_document(7)).unwrap());
+        product
+            .enqueue(
+                51,
+                5_000,
+                display_update_action(
+                    DisplayPolicyUpdate {
+                        dd_resolution_option: FieldUpdate::Value("manual".into()),
+                        dd_manual_resolution: FieldUpdate::Value("1920x1080".into()),
+                        dd_refresh_rate_option: FieldUpdate::Value("manual".into()),
+                        dd_manual_refresh_rate: FieldUpdate::Value("59.94".into()),
+                        dd_hdr_option: FieldUpdate::Value("disabled".into()),
+                        dd_configuration_option: FieldUpdate::Value("verify_only".into()),
+                        dd_hdr_request_override: FieldUpdate::Value("force_off".into()),
+                        dd_mode_remapping: FieldUpdate::Value(json!({"mixed":[{
+                            "final_resolution":"1280x720","final_refresh_rate":"60"
+                        }]})),
+                    },
+                    7,
+                ),
+            )
+            .unwrap();
+        product.start_next();
+        let pending = product.pending.take().unwrap();
+        assert_eq!(pending.payload["version"], 18);
+        assert_eq!(pending.payload["expected_revision"], 7);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 40);
+        let write = pending.payload["values"].clone();
+        let response = json!({"ok":true,"found":true,"version":18,"revision":8,"values":write});
+        product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
+        assert_eq!(product.display_policy_snapshot().unwrap().0, 8);
+        assert_eq!(
+            product.settings_payload()["configured_display_policy"]["dd_manual_refresh_rate"],
+            "59.94"
+        );
+        let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        restarted.apply_document(parse_document(&response).unwrap());
+        assert_eq!(
+            restarted.display_policy_snapshot(),
+            product.display_policy_snapshot()
+        );
+
+        product
+            .enqueue(
+                52,
+                5_000,
+                display_update_action(
+                    DisplayPolicyUpdate {
+                        dd_refresh_rate_option: FieldUpdate::Null,
+                        ..DisplayPolicyUpdate::default()
+                    },
+                    8,
+                ),
+            )
+            .unwrap();
+        product.start_next();
+        let pending = product.pending.take().unwrap();
+        assert!(pending.payload["values"]["dd_refresh_rate_option"].is_null());
+        assert_eq!(
+            pending.payload["values"]["dd_manual_resolution"],
+            "1920x1080"
+        );
+    }
+
+    #[test]
+    fn malformed_global_display_values_fail_before_a_cas_write() {
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(parse_document(&display_v18_document(7)).unwrap());
+        for (index, invalid) in [
+            DisplayPolicyUpdate {
+                dd_refresh_rate_option: FieldUpdate::Value("unknown".into()),
+                ..Default::default()
+            },
+            DisplayPolicyUpdate {
+                dd_manual_resolution: FieldUpdate::Value("bad".into()),
+                ..Default::default()
+            },
+            DisplayPolicyUpdate {
+                dd_manual_refresh_rate: FieldUpdate::Value("0.0000000001".into()),
+                ..Default::default()
+            },
+            DisplayPolicyUpdate {
+                dd_mode_remapping: FieldUpdate::Value(json!({"mixed":[{}]})),
+                ..Default::default()
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            product
+                .enqueue(60 + index as u64, 5_000, display_update_action(invalid, 7))
+                .unwrap();
+            product.start_next();
+            assert!(product.pending.is_none());
+            assert_eq!(product.revision(), Some(7));
+            assert_eq!(
+                product.completions.pop_front().unwrap().payload["code"],
+                "invalid_display_policy"
+            );
+        }
+        let mut invalid = display_v18_document(7);
+        invalid["values"]["dd_hdr_option"] = json!("force_on");
+        assert!(parse_document(&invalid).is_err());
+        invalid = display_v18_document(7);
+        invalid["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dd_hdr_option");
+        assert!(parse_document(&invalid).is_err());
     }
 
     fn bootstrap_with_capture_output(output: &str) -> Settings {
@@ -3471,6 +3948,7 @@ mod tests {
             &target,
             None,
             ProductStreamingSettings {
+                display_policy: empty_display_policy(),
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
@@ -3507,6 +3985,7 @@ mod tests {
                 72,
                 5_000,
                 AdminAction::Update {
+                    display_policy: DisplayPolicyUpdate::default(),
                     hostname: "Host".into(),
                     port: settings::DEFAULT_PORT,
                     address_family: FieldUpdate::Omitted,
@@ -3655,6 +4134,7 @@ mod tests {
             },
             None,
             ProductStreamingSettings {
+                display_policy: empty_display_policy(),
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
@@ -3704,6 +4184,7 @@ mod tests {
                     request,
                     5_000,
                     AdminAction::Update {
+                        display_policy: DisplayPolicyUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -3806,6 +4287,7 @@ mod tests {
                 41,
                 5_000,
                 AdminAction::Update {
+                    display_policy: DisplayPolicyUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -3878,6 +4360,7 @@ mod tests {
                 41,
                 5_000,
                 AdminAction::Update {
+                    display_policy: DisplayPolicyUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -3949,6 +4432,7 @@ mod tests {
                     request,
                     5_000,
                     AdminAction::Update {
+                        display_policy: DisplayPolicyUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -4031,6 +4515,7 @@ mod tests {
                     request,
                     5_000,
                     AdminAction::Update {
+                        display_policy: DisplayPolicyUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -4218,7 +4703,9 @@ mod tests {
             bind_address: None,
         };
         let default_frame_limiter = FrameLimiterSettings::default();
+        let expected_display_policy = empty_display_policy();
         let expected = UpdateExpectation {
+            display_policy: &expected_display_policy,
             revision: 3,
             hostname: "New Host",
             target: &target,
@@ -4390,6 +4877,7 @@ mod tests {
             },
             None,
             ProductStreamingSettings {
+                display_policy: empty_display_policy(),
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
@@ -4410,7 +4898,7 @@ mod tests {
             },
         );
         assert_eq!(update["version"], SETTINGS_VERSION);
-        assert_eq!(update["values"].as_object().unwrap().len(), 32);
+        assert_eq!(update["values"].as_object().unwrap().len(), 40);
         assert_eq!(update["values"]["nvenc_spatial_aq"], false);
         assert_eq!(
             update["values"]["global_preparation"]
@@ -4449,6 +4937,7 @@ mod tests {
             },
             None,
             ProductStreamingSettings {
+                display_policy: empty_display_policy(),
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
@@ -4521,6 +5010,10 @@ mod tests {
         );
 
         let mut old_v17 = reply.clone();
+        old_v17["version"] = json!(GLOBAL_RAW_PREPARATION_SETTINGS_VERSION);
+        for key in DISPLAY_POLICY_KEYS {
+            old_v17["values"].as_object_mut().unwrap().remove(key);
+        }
         old_v17["values"]
             .as_object_mut()
             .unwrap()
@@ -4567,6 +5060,7 @@ mod tests {
             &NetworkTarget::from(settings::DEFAULT_PORT),
             None,
             ProductStreamingSettings {
+                display_policy: empty_display_policy(),
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
@@ -4605,6 +5099,7 @@ mod tests {
             &target,
             None,
             ProductStreamingSettings {
+                display_policy: empty_display_policy(),
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
@@ -4639,6 +5134,7 @@ mod tests {
                 71,
                 5_000,
                 AdminAction::Update {
+                    display_policy: DisplayPolicyUpdate::default(),
                     hostname: "Host".into(),
                     port: settings::DEFAULT_PORT,
                     address_family: FieldUpdate::Omitted,
@@ -4807,6 +5303,10 @@ mod tests {
                     },
                 }),
                 json!({
+                    "configured_display_policy":{},
+                    "display_policy_revision":3,
+                }),
+                json!({
                     "lan_encryption_mode":0,
                     "wan_encryption_mode":1,
                     "audio_sink_capture_only":false,
@@ -4915,6 +5415,7 @@ mod tests {
 
         settings.finish_call(
             Purpose::Update(Box::new(UpdatePurpose {
+                display_policy: empty_display_policy(),
                 request: 12,
                 hostname: "New Host".into(),
                 target: NetworkTarget {
@@ -4985,6 +5486,7 @@ mod tests {
         );
         settings.finish_call(
             Purpose::Update(Box::new(UpdatePurpose {
+                display_policy: empty_display_policy(),
                 request: 12,
                 hostname: "New Host".into(),
                 target: NetworkTarget {
@@ -5168,6 +5670,7 @@ mod tests {
 
         product.finish_call(
             Purpose::Update(Box::new(UpdatePurpose {
+                display_policy: empty_display_policy(),
                 request: 21,
                 hostname: "Host".into(),
                 target: NetworkTarget {
@@ -5287,6 +5790,7 @@ mod tests {
                     41,
                     5_000,
                     AdminAction::Update {
+                        display_policy: DisplayPolicyUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -5426,6 +5930,7 @@ mod tests {
                     revision + 10,
                     5_000,
                     AdminAction::Update {
+                        display_policy: DisplayPolicyUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -5526,6 +6031,7 @@ mod tests {
             },
             None,
             ProductStreamingSettings {
+                display_policy: empty_display_policy(),
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
@@ -5565,6 +6071,7 @@ mod tests {
             },
             Some("stable-display-id"),
             ProductStreamingSettings {
+                display_policy: empty_display_policy(),
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
@@ -5648,6 +6155,7 @@ mod tests {
                     request,
                     5_000,
                     AdminAction::Update {
+                        display_policy: DisplayPolicyUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -5724,6 +6232,7 @@ mod tests {
                 7,
                 5_000,
                 AdminAction::Update {
+                    display_policy: DisplayPolicyUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -5771,6 +6280,7 @@ mod tests {
                 8,
                 5_000,
                 AdminAction::Update {
+                    display_policy: DisplayPolicyUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -5821,6 +6331,7 @@ mod tests {
                 11,
                 5_000,
                 AdminAction::Update {
+                    display_policy: DisplayPolicyUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,

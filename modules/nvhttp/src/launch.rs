@@ -431,6 +431,8 @@ pub struct Controller {
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
     global_frame_limiter_settings: FrameLimiterSettings,
+    global_display_revision: Option<u64>,
+    global_display_policy: Value,
     global_audio_sink_capture_only: bool,
     configured_capture: CaptureMode,
     output_settings_ready: bool,
@@ -464,6 +466,8 @@ impl Controller {
             global_preparation: Vec::new(),
             legacy_global_preparation: Vec::new(),
             global_frame_limiter_settings: FrameLimiterSettings::default(),
+            global_display_revision: None,
+            global_display_policy: json!({}),
             global_audio_sink_capture_only: false,
             configured_capture: CaptureMode::Auto,
             output_settings_ready: true,
@@ -510,6 +514,11 @@ impl Controller {
 
     pub fn set_global_frame_limiter_settings(&mut self, settings: &FrameLimiterSettings) {
         self.global_frame_limiter_settings = settings.clone();
+    }
+
+    pub fn set_global_display_policy(&mut self, revision: u64, policy: Value) {
+        self.global_display_revision = Some(revision);
+        self.global_display_policy = policy;
     }
 
     pub fn set_audio_sink_capture_only(&mut self, enabled: bool) {
@@ -657,7 +666,7 @@ impl Controller {
             Ok(value) => value,
             Err(code) => return Some(private_error(503, code)),
         };
-        let record = Record::new(
+        let mut record = Record::new(
             id,
             peer,
             request,
@@ -688,6 +697,8 @@ impl Controller {
             connection,
             now + INITIAL_DEADLINE,
         );
+        record.global_display_revision = self.global_display_revision;
+        record.global_display_policy = self.global_display_policy.clone();
         self.records.insert(id, record);
         None
     }

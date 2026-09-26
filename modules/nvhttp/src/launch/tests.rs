@@ -2613,7 +2613,60 @@ fn paired_client_display_policy_overrides_application_fields_without_global_defa
             .get("dd_resolution_option")
             .is_none()
     );
-    assert!(snapshot.get("global_overrides").is_none());
+    assert_eq!(snapshot["global_overrides"], json!({}));
+    assert!(snapshot["global_revision"].is_null());
+    assert!(
+        opened_rtsp_payload(&broker)
+            .get("display_request")
+            .is_none()
+    );
+}
+
+#[test]
+fn global_display_policy_is_frozen_and_resolves_below_application_and_client() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_display_policy(
+        17,
+        json!({
+            "dd_refresh_rate_option":"auto",
+            "dd_hdr_option":"disabled"
+        }),
+    );
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({"dd_refresh_rate_option":"manual"})),
+        ..Broker::default()
+    };
+    let certificate = vec![16; 32];
+    let paired = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            "client-16".into(),
+            fingerprint(&certificate),
+            ClientConfigOverrides {
+                dd_hdr_option: Some("auto".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(controller.launch(10, request(16), paired, now).is_none());
+    controller.set_global_display_policy(18, json!({"dd_refresh_rate_option":"disabled"}));
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let snapshot = &opened_rtsp_payload(&broker)["display_policy_snapshot"];
+    assert_eq!(snapshot["global_revision"], 17);
+    assert_eq!(
+        snapshot["global_overrides"],
+        json!({
+            "dd_refresh_rate_option":"auto", "dd_hdr_option":"disabled"
+        })
+    );
+    assert_eq!(
+        snapshot["effective_overrides"],
+        json!({
+            "dd_refresh_rate_option":"manual", "dd_hdr_option":"auto"
+        })
+    );
     assert!(
         opened_rtsp_payload(&broker)
             .get("display_request")

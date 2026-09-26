@@ -62,6 +62,8 @@ pub struct Record {
     pub application_preflight_overrides: Option<ApplicationConfigOverrides>,
     /// Sparse application display fields frozen at preflight for launch readback.
     pub application_display_overrides: Option<Value>,
+    pub global_display_revision: Option<u64>,
+    pub global_display_policy: Value,
     pub display_policy_snapshot: Option<Value>,
     /// Authorized complete display request, absent until admission supplies all facts.
     pub display_request: Option<Value>,
@@ -182,6 +184,8 @@ impl Record {
             application_frame_limiter_settings: FrameLimiterSettings::default(),
             application_preflight_overrides: None,
             application_display_overrides: None,
+            global_display_revision: None,
+            global_display_policy: serde_json::json!({}),
             display_policy_snapshot: None,
             display_request: None,
             application_preflight_token: None,

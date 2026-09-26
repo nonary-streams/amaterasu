@@ -16,11 +16,11 @@ use launch::CaptureMode;
 use network_settings::NetworkSettings;
 use preparation::LegacyPreparationStep;
 use product_settings::{
-    AdminAction, EncryptionModeUpdate, FieldUpdate, FrameLimiterUpdate, NetworkTarget,
-    ProductSettings,
+    AdminAction, DisplayPolicyUpdate, EncryptionModeUpdate, FieldUpdate, FrameLimiterUpdate,
+    NetworkTarget, ProductSettings,
 };
 use serde::{Deserialize, Deserializer};
-use serde_json::json;
+use serde_json::{Value, json};
 use settings::Settings;
 use std::time::{Duration, Instant};
 
@@ -93,6 +93,22 @@ enum Operation {
         bind_address: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         output_name: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        dd_mode_remapping: FieldUpdate<Value>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        dd_resolution_option: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        dd_manual_resolution: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        dd_refresh_rate_option: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        dd_manual_refresh_rate: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        dd_hdr_option: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        dd_configuration_option: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        dd_hdr_request_override: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         audio_sink: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
@@ -277,6 +293,9 @@ impl ManagedModule for NvhttpModule {
             router.set_global_frame_limiter_settings(
                 self.product_settings.configured_frame_limiter(),
             );
+            if let Some((revision, policy)) = self.product_settings.display_policy_snapshot() {
+                router.set_global_display_policy(revision, policy);
+            }
             router.set_audio_sink_capture_only(self.product_settings.audio_sink_capture_only());
             router.set_global_stream_audio(self.product_settings.stream_audio());
             router.set_global_video_encryption_modes(
@@ -536,6 +555,14 @@ impl NvhttpModule {
                                 address_family,
                                 bind_address,
                                 output_name,
+                                dd_mode_remapping,
+                                dd_resolution_option,
+                                dd_manual_resolution,
+                                dd_refresh_rate_option,
+                                dd_manual_refresh_rate,
+                                dd_hdr_option,
+                                dd_configuration_option,
+                                dd_hdr_request_override,
                                 audio_sink,
                                 virtual_sink,
                                 audio_sink_capture_only,
@@ -586,6 +613,16 @@ impl NvhttpModule {
                                     address_family,
                                     bind_address,
                                     output_name,
+                                    display_policy: DisplayPolicyUpdate {
+                                        dd_mode_remapping,
+                                        dd_resolution_option,
+                                        dd_manual_resolution,
+                                        dd_refresh_rate_option,
+                                        dd_manual_refresh_rate,
+                                        dd_hdr_option,
+                                        dd_configuration_option,
+                                        dd_hdr_request_override,
+                                    },
                                     audio_sink,
                                     virtual_sink,
                                     audio_sink_capture_only,
@@ -920,6 +957,74 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn signed_display_updates_preserve_sparse_omission_null_and_values() {
+        let base = json!({"action":"settings_update","hostname":"Host",
+            "port":47989,"expected_revision":7});
+        let Operation::SettingsUpdate {
+            dd_mode_remapping: omitted_remapping,
+            dd_refresh_rate_option: omitted_refresh,
+            ..
+        } = serde_json::from_value(base.clone()).unwrap()
+        else {
+            panic!("settings update");
+        };
+        assert_eq!(omitted_remapping, FieldUpdate::Omitted);
+        assert_eq!(omitted_refresh, FieldUpdate::Omitted);
+
+        let mut reset = base.clone();
+        reset["dd_mode_remapping"] = Value::Null;
+        reset["dd_refresh_rate_option"] = Value::Null;
+        let Operation::SettingsUpdate {
+            dd_mode_remapping: reset_remapping,
+            dd_refresh_rate_option: reset_refresh,
+            ..
+        } = serde_json::from_value(reset).unwrap()
+        else {
+            panic!("settings update");
+        };
+        assert_eq!(reset_remapping, FieldUpdate::Null);
+        assert_eq!(reset_refresh, FieldUpdate::Null);
+
+        let mut selected = base;
+        selected["dd_mode_remapping"] = json!({"mixed":[]});
+        selected["dd_resolution_option"] = json!("manual");
+        selected["dd_manual_resolution"] = json!("1920x1080");
+        selected["dd_refresh_rate_option"] = json!("manual");
+        selected["dd_manual_refresh_rate"] = json!("59.94");
+        selected["dd_hdr_option"] = json!("disabled");
+        selected["dd_configuration_option"] = json!("verify_only");
+        selected["dd_hdr_request_override"] = json!("force_off");
+        let Operation::SettingsUpdate {
+            dd_mode_remapping,
+            dd_resolution_option,
+            dd_manual_resolution,
+            dd_refresh_rate_option,
+            dd_manual_refresh_rate,
+            dd_hdr_option,
+            dd_configuration_option,
+            dd_hdr_request_override,
+            ..
+        } = serde_json::from_value(selected).unwrap()
+        else {
+            panic!("settings update");
+        };
+        assert_eq!(dd_mode_remapping, FieldUpdate::Value(json!({"mixed":[]})));
+        assert_eq!(dd_resolution_option, FieldUpdate::Value("manual".into()));
+        assert_eq!(dd_manual_resolution, FieldUpdate::Value("1920x1080".into()));
+        assert_eq!(dd_refresh_rate_option, FieldUpdate::Value("manual".into()));
+        assert_eq!(dd_manual_refresh_rate, FieldUpdate::Value("59.94".into()));
+        assert_eq!(dd_hdr_option, FieldUpdate::Value("disabled".into()));
+        assert_eq!(
+            dd_configuration_option,
+            FieldUpdate::Value("verify_only".into())
+        );
+        assert_eq!(
+            dd_hdr_request_override,
+            FieldUpdate::Value("force_off".into())
+        );
     }
 
     #[test]
