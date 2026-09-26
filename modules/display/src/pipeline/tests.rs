@@ -475,6 +475,19 @@ fn reordered_readback_rejects_duplicate_identity() {
     assert!(!before.equivalent(&readback));
 }
 
+#[test]
+fn exact_restore_rejects_changed_path_flags_and_output_technology() {
+    let baseline = two_display_snapshot();
+    for change in 0..2 {
+        let mut readback = baseline.clone();
+        match change {
+            0 => readback.paths[1].path_flags ^= 2,
+            _ => readback.paths[1].output_technology += 1,
+        }
+        assert!(!baseline.equivalent(&readback));
+    }
+}
+
 #[derive(Default)]
 struct State {
     revision: u64,

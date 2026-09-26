@@ -491,6 +491,8 @@ impl Snapshot {
                         && left.scaling == right.scaling
                         && left.refresh.equivalent(right.refresh)
                         && left.scan_line_ordering == right.scan_line_ordering
+                        && left.output_technology == right.output_technology
+                        && left.path_flags == right.path_flags
                         && (left.hdr_enabled == right.hdr_enabled
                             || (left.hdr_enabled.is_none() && right.hdr_enabled == Some(false)))
                 })

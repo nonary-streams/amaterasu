@@ -249,6 +249,14 @@ Windows uses `GetDisplayConfigBufferSizes`, `QueryDisplayConfig`,
 `windows-sys`. All native buffers are owned for the duration of synchronous calls.
 Union tags/indexes are validated, and snapshots serialize individual fields;
 no native struct padding or raw pointer is persisted.
+Restore readback compares saved mode, placement, scaling, path flags,
+output technology, and queryable HDR state. Transient adapter LUIDs are
+rebound after restart rather than compared as persistent identities. A driver
+that normalizes these saved flags can leave the recovery lease armed until its
+behavior is qualified; this has not been tested on physical display hardware.
+Readback matches paths by monitor identity independent of array order; it does
+not assert native path priority order. Read-only source/target status flags may
+drift and are not restore invariants.
 
 This implementation uses the classic CCD compatibility view and journals the
 queryable HDR on/off state of active paths. Active HDR can be restored; enforced
