@@ -710,7 +710,8 @@ impl PreparationLease {
     }
 
     fn settled_for_shutdown(&self) -> bool {
-        self.lifecycle.is_cleanup_complete() || self.lifecycle.cleanup_failed()
+        !self.lifecycle.has_active_command()
+            && (self.lifecycle.is_cleanup_complete() || self.lifecycle.cleanup_failed())
     }
 
     fn prepare_shutdown(&mut self) {
@@ -1131,6 +1132,45 @@ impl Drop for ProcessManager {
         if self.shutdown().is_err() {
             self.force_settle_owned_children();
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod failed_preparation_shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn failed_cleanup_with_an_active_child_is_not_settled_for_shutdown() {
+        let mut manager = ProcessManager::default();
+        crate::containment::fail_next_job_assignment();
+        crate::containment::fail_next_failed_spawn_termination();
+        let started = manager.handle(
+            "alice",
+            json!({
+                "action":"prepare",
+                "operation_id":"failed-preparation-shutdown",
+                "preparation":[{"run":{
+                    "executable":std::env::current_exe().unwrap(),
+                    "args":["--exact","tests::controlled_child","--ignored"],
+                    "environment":{"AMATERASU_TEST_CHILD":"sleep"},
+                    "timeout_ms":1000
+                }}]
+            }),
+        );
+        assert_eq!(started["ok"], true, "{started}");
+        let failed = manager.handle(
+            "alice",
+            json!({"action":"preparation_status","operation_id":"failed-preparation-shutdown"}),
+        );
+        assert_eq!(failed["preparation"]["state"], "cleanup_failed", "{failed}");
+        let lease = manager.preparations.values().next().unwrap();
+        assert!(lease.lifecycle.has_active_command());
+        assert!(!lease.settled_for_shutdown());
+
+        assert_eq!(manager.shutdown(), Ok(()));
+        let lease = manager.preparations.values().next().unwrap();
+        assert!(!lease.lifecycle.has_active_command());
+        assert!(lease.settled_for_shutdown());
     }
 }
 
