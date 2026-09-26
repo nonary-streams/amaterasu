@@ -129,9 +129,7 @@ impl HistoryStore {
         settings.validate().map_err(HistoryError::Invalid)?;
         self.settings = settings;
         self.configuration_ready = true;
-        if self.active_streams.is_empty() {
-            self.effective_enabled = self.settings.enabled;
-        }
+        self.effective_enabled = self.settings.enabled;
         self.prune_best_effort(now_unix);
         self.next_prune_at_unix = Some(now_unix.saturating_add(PRUNE_INTERVAL_SECONDS));
         Ok(())
@@ -231,7 +229,7 @@ impl HistoryStore {
         .map_err(HistoryError::Invalid)?;
         let was_active = self.active_streams.contains(session_id);
         let mut ended = false;
-        if self.effective_enabled {
+        if is_active_record(&self.connection, session_id)? {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -256,16 +254,13 @@ impl HistoryStore {
         if was_active {
             self.active_streams.remove(session_id);
         }
-        if self.active_streams.is_empty() {
-            self.effective_enabled = self.settings.enabled;
-        }
         self.prune_best_effort(retention_now_unix);
         Ok(ended)
     }
 
     pub fn record_sample(&mut self, sample: &SessionSample) -> Result<bool, HistoryError> {
         sample.validate().map_err(HistoryError::Invalid)?;
-        if !self.effective_enabled || !is_active_record(&self.connection, &sample.session_id)? {
+        if !is_active_record(&self.connection, &sample.session_id)? {
             return Ok(false);
         }
         let frames_sent = i64::try_from(sample.frames_sent)
@@ -300,7 +295,7 @@ impl HistoryStore {
 
     pub fn record_event(&mut self, event: &SessionEvent) -> Result<bool, HistoryError> {
         event.validate().map_err(HistoryError::Invalid)?;
-        if !self.effective_enabled || !is_active_record(&self.connection, &event.session_id)? {
+        if !is_active_record(&self.connection, &event.session_id)? {
             return Ok(false);
         }
         let payload = event
@@ -1100,7 +1095,7 @@ mod tests {
         store
             .apply_configuration(HistorySettings::default(), 101)
             .unwrap();
-        assert!(!store.status().unwrap().effective_enabled);
+        assert!(store.status().unwrap().effective_enabled);
         assert!(!store.end_session("config-pending", 110, 110).unwrap());
         assert!(store.status().unwrap().effective_enabled);
         assert_eq!(store.list_sessions(25, 0).unwrap().len(), 0);
@@ -1261,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_changes_wait_until_the_last_active_session_ends() {
+    fn enabling_records_new_streams_while_old_unrecorded_streams_finish() {
         let database = TemporaryDatabase::new();
         let mut store = HistoryStore::open(&database.path(), 100).unwrap();
         configure(
@@ -1274,10 +1269,26 @@ mod tests {
         );
         assert!(!store.begin_session(&metadata("unrecorded"), 110).unwrap());
         configure(&mut store, HistorySettings::default(), 120);
-        assert!(!store.settings().1);
-        assert!(!store.end_session("unrecorded", 130, 130).unwrap());
         assert!(store.settings().1);
-        assert!(store.list_sessions(25, 0).unwrap().is_empty());
+        assert!(store.begin_session(&metadata("recorded"), 121).unwrap());
+        assert!(
+            store
+                .record_sample(&SessionSample {
+                    session_id: "recorded".into(),
+                    recorded_at_unix: 122,
+                    frames_sent: 1,
+                    bytes_sent: 100,
+                    dropped_frames: 0,
+                    actual_fps: 1.0,
+                    actual_bitrate_kbps: 1.0,
+                    encode_latency_ms: 1.0,
+                })
+                .unwrap()
+        );
+        assert!(!store.end_session("unrecorded", 130, 130).unwrap());
+        assert!(store.end_session("recorded", 131, 131).unwrap());
+        assert!(store.settings().1);
+        assert_eq!(store.list_sessions(25, 0).unwrap().len(), 1);
     }
 
     #[test]
@@ -1418,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn disabling_during_a_stream_keeps_its_recording_until_all_streams_end() {
+    fn disabling_stops_new_streams_but_finishes_existing_recording() {
         let database = TemporaryDatabase::new();
         let path = database.path();
         let mut store = HistoryStore::open(&path, 100).unwrap();
@@ -1434,15 +1445,20 @@ mod tests {
             },
             101,
         );
-        assert!(store.settings().1);
-        assert!(store.begin_session(&metadata("second"), 102).unwrap());
+        assert!(!store.settings().1);
+        assert!(!store.begin_session(&metadata("second"), 102).unwrap());
+        assert!(
+            store
+                .record_event(&event("first", 102, json!("still recording")))
+                .unwrap()
+        );
         assert!(store.end_session("first", 103, 103).unwrap());
-        assert!(store.settings().1);
-        assert!(store.end_session("second", 104, 104).unwrap());
+        assert!(!store.settings().1);
+        assert!(!store.end_session("second", 104, 104).unwrap());
         assert!(!store.settings().1);
         assert!(!store.begin_session(&metadata("third"), 105).unwrap());
         assert!(!store.end_session("third", 106, 106).unwrap());
-        assert_eq!(store.status().unwrap().sessions, 2);
+        assert_eq!(store.status().unwrap().sessions, 1);
 
         drop(store);
         let mut reopened = HistoryStore::open(&path, 200).unwrap();
@@ -1455,7 +1471,7 @@ mod tests {
             },
             200,
         );
-        assert_eq!(reopened.list_sessions(25, 0).unwrap().len(), 2);
+        assert_eq!(reopened.list_sessions(25, 0).unwrap().len(), 1);
         assert!(reopened.active_sessions(16).unwrap().is_empty());
     }
 

@@ -45,6 +45,11 @@ operation returns an `{ "ok": ... }` result. Storage failures are returned as
 ordinary failed RPC results and increment the degraded-operation counter; they
 do not fail the history module tick or the stream session.
 
+Once the central setting is confirmed, a change to `enabled` applies to new
+stream starts immediately. A stream already being recorded continues to accept
+samples and events and saves its end even if recording is then disabled.
+An unrecorded stream remains unrecorded if recording is enabled during its life.
+
 History detail responses cap samples to the latest 32 and events to the latest
 8. Session listing is capped at 25 items per page and active listing at 16.
 Storage keeps the latest 7,200 samples and 2,000 events per session; inserts
