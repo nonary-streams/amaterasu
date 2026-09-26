@@ -114,6 +114,7 @@ struct ProviderInventoryRequest {
 struct ProviderSession {
     caller: String,
     key: String,
+    state_present: bool,
     collection_revision: u64,
     document_revision: u64,
     next_id: u64,
@@ -141,10 +142,17 @@ struct ProviderBatch {
     expire_source_ids: Vec<String>,
     selection_remove_source_ids: Vec<String>,
 }
+struct ProviderBegin {
+    sync_id: String,
+    source_revision: u64,
+    provider_epoch: u64,
+    expected_collection_revision: Option<u64>,
+}
 struct ProviderFinish {
     sync_id: String,
     generation: u64,
     source_revision: u64,
+    provider_epoch: u64,
     expected_revision: u64,
     next_sequence: u64,
     source_complete: bool,
@@ -215,6 +223,7 @@ impl Pipeline {
         }
         match operation {
             operation @ (Operation::ProviderSnapshotBegin { .. }
+            | Operation::ProviderSnapshotRevoke { .. }
             | Operation::ProviderSnapshotInventory { .. }
             | Operation::ProviderSnapshotBatch { .. }
             | Operation::ProviderSnapshotFinish { .. }
@@ -304,6 +313,7 @@ impl Pipeline {
                 catalog_owner: incoming.catalog_owner,
                 importer: match &incoming.operation {
                     Operation::ProviderSnapshotBegin { .. }
+                    | Operation::ProviderSnapshotRevoke { .. }
                     | Operation::ProviderSnapshotInventory { .. }
                     | Operation::ProviderSnapshotBatch { .. }
                     | Operation::ProviderSnapshotFinish { .. } => Some(incoming.caller.clone()),
@@ -322,6 +332,7 @@ impl Pipeline {
             if matches!(
                 incoming.operation,
                 Operation::ProviderSnapshotBegin { .. }
+                    | Operation::ProviderSnapshotRevoke { .. }
                     | Operation::ProviderSnapshotInventory { .. }
                     | Operation::ProviderSnapshotBatch { .. }
                     | Operation::ProviderSnapshotFinish { .. }
@@ -357,14 +368,28 @@ impl Pipeline {
                         Ok(selected) => selected,
                         Err(failure) => return complete(send, id, failure),
                     };
-                self.queued.push_back(Incoming {
+                let incoming = Incoming {
                     request_id: id,
                     caller,
                     key,
                     catalog_owner,
                     operation,
                     deadline: Instant::now() + Duration::from_millis(remaining_ms.min(30_000)),
-                });
+                };
+                if matches!(incoming.operation, Operation::ProviderSnapshotRevoke { .. }) {
+                    // Once the current State request settles, fence queued snapshot work
+                    // before it can start another catalog mutation.
+                    let position = self
+                        .queued
+                        .iter()
+                        .position(|queued| {
+                            !matches!(queued.operation, Operation::ProviderSnapshotRevoke { .. })
+                        })
+                        .unwrap_or(self.queued.len());
+                    self.queued.insert(position, incoming);
+                } else {
+                    self.queued.push_back(incoming);
+                }
                 Ok(())
             }
             unexpected => Err(format!("catalog poll failed: {unexpected:?}")),
@@ -403,8 +428,10 @@ impl Pipeline {
                 ),
             );
         };
-        if !matches!(operation, Operation::ProviderSnapshotBegin { .. })
-            && let Operation::ProviderSnapshotInventory { after: Some(_), .. } = &operation
+        if !matches!(
+            operation,
+            Operation::ProviderSnapshotBegin { .. } | Operation::ProviderSnapshotRevoke { .. }
+        ) && let Operation::ProviderSnapshotInventory { after: Some(_), .. } = &operation
             && let Some(session) = self.provider_sessions.get(caller).cloned()
         {
             let payload = json!({"action":"collection_get","collection":context.key,"key":null});
@@ -415,8 +442,10 @@ impl Pipeline {
                 send,
             );
         }
-        if !matches!(operation, Operation::ProviderSnapshotBegin { .. })
-            && !matches!(operation, Operation::ProviderSnapshotInventory { .. })
+        if !matches!(
+            operation,
+            Operation::ProviderSnapshotBegin { .. } | Operation::ProviderSnapshotRevoke { .. }
+        ) && !matches!(operation, Operation::ProviderSnapshotInventory { .. })
             && matches!(operation, Operation::ProviderPlayniteFullscreenEntry { .. })
             && let Some(session) = self.provider_sessions.get(caller).cloned()
         {
@@ -428,8 +457,16 @@ impl Pipeline {
                 send,
             );
         }
-        if !matches!(operation, Operation::ProviderSnapshotBegin { .. })
-            && !matches!(operation, Operation::ProviderSnapshotInventory { .. })
+        if !matches!(
+            operation,
+            Operation::ProviderSnapshotBegin { .. } | Operation::ProviderSnapshotRevoke { .. }
+        ) && !matches!(operation, Operation::ProviderSnapshotInventory { .. })
+            && !(caller == PLAYNITE_IMPORTER
+                && matches!(
+                    operation,
+                    Operation::ProviderSnapshotBatch { .. }
+                        | Operation::ProviderSnapshotFinish { .. }
+                ))
             && let Some(session) = self.provider_sessions.get(caller).cloned()
         {
             return self.apply_provider_operation(context, operation, session, send);
@@ -461,6 +498,7 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
         let caller = context.importer.clone().expect("authorized importer");
+        let state_present = scan.provider_state.is_some();
         let state = scan.provider_state.unwrap_or_else(SnapshotState::initial);
         if !state.validate() {
             return complete(send, context.request_id, malformed());
@@ -478,6 +516,7 @@ impl Pipeline {
         let session = ProviderSession {
             caller,
             key: context.key.clone(),
+            state_present,
             collection_revision: scan.state_revision,
             document_revision: scan.document_revision,
             next_id: scan.next_id,
@@ -571,6 +610,7 @@ impl Pipeline {
             json!({
                 "ok":true,
                 "collection_revision":session.collection_revision,
+                "provider_epoch":session.state.provider_epoch,
                 "total_count":total_count,
                 "entries":entries,
                 "next_after":next_after,
@@ -589,13 +629,27 @@ impl Pipeline {
             Operation::ProviderSnapshotBegin {
                 sync_id,
                 source_revision,
+                provider_epoch,
                 expected_collection_revision,
             } => self.begin_snapshot(
                 context,
                 session,
-                sync_id,
-                source_revision,
-                expected_collection_revision,
+                ProviderBegin {
+                    sync_id,
+                    source_revision,
+                    provider_epoch,
+                    expected_collection_revision,
+                },
+                send,
+            ),
+            Operation::ProviderSnapshotRevoke {
+                revocation_id,
+                expected_provider_epoch,
+            } => self.revoke_snapshot(
+                context,
+                session,
+                revocation_id,
+                expected_provider_epoch,
                 send,
             ),
             Operation::ProviderSnapshotInventory {
@@ -618,6 +672,7 @@ impl Pipeline {
                 sync_id,
                 generation,
                 source_revision,
+                provider_epoch,
                 sequence,
                 expected_revision,
                 entries,
@@ -625,6 +680,22 @@ impl Pipeline {
                 expire_source_ids,
                 selection_remove_source_ids,
             } => {
+                if session.caller == PLAYNITE_IMPORTER
+                    && provider_epoch != session.state.provider_epoch
+                {
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("provider_epoch_conflict", "Playnite provider epoch changed"),
+                    );
+                }
+                if session.caller != PLAYNITE_IMPORTER && provider_epoch != 0 {
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("invalid_request", "provider epoch is reserved for Playnite"),
+                    );
+                }
                 let batch_payload = json!({
                     "entries":&entries,
                     "remove_source_ids":&remove_source_ids,
@@ -666,7 +737,13 @@ impl Pipeline {
                 let batch_fingerprint = serde_json::to_vec(&batch_payload)
                     .map(|bytes| fingerprint_bytes(&bytes))
                     .unwrap_or_default();
-                if !snapshot_matches(&session, &sync_id, generation, source_revision) {
+                if !snapshot_matches(
+                    &session,
+                    &sync_id,
+                    generation,
+                    source_revision,
+                    provider_epoch,
+                ) {
                     return complete(
                         send,
                         context.request_id,
@@ -682,7 +759,7 @@ impl Pipeline {
                         return complete(
                             send,
                             context.request_id,
-                            json!({"ok":true,"revision":last.revision,"generation":generation,"next_sequence":last.next_sequence,"replayed":true}),
+                            json!({"ok":true,"revision":last.revision,"generation":generation,"provider_epoch":provider_epoch,"next_sequence":last.next_sequence,"replayed":true}),
                         );
                     }
                     return complete(
@@ -731,6 +808,7 @@ impl Pipeline {
                 sync_id,
                 generation,
                 source_revision,
+                provider_epoch,
                 expected_revision,
                 next_sequence,
                 complete: source_complete,
@@ -738,23 +816,42 @@ impl Pipeline {
                 remove_uninstalled,
                 remove_expired,
                 remove_selection,
-            } => self.finish_snapshot(
-                context,
-                session,
-                ProviderFinish {
-                    sync_id,
-                    generation,
-                    source_revision,
-                    expected_revision,
-                    next_sequence,
-                    source_complete,
-                    remove_stale,
-                    remove_uninstalled,
-                    remove_expired,
-                    remove_selection,
-                },
-                send,
-            ),
+            } => {
+                if session.caller == PLAYNITE_IMPORTER
+                    && provider_epoch != session.state.provider_epoch
+                {
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("provider_epoch_conflict", "Playnite provider epoch changed"),
+                    );
+                }
+                if session.caller != PLAYNITE_IMPORTER && provider_epoch != 0 {
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("invalid_request", "provider epoch is reserved for Playnite"),
+                    );
+                }
+                self.finish_snapshot(
+                    context,
+                    session,
+                    ProviderFinish {
+                        sync_id,
+                        generation,
+                        source_revision,
+                        provider_epoch,
+                        expected_revision,
+                        next_sequence,
+                        source_complete,
+                        remove_stale,
+                        remove_uninstalled,
+                        remove_expired,
+                        remove_selection,
+                    },
+                    send,
+                )
+            }
             Operation::UpdateProviderOverrides {
                 id,
                 expected_revision,
@@ -1120,7 +1217,10 @@ impl Pipeline {
             // fixed provider row as a future-generation marker.
             session.state.generation = 1;
             session.state.sync_id = "playnite-fullscreen-bootstrap".into();
+        }
+        if !session.state_present {
             session.provider_count = session.provider_count.saturating_add(1);
+            session.state_present = true;
         }
         let entry = playnite_fullscreen_entry(ConfigOverrides::default());
         let marker = Marker {
@@ -1363,11 +1463,29 @@ impl Pipeline {
         &mut self,
         context: Context,
         mut session: ProviderSession,
-        sync_id: String,
-        source_revision: u64,
-        expected_collection_revision: Option<u64>,
+        begin: ProviderBegin,
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
+        let ProviderBegin {
+            sync_id,
+            source_revision,
+            provider_epoch,
+            expected_collection_revision,
+        } = begin;
+        if session.caller == PLAYNITE_IMPORTER && provider_epoch != session.state.provider_epoch {
+            return complete(
+                send,
+                context.request_id,
+                error("provider_epoch_conflict", "Playnite provider epoch changed"),
+            );
+        }
+        if session.caller != PLAYNITE_IMPORTER && provider_epoch != 0 {
+            return complete(
+                send,
+                context.request_id,
+                error("invalid_request", "provider epoch is reserved for Playnite"),
+            );
+        }
         if expected_collection_revision
             .is_some_and(|revision| revision != session.collection_revision)
         {
@@ -1388,6 +1506,13 @@ impl Pipeline {
             );
         }
         if session.state.sync_id == sync_id {
+            if session.state.revoked {
+                return complete(
+                    send,
+                    context.request_id,
+                    error("snapshot_conflict", "revoked snapshot cannot be resumed"),
+                );
+            }
             if session.state.source_revision != source_revision {
                 return complete(
                     send,
@@ -1403,10 +1528,10 @@ impl Pipeline {
             return complete(
                 send,
                 context.request_id,
-                json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"next_sequence":session.state.next_sequence}),
+                json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"provider_epoch":provider_epoch,"next_sequence":session.state.next_sequence}),
             );
         }
-        let is_new_state = session.state.generation == 0;
+        let is_new_state = !session.state_present;
         let Some(generation) = session.state.generation.checked_add(1) else {
             return complete(
                 send,
@@ -1416,6 +1541,9 @@ impl Pipeline {
         };
         session.state = SnapshotState {
             version: 1,
+            provider_epoch,
+            last_revocation_id: session.state.last_revocation_id.clone(),
+            revoked: false,
             generation,
             sync_id,
             source_revision,
@@ -1433,12 +1561,95 @@ impl Pipeline {
         let key = state_key(&session.caller);
         if is_new_state {
             session.provider_count = session.provider_count.saturating_add(1);
+            session.state_present = true;
         }
-        let reply = json!({"ok":true,"revision":session.document_revision,"generation":generation,"next_sequence":0});
+        let reply = json!({"ok":true,"revision":session.document_revision,"generation":generation,"provider_epoch":provider_epoch,"next_sequence":0});
         let payload = collection_commit(
             &session,
             vec![json!({"key":key,"value":session.state.clone()})],
         );
+        self.submit(
+            context,
+            payload,
+            Stage::ProviderSaving(ProviderSave {
+                session,
+                reply,
+                remaining_cleanup: Vec::new(),
+                finish: false,
+            }),
+            send,
+        )
+    }
+
+    fn revoke_snapshot(
+        &mut self,
+        context: Context,
+        mut session: ProviderSession,
+        revocation_id: String,
+        expected_provider_epoch: u64,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        if session.caller != PLAYNITE_IMPORTER {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "permission_denied",
+                    "only Playnite may revoke its provider epoch",
+                ),
+            );
+        }
+        if !valid_sync_id(&revocation_id) {
+            return complete(
+                send,
+                context.request_id,
+                error("invalid_request", "invalid revocation ID"),
+            );
+        }
+        if session.state.last_revocation_id.as_deref() == Some(revocation_id.as_str()) {
+            return if expected_provider_epoch.checked_add(1) == Some(session.state.provider_epoch) {
+                complete(
+                    send,
+                    context.request_id,
+                    json!({"ok":true,"provider_epoch":session.state.provider_epoch,"revision":session.document_revision,"replayed":true}),
+                )
+            } else {
+                complete(
+                    send,
+                    context.request_id,
+                    error(
+                        "provider_epoch_conflict",
+                        "revocation ID was reused for another epoch",
+                    ),
+                )
+            };
+        }
+        if expected_provider_epoch != session.state.provider_epoch {
+            return complete(
+                send,
+                context.request_id,
+                error("provider_epoch_conflict", "Playnite provider epoch changed"),
+            );
+        }
+        let Some(next_epoch) = session.state.provider_epoch.checked_add(1) else {
+            return complete(
+                send,
+                context.request_id,
+                error("resource_exhausted", "provider epoch exhausted"),
+            );
+        };
+        session.state.provider_epoch = next_epoch;
+        session.state.last_revocation_id = Some(revocation_id);
+        session.state.revoked = true;
+        if !session.state_present {
+            session.provider_count = session.provider_count.saturating_add(1);
+            session.state_present = true;
+        }
+        let payload = collection_commit(
+            &session,
+            vec![json!({"key":state_key(&session.caller),"value":session.state.clone()})],
+        );
+        let reply = json!({"ok":true,"provider_epoch":next_epoch,"revision":session.document_revision,"replayed":false});
         self.submit(
             context,
             payload,
@@ -1717,7 +1928,7 @@ impl Pipeline {
             "value":session.state.clone(),
         }));
         let payload = collection_commit(&session, edits);
-        let reply = json!({"ok":true,"revision":new_revision,"generation":session.state.generation,"next_sequence":next_sequence});
+        let reply = json!({"ok":true,"revision":new_revision,"generation":session.state.generation,"provider_epoch":session.state.provider_epoch,"next_sequence":next_sequence});
         self.submit(
             context,
             payload,
@@ -1742,6 +1953,7 @@ impl Pipeline {
             sync_id,
             generation,
             source_revision,
+            provider_epoch,
             expected_revision,
             next_sequence,
             source_complete,
@@ -1760,8 +1972,13 @@ impl Pipeline {
                 ),
             );
         }
-        if !snapshot_matches(&session, &sync_id, generation, source_revision)
-            || next_sequence != session.state.next_sequence
+        if !snapshot_matches(
+            &session,
+            &sync_id,
+            generation,
+            source_revision,
+            provider_epoch,
+        ) || next_sequence != session.state.next_sequence
         {
             return complete(
                 send,
@@ -1789,7 +2006,7 @@ impl Pipeline {
                 return complete(
                     send,
                     context.request_id,
-                    json!({"ok":true,"revision":session.document_revision,"generation":generation,"complete":true,"cleanup_pending":false,"remove_stale":remove_stale,"remove_uninstalled":remove_uninstalled,"remove_expired":remove_expired,"remove_selection":remove_selection}),
+                    json!({"ok":true,"revision":session.document_revision,"generation":generation,"provider_epoch":provider_epoch,"complete":true,"cleanup_pending":false,"remove_stale":remove_stale,"remove_uninstalled":remove_uninstalled,"remove_expired":remove_expired,"remove_selection":remove_selection}),
                 );
             }
         } else {
@@ -1875,7 +2092,7 @@ impl Pipeline {
             "value":session.state.clone(),
         }));
         let payload = collection_commit(&session, edits);
-        let reply = json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"complete":true,"cleanup_pending":!remaining.is_empty(),"remove_stale":session.state.finish_remove_stale,"remove_uninstalled":session.state.finish_remove_uninstalled,"remove_expired":session.state.finish_remove_expired,"remove_selection":session.state.finish_remove_selection});
+        let reply = json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"provider_epoch":session.state.provider_epoch,"complete":true,"cleanup_pending":!remaining.is_empty(),"remove_stale":session.state.finish_remove_stale,"remove_uninstalled":session.state.finish_remove_uninstalled,"remove_expired":session.state.finish_remove_expired,"remove_selection":session.state.finish_remove_selection});
         self.submit(
             context,
             payload,
@@ -2627,8 +2844,11 @@ fn snapshot_matches(
     sync_id: &str,
     generation: u64,
     source_revision: u64,
+    provider_epoch: u64,
 ) -> bool {
-    session.state.generation == generation
+    !session.state.revoked
+        && session.state.provider_epoch == provider_epoch
+        && session.state.generation == generation
         && session.state.sync_id == sync_id
         && session.state.source_revision == source_revision
 }

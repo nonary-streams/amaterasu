@@ -59,7 +59,14 @@ pub enum Operation {
         sync_id: String,
         source_revision: u64,
         #[serde(default)]
+        provider_epoch: u64,
+        #[serde(default)]
         expected_collection_revision: Option<u64>,
+    },
+    /// Only the authenticated Playnite importer may advance this durable fence.
+    ProviderSnapshotRevoke {
+        revocation_id: String,
+        expected_provider_epoch: u64,
     },
     /// Reads the authorized importer's provenance without exposing an owner
     /// selector. Each page is pinned to the state collection revision.
@@ -74,6 +81,8 @@ pub enum Operation {
         sync_id: String,
         generation: u64,
         source_revision: u64,
+        #[serde(default)]
+        provider_epoch: u64,
         sequence: u64,
         expected_revision: u64,
         entries: Vec<ProviderEntry>,
@@ -88,6 +97,8 @@ pub enum Operation {
         sync_id: String,
         generation: u64,
         source_revision: u64,
+        #[serde(default)]
+        provider_epoch: u64,
         expected_revision: u64,
         next_sequence: u64,
         complete: bool,
@@ -164,6 +175,7 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
             return page(&document, &query.to_lowercase(), cursor, limit, false);
         }
         Operation::ProviderSnapshotBegin { .. }
+        | Operation::ProviderSnapshotRevoke { .. }
         | Operation::ProviderSnapshotInventory { .. }
         | Operation::ProviderSnapshotBatch { .. }
         | Operation::ProviderSnapshotFinish { .. }

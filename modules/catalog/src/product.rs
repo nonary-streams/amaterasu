@@ -48,6 +48,12 @@ pub(crate) enum RemovalReason {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SnapshotState {
     pub(crate) version: u8,
+    #[serde(default)]
+    pub(crate) provider_epoch: u64,
+    #[serde(default)]
+    pub(crate) last_revocation_id: Option<String>,
+    #[serde(default)]
+    pub(crate) revoked: bool,
     pub(crate) generation: u64,
     pub(crate) sync_id: String,
     pub(crate) source_revision: u64,
@@ -80,6 +86,9 @@ impl SnapshotState {
     pub(crate) fn initial() -> Self {
         Self {
             version: 1,
+            provider_epoch: 0,
+            last_revocation_id: None,
+            revoked: false,
             generation: 0,
             sync_id: String::new(),
             source_revision: 0,
@@ -97,6 +106,8 @@ impl SnapshotState {
 
     pub(crate) fn validate(&self) -> bool {
         (self.version == 1)
+            && self.last_revocation_id.as_deref().is_none_or(valid_sync_id)
+            && (self.last_revocation_id.is_none() || self.provider_epoch > 0)
             && (self.generation == 0 || valid_sync_id(&self.sync_id))
             && (self.generation != 0 || (self.sync_id.is_empty() && self.next_sequence == 0))
             && (!self.finished || self.generation != 0)

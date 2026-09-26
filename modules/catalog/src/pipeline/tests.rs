@@ -290,6 +290,488 @@ fn playnite_entry(name: &str) -> Value {
 }
 
 #[test]
+fn playnite_revocation_fences_old_snapshot_and_preserves_unowned_rows() {
+    let mut backend = Backend::default();
+    let mut playnite = playnite_importer();
+    let mut management = Pipeline::default();
+    let manual = backend.run_for(
+        &mut management,
+        json!({"action":"create","entry":entry("Manual"),"expected_revision":0}),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(manual["ok"], true, "{manual}");
+    let manual_id = manual["id"].as_str().unwrap().to_owned();
+    let mut other_provider = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::new(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        BTreeMap::from([("other.provider".into(), "amaterasu.management".into())]),
+    );
+    let other_begin = backend.run_for(
+        &mut other_provider,
+        snapshot_begin("other-scan", 1),
+        "other.provider",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let other_batch = backend.run_for(
+        &mut other_provider,
+        snapshot_batch(
+            "other-scan",
+            other_begin["generation"].as_u64().unwrap(),
+            1,
+            0,
+            other_begin["revision"].as_u64().unwrap(),
+            vec![("other-game", entry("Other provider"))],
+        ),
+        "other.provider",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(other_batch["ok"], true, "{other_batch}");
+    let other_id = backend.entries[&entry_key("other.provider", "other-game")]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let old_begin = backend.run_for(
+        &mut playnite,
+        snapshot_begin("old-process", 1),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(old_begin["provider_epoch"], 0);
+    let old_generation = old_begin["generation"].as_u64().unwrap();
+    let old_batch = backend.run_for(
+        &mut playnite,
+        snapshot_batch(
+            "old-process",
+            old_generation,
+            1,
+            0,
+            old_begin["revision"].as_u64().unwrap(),
+            vec![
+                ("playnite:one", playnite_entry("First")),
+                ("playnite:two", playnite_entry("Second")),
+            ],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(old_batch["ok"], true, "{old_batch}");
+    let first_id = backend.entries[&entry_key("amaterasu.playnite", "playnite:one")]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second_id = backend.entries[&entry_key("amaterasu.playnite", "playnite:two")]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let detached = backend.run_for(
+        &mut management,
+        json!({"action":"delete","id":second_id,"expected_revision":old_batch["revision"]}),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(detached["ok"], true, "{detached}");
+
+    let unauthorized = backend.run_for(
+        &mut management,
+        json!({"action":"provider_snapshot_revoke","revocation_id":"disabled-1","expected_provider_epoch":0}),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(unauthorized["error"]["code"], "permission_denied");
+    let revoke = json!({"action":"provider_snapshot_revoke","revocation_id":"disabled-1","expected_provider_epoch":0});
+    let revoked = backend.run_for(
+        &mut playnite,
+        revoke.clone(),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(revoked["provider_epoch"], 1, "{revoked}");
+    assert_eq!(
+        backend.entries[&state_key("amaterasu.playnite")]["provider_epoch"],
+        1
+    );
+    assert_eq!(
+        backend.entries[&state_key("amaterasu.playnite")]["revoked"],
+        true
+    );
+    assert!(backend.entries.contains_key(&manual_id));
+    assert!(backend.entries.contains_key(&other_id));
+    assert!(backend.entries.contains_key(&first_id));
+    assert!(!backend.entries.contains_key(&second_id));
+
+    let replay = backend.run_for(
+        &mut playnite,
+        revoke,
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(replay["provider_epoch"], 1);
+    assert_eq!(replay["replayed"], true);
+    let conflicting = backend.run_for(
+        &mut playnite,
+        json!({"action":"provider_snapshot_revoke","revocation_id":"different-disable","expected_provider_epoch":0}),
+        "amaterasu.playnite", "amaterasu.management", "amaterasu.management",
+    );
+    assert_eq!(conflicting["error"]["code"], "provider_epoch_conflict");
+
+    let mut old_finish = snapshot_finish(
+        "old-process",
+        old_generation,
+        1,
+        old_batch["revision"].as_u64().unwrap(),
+        1,
+        true,
+    );
+    old_finish["remove_stale"] = json!(true);
+    let stale = backend.run_for(
+        &mut playnite,
+        old_finish,
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert!(!backend.entries.contains_key(&second_id));
+    let old_replay = backend.run_for(
+        &mut playnite,
+        snapshot_begin("old-process", 1),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(old_replay["error"]["code"], "provider_epoch_conflict");
+
+    let mut new_begin = snapshot_begin("new-process", 2);
+    new_begin["provider_epoch"] = json!(1);
+    let begun = backend.run_for(
+        &mut playnite,
+        new_begin,
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(begun["ok"], true, "{begun}");
+    let mut new_batch = snapshot_batch(
+        "new-process",
+        begun["generation"].as_u64().unwrap(),
+        2,
+        0,
+        begun["revision"].as_u64().unwrap(),
+        vec![("playnite:one", playnite_entry("First"))],
+    );
+    new_batch["provider_epoch"] = json!(1);
+    let batch = backend.run_for(
+        &mut playnite,
+        new_batch,
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(batch["ok"], true, "{batch}");
+    let mut new_finish = snapshot_finish(
+        "new-process",
+        begun["generation"].as_u64().unwrap(),
+        2,
+        batch["revision"].as_u64().unwrap(),
+        1,
+        true,
+    );
+    new_finish["provider_epoch"] = json!(1);
+    let finished = backend.run_for(
+        &mut playnite,
+        new_finish,
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(finished["ok"], true, "{finished}");
+    assert!(backend.entries.contains_key(&manual_id));
+    assert!(backend.entries.contains_key(&other_id));
+    assert!(backend.entries.contains_key(&first_id));
+    assert!(!backend.entries.contains_key(&second_id));
+    assert!(
+        !backend
+            .entries
+            .contains_key(&entry_key("amaterasu.playnite", "playnite:two"))
+    );
+}
+
+#[test]
+fn durable_revoke_wins_over_an_already_dispatched_finish_commit() {
+    let mut backend = Backend::default();
+    let mut old_pipeline = playnite_importer();
+    let first = backend.run_for(
+        &mut old_pipeline,
+        snapshot_begin("first-scan", 1),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let first_batch = backend.run_for(
+        &mut old_pipeline,
+        snapshot_batch(
+            "first-scan",
+            first["generation"].as_u64().unwrap(),
+            1,
+            0,
+            first["revision"].as_u64().unwrap(),
+            vec![("playnite:stale", playnite_entry("Still installed"))],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let first_finish = backend.run_for(
+        &mut old_pipeline,
+        snapshot_finish(
+            "first-scan",
+            first["generation"].as_u64().unwrap(),
+            1,
+            first_batch["revision"].as_u64().unwrap(),
+            1,
+            true,
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(first_finish["ok"], true, "{first_finish}");
+    let stale_id = backend.entries[&entry_key("amaterasu.playnite", "playnite:stale")]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second = backend.run_for(
+        &mut old_pipeline,
+        snapshot_begin("old-process-empty-scan", 2),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(second["ok"], true, "{second}");
+    let finish_request = snapshot_finish(
+        "old-process-empty-scan",
+        second["generation"].as_u64().unwrap(),
+        2,
+        second["revision"].as_u64().unwrap(),
+        0,
+        true,
+    );
+
+    let mut incoming = Some(finish_request);
+    let mut state_result = None;
+    let mut held_commit = None;
+    for _ in 0..100 {
+        old_pipeline
+            .tick(|command| {
+                Ok(match command {
+                    Command::Poll {} => {
+                        incoming
+                            .take()
+                            .map_or(Response::Pending, |payload| Response::Request {
+                                id: 71,
+                                caller: "amaterasu.playnite".into(),
+                                initiator: "amaterasu.management".into(),
+                                service: crate::SERVICE.into(),
+                                remaining_ms: 30_000,
+                                payload,
+                            })
+                    }
+                    Command::Request { payload, .. } => {
+                        if payload["action"] == "collection_commit" {
+                            held_commit = Some(payload);
+                        } else {
+                            state_result = Some(backend.handle(payload));
+                        }
+                        Response::Accepted { id: 72 }
+                    }
+                    Command::TakeResult { .. } => Response::Result {
+                        payload: state_result.take().expect("scan result"),
+                    },
+                    command => panic!("unexpected command before held commit: {command:?}"),
+                })
+            })
+            .unwrap();
+        if held_commit.is_some() {
+            break;
+        }
+    }
+    let held_commit = held_commit.expect("old Finish dispatched a stale cleanup commit");
+    assert!(
+        held_commit["edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edit| { edit["key"] == stale_id && edit["value"].is_null() })
+    );
+
+    let mut replacement_pipeline = playnite_importer();
+    let revoked = backend.run_for(
+        &mut replacement_pipeline,
+        json!({"action":"provider_snapshot_revoke","revocation_id":"process-replaced","expected_provider_epoch":0}),
+        "amaterasu.playnite", "amaterasu.management", "amaterasu.management",
+    );
+    assert_eq!(revoked["provider_epoch"], 1, "{revoked}");
+    assert!(backend.entries.contains_key(&stale_id));
+
+    let mut completion = None;
+    old_pipeline
+        .tick(|command| {
+            Ok(match command {
+                Command::TakeResult { .. } => Response::Result {
+                    payload: backend.handle(held_commit.clone()),
+                },
+                Command::Poll {} => Response::Pending,
+                Command::Complete { payload, .. } => {
+                    completion = Some(payload);
+                    Response::Ok
+                }
+                command => panic!("unexpected command after revoke: {command:?}"),
+            })
+        })
+        .unwrap();
+    assert_eq!(completion.unwrap()["error"]["code"], "revision_conflict");
+    assert!(backend.entries.contains_key(&stale_id));
+    assert_eq!(
+        backend.entries[&state_key("amaterasu.playnite")]["provider_epoch"],
+        1
+    );
+    let mut reloaded = playnite_importer();
+    let inventory = backend.run_for(
+        &mut reloaded,
+        snapshot_inventory(None, None, 32),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(inventory["provider_epoch"], 1, "{inventory}");
+}
+
+#[test]
+fn queued_revoke_precedes_an_older_undispatched_playnite_finish() {
+    let mut pipeline = playnite_importer();
+    pipeline.queued.push_back(Incoming {
+        request_id: 81,
+        caller: PLAYNITE_IMPORTER.into(),
+        key: "principal/amaterasu.management".into(),
+        catalog_owner: None,
+        operation: serde_json::from_value(snapshot_finish("old-scan", 1, 1, 1, 0, true)).unwrap(),
+        deadline: Instant::now() + Duration::from_secs(30),
+    });
+    pipeline.receive(&mut |command| {
+        Ok(match command {
+            Command::Poll {} => Response::Request {
+                id: 82,
+                caller: PLAYNITE_IMPORTER.into(),
+                initiator: "amaterasu.management".into(),
+                service: crate::SERVICE.into(),
+                remaining_ms: 30_000,
+                payload: json!({"action":"provider_snapshot_revoke","revocation_id":"replacement","expected_provider_epoch":0}),
+            },
+            command => panic!("unexpected command: {command:?}"),
+        })
+    }).unwrap();
+    assert_eq!(pipeline.queued.len(), 2);
+    assert!(matches!(
+        pipeline.queued[0].operation,
+        Operation::ProviderSnapshotRevoke { .. }
+    ));
+    assert!(matches!(
+        pipeline.queued[1].operation,
+        Operation::ProviderSnapshotFinish { .. }
+    ));
+}
+
+#[test]
+fn first_boot_revoke_counts_durable_state_once_across_reload_and_begin() {
+    let mut backend = Backend::default();
+    let mut playnite = playnite_importer();
+    let revoked = backend.run_for(
+        &mut playnite,
+        json!({"action":"provider_snapshot_revoke","revocation_id":"first-disabled","expected_provider_epoch":0}),
+        PLAYNITE_IMPORTER, "amaterasu.management", "amaterasu.management",
+    );
+    assert_eq!(revoked["provider_epoch"], 1, "{revoked}");
+    assert_eq!(backend.metadata["provider_count"], 1);
+    assert_eq!(backend.entries.len(), 1);
+
+    let mut reloaded = playnite_importer();
+    let inventory = backend.run_for(
+        &mut reloaded,
+        snapshot_inventory(None, None, 32),
+        PLAYNITE_IMPORTER,
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(inventory["ok"], true, "{inventory}");
+    assert_eq!(inventory["provider_epoch"], 1);
+    let mut begin = snapshot_begin("first-enabled-process", 1);
+    begin["provider_epoch"] = json!(1);
+    let begun = backend.run_for(
+        &mut reloaded,
+        begin,
+        PLAYNITE_IMPORTER,
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(begun["ok"], true, "{begun}");
+    assert_eq!(begun["provider_epoch"], 1);
+    assert_eq!(backend.metadata["provider_count"], 1);
+    assert_eq!(backend.entries.len(), 1);
+    assert_eq!(
+        backend.entries[&state_key(PLAYNITE_IMPORTER)]["revoked"],
+        false
+    );
+    let mut batch_request = snapshot_batch(
+        "first-enabled-process",
+        begun["generation"].as_u64().unwrap(),
+        1,
+        0,
+        begun["revision"].as_u64().unwrap(),
+        vec![("playnite:first", playnite_entry("First"))],
+    );
+    batch_request["provider_epoch"] = json!(1);
+    let batch = backend.run_for(
+        &mut reloaded,
+        batch_request,
+        PLAYNITE_IMPORTER,
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(batch["ok"], true, "{batch}");
+    let mut finish_request = snapshot_finish(
+        "first-enabled-process",
+        begun["generation"].as_u64().unwrap(),
+        1,
+        batch["revision"].as_u64().unwrap(),
+        1,
+        true,
+    );
+    finish_request["provider_epoch"] = json!(1);
+    let finished = backend.run_for(
+        &mut reloaded,
+        finish_request,
+        PLAYNITE_IMPORTER,
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(finished["ok"], true, "{finished}");
+    assert_eq!(finished["provider_epoch"], 1);
+    assert_eq!(backend.metadata["provider_count"], 2);
+}
+
+#[test]
 fn playnite_fullscreen_synthetic_entry_is_fixed_cas_owned_and_survives_snapshots() {
     let mut backend = Backend::default();
     let mut playnite = playnite_importer();
@@ -3890,6 +4372,9 @@ fn provider_override_rejects_entries_marked_for_another_provider() {
     };
     let playnite_state = SnapshotState {
         version: 1,
+        provider_epoch: 0,
+        last_revocation_id: None,
+        revoked: false,
         generation: 1,
         sync_id: "playnite-scan".into(),
         source_revision: 1,
