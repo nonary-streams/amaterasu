@@ -575,6 +575,14 @@ pub(super) struct ClientConfigOverrides {
     pub(super) max_bitrate: Option<i32>,
     pub(super) minimum_fps_target: Option<f64>,
     pub(super) video_max_batch_size_kb: Option<u8>,
+    pub(super) dd_mode_remapping: Option<serde_json::Value>,
+    pub(super) dd_resolution_option: Option<String>,
+    pub(super) dd_manual_resolution: Option<String>,
+    pub(super) dd_refresh_rate_option: Option<String>,
+    pub(super) dd_manual_refresh_rate: Option<String>,
+    pub(super) dd_hdr_option: Option<String>,
+    pub(super) dd_configuration_option: Option<String>,
+    pub(super) dd_hdr_request_override: Option<String>,
     pub(super) stream_audio: Option<bool>,
     pub(super) audio_sink: Option<String>,
     pub(super) virtual_sink: Option<String>,
@@ -596,6 +604,26 @@ pub(super) struct ClientConfigOverrides {
     pub(super) frame_limiter_disable_vsync: Option<bool>,
     pub(super) frame_limiter_auto_virtual_framegen: Option<String>,
     pub(super) rtss_frame_limit_type: Option<String>,
+}
+
+impl ClientConfigOverrides {
+    pub(super) fn display_overrides(&self) -> serde_json::Value {
+        let mut fields = serde_json::json!({
+            "dd_mode_remapping":self.dd_mode_remapping,
+            "dd_resolution_option":self.dd_resolution_option,
+            "dd_manual_resolution":self.dd_manual_resolution,
+            "dd_refresh_rate_option":self.dd_refresh_rate_option,
+            "dd_manual_refresh_rate":self.dd_manual_refresh_rate,
+            "dd_hdr_option":self.dd_hdr_option,
+            "dd_configuration_option":self.dd_configuration_option,
+            "dd_hdr_request_override":self.dd_hdr_request_override,
+        });
+        fields
+            .as_object_mut()
+            .expect("display overrides object")
+            .retain(|_, value| !value.is_null());
+        fields
+    }
 }
 
 #[cfg(test)]

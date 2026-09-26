@@ -71,6 +71,7 @@ impl Record {
             "frame_limiter_settings":self.config.frame_limiter_settings,
             "frame_limiter_executable_path":self.config.frame_limiter_executable_path,
             "display_request":self.config.display_request,
+            "display_policy_snapshot":self.config.display_policy_snapshot,
             "failure":self.failure,"cleanup_error":self.cleanup_error})
     }
 

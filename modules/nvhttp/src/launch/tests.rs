@@ -901,8 +901,10 @@ struct Broker {
     application_executable_path: Option<String>,
     application_catalog_revision: u64,
     rtsp_snapshot: Option<Value>,
+    rtsp_display_policy_snapshot: Option<Value>,
     rtsp_executable_path: Option<String>,
     wrong_rtsp_snapshot: bool,
+    wrong_rtsp_display_policy_snapshot: bool,
     wrong_application_display_overrides: bool,
 }
 
@@ -942,8 +944,10 @@ impl Default for Broker {
             application_executable_path: None,
             application_catalog_revision: 1,
             rtsp_snapshot: None,
+            rtsp_display_policy_snapshot: None,
             rtsp_executable_path: None,
             wrong_rtsp_snapshot: false,
+            wrong_rtsp_display_policy_snapshot: false,
             wrong_application_display_overrides: false,
         }
     }
@@ -1004,6 +1008,7 @@ impl Broker {
         let action = payload["action"].as_str().unwrap_or_default();
         if service == "amaterasu.rtsp/1" && action == "open" {
             self.rtsp_snapshot = payload.get("frame_limiter_settings").cloned();
+            self.rtsp_display_policy_snapshot = payload.get("display_policy_snapshot").cloned();
             self.rtsp_executable_path = payload["frame_limiter_executable_path"]
                 .as_str()
                 .map(str::to_owned);
@@ -1159,6 +1164,8 @@ impl Broker {
         };
         let wrong_rtsp_snapshot = self.wrong_rtsp_snapshot;
         self.wrong_rtsp_snapshot = false;
+        let wrong_rtsp_display_policy_snapshot = self.wrong_rtsp_display_policy_snapshot;
+        self.wrong_rtsp_display_policy_snapshot = false;
         json!({
             "ok": true,
             "ticket": 71,
@@ -1173,6 +1180,11 @@ impl Broker {
                 self.rtsp_snapshot.clone().unwrap_or(Value::Null)
             },
             "frame_limiter_executable_path": self.rtsp_executable_path,
+            "display_policy_snapshot": if wrong_rtsp_display_policy_snapshot {
+                json!({"forged":true})
+            } else {
+                self.rtsp_display_policy_snapshot.clone().unwrap_or(Value::Null)
+            },
             "display_request": Value::Null,
             "failure": null,
             "cleanup_error": if state == "cleanup_failed" {
@@ -1950,6 +1962,7 @@ fn launch_export_includes_admitted_frame_limiter_settings_and_context() {
         "rtss_frame_limit_type_explicit_override":null
     });
 
+    assert_eq!(launch_payload["application_display_overrides"], json!({}));
     assert_eq!(launch_payload["frame_limiter_settings"], expected_settings);
     assert_eq!(launch_payload["client_frame_limiter_overrides"], json!({}));
     let rtsp_open = opened_rtsp_payload(&broker);
@@ -2521,6 +2534,116 @@ fn sparse_application_display_fields_are_frozen_before_launch_and_checked_on_rea
             .get("display_request")
             .is_none()
     );
+    let launch_export = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        launch_export["application_display_overrides"],
+        record
+            .application_display_overrides
+            .as_ref()
+            .unwrap()
+            .clone()
+    );
+    assert_eq!(
+        opened_rtsp_payload(&broker)["display_policy_snapshot"],
+        record.display_policy_snapshot.as_ref().unwrap().clone()
+    );
+}
+
+#[test]
+fn paired_client_display_policy_overrides_application_fields_without_global_defaults() {
+    let now = Instant::now();
+    let certificate = vec![13; 32];
+    let paired = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            "display-client".into(),
+            fingerprint(&certificate),
+            ClientConfigOverrides {
+                dd_refresh_rate_option: Some("disabled".into()),
+                dd_hdr_option: Some("auto".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({
+            "dd_refresh_rate_option":"manual",
+            "dd_manual_refresh_rate":"59.94",
+            "dd_configuration_option":"verify_only"
+        })),
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(13), paired, now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let snapshot = &opened_rtsp_payload(&broker)["display_policy_snapshot"];
+    assert_eq!(
+        snapshot["application_overrides"]["dd_refresh_rate_option"],
+        "manual"
+    );
+    assert_eq!(
+        snapshot["client_overrides"],
+        json!({
+            "dd_refresh_rate_option":"disabled", "dd_hdr_option":"auto"
+        })
+    );
+    assert_eq!(
+        snapshot["effective_overrides"],
+        json!({
+            "dd_refresh_rate_option":"disabled",
+            "dd_hdr_option":"auto",
+            "dd_manual_refresh_rate":"59.94",
+            "dd_configuration_option":"verify_only"
+        })
+    );
+    assert!(
+        snapshot["effective_overrides"]
+            .get("dd_resolution_option")
+            .is_none()
+    );
+    assert!(snapshot.get("global_overrides").is_none());
+    assert!(
+        opened_rtsp_payload(&broker)
+            .get("display_request")
+            .is_none()
+    );
+}
+
+#[test]
+fn certificate_matched_peer_preserves_all_eight_sparse_display_fields() {
+    let certificate = vec![15; 32];
+    let display = json!({
+        "dd_mode_remapping":{"mixed":[]},
+        "dd_resolution_option":"manual",
+        "dd_manual_resolution":"1920x1080",
+        "dd_refresh_rate_option":"manual",
+        "dd_manual_refresh_rate":"59.94",
+        "dd_hdr_option":"disabled",
+        "dd_configuration_option":"ensure_active",
+        "dd_hdr_request_override":"force_off"
+    });
+    let overrides: ClientConfigOverrides = serde_json::from_value(display.clone()).unwrap();
+    let selected = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            "display-client".into(),
+            fingerprint(&certificate),
+            overrides,
+        )
+        .unwrap();
+    assert_eq!(selected.client_display_overrides, display);
 }
 
 #[test]
@@ -2536,6 +2659,58 @@ fn forged_display_readback_stops_before_rtsp_open() {
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_ne!(reply.status, 200);
     assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+}
+
+#[test]
+fn forged_rtsp_display_snapshot_never_completes_launch() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        wrong_rtsp_display_policy_snapshot: true,
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_ne!(reply.status, 200);
+    assert!(broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+}
+
+#[test]
+fn explicit_null_client_display_field_inherits_application_choice() {
+    let certificate = vec![14; 32];
+    let config_overrides: ClientConfigOverrides = serde_json::from_value(json!({
+        "dd_refresh_rate_option":null,
+        "dd_hdr_option":"disabled"
+    }))
+    .unwrap();
+    let paired = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            "display-client".into(),
+            fingerprint(&certificate),
+            config_overrides,
+        )
+        .unwrap();
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({"dd_refresh_rate_option":"manual"})),
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(14), paired, now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let snapshot = &opened_rtsp_payload(&broker)["display_policy_snapshot"];
+    assert!(
+        snapshot["client_overrides"]
+            .get("dd_refresh_rate_option")
+            .is_none()
+    );
+    assert_eq!(
+        snapshot["effective_overrides"]["dd_refresh_rate_option"],
+        "manual"
+    );
+    assert_eq!(snapshot["effective_overrides"]["dd_hdr_option"], "disabled");
 }
 
 #[test]

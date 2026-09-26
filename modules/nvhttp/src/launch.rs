@@ -16,6 +16,7 @@ use crate::wire::{ClientConfigOverrides, Reply, xml};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use record::{Record, Stage, State};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -80,6 +81,7 @@ pub struct PeerIdentity {
     client_key_repeat_delay: Option<u32>,
     client_key_repeat_frequency: Option<f64>,
     client_frame_limiter_settings: FrameLimiterSettings,
+    client_display_overrides: Value,
 }
 
 impl PeerIdentity {
@@ -115,6 +117,7 @@ impl PeerIdentity {
             client_key_repeat_delay: None,
             client_key_repeat_frequency: None,
             client_frame_limiter_settings: FrameLimiterSettings::default(),
+            client_display_overrides: json!({}),
         })
     }
 
@@ -124,6 +127,7 @@ impl PeerIdentity {
         certificate_id: String,
         config_overrides: ClientConfigOverrides,
     ) -> Result<Self, &'static str> {
+        let client_display_overrides = config_overrides.display_overrides();
         let ClientConfigOverrides {
             fec_percentage,
             max_bitrate,
@@ -181,6 +185,8 @@ impl PeerIdentity {
             || key_repeat_frequency
                 .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
             || client_frame_limiter_settings.validate().is_err()
+            || workflow::parse_application_config_overrides(Some(&client_display_overrides))
+                .is_err()
         {
             return Err("invalid_paired_identity");
         }
@@ -206,6 +212,7 @@ impl PeerIdentity {
         self.client_key_repeat_delay = key_repeat_delay;
         self.client_key_repeat_frequency = key_repeat_frequency;
         self.client_frame_limiter_settings = client_frame_limiter_settings;
+        self.client_display_overrides = client_display_overrides;
         Ok(self)
     }
 

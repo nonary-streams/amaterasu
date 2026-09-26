@@ -433,6 +433,9 @@ pub struct Open {
     /// None leaves the host display topology untouched.
     #[serde(default)]
     pub display_request: Option<serde_json::Value>,
+    /// Frozen sparse source policy for exact readback; this alone never changes a display.
+    #[serde(default)]
+    pub display_policy_snapshot: Option<serde_json::Value>,
     #[serde(default)]
     pub video_encryption_policy: Option<VideoEncryptionPolicySnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -503,6 +506,13 @@ impl Open {
             .is_some_and(|request| !valid_display_request(request))
         {
             return Err("invalid_display_request");
+        }
+        if self
+            .display_policy_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !valid_display_policy_snapshot(snapshot))
+        {
+            return Err("invalid_display_policy_snapshot");
         }
         if let Some(snapshot) = &self.frame_limiter_settings
             && !valid_frame_limiter_snapshot(snapshot, self.profile.fps)
@@ -797,6 +807,47 @@ fn valid_display_request(request: &serde_json::Value) -> bool {
     policy_ids == display_ids
 }
 
+fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
+    let Some(fields) = snapshot.as_object() else {
+        return false;
+    };
+    let Some(application) = snapshot["application_overrides"].as_object() else {
+        return false;
+    };
+    let Some(client) = snapshot["client_overrides"].as_object() else {
+        return false;
+    };
+    let Some(effective) = snapshot["effective_overrides"].as_object() else {
+        return false;
+    };
+    let Some(certificate_id) = snapshot["certificate_id"].as_str() else {
+        return false;
+    };
+    if fields.len() != 5
+        || snapshot["catalog_revision"].as_u64().is_none()
+        || certificate_id.len() != 64
+        || !certificate_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || application.keys().chain(client.keys()).any(|key| {
+            !matches!(
+                key.as_str(),
+                "dd_mode_remapping"
+                    | "dd_resolution_option"
+                    | "dd_manual_resolution"
+                    | "dd_refresh_rate_option"
+                    | "dd_manual_refresh_rate"
+                    | "dd_hdr_option"
+                    | "dd_configuration_option"
+                    | "dd_hdr_request_override"
+            )
+        })
+    {
+        return false;
+    }
+    let mut resolved = application.clone();
+    resolved.extend(client.clone());
+    &resolved == effective
+}
+
 fn valid_frame_limiter_snapshot(snapshot: &serde_json::Value, stream_fps: u32) -> bool {
     let Some(fields) = snapshot.as_object() else {
         return false;
@@ -1029,6 +1080,34 @@ mod tests {
                 .prepare("prepare", None)
                 .get("display_request")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn sparse_display_policy_snapshot_requires_exact_client_precedence() {
+        let mut input = open_json();
+        input["display_policy_snapshot"] = json!({
+            "catalog_revision":7,
+            "certificate_id":"ab".repeat(32),
+            "application_overrides":{"dd_refresh_rate_option":"manual"},
+            "client_overrides":{"dd_refresh_rate_option":"disabled"},
+            "effective_overrides":{"dd_refresh_rate_option":"disabled"}
+        });
+        let selected: Open = serde_json::from_value(input.clone()).unwrap();
+        selected.validate(false).unwrap();
+        assert!(
+            selected
+                .prepare("prepare", None)
+                .get("display_request")
+                .is_none()
+        );
+
+        input["display_policy_snapshot"]["effective_overrides"]["dd_refresh_rate_option"] =
+            json!("manual");
+        let forged: Open = serde_json::from_value(input).unwrap();
+        assert_eq!(
+            forged.validate(false),
+            Err("invalid_display_policy_snapshot")
         );
     }
 

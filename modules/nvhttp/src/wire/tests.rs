@@ -136,6 +136,7 @@ impl Broker {
                         "state": "ready",
                         "frame_limiter_settings": payload["frame_limiter_settings"],
                         "frame_limiter_executable_path": payload["frame_limiter_executable_path"],
+                        "display_policy_snapshot": payload["display_policy_snapshot"],
                         "display_request": payload["display_request"],
                         "failure": null,
                         "cleanup_error": null

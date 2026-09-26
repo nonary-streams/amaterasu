@@ -157,6 +157,7 @@ impl Controller {
                         "global_preparation": record.global_preparation,
                         "legacy_global_preparation": record.legacy_global_preparation,
                         "preflight_token": record.application_preflight_token,
+                        "application_display_overrides": record.application_display_overrides,
                         "frame_limiter_settings": record.frame_limiter_snapshot,
                         "client_frame_limiter_overrides":
                             client_frame_limiter_overrides(record),
@@ -236,6 +237,7 @@ impl Controller {
                         "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
                         "frame_limiter_settings": record.executable_path.as_ref().and(record.frame_limiter_snapshot.as_ref()),
                         "frame_limiter_executable_path": record.executable_path,
+                        "display_policy_snapshot": record.display_policy_snapshot,
                         "display_request": record.display_request,
                         "capture": capture,
                         "profile": profile,
@@ -309,6 +311,7 @@ impl Controller {
                     record.application_display_overrides = Some(application_display_overrides(
                         payload.get("config_overrides"),
                     ));
+                    record.display_policy_snapshot = Some(display_policy_snapshot(record));
                     record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
                     record.stage = Stage::LaunchApplication;
                 }
@@ -915,6 +918,26 @@ pub(super) fn application_display_overrides(config_overrides: Option<&Value>) ->
     Value::Object(display)
 }
 
+fn display_policy_snapshot(record: &Record) -> Value {
+    let application = record
+        .application_display_overrides
+        .as_ref()
+        .expect("display overrides captured at preflight");
+    let client = &record.peer.client_display_overrides;
+    let mut effective = application
+        .as_object()
+        .expect("application overrides object")
+        .clone();
+    effective.extend(client.as_object().expect("client overrides object").clone());
+    json!({
+        "catalog_revision":record.application_catalog_revision,
+        "certificate_id":record.peer.certificate_id,
+        "application_overrides":application,
+        "client_overrides":client,
+        "effective_overrides":effective,
+    })
+}
+
 fn application_preflight_response(
     record: &Record,
     payload: &Value,
@@ -951,7 +974,7 @@ fn application_preflight_response(
     ))
 }
 
-fn parse_application_config_overrides(
+pub(super) fn parse_application_config_overrides(
     value: Option<&Value>,
 ) -> Result<ApplicationConfigOverrides, &'static str> {
     let config_overrides = match value {
@@ -1105,6 +1128,7 @@ fn rtsp_response<'a>(
                     .unwrap_or(&Value::Null),
             )
         || payload["frame_limiter_executable_path"].as_str() != record.executable_path.as_deref()
+        || payload.get("display_policy_snapshot") != record.display_policy_snapshot.as_ref()
         || payload.get("display_request")
             != Some(record.display_request.as_ref().unwrap_or(&Value::Null))
     {
