@@ -529,6 +529,14 @@ impl CatalogSync {
         self.consume_response(transaction, payload).unwrap();
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_payload_for_test(&self) -> Value {
+        self.transaction
+            .as_ref()
+            .expect("catalog payload requires an in-flight transaction")
+            .payload()
+    }
+
     pub fn status(&self) -> Value {
         json!({
             "busy":self.busy(),

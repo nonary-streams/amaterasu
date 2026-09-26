@@ -172,18 +172,23 @@ impl CapturedScan {
         self,
         catalog: &mut catalog_sync::CatalogSync,
         steam_app_ids: &BTreeSet<u32>,
-    ) -> Result<(usize, SourceSignature, u64), String> {
+        current_epoch: u64,
+        enabled: bool,
+    ) -> Result<Option<(usize, SourceSignature, u64)>, String> {
+        if !enabled || self.settings_epoch != current_epoch {
+            return Ok(None);
+        }
         let count = catalog.start(
             &self.snapshot,
             &self.settings,
             steam_app_ids,
             self.source_revision,
         )?;
-        Ok((
+        Ok(Some((
             count,
             SourceSignature::from(&self.snapshot),
             self.settings_epoch,
-        ))
+        )))
     }
 }
 
@@ -285,6 +290,10 @@ impl LutrisModule {
         else {
             return;
         };
+        if settings_epoch != self.settings_epoch || !self.configuration.settings().enabled {
+            self.schedule_next_auto_sync(settings_epoch != self.settings_epoch);
+            return;
+        }
         match result {
             Ok(mut snapshot) => {
                 retain_current_artwork(
@@ -364,11 +373,17 @@ impl LutrisModule {
 
     fn start_catalog_scan(&mut self, scan: CapturedScan, steam_app_ids: &BTreeSet<u32>) {
         let settings_changed = scan.settings_epoch != self.settings_epoch;
-        match scan.start_catalog(&mut self.catalog, steam_app_ids) {
-            Ok((_, signature, settings_epoch)) => {
+        match scan.start_catalog(
+            &mut self.catalog,
+            steam_app_ids,
+            self.settings_epoch,
+            self.configuration.settings().enabled,
+        ) {
+            Ok(Some((_, signature, settings_epoch))) => {
                 self.pending_source = Some((signature, settings_epoch));
                 self.last_error = None;
             }
+            Ok(None) => self.schedule_next_auto_sync(settings_changed),
             Err(error) => {
                 self.last_error = Some(error);
                 self.last_reconciled_source = None;
@@ -1010,7 +1025,8 @@ mod tests {
         // The receipt is created only when the deduped scan starts a catalog transaction.
         let (_, signature, epoch) = pending
             .scan
-            .start_catalog(&mut catalog, &BTreeSet::new())
+            .start_catalog(&mut catalog, &BTreeSet::new(), 7, true)
+            .unwrap()
             .unwrap();
         assert_eq!(signature, SourceSignature::from(&source));
         assert_eq!(epoch, 7);
@@ -1034,7 +1050,8 @@ mod tests {
             settings_epoch: 7,
         };
         failing_scan
-            .start_catalog(&mut catalog, &BTreeSet::new())
+            .start_catalog(&mut catalog, &BTreeSet::new(), 7, true)
+            .unwrap()
             .unwrap();
         catalog.respond_for_test(json!({"ok":true,"revision":2,"generation":3,"next_sequence":0}));
         catalog.respond_for_test(json!({
@@ -1124,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn disable_during_scan_keeps_captured_settings_through_steam_dedupe() {
+    fn stale_pre_disable_scan_cannot_publish_after_reenable() {
         let scan_start_settings = ProductSettings {
             enabled: true,
             auto_sync: false,
@@ -1164,23 +1181,56 @@ mod tests {
         assert_eq!(scan.settings, scan_start_settings);
         assert!(scan.settings.include_steam);
 
-        let pending = PendingSteamRead {
-            scan,
-            reader: SteamCatalogRead::new(),
-        };
-        assert_eq!(pending.scan.settings, scan_start_settings);
-        assert!(!disabled_settings.include_steam);
-
         let mut catalog = catalog_sync::CatalogSync::default();
-        let (count, _, _) = pending
-            .scan
-            .start_catalog(&mut catalog, &[9001].into())
+        // A Steam read may finish after disable and re-enable. Its old scan
+        // must not reach the catalog even when the current settings are enabled.
+        assert!(
+            scan.start_catalog(&mut catalog, &[9001].into(), 5, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!catalog.busy());
+        assert_eq!(catalog.status()["last_import_count"], 0);
+
+        let fresh = CapturedScan {
+            snapshot: snapshot(),
+            settings: ProductSettings {
+                enabled: true,
+                auto_sync: false,
+                include_steam: true,
+                autosync_remove_uninstalled: false,
+                exclude_games: vec![Exclusion::Id("10".into())],
+            },
+            source_revision: 2,
+            settings_epoch: 5,
+        };
+        let (count, _, _) = fresh
+            .start_catalog(&mut catalog, &[9001].into(), 5, true)
+            .unwrap()
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(catalog.status()["busy"], true);
+        assert_eq!(count, 1);
         let catalog_status = catalog.status();
         assert_eq!(catalog_status["busy"], true);
-        assert_eq!(catalog_status["last_import_count"], 2);
+        assert_eq!(catalog_status["last_import_count"], 1);
         assert_eq!(catalog_status["skipped_steam_count"], 1);
+        assert_eq!(
+            catalog.pending_payload_for_test()["action"],
+            "provider_snapshot_begin"
+        );
+        catalog.respond_for_test(json!({"ok":true,"revision":1,"generation":2,"next_sequence":0}));
+        let batch = catalog.pending_payload_for_test();
+        assert_eq!(batch["entries"][0]["source_id"], "8");
+        assert_eq!(batch["selection_remove_source_ids"], json!(["10", "7"]));
+        catalog.respond_for_test(json!({"ok":true,"revision":2,"generation":2,"next_sequence":1}));
+        let finish = catalog.pending_payload_for_test();
+        assert_eq!(finish["remove_stale"], false);
+        catalog.respond_for_test(json!({
+            "ok":true,"revision":3,"generation":2,"complete":true,
+            "cleanup_pending":false,"remove_stale":false,"remove_selection":true
+        }));
+        assert_eq!(catalog.status()["busy"], false);
+        assert_eq!(catalog.status()["last_error"], Value::Null);
 
         let now = Instant::now();
         assert!(!scan_is_due(
