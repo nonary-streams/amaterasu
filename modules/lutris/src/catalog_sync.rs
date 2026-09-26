@@ -695,7 +695,7 @@ fn prepare_snapshot(
                 continue;
             }
         }
-        let entry = json!({
+        let mut entry = json!({
             "name":game.name,
             "description":format!("Imported from Lutris{}", runner_description(&game.runner)),
             "tags":["Lutris"],
@@ -708,6 +708,11 @@ fn prepare_snapshot(
                 "wait_all":false,
             }
         });
+        if let Some(revision) = snapshot.artwork_revisions.get(&game.id) {
+            entry["artwork"] = json!({
+                "provider":"lutris","game_id":game.id,"revision":revision
+            });
+        }
         validate_catalog_entry(&entry, executable)
             .map_err(|error| format!("Lutris entry {} is not catalog-safe: {error}", game.id))?;
         entries.push(json!({
@@ -919,8 +924,11 @@ fn new_sync_id(source_revision: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::artwork::ArtworkStore;
     use crate::discovery::Game;
     use crate::settings::{Exclusion, ExclusionMetadata};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     fn game(id: i64, name: &str, runner: &str, service: &str, service_id: &str) -> Game {
@@ -942,6 +950,9 @@ mod tests {
             database_path: PathBuf::from("/home/user/.local/share/lutris/pga.db"),
             lutris_executable: test_lutris_path(),
             games,
+            artwork_revisions: Default::default(),
+            artwork_scan_incomplete: false,
+            artwork_scanned_games: 0,
         }
     }
 
@@ -951,6 +962,91 @@ mod tests {
         } else {
             PathBuf::from("/usr/bin/lutris")
         }
+    }
+
+    #[test]
+    fn incomplete_artwork_scan_preserves_unvisited_references_only() {
+        let mut source = snapshot(vec![
+            game(10, "First", "wine", "", ""),
+            game(11, "Second", "wine", "", ""),
+        ]);
+        let prior = BTreeMap::from([(10, "a".repeat(64)), (11, "b".repeat(64))]);
+        source.artwork_scan_incomplete = true;
+        source.artwork_scanned_games = 1;
+        // The first game was visited and its missing image must clear.
+        crate::preserve_unscanned_artwork(&mut source, &prior);
+        let entries =
+            prepare_entries(&source, &ProductSettings::default(), &BTreeSet::new()).unwrap();
+        assert!(entries[0]["entry"].get("artwork").is_none());
+        assert_eq!(entries[1]["entry"]["artwork"]["revision"], "b".repeat(64));
+
+        source.artwork_scan_incomplete = false;
+        source.artwork_scanned_games = source.games.len();
+        source.artwork_revisions.clear();
+        crate::preserve_unscanned_artwork(&mut source, &prior);
+        let complete =
+            prepare_entries(&source, &ProductSettings::default(), &BTreeSet::new()).unwrap();
+        assert!(
+            complete
+                .iter()
+                .all(|record| record["entry"].get("artwork").is_none())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn artwork_digest_flows_from_discovery_to_catalog_and_signed_read() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("amaterasu-lutris-catalog-art-{nonce}"));
+        let data = root.join("lutris");
+        let cover = data.join("coverart/example.png");
+        std::fs::create_dir_all(cover.parent().unwrap()).unwrap();
+        std::fs::write(&cover, [b"\x89PNG\r\n\x1a\n".as_slice(), b"first"].concat()).unwrap();
+        let mut source = snapshot(vec![game(10, "Example", "wine", "", "")]);
+        source.database_path = data.join("pga.db");
+        source.artwork_revisions = ArtworkStore::revisions(&source).revisions;
+        let first = source.artwork_revisions[&10].clone();
+        assert_eq!(first.len(), 64);
+        let settings = ProductSettings::default();
+        let entries = prepare_entries(&source, &settings, &BTreeSet::new()).unwrap();
+        assert_eq!(
+            entries[0]["entry"]["artwork"],
+            json!({"provider":"lutris","game_id":10,"revision":first})
+        );
+        assert_eq!(entries[0]["source_id"], "10");
+        let mut store = ArtworkStore::default();
+        store.update(&source);
+        assert_eq!(store.read(10, &first, 0).unwrap()["revision"], first);
+
+        std::fs::write(&cover, [b"\x89PNG\r\n\x1a\n".as_slice(), b"later"].concat()).unwrap();
+        source.artwork_revisions = ArtworkStore::revisions(&source).revisions;
+        let second = source.artwork_revisions[&10].clone();
+        assert_ne!(first, second);
+        assert_eq!(
+            prepare_entries(&source, &settings, &BTreeSet::new()).unwrap()[0]["entry"]["artwork"]["revision"],
+            second
+        );
+        assert_eq!(store.read(10, &first, 0), Err("artwork_changed"));
+        assert_eq!(store.read(10, &second, 0).unwrap()["revision"], second);
+
+        let excluded = ProductSettings {
+            exclude_games: vec![crate::settings::Exclusion::Id("10".into())],
+            ..settings
+        };
+        assert!(
+            prepare_entries(&source, &excluded, &BTreeSet::new())
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_file(cover).unwrap();
+        source.artwork_revisions = ArtworkStore::revisions(&source).revisions;
+        assert!(prepare_entries(&source, &ProductSettings::default(), &BTreeSet::new()).unwrap()[0]["entry"].get("artwork").is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn respond_to_catalog(catalog: &mut CatalogSync, payload: Value) {

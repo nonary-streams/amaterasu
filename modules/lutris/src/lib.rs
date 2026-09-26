@@ -12,7 +12,7 @@ use discovery::Snapshot;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use settings::{Exclusion, ProductSettings};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -27,6 +27,8 @@ const RECONCILIATION_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 struct SourceSignature {
     executable: std::path::PathBuf,
     games: Vec<discovery::Game>,
+    artwork_revisions: std::collections::BTreeMap<i64, String>,
+    artwork_scan_incomplete: bool,
 }
 
 impl From<&Snapshot> for SourceSignature {
@@ -34,6 +36,8 @@ impl From<&Snapshot> for SourceSignature {
         Self {
             executable: snapshot.lutris_executable.clone(),
             games: snapshot.games.clone(),
+            artwork_revisions: snapshot.artwork_revisions.clone(),
+            artwork_scan_incomplete: snapshot.artwork_scan_incomplete,
         }
     }
 }
@@ -199,6 +203,8 @@ struct LutrisModule {
     manual_refresh_pending: bool,
     next_source_revision: u64,
     last_snapshot_games: usize,
+    last_artwork_scan_incomplete: bool,
+    last_artwork_revisions: BTreeMap<i64, String>,
     last_error: Option<String>,
     last_reconciled_source: Option<SourceSignature>,
     last_reconciled_at: Option<Instant>,
@@ -223,6 +229,8 @@ impl ManagedModule for LutrisModule {
             manual_refresh_pending: false,
             next_source_revision: 0,
             last_snapshot_games: 0,
+            last_artwork_scan_incomplete: false,
+            last_artwork_revisions: BTreeMap::new(),
             last_error: None,
             last_reconciled_source: None,
             last_reconciled_at: None,
@@ -259,6 +267,7 @@ impl LutrisModule {
         }
         self.observed_settings_epoch = self.settings_epoch;
         self.artwork.clear();
+        self.last_artwork_revisions.clear();
         self.last_reconciled_source = None;
         self.last_reconciled_at = None;
         let settings = self.configuration.settings();
@@ -275,8 +284,16 @@ impl LutrisModule {
             return;
         };
         match result {
-            Ok(snapshot) => {
+            Ok(mut snapshot) => {
+                retain_current_artwork(
+                    &mut snapshot,
+                    &mut self.last_artwork_revisions,
+                    settings_epoch,
+                    self.settings_epoch,
+                    self.configuration.settings().enabled,
+                );
                 self.last_snapshot_games = snapshot.games.len();
+                self.last_artwork_scan_incomplete = snapshot.artwork_scan_incomplete;
                 self.artwork.update_if_current(
                     &snapshot,
                     settings_epoch,
@@ -506,6 +523,7 @@ impl LutrisModule {
             "executable_available":available.executable_available,
             "settings_revision":self.configuration.revision(),
             "game_count":self.last_snapshot_games,
+            "artwork_scan_incomplete":self.last_artwork_scan_incomplete,
             "refresh_pending":self.manual_refresh_pending || self.snapshot_worker.busy() || self.steam_read.is_some() || self.catalog.busy(),
             "last_error":self.last_error,
             "catalog_sync":self.catalog.status(),
@@ -541,6 +559,34 @@ fn artwork_response(
         None => store.metadata(game_id),
     };
     result.unwrap_or_else(|code| json!({"ok":false,"code":code}))
+}
+
+pub(crate) fn preserve_unscanned_artwork(
+    snapshot: &mut Snapshot,
+    previous: &BTreeMap<i64, String>,
+) {
+    if !snapshot.artwork_scan_incomplete {
+        return;
+    }
+    for game in snapshot.games.iter().skip(snapshot.artwork_scanned_games) {
+        if let Some(revision) = previous.get(&game.id) {
+            snapshot.artwork_revisions.insert(game.id, revision.clone());
+        }
+    }
+}
+
+fn retain_current_artwork(
+    snapshot: &mut Snapshot,
+    previous: &mut BTreeMap<i64, String>,
+    captured_epoch: u64,
+    current_epoch: u64,
+    enabled: bool,
+) {
+    if !enabled || captured_epoch != current_epoch {
+        return;
+    }
+    preserve_unscanned_artwork(snapshot, previous);
+    *previous = snapshot.artwork_revisions.clone();
 }
 
 fn next_auto_sync_after_scan(
@@ -633,6 +679,9 @@ mod tests {
                 game(8, "steam", "steam", "9002"),
                 game(10, "wine", "", ""),
             ],
+            artwork_revisions: Default::default(),
+            artwork_scan_incomplete: false,
+            artwork_scanned_games: 3,
         }
     }
 
@@ -741,6 +790,27 @@ mod tests {
         assert!(!store.contains_game_for_test(10));
         store.update_if_current(&source, 5, 5, true);
         assert!(store.contains_game_for_test(10));
+    }
+
+    #[test]
+    fn late_old_epoch_artwork_cannot_seed_a_partial_reenable_scan() {
+        let mut previous = BTreeMap::from([(10, "a".repeat(64))]);
+        previous.clear(); // disabling invalidates the remembered source
+        let mut late = snapshot();
+        late.artwork_scan_incomplete = true;
+        late.artwork_scanned_games = 0;
+        late.artwork_revisions.insert(10, "a".repeat(64));
+        retain_current_artwork(&mut late, &mut previous, 3, 4, false);
+        assert!(previous.is_empty());
+        retain_current_artwork(&mut late, &mut previous, 3, 5, true);
+        assert!(previous.is_empty());
+
+        let mut current_partial = snapshot();
+        current_partial.artwork_scan_incomplete = true;
+        current_partial.artwork_scanned_games = 0;
+        retain_current_artwork(&mut current_partial, &mut previous, 5, 5, true);
+        assert!(!current_partial.artwork_revisions.contains_key(&10));
+        assert!(previous.is_empty());
     }
 
     fn completed_snapshot_worker(settings: ProductSettings, snapshot: Snapshot) -> SnapshotWorker {
@@ -893,6 +963,15 @@ mod tests {
         changed.games[0].service_id = "9001".into();
         changed.games[0].config_path = "/new/config.yml".into();
         assert_ne!(SourceSignature::from(&changed), signature);
+        changed.games[0].config_path = "/games/example.yml".into();
+        changed.artwork_revisions.insert(10, "a".repeat(64));
+        assert!(should_reconcile(
+            &SourceSignature::from(&changed),
+            Some(&signature),
+            Some(now),
+            false,
+            now,
+        ));
     }
 
     #[test]

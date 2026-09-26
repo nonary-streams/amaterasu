@@ -1,7 +1,7 @@
 //! Bounded, read-only discovery of the current user's installed Lutris games.
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,9 @@ pub struct Snapshot {
     pub database_path: PathBuf,
     pub lutris_executable: PathBuf,
     pub games: Vec<Game>,
+    pub artwork_revisions: BTreeMap<i64, String>,
+    pub artwork_scan_incomplete: bool,
+    pub artwork_scanned_games: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,11 +62,19 @@ pub fn discover() -> Result<Snapshot, String> {
     let lutris_executable =
         find_lutris_executable().ok_or_else(|| "lutris_executable_unavailable".to_owned())?;
     let games = scan_database(&database_path)?;
-    Ok(Snapshot {
+    let mut snapshot = Snapshot {
         database_path,
         lutris_executable,
         games,
-    })
+        artwork_revisions: BTreeMap::new(),
+        artwork_scan_incomplete: false,
+        artwork_scanned_games: 0,
+    };
+    let artwork = crate::artwork::ArtworkStore::revisions(&snapshot);
+    snapshot.artwork_revisions = artwork.revisions;
+    snapshot.artwork_scan_incomplete = artwork.incomplete;
+    snapshot.artwork_scanned_games = artwork.scanned_games;
+    Ok(snapshot)
 }
 
 pub fn availability() -> Availability {

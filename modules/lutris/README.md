@@ -75,7 +75,7 @@ captured `autosync_remove_uninstalled` value.
 
 Automatic discovery checks the installed rows every 30 seconds after the
 previous scan and catalog work finish. A catalog snapshot is submitted when the
-source rows or resolved Lutris executable change, after a settings change, or
+source rows, local image digest, or resolved Lutris executable change, after a settings change, or
 at least every five minutes to retry catalog state changes outside Lutris.
 Manual refresh always submits a snapshot. A failed scan or reconciliation is
 retried on the next automatic discovery; only a validated catalog finish records
@@ -86,8 +86,14 @@ the current enabled settings still trigger an immediate automatic scan.
 The provider status keeps `refresh_pending` true through catalog completion and
 reports a catalog failure in `last_error`; a successful later reconciliation
 clears it.
-Artwork revisions are not represented by the current Lutris snapshot, so this
-periodic retry does not refresh artwork.
+Local artwork revisions are SHA-256 digests of the validated opened image bytes.
+An image-only change updates the opaque Catalog reference on the next scan.
+Artwork discovery is limited to 256 MiB and eight seconds per snapshot; if the
+budget is reached, game rows still reconcile and provider
+status reports `artwork_scan_incomplete`. Previously known artwork revisions are
+retained for games the partial scan did not reach; a complete scan clears images
+that are genuinely absent. Readback still rejects a retained revision if the
+underlying image changed.
 
 The provider can discover local cover art by safe game slug in Lutris `coverart`
 (`png`, `jpg`, `jpeg`, `webp` in that order), falling back to installed hicolor
@@ -101,9 +107,10 @@ reads and clears the discovered image source. Re-enabling requires a new scan,
 even when automatic sync is off; a late scan captured under older settings
 cannot publish image sources. Linux reads verify the opened file descriptor's
 resolved target under the discovered data tree and use that same descriptor for
-metadata and bytes. Other platforms fail closed. Catalog artwork references and
-image delivery still require the Catalog
-consumer contract, so imported rows currently contain no artwork.
+metadata and bytes. Other platforms fail closed. Imported rows with readable
+artwork include an opaque Catalog Lutris reference; rows without artwork omit it.
+Catalog acceptance requires the canonical decimal Lutris source ID artwork
+authorization contract. Client image delivery still needs the consuming integration.
 
 Other remaining gaps are trusted per-session discovery for machine services,
 cross-user import, and launch handling for games whose Lutris client cannot be
