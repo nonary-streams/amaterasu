@@ -787,6 +787,37 @@ fn constant_rate_repeats_owned_pixels_with_monotonic_metadata_and_stops_after_er
 }
 
 #[test]
+fn closed_capture_drops_constant_rate_cache_and_requires_a_new_stream() {
+    let events = Arc::new(Mutex::new(VecDeque::from([
+        Ok(Some(frame(7, 4, &[1, 2, 3, 4, 5, 6, 7, 8]))),
+        Err(CaptureError::new("access_lost", "capture item closed")),
+        Ok(None),
+    ])));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut controller = Controller::new(
+        FakeBackend {
+            events: events.clone(),
+            geometries: Arc::new(Mutex::new(VecDeque::new())),
+            drops: drops.clone(),
+        },
+        true,
+    );
+    let stream = open_constant_rate(&mut controller, "owner");
+
+    assert!(controller.read("owner", stream, 0).unwrap().is_some());
+    assert_eq!(
+        controller.read("owner", stream, 0).unwrap_err().code,
+        "access_lost"
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        controller.read("owner", stream, 0).unwrap_err().code,
+        "not_found"
+    );
+    assert_eq!(events.lock().unwrap().len(), 1);
+}
+
+#[test]
 fn v1_3_capture_callback_preserves_acquisition_time_across_timestamp_rewrite_and_reuse() {
     let mut acquired = frame(0, 4, &[1, 2, 3, 4, 5, 6, 7, 8]);
     acquired.capture_pacing_timestamp_us = 123;

@@ -291,17 +291,36 @@ fn capture_geometry_error(error: GeometryError) -> CaptureError {
 
 impl FrameSource for Session {
     fn poll(&mut self) -> CaptureResult<Option<Frame>> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(CaptureError::new(
+        let closed = self.closed.clone();
+        while_item_open(&closed, || {
+            if !self.readback.pending() && !self.acquire()? {
+                return Ok(None);
+            }
+            self.readback.poll()
+        })
+    }
+}
+
+fn while_item_open<T>(
+    closed: &AtomicBool,
+    poll: impl FnOnce() -> CaptureResult<T>,
+) -> CaptureResult<T> {
+    let check_open = || {
+        if closed.load(Ordering::Acquire) {
+            Err(CaptureError::new(
                 "access_lost",
                 "capture monitor closed; enumerate and reopen",
-            ));
+            ))
+        } else {
+            Ok(())
         }
-        if !self.readback.pending() && !self.acquire()? {
-            return Ok(None);
-        }
-        self.readback.poll()
-    }
+    };
+    check_open()?;
+    let result = poll()?;
+    // A queued GPU readback may complete after GraphicsCaptureItem.Closed.
+    // Never hand those pixels to a stream that must now be reopened.
+    check_open()?;
+    Ok(result)
 }
 
 impl Drop for Session {
@@ -361,5 +380,31 @@ impl Drop for Apartment {
     fn drop(&mut self) {
         // SAFETY: paired with successful RoInitialize on this worker.
         unsafe { RoUninitialize() };
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn closed_item_discards_a_frame_completed_during_readback() {
+        let closed = AtomicBool::new(false);
+        let result = while_item_open(&closed, || {
+            closed.store(true, Ordering::Release);
+            Ok(Some(42))
+        });
+
+        assert!(matches!(result, Err(error) if error.code == "access_lost"));
+    }
+
+    #[test]
+    fn closed_item_never_starts_a_new_readback() {
+        let closed = AtomicBool::new(true);
+        let result = while_item_open(&closed, || -> CaptureResult<Option<u32>> {
+            panic!("closed capture must not poll its readback")
+        });
+
+        assert!(matches!(result, Err(error) if error.code == "access_lost"));
     }
 }
