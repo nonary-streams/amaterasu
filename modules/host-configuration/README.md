@@ -111,7 +111,9 @@ may still have committed; read the current revision before retrying.
 
 `update` is a full replacement. `expected_revision` compares to the document
 revision. Before writing, the provider checks diagnostics `status` under its
-signed call grant. It normally requires `ready:true`. For the exact default
+signed call grant. The status must include a boolean readiness marker, a null
+or positive applied configuration revision, and a valid sink state and failure.
+It normally requires `ready:true`. For the exact default
 document at state revision zero, it accepts the initial `ready:false` status
 only when diagnostics reports no applied revision and a disabled sink without
 failure. That permits the first write that diagnostics needs to become ready.
@@ -142,8 +144,12 @@ An explicit diagnostics rejection triggers a state CAS restoring the previous
 settings at the next document revision. The provider then directly applies that
 restored document to diagnostics. Only matching applied-revision confirmation
 reports `logging_apply_failed` with `logging.status: "rolled_back"`. A failed
-or ambiguous restored-logging apply reports `logging_rollback_application_unconfirmed`
-with the saved and restored revisions; callers must inspect diagnostics status.
+or ambiguous restored-logging apply reports `logging_rollback_unconfirmed` with
+`logging.status: "rollback_application_unconfirmed"` and the saved and restored
+revisions; callers must inspect diagnostics status. If the original management
+request ended during durable rollback, the provider retries restored logging
+with a detached signed diagnostics request and still reports an unconfirmed
+management outcome.
 If the compensating write is explicitly rejected, it reports `logging_rollback_failed`
 with `logging.status: "rollback_failed"`. An ambiguous compensation reports
 `logging_rollback_unconfirmed`. When a write or diagnostics apply

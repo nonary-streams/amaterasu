@@ -413,6 +413,13 @@ impl Pipeline {
                     };
                 }
                 if let Stage::Preflighting(update) = pending.stage {
+                    if !valid_diagnostics_status(&payload) {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            unavailable("diagnostics status preflight was malformed"),
+                        );
+                    }
                     let ready = payload.get("ready").and_then(Value::as_bool) == Some(true);
                     let initial_unready = update.allow_unready_bootstrap
                         && payload.get("ready").and_then(Value::as_bool) == Some(false)
@@ -902,24 +909,41 @@ impl Pipeline {
         let remaining_ms = original_deadline
             .saturating_duration_since(Instant::now())
             .as_millis() as u64;
-        let parented = remaining_ms > 0;
-        let deadline = if parented {
-            original_deadline
-        } else {
-            Instant::now() + Duration::from_millis(MAX_REQUEST_MS)
-        };
-        let result = send(Command::Request {
-            service: DIAGNOSTICS_SERVICE.into(),
-            payload: json!({"action":"apply_host_logging","configuration":restored_configuration}),
-            timeout_ms: if parented {
-                remaining_ms.min(MAX_REQUEST_MS)
-            } else {
-                MAX_REQUEST_MS
-            },
-            operation_id: format!("host-configuration.{request_id}.restore-logging"),
-            parent: parented.then_some(request_id),
+        let parented_result = (remaining_ms > 0).then(|| {
+            send(Command::Request {
+                service: DIAGNOSTICS_SERVICE.into(),
+                payload: json!({"action":"apply_host_logging","configuration":restored_configuration}),
+                timeout_ms: remaining_ms.min(MAX_REQUEST_MS),
+                operation_id: format!("host-configuration.{request_id}.restore-logging"),
+                parent: Some(request_id),
+            })
         });
-        let Ok(Response::Accepted { id }) = result else {
+        let use_detached = match parented_result {
+            None => true,
+            Some(Ok(Response::Error { code, .. }))
+                if code == "permission_denied"
+                    || code == "request_ended"
+                    || code == "not_found" =>
+            {
+                true
+            }
+            Some(Ok(Response::Accepted { id })) => {
+                self.pending = Some(Pending {
+                    request_id,
+                    deadline: original_deadline,
+                    state_request_id: id,
+                    stage: Stage::Compensating {
+                        saved_revision,
+                        restored_revision,
+                        parented: true,
+                    },
+                    phase: PendingPhase::Waiting,
+                });
+                return Ok(());
+            }
+            _ => false,
+        };
+        if !use_detached {
             return complete(
                 send,
                 request_id,
@@ -929,15 +953,33 @@ impl Pipeline {
                     "diagnostics did not accept restored logging apply",
                 ),
             );
+        }
+        let detached_result = send(Command::Request {
+            service: DIAGNOSTICS_SERVICE.into(),
+            payload: json!({"action":"apply_host_logging","configuration":restored_configuration}),
+            timeout_ms: MAX_REQUEST_MS,
+            operation_id: format!("host-configuration.{request_id}.restore-logging-detached"),
+            parent: None,
+        });
+        let Ok(Response::Accepted { id }) = detached_result else {
+            return complete(
+                send,
+                request_id,
+                rollback_application_unconfirmed(
+                    saved_revision,
+                    restored_revision,
+                    "diagnostics did not accept detached restored logging apply",
+                ),
+            );
         };
         self.pending = Some(Pending {
             request_id,
-            deadline,
+            deadline: Instant::now() + Duration::from_millis(MAX_REQUEST_MS),
             state_request_id: id,
             stage: Stage::Compensating {
                 saved_revision,
                 restored_revision,
-                parented,
+                parented: false,
             },
             phase: PendingPhase::Waiting,
         });
@@ -1018,9 +1060,31 @@ fn rollback_application_unconfirmed(
 ) -> Value {
     json!({
         "ok":false,
-        "error":{"code":"logging_rollback_application_unconfirmed","message":format!("{}; GET configuration and diagnostics status before retrying", message.into())},
+        "error":{"code":"logging_rollback_unconfirmed","message":format!("{}; GET configuration and diagnostics status before retrying", message.into())},
         "logging":{"saved_revision":saved_revision,"restored_revision":restored_revision,"applied_revision":null,"status":"rollback_application_unconfirmed"}
     })
+}
+
+fn valid_diagnostics_status(payload: &Value) -> bool {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true)
+        || payload.get("ready").and_then(Value::as_bool).is_none()
+    {
+        return false;
+    }
+    match payload.get("logging_configuration_revision") {
+        Some(Value::Null) => {}
+        Some(Value::Number(revision)) if revision.as_u64().is_some_and(|value| value > 0) => {}
+        _ => return false,
+    }
+    let state = payload
+        .pointer("/logging_sink/state")
+        .and_then(Value::as_str);
+    let failure = payload.pointer("/logging_sink/failure");
+    match (state, failure) {
+        (Some("disabled" | "healthy"), Some(Value::Null)) => true,
+        (Some("failed"), Some(Value::String(kind))) if kind == "open" || kind == "write" => true,
+        _ => false,
+    }
 }
 
 fn save_unconfirmed(attempted_revision: u64) -> Value {

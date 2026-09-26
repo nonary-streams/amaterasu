@@ -204,7 +204,7 @@ fn management_update_uses_store_revision_cas_and_returns_only_after_confirmation
                     Ok(Response::Accepted { id: 23 })
                 }
                 (3, Command::TakeResult { request: 23 }) => Ok(Response::Result {
-                    payload: json!({"ok":true,"ready":true,"applied_revision":5}),
+                    payload: json!({"ok":true,"ready":true,"logging_configuration_revision":5,"logging_sink":{"state":"healthy","failure":null}}),
                 }),
                 (3, Command::ReleaseResult { request: 23 }) => Ok(Response::Ok),
                 (
@@ -378,7 +378,7 @@ fn failed_logging_apply_restores_previous_document_with_a_new_revision() {
                     Ok(Response::Accepted { id: 23 })
                 }
                 (3, Command::TakeResult { request: 23 }) => Ok(Response::Result {
-                    payload: json!({"ok":true,"ready":true}),
+                    payload: json!({"ok":true,"ready":true,"logging_configuration_revision":5,"logging_sink":{"state":"healthy","failure":null}}),
                 }),
                 (3, Command::ReleaseResult { request: 23 }) => Ok(Response::Ok),
                 (3, Command::Request { payload, .. }) => {
@@ -525,10 +525,92 @@ fn restored_state_without_confirmed_diagnostics_reapply_reports_divergence() {
     }
 
     let response = completed.unwrap();
+    assert_eq!(response["error"]["code"], "logging_rollback_unconfirmed");
+    assert_eq!(response["logging"]["restored_revision"], 7);
+    assert_eq!(response["logging"]["applied_revision"], Value::Null);
     assert_eq!(
-        response["error"]["code"],
-        "logging_rollback_application_unconfirmed"
+        response["logging"]["status"],
+        "rollback_application_unconfirmed"
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ended_parent_retries_restored_logging_detached_without_claiming_rollback() {
+    let root = test_root();
+    let restored = Document::from_settings(7, crate::settings::Settings::default());
+    let mut pipeline = Pipeline::new(Ok(root.clone()));
+    pipeline.pending = Some(Pending {
+        request_id: 7,
+        deadline: Instant::now() + Duration::from_secs(30),
+        state_request_id: 26,
+        stage: Stage::RollingBack {
+            saved_revision: 6,
+            expected_state_revision: 13,
+            original_deadline: Instant::now() + Duration::from_secs(30),
+            restored_configuration: Some(build_read_response(&restored, &root).unwrap()),
+        },
+        phase: PendingPhase::Waiting,
+    });
+    let mut completed = None;
+    let mut detached_applied = false;
+    for tick_number in 1..=2 {
+        pipeline
+            .tick(|command| match (tick_number, command) {
+                (1, Command::TakeResult { request: 26 }) => Ok(Response::Result {
+                    payload: json!({"ok":true,"revision":14}),
+                }),
+                (1, Command::ReleaseResult { request: 26 }) => Ok(Response::Ok),
+                (
+                    1,
+                    Command::Request {
+                        service,
+                        payload,
+                        parent: Some(7),
+                        operation_id,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(service, DIAGNOSTICS_SERVICE);
+                    assert_eq!(payload["configuration"]["revision"], 7);
+                    assert!(operation_id.ends_with("restore-logging"));
+                    Ok(Response::error(
+                        "permission_denied",
+                        "management parent ended",
+                    ))
+                }
+                (
+                    1,
+                    Command::Request {
+                        service,
+                        payload,
+                        parent: None,
+                        operation_id,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(service, DIAGNOSTICS_SERVICE);
+                    assert_eq!(payload["configuration"]["revision"], 7);
+                    assert!(operation_id.ends_with("restore-logging-detached"));
+                    detached_applied = true;
+                    Ok(Response::Accepted { id: 27 })
+                }
+                (2, Command::TakeResult { request: 27 }) => Ok(Response::Result {
+                    payload: json!({"ok":true,"applied_revision":7}),
+                }),
+                (2, Command::ReleaseResult { request: 27 }) => Ok(Response::Ok),
+                (2, Command::Complete { payload, .. }) => {
+                    completed = Some(payload);
+                    Ok(Response::Ok)
+                }
+                (_, Command::Poll {}) => Ok(Response::Pending),
+                (_, command) => panic!("unexpected detached compensation command: {command:?}"),
+            })
+            .unwrap();
+    }
+    assert!(detached_applied);
+    let response = completed.unwrap();
+    assert_eq!(response["error"]["code"], "logging_rollback_unconfirmed");
     assert_eq!(response["logging"]["restored_revision"], 7);
     assert_eq!(response["logging"]["applied_revision"], Value::Null);
     assert_eq!(
@@ -892,7 +974,7 @@ fn durable_update_applies_logging_then_provider_reload_reads_saved_settings() {
 }
 
 #[test]
-fn unready_diagnostics_preflight_only_allows_exact_initial_bootstrap_status() {
+fn preflight_rejects_later_unready_and_malformed_diagnostics_status() {
     let initial_status = json!({
         "ok":true,"ready":false,"logging_configuration_revision":null,
         "logging_sink":{"state":"disabled","failure":null}
@@ -914,6 +996,22 @@ fn unready_diagnostics_preflight_only_allows_exact_initial_bootstrap_status() {
             0,
             false,
             json!({"ok":true,"ready":false,"logging_configuration_revision":null,"logging_sink":{"state":"failed","failure":"open"}}),
+        ),
+        (1, false, json!({"ok":true,"ready":true})),
+        (
+            1,
+            false,
+            json!({"ok":true,"ready":true,"logging_configuration_revision":1}),
+        ),
+        (
+            1,
+            false,
+            json!({"ok":true,"ready":true,"logging_configuration_revision":0,"logging_sink":{"state":"healthy","failure":null}}),
+        ),
+        (
+            1,
+            false,
+            json!({"ok":true,"ready":true,"logging_configuration_revision":1,"logging_sink":{"state":"failed","failure":null}}),
         ),
     ];
 
