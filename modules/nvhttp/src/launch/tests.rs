@@ -1076,6 +1076,9 @@ struct Broker {
     rtsp_executable_path: Option<String>,
     wrong_rtsp_snapshot: bool,
     wrong_rtsp_display_policy_snapshot: bool,
+    reject_rtsp_display_apply: bool,
+    missing_rtsp_display_readback: bool,
+    reject_launch_export: bool,
     wrong_application_display_overrides: bool,
     display_entries: Vec<Value>,
     display_snapshot_ids: Vec<String>,
@@ -1128,6 +1131,9 @@ impl Default for Broker {
             rtsp_executable_path: None,
             wrong_rtsp_snapshot: false,
             wrong_rtsp_display_policy_snapshot: false,
+            reject_rtsp_display_apply: false,
+            missing_rtsp_display_readback: false,
+            reject_launch_export: false,
             wrong_application_display_overrides: false,
             display_entries: Vec::new(),
             display_snapshot_ids: Vec::new(),
@@ -1235,6 +1241,9 @@ impl Broker {
             };
         }
         if service == "amaterasu.rtsp/1" && action == "open" {
+            if self.reject_rtsp_display_apply && payload.get("display_request").is_some() {
+                return json!({"ok":false,"code":"display_apply_failed"});
+            }
             self.rtsp_snapshot = payload.get("frame_limiter_settings").cloned();
             self.rtsp_display_policy_snapshot = payload.get("display_policy_snapshot").cloned();
             self.rtsp_display_request = payload.get("display_request").cloned();
@@ -1260,11 +1269,19 @@ impl Broker {
         {
             return json!({"ok":false,"code":"not_found"});
         }
-        if service == "amaterasu.rtsp/1" && self.unavailable_output.is_some() && action == "lookup"
+        if service == "amaterasu.rtsp/1"
+            && (self.unavailable_output.is_some() || self.reject_rtsp_display_apply)
+            && action == "lookup"
         {
             return json!({"ok":false,"code":"ticket_not_found"});
         }
         if service == "amaterasu.launch/1" {
+            if action == "launch_export" && self.reject_launch_export {
+                return json!({"ok":false,"code":"display_admission_denied"});
+            }
+            if action == "lookup" && self.reject_launch_export {
+                return json!({"ok":false,"code":"launch_not_found"});
+            }
             if action == "prepare_display_admission" {
                 if self.reject_display_admission {
                     return json!({"ok":false,"code":"display_admission_denied"});
@@ -1419,6 +1436,8 @@ impl Broker {
         self.wrong_rtsp_snapshot = false;
         let wrong_rtsp_display_policy_snapshot = self.wrong_rtsp_display_policy_snapshot;
         self.wrong_rtsp_display_policy_snapshot = false;
+        let missing_rtsp_display_readback = self.missing_rtsp_display_readback;
+        self.missing_rtsp_display_readback = false;
         json!({
             "ok": true,
             "ticket": 71,
@@ -1439,6 +1458,8 @@ impl Broker {
                 self.rtsp_display_policy_snapshot.clone().unwrap_or(Value::Null)
             },
             "display_request": self.rtsp_display_request.clone().unwrap_or(Value::Null),
+            "display_applied": state == "ready" && self.rtsp_display_request.is_some()
+                && !missing_rtsp_display_readback,
             "failure": null,
             "cleanup_error": if state == "cleanup_failed" {
                 Value::String("fixture_failure".into())

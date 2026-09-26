@@ -230,6 +230,28 @@ fn selected_two_monitor_mutation_attests_full_topology_and_physical_5994_mode() 
         "disabled"
     );
     assert_eq!(broker.rtsp_display_request.as_ref(), Some(display_request));
+    let actions = broker.actions();
+    let position = |service: &str, action: &str| {
+        actions
+            .iter()
+            .position(|(seen_service, seen_action)| *seen_service == service && *seen_action == action)
+            .expect("required launch phase")
+    };
+    assert!(position("amaterasu.launch/1", "preflight_export")
+        < position("amaterasu.launch/1", "prepare_display_admission"));
+    assert!(position("amaterasu.launch/1", "prepare_display_admission")
+        < position("amaterasu.rtsp/1", "open"));
+    assert!(position("amaterasu.rtsp/1", "open")
+        < position("amaterasu.launch/1", "launch_export"));
+    let export = broker.commands.iter().find_map(|command| match command {
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.launch/1" && payload["action"] == "launch_export" =>
+        {
+            Some(payload)
+        }
+        _ => None,
+    }).unwrap();
+    assert_eq!(export["display_admission_token"], open["display_admission_token"]);
     controller.reply_delivered(10, now);
     let retry = controller
         .launch(11, stream, paired, now)
@@ -275,7 +297,7 @@ fn active_target_allows_active_and_primary_options_in_full_topology() {
 }
 
 #[test]
-fn unsupported_or_changed_display_facts_fail_before_launch_or_rtsp() {
+fn unsupported_or_changed_display_facts_fail_before_application_success() {
     for case in [
         "inactive_target",
         "rotation_null",
@@ -303,13 +325,17 @@ fn unsupported_or_changed_display_facts_fail_before_launch_or_rtsp() {
         assert!(controller.launch(10, request(43), peer(43), now).is_none());
         let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
         assert_ne!(reply.status, 200, "{case}");
-        assert!(
-            !broker
-                .actions()
-                .iter()
-                .any(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open"),
-            "{case}"
-        );
+        if case != "catalog_revision" {
+            assert!(
+                !broker
+                    .actions()
+                    .iter()
+                    .any(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open"),
+                "{case}"
+            );
+        } else {
+            assert!(broker.rtsp_closed, "staged display must be restored after launch drift");
+        }
         if matches!(
             case,
             "inactive_target" | "rotation_null" | "topology_bytes" | "hdr_auto" | "optimize_unknown"
@@ -323,5 +349,33 @@ fn unsupported_or_changed_display_facts_fail_before_launch_or_rtsp() {
                 "{case}"
             );
         }
+    }
+}
+
+#[test]
+fn failed_display_stage_never_starts_application_and_failed_export_restores_rtsp() {
+    for case in ["apply_failed", "readback_missing", "export_rejected"] {
+        let now = Instant::now();
+        let (mut controller, mut broker) =
+            mutating_display_fixture("ensure_only_display", true);
+        broker.reject_rtsp_display_apply = case == "apply_failed";
+        broker.missing_rtsp_display_readback = case == "readback_missing";
+        broker.reject_launch_export = case == "export_rejected";
+        assert!(controller.launch(10, request(44), peer(44), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_ne!(reply.status, 200, "{case}");
+        let actions = broker.actions();
+        if case != "export_rejected" {
+            assert!(
+                !actions.iter().any(|(service, action)|
+                    *service == "amaterasu.launch/1" && *action == "launch_export"),
+                "{case}"
+            );
+        }
+        if case != "apply_failed" {
+            assert!(broker.rtsp_closed, "{case}: staged RTSP must be closed");
+        }
+        assert!(!actions.iter().any(|(service, action)|
+            *service == "amaterasu.display/1" && *action == "apply"));
     }
 }

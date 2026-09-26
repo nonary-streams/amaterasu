@@ -179,6 +179,7 @@ impl Controller {
                         "global_preparation": record.global_preparation,
                         "legacy_global_preparation": record.legacy_global_preparation,
                         "preflight_token": record.application_preflight_token,
+                        "display_admission_token": record.display_admission_token,
                         "application_display_overrides": record.application_display_overrides,
                         "frame_limiter_settings": record.frame_limiter_snapshot,
                         "client_frame_limiter_overrides":
@@ -369,12 +370,18 @@ impl Controller {
                     let frozen_overrides = record
                         .application_preflight_overrides
                         .as_ref()
-                        .expect("validated preflight overrides");
-                    if record.request.audio_channels != 2
-                        && (!effective_stream_audio(record, frozen_overrides)
-                            || resolved_virtual_sink(record, frozen_overrides).is_none())
+                        .expect("validated preflight overrides")
+                        .clone();
+                    let mut profile = self
+                        .config
+                        .as_ref()
+                        .expect("enabled streaming config")
+                        .profile
+                        .clone();
+                    if let Err(code) =
+                        project_application_policy(record, &frozen_overrides, &mut profile)
                     {
-                        fail_record(record, "surround_audio_requires_stream_sink", now);
+                        fail_record(record, code, now);
                         self.finish_or_retain(job.record, now, replies);
                         return;
                     }
@@ -436,7 +443,11 @@ impl Controller {
                     match build_display_request(record) {
                         Ok(request) => {
                             record.display_request = request;
-                            record.stage = Stage::LaunchApplication;
+                            record.stage = if record.display_request.is_some() {
+                                Stage::PrepareDisplayAdmission
+                            } else {
+                                Stage::LaunchApplication
+                            };
                         }
                         Err(code) => fail_record(record, code, now),
                     }
@@ -487,146 +498,10 @@ impl Controller {
                                     self.finish_or_retain(job.record, now, replies);
                                     return;
                                 }
-                                record.scoped_ds4_back_as_touchpad_click =
-                                    application_overrides.ds4_back_as_touchpad_click;
-                                let application_fec_percentage =
-                                    application_overrides.fec_percentage;
-                                record.application_fec_percentage = application_fec_percentage;
-                                record.effective_fec_percentage = record
-                                    .peer
-                                    .client_fec_percentage
-                                    .or(application_fec_percentage)
-                                    .unwrap_or(record.global_fec_percentage);
-                                record.effective_max_bitrate_kbps = resolve_max_bitrate_kbps(
-                                    record.peer.client_max_bitrate,
-                                    application_overrides.max_bitrate,
-                                    record.global_max_bitrate_kbps,
-                                );
-                                record.effective_minimum_fps_target = record
-                                    .peer
-                                    .client_minimum_fps_target
-                                    .or(application_overrides.minimum_fps_target)
-                                    .unwrap_or(record.global_minimum_fps_target);
-                                record.effective_video_max_batch_size_kb = record
-                                    .peer
-                                    .client_video_max_batch_size_kb
-                                    .or(application_overrides.video_max_batch_size_kb)
-                                    .unwrap_or(record.global_video_max_batch_size_kb);
-                                record.application_stream_audio =
-                                    application_overrides.stream_audio;
-                                record.effective_stream_audio =
-                                    effective_stream_audio(record, &application_overrides);
-                                let scoped_audio_sink = record
-                                    .peer
-                                    .client_audio_sink
-                                    .as_deref()
-                                    .or(application_overrides.audio_sink.as_deref());
-                                // An explicit virtual selector wins over regular endpoint settings.
-                                // Empty means no managed selector; source host-audio fallback is
-                                // unavailable because Amaterasu has no host-audio toggle yet.
-                                record.resolved_virtual_sink =
-                                    resolved_virtual_sink(record, &application_overrides);
-                                let resolved_configured_audio_sink =
-                                    if record.resolved_virtual_sink.is_some() {
-                                        None
-                                    } else {
-                                        match scoped_audio_sink {
-                                            Some("") => None,
-                                            Some(audio_sink) => Some(audio_sink.to_owned()),
-                                            None => record.global_configured_audio_sink.clone(),
-                                        }
-                                    };
-                                record.audio_endpoint = if record.resolved_virtual_sink.is_some() {
-                                    String::new()
+                                if record.display_request.is_some() {
+                                    complete_launch(record, now, replies);
                                 } else {
-                                    resolved_configured_audio_sink
-                                        .as_deref()
-                                        .unwrap_or(&record.bootstrap_audio_endpoint)
-                                        .to_owned()
-                                };
-                                // A selected virtual sink wins over all regular endpoint
-                                // overrides. Empty scoped selectors explicitly clear inheritance.
-                                record.capture_sink_without_routing = capture_sink_without_routing(
-                                    record.global_audio_sink_capture_only,
-                                    AudioSinkCaptureOnlyOverrides {
-                                        application: application_overrides.audio_sink_capture_only,
-                                        client: record.peer.client_audio_sink_capture_only,
-                                    },
-                                    resolved_configured_audio_sink.as_deref(),
-                                    &record.audio_endpoint,
-                                    record.resolved_virtual_sink.as_deref(),
-                                );
-                                if record.request.audio_channels != 2
-                                    && (record.resolved_virtual_sink.is_none()
-                                        || !record.effective_stream_audio)
-                                {
-                                    fail_record(record, "surround_audio_requires_stream_sink", now);
-                                    self.finish_or_retain(job.record, now, replies);
-                                    return;
-                                }
-                                record.scoped_back_button_timeout = record
-                                    .peer
-                                    .client_back_button_timeout
-                                    .or(application_overrides.back_button_timeout);
-                                record.scoped_controller = record
-                                    .peer
-                                    .client_controller
-                                    .or(application_overrides.controller);
-                                record.scoped_gamepad = record
-                                    .peer
-                                    .client_gamepad
-                                    .clone()
-                                    .or(application_overrides.gamepad);
-                                record.scoped_keyboard = record
-                                    .peer
-                                    .client_keyboard
-                                    .or(application_overrides.keyboard);
-                                record.scoped_mouse =
-                                    record.peer.client_mouse.or(application_overrides.mouse);
-                                record.scoped_native_pen_touch = record
-                                    .peer
-                                    .client_native_pen_touch
-                                    .or(application_overrides.native_pen_touch);
-                                record.scoped_high_resolution_scrolling = record
-                                    .peer
-                                    .client_high_resolution_scrolling
-                                    .or(application_overrides.high_resolution_scrolling);
-                                record.scoped_always_send_scancodes = record
-                                    .peer
-                                    .client_always_send_scancodes
-                                    .or(application_overrides.always_send_scancodes);
-                                record.scoped_key_rightalt_to_key_win = record
-                                    .peer
-                                    .client_key_rightalt_to_key_win
-                                    .or(application_overrides.key_rightalt_to_key_win);
-                                record.scoped_key_repeat_delay = record
-                                    .peer
-                                    .client_key_repeat_delay
-                                    .or(application_overrides.key_repeat_delay);
-                                record.scoped_key_repeat_frequency = record
-                                    .peer
-                                    .client_key_repeat_frequency
-                                    .or(application_overrides.key_repeat_frequency);
-                                let mut profile = self
-                                    .config
-                                    .as_ref()
-                                    .expect("enabled streaming config")
-                                    .profile
-                                    .clone();
-                                profile.fec_percentage = record.effective_fec_percentage;
-                                if record
-                                    .effective_max_bitrate_kbps
-                                    .is_some_and(|bitrate| bitrate < 100)
-                                {
-                                    fail_record(record, "max_bitrate_below_encoder_minimum", now);
-                                } else if profile.validate().is_ok() {
-                                    record.stage = if record.display_request.is_some() {
-                                        Stage::PrepareDisplayAdmission
-                                    } else {
-                                        Stage::OpenRtsp
-                                    };
-                                } else {
-                                    fail_record(record, "invalid_streaming_profile_override", now);
+                                    record.stage = Stage::OpenRtsp;
                                 }
                             }
                             Err(code) => fail_record(record, code, now),
@@ -666,15 +541,10 @@ impl Controller {
                 Ok((ticket, url, "ready", true)) if record.state == State::Starting => {
                     record.rtsp_ticket = Some(ticket);
                     record.rtsp_url = Some(url.to_owned());
-                    record.state = State::AwaitingDelivery;
-                    record.stage = Stage::AwaitingDelivery;
-                    if let Some(connection) = record.launch_connection {
-                        replies.push((connection, success_reply(record)));
+                    if record.display_request.is_some() && record.application_launch.is_none() {
+                        record.stage = Stage::LaunchApplication;
                     } else {
-                        record.request_cleanup(
-                            Some("launch_response_unavailable"),
-                            now + CLEANUP_DEADLINE,
-                        );
+                        complete_launch(record, now, replies);
                     }
                 }
                 Ok((ticket, _, _, _)) => {
@@ -1344,6 +1214,143 @@ fn fail_record(record: &mut Record, code: &'static str, now: Instant) {
     record.request_cleanup(Some(code), now + CLEANUP_DEADLINE);
 }
 
+fn complete_launch(record: &mut Record, now: Instant, replies: &mut Vec<(u64, Reply)>) {
+    record.state = State::AwaitingDelivery;
+    record.stage = Stage::AwaitingDelivery;
+    if let Some(connection) = record.launch_connection {
+        replies.push((connection, success_reply(record)));
+    } else {
+        record.request_cleanup(Some("launch_response_unavailable"), now + CLEANUP_DEADLINE);
+    }
+}
+
+fn project_application_policy(
+    record: &mut Record,
+    application_overrides: &ApplicationConfigOverrides,
+    profile: &mut super::StreamProfile,
+) -> Result<(), &'static str> {
+    record.scoped_ds4_back_as_touchpad_click = application_overrides.ds4_back_as_touchpad_click;
+    let application_fec_percentage = application_overrides.fec_percentage;
+    record.application_fec_percentage = application_fec_percentage;
+    record.effective_fec_percentage = record
+        .peer
+        .client_fec_percentage
+        .or(application_fec_percentage)
+        .unwrap_or(record.global_fec_percentage);
+    record.effective_max_bitrate_kbps = resolve_max_bitrate_kbps(
+        record.peer.client_max_bitrate,
+        application_overrides.max_bitrate,
+        record.global_max_bitrate_kbps,
+    );
+    record.effective_minimum_fps_target = record
+        .peer
+        .client_minimum_fps_target
+        .or(application_overrides.minimum_fps_target)
+        .unwrap_or(record.global_minimum_fps_target);
+    record.effective_video_max_batch_size_kb = record
+        .peer
+        .client_video_max_batch_size_kb
+        .or(application_overrides.video_max_batch_size_kb)
+        .unwrap_or(record.global_video_max_batch_size_kb);
+    record.application_stream_audio = application_overrides.stream_audio;
+    record.effective_stream_audio = effective_stream_audio(record, application_overrides);
+    let scoped_audio_sink = record
+        .peer
+        .client_audio_sink
+        .as_deref()
+        .or(application_overrides.audio_sink.as_deref());
+    // An explicit virtual selector wins over regular endpoint settings.
+    // Empty means no managed selector; source host-audio fallback is
+    // unavailable because Amaterasu has no host-audio toggle yet.
+    record.resolved_virtual_sink = resolved_virtual_sink(record, application_overrides);
+    let resolved_configured_audio_sink = if record.resolved_virtual_sink.is_some() {
+        None
+    } else {
+        match scoped_audio_sink {
+            Some("") => None,
+            Some(audio_sink) => Some(audio_sink.to_owned()),
+            None => record.global_configured_audio_sink.clone(),
+        }
+    };
+    record.audio_endpoint = if record.resolved_virtual_sink.is_some() {
+        String::new()
+    } else {
+        resolved_configured_audio_sink
+            .as_deref()
+            .unwrap_or(&record.bootstrap_audio_endpoint)
+            .to_owned()
+    };
+    // A selected virtual sink wins over all regular endpoint
+    // overrides. Empty scoped selectors explicitly clear inheritance.
+    record.capture_sink_without_routing = capture_sink_without_routing(
+        record.global_audio_sink_capture_only,
+        AudioSinkCaptureOnlyOverrides {
+            application: application_overrides.audio_sink_capture_only,
+            client: record.peer.client_audio_sink_capture_only,
+        },
+        resolved_configured_audio_sink.as_deref(),
+        &record.audio_endpoint,
+        record.resolved_virtual_sink.as_deref(),
+    );
+    if record.request.audio_channels != 2
+        && (record.resolved_virtual_sink.is_none() || !record.effective_stream_audio)
+    {
+        return Err("surround_audio_requires_stream_sink");
+    }
+    record.scoped_back_button_timeout = record
+        .peer
+        .client_back_button_timeout
+        .or(application_overrides.back_button_timeout);
+    record.scoped_controller = record
+        .peer
+        .client_controller
+        .or(application_overrides.controller);
+    record.scoped_gamepad = record
+        .peer
+        .client_gamepad
+        .clone()
+        .or(application_overrides.gamepad.clone());
+    record.scoped_keyboard = record
+        .peer
+        .client_keyboard
+        .or(application_overrides.keyboard);
+    record.scoped_mouse = record.peer.client_mouse.or(application_overrides.mouse);
+    record.scoped_native_pen_touch = record
+        .peer
+        .client_native_pen_touch
+        .or(application_overrides.native_pen_touch);
+    record.scoped_high_resolution_scrolling = record
+        .peer
+        .client_high_resolution_scrolling
+        .or(application_overrides.high_resolution_scrolling);
+    record.scoped_always_send_scancodes = record
+        .peer
+        .client_always_send_scancodes
+        .or(application_overrides.always_send_scancodes);
+    record.scoped_key_rightalt_to_key_win = record
+        .peer
+        .client_key_rightalt_to_key_win
+        .or(application_overrides.key_rightalt_to_key_win);
+    record.scoped_key_repeat_delay = record
+        .peer
+        .client_key_repeat_delay
+        .or(application_overrides.key_repeat_delay);
+    record.scoped_key_repeat_frequency = record
+        .peer
+        .client_key_repeat_frequency
+        .or(application_overrides.key_repeat_frequency);
+    profile.fec_percentage = record.effective_fec_percentage;
+    if record
+        .effective_max_bitrate_kbps
+        .is_some_and(|bitrate| bitrate < 100)
+    {
+        return Err("max_bitrate_below_encoder_minimum");
+    }
+    profile
+        .validate()
+        .map_err(|_| "invalid_streaming_profile_override")
+}
+
 fn application_response<'a>(
     record: &Record,
     payload: &'a Value,
@@ -1723,6 +1730,9 @@ fn rtsp_response<'a>(
         || payload.get("display_policy_snapshot") != record.display_policy_snapshot.as_ref()
         || payload.get("display_request")
             != Some(record.display_request.as_ref().unwrap_or(&Value::Null))
+        || (record.display_request.is_some()
+            && payload["state"] == "ready"
+            && payload["display_applied"] != true)
     {
         return Err("invalid_rtsp_response");
     }
