@@ -133,6 +133,9 @@ namespace Amaterasu {
     if (reply.ok !== true || !reply.status || typeof reply.status !== "object" || Array.isArray(reply.status))
       throw new Error("History status reply is invalid.");
     const status = reply.status as Record<string, unknown>;
+    if (status.applied_revision !== null &&
+        (!Number.isSafeInteger(status.applied_revision) || (status.applied_revision as number) < 0))
+      throw new Error("History applied revision is invalid.");
     const prune = status.last_prune;
     if (!prune || typeof prune !== "object" || Array.isArray(prune))
       throw new Error("History retention status is invalid.");
@@ -185,7 +188,10 @@ namespace Amaterasu {
   export function historyRuntimeDescription(status: HistoryRuntimeStatus): string[] {
     if (!status.available)
       return ["History storage is unavailable; recording and recorded session reads cannot run."];
-    const lines = [historyRecordingPolicyDescription(status)];
+    const lines = [status.applied_revision === null
+      ? "Runtime configuration revision is not confirmed."
+      : `Runtime applied configuration revision ${status.applied_revision}.`,
+      historyRecordingPolicyDescription(status)];
     lines.push(`${historyActivityDescription(status)} · ${status.sessions} stored sessions · ${status.samples} samples · ${status.events} events · ${status.live_bytes} live bytes.`);
     if (status.configuration_ready && !status.effective_enabled)
       lines.push("Stored sessions remain readable. Automatic retention and deletion are paused until recording is enabled.");

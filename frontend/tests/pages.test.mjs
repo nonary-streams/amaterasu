@@ -99,6 +99,7 @@ function historyStatus(overrides = {}) {
     status: {
       available: true,
       configuration_ready: true,
+      applied_revision: 4,
       enabled: true,
       effective_enabled: true,
       degraded: false,
@@ -163,6 +164,8 @@ test("history runtime status rejects malformed signed replies and counters", () 
     historyStatus({ pending_activities: -1 }), historyStatus({ pending_activities: 1.5 }),
     historyStatus({ pending_activities: "1" }),
     historyStatus({ pending_activities: Number.MAX_SAFE_INTEGER + 1 }),
+    historyStatus({ applied_revision: undefined }), historyStatus({ applied_revision: -1 }),
+    historyStatus({ applied_revision: "4" }), historyStatus({ applied_revision: 1.5 }),
     historyStatus({ sessions: 1.5 }), historyStatus({ live_bytes: Number.MAX_SAFE_INTEGER + 1 }),
     historyStatus({ last_prune: null }),
     historyStatus({ last_prune: { ...historyStatus().status.last_prune, size_limit_unmet: "false" } }),

@@ -2210,22 +2210,33 @@ var Amaterasu;
     }
     Amaterasu.saveHistorySettingsState = saveHistorySettingsState;
     function historySettingsRuntimeDescription(settings, runtime) {
+        const saved = `Saved history settings revision ${settings.revision} confirmed.`;
         if (runtime === null)
-            return "Saved history settings confirmed. Runtime status is unavailable; recording is not confirmed.";
+            return `${saved} Runtime status is unavailable; recording is not confirmed.`;
         if (!runtime.available)
-            return "Saved history settings confirmed. History storage is unavailable; recording is not active.";
+            return `${saved} History storage is unavailable; runtime application is not confirmed.`;
         if (!runtime.configuration_ready)
-            return "Saved history settings confirmed. History configuration is not ready; recording is not confirmed.";
+            return `${saved} History configuration is not ready; runtime application is not confirmed.`;
+        if (runtime.applied_revision === null)
+            return `${saved} Runtime applied revision is unavailable; recording is not confirmed.`;
+        if (runtime.applied_revision > settings.revision)
+            return `${saved} Runtime reports newer applied revision ${runtime.applied_revision}; this settings readback is stale. Refresh to check the current settings.`;
         if (runtime.enabled !== settings.settings.enabled)
-            return "Saved history settings confirmed. Runtime reports a different recording policy from this saved readback; refresh to check the current settings.";
+            return `${saved} Runtime reports a different recording policy from this saved readback; refresh to check the current settings.`;
+        if (runtime.applied_revision < settings.revision) {
+            const deferred = runtime.effective_enabled !== runtime.enabled &&
+                (runtime.active_streams > 0 || runtime.pending_activities > 0);
+            const policy = deferred ? ` ${Amaterasu.historyRecordingPolicyDescription(runtime)} ${Amaterasu.historyActivityDescription(runtime)}.` : "";
+            return `${saved} Runtime status is stale: applied revision ${runtime.applied_revision} is behind; recording at saved revision ${settings.revision} is not confirmed.${policy}`;
+        }
         const policy = Amaterasu.historyRecordingPolicyDescription(runtime);
         const activity = ` ${Amaterasu.historyActivityDescription(runtime)}.`;
         const retention = runtime.effective_enabled
             ? ""
             : " Stored sessions remain readable. Automatic retention and deletion are paused until recording is enabled.";
         return runtime.degraded
-            ? `Saved history settings confirmed. ${policy}${activity}${retention} History runtime is degraded; check failed operations and retention status.`
-            : `Saved history settings confirmed. ${policy}${activity}${retention}`;
+            ? `${saved} Runtime applied revision ${runtime.applied_revision} confirmed. ${policy}${activity}${retention} History runtime is degraded; check failed operations and retention status.`
+            : `${saved} Runtime applied revision ${runtime.applied_revision} confirmed. ${policy}${activity}${retention}`;
     }
     Amaterasu.historySettingsRuntimeDescription = historySettingsRuntimeDescription;
     async function saveAuthTokenLifetimes(api, revision, sessionTokenTtlSeconds, rememberMeRefreshTokenTtlSeconds) {
@@ -5107,6 +5118,9 @@ var Amaterasu;
         if (reply.ok !== true || !reply.status || typeof reply.status !== "object" || Array.isArray(reply.status))
             throw new Error("History status reply is invalid.");
         const status = reply.status;
+        if (status.applied_revision !== null &&
+            (!Number.isSafeInteger(status.applied_revision) || status.applied_revision < 0))
+            throw new Error("History applied revision is invalid.");
         const prune = status.last_prune;
         if (!prune || typeof prune !== "object" || Array.isArray(prune))
             throw new Error("History retention status is invalid.");
@@ -5160,7 +5174,10 @@ var Amaterasu;
     function historyRuntimeDescription(status) {
         if (!status.available)
             return ["History storage is unavailable; recording and recorded session reads cannot run."];
-        const lines = [historyRecordingPolicyDescription(status)];
+        const lines = [status.applied_revision === null
+                ? "Runtime configuration revision is not confirmed."
+                : `Runtime applied configuration revision ${status.applied_revision}.`,
+            historyRecordingPolicyDescription(status)];
         lines.push(`${historyActivityDescription(status)} · ${status.sessions} stored sessions · ${status.samples} samples · ${status.events} events · ${status.live_bytes} live bytes.`);
         if (status.configuration_ready && !status.effective_enabled)
             lines.push("Stored sessions remain readable. Automatic retention and deletion are paused until recording is enabled.");

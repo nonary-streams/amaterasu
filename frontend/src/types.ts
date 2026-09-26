@@ -359,6 +359,7 @@ namespace Amaterasu {
   export interface HistoryRuntimeStatus {
     available: boolean;
     configuration_ready: boolean;
+    applied_revision: number | null;
     enabled: boolean;
     effective_enabled: boolean;
     degraded: boolean;

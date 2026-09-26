@@ -797,12 +797,40 @@ test("history editor ignores stale loads and errors after a newer load or save b
   assert.equal((await reloaded).settings.revision, 9);
 });
 
+test("history editor discards an older runtime status after refresh", async () => {
+  const gate = new context.Amaterasu.HistorySettingsLoadGate();
+  const current = { ok: true, revision: 9,
+    settings: { enabled: true, ttl_days: 14, db_size_limit_mb: 20 }, effective_enabled: true };
+  const runtime = { ok: true, status: {
+    available: true, configuration_ready: true, applied_revision: 9,
+    enabled: true, effective_enabled: true, degraded: false,
+    failed_operations: 0, active_streams: 0, pending_activities: 0,
+    sessions: 0, samples: 0, events: 0, live_bytes: 0,
+    last_prune: { sessions_deleted: 0, live_bytes: 0,
+      size_limit_bytes: 0, size_limit_unmet: false },
+  } };
+  const pending = [];
+  const api = { post(route) {
+    if (route === "history/settings_get") return Promise.resolve(current);
+    return new Promise((resolve) => pending.push(resolve));
+  } };
+  const old = gate.read(api);
+  await new Promise(setImmediate);
+  const latest = gate.read(api);
+  await new Promise(setImmediate);
+  pending[1](runtime);
+  assert.equal((await latest).runtime.applied_revision, 9);
+  pending[0]({ ...runtime, status: { ...runtime.status, applied_revision: 8 } });
+  assert.equal(await old, null);
+});
+
 test("history editor confirms deferred toggles and durable restart readback", async () => {
   let stored = { ok: true, revision: 4, settings: { enabled: false, ttl_days: 30, db_size_limit_mb: 50 }, effective_enabled: false };
   let runtime = {
     ok: true,
     status: {
-      available: true, configuration_ready: true, enabled: false, effective_enabled: false,
+      available: true, configuration_ready: true, applied_revision: 4,
+      enabled: false, effective_enabled: false,
       degraded: false, failed_operations: 0, active_streams: 1, pending_activities: 0, sessions: 0, samples: 0,
       events: 0, live_bytes: 0,
       last_prune: { sessions_deleted: 0, live_bytes: 0, size_limit_bytes: 0, size_limit_unmet: false },
@@ -818,6 +846,8 @@ test("history editor confirms deferred toggles and durable restart readback", as
       stored = { ...stored, revision: stored.revision + 1, settings: body.settings,
         effective_enabled: effective };
       runtime = { ...runtime, status: { ...runtime.status, enabled: body.settings.enabled,
+        applied_revision: runtime.status.active_streams === 0 && runtime.status.pending_activities === 0
+          ? stored.revision : runtime.status.applied_revision,
         effective_enabled: effective,
         last_prune: { ...runtime.status.last_prune,
           size_limit_bytes: body.settings.db_size_limit_mb * 1048576 } } };
@@ -835,6 +865,10 @@ test("history editor confirms deferred toggles and durable restart readback", as
   assert.equal(saved.settings.revision, 5);
   assert.equal(saved.settings.effective_enabled, false);
   assert.equal(saved.runtime.effective_enabled, false);
+  assert.equal(saved.runtime.applied_revision, 4);
+  const deferredStatus = context.Amaterasu.historySettingsRuntimeDescription(saved.settings, saved.runtime);
+  assert.match(deferredStatus, /Runtime status is stale: applied revision 4 is behind/);
+  assert.doesNotMatch(deferredStatus, /Runtime applied revision 5 confirmed/);
   assert.equal(saved.runtime.last_prune.size_limit_bytes, 20 * 1048576);
   assert.match(context.Amaterasu.historySettingsRuntimeDescription(saved.settings, saved.runtime), /enable is deferred until active streams end; new streams still use the disabled policy/);
   runtime = { ...runtime, status: { ...runtime.status, active_streams: 0, pending_activities: 1 } };
@@ -852,11 +886,20 @@ test("history editor confirms deferred toggles and durable restart readback", as
   runtime = { ...runtime, status: { ...runtime.status, active_streams: 2 } };
   assert.match(context.Amaterasu.historySettingsRuntimeDescription(saved.settings,
     context.Amaterasu.parseHistoryRuntimeStatus(runtime)), /still use the disabled policy/);
-  runtime = { ...runtime, status: { ...runtime.status, effective_enabled: true, active_streams: 0 } };
+  runtime = { ...runtime, status: { ...runtime.status, effective_enabled: true,
+    applied_revision: 5, active_streams: 0 } };
   stored = { ...stored, effective_enabled: true };
   const reloaded = await context.Amaterasu.readHistorySettingsState(api);
   assert.equal(reloaded.settings.effective_enabled, true);
   assert.match(context.Amaterasu.historySettingsRuntimeDescription(reloaded.settings, reloaded.runtime), /Recording is enabled for new streams/);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(reloaded.settings, reloaded.runtime), /Runtime applied revision 5 confirmed/);
+  const staleReadback = context.Amaterasu.historySettingsRuntimeDescription(initial.settings, reloaded.runtime);
+  assert.match(staleReadback, /settings readback is stale/);
+  assert.doesNotMatch(staleReadback, /Runtime applied revision 5 confirmed|Recording is enabled for new streams/);
+  const unconfirmed = context.Amaterasu.historySettingsRuntimeDescription(reloaded.settings,
+    { ...reloaded.runtime, applied_revision: null });
+  assert.match(unconfirmed, /Runtime applied revision is unavailable/);
+  assert.doesNotMatch(unconfirmed, /Recording is enabled for new streams/);
   assert.doesNotMatch(context.Amaterasu.historySettingsRuntimeDescription(reloaded.settings, reloaded.runtime), /retention and deletion are paused/);
   runtime = { ...runtime, status: { ...runtime.status, active_streams: 1 } };
   const disabled = await context.Amaterasu.saveHistorySettingsState(api, reloaded.settings, false, 7, 10);
@@ -867,7 +910,8 @@ test("history editor confirms deferred toggles and durable restart readback", as
   runtime = { ...runtime, status: { ...runtime.status, active_streams: 2 } };
   assert.match(context.Amaterasu.historySettingsRuntimeDescription(disabled.settings,
     context.Amaterasu.parseHistoryRuntimeStatus(runtime)), /still use the enabled policy/);
-  runtime = { ...runtime, status: { ...runtime.status, effective_enabled: false, active_streams: 0 } };
+  runtime = { ...runtime, status: { ...runtime.status, effective_enabled: false,
+    applied_revision: 6, active_streams: 0 } };
   stored = { ...stored, effective_enabled: false };
   const drained = await context.Amaterasu.readHistorySettingsState(api);
   assert.equal(drained.settings.effective_enabled, false);
