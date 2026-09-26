@@ -2500,12 +2500,12 @@ var Amaterasu;
             ...logging,
             expected_revision: current.revision,
         }));
-        if (!confirmsHostLoggingUpdate(updated, current, logging))
+        if (!confirmsHostLoggingUpdate(updated, current, logging) || !updated.logging)
             throw new Error("Host logging update could not be confirmed. Refresh and check the current values.");
         const saved = parseHostConfigurationReply(await api.post("host-configuration/get"));
         if (!confirmsHostLoggingUpdate(saved, current, logging))
             throw new Error("Host logging settings could not be confirmed after saving. Refresh and check the current values.");
-        return updated.logging ? { ...saved, logging: updated.logging } : saved;
+        return { ...saved, logging: updated.logging };
     }
     Amaterasu.saveHostLoggingSettings = saveHostLoggingSettings;
     function confirmsHostLoggingUpdate(reply, current, logging) {
@@ -2577,27 +2577,26 @@ var Amaterasu;
     }
     async function saveHostLoggingState(api, current, level, path) {
         const settings = await saveHostLoggingSettings(api, current, level, path);
-        const appliedSynchronously = settings.logging?.status === "applied";
-        let refreshScheduled = false;
-        if (!appliedSynchronously) {
-            try {
-                const reply = await api.post("diagnostics/refresh_logging", {
-                    minimum_revision: settings.revision,
-                });
-                if (reply && typeof reply === "object" && !Array.isArray(reply)) {
-                    const response = reply;
-                    const applied = response.logging_configuration_revision;
-                    refreshScheduled = response.ok === true && response.requested_revision === settings.revision &&
-                        typeof response.ready === "boolean" &&
-                        (applied === null || (Number.isSafeInteger(applied) && applied > 0));
-                }
-            }
-            catch {
-            }
-        }
-        return { settings, diagnostics: await readDiagnosticsLoggingStatus(api), refreshScheduled, appliedSynchronously };
+        return { settings, diagnostics: await readDiagnosticsLoggingStatus(api) };
     }
     Amaterasu.saveHostLoggingState = saveHostLoggingState;
+    function hostLoggingSaveFailureNotice(code) {
+        switch (code) {
+            case "logging_apply_failed":
+                return "Host logging application failed and the previous settings were restored. Review the refreshed policy before saving again.";
+            case "save_unconfirmed":
+                return "Host logging write outcome is unknown. Review the refreshed policy and diagnostics status before retrying.";
+            case "logging_application_unconfirmed":
+                return "Host logging settings may be saved, but application is unconfirmed. Review the refreshed policy and diagnostics status before retrying.";
+            case "logging_rollback_failed":
+                return "Host logging application failed and previous settings could not be restored. Configuration may differ from the active policy; review both statuses before retrying.";
+            case "logging_rollback_unconfirmed":
+                return "Host logging application failed and restoration is unconfirmed. Configuration may differ from the active policy; review both statuses before retrying.";
+            default:
+                return "Host logging save could not be confirmed. Review the refreshed policy before saving again.";
+        }
+    }
+    Amaterasu.hostLoggingSaveFailureNotice = hostLoggingSaveFailureNotice;
     function diagnosticsLoggingDescription(savedRevision, result) {
         if (result.error === "permission")
             return "Saved host logging policy; diagnostics status requires diagnostics.read permission.";
@@ -3759,7 +3758,7 @@ var Amaterasu;
                     });
                 });
                 refresh.disabled = !context.api.allows("diagnostics.read");
-                form.append(Amaterasu.field("Minimum log level", level, "Product default uses the release channel's policy. Diagnostic records below this level are filtered."), Amaterasu.field("Log path", path, "A relative path stays beneath the private host state root. The setting applies to diagnostic records when diagnostics confirms the policy."), Amaterasu.el("p", "muted", `Effective host policy: ${settings.effective.min_log_level} · ${settings.effective.log_path}`), Amaterasu.el("p", "muted", "The host confirms logging application during save when supported; the diagnostics status checks disk delivery. Older hosts may apply saved changes asynchronously. Other host and native logs do not use this sink; a host restart may be required for their separate logging policies."), applicationStatus, refresh, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Minimum log level", level, "Product default uses the release channel's policy. Diagnostic records below this level are filtered."), Amaterasu.field("Log path", path, "A relative path stays beneath the private host state root. The setting applies to diagnostic records when diagnostics confirms the policy."), Amaterasu.el("p", "muted", `Effective host policy: ${settings.effective.min_log_level} · ${settings.effective.log_path}`), Amaterasu.el("p", "muted", "The host confirms logging application during save; diagnostics status checks disk delivery. Other host and native logs do not use this sink; a host restart may be required for their separate logging policies."), applicationStatus, refresh, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     if (!form.reportValidity())
@@ -3768,10 +3767,7 @@ var Amaterasu;
                         hostLoggingLoads.invalidate();
                         try {
                             const saved = await saveHostLoggingState(context.api, settings, level.value, path.value);
-                            const description = diagnosticsLoggingDescription(saved.settings.revision, saved.diagnostics);
-                            context.notify(saved.appliedSynchronously || saved.refreshScheduled
-                                ? description
-                                : `Diagnostics refresh could not be scheduled. ${description}`);
+                            context.notify(diagnosticsLoggingDescription(saved.settings.revision, saved.diagnostics));
                         }
                         catch (error) {
                             if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
@@ -3780,7 +3776,7 @@ var Amaterasu;
                                 return;
                             }
                             await loadHostLogging();
-                            context.notify("Host logging save could not be confirmed. Review the refreshed policy before saving again.");
+                            context.notify(hostLoggingSaveFailureNotice(error instanceof Amaterasu.ApiError ? error.code : null));
                             return;
                         }
                         await loadHostLogging();
@@ -3788,9 +3784,9 @@ var Amaterasu;
                 });
                 hostLoggingArea.replaceChildren(Amaterasu.panel("Host logging", form));
             }
-            catch (error) {
+            catch {
                 if (context.content.isConnected)
-                    hostLoggingArea.replaceChildren(Amaterasu.errorPanel(error, loadHostLogging));
+                    hostLoggingArea.replaceChildren(Amaterasu.errorPanel(new Error("Host logging policy could not be loaded. Try again."), loadHostLogging));
             }
         }
         async function loadSteam() {
