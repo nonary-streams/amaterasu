@@ -615,8 +615,8 @@ fn settings_that_exceed_the_runtime_response_bound_are_rejected() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// A tiny service transport with state backed by a file survives reconstruction
-/// of both the provider pipeline and the transport after an update.
+/// A file-backed service transport lets a new provider instance read the saved
+/// document after the first instance completes a live logging update.
 struct LifecycleTransport {
     state_file: PathBuf,
     incoming: Option<Response>,
@@ -747,7 +747,7 @@ impl LifecycleTransport {
 }
 
 #[test]
-fn durable_update_applies_logging_and_reloads_after_provider_restart() {
+fn durable_update_applies_logging_then_provider_reload_reads_saved_settings() {
     let root = test_root();
     let state_file = root.join("host-configuration-test-state.json");
     let mut transport = LifecycleTransport::new(state_file.clone());
@@ -767,6 +767,7 @@ fn durable_update_applies_logging_and_reloads_after_provider_restart() {
     assert_eq!(transport.applied_revision, Some(1));
     assert_eq!(transport.events, ["read", "preflight", "save", "apply"]);
 
+    // A new provider instance must read the durable document, not cached settings.
     let mut restarted_transport = LifecycleTransport::new(state_file);
     restarted_transport.incoming = Some(request("consumer.module", json!({"action":"get"})));
     let reloaded = restarted_transport.complete(&mut Pipeline::new(Ok(root.clone())));
