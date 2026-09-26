@@ -351,6 +351,10 @@ impl LinuxPenTouch {
         self.tracker.is_empty() && self.pen_device.is_none() && self.touch_device.is_none()
     }
 
+    pub(super) fn has_device(&self) -> bool {
+        self.pen_device.is_some() || self.touch_device.is_some()
+    }
+
     pub(super) fn inject(&mut self, path: &str, event: &Event) -> InputResult<()> {
         let Self {
             tracker,
@@ -362,6 +366,19 @@ impl LinuxPenTouch {
                 Target::Pen => &mut *pen_device,
                 Target::Touch => &mut *touch_device,
             };
+            if device.is_none()
+                && matches!(
+                    event,
+                    Event::PenTouch {
+                        phase: PenTouchPhase::Cancel,
+                        ..
+                    }
+                )
+            {
+                // A failed Down may have reserved a contact before opening
+                // uinput. No native device exists to receive its cancellation.
+                return Ok(());
+            }
             if device.is_none() {
                 *device = Some(match target {
                     Target::Pen => Device::create_pen(path)?,
@@ -700,6 +717,46 @@ fn with_phase(event: &Event, phase: PenTouchPhase) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_device_stays_available_when_uinput_path_disappears() {
+        let mut backend = super::super::LinuxBackend::new("\0".into());
+        backend.pen_touch.pen_device = Some(Device {
+            file: std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .unwrap(),
+            created: false,
+        });
+        assert!(super::super::Backend::pen_touch_supported(&backend));
+        let pen_down = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Down,
+            10,
+            20,
+        );
+        super::super::Backend::inject(&mut backend, &pen_down).unwrap();
+        let pen_move = with_phase(&pen_down, PenTouchPhase::Move);
+        super::super::Backend::inject(&mut backend, &pen_move).unwrap();
+        let pen_cancel = with_phase(&pen_down, PenTouchPhase::Cancel);
+        super::super::Backend::inject(&mut backend, &pen_cancel).unwrap();
+        assert!(backend.pen_touch.tracker.is_empty());
+
+        let touch_down = event(42, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 40);
+        assert!(super::super::Backend::validate(&backend, &touch_down).is_ok());
+        assert!(super::super::Backend::inject(&mut backend, &touch_down).is_err());
+        assert!(backend.pen_touch.tracker.touches.contains_key(&42));
+        super::super::Backend::inject(
+            &mut backend,
+            &with_phase(&touch_down, PenTouchPhase::Cancel),
+        )
+        .unwrap();
+        assert!(backend.pen_touch.tracker.is_empty());
+
+        backend.pen_touch.pen_device = None;
+        assert!(!super::super::Backend::pen_touch_supported(&backend));
+    }
 
     type RecordedFrame = (Target, Vec<(u16, u16, i32)>);
 

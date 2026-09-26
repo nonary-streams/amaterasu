@@ -3527,6 +3527,55 @@ fn failed_pen_touch_move_is_retried_before_deduplication_and_released() {
 }
 
 #[test]
+fn pen_touch_capability_loss_allows_release_and_reacquire_after_recovery() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            supports_pen_touch: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let token = acquire(&mut controller, now);
+    let down = pen_touch(42, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 20);
+    assert_eq!(
+        batch(&mut controller, &token, vec![down.clone()])["ok"],
+        true
+    );
+
+    controller.backend.supports_pen_touch = false;
+    let move_event = pen_touch(42, PenTouchDevice::Touch, PenTouchPhase::Move, 30, 40);
+    let unavailable = batch(&mut controller, &token, vec![move_event]);
+    assert_eq!(unavailable["error"]["code"], "unsupported_event");
+    assert_eq!(controller.pen_touch_contacts.len(), 1);
+
+    let release = controller.handle(
+        "owner",
+        Operation::Release { lease: token },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(release["released"], true);
+    assert!(controller.pen_touch_contacts.is_empty());
+    assert!(!controller.cleanup_required());
+
+    controller.backend.supports_pen_touch = true;
+    let next_token = acquire(&mut controller, now);
+    assert_eq!(batch(&mut controller, &next_token, vec![down])["ok"], true);
+    assert_eq!(
+        controller.handle(
+            "owner",
+            Operation::Release { lease: next_token },
+            now,
+            &mut || Ok(()),
+        )["released"],
+        true
+    );
+    assert_eq!(controller.backend.starts, 2);
+    assert_eq!(controller.backend.stops, 2);
+}
+
+#[test]
 fn failed_pen_touch_release_retries_only_the_contact_whose_cancel_failed() {
     let mut controller = Controller::new(
         FakeBackend {

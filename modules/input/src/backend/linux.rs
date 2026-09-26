@@ -404,8 +404,10 @@ impl Backend for LinuxBackend {
     fn pen_touch_supported(&self) -> bool {
         // UInput availability requires a writable character device (commonly
         // granted through a udev rule or membership in the uinput group).
-        // Compositor acceptance and coordinate calibration need platform QA.
-        uinput_pen_touch_available(&self.path)
+        // An existing device remains usable for its lease even if the node or
+        // its permissions disappear after creation. Compositor acceptance and
+        // coordinate calibration need platform QA.
+        self.pen_touch.has_device() || uinput_pen_touch_available(&self.path)
     }
     fn pen_touch_max_contacts(&self, device: PenTouchDevice) -> Option<usize> {
         Some(match device {
@@ -526,10 +528,12 @@ impl Backend for LinuxBackend {
         Ok(())
     }
     fn inject(&mut self, event: &Event) -> InputResult<()> {
-        self.validate(event)?;
         if matches!(event, Event::PenTouch { .. }) {
+            // Cleanup must still reach an owned device after the uinput path
+            // becomes unavailable. The tracker validates event and identity.
             return self.pen_touch.inject(&self.path, event);
         }
+        self.validate(event)?;
         if let Event::Controller {
             number,
             active_mask,
@@ -814,6 +818,35 @@ fn scroll_unit_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PenTouchPhase;
+
+    fn touch_event(phase: PenTouchPhase) -> Event {
+        Event::PenTouch {
+            pointer_id: 7,
+            device: PenTouchDevice::Touch,
+            phase,
+            x: 10,
+            y: 20,
+            pressure: None,
+            contact_area_major: None,
+            contact_area_minor: None,
+            rotation_degrees: None,
+            pen_tool: None,
+            pen_buttons: None,
+            tilt: None,
+        }
+    }
+
+    #[test]
+    fn unavailable_uinput_path_does_not_block_cleanup_of_a_failed_down() {
+        let mut backend = LinuxBackend::new("\0".into());
+        let down = touch_event(PenTouchPhase::Down);
+        assert!(backend.inject(&down).is_err());
+        assert!(!backend.pen_touch.is_idle());
+        backend.inject(&touch_event(PenTouchPhase::Cancel)).unwrap();
+        assert!(backend.pen_touch.is_idle());
+        assert!(!backend.pen_touch_supported());
+    }
 
     #[test]
     fn gamepad_events_require_a_successful_lease_capability_probe() {
