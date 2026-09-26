@@ -190,6 +190,45 @@ def test_build_is_tracked_and_uses_stable_harvest_guids():
     assert 'if ([string]::IsNullOrWhiteSpace($OutputDirectory))' in BUILD
 
 
+def test_installer_reads_release_binaries_from_the_cargo_target_directory():
+    if not shutil.which("pwsh"):
+        return
+    command = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:TEST_BUILD, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw 'installer build script has syntax errors' }
+$function = $ast.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-CargoReleaseDirectory'
+}, $true)
+if (-not $function) { throw 'missing Cargo release directory resolver' }
+Invoke-Expression $function.Extent.Text
+$repository = $env:TEST_REPOSITORY
+$expected = Join-Path $repository 'target\release'
+if ((Get-CargoReleaseDirectory $repository '') -ne $expected) { throw 'default target mismatch' }
+$expected = Join-Path $repository 'isolated\target\release'
+if ((Get-CargoReleaseDirectory $repository 'isolated\target') -ne $expected) { throw 'relative target mismatch' }
+$absolute = Join-Path $repository 'another\target'
+$expected = Join-Path $absolute 'release'
+if ((Get-CargoReleaseDirectory $repository $absolute) -ne $expected) { throw 'absolute target mismatch' }
+"""
+    environment = os.environ.copy()
+    environment.update(
+        TEST_BUILD=str(ROOT / "installer" / "build-installer.ps1"),
+        TEST_REPOSITORY=str(ROOT),
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_playnite_extension_is_one_msi_owned_pair_under_program_files():
     namespace = {"w": "http://schemas.microsoft.com/wix/2006/wi"}
     product = ET.fromstring(PRODUCT)
@@ -381,6 +420,7 @@ if __name__ == "__main__":
     test_installer_never_uses_shell_cleanup_for_mutable_data()
     test_all_predecessor_families_are_discovered_and_critical_settings_fail_closed()
     test_build_is_tracked_and_uses_stable_harvest_guids()
+    test_installer_reads_release_binaries_from_the_cargo_target_directory()
     test_playnite_extension_is_one_msi_owned_pair_under_program_files()
     test_playnite_staging_accepts_only_approved_sources_and_exact_crlf_bytes()
     test_bundle_owns_irreversible_legacy_retirement_after_coordinated_msi()

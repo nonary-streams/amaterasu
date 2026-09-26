@@ -49,6 +49,18 @@ function Write-ApprovedPlayniteExtension {
     }
 }
 
+function Get-CargoReleaseDirectory {
+    param([string]$Repository, [string]$CargoTargetDirectory)
+
+    if ([string]::IsNullOrWhiteSpace($CargoTargetDirectory)) {
+        return Join-Path $Repository 'target\release'
+    }
+    if (-not [System.IO.Path]::IsPathFullyQualified($CargoTargetDirectory)) {
+        $CargoTargetDirectory = Join-Path $Repository $CargoTargetDirectory
+    }
+    return Join-Path ([System.IO.Path]::GetFullPath($CargoTargetDirectory)) 'release'
+}
+
 $repository = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $playniteSource = Join-Path $repository 'modules\playnite\extension'
 $approvedPlayniteFiles = Get-ApprovedPlayniteExtension $playniteSource
@@ -90,7 +102,7 @@ if (Test-Path $stage) {
 New-Item -ItemType Directory -Path (Join-Path $stage 'tools') -Force | Out-Null
 Write-ApprovedPlayniteExtension $approvedPlayniteFiles $stage
 
-$releaseDirectory = Join-Path $repository 'target\release'
+$releaseDirectory = Get-CargoReleaseDirectory $repository $env:CARGO_TARGET_DIR
 $installerSigner = $env:AMATERASU_INSTALLER_SIGNING_KEY
 if ([string]::IsNullOrWhiteSpace($installerSigner)) {
     $signerDirectory = Join-Path $env:LOCALAPPDATA 'Amaterasu\installer'
