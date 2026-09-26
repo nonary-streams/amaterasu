@@ -12,8 +12,6 @@ pub(crate) use windows::ContainedChild;
 #[cfg(windows)]
 pub(crate) use windows::DetachedChild;
 #[cfg(all(test, windows))]
-pub(crate) use windows::fail_next_job_assignment;
-#[cfg(all(test, windows))]
 pub(crate) use windows::fail_next_job_process_query;
 
 #[cfg(any(target_os = "macos", test))]

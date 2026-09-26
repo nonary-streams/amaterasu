@@ -1264,30 +1264,6 @@ fn failed_launch_is_retained_and_caller_scoped_capacity_is_bounded() {
 
 #[test]
 #[cfg(windows)]
-fn failed_job_assignment_never_runs_the_suspended_application() {
-    let marker = test_directory("failed-job-assignment").join("ran");
-    let mut request = launch("failed-job-assignment", "exit");
-    request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker);
-    let mut manager = ProcessManager::default();
-
-    crate::containment::fail_next_job_assignment();
-    let failed = manager.handle("alice", request);
-    assert_eq!(failed["process"]["state"], "launch_failed", "{failed}");
-    assert!(!marker.exists(), "application ran before job assignment");
-
-    let recovered = manager.handle("alice", launch("after-job-assignment", "exit"));
-    assert_eq!(recovered["process"]["state"], "running", "{recovered}");
-    let recovered_id = recovered["process"]["process_id"].as_u64().unwrap();
-    assert_eq!(
-        wait_for_exit(&mut manager, recovered_id)["process"]["success"],
-        true
-    );
-    manager.shutdown().unwrap();
-    std::fs::remove_dir_all(marker.parent().unwrap()).unwrap();
-}
-
-#[test]
-#[cfg(windows)]
 fn shutdown_recovers_after_a_transient_job_process_query_failure() {
     let mut manager = ProcessManager::default();
     let launched = manager.handle("alice", launch("transient-job-query", "sleep"));

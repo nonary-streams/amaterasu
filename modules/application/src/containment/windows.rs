@@ -3,7 +3,6 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
-use std::time::{Duration, Instant};
 #[path = "windows_user_process.rs"]
 mod windows_user_process;
 use windows_sys::Win32::Foundation::{
@@ -208,21 +207,9 @@ impl ContainedChild {
             }
         };
         // SAFETY: both handles remain owned throughout assignment.
-        #[cfg(test)]
-        let fail_assignment = FAIL_NEXT_JOB_ASSIGNMENT.with(|failure| failure.replace(false));
-        #[cfg(not(test))]
-        let fail_assignment = false;
-        let assigned = if fail_assignment {
-            0
-        } else {
-            unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.raw_handle()) }
-        };
+        let assigned = unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.raw_handle()) };
         let setup = if assigned == 0 {
-            Err(if fail_assignment {
-                io::Error::other("injected job assignment failure")
-            } else {
-                io::Error::last_os_error()
-            })
+            Err(io::Error::last_os_error())
         } else {
             child.resume()
         };
@@ -233,15 +220,6 @@ impl ContainedChild {
                 let _ = unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
             }
             child.terminate();
-            // Keep the process handle until the suspended or failed-resume child
-            // has exited. A successful termination request is asynchronous.
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < deadline {
-                if child.process.try_wait().ok().flatten().is_some() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
             return Err(error);
         }
         Ok(Self {
@@ -408,17 +386,11 @@ fn process_ids_in_job(job: HANDLE) -> io::Result<Vec<u32>> {
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_JOB_PROCESS_QUERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static FAIL_NEXT_JOB_ASSIGNMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 pub(crate) fn fail_next_job_process_query() {
     FAIL_NEXT_JOB_PROCESS_QUERY.with(|failure| failure.set(true));
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_job_assignment() {
-    FAIL_NEXT_JOB_ASSIGNMENT.with(|failure| failure.set(true));
 }
 
 struct CloseWindowsContext {
