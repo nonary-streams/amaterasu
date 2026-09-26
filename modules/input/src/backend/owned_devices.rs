@@ -1,4 +1,4 @@
-use crate::model::InputResult;
+use crate::model::{InputError, InputResult};
 
 /// Publish each created device to its owning backend before acquiring the next.
 /// If pointer creation fails, startup cleanup can still retry keyboard destroy.
@@ -7,6 +7,12 @@ pub(super) fn acquire_input_pair<Device>(
     pointer: &mut Option<Device>,
     mut create: impl FnMut(bool) -> InputResult<Device>,
 ) -> InputResult<()> {
+    if keyboard.is_some() || pointer.is_some() {
+        return Err(InputError::new(
+            "backend_busy",
+            "owned uinput devices must be released before reacquisition",
+        ));
+    }
     *keyboard = Some(create(true)?);
     *pointer = Some(create(false)?);
     Ok(())
@@ -72,6 +78,14 @@ mod tests {
         keyboard.as_mut().unwrap().updated = true;
         assert_eq!(keyboard.as_ref().map(|device| device.id), Some(1));
         assert!(pointer.is_none());
+        assert_eq!(
+            acquire_input_pair(&mut keyboard, &mut pointer, &mut create)
+                .unwrap_err()
+                .code,
+            "backend_busy"
+        );
+        assert_eq!(keyboard.as_ref().map(|device| device.id), Some(1));
+        assert!(pointer.is_none());
 
         let mut fail_destroy_once = true;
         let mut destroy = |device: &mut FakeInputDevice| {
@@ -89,6 +103,12 @@ mod tests {
             "release_failed"
         );
         assert_eq!(keyboard.as_ref().map(|device| device.id), Some(1));
+        assert_eq!(
+            acquire_input_pair(&mut keyboard, &mut pointer, &mut create)
+                .unwrap_err()
+                .code,
+            "backend_busy"
+        );
         release_input_pair(&mut keyboard, &mut pointer, &mut destroy).unwrap();
         assert!(keyboard.is_none());
 
@@ -119,6 +139,16 @@ mod tests {
         pointer.as_mut().unwrap().updated = true;
         assert_eq!(allocations.get(), 2);
 
+        let mut create = |_| -> InputResult<FakeInputDevice> {
+            panic!("reacquisition must not create over an owned input device")
+        };
+        assert_eq!(
+            acquire_input_pair(&mut keyboard, &mut pointer, &mut create)
+                .unwrap_err()
+                .code,
+            "backend_busy"
+        );
+
         let mut attempts = Vec::new();
         let mut fail_keyboard_once = true;
         {
@@ -148,5 +178,49 @@ mod tests {
         keyboard = Some(acquire(3));
         assert_eq!(keyboard.as_ref().map(|device| device.id), Some(3));
         assert_eq!(allocations.get(), 3);
+    }
+
+    #[test]
+    fn pointer_destroy_failure_blocks_reacquisition_until_retry() {
+        let mut keyboard = Some(1_u8);
+        let mut pointer = Some(2_u8);
+        let mut attempts = Vec::new();
+        let mut fail_pointer_once = true;
+        let mut destroy = |device: &mut u8| {
+            attempts.push(*device);
+            if *device == 2 && std::mem::take(&mut fail_pointer_once) {
+                Err(InputError::new("release_failed", "pointer destroy failed"))
+            } else {
+                Ok(())
+            }
+        };
+
+        assert_eq!(
+            release_input_pair(&mut keyboard, &mut pointer, &mut destroy)
+                .unwrap_err()
+                .code,
+            "release_failed"
+        );
+        assert!(keyboard.is_none());
+        assert_eq!(pointer, Some(2));
+
+        let allocations = std::cell::Cell::new(0);
+        let mut create = |_: bool| {
+            allocations.set(allocations.get() + 1);
+            Ok(allocations.get() + 2)
+        };
+        assert_eq!(
+            acquire_input_pair(&mut keyboard, &mut pointer, &mut create)
+                .unwrap_err()
+                .code,
+            "backend_busy"
+        );
+        assert_eq!(allocations.get(), 0);
+        assert_eq!(pointer, Some(2));
+
+        release_input_pair(&mut keyboard, &mut pointer, &mut destroy).unwrap();
+        acquire_input_pair(&mut keyboard, &mut pointer, &mut create).unwrap();
+        assert_eq!((keyboard, pointer), (Some(3), Some(4)));
+        assert_eq!(attempts, [1, 2, 2]);
     }
 }
