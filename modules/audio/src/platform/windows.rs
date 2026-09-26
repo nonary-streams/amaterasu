@@ -185,6 +185,17 @@ impl RouteLease {
             default_endpoints(enumerator)?
         } else {
             let current = default_endpoints(enumerator).ok();
+            if explicit_route
+                && let Some(current) = current.as_ref()
+                && let Some(assignments) = policy.resume_absent_restore(endpoint, current)
+            {
+                let result = assign_route(enumerator, &mut policy, endpoint, current, &assignments);
+                if matches!(result, Err("audio_route_restore_failed")) {
+                    drop(policy);
+                    schedule_route_restore_retry_if_pending();
+                }
+                return result;
+            }
             if !explicit_route
                 || !current.as_ref().is_some_and(|current| {
                     policy.abandon_absent_restore_for_new_route(endpoint, current)
@@ -204,20 +215,12 @@ impl RouteLease {
             }),
             AcquirePlan::Assign(assignments) => {
                 let result =
-                    assign_defaults(enumerator, &mut policy, endpoint, &original, &assignments);
-                if result.is_err() {
-                    policy.abort_acquire(endpoint)?;
-                    if !matches!(restore_pending(enumerator, &mut policy), Ok(true)) {
-                        drop(policy);
-                        schedule_route_restore_retry_if_pending();
-                        return Err("audio_route_restore_failed");
-                    }
-                    return Err("audio_route_change_failed");
+                    assign_route(enumerator, &mut policy, endpoint, &original, &assignments);
+                if matches!(result, Err("audio_route_restore_failed")) {
+                    drop(policy);
+                    schedule_route_restore_retry_if_pending();
                 }
-                Ok(Self {
-                    endpoint: endpoint.to_owned(),
-                    active: true,
-                })
+                result
             }
         }
     }
@@ -245,6 +248,26 @@ impl RouteLease {
         }
         Ok(())
     }
+}
+
+fn assign_route(
+    enumerator: &IMMDeviceEnumerator,
+    policy: &mut RoutePolicy,
+    endpoint: &str,
+    observed: &DefaultEndpoints,
+    assignments: &[RoleAssignment],
+) -> AudioResult<RouteLease> {
+    if assign_defaults(enumerator, policy, endpoint, observed, assignments).is_err() {
+        policy.abort_acquire(endpoint)?;
+        if !matches!(restore_pending(enumerator, policy), Ok(true)) {
+            return Err("audio_route_restore_failed");
+        }
+        return Err("audio_route_change_failed");
+    }
+    Ok(RouteLease {
+        endpoint: endpoint.to_owned(),
+        active: true,
+    })
 }
 
 impl Drop for RouteLease {

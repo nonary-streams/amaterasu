@@ -253,6 +253,46 @@ impl RoutePolicy {
         true
     }
 
+    /// Resume a pending lease for the same explicitly selected endpoint. Only
+    /// roles still absent are reassigned; a live choice relinquishes the old
+    /// role and becomes the snapshot preserved for this new capture.
+    pub fn resume_absent_restore(
+        &mut self,
+        endpoint: &str,
+        current: &DefaultEndpoints,
+    ) -> Option<Vec<RoleAssignment>> {
+        let active = self.active.as_mut().filter(|active| {
+            active.references == 0
+                && active.endpoint == endpoint
+                && restore_assignments(active, current).is_empty()
+        })?;
+        let assignments: Vec<_> = DefaultRole::ALL
+            .into_iter()
+            .filter(|role| {
+                active.assigned_roles[role.index()]
+                    && active.original[role.index()].as_deref() != Some(endpoint)
+                    && current[role.index()].is_none()
+            })
+            .map(|role| RoleAssignment {
+                role,
+                endpoint: endpoint.to_owned(),
+            })
+            .collect();
+        if assignments.is_empty() {
+            return None;
+        }
+        for role in DefaultRole::ALL {
+            if let Some(live_endpoint) = current[role.index()].as_ref()
+                && live_endpoint != endpoint
+            {
+                active.original[role.index()] = Some(live_endpoint.clone());
+                active.assigned_roles[role.index()] = false;
+            }
+        }
+        active.references = 1;
+        Some(assignments)
+    }
+
     /// A routed virtual sink remains selected while its capture is active.
     /// Preserve the initial snapshot for final restoration, even if another
     /// application changes a default role during the stream.
@@ -985,5 +1025,83 @@ mod tests {
             policy.acquire("render.new", &restored),
             Ok(AcquirePlan::Assign(_))
         ));
+    }
+
+    #[test]
+    fn same_route_reacquires_absent_role_and_keeps_its_original_restore_target() {
+        let original = endpoints("render.console", "render.multimedia", "render.comms");
+        let mut policy = RoutePolicy::new();
+        assert!(matches!(
+            policy.acquire("render.virtual", &original),
+            Ok(AcquirePlan::Assign(_))
+        ));
+        for role in DefaultRole::ALL {
+            policy.record_assignment("render.virtual", role).unwrap();
+        }
+        let missing = [
+            None,
+            Some("render.user".into()),
+            Some("render.other".into()),
+        ];
+        assert_eq!(
+            policy.release("render.virtual", &missing),
+            Ok(ReleasePlan::Restore(Vec::new()))
+        );
+        assert!(!policy.pending_restore_complete(&missing));
+        policy.complete_restore(false);
+        assert_eq!(
+            policy.endpoint_with_pending_restore(),
+            Some("render.virtual")
+        );
+        assert_eq!(
+            policy.resume_absent_restore("render.virtual", &missing),
+            Some(vec![RoleAssignment {
+                role: DefaultRole::Console,
+                endpoint: "render.virtual".into(),
+            }])
+        );
+        policy
+            .record_assignment("render.virtual", DefaultRole::Console)
+            .unwrap();
+        let routed = endpoints("render.virtual", "render.user", "render.other");
+        assert_eq!(
+            policy.refresh_assignments("render.virtual", &routed),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            policy.release("render.virtual", &routed),
+            Ok(ReleasePlan::Restore(vec![RoleAssignment {
+                role: DefaultRole::Console,
+                endpoint: "render.console".into(),
+            }]))
+        );
+        let restored = endpoints("render.console", "render.user", "render.other");
+        assert!(policy.pending_restore_complete(&restored));
+        policy.complete_restore(true);
+        assert_eq!(policy.endpoint_with_pending_restore(), None);
+    }
+
+    #[test]
+    fn same_route_does_not_resume_while_it_still_owns_a_live_role() {
+        let original = endpoints("render.console", "render.multimedia", "render.comms");
+        let mut policy = RoutePolicy::new();
+        policy.acquire("render.virtual", &original).unwrap();
+        for role in DefaultRole::ALL {
+            policy.record_assignment("render.virtual", role).unwrap();
+        }
+        let partly_missing = [
+            None,
+            Some("render.virtual".into()),
+            Some("render.user".into()),
+        ];
+        policy.release("render.virtual", &partly_missing).unwrap();
+        assert_eq!(
+            policy.resume_absent_restore("render.virtual", &partly_missing),
+            None
+        );
+        assert_eq!(
+            policy.endpoint_with_pending_restore(),
+            Some("render.virtual")
+        );
     }
 }
