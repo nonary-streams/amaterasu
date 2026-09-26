@@ -185,6 +185,25 @@ fn steam_artwork_entry(name: &str, revision: Option<&str>) -> Value {
     result
 }
 
+fn lutris_artwork_entry(name: &str, game_id: i64, revision: &str) -> Value {
+    let mut result = entry(name);
+    result["artwork"] = json!({"provider":"lutris","game_id":game_id,"revision":revision});
+    result
+}
+
+fn lutris_artwork_importer() -> Pipeline {
+    Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::new(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        BTreeMap::from([
+            ("amaterasu.lutris".into(), "amaterasu.management".into()),
+            ("other.provider".into(), "amaterasu.management".into()),
+            ("amaterasu.steam".into(), "amaterasu.management".into()),
+        ]),
+    )
+}
+
 fn steam_launch_entry(name: &str, app_id: &str, install_dir: Option<&str>) -> Value {
     let mut result = entry(name);
     result["steam_id"] = json!(app_id);
@@ -4130,6 +4149,134 @@ fn steam_artwork_is_limited_to_the_authenticated_importer_and_matching_source_id
     );
     assert_eq!(wrong_source["error"]["code"], "provider_artwork_required");
     assert!(!backend.entries.contains_key("app-0000000000000001"));
+}
+
+#[test]
+fn lutris_artwork_requires_authenticated_matching_importer_and_source() {
+    let mut backend = Backend::default();
+    let mut pipeline = lutris_artwork_importer();
+    let digest = "a".repeat(64);
+    for (caller, source_id) in [
+        ("other.provider", "lutris:42"),
+        ("amaterasu.steam", "lutris:42"),
+        ("amaterasu.lutris", "lutris:43"),
+        ("amaterasu.lutris", "lutris:042"),
+    ] {
+        let sync_id = format!("forged-{caller}-{source_id}");
+        let begin = backend.run_for(
+            &mut pipeline,
+            snapshot_begin(&sync_id, 1),
+            caller,
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(begin["ok"], true, "{begin}");
+        let rejected = backend.run_for(
+            &mut pipeline,
+            snapshot_batch(
+                &sync_id,
+                begin["generation"].as_u64().unwrap(),
+                1,
+                0,
+                begin["revision"].as_u64().unwrap(),
+                vec![(source_id, lutris_artwork_entry("Forged", 42, &digest))],
+            ),
+            caller,
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(rejected["error"]["code"], "provider_artwork_required");
+    }
+    assert!(!backend.entries.contains_key("app-0000000000000001"));
+}
+
+#[test]
+fn lutris_artwork_revision_persists_without_changing_other_rows() {
+    let mut backend = Backend::default();
+    let mut pipeline = lutris_artwork_importer();
+    let revision_a = "a".repeat(64);
+    let revision_b = "b".repeat(64);
+    let manual = backend.run_for(
+        &mut pipeline,
+        json!({"action":"create","expected_revision":0,"entry":entry("Manual game")}),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(manual["ok"], true, "{manual}");
+    let manual_id = manual["id"].as_str().unwrap().to_owned();
+    let manual_before = backend.entries[&manual_id].clone();
+    run_steam_artwork_snapshot(
+        &mut backend,
+        &mut pipeline,
+        "steam-unchanged",
+        1,
+        Some("17"),
+    );
+    let steam_id = "app-0000000000000002";
+    let steam_before = backend.entries[steam_id].clone();
+
+    for (sync_id, source_revision, digest) in [
+        ("lutris-artwork-a", 1, &revision_a),
+        ("lutris-artwork-b", 2, &revision_b),
+    ] {
+        let begin = backend.run_for(
+            &mut pipeline,
+            snapshot_begin(sync_id, source_revision),
+            "amaterasu.lutris",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(begin["ok"], true, "{begin}");
+        let batch = backend.run_for(
+            &mut pipeline,
+            snapshot_batch(
+                sync_id,
+                begin["generation"].as_u64().unwrap(),
+                source_revision,
+                0,
+                begin["revision"].as_u64().unwrap(),
+                vec![("lutris:42", lutris_artwork_entry("Lutris game", 42, digest))],
+            ),
+            "amaterasu.lutris",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(batch["ok"], true, "{batch}");
+        let finish = backend.run_for(
+            &mut pipeline,
+            snapshot_finish(
+                sync_id,
+                begin["generation"].as_u64().unwrap(),
+                source_revision,
+                batch["revision"].as_u64().unwrap(),
+                1,
+                true,
+            ),
+            "amaterasu.lutris",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(finish["ok"], true, "{finish}");
+    }
+
+    let lutris_id = "app-0000000000000003";
+    assert_eq!(
+        backend.entries[lutris_id]["artwork"]["revision"],
+        revision_b
+    );
+    assert_eq!(backend.entries[&manual_id], manual_before);
+    assert_eq!(backend.entries[steam_id], steam_before);
+    let mut reloaded = lutris_artwork_importer();
+    let readback = backend.run_for(
+        &mut reloaded,
+        json!({"action":"get","id":lutris_id}),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(readback["ok"], true, "{readback}");
+    assert_eq!(readback["entry"]["artwork"]["revision"], revision_b);
 }
 
 #[test]

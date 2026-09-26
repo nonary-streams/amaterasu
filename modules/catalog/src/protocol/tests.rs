@@ -326,6 +326,39 @@ fn manual_mutations_cannot_forge_provider_owned_steam_artwork() {
 }
 
 #[test]
+fn manual_mutations_cannot_forge_lutris_artwork() {
+    let mut artwork_entry = entry("Lutris artwork");
+    artwork_entry.artwork = Some(crate::model::ArtworkReference::Lutris {
+        game_id: 42,
+        revision: "a".repeat(64),
+    });
+    let create_error = apply(
+        Operation::Create {
+            entry: artwork_entry.clone(),
+            expected_revision: 0,
+        },
+        None,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(create_error["error"]["code"], "provider_artwork_required");
+
+    let document = create(Document::default(), "Ordinary game");
+    let update_error = apply(
+        Operation::Update {
+            id: "app-0000000000000001".into(),
+            entry: artwork_entry,
+            expected_revision: 1,
+        },
+        Some(document.clone()),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(update_error["error"]["code"], "provider_artwork_required");
+    assert!(document.entries["app-0000000000000001"].artwork.is_none());
+}
+
+#[test]
 fn pagination_is_bounded_and_rejects_stale_or_cross_query_cursors() {
     let document = create(
         create(create(Document::default(), "Arcade One"), "Puzzle"),

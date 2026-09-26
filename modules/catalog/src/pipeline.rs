@@ -21,6 +21,7 @@ const MAX_SCAN: usize = 256;
 const MANAGEMENT_PRINCIPAL: &str = "amaterasu.management";
 const PLAYNITE_IMPORTER: &str = "amaterasu.playnite";
 const STEAM_IMPORTER: &str = "amaterasu.steam";
+const LUTRIS_IMPORTER: &str = "amaterasu.lutris";
 const PLAYNITE_FULLSCREEN_SOURCE_ID: &str = "fullscreen-entry";
 const PLAYNITE_FULLSCREEN_NAME: &str = "Playnite (Fullscreen)";
 type TransportResult = ModuleResult<Response>;
@@ -1509,6 +1510,9 @@ impl Pipeline {
                 Some(ArtworkReference::Steam { app_id, .. }) => {
                     session.caller != STEAM_IMPORTER || source_id != format!("steam:{app_id}")
                 }
+                Some(ArtworkReference::Lutris { game_id, .. }) => {
+                    session.caller != LUTRIS_IMPORTER || source_id != format!("lutris:{game_id}")
+                }
                 None => false,
             };
             let has_steam_metadata = entry.steam_id.is_some() || entry.steam_install_dir.is_some();
@@ -1522,7 +1526,7 @@ impl Pipeline {
                     context.request_id,
                     error(
                         "provider_artwork_required",
-                        "Steam artwork requires the authenticated Steam importer and matching app ID",
+                        "provider artwork requires its authenticated importer and matching source ID",
                     ),
                 );
             }

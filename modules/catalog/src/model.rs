@@ -59,6 +59,7 @@ pub struct RawPreparationCommand {
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ArtworkReference {
     Steam { app_id: u32, revision: String },
+    Lutris { game_id: i64, revision: String },
 }
 
 impl ArtworkReference {
@@ -73,6 +74,16 @@ impl ArtworkReference {
                     || parsed_revision.is_none_or(|number| number.to_string() != *revision)
                 {
                     return Err("invalid Steam artwork reference");
+                }
+            }
+            Self::Lutris { game_id, revision } => {
+                if *game_id <= 0
+                    || revision.len() != 64
+                    || !revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err("invalid Lutris artwork reference");
                 }
             }
         }
@@ -1588,6 +1599,42 @@ mod tests {
             serde_json::from_value::<Entry>(json!({
                 "name":"Unknown artwork provider",
                 "artwork":{"provider":"local_path","path":"C:/private/image.png"},
+                "launch":{"kind":"application","path":"/games/example"}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn lutris_artwork_references_require_positive_ids_and_digest_revisions() {
+        let digest = "a".repeat(64);
+        let valid: Entry = serde_json::from_value(json!({
+            "name":"Lutris game",
+            "artwork":{"provider":"lutris","game_id":42,"revision":digest},
+            "launch":{"kind":"application","path":"/games/example"}
+        }))
+        .unwrap();
+        valid.validate().unwrap();
+
+        for reference in [
+            json!({"provider":"lutris","game_id":0,"revision":digest}),
+            json!({"provider":"lutris","game_id":-1,"revision":digest}),
+            json!({"provider":"lutris","game_id":42,"revision":"a"}),
+            json!({"provider":"lutris","game_id":42,"revision":"A".repeat(64)}),
+            json!({"provider":"lutris","game_id":42,"revision":"/".repeat(64)}),
+        ] {
+            let entry: Entry = serde_json::from_value(json!({
+                "name":"Invalid artwork",
+                "artwork":reference,
+                "launch":{"kind":"application","path":"/games/example"}
+            }))
+            .unwrap();
+            assert!(entry.validate().is_err(), "accepted artwork {reference}");
+        }
+        assert!(
+            serde_json::from_value::<Entry>(json!({
+                "name":"Path forgery",
+                "artwork":{"provider":"lutris","game_id":42,"revision":digest,"path":"/secret"},
                 "launch":{"kind":"application","path":"/games/example"}
             }))
             .is_err()
