@@ -344,6 +344,8 @@ fn run_capture_loop<F>(
 }
 
 fn permanent_reopen_error(error: &str) -> bool {
+    // Format policy access can fail briefly after a previously working virtual
+    // endpoint resets; keep retrying that acquisition during recovery.
     matches!(
         error,
         "invalid_endpoint"
@@ -351,7 +353,6 @@ fn permanent_reopen_error(error: &str) -> bool {
             | "invalid_channel_layout"
             | "unsupported_channel_layout"
             | "unsupported_format"
-            | "virtual_sink_format_unavailable"
     )
 }
 
@@ -823,6 +824,63 @@ mod tests {
         let health = health.lock().unwrap();
         assert_eq!(health.failure, None);
         assert!(!health.recovering);
+    }
+
+    #[test]
+    fn unavailable_virtual_format_retries_until_capture_resumes_and_releases_on_stop() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let initial =
+            FakeCapture::new(format, [Err("device_lost")]).with_drop_counter(drops.clone());
+        let (sender, packets) = mpsc::sync_channel(1);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runner = thread::spawn({
+            let health = health.clone();
+            let stop = stop.clone();
+            let attempts = attempts.clone();
+            let drops = drops.clone();
+            move || {
+                run_capture_loop(
+                    Box::new(initial),
+                    || {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            assert!(health.lock().unwrap().recovering);
+                            return Err("virtual_sink_format_unavailable");
+                        }
+                        Ok(Box::new(
+                            FakeCapture::new(format, [Ok(Some(packet(0, 0)))])
+                                .with_drop_counter(drops.clone()),
+                        ) as Box<dyn CaptureDevice>)
+                    },
+                    &sender,
+                    &health,
+                    &stop,
+                    RecoveryPolicy {
+                        expected_endpoint: "render.fixed".into(),
+                        expected_format: format,
+                        follow_console_default: false,
+                        retry_delay: Duration::from_millis(1),
+                    },
+                );
+            }
+        });
+
+        let recovered = packets.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_ne!(recovered.flags & AUDIO_DISCONTINUITY, 0);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while health.lock().unwrap().recovering && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let snapshot = health.lock().unwrap().clone();
+        assert_eq!(snapshot.failure, None);
+        assert!(!snapshot.recovering);
+        stop.store(true, Ordering::Release);
+        runner.thread().unpark();
+        runner.join().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]
