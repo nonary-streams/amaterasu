@@ -981,7 +981,7 @@ test("remembered login requires Web Locks", async () => {
   assert.equal(api.subject, "");
 });
 
-test("restored remembered sessions fail closed without Web Locks", async () => {
+test("restore without Web Locks leaves another tab's remembered session intact", async () => {
   const bearer = secret("f");
   const refreshToken = secret("1");
   const storage = memoryStorage();
@@ -992,18 +992,18 @@ test("restored remembered sessions fail closed without Web Locks", async () => {
         ? sessionReply(bearer, refreshToken, future(3600), future(7200), {
             remember_me: true,
           })
-        : { ok: false, code: "unauthorized" },
-      { status: url.endsWith("/auth/login") ? 200 : 401 },
+        : { ok: true },
     );
   const setup = apiHarness(responder, { storage, locks: lockManager() });
   await setup.api.login("admin", "password", true);
   const { api, calls } = apiHarness(responder, { storage, locks: null });
-  assert.equal(await api.restoreSession(), true);
-
-  await assert.rejects(api.post("catalog/list"), /Web Locks/);
-  assert.equal(calls.filter((call) => call.url.endsWith("/auth/refresh")).length, 0);
-  assert.equal(storage.getItem(storageKey), null);
+  assert.equal(await api.restoreSession(), false);
   assert.equal(api.subject, "");
+  await assert.rejects(api.post("catalog/list"), /Sign in to continue/);
+  assert.equal(calls.filter((call) => call.url.endsWith("/auth/refresh")).length, 0);
+  assert.equal(JSON.parse(storage.getItem(storageKey)).bearer, bearer);
+  await setup.api.post("catalog/list");
+  assert.equal(setup.api.subject, "admin");
 });
 
 test("remember_me=false leaves no persistent session record", async () => {

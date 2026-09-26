@@ -104,6 +104,12 @@ namespace Amaterasu {
     async restoreSession(): Promise<boolean> {
       if (this.loggingOut) return false;
       this.resetMemory(true);
+      if (!this.webLocks()) {
+        // A remembered bearer cannot be used safely when this browser cannot
+        // serialize refresh and sign-out with other tabs. Leave shared storage
+        // untouched because another tab may be using or rotating its session.
+        return false;
+      }
       const generation = this.authGeneration;
       const persistenceGeneration = this.persistenceGeneration;
       const stored = await this.withSessionLock(() => {

@@ -495,6 +495,9 @@ var Amaterasu;
             if (this.loggingOut)
                 return false;
             this.resetMemory(true);
+            if (!this.webLocks()) {
+                return false;
+            }
             const generation = this.authGeneration;
             const persistenceGeneration = this.persistenceGeneration;
             const stored = await this.withSessionLock(() => {
