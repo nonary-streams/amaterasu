@@ -551,6 +551,7 @@ fn valid_rule_rate(value: &str, allow_fraction: bool) -> bool {
 }
 
 fn valid_manual_resolution(value: &str) -> bool {
+    let value = value.trim();
     if value.is_empty() {
         return true;
     }
@@ -1426,5 +1427,8 @@ mod tests {
         let zero_resolution: ClientConfigOverrides =
             serde_json::from_value(json!({"dd_manual_resolution":"1920x0"})).unwrap();
         zero_resolution.validate().unwrap();
+        let spaced_resolution: ClientConfigOverrides =
+            serde_json::from_value(json!({"dd_manual_resolution":" 1920×1080 "})).unwrap();
+        spaced_resolution.validate().unwrap();
     }
 }
