@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 pub const MAX_DISPLAYS: usize = 16;
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Status,
@@ -38,7 +38,7 @@ pub enum Operation {
 }
 /// Session-selected mode policy for one display in a concrete configuration.
 /// The caller supplies client/launch facts; the provider does not infer them.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModePolicy {
     pub display_id: String,
@@ -584,6 +584,9 @@ pub struct Journal {
     pub operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_configuration: Option<Configuration>,
+    /// Parsed caller request before topology composition or mode resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_identity: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_topology_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -611,6 +614,7 @@ impl Journal {
                 .requested_configuration
                 .as_ref()
                 .is_some_and(|configuration| configuration.validate().is_err())
+            || !self.valid_request_identity()
             || self.pending_route.as_ref().is_some_and(|route| {
                 route.id.is_empty()
                     || route.id.len() > 1024
@@ -624,6 +628,28 @@ impl Journal {
             ));
         }
         self.snapshot.validate()
+    }
+
+    fn valid_request_identity(&self) -> bool {
+        let Some(identity) = &self.request_identity else {
+            return true;
+        };
+        let Ok(operation @ Operation::Apply { .. }) =
+            serde_json::from_value::<Operation>(identity.clone())
+        else {
+            return false;
+        };
+        let Operation::Apply {
+            operation_id,
+            expected_topology_revision,
+            ..
+        } = &operation
+        else {
+            unreachable!("parsed Apply request")
+        };
+        operation_id == &self.operation_id
+            && expected_topology_revision == &self.expected_topology_revision
+            && serde_json::to_value(&operation).ok().as_ref() == Some(identity)
     }
 }
 #[derive(Debug)]

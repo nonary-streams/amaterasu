@@ -123,10 +123,14 @@ journal or native mutation when detected at prepare.
 
 Apply can carry a stable ASCII `operation_id` (1–128 graphic bytes). It is
 persisted with the recovery journal before native mutation and returned in
-owner-visible Status with the lease. An exact no-policy retry with the same
-owner, ID, concrete configuration, and expected revision returns the existing
-lease as `recovery_required` with `applied:false`; it cannot claim a native
-effect without fresh readback. A changed request using the same ID conflicts.
+owner-visible Status with the lease. An exact retry with the same owner, ID,
+original configuration, expected revision, and mode policy returns the existing
+lease as `recovery_required` with `applied:false`, without resolving modes or
+repeating a native effect. A changed request using the same ID conflicts.
+Older journals without the original request identity retain exact no-policy
+retries against their saved concrete configuration and expected revision.
+Policy retries against those journals fail closed; their owner can recover or
+restore the saved lease.
 
 A single `mode_policy` may include `configuration_option`. `disabled` returns
 without a state-service request or native effect. `verify_only` reads the

@@ -23,6 +23,7 @@ struct Incoming {
 struct PrepareIntent {
     expected_topology_revision: Option<String>,
     operation_id: Option<String>,
+    request_identity: Value,
     topology_change: bool,
     native_target: Option<(String, TopologyShape)>,
     pending_route: Option<RouteBinding>,
@@ -352,21 +353,31 @@ impl<P: Platform> Pipeline<P> {
                 mode_policy,
                 mode_policies,
             } => {
+                let request_identity = serde_json::to_value(Operation::Apply {
+                    configuration: configuration.clone(),
+                    expected_topology_revision: expected_topology_revision.clone(),
+                    operation_id: operation_id.clone(),
+                    mode_policy: mode_policy.clone(),
+                    mode_policies: mode_policies.clone(),
+                })
+                .expect("parsed display request serializes");
                 if let Some(journal) = journal {
                     if operation_id.is_some()
                         && operation_id == journal.operation_id
                         && journal.owner == context.caller
                     {
-                        if mode_policy.is_none()
-                            && mode_policies.is_none()
-                            && expected_topology_revision == journal.expected_topology_revision
-                            && journal
-                                .requested_configuration
-                                .as_ref()
-                                .is_some_and(|saved| {
-                                    serde_json::to_value(saved).ok()
-                                        == serde_json::to_value(&configuration).ok()
-                                })
+                        if journal.request_identity.as_ref() == Some(&request_identity)
+                            || (journal.request_identity.is_none()
+                                && mode_policy.is_none()
+                                && mode_policies.is_none()
+                                && expected_topology_revision == journal.expected_topology_revision
+                                && journal
+                                    .requested_configuration
+                                    .as_ref()
+                                    .is_some_and(|saved| {
+                                        serde_json::to_value(saved).ok()
+                                            == serde_json::to_value(&configuration).ok()
+                                    }))
                         {
                             // The reply may have been lost while a driver or third party
                             // changed the desktop. Never claim an unverified native effect.
@@ -728,6 +739,7 @@ impl<P: Platform> Pipeline<P> {
                     PrepareIntent {
                         expected_topology_revision,
                         operation_id,
+                        request_identity,
                         topology_change: topology_change
                             || native_target
                                 .as_ref()
@@ -787,6 +799,7 @@ impl<P: Platform> Pipeline<P> {
         let PrepareIntent {
             expected_topology_revision,
             operation_id,
+            request_identity,
             topology_change,
             native_target,
             pending_route,
@@ -849,12 +862,14 @@ impl<P: Platform> Pipeline<P> {
                 failure("resource_exhausted", "display lease generation exhausted"),
             );
         };
+        let request_identity = operation_id.as_ref().map(|_| request_identity);
         let journal = Journal {
             owner: context.caller.clone(),
             lease: format!("display-{generation:016x}"),
             snapshot,
             operation_id,
-            requested_configuration: Some(configuration.clone()),
+            requested_configuration: None,
+            request_identity,
             expected_topology_revision,
             pending_route,
         };

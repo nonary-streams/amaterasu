@@ -1021,6 +1021,8 @@ struct State {
     fail_clear: bool,
     cancel_ack: bool,
     deny_guard: bool,
+    lose_set_acceptance: bool,
+    lose_apply_completion: bool,
 }
 impl State {
     fn run(
@@ -1058,7 +1060,12 @@ impl State {
                             }
                             action => panic!("unexpected state action {action}"),
                         });
-                        Response::Accepted { id:20 }
+                        if self.lose_set_acceptance && payload["action"] == "set" {
+                            self.lose_set_acceptance = false;
+                            Response::error("transport_error", "set accepted but reply lost")
+                        } else {
+                            Response::Accepted { id:20 }
+                        }
                     }
                     Command::TakeResult { .. } => {
                         if self.cancel_ack && self.journal.is_some() { Response::error("cancelled", "parent cancelled before acknowledgement") }
@@ -1069,7 +1076,16 @@ impl State {
                         assert!(self.journal.is_some(), "native effect requires durable journal");
                         if self.deny_guard { Response::error("request_ended", "cancelled at native boundary") } else { Response::Ok }
                     }
-                    Command::Complete { payload, .. } => { result = Some(payload); Response::Ok }
+                    Command::Complete { payload, .. } => {
+                        if self.lose_apply_completion && payload["applied"] == true {
+                            self.lose_apply_completion = false;
+                            result = Some(json!({"reply_lost":true}));
+                            Response::error("request_ended", "apply reply lost after native effect")
+                        } else {
+                            result = Some(payload);
+                            Response::Ok
+                        }
+                    }
                     command => panic!("unexpected command: {command:?}"),
                 })
             }).unwrap();
@@ -1352,16 +1368,14 @@ fn ensure_only_display_drops_other_and_exactly_restores_baseline() {
         true,
     );
     let baseline = state.run(&mut pipeline, "owner", json!({"action":"snapshot"}));
-    let applied = state.run(
-        &mut pipeline,
-        "owner",
-        mutating_option_request(
-            option,
-            "monitor.two",
-            two_display_configuration(),
-            &baseline["topology_revision"],
-        ),
+    let mut request = mutating_option_request(
+        option,
+        "monitor.two",
+        two_display_configuration(),
+        &baseline["topology_revision"],
     );
+    request["operation_id"] = json!("topology-retry");
+    let applied = state.run(&mut pipeline, "owner", request.clone());
     assert_eq!(applied["applied"], true, "{option}: {applied}");
     let prepared = pipeline.platform.prepared_configuration.as_ref().unwrap();
     assert_eq!(prepared.displays.len(), 1);
@@ -1373,6 +1387,17 @@ fn ensure_only_display_drops_other_and_exactly_restores_baseline() {
             .unwrap()
             .len(),
         2
+    );
+    let effects = pipeline.platform.effects.len();
+    let retry = state.run(&mut pipeline, "owner", request.clone());
+    assert_eq!(retry["state"], "recovery_required");
+    assert_eq!(retry["lease"], applied["lease"]);
+    assert_eq!(pipeline.platform.effects.len(), effects);
+    assert_eq!(pipeline.platform.applied_modes.len(), 1);
+    request["mode_policy"]["configuration_option"] = json!("ensure_primary");
+    assert_eq!(
+        state.run(&mut pipeline, "owner", request)["error"]["code"],
+        "operation_conflict"
     );
     let restored = state.run(
         &mut pipeline,
@@ -2124,6 +2149,197 @@ fn durable_operation_identity_prevents_same_caller_adoption_and_survives_restart
     assert_eq!(retry["state"], "recovery_required");
     assert_eq!(retry["applied"], false);
     assert!(restarted.platform.effects.is_empty());
+}
+
+#[test]
+fn policy_retry_uses_original_request_after_mode_and_hdr_apply() {
+    let mut state = State {
+        lose_apply_completion: true,
+        ..Default::default()
+    };
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            available_modes: vec![crate::model::AvailableMode {
+                width: 1920,
+                height: 1080,
+                bits_per_pixel: 32,
+                nominal_refresh_hz: 120,
+                exact_current: false,
+                refresh: Rational {
+                    numerator: 120,
+                    denominator: 1,
+                },
+            }],
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let request = json!({
+        "action":"apply", "configuration":configuration(), "operation_id":"policy-lost-reply",
+        "mode_policy":{
+            "display_id":"monitor.one",
+            "context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":false,
+                "client_display_mode_override":false,"optimize_game_settings":true},
+            "remapping":{"resolution_only":[{"requested_resolution":"1280x720",
+                "final_resolution":"1920x1080"}]},
+            "resolution_option":"auto", "manual_resolution":"1920x1080",
+            "refresh_rate_option":"prefer_highest",
+            "hdr_option":"auto", "effective_client_hdr_request":true
+        }
+    });
+    let applied = state.run(&mut pipeline, "owner", request.clone());
+    assert_eq!(applied["reply_lost"], true, "{applied}");
+    let lease = state.journal.as_ref().unwrap()["lease"].clone();
+    assert_eq!(pipeline.platform.applied_mode.unwrap().0, 1920);
+    assert_eq!(pipeline.platform.applied_mode.unwrap().2.numerator, 120);
+    assert!(pipeline.platform.hdr_state);
+    assert_eq!(pipeline.platform.hdr_mutations, 1);
+    assert_eq!(pipeline.platform.mode_queries, 1);
+    assert_eq!(
+        pipeline
+            .platform
+            .prepared_configuration
+            .as_ref()
+            .unwrap()
+            .displays[0]
+            .width,
+        1920
+    );
+
+    pipeline.platform.available_modes.clear();
+    let retry = state.run(&mut pipeline, "owner", request.clone());
+    assert_eq!(retry["state"], "recovery_required");
+    assert_eq!(retry["applied"], false);
+    assert_eq!(retry["lease"], lease);
+    assert_eq!(pipeline.platform.mode_queries, 1);
+    assert_eq!(pipeline.platform.hdr_mutations, 1);
+    assert_eq!(pipeline.platform.effects, ["apply"]);
+
+    for field in [
+        "manual_resolution",
+        "refresh_rate_option",
+        "hdr_option",
+        "effective_client_hdr_request",
+    ] {
+        let mut changed = request.clone();
+        changed["mode_policy"][field] = json!(match field {
+            "manual_resolution" => "1280x720",
+            "refresh_rate_option" => "auto",
+            "hdr_option" => "disabled",
+            _ => "false",
+        });
+        if field == "effective_client_hdr_request" {
+            changed["mode_policy"][field] = json!(false);
+        }
+        let rejected = state.run(&mut pipeline, "owner", changed);
+        assert_eq!(
+            rejected["error"]["code"], "operation_conflict",
+            "{field}: {rejected}"
+        );
+    }
+    let mut changed_revision = request.clone();
+    changed_revision["expected_topology_revision"] = json!("00000000000000000000000000000000");
+    assert_eq!(
+        state.run(&mut pipeline, "owner", changed_revision)["error"]["code"],
+        "operation_conflict"
+    );
+    let foreign = state.run(&mut pipeline, "foreign", request.clone());
+    assert_eq!(foreign["error"]["code"], "display_busy");
+    assert!(foreign["lease"].is_null());
+
+    let mut restarted = Pipeline::new(FakePlatform::default(), true);
+    let recovered = state.run(&mut restarted, "owner", request);
+    assert_eq!(recovered["state"], "recovery_required");
+    assert_eq!(recovered["lease"], lease);
+    assert!(restarted.platform.effects.is_empty());
+    let readback = state.run(
+        &mut restarted,
+        "owner",
+        json!({"action":"recover","lease":lease}),
+    );
+    assert_eq!(readback["ok"], true, "{readback}");
+    assert!(state.journal.is_none());
+    assert_eq!(restarted.platform.effects, ["restore"]);
+}
+
+#[test]
+fn legacy_journal_without_request_identity_keeps_exact_plain_retry() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let request = json!({"action":"apply","configuration":configuration(),"operation_id":"legacy"});
+    let applied = state.run(&mut pipeline, "owner", request.clone());
+    state
+        .journal
+        .as_mut()
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("request_identity");
+    state.journal.as_mut().unwrap()["requested_configuration"] = configuration();
+    let mut restarted = Pipeline::new(FakePlatform::default(), true);
+    let retry = state.run(&mut restarted, "owner", request);
+    assert_eq!(retry["state"], "recovery_required");
+    assert_eq!(retry["lease"], applied["lease"]);
+    assert!(restarted.platform.effects.is_empty());
+    let restored = state.run(
+        &mut restarted,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+}
+
+#[test]
+fn legacy_policy_journal_cannot_be_adopted_without_original_request() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let request = json!({"action":"apply","configuration":configuration(),
+        "operation_id":"legacy-policy", "mode_policy":policy("monitor.one", "1920x1080", "120")});
+    let applied = state.run(&mut pipeline, "owner", request.clone());
+    assert_eq!(applied["applied"], true);
+    state
+        .journal
+        .as_mut()
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("request_identity");
+    let retry = state.run(&mut pipeline, "owner", request);
+    assert_eq!(retry["error"]["code"], "operation_conflict");
+    assert_eq!(pipeline.platform.effects, ["apply"]);
+}
+
+#[test]
+fn durable_policy_journal_recovers_when_set_acceptance_is_lost() {
+    let mut state = State {
+        lose_set_acceptance: true,
+        ..Default::default()
+    };
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let request = json!({
+        "action":"apply", "configuration":configuration(), "operation_id":"lost-set",
+        "mode_policy":policy("monitor.one", "1920x1080", "120")
+    });
+    let lost = state.run(&mut pipeline, "owner", request.clone());
+    assert_eq!(lost["error"]["code"], "transport_error");
+    assert!(state.journal.is_some());
+    assert!(pipeline.platform.effects.is_empty());
+    let retried = state.run(&mut pipeline, "owner", request.clone());
+    assert_eq!(retried["state"], "recovery_required");
+    assert_eq!(retried["applied"], false);
+    assert_eq!(retried["lease"], state.journal.as_ref().unwrap()["lease"]);
+    assert!(pipeline.platform.effects.is_empty());
+    let mut changed = request.clone();
+    changed["mode_policy"]["remapping"]["mixed"][0]["final_refresh_rate"] = json!("144");
+    assert_eq!(
+        state.run(&mut pipeline, "owner", changed)["error"]["code"],
+        "operation_conflict"
+    );
+    assert_eq!(
+        state.run(&mut pipeline, "foreign", request)["error"]["code"],
+        "display_busy"
+    );
 }
 #[test]
 fn durable_journal_precedes_effects_and_only_owner_can_restore() {
@@ -3182,6 +3398,7 @@ fn expired_native_boundary_keeps_recovery_without_effects() {
         lease: "display-0000000000000001".into(),
         snapshot: snapshot(),
         operation_id: None,
+        request_identity: None,
         requested_configuration: None,
         expected_topology_revision: None,
         pending_route: None,
@@ -3246,6 +3463,7 @@ fn invalid_journals_and_stale_leases_are_never_overwritten() {
             lease: "current".into(),
             snapshot: snapshot(),
             operation_id: None,
+            request_identity: None,
             requested_configuration: None,
             expected_topology_revision: None,
             pending_route: None,
