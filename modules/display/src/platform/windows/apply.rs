@@ -190,15 +190,32 @@ pub fn preserving(
         (Some(route), super::super::TopologyShape::OnlySelected) => {
             only_bound_inactive(configuration, before, selected, route)
         }
-        (Some(route), super::super::TopologyShape::PreserveActive) => {
-            append_inactive(restoration(before)?, configuration, before, selected, route)
-        }
+        (Some(route), super::super::TopologyShape::PreserveActive) => append_inactive(
+            restoration(before)?,
+            configuration,
+            before,
+            selected,
+            route,
+            false,
+        ),
+        (Some(route), super::super::TopologyShape::TranslateActive) => append_inactive(
+            restoration(before)?,
+            configuration,
+            before,
+            selected,
+            route,
+            true,
+        ),
         (None, super::super::TopologyShape::PreserveActive) => {
             preserve_bound(restoration(before)?, configuration, before, selected)
         }
         (None, super::super::TopologyShape::OnlySelected) => Err(DisplayError::new(
             "unsupported_topology",
             "selected-only inactive topology requires a bound route",
+        )),
+        (None, super::super::TopologyShape::TranslateActive) => Err(DisplayError::new(
+            "unsupported_topology",
+            "inactive primary topology requires a bound route",
         )),
     }
 }
@@ -327,9 +344,18 @@ fn append_inactive(
     before: &Snapshot,
     selected: &str,
     route: &RouteBinding,
+    translate_active: bool,
 ) -> DisplayResult<ConfigurationBuffers> {
     let path = bound_inactive_path(route, before)?;
-    append_bound_inactive(bound, configuration, before, selected, route, path)
+    append_bound_inactive(
+        bound,
+        configuration,
+        before,
+        selected,
+        route,
+        path,
+        translate_active,
+    )
 }
 
 fn only_bound_inactive(
@@ -383,6 +409,7 @@ pub(super) fn append_bound_inactive(
     selected: &str,
     route: &RouteBinding,
     path: DISPLAYCONFIG_PATH_INFO,
+    translate_active: bool,
 ) -> DisplayResult<ConfigurationBuffers> {
     configuration.validate()?;
     before.configuration()?;
@@ -405,7 +432,13 @@ pub(super) fn append_bound_inactive(
                 "inactive target is missing from request",
             )
         })?;
-    let (translation_x, translation_y) = if selected_wanted.x == 0 && selected_wanted.y == 0 {
+    if translate_active && (selected_wanted.x != 0 || selected_wanted.y != 0) {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "inactive primary target must begin at origin",
+        ));
+    }
+    let (translation_x, translation_y) = if translate_active {
         let anchor = before
             .paths
             .iter()
@@ -476,7 +509,7 @@ pub(super) fn append_bound_inactive(
         };
     }
     let mut result = append_selected_inactive(bound, selected_wanted, route, path)?;
-    if selected_wanted.x == 0 && selected_wanted.y == 0 {
+    if translate_active {
         // CCD path order is priority order. Give the new primary first
         // priority while retaining the relative order of saved active paths.
         let primary = result.paths.pop().expect("selected path was appended");

@@ -528,6 +528,10 @@ impl<P: Platform> Pipeline<P> {
                                 == Some(DisplayConfigurationOption::EnsureOnlyDisplay)
                             {
                                 TopologyShape::OnlySelected
+                            } else if topology_option
+                                == Some(DisplayConfigurationOption::EnsurePrimary)
+                            {
+                                TopologyShape::TranslateActive
                             } else {
                                 TopologyShape::PreserveActive
                             },

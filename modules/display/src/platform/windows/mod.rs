@@ -241,7 +241,8 @@ fn apply_configuration(
     if let Some(route) = route {
         verify_activated_route(route, &final_state)?;
     }
-    if let Some((selected, TopologyShape::PreserveActive)) = selected
+    if let Some((selected, TopologyShape::PreserveActive | TopologyShape::TranslateActive)) =
+        selected
         && !apply::verifies_untouched(configuration, before, &final_state, selected)
     {
         return Err(DisplayError::new(
@@ -594,6 +595,7 @@ mod tests {
             "monitor.two",
             &route,
             path,
+            false,
         )
         .unwrap();
         assert_eq!(bound.paths.len(), 2);
@@ -819,6 +821,7 @@ mod tests {
             "monitor.three",
             &route,
             path,
+            true,
         )
         .unwrap();
         assert_eq!(buffers.paths.len(), 3);
@@ -886,7 +889,8 @@ mod tests {
                 &before,
                 "monitor.three",
                 &route,
-                path
+                path,
+                true,
             )
             .err()
             .unwrap()

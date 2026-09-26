@@ -961,6 +961,13 @@ fn ensure_active_inactive_target_persists_route_and_restores_baseline() {
     assert_eq!(prepared.displays[0].id, "monitor.other");
     assert_eq!(prepared.displays[1].id, "monitor.one");
     assert_eq!(prepared.displays[1].x, 1920);
+    assert_eq!(
+        pipeline.platform.preserving_selected,
+        [
+            "prepare:monitor.one:PreserveActive",
+            "apply:monitor.one:PreserveActive"
+        ]
+    );
     let restored = state.run(
         &mut pipeline,
         "owner",
@@ -1366,8 +1373,8 @@ fn ensure_primary_places_inactive_target_left_of_translated_desktop_and_restores
     assert_eq!(
         pipeline.platform.preserving_selected,
         [
-            "prepare:monitor.new:PreserveActive",
-            "apply:monitor.new:PreserveActive"
+            "prepare:monitor.new:TranslateActive",
+            "apply:monitor.new:TranslateActive"
         ]
     );
     let restored = state.run(
