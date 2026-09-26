@@ -1458,9 +1458,10 @@ fn terminal_capture_failure_drops_cached_pixels_and_allows_a_fresh_open() {
 }
 
 #[test]
-fn v1_3_capture_callback_preserves_acquisition_time_across_timestamp_rewrite_and_reuse() {
-    let mut acquired = frame(0, 4, &[1, 2, 3, 4, 5, 6, 7, 8]);
-    acquired.capture_pacing_timestamp_us = 123;
+fn v1_3_capture_callback_preserves_source_time_across_readback_delay_and_reuse() {
+    // The fake readback completed at 40 ms for a frame rendered at 10 ms.
+    let mut acquired = frame(40_000, 4, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    acquired.capture_pacing_timestamp_us = 10_000;
     let events = VecDeque::from([Ok(Some(acquired)), Ok(None)]);
     let controller = Arc::new(Mutex::new(Controller::new(
         FakeBackend {
@@ -1495,8 +1496,8 @@ fn v1_3_capture_callback_preserves_acquisition_time_across_timestamp_rewrite_and
     assert!(deliveries[0].0 > 0);
     assert_eq!([deliveries[0].1, deliveries[1].1], [1, 2]);
     assert!(deliveries[0].0 < deliveries[1].0);
-    assert_eq!(deliveries[0].2, 123);
-    assert_eq!(deliveries[1].2, 123);
+    assert_eq!(deliveries[0].2, 10_000);
+    assert_eq!(deliveries[1].2, 10_000);
     assert_eq!(
         [deliveries[0].3, deliveries[1].3],
         [CAPTURE_FRAME_FRESH, CAPTURE_FRAME_CACHED_REUSE]

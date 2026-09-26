@@ -28,7 +28,10 @@ use windows::core::{IInspectable, Interface};
 mod monitors;
 #[path = "readback.rs"]
 mod readback;
+#[path = "source_clock.rs"]
+mod source_clock;
 use readback::{Readback, native_error};
+use source_clock::SourceClock;
 
 pub struct WindowsBackend {
     capture_cursor: Option<bool>,
@@ -145,6 +148,7 @@ struct Session {
     closed_token: Option<i64>,
     size: SizeInt32,
     started: Instant,
+    source_clock: SourceClock,
     _apartment: Apartment,
 }
 
@@ -195,6 +199,7 @@ impl Session {
         drop(graphics_device);
         drop(interop);
         let closed = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
         let mut result = Self {
             session,
             pool,
@@ -203,7 +208,8 @@ impl Session {
             closed,
             closed_token: None,
             size,
-            started: Instant::now(),
+            started,
+            source_clock: SourceClock::start(),
             _apartment: apartment,
         };
         result.configure(capture_cursor)?;
@@ -253,9 +259,18 @@ impl Session {
         // SAFETY: WinRT surface exposes the official DXGI access interface;
         // the returned texture owns a reference through readback submission.
         let texture = unsafe { access.GetInterface() }.map_err(native_error)?;
-        let timestamp = self.started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        self.readback
-            .submit(&texture, size.Width as u32, size.Height as u32, timestamp)?;
+        let observed_us = self.started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        // WinRT supplies the compositor's QPC time. If it fails to supply one,
+        // retain only the local observation time, with no source-time claim.
+        let source_time = frame.0.SystemRelativeTime().ok().map(|time| time.Duration);
+        let timestamp = self.source_clock.map(source_time, observed_us);
+        self.readback.submit(
+            &texture,
+            size.Width as u32,
+            size.Height as u32,
+            observed_us,
+            timestamp,
+        )?;
         Ok(true)
     }
 }

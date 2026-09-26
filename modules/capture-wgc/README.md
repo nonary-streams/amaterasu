@@ -108,11 +108,17 @@ and may be retried without consuming a frame.
 
 The v1.2 freshness callback reports whether delivered pixels came from a fresh
 WGC frame or cached reuse. The v1.3 `read_frame_with_capture_timestamp` callback
-also returns the WGC acquisition timestamp separately from `CpuFrame.timestamp_us`.
-That source timestamp is captured before GPU readback and preserved while the
-controller keeps its own monotonic frame timestamp and sequence. Consumers can
-bind the v1.3 tail only after checking both its advertised minor version and
+also returns a source pacing timestamp separately from `CpuFrame.timestamp_us`.
+On Windows, `Direct3D11CaptureFrame.SystemRelativeTime` identifies when the
+compositor rendered the frame. Its QPC time is mapped to this stream's epoch
+before GPU readback. Missing, zero, regressing, future, or unrepresentable
+source times fall back to the worker's local frame observation time; that
+fallback cannot recover time spent queued by WGC. The controller keeps its own
+monotonic delivery timestamp and sequence, independent of source pacing time.
+Consumers can bind the v1.3 tail only after checking its advertised minor version and
 table size; older prefixes retain their original layout and behavior.
+The QPC mapping and real capture/readback timing still require qualification
+on an attached Windows display with WGC access.
 
 The broker supplies
 the authenticated immediate caller at bind time, and the provider copies it into

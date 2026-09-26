@@ -24,6 +24,7 @@ struct PendingTexture {
     width: u32,
     height: u32,
     timestamp_us: u64,
+    capture_pacing_timestamp_us: u64,
 }
 
 impl Readback {
@@ -104,6 +105,7 @@ impl Readback {
         width: u32,
         height: u32,
         timestamp_us: u64,
+        capture_pacing_timestamp_us: u64,
     ) -> CaptureResult<()> {
         if self.pending() {
             return Err(CaptureError::new(
@@ -174,6 +176,7 @@ impl Readback {
             width,
             height,
             timestamp_us,
+            capture_pacing_timestamp_us,
         });
         Ok(())
     }
@@ -236,7 +239,7 @@ impl Readback {
             stride,
             bytes: Arc::new(bytes),
             timestamp_us: pending.timestamp_us,
-            capture_pacing_timestamp_us: pending.timestamp_us,
+            capture_pacing_timestamp_us: pending.capture_pacing_timestamp_us,
             sequence: self.sequence,
         };
         let completed = self
