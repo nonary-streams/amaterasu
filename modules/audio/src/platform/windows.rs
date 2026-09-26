@@ -1233,8 +1233,14 @@ impl Capture {
         // SAFETY: GetBuffer/ReleaseBuffer are paired on the same worker thread;
         // copy_samples never borrows uninitialized padding or silent pointers.
         unsafe {
-            if self.capture.GetNextPacketSize().map_err(capture_error)? == 0 {
-                self.buffer_error_since = None;
+            if matches!(
+                packet_size_after_query(
+                    self.capture.GetNextPacketSize(),
+                    &mut self.buffer_error_since,
+                    Instant::now(),
+                )?,
+                None | Some(0)
+            ) {
                 return Ok(None);
             }
             let mut pointer = std::ptr::null_mut();
@@ -1386,6 +1392,24 @@ fn borrowed_packet_after_acquisition<'a, C: CaptureBufferRelease + ?Sized>(
         // A failed GetBuffer owns no buffer, so there is nothing to release.
         Err(error) if transient_buffer_error(error.code()) => {
             if buffer_error_requires_recovery(first_error, Instant::now()) {
+                Err("device_lost")
+            } else {
+                Ok(None)
+            }
+        }
+        Err(error) => Err(capture_error(error)),
+    }
+}
+
+fn packet_size_after_query(
+    queried: windows::core::Result<u32>,
+    first_error: &mut Option<Instant>,
+    now: Instant,
+) -> AudioResult<Option<u32>> {
+    match queried {
+        Ok(size) => Ok(Some(size)),
+        Err(error) if transient_buffer_error(error.code()) => {
+            if buffer_error_requires_recovery(first_error, now) {
                 Err("device_lost")
             } else {
                 Ok(None)
@@ -1554,6 +1578,51 @@ mod tests {
         );
         assert!(matches!(acquisition, Ok(None)));
         assert!(capture.released.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_polls_do_not_hide_repeated_buffer_failures_from_recovery() {
+        let started = Instant::now();
+        let mut first_error = Some(started);
+        assert_eq!(
+            packet_size_after_query(Ok(0), &mut first_error, started + Duration::from_millis(1)),
+            Ok(Some(0))
+        );
+        assert_eq!(first_error, Some(started));
+
+        let buffer_error = || windows::core::Error::from_hresult(AUDCLNT_E_BUFFER_ERROR);
+        assert_eq!(
+            packet_size_after_query(
+                Err(buffer_error()),
+                &mut first_error,
+                started + BUFFER_ERROR_RECOVERY_DELAY - Duration::from_nanos(1),
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            packet_size_after_query(
+                Ok(0),
+                &mut first_error,
+                started + BUFFER_ERROR_RECOVERY_DELAY
+            ),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            packet_size_after_query(
+                Err(buffer_error()),
+                &mut first_error,
+                started + BUFFER_ERROR_RECOVERY_DELAY,
+            ),
+            Err("device_lost")
+        );
+
+        let capture = FakeCaptureBuffer::default();
+        let acquired = borrowed_packet_after_acquisition(&capture, Ok(()), 4, &mut first_error)
+            .unwrap()
+            .unwrap();
+        acquired.release().unwrap();
+        assert_eq!(first_error, None);
+        assert_eq!(*capture.released.lock().unwrap(), [4]);
     }
 
     #[test]
