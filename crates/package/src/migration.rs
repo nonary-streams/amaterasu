@@ -453,6 +453,26 @@ pub fn import_legacy_configuration_with_sensitive_sources(
     import_legacy_configuration_after_preflight(data_root, sources, plan)
 }
 
+/// Fingerprints the complete bounded source snapshot used by sensitive helpers.
+/// Configuration files choose helper inputs, so binding only credential and
+/// identity files would allow a changed selector to redirect an approval.
+pub fn sensitive_source_fingerprints(
+    source: &LegacyConfigSource,
+) -> PackageResult<BTreeMap<PathBuf, String>> {
+    let collected = collect_configuration_files(&source.root)?
+        .ok_or("a predecessor configuration source no longer contains supported files")?;
+    let mut fingerprints = BTreeMap::new();
+    for relative in &collected.files {
+        let path = collected
+            .copy_sources
+            .get(relative)
+            .cloned()
+            .unwrap_or_else(|| source.root.join(relative));
+        fingerprints.insert(relative.clone(), digest_regular_file(&path)?);
+    }
+    Ok(fingerprints)
+}
+
 /// Removes only files created by a successful import. A changed target causes
 /// rollback to stop rather than erase a post-import user change. Source backups
 /// remain available for recovery and audit.

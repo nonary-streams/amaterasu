@@ -369,8 +369,13 @@ fn validate_sensitive_sources(
     for source in sources {
         let plan = analyze_legacy_configuration(std::slice::from_ref(source))?;
         let (needs_pairing, needs_authentication) = sensitive_needs_in_plan(&plan);
+        let fingerprints = if needs_pairing || needs_authentication {
+            amaterasu_package::migration::sensitive_source_fingerprints(source)?
+        } else {
+            Default::default()
+        };
         critical_items.extend(plan.critical_items);
-        checks.push(SourceValidation {
+        let check = SourceValidation {
             product: source.product,
             pairing_needed: needs_pairing,
             authentication_needed: needs_authentication,
@@ -388,7 +393,15 @@ fn validate_sensitive_sources(
                     &source.root,
                     None,
                 )?,
-        });
+            fingerprints,
+        };
+        if (needs_pairing || needs_authentication)
+            && amaterasu_package::migration::sensitive_source_fingerprints(source)?
+                != check.fingerprints
+        {
+            return Err("predecessor sensitive state changed during validation".into());
+        }
+        checks.push(check);
     }
     critical_items.sort();
     critical_items.dedup();
@@ -412,6 +425,7 @@ struct SourceValidation {
     authentication_needed: bool,
     pairing_valid: bool,
     authentication_valid: bool,
+    fingerprints: std::collections::BTreeMap<PathBuf, String>,
 }
 
 fn ensure_copied_sensitive_requirements(
@@ -429,6 +443,15 @@ fn ensure_copied_sensitive_requirements(
     };
     if requirements(original) != requirements(copied)
         || original.critical_items != copied.critical_items
+        || original.checks.len() != copied.checks.len()
+        || original
+            .checks
+            .iter()
+            .zip(&copied.checks)
+            .any(|(approved, imported)| {
+                approved.product != imported.product
+                    || approved.fingerprints != imported.fingerprints
+            })
     {
         return Err("predecessor sensitive state changed while being imported".into());
     }
@@ -1522,6 +1545,7 @@ mod handoff_cli_tests {
                 authentication_needed: original_needs.1,
                 pairing_valid: true,
                 authentication_valid: true,
+                fingerprints: Default::default(),
             }],
         };
         let mut copied_validation = SensitiveValidation {
@@ -1535,6 +1559,7 @@ mod handoff_cli_tests {
                 authentication_needed: copied_needs.1,
                 pairing_valid: true,
                 authentication_valid: true,
+                fingerprints: Default::default(),
             }],
         };
         assert!(
@@ -1642,6 +1667,7 @@ mod handoff_cli_tests {
             authentication_needed: true,
             pairing_valid: true,
             authentication_valid: true,
+            fingerprints: Default::default(),
         };
         let validation = SensitiveValidation {
             approvals: aggregate_sensitive_approvals(std::slice::from_ref(&check)),
@@ -1690,6 +1716,7 @@ mod handoff_cli_tests {
             authentication_needed: true,
             pairing_valid: true,
             authentication_valid: true,
+            fingerprints: Default::default(),
         };
         let validation = SensitiveValidation {
             approvals: aggregate_sensitive_approvals(std::slice::from_ref(&check)),
@@ -1758,6 +1785,7 @@ mod handoff_cli_tests {
                 authentication_needed: true,
                 pairing_valid: true,
                 authentication_valid: true,
+                fingerprints: Default::default(),
             },
             SourceValidation {
                 product: LegacyProduct::Sunshine,
@@ -1765,6 +1793,7 @@ mod handoff_cli_tests {
                 authentication_needed: true,
                 pairing_valid: true,
                 authentication_valid: false,
+                fingerprints: Default::default(),
             },
         ]);
         assert!(!approvals[0].authentication);

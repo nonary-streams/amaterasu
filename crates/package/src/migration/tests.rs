@@ -37,6 +37,42 @@ fn source(product: LegacyProduct, root: &Path) -> LegacyConfigSource {
 }
 
 #[test]
+fn sensitive_snapshot_binds_default_state_and_configured_input_selector() {
+    let fixture = TemporaryDirectory::new();
+    let root = fixture.path().join("Sunshine");
+    write(
+        &root.join("sunshine.conf"),
+        b"credentials_file = credentials/A.json\n",
+    );
+    write(&root.join("credentials/A.json"), b"approved verifier");
+    write(&root.join("credentials/B.json"), b"other verifier");
+    write(
+        &root.join("sunshine_state.json"),
+        b"approved pairing identity",
+    );
+    let source = source(LegacyProduct::Sunshine, &root);
+    let approved = sensitive_source_fingerprints(&source).unwrap();
+
+    write(
+        &root.join("sunshine_state.json"),
+        b"changed pairing identity",
+    );
+    assert_ne!(sensitive_source_fingerprints(&source).unwrap(), approved);
+    write(
+        &root.join("sunshine_state.json"),
+        b"approved pairing identity",
+    );
+
+    // Both candidate credentials existed when approval was issued. Changing
+    // only the config selector still invalidates that approval.
+    write(
+        &root.join("sunshine.conf"),
+        b"credentials_file = credentials/B.json\n",
+    );
+    assert_ne!(sensitive_source_fingerprints(&source).unwrap(), approved);
+}
+
+#[test]
 fn detects_only_known_product_roots_with_supported_configuration() {
     let fixture = TemporaryDirectory::new();
     write(

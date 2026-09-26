@@ -204,6 +204,138 @@ fn credential_import_seeds_runtime_and_failed_retry_revokes_handoff_approval() {
 }
 
 #[test]
+#[ignore = "requires a separately built authentication import helper"]
+fn valid_credential_swap_after_helper_approval_preserves_previous_seed() {
+    let helper = PathBuf::from(
+        std::env::var_os("AMATERASU_AUTHENTICATION_IMPORT_EXE")
+            .expect("set AMATERASU_AUTHENTICATION_IMPORT_EXE"),
+    );
+    let root = unique_fixture_root();
+    let binaries = root.join("bin");
+    let source = root.join("predecessor");
+    let destination = root.join("data");
+    let runtime = root.join("runtime");
+    fs::create_dir_all(&binaries).unwrap();
+    fs::create_dir_all(source.join("credentials")).unwrap();
+    fs::create_dir_all(&runtime).unwrap();
+    let migration = binaries.join(format!(
+        "amaterasu-migration{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let staged_helper = binaries.join(format!(
+        "amaterasu-authentication-import{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::copy(env!("CARGO_BIN_EXE_amaterasu-migration"), &migration).unwrap();
+    fs::copy(&helper, &staged_helper).unwrap();
+    fs::write(
+        source.join("sunshine.conf"),
+        "credentials_file = credentials/login.json\n",
+    )
+    .unwrap();
+    let credential = source.join("credentials/login.json");
+    let approved_hash = "0123456789abcdef".repeat(4);
+    let replacement_hash = "fedcba9876543210".repeat(4);
+    write_credential(&credential, &approved_hash);
+    let first = import(&migration, &source, &destination, &runtime);
+    assert!(first.status.success(), "{}", output_text(&first));
+    let seeded = authentication_namespace(&runtime);
+    let previous_seed = fs::read(&seeded).unwrap();
+
+    // This process delegates to the real validator, then swaps in another
+    // valid verifier before migration resumes copying the predecessor files.
+    let wrapper_source = binaries.join("credential-swap-helper.rs");
+    fs::write(
+        &wrapper_source,
+        r#"use std::{env, fs, process::{self, Command}};
+fn main() {
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    let status = Command::new(env::var_os("REAL_AUTH_HELPER").unwrap())
+        .args(&args).status().unwrap();
+    if status.success() && args.first().is_some_and(|arg| arg == "validate") {
+        let source = args.get(2).unwrap();
+        if source == &env::var_os("SWAP_SOURCE").unwrap() {
+            fs::write(env::var_os("SWAP_CREDENTIAL").unwrap(),
+                env::var_os("SWAP_CONTENT").unwrap().to_string_lossy().as_bytes()).unwrap();
+        }
+    }
+    process::exit(status.code().unwrap_or(1));
+}"#,
+    )
+    .unwrap();
+    let compile = Command::new("rustc")
+        .arg("--edition=2024")
+        .arg(&wrapper_source)
+        .arg("-o")
+        .arg(&staged_helper)
+        .output()
+        .unwrap();
+    assert!(compile.status.success(), "{}", output_text(&compile));
+    let replacement = serde_json::json!({
+        "username": "admin", "password": replacement_hash, "salt": "1234567890abcdef"
+    })
+    .to_string();
+    let retry = Command::new(&migration)
+        .args(["import", "--destination"])
+        .arg(&destination)
+        .arg("--runtime")
+        .arg(&runtime)
+        .arg("--source")
+        .arg(format!("sunshine={}", source.display()))
+        .env("REAL_AUTH_HELPER", &helper)
+        .env("SWAP_SOURCE", &source)
+        .env("SWAP_CREDENTIAL", &credential)
+        .env("SWAP_CONTENT", &replacement)
+        .output()
+        .unwrap();
+    assert!(!retry.status.success(), "swapped credential was accepted");
+    assert_eq!(fs::read(&seeded).unwrap(), previous_seed);
+    assert_eq!(
+        fs::read(destination.join("legacy-imports/sunshine/credentials/login.json")).unwrap(),
+        serde_json::to_vec(&serde_json::json!({
+            "username": "admin", "password": approved_hash, "salt": "1234567890abcdef"
+        }))
+        .unwrap()
+    );
+    assert!(!runtime.join("installer-import-validated.json").exists());
+
+    // A fresh destination cannot reject the changed credential through an
+    // existing archive conflict. The approval binding itself must stop it.
+    write_credential(&credential, &approved_hash);
+    let fresh_destination = root.join("fresh-data");
+    let fresh_runtime = root.join("fresh-runtime");
+    fs::create_dir_all(&fresh_runtime).unwrap();
+    let fresh_attempt = Command::new(&migration)
+        .args(["import", "--destination"])
+        .arg(&fresh_destination)
+        .arg("--runtime")
+        .arg(&fresh_runtime)
+        .arg("--source")
+        .arg(format!("sunshine={}", source.display()))
+        .env("REAL_AUTH_HELPER", &helper)
+        .env("SWAP_SOURCE", &source)
+        .env("SWAP_CREDENTIAL", &credential)
+        .env("SWAP_CONTENT", &replacement)
+        .output()
+        .unwrap();
+    assert!(!fresh_attempt.status.success());
+    assert!(
+        output_text(&fresh_attempt)
+            .contains("predecessor sensitive state changed during validation"),
+        "{}",
+        output_text(&fresh_attempt)
+    );
+    assert!(!authentication_namespace(&fresh_runtime).exists());
+    assert!(
+        !fresh_runtime
+            .join("installer-import-validated.json")
+            .exists()
+    );
+    assert!(!fresh_destination.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 #[ignore = "requires separately built authentication and pairing import helpers"]
 fn failed_process_import_rolls_back_all_configured_files_and_retry_seeds_credential() {
     let authentication_helper = PathBuf::from(
