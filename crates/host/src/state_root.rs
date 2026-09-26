@@ -17,6 +17,7 @@ pub(crate) use seed::apply_pending_seed;
 
 const TOKEN_USER: u32 = 1;
 const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
 const SE_FILE_OBJECT: u32 = 1;
 const SE_DACL_PROTECTED: u16 = 0x1000;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -124,6 +125,73 @@ unsafe extern "system" {
 pub(crate) struct PreparedUserState {
     pub(crate) root: PathBuf,
     pub(crate) seed: Option<PathBuf>,
+}
+
+/// Prepare the only parent a provider may use for durable Steam artwork.
+/// The worker runs as the active user, so this uses the same protected SID
+/// boundary as its state root. A package never supplies either path segment.
+pub(crate) fn prepare_steam_artwork_cache_parent(state_root: &Path) -> PackageResult<PathBuf> {
+    let state_root = canonical_real_directory(state_root, "worker state root")?;
+    let mut token = std::ptr::null_mut();
+    // SAFETY: the current process pseudo-handle is valid and the output receives
+    // one owned token handle, closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), 8, &mut token) } == 0 {
+        return Err("worker token is unavailable".into());
+    }
+    let sid = sid_string(token);
+    // SAFETY: OpenProcessToken returned this owned handle.
+    unsafe { CloseHandle(token) };
+    let sid = sid?;
+    let sddl = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})");
+    validate_owner(&state_root, &[&sid, "S-1-5-18"])?;
+    validate_dacl(&state_root, &sddl)?;
+    let mut parent = state_root;
+    for segment in ["provider-cache", "steam"] {
+        parent = parent.join(segment);
+        if !parent.try_exists().map_err(|error| error.to_string())? {
+            create_real_directory(&parent)?;
+        }
+        parent = canonical_real_directory(&parent, "Steam artwork cache parent")?;
+        validate_owner(&parent, &[&sid])?;
+        set_dacl(&parent, &sddl)?;
+    }
+    Ok(parent)
+}
+
+fn validate_owner(path: &Path, allowed_sids: &[&str]) -> PackageResult<()> {
+    let path_wide = wide(path.as_os_str())?;
+    let mut owner = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: the path is NUL-terminated. The owner is borrowed from the
+    // LocalFree-owned descriptor until this function releases it.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 || descriptor.is_null() || owner.is_null() {
+        return Err("Steam artwork cache owner is unavailable".into());
+    }
+    let matches = allowed_sids.iter().any(|sid| {
+        let Ok(expected) = sid_from_string(sid) else {
+            return false;
+        };
+        // SAFETY: both SIDs remain live through this call.
+        (unsafe { EqualSid(owner, expected.0) }) != 0
+    });
+    // SAFETY: GetNamedSecurityInfoW allocated the descriptor containing owner.
+    unsafe { LocalFree(descriptor) };
+    if !matches {
+        return Err("Steam artwork cache has an untrusted owner".into());
+    }
+    Ok(())
 }
 
 /// Prepares a user root and a separate SID-readable migration snapshot.
@@ -628,8 +696,8 @@ mod tests {
         AccessAllowedAce, CloseHandle, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         GetCurrentProcess, GetSecurityDescriptorDacl, LocalFree, OpenProcessToken,
         SetFileSecurityW, canonical_real_directory, claim_pending_seed, copy_real_tree,
-        expected_sids, same_windows_path, sid_string, stage_seed_snapshot, valid_sid,
-        validate_dacl, validate_descriptor, wide,
+        expected_sids, prepare_steam_artwork_cache_parent, same_windows_path, set_dacl, sid_string,
+        stage_seed_snapshot, valid_sid, validate_dacl, validate_descriptor, wide,
     };
     use serde_json::Value;
     use std::collections::BTreeMap;
@@ -677,6 +745,32 @@ mod tests {
         assert!(valid_sid("S-1-5-21-123-456-789-1001"));
         assert!(!valid_sid("S-1-5-21-.."));
         assert!(!valid_sid("S-1-5-21-1001\\escape"));
+    }
+
+    #[test]
+    fn steam_cache_parent_is_private_and_stable_across_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-steam-host-cache-{}-{}",
+            std::process::id(),
+            amaterasu_package::random_identifier().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let sddl = format!(
+            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{})",
+            current_sid()
+        );
+        make_permissive(&root);
+        assert!(prepare_steam_artwork_cache_parent(&root).is_err());
+        set_dacl(&root, &sddl).unwrap();
+        let first = prepare_steam_artwork_cache_parent(&root).unwrap();
+        assert_eq!(first, root.join("provider-cache").join("steam"));
+        validate_dacl(&root.join("provider-cache"), &sddl).unwrap();
+        validate_dacl(&first, &sddl).unwrap();
+        assert_eq!(prepare_steam_artwork_cache_parent(&root).unwrap(), first);
+        fs::write(root.join("unrelated.txt"), b"keep").unwrap();
+        assert_eq!(fs::read(root.join("unrelated.txt")).unwrap(), b"keep");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

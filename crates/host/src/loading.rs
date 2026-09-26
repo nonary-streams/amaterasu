@@ -11,6 +11,7 @@ use std::mem::MaybeUninit;
 use std::path::Path;
 
 const HOST_CONFIGURATION_COMPONENT: &str = "amaterasu.host-configuration";
+const STEAM_COMPONENT: &str = "amaterasu.steam";
 
 pub(crate) fn path_to_unicode_string(path: &Path) -> Result<String, String> {
     path.to_str()
@@ -57,6 +58,18 @@ impl LoadedComponents {
             .any(|component| component.id == HOST_CONFIGURATION_COMPONENT)
         {
             inject_host_configuration_root(&mut runtime_config, &state_root_string)?;
+        }
+        if package
+            .manifest
+            .components
+            .iter()
+            .any(|component| component.id == STEAM_COMPONENT)
+        {
+            // Cache setup is optional. Always discard the package value, even
+            // when the private directory is unavailable, so Steam falls back.
+            let cache_parent = prepare_steam_artwork_cache_parent(&state_root)
+                .and_then(|path| path_to_unicode_string(&path));
+            inject_steam_artwork_cache_parent(&mut runtime_config, cache_parent.ok().as_deref())?;
         }
         let configuration =
             serde_json::to_vec(&runtime_config).map_err(|error| error.to_string())?;
@@ -134,6 +147,63 @@ fn inject_host_configuration_root(
         .ok_or("host configuration component settings must be an object")?;
     settings.insert("host_state_root".into(), json!(state_root));
     Ok(())
+}
+
+fn inject_steam_artwork_cache_parent(
+    runtime_config: &mut amaterasu_contracts::RuntimeConfig,
+    cache_parent: Option<&str>,
+) -> PackageResult<()> {
+    let settings = runtime_config
+        .settings
+        .entry(STEAM_COMPONENT.into())
+        .or_insert_with(|| json!({}));
+    let settings = settings
+        .as_object_mut()
+        .ok_or("Steam component settings must be an object")?;
+    settings.remove("steam_artwork_cache_root");
+    if let Some(cache_parent) = cache_parent {
+        settings.insert("steam_artwork_cache_root".into(), json!(cache_parent));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prepare_steam_artwork_cache_parent(state_root: &Path) -> PackageResult<std::path::PathBuf> {
+    crate::state_root::prepare_steam_artwork_cache_parent(state_root)
+}
+
+#[cfg(not(windows))]
+fn prepare_steam_artwork_cache_parent(state_root: &Path) -> PackageResult<std::path::PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: geteuid takes no pointers and returns the process's effective UID.
+    let user_id = unsafe { geteuid() };
+
+    let mut parent = state_root.to_path_buf();
+    for segment in [None, Some("provider-cache"), Some("steam")] {
+        if let Some(segment) = segment {
+            parent = parent.join(segment);
+            if !parent.try_exists().map_err(|error| error.to_string())? {
+                amaterasu_package::create_private_directory(&parent)?;
+            }
+        }
+        let metadata = std::fs::symlink_metadata(&parent).map_err(|error| error.to_string())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("Steam artwork cache parent is not a real directory".into());
+        }
+        let canonical = parent.canonicalize().map_err(|error| error.to_string())?;
+        if canonical != parent
+            || metadata.uid() != user_id
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err("Steam artwork cache parent is not private and canonical".into());
+        }
+        parent = canonical;
+    }
+    Ok(parent)
 }
 
 fn same_path(left: &str, right: &str) -> bool {
@@ -313,7 +383,9 @@ fn require_success(status: Status, operation: &str) -> PackageResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{inject_host_configuration_root, path_to_unicode_string};
+    use super::{
+        inject_host_configuration_root, inject_steam_artwork_cache_parent, path_to_unicode_string,
+    };
     use amaterasu_contracts::RuntimeConfig;
     use serde_json::json;
 
@@ -345,6 +417,62 @@ mod tests {
         );
 
         assert!(inject_host_configuration_root(&mut runtime_config, r"C:\state\user").is_err());
+    }
+
+    #[test]
+    fn steam_cache_parent_overrides_package_path_and_falls_back_without_one() {
+        let mut runtime_config = RuntimeConfig::default();
+        runtime_config.settings.insert(
+            super::STEAM_COMPONENT.into(),
+            json!({"steam_artwork_cache_root":"package-controlled","retained":true}),
+        );
+        inject_steam_artwork_cache_parent(
+            &mut runtime_config,
+            Some("/private/state/provider-cache/steam"),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_config.settings[super::STEAM_COMPONENT],
+            json!({
+                "steam_artwork_cache_root":"/private/state/provider-cache/steam",
+                "retained":true
+            })
+        );
+        inject_steam_artwork_cache_parent(&mut runtime_config, None).unwrap();
+        assert_eq!(
+            runtime_config.settings[super::STEAM_COMPONENT],
+            json!({"retained":true})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steam_cache_parent_is_private_on_first_start_and_restart() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_root = std::env::temp_dir().join(format!(
+            "amaterasu-host-steam-cache-{}-{}",
+            std::process::id(),
+            amaterasu_package::random_identifier().unwrap()
+        ));
+        amaterasu_package::create_private_directory(&state_root).unwrap();
+        let state_root = state_root.canonicalize().unwrap();
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::prepare_steam_artwork_cache_parent(&state_root).is_err());
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let first = super::prepare_steam_artwork_cache_parent(&state_root).unwrap();
+        assert_eq!(first, state_root.join("provider-cache/steam"));
+        assert_eq!(
+            std::fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            super::prepare_steam_artwork_cache_parent(&state_root).unwrap(),
+            first
+        );
+        std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::prepare_steam_artwork_cache_parent(&state_root).is_err());
+        std::fs::remove_dir_all(state_root).unwrap();
     }
 
     #[cfg(unix)]
