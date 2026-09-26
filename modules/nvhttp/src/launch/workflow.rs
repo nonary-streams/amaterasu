@@ -359,7 +359,18 @@ impl Controller {
         }
         if matches!(phase, Phase::OpenRtsp) && record.display_request.is_some() {
             payload["display_admission_token"] = json!(record.display_admission_token);
+        }
+        if matches!(phase, Phase::OpenRtsp)
+            && (record.display_request.is_some()
+                || (record.executable_path.is_some() && record.frame_limiter_snapshot.is_some()))
+        {
             payload["application_operation_id"] = json!(record.application_operation);
+            payload["app_id"] = json!(app_id(record.request.app_id));
+            payload["catalog_revision"] = json!(
+                record
+                    .application_catalog_revision
+                    .expect("RTSP admission follows application preflight")
+            );
         }
         let operation = self.next_operation(record, phase.name());
         Call::new(service, payload, operation, timeout_ms)

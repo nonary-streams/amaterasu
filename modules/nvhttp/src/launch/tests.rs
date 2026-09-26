@@ -2493,6 +2493,9 @@ fn launch_export_includes_admitted_frame_limiter_settings_and_context() {
     let rtsp_open = opened_rtsp_payload(&broker);
     assert!(rtsp_open["frame_limiter_settings"].is_null());
     assert!(rtsp_open["frame_limiter_executable_path"].is_null());
+    assert!(rtsp_open.get("application_operation_id").is_none());
+    assert!(rtsp_open.get("app_id").is_none());
+    assert!(rtsp_open.get("catalog_revision").is_none());
 }
 
 #[test]
@@ -3240,6 +3243,37 @@ fn verify_only_freezes_unique_active_monitor_without_mutation_and_retries_exactl
 }
 
 #[test]
+fn display_and_frame_limiter_open_share_frozen_application_identity() {
+    let now = Instant::now();
+    let mut streaming = config();
+    streaming.capture.capture_provider = CaptureProvider::Wgc;
+    streaming.capture.output = "\\\\.\\DISPLAY2".into();
+    let mut controller = Controller::new(Some(streaming)).unwrap();
+    controller.set_global_display_policy(9, json!({"dd_configuration_option":"ensure_active"}));
+    let mut broker = Broker {
+        display_snapshot_ids: vec!["monitor.one".into(), "monitor.two".into()],
+        display_entries: vec![
+            json!({"id":"monitor.one","source":"\\\\.\\DISPLAY1","active":true}),
+            json!({"id":"monitor.two","source":"\\\\.\\DISPLAY2","active":true}),
+        ],
+        application_executable_path: Some("C:\\Games\\Example.exe".into()),
+        ..Broker::default()
+    };
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let record = controller.records.values().next().expect("launch record");
+    let open = opened_rtsp_payload(&broker);
+    assert!(open["display_request"].is_object());
+    assert!(open["frame_limiter_settings"].is_object());
+    assert_eq!(open["application_operation_id"], record.application_operation);
+    assert_eq!(open["app_id"], super::app_id(1));
+    assert_eq!(open["catalog_revision"], record.application_catalog_revision.unwrap());
+    assert_eq!(open["display_policy_snapshot"]["catalog_revision"], open["catalog_revision"]);
+}
+
+#[test]
 fn verify_only_fails_before_application_for_missing_ambiguous_inactive_or_changed_output() {
     let cases = [
         (
@@ -3613,6 +3647,11 @@ fn lost_rtsp_admission_is_settled_before_owned_lookup_without_reopening() {
         .collect();
     assert_eq!(rtsp_requests.len(), 3);
     assert_eq!(rtsp_requests[0].1, rtsp_requests[1].1);
+    let record = controller.records.values().next().expect("launch record");
+    assert_eq!(rtsp_requests[0].1["application_operation_id"], record.application_operation);
+    assert_eq!(rtsp_requests[0].1["app_id"], super::app_id(1));
+    assert_eq!(rtsp_requests[0].1["catalog_revision"], record.application_catalog_revision.unwrap());
+    assert!(rtsp_requests[0].1.get("display_request").is_none());
     assert_eq!(
         rtsp_requests[0].1["frame_limiter_settings"],
         broker.rtsp_snapshot.clone().expect("frozen RTSP snapshot")
