@@ -784,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn send_input_rejects_pen_touch_until_native_support_is_available() {
+    fn send_input_rejects_pen_touch_that_requires_synthetic_pointer() {
         let event = Event::PenTouch {
             pointer_id: 1,
             device: crate::model::PenTouchDevice::Touch,
@@ -792,8 +792,12 @@ mod tests {
             x: 0,
             y: 0,
             pressure: None,
-            tilt_x: None,
-            tilt_y: None,
+            contact_area_major: None,
+            contact_area_minor: None,
+            rotation_degrees: None,
+            pen_tool: None,
+            pen_buttons: None,
+            tilt: None,
         };
 
         assert_eq!(
