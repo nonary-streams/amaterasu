@@ -392,7 +392,8 @@ fn resolve_log_root(configured_path: &Path) -> io::Result<(PathBuf, String)> {
 }
 
 fn safe_base_name(name: &str) -> String {
-    name.chars()
+    let normalized: String = name
+        .chars()
         .take(64)
         .map(|character| {
             if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
@@ -401,7 +402,17 @@ fn safe_base_name(name: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    if normalized == name {
+        return normalized;
+    }
+
+    // An escaped prefix cannot overlap a plain filename's prefix. Include the
+    // original bytes so sanitization and truncation do not merge log policies.
+    let hash = name.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("~{normalized}-{hash:016x}")
 }
 
 fn purge_old_sessions(root: &Path, base_name: &str) -> io::Result<()> {
@@ -824,6 +835,49 @@ mod tests {
         for filename in unrelated_files {
             assert_eq!(fs::read(root.join(filename)).unwrap(), b"keep");
         }
+        fs::remove_dir_all(state_root).unwrap();
+    }
+
+    #[test]
+    fn custom_file_retention_does_not_prune_another_policy_after_restart() {
+        let state_root = temp_root();
+        let open = |path: &str| {
+            let settings = LoggingSettings::from_value(json!({
+                "log_path":path,
+                "state_root":state_root,
+            }))
+            .unwrap();
+            let (logger, warning) = SessionLogger::open(settings);
+            assert!(warning.is_none());
+            logger
+        };
+        let mut first = open("custom/app+one.log");
+        first.write_record("capture", &test_record("first policy"));
+        let first_session_path = first.active_path_for_test().to_path_buf();
+        drop(first);
+
+        // These configured names previously collapsed to the same prefix in
+        // custom/logs, allowing this policy to prune the first policy's file.
+        for _ in 0..SESSION_LIMIT {
+            let mut session = open("custom/app_one.log");
+            session.write_record("capture", &test_record("second policy"));
+        }
+        let restarted = open("custom/app+one.log");
+
+        assert_eq!(
+            restarted.health(),
+            json!({"state":"healthy","failure":null})
+        );
+        assert_eq!(
+            first_session_path.parent(),
+            Some(state_root.join("custom/logs").as_path())
+        );
+        assert_ne!(safe_base_name("app+one"), safe_base_name("app_one"));
+        assert!(
+            fs::read_to_string(&first_session_path)
+                .unwrap()
+                .contains("first policy")
+        );
         fs::remove_dir_all(state_root).unwrap();
     }
 }
