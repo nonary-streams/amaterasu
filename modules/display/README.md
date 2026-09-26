@@ -129,8 +129,11 @@ without a state-service request or native effect. `verify_only` reads the
 coherent active topology and requires its selected display to be active;
 neither option resolves mode/HDR policy, creates a lease, or requires mutation
 startup permission. Mutating options require `expected_topology_revision` and
-use the durable Apply/restore journal. `ensure_only_display` accepts an active
-selected target, applies it at the origin, and disables all other active paths.
+use the durable Apply/restore journal. `ensure_only_display` applies the
+selected target at the origin and disables all other active paths. An inactive
+physical target needs one unambiguous free QDC route and a restorable baseline.
+Every path it deactivates must have a queryable saved HDR state so recovery can
+restore the complete baseline.
 `ensure_active` and `ensure_primary` accept an already active selected target.
 On a multi-monitor desktop they rebuild only that target's requested mode and
 translate untouched source positions for a primary change, while retaining the
@@ -142,8 +145,8 @@ persists that monitor/source/target binding with the journal and rechecks it
 after journal acknowledgement and just before native Apply. It preserves all
 previously active paths and places the new target to their right. HDR=true is
 rejected without a saved baseline; false or unspecified HDR must read back as
-off after activation, or the provider rolls back. Inactive targets remain
-unsupported for `ensure_primary` and `ensure_only_display`.
+off after activation, or the provider rolls back. An inactive target remains
+unsupported for `ensure_primary`.
 The selected path uses the existing CCD Apply contract, including its requested
 32bpp mode and preferred scaling.
 

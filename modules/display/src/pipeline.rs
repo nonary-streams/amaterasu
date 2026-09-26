@@ -2,7 +2,7 @@ use crate::configuration_option::DisplayConfigurationOption;
 use crate::model::{
     Configuration, DisplayError, DisplayResult, Journal, Operation, RouteBinding, Snapshot,
 };
-use crate::platform::Platform;
+use crate::platform::{Platform, TopologyShape};
 use crate::{JOURNAL_KEY, SERVICE, STATE_SERVICE};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
@@ -24,7 +24,7 @@ struct PrepareIntent {
     expected_topology_revision: Option<String>,
     operation_id: Option<String>,
     topology_change: bool,
-    preserve_target: Option<String>,
+    native_target: Option<(String, TopologyShape)>,
     pending_route: Option<RouteBinding>,
 }
 struct Pending {
@@ -37,7 +37,7 @@ enum Stage {
     Armed {
         journal: Journal,
         configuration: Configuration,
-        preserve_target: Option<String>,
+        native_target: Option<(String, TopologyShape)>,
     },
     Clearing(Value),
 }
@@ -279,13 +279,13 @@ impl<P: Platform> Pipeline<P> {
                     Stage::Armed {
                         journal,
                         configuration,
-                        preserve_target,
+                        native_target,
                     } => self.apply(
                         pending.context,
                         revision,
                         journal,
                         configuration,
-                        preserve_target,
+                        native_target,
                         send,
                     ),
                     Stage::Clearing(reply) => {
@@ -434,7 +434,7 @@ impl<P: Platform> Pipeline<P> {
                             | DisplayConfigurationOption::EnsureOnlyDisplay
                     )
                 );
-                let mut preserve_target = None;
+                let mut native_target = None;
                 let mut pending_route = None;
                 if topology_change {
                     let Some(expected) = expected_topology_revision.as_deref() else {
@@ -461,6 +461,22 @@ impl<P: Platform> Pipeline<P> {
                             ),
                         );
                     }
+                    if topology_option == Some(DisplayConfigurationOption::EnsureOnlyDisplay)
+                        && let Some(policy) = mode_policy.as_ref()
+                        && snapshot.paths.iter().any(|path| {
+                            !path.id.eq_ignore_ascii_case(&policy.display_id)
+                                && path.hdr_enabled.is_none()
+                        })
+                    {
+                        return complete(
+                            send,
+                            context.request,
+                            failure(
+                                "unsupported_topology",
+                                "deactivated display has no queryable HDR recovery baseline",
+                            ),
+                        );
+                    }
                     if matches!(
                         topology_option,
                         Some(
@@ -469,11 +485,17 @@ impl<P: Platform> Pipeline<P> {
                         )
                     ) && snapshot.paths.len() > 1
                     {
-                        preserve_target =
-                            mode_policy.as_ref().map(|policy| policy.display_id.clone());
+                        native_target = mode_policy.as_ref().map(|policy| {
+                            (policy.display_id.clone(), TopologyShape::PreserveActive)
+                        });
                     }
-                    if topology_option == Some(DisplayConfigurationOption::EnsureActive)
-                        && let Some(policy) = mode_policy.as_ref()
+                    if matches!(
+                        topology_option,
+                        Some(
+                            DisplayConfigurationOption::EnsureActive
+                                | DisplayConfigurationOption::EnsureOnlyDisplay
+                        )
+                    ) && let Some(policy) = mode_policy.as_ref()
                         && !snapshot
                             .paths
                             .iter()
@@ -499,7 +521,16 @@ impl<P: Platform> Pipeline<P> {
                             Ok(route) => Some(route),
                             Err(error) => return complete(send, context.request, error.payload()),
                         };
-                        preserve_target = Some(policy.display_id.clone());
+                        native_target = Some((
+                            policy.display_id.clone(),
+                            if topology_option
+                                == Some(DisplayConfigurationOption::EnsureOnlyDisplay)
+                            {
+                                TopologyShape::OnlySelected
+                            } else {
+                                TopologyShape::PreserveActive
+                            },
+                        ));
                     }
                     configuration = match compose_configuration(
                         &configuration,
@@ -560,7 +591,7 @@ impl<P: Platform> Pipeline<P> {
                         expected_topology_revision,
                         operation_id,
                         topology_change,
-                        preserve_target,
+                        native_target,
                         pending_route,
                     },
                     send,
@@ -616,17 +647,19 @@ impl<P: Platform> Pipeline<P> {
             expected_topology_revision,
             operation_id,
             topology_change,
-            preserve_target,
+            native_target,
             pending_route,
         } = intent;
         if let Err(error) = configuration.validate() {
             return complete(send, context.request, error.payload());
         }
-        let prepared = match preserve_target.as_deref() {
-            Some(selected) => {
-                self.platform
-                    .prepare_preserving(&configuration, selected, pending_route.as_ref())
-            }
+        let prepared = match native_target.as_ref() {
+            Some((selected, shape)) => self.platform.prepare_preserving(
+                &configuration,
+                selected,
+                pending_route.as_ref(),
+                *shape,
+            ),
             None => self.platform.prepare(&configuration),
         };
         let snapshot = match prepared {
@@ -704,7 +737,7 @@ impl<P: Platform> Pipeline<P> {
             Stage::Armed {
                 journal,
                 configuration,
-                preserve_target,
+                native_target,
             },
             send,
         )
@@ -715,15 +748,16 @@ impl<P: Platform> Pipeline<P> {
         revision: u64,
         journal: Journal,
         configuration: Configuration,
-        preserve_target: Option<String>,
+        native_target: Option<(String, TopologyShape)>,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
-        let result = if let Some(selected) = preserve_target.as_deref() {
+        let result = if let Some((selected, shape)) = native_target.as_ref() {
             self.platform.apply_preserving(
                 &configuration,
                 &journal.snapshot,
                 selected,
                 journal.pending_route.as_ref(),
+                *shape,
                 &mut || check_request(send, &context),
             )
         } else {
@@ -880,17 +914,14 @@ fn compose_configuration(
             configuration.displays.push(selected);
             configuration
         }
-        Some(DisplayConfigurationOption::EnsureOnlyDisplay) if existing.is_some() => {
+        Some(DisplayConfigurationOption::EnsureOnlyDisplay) => {
             selected.x = 0;
             selected.y = 0;
             Configuration {
                 displays: vec![selected],
             }
         }
-        Some(
-            DisplayConfigurationOption::EnsurePrimary
-            | DisplayConfigurationOption::EnsureOnlyDisplay,
-        ) => {
+        Some(DisplayConfigurationOption::EnsurePrimary) => {
             return Err(DisplayError::new(
                 "unsupported_topology",
                 "inactive display route cannot be bound across the journal boundary",

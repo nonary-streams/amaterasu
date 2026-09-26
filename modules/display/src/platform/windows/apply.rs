@@ -184,11 +184,22 @@ pub fn preserving(
     before: &Snapshot,
     selected: &str,
     route: Option<&RouteBinding>,
+    shape: super::super::TopologyShape,
 ) -> DisplayResult<ConfigurationBuffers> {
-    let bound = restoration(before)?;
-    match route {
-        Some(route) => append_inactive(bound, configuration, before, selected, route),
-        None => preserve_bound(bound, configuration, before, selected),
+    match (route, shape) {
+        (Some(route), super::super::TopologyShape::OnlySelected) => {
+            only_bound_inactive(configuration, before, selected, route)
+        }
+        (Some(route), super::super::TopologyShape::PreserveActive) => {
+            append_inactive(restoration(before)?, configuration, before, selected, route)
+        }
+        (None, super::super::TopologyShape::PreserveActive) => {
+            preserve_bound(restoration(before)?, configuration, before, selected)
+        }
+        (None, super::super::TopologyShape::OnlySelected) => Err(DisplayError::new(
+            "unsupported_topology",
+            "selected-only inactive topology requires a bound route",
+        )),
     }
 }
 
@@ -321,13 +332,57 @@ fn append_inactive(
     append_bound_inactive(bound, configuration, before, selected, route, path)
 }
 
-pub(super) fn append_bound_inactive(
-    mut bound: ConfigurationBuffers,
+fn only_bound_inactive(
     configuration: &Configuration,
     before: &Snapshot,
     selected: &str,
     route: &RouteBinding,
-    mut path: DISPLAYCONFIG_PATH_INFO,
+) -> DisplayResult<ConfigurationBuffers> {
+    let path = bound_inactive_path(route, before)?;
+    only_from_bound_inactive(configuration, before, selected, route, path)
+}
+
+pub(super) fn only_from_bound_inactive(
+    configuration: &Configuration,
+    before: &Snapshot,
+    selected: &str,
+    route: &RouteBinding,
+    path: DISPLAYCONFIG_PATH_INFO,
+) -> DisplayResult<ConfigurationBuffers> {
+    configuration.validate()?;
+    before.configuration()?;
+    let wanted = configuration.displays.first().ok_or_else(|| {
+        DisplayError::new("unsupported_topology", "selected-only topology is empty")
+    })?;
+    if configuration.displays.len() != 1
+        || !wanted.id.eq_ignore_ascii_case(selected)
+        || !route.id.eq_ignore_ascii_case(selected)
+        || wanted.x != 0
+        || wanted.y != 0
+    {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "selected-only topology must contain the bound target at origin",
+        ));
+    }
+    append_selected_inactive(
+        ConfigurationBuffers {
+            paths: Vec::new(),
+            modes: Vec::new(),
+        },
+        wanted,
+        route,
+        path,
+    )
+}
+
+pub(super) fn append_bound_inactive(
+    bound: ConfigurationBuffers,
+    configuration: &Configuration,
+    before: &Snapshot,
+    selected: &str,
+    route: &RouteBinding,
+    path: DISPLAYCONFIG_PATH_INFO,
 ) -> DisplayResult<ConfigurationBuffers> {
     configuration.validate()?;
     before.configuration()?;
@@ -371,6 +426,15 @@ pub(super) fn append_bound_inactive(
                 "inactive target is missing from request",
             )
         })?;
+    append_selected_inactive(bound, wanted, route, path)
+}
+
+fn append_selected_inactive(
+    mut bound: ConfigurationBuffers,
+    wanted: &crate::model::DisplaySetting,
+    route: &RouteBinding,
+    mut path: DISPLAYCONFIG_PATH_INFO,
+) -> DisplayResult<ConfigurationBuffers> {
     if wanted.hdr_enabled == Some(true) {
         return Err(DisplayError::new(
             "unsupported_display",

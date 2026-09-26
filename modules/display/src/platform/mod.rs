@@ -1,6 +1,12 @@
 use crate::model::{AvailableMode, Configuration, DisplayResult, RouteBinding, Snapshot};
 use serde_json::Value;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopologyShape {
+    PreserveActive,
+    OnlySelected,
+}
+
 pub trait Platform {
     fn name(&self) -> &'static str;
     fn supported(&self) -> bool;
@@ -19,6 +25,7 @@ pub trait Platform {
         configuration: &Configuration,
         selected: &str,
         route: Option<&RouteBinding>,
+        shape: TopologyShape,
     ) -> DisplayResult<Snapshot>;
     fn apply(
         &mut self,
@@ -32,6 +39,7 @@ pub trait Platform {
         before: &Snapshot,
         selected: &str,
         route: Option<&RouteBinding>,
+        shape: TopologyShape,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()>;
     fn restore(
@@ -75,6 +83,7 @@ impl Platform for NativePlatform {
         _: &Configuration,
         _: &str,
         _: Option<&RouteBinding>,
+        _: TopologyShape,
     ) -> DisplayResult<Snapshot> {
         unsupported()
     }
@@ -92,6 +101,7 @@ impl Platform for NativePlatform {
         _: &Snapshot,
         _: &str,
         _: Option<&RouteBinding>,
+        _: TopologyShape,
         _: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
         unsupported()

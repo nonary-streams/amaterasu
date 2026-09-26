@@ -3,6 +3,7 @@ mod conversion;
 mod query;
 
 use super::Platform;
+use super::TopologyShape;
 use crate::model::{
     AvailableMode, Configuration, DisplayError, DisplayResult, RouteBinding, Snapshot,
 };
@@ -66,8 +67,9 @@ impl Platform for WindowsPlatform {
         configuration: &Configuration,
         selected: &str,
         route: Option<&RouteBinding>,
+        shape: TopologyShape,
     ) -> DisplayResult<Snapshot> {
-        prepare_configuration(configuration, Some(selected), route)
+        prepare_configuration(configuration, Some((selected, shape)), route)
     }
     fn snapshot(&mut self) -> DisplayResult<Snapshot> {
         let first = query::snapshot()?;
@@ -97,9 +99,10 @@ impl Platform for WindowsPlatform {
         before: &Snapshot,
         selected: &str,
         route: Option<&RouteBinding>,
+        shape: TopologyShape,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
-        apply_configuration(configuration, before, Some(selected), route, guard)
+        apply_configuration(configuration, before, Some((selected, shape)), route, guard)
     }
     fn restore(
         &mut self,
@@ -130,10 +133,11 @@ impl Platform for WindowsPlatform {
 
 fn prepare_configuration(
     configuration: &Configuration,
-    selected: Option<&str>,
+    selected: Option<(&str, TopologyShape)>,
     route: Option<&RouteBinding>,
 ) -> DisplayResult<Snapshot> {
     let before = query::snapshot()?;
+    check_inactive_only_recovery(&before, selected, route)?;
     for display in &configuration.displays {
         let active = before
             .paths
@@ -155,9 +159,17 @@ fn prepare_configuration(
         }
     }
     let requested = match selected {
-        Some(selected) => apply::preserving(configuration, &before, selected, route)?,
+        Some((selected, shape)) => {
+            apply::preserving(configuration, &before, selected, route, shape)?
+        }
         None => apply::requested(configuration)?,
     };
+    if selected.is_some_and(|(_, shape)| shape == TopologyShape::OnlySelected) {
+        // This request removes every saved path. Prove that the journal
+        // baseline can be rebound and restored before arming the journal.
+        let restoration = apply::restoration(&before)?;
+        apply::set(&restoration, false)?;
+    }
     apply::set(&requested, false)?;
     Ok(before)
 }
@@ -165,10 +177,11 @@ fn prepare_configuration(
 fn apply_configuration(
     configuration: &Configuration,
     before: &Snapshot,
-    selected: Option<&str>,
+    selected: Option<(&str, TopologyShape)>,
     route: Option<&RouteBinding>,
     guard: &mut dyn FnMut() -> DisplayResult<()>,
 ) -> DisplayResult<()> {
+    check_inactive_only_recovery(before, selected, route)?;
     if before.revision()? != query::snapshot()?.revision()? {
         return Err(DisplayError::new(
             "topology_changed",
@@ -176,9 +189,15 @@ fn apply_configuration(
         ));
     }
     let requested = match selected {
-        Some(selected) => apply::preserving(configuration, before, selected, route)?,
+        Some((selected, shape)) => {
+            apply::preserving(configuration, before, selected, route, shape)?
+        }
         None => apply::requested(configuration)?,
     };
+    if selected.is_some_and(|(_, shape)| shape == TopologyShape::OnlySelected) {
+        let restoration = apply::restoration(before)?;
+        apply::set(&restoration, false)?;
+    }
     apply::set(&requested, false)?;
     guard()?;
     if before.revision()? != query::snapshot()?.revision()? {
@@ -196,7 +215,7 @@ fn apply_configuration(
         verify_activated_route(route, &initial_state)?;
     }
     for display in &configuration.displays {
-        if selected.is_some_and(|id| !display.id.eq_ignore_ascii_case(id)) {
+        if selected.is_some_and(|(id, _)| !display.id.eq_ignore_ascii_case(id)) {
             continue;
         }
         if let Some(enabled) = display.hdr_enabled {
@@ -222,7 +241,7 @@ fn apply_configuration(
     if let Some(route) = route {
         verify_activated_route(route, &final_state)?;
     }
-    if let Some(selected) = selected
+    if let Some((selected, TopologyShape::PreserveActive)) = selected
         && !apply::verifies_untouched(configuration, before, &final_state, selected)
     {
         return Err(DisplayError::new(
@@ -230,6 +249,23 @@ fn apply_configuration(
             "untouched Windows display path changed during apply",
         )
         .after_mutation());
+    }
+    Ok(())
+}
+
+fn check_inactive_only_recovery(
+    before: &Snapshot,
+    selected: Option<(&str, TopologyShape)>,
+    route: Option<&RouteBinding>,
+) -> DisplayResult<()> {
+    if selected.is_some_and(|(_, shape)| shape == TopologyShape::OnlySelected)
+        && route.is_some()
+        && before.paths.iter().any(|path| path.hdr_enabled.is_none())
+    {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "saved display HDR state is not queryable for selected-only recovery",
+        ));
     }
     Ok(())
 }
@@ -659,6 +695,99 @@ mod tests {
             .code,
             "unsupported_topology"
         );
+    }
+
+    #[test]
+    fn inactive_only_builder_excludes_saved_paths_and_uses_bound_route() {
+        let before = Snapshot {
+            format_version: 1,
+            paths: vec![
+                readback_path("monitor.one", 0, Some(false)),
+                readback_path("monitor.two", 1920, Some(false)),
+            ],
+        };
+        let mut wanted = requested().displays.remove(0);
+        wanted.id = "monitor.three".into();
+        wanted.hdr_enabled = Some(false);
+        let configuration = Configuration {
+            displays: vec![wanted],
+        };
+        let route = RouteBinding {
+            id: "monitor.three".into(),
+            source_name: "DISPLAY3".into(),
+            source_address: Address {
+                adapter_low: 1,
+                adapter_high: 0,
+                id: 52,
+            },
+            target_address: Address {
+                adapter_low: 1,
+                adapter_high: 0,
+                id: 53,
+            },
+            output_technology: 0,
+        };
+        let mut path = DISPLAYCONFIG_PATH_INFO::default();
+        path.sourceInfo.adapterId = LUID {
+            LowPart: 1,
+            HighPart: 0,
+        };
+        path.sourceInfo.id = 52;
+        path.targetInfo.adapterId = LUID {
+            LowPart: 1,
+            HighPart: 0,
+        };
+        path.targetInfo.id = 53;
+        path.targetInfo.targetAvailable = 1;
+        let buffers =
+            apply::only_from_bound_inactive(&configuration, &before, "monitor.three", &route, path)
+                .unwrap();
+        assert_eq!(buffers.paths.len(), 1);
+        assert_eq!(buffers.modes.len(), 1);
+        assert_eq!(buffers.paths[0].sourceInfo.id, 52);
+        assert_eq!(buffers.paths[0].targetInfo.id, 53);
+        assert_eq!(
+            buffers.paths[0].targetInfo.scanLineOrdering,
+            DISPLAYCONFIG_SCANLINE_ORDERING_UNSPECIFIED
+        );
+        // SAFETY: the builder created one initialized SOURCE mode and its index.
+        let source_index = unsafe { buffers.paths[0].sourceInfo.Anonymous.modeInfoIdx } as usize;
+        assert_eq!(source_index, 0);
+        let source = unsafe { buffers.modes[source_index].Anonymous.sourceMode };
+        assert_eq!((source.position.x, source.position.y), (0, 0));
+        assert_eq!(source.width, 1920);
+    }
+
+    #[test]
+    fn inactive_only_rejects_unknown_saved_hdr_before_journal() {
+        let mut before = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.one", 0, None)],
+        };
+        let route = RouteBinding {
+            id: "monitor.two".into(),
+            source_name: "DISPLAY2".into(),
+            source_address: Address {
+                adapter_low: 1,
+                adapter_high: 0,
+                id: 42,
+            },
+            target_address: Address {
+                adapter_low: 1,
+                adapter_high: 0,
+                id: 43,
+            },
+            output_technology: 0,
+        };
+        let intent = Some(("monitor.two", TopologyShape::OnlySelected));
+        assert_eq!(
+            check_inactive_only_recovery(&before, intent, Some(&route))
+                .unwrap_err()
+                .code,
+            "unsupported_topology"
+        );
+        before.paths[0].hdr_enabled = Some(false);
+        assert!(check_inactive_only_recovery(&before, intent, Some(&route)).is_ok());
     }
 
     fn requested() -> Configuration {
