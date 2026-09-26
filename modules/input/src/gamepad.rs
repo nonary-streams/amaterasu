@@ -516,6 +516,9 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
         for slot_device in &mut self.devices {
             if let Some(device) = slot_device.as_mut() {
                 device.cancel_timeout();
+                // A failed release still ends this slot's lease. Later ticks
+                // must retry removal, never send another report to it.
+                device.pending_removal = true;
                 match device.device.release() {
                     Ok(()) => *slot_device = None,
                     Err(error) => {
@@ -2125,5 +2128,49 @@ mod tests {
         assert!(trace.borrow().contains(&"allocate"));
         slots.stop().unwrap();
         assert_eq!(trace.borrow().last(), Some(&"release"));
+    }
+
+    #[test]
+    fn failed_lease_release_retries_removal_without_writing_another_report() {
+        struct FlakyRelease {
+            trace: Rc<RefCell<Vec<&'static str>>>,
+            release_failures: Rc<std::cell::Cell<u8>>,
+        }
+
+        impl GamepadDevice for FlakyRelease {
+            fn update(&mut self, _: ControllerSnapshot) -> InputResult<()> {
+                self.trace.borrow_mut().push("update");
+                Ok(())
+            }
+
+            fn release(&mut self) -> InputResult<()> {
+                self.trace.borrow_mut().push("release");
+                let remaining = self.release_failures.get();
+                if remaining > 0 {
+                    self.release_failures.set(remaining - 1);
+                    Err(InputError::new("release_failed", "device still attached"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let release_failures = Rc::new(std::cell::Cell::new(1));
+        let mut slots = GamepadSlots::new();
+        let now = Instant::now();
+        slots
+            .apply(0, 1, ControllerSnapshot::default(), -1, now, |_| {
+                Ok(FlakyRelease {
+                    trace: trace.clone(),
+                    release_failures: release_failures.clone(),
+                })
+            })
+            .unwrap();
+        assert_eq!(slots.stop().unwrap_err().code, "release_failed");
+        assert!(!slots.is_empty());
+        slots.advance(now + Duration::from_millis(100)).unwrap();
+        assert!(slots.is_empty());
+        assert_eq!(&*trace.borrow(), &["update", "release", "release"]);
     }
 }
