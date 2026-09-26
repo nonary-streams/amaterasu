@@ -54,6 +54,7 @@ struct TrackedPen {
     contact: TrackedContact,
     initial_metadata: PenMetadata,
     metadata: PenMetadata,
+    replay_event: Event,
 }
 
 #[derive(Clone)]
@@ -193,6 +194,7 @@ impl ContactTracker {
                         },
                         initial_metadata: metadata,
                         metadata,
+                        replay_event: event.clone(),
                     });
                     metadata
                 }
@@ -201,6 +203,7 @@ impl ContactTracker {
                 ensure_active_pointer(active_pointer, pointer_id)?;
                 let pen = self.pen.as_mut().expect("active pen has a contact");
                 pen.contact.last_event = event.clone();
+                pen.replay_event = pen_replay_event(&pen.replay_event, event);
                 update_pen_metadata(&mut pen.metadata, event);
                 pen.metadata
             }
@@ -228,7 +231,10 @@ impl ContactTracker {
                 .contact
                 .down_written;
         let frame_event = if recovering_down {
-            with_phase(event, PenTouchPhase::Down)
+            with_phase(
+                &self.pen.as_ref().unwrap().replay_event,
+                PenTouchPhase::Down,
+            )
         } else {
             event.clone()
         };
@@ -476,6 +482,13 @@ impl ContactTracker {
         }
     }
 
+    fn reset_pen_device_state(&mut self) {
+        if let Some(pen) = self.pen.as_mut() {
+            pen.contact.down_written = false;
+            pen.contact.native_write_attempted = false;
+        }
+    }
+
     fn replay_active_touches(
         &mut self,
         terminal_pointer: Option<u32>,
@@ -581,10 +594,7 @@ impl LinuxPenTouch {
             // device must be removed before any more reports reach that pen.
             destroy_device(&mut self.pen_device)?;
             self.pen_write_failed = false;
-            if let Some(pen) = self.tracker.pen.as_mut() {
-                pen.contact.down_written = false;
-                pen.contact.native_write_attempted = false;
-            }
+            self.tracker.reset_pen_device_state();
         }
         if self.touch_write_failed
             && let Event::PenTouch {
@@ -730,6 +740,24 @@ fn touch_replay_event(previous: &Event, current: &Event) -> Event {
             *contact_area_major = *previous_major;
             *contact_area_minor = *previous_minor;
         }
+    }
+    replay
+}
+
+fn pen_replay_event(previous: &Event, current: &Event) -> Event {
+    let mut replay = current.clone();
+    if let (
+        Event::PenTouch {
+            pressure: previous_pressure,
+            ..
+        },
+        Event::PenTouch { pressure, .. },
+    ) = (previous, &mut replay)
+        && pressure.is_none()
+    {
+        // Sparse moves retain the pressure already applied to the old device.
+        // Reopening after a partial write needs that value in its initial frame.
+        *pressure = *previous_pressure;
     }
     replay
 }
@@ -1777,6 +1805,89 @@ mod tests {
         assert_eq!(event_at(recovered, EV_KEY, BTN_TOUCH), Some(1));
         assert_eq!(event_at(recovered, EV_KEY, BTN_TOOL_PEN), Some(1));
         assert!(tracker.pen.as_ref().unwrap().contact.down_written);
+    }
+
+    #[test]
+    fn sparse_pen_pressure_survives_failed_update_and_device_recreation() {
+        let mut tracker = ContactTracker::default();
+        let mut writer = FakeWriter::default();
+        let mut down = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Down,
+            10,
+            20,
+        );
+        if let Event::PenTouch { pressure, .. } = &mut down {
+            *pressure = Some(0.7);
+        }
+        emit(&mut tracker, &mut writer, &down).unwrap();
+
+        let mut moved = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Move,
+            11,
+            21,
+        );
+        if let Event::PenTouch { pressure, .. } = &mut moved {
+            *pressure = None;
+        }
+        emit(&mut tracker, &mut writer, &moved).unwrap();
+        assert_eq!(event_at(&writer.frames[1].1, EV_ABS, ABS_PRESSURE), None);
+
+        writer.partial_next = Some(2);
+        let mut failed_move = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Move,
+            12,
+            22,
+        );
+        if let Event::PenTouch { pressure, .. } = &mut failed_move {
+            *pressure = None;
+        }
+        assert!(emit(&mut tracker, &mut writer, &failed_move).is_err());
+
+        // The native device is destroyed after a partial frame. The next
+        // sparse move opens a fresh device and must restore its held pressure.
+        tracker.reset_pen_device_state();
+        let mut recovered_move = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Move,
+            13,
+            23,
+        );
+        if let Event::PenTouch { pressure, .. } = &mut recovered_move {
+            *pressure = None;
+        }
+        emit(&mut tracker, &mut writer, &recovered_move).unwrap();
+        let recovered = &writer.frames[3].1;
+        assert_eq!(event_at(recovered, EV_ABS, ABS_X), Some(13));
+        assert_eq!(
+            event_at(recovered, EV_ABS, ABS_PRESSURE),
+            Some(pressure_value(0.7))
+        );
+        assert_eq!(event_at(recovered, EV_KEY, BTN_TOUCH), Some(1));
+
+        emit(
+            &mut tracker,
+            &mut writer,
+            &with_phase(&recovered_move, PenTouchPhase::Up),
+        )
+        .unwrap();
+        assert_eq!(event_at(&writer.frames[4].1, EV_KEY, BTN_TOUCH), Some(0));
+        assert!(tracker.is_empty());
+        emit(&mut tracker, &mut writer, &down).unwrap();
+        tracker
+            .release_all(|target, frame, attempted| {
+                *attempted = true;
+                writer.emit(target, frame)
+            })
+            .unwrap();
+        assert!(tracker.is_empty());
+        assert_eq!(event_at(&writer.frames[6].1, EV_KEY, BTN_TOUCH), Some(0));
     }
 
     #[test]
