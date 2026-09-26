@@ -6,9 +6,13 @@
 //! environment, or service handle is passed to the worker after launch.
 
 use amaterasu_package::PackageResult;
-use std::ffi::{OsStr, c_void};
-use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use amaterasu_package::playnite_extension::{
+    PlayniteExtensionInstall, PlayniteExtensionReceipt, finalize_playnite_extension,
+    install_playnite_extension, pending_playnite_extension_receipt, rollback_playnite_extension,
+};
+use std::ffi::{OsStr, OsString, c_void};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf, Prefix};
 
 const WTS_ACTIVE: i32 = 0;
 const INVALID_SESSION_ID: u32 = u32::MAX;
@@ -17,6 +21,11 @@ const WAIT_TIMEOUT: u32 = 258;
 const TOKEN_ASSIGN_PRIMARY: u32 = 0x0001;
 const TOKEN_DUPLICATE: u32 = 0x0002;
 const TOKEN_QUERY: u32 = 0x0008;
+const TOKEN_USER: u32 = 1;
+const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+const SE_FILE_OBJECT: u32 = 1;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
 const TOKEN_ADJUST_DEFAULT: u32 = 0x0080;
 const TOKEN_ADJUST_SESSIONID: u32 = 0x0100;
 const SECURITY_IMPERSONATION: u32 = 2;
@@ -84,8 +93,33 @@ struct WtsSessionInfoW {
     state: i32,
 }
 
+#[repr(C)]
+struct SidAndAttributes {
+    sid: *mut c_void,
+    attributes: u32,
+}
+
 #[link(name = "advapi32")]
 unsafe extern "system" {
+    fn GetTokenInformation(
+        token: *mut c_void,
+        class: u32,
+        buffer: *mut c_void,
+        length: u32,
+        returned: *mut u32,
+    ) -> i32;
+    fn GetNamedSecurityInfoW(
+        object: *const u16,
+        object_type: u32,
+        information: u32,
+        owner: *mut *mut c_void,
+        group: *mut *mut c_void,
+        dacl: *mut *mut c_void,
+        sacl: *mut *mut c_void,
+        descriptor: *mut *mut c_void,
+    ) -> u32;
+    fn EqualSid(left: *const c_void, right: *const c_void) -> i32;
+    fn ConvertSidToStringSidW(sid: *mut c_void, text: *mut *mut u16) -> i32;
     fn DuplicateTokenEx(
         existing: *mut c_void,
         desired_access: u32,
@@ -125,6 +159,7 @@ unsafe extern "system" {
 
 #[link(name = "userenv")]
 unsafe extern "system" {
+    fn GetUserProfileDirectoryW(token: *mut c_void, directory: *mut u16, length: *mut u32) -> i32;
     fn CreateEnvironmentBlock(
         environment: *mut *mut c_void,
         token: *mut c_void,
@@ -135,6 +170,8 @@ unsafe extern "system" {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    fn GetFileAttributesW(path: *const u16) -> u32;
     fn CreateFileW(
         path: *const u16,
         desired_access: u32,
@@ -279,9 +316,16 @@ impl Worker {
         let prepared = crate::state_root::prepare(root, user_token.handle)?;
         let primary_token = user_token.duplicate_primary()?;
         let environment = UserEnvironment::for_token(primary_token.handle)?;
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let extension_install = match prepare_playnite_extension(user_token.handle, &executable) {
+            Ok(install) => install,
+            Err(error) => {
+                eprintln!("Playnite extension installation skipped: {error}");
+                None
+            }
+        };
         let null_device = InheritableNull::open()?;
         let mut readiness = ReadinessPipe::open()?;
-        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         let application_name = wide_os(executable.as_os_str())?;
         let mut arguments = vec![
             executable.as_os_str(),
@@ -361,6 +405,11 @@ impl Worker {
         if let Err(error) = readiness.wait_for_ready(&worker) {
             drop(worker);
             return Err(error);
+        }
+        if let Some(install) = extension_install
+            && let Err(error) = install.finalize()
+        {
+            eprintln!("Playnite extension installation could not finalize: {error}");
         }
         Ok(worker)
     }
@@ -578,6 +627,245 @@ struct UserToken {
     handle: *mut c_void,
 }
 
+/// A real local profile directory whose owner is the active WTS token's user.
+/// The service must never derive this path from its own environment.
+struct BoundUserProfile {
+    path: PathBuf,
+    sid: String,
+}
+
+/// Keeps the receipt live until the user worker reports ready. Every early
+/// startup return rolls the extension back; a crash leaves the durable receipt
+/// for the next startup to recover before another install.
+struct PendingExtensionInstall {
+    receipt: Option<PlayniteExtensionReceipt>,
+    profile: BoundUserProfile,
+}
+
+impl PendingExtensionInstall {
+    fn finalize(mut self) -> PackageResult<()> {
+        let receipt = self.receipt.as_ref().expect("pending receipt");
+        finalize_playnite_extension(receipt, &self.profile.path, &self.profile.sid)?;
+        self.receipt = None;
+        Ok(())
+    }
+}
+
+impl Drop for PendingExtensionInstall {
+    fn drop(&mut self) {
+        if let Some(receipt) = self.receipt.take()
+            && let Err(error) =
+                rollback_playnite_extension(&receipt, &self.profile.path, &self.profile.sid)
+        {
+            eprintln!("Playnite extension rollback requires recovery: {error}");
+        }
+    }
+}
+
+fn prepare_playnite_extension(
+    token: *mut c_void,
+    executable: &Path,
+) -> PackageResult<Option<PendingExtensionInstall>> {
+    let profile = BoundUserProfile::for_token(token)?;
+    // This is the default per-user Playnite location only. A configured
+    // playnite_extensions_dir needs an authenticated per-user setting flow.
+    let mut extensions = profile.path.clone();
+    for component in ["AppData", "Roaming", "Playnite", "Extensions"] {
+        extensions.push(component);
+        match std::fs::symlink_metadata(&extensions) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("Playnite extension target is unavailable".into()),
+            Ok(metadata) if metadata.is_dir() && !is_reparse_point(&metadata) => {}
+            Ok(_) => return Err("Playnite extension target contains an unsafe path".into()),
+        }
+    }
+    if let Some(receipt) =
+        pending_playnite_extension_receipt(&extensions, &profile.path, &profile.sid)?
+    {
+        rollback_playnite_extension(&receipt, &profile.path, &profile.sid)?;
+    }
+    let source = bundled_extension_source(executable)?;
+    match install_playnite_extension(&source, &extensions, &profile.path, &profile.sid)? {
+        PlayniteExtensionInstall::AlreadyCurrent => Ok(None),
+        PlayniteExtensionInstall::Installed(receipt) => Ok(Some(PendingExtensionInstall {
+            receipt: Some(receipt),
+            profile,
+        })),
+    }
+}
+
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+impl BoundUserProfile {
+    fn for_token(token: *mut c_void) -> PackageResult<Self> {
+        let mut length = 0u32;
+        // SAFETY: the sizing call supplies no output buffer; token remains owned
+        // by UserToken throughout this lookup.
+        unsafe { GetUserProfileDirectoryW(token, std::ptr::null_mut(), &mut length) };
+        if !(2..=32_768).contains(&length) {
+            return Err("active user profile is unavailable".into());
+        }
+        let mut buffer = vec![0u16; length as usize];
+        // SAFETY: buffer has the exact capacity requested by userenv and token
+        // remains live for the synchronous call.
+        if unsafe { GetUserProfileDirectoryW(token, buffer.as_mut_ptr(), &mut length) } == 0
+            || length < 2
+            || length as usize > buffer.len()
+            || buffer[length as usize - 1] != 0
+        {
+            return Err("active user profile is unavailable".into());
+        }
+        let path = PathBuf::from(OsString::from_wide(&buffer[..length as usize - 1]));
+        if !path.is_absolute()
+            || !matches!(
+                path.components().next(),
+                Some(std::path::Component::Prefix(prefix))
+                    if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+            )
+        {
+            return Err("active user profile is not a local absolute path".into());
+        }
+        require_real_path_ancestors(&path)?;
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| "active user profile is unavailable")?;
+        if !canonical.is_dir() {
+            return Err("active user profile is unavailable".into());
+        }
+        let sid = verify_profile_owner(token, &canonical)?;
+        Ok(Self {
+            path: canonical,
+            sid,
+        })
+    }
+}
+
+fn bundled_extension_source(executable: &Path) -> PackageResult<PathBuf> {
+    require_real_path_ancestors(executable)?;
+    if !executable.is_file() {
+        return Err("service executable is unavailable".into());
+    }
+    let parent = executable
+        .parent()
+        .ok_or("service executable has no install directory")?;
+    let source = parent.join("playnite-extension");
+    require_real_path_ancestors(&source)?;
+    if !source.is_dir() {
+        return Err("bundled Playnite extension is unavailable".into());
+    }
+    source
+        .canonicalize()
+        .map_err(|_| "bundled Playnite extension is unavailable".into())
+}
+
+fn require_real_path_ancestors(path: &Path) -> PackageResult<()> {
+    for ancestor in path.ancestors() {
+        let wide = wide_os(ancestor.as_os_str())?;
+        // SAFETY: wide_os NUL-terminates every component path. Reparse points
+        // could redirect an elevated installer outside its approved location.
+        let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        if attributes == INVALID_FILE_ATTRIBUTES || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("installer path contains a reparse point or missing ancestor".into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_profile_owner(token: *mut c_void, profile: &Path) -> PackageResult<String> {
+    let mut length = 0u32;
+    // SAFETY: the sizing call intentionally passes no output buffer.
+    unsafe { GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut length) };
+    if length < std::mem::size_of::<SidAndAttributes>() as u32 || length > 16 * 1024 {
+        return Err("active user token has no valid SID".into());
+    }
+    let mut token_user = vec![0u8; length as usize];
+    // SAFETY: token_user is large enough for the TOKEN_USER result and remains
+    // allocated until after EqualSid has consumed its SID pointer.
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_USER,
+            token_user.as_mut_ptr().cast(),
+            length,
+            &mut length,
+        )
+    } == 0
+    {
+        return Err("active user token SID is unavailable".into());
+    }
+    // SAFETY: GetTokenInformation wrote the leading SID_AND_ATTRIBUTES. Use an
+    // unaligned read because a byte buffer does not promise pointer alignment.
+    let user = unsafe { std::ptr::read_unaligned(token_user.as_ptr().cast::<SidAndAttributes>()) };
+    if user.sid.is_null() {
+        return Err("active user token SID is unavailable".into());
+    }
+    let path = wide_os(profile.as_os_str())?;
+    let mut owner = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: path is NUL-terminated; GetNamedSecurityInfoW returns the owner
+    // pointer inside its separately owned descriptor allocation.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 || descriptor.is_null() || owner.is_null() {
+        if !descriptor.is_null() {
+            // SAFETY: GetNamedSecurityInfoW owns this descriptor allocation.
+            unsafe { LocalFree(descriptor) };
+        }
+        return Err("active user profile owner is unavailable".into());
+    }
+    // SAFETY: both SID pointers remain valid until the descriptor and token
+    // information buffer are released after this comparison.
+    let matches = unsafe { EqualSid(user.sid, owner) } != 0;
+    // SAFETY: owner points inside this descriptor and must not be freed alone.
+    unsafe { LocalFree(descriptor) };
+    if !matches {
+        return Err("active user profile is not owned by its token SID".into());
+    }
+    let mut text = std::ptr::null_mut();
+    // SAFETY: the token SID is valid while token_user remains allocated;
+    // Windows returns a separate LocalFree-owned UTF-16 string.
+    if unsafe { ConvertSidToStringSidW(user.sid, &mut text) } == 0 || text.is_null() {
+        return Err("active user token SID is unavailable".into());
+    }
+    let mut length = 0usize;
+    // SAFETY: Windows returns a terminated SID string. A SID string longer
+    // than this bound is rejected before exposing it to the installer.
+    while length < 184 && unsafe { *text.add(length) } != 0 {
+        length += 1;
+    }
+    let sid = if length == 184 {
+        Err("active user token SID is invalid".into())
+    } else {
+        // SAFETY: the slice excludes the terminator and remains owned locally.
+        String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
+            .map_err(|_| "active user token SID is invalid".to_string())
+    };
+    // SAFETY: ConvertSidToStringSidW allocated this exact buffer.
+    unsafe { LocalFree(text.cast()) };
+    let sid = sid?;
+    if !sid.starts_with("S-1-")
+        || !sid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'S')
+    {
+        return Err("active user token SID is invalid".into());
+    }
+    Ok(sid)
+}
+
 impl UserToken {
     fn for_session(session_id: u32) -> PackageResult<Self> {
         let mut token = std::ptr::null_mut();
@@ -792,7 +1080,34 @@ fn quote_windows_argument(argument: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::quote_windows_argument;
+    use super::{BoundUserProfile, CloseHandle, TOKEN_QUERY, quote_windows_argument};
+    use std::ffi::c_void;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+    }
+
+    #[test]
+    fn profile_directory_and_sid_are_bound_to_the_same_token() {
+        let mut token = std::ptr::null_mut();
+        // SAFETY: the process pseudo handle is valid and OpenProcessToken
+        // returns one separately owned token handle on success.
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+            0
+        );
+        let profile = BoundUserProfile::for_token(token);
+        // SAFETY: OpenProcessToken returned this owned handle.
+        unsafe { CloseHandle(token) };
+        let profile = profile.unwrap();
+        assert!(profile.path.is_dir());
+        assert!(profile.sid.starts_with("S-1-"));
+    }
 
     #[test]
     fn quotes_windows_arguments_without_rewriting_safe_paths() {
