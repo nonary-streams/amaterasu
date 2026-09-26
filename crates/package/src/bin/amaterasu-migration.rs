@@ -4,10 +4,11 @@ use amaterasu_package::handoff::{
 };
 use amaterasu_package::importer::{materialize_import_plan, runtime_state_directory};
 use amaterasu_package::migration::{
-    LegacyConfigSource, LegacyProduct, LegacySearchPaths, ValidatedSensitiveSource,
+    LegacyConfigSource, LegacyProduct, LegacySearchPaths, MigrationReceipt,
+    ValidatedSensitiveSource,
     analyze_legacy_configuration, canonical_existing_source_root, discover_legacy_sources,
     import_legacy_configuration_with_sensitive_sources,
-    preflight_legacy_configuration_with_sensitive_sources,
+    preflight_legacy_configuration_with_sensitive_sources, rollback_legacy_configuration,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -176,10 +177,13 @@ fn run() -> Result<(), String> {
                 &validation.approvals,
             )?;
             if let Some(runtime) = runtime {
-                let materialized = materialize_import_plan(&runtime, &receipt.plan)?;
-                let state = runtime_state_directory(&runtime)?;
-                seed_sensitive_sources(&destination, &validation, &state)?;
-                write_import_validation(&runtime, &sources)?;
+                let materialized = finish_import(&receipt, || {
+                    let materialized = materialize_import_plan(&runtime, &receipt.plan)?;
+                    let state = runtime_state_directory(&runtime)?;
+                    seed_sensitive_sources(&destination, &validation, &state)?;
+                    write_import_validation(&runtime, &sources)?;
+                    Ok(materialized)
+                })?;
                 println!(
                     "migration runtime state materialized: {} application(s), {} setting(s)",
                     materialized.applications, materialized.settings
@@ -316,6 +320,24 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         _ => Err(usage().into()),
+    }
+}
+
+/// A failed runtime handoff must leave the copied import retryable. Namespace
+/// seeds are idempotent and may have completed before the failure; the receipt
+/// removes only files this attempt created and keeps its source backup.
+fn finish_import<T>(
+    receipt: &MigrationReceipt,
+    handoff: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    match handoff() {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            rollback_legacy_configuration(receipt).map_err(|rollback| {
+                format!("{error}; imported files could not be rolled back: {rollback}")
+            })?;
+            Err(error)
+        }
     }
 }
 
@@ -1381,6 +1403,55 @@ fn usage() -> &'static str {
 #[cfg(test)]
 mod handoff_cli_tests {
     use super::*;
+
+    #[test]
+    fn failed_credential_handoff_can_retry_with_updated_predecessor_file() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-credential-retry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_root = root.join("Sunshine");
+        let credential_path = source_root.join("credentials/login.json");
+        let destination = root.join("Amaterasu");
+        fs::create_dir_all(credential_path.parent().unwrap()).unwrap();
+        fs::write(
+            source_root.join("sunshine.conf"),
+            b"credentials_file = credentials/login.json\n",
+        )
+        .unwrap();
+        fs::write(&credential_path, b"first verifier").unwrap();
+
+        let sources = [LegacyConfigSource {
+            product: LegacyProduct::Sunshine,
+            root: source_root,
+        }];
+        let validated = [ValidatedSensitiveSource {
+            product: LegacyProduct::Sunshine,
+            pairing: false,
+            authentication: true,
+        }];
+        let first =
+            import_legacy_configuration_with_sensitive_sources(&destination, &sources, &validated)
+                .unwrap();
+        let imported = destination.join("legacy-imports/sunshine/credentials/login.json");
+        assert_eq!(fs::read(&imported).unwrap(), b"first verifier");
+        assert_eq!(
+            finish_import(&first, || Err::<(), _>("credential seed failed".into())),
+            Err("credential seed failed".into())
+        );
+        assert!(!imported.exists());
+        assert!(first.backup_directory.join("receipt.json").is_file());
+
+        fs::write(&credential_path, b"corrected verifier").unwrap();
+        let second =
+            import_legacy_configuration_with_sensitive_sources(&destination, &sources, &validated)
+                .unwrap();
+        finish_import(&second, || Ok(())).unwrap();
+        assert_eq!(fs::read(&imported).unwrap(), b"corrected verifier");
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn failed_credential_import_retry_revokes_previous_handoff_validation() {
