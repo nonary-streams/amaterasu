@@ -200,7 +200,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
                 && existing.applied.profile == desired_profile
                 && existing.applied.profile_exists
             {
-                return match self.current_state(&existing) {
+                return match self.confirmed_active_state(&existing) {
                     Ok(true) => ApplyOutcome::AlreadyApplied(existing.clone()),
                     Ok(false) => ApplyOutcome::Stale(existing.lease_id.clone()),
                     Err(error) => ApplyOutcome::Unavailable(error.diagnostic()),
@@ -344,7 +344,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
     fn status_for_records(&mut self, owned: Vec<LeaseRecord>) -> Vec<OwnedLeaseStatus> {
         let mut results = Vec::with_capacity(owned.len());
         for lease in owned {
-            let provider_state = self.current_state(&lease);
+            let provider_state = self.confirmed_active_state(&lease);
             let (state, diagnostic) = if lease.phase == LeasePhase::Pending {
                 match provider_state {
                     Err(error) => ("stale_lease", Some(error.diagnostic())),
@@ -386,7 +386,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             if lease.phase == LeasePhase::Pending {
                 return ApplyPreflight::Stale(lease.lease_id);
             }
-            return match self.current_state(&lease) {
+            return match self.confirmed_active_state(&lease) {
                 Ok(true) => ApplyPreflight::AlreadyApplied(lease.lease_id),
                 Ok(false) => ApplyPreflight::Stale(lease.lease_id),
                 Err(error) => ApplyPreflight::Unavailable(error.diagnostic()),
@@ -544,6 +544,17 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             .select_installation(&lease.rtss_install_path)?;
         let current = self.read_provider_snapshot(&lease.profile)?;
         self.snapshot_matches_applied(lease, current)
+    }
+
+    fn confirmed_active_state(&mut self, lease: &LeaseRecord) -> Result<bool, ProviderError> {
+        if lease.phase == LeasePhase::Pending {
+            return Ok(false);
+        }
+        // A lease imported from an older journal may still match its applied
+        // values even though this provider can no longer restore them safely.
+        // Do not advertise that record as an active, retryable effect.
+        self.provider.ensure_safe_writes_supported()?;
+        self.current_state(lease)
     }
 
     fn restore_one(&mut self, lease: &LeaseRecord) -> Result<(), RestoreFailure> {
@@ -1729,6 +1740,49 @@ mod tests {
                 code: "fake_safe_write_unsupported",
             }
         );
+        assert_eq!(restarted.provider.profiles["game.exe"], TARGET);
+        drop(restarted);
+        fs::remove_dir_all(temp_directory).unwrap();
+    }
+
+    #[test]
+    fn restart_does_not_advertise_an_active_lease_without_safe_restore() {
+        let temp_directory = std::env::temp_dir().join(format!(
+            "amaterasu-frame-limiter-unsupported-active-recovery-{}-{}",
+            std::process::id(),
+            NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&temp_directory).unwrap();
+        let journal_path = temp_directory.join("leases.json");
+        let mut first = LeaseManager::open(FakeProvider::new(), journal_path.clone()).unwrap();
+        let ApplyOutcome::Applied(lease) = apply(&mut first, "caller.a", "session-1") else {
+            panic!("the old provider must create an active lease");
+        };
+        let mut provider = first.provider.clone();
+        provider.mutation_supported = false;
+        drop(first);
+
+        let mut restarted = LeaseManager::open(provider, journal_path.clone()).unwrap();
+        restarted.recover().unwrap();
+        let status = restarted.status("caller.a", Some("session-1"));
+        assert_eq!(status[0].state, "stale_lease");
+        assert_eq!(status[0].diagnostic, Some("fake_safe_write_unsupported"));
+        assert_eq!(
+            restarted.preflight_apply("caller.a", "session-1", "same-request"),
+            ApplyPreflight::Unavailable("fake_safe_write_unsupported")
+        );
+        assert_eq!(
+            apply(&mut restarted, "caller.a", "session-1"),
+            ApplyOutcome::Unavailable("fake_safe_write_unsupported")
+        );
+        assert_eq!(
+            restarted.restore("caller.a", None, Some(&lease.lease_id)),
+            RestoreOutcome::Failed {
+                lease_id: lease.lease_id,
+                code: "fake_safe_write_unsupported",
+            }
+        );
+        assert_eq!(restarted.records().len(), 1);
         assert_eq!(restarted.provider.profiles["game.exe"], TARGET);
         drop(restarted);
         fs::remove_dir_all(temp_directory).unwrap();
