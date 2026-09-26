@@ -912,9 +912,9 @@ fn display_snapshot(payload: &Value) -> Result<(String, Vec<String>), &'static s
         {
             return Err("invalid_display_snapshot");
         }
-        ids.push(id.to_ascii_lowercase());
+        ids.push(id.to_owned());
     }
-    ids.sort();
+    ids.sort_by_key(|id| id.to_ascii_lowercase());
     Ok((revision.to_owned(), ids))
 }
 
@@ -970,18 +970,17 @@ fn display_enumeration(
             .as_bool()
             .ok_or("invalid_display_enumeration")?;
         if entry_source.eq_ignore_ascii_case(source) {
-            if !active
-                || !record
-                    .display_snapshot_ids
-                    .iter()
-                    .any(|known| known.eq_ignore_ascii_case(id))
-            {
+            let snapshot_id = record
+                .display_snapshot_ids
+                .iter()
+                .find(|known| known.eq_ignore_ascii_case(id));
+            if !active || snapshot_id.is_none() {
                 return Err("inactive_capture_output");
             }
             if match_id.is_some() {
                 return Err("ambiguous_capture_output");
             }
-            match_id = Some(id.to_ascii_lowercase());
+            match_id = snapshot_id.cloned();
         }
     }
     record.display_match_id = match_id;

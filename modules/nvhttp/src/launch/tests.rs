@@ -2773,7 +2773,7 @@ fn verify_only_freezes_unique_active_monitor_without_mutation_and_retries_exactl
     let mut controller = Controller::new(Some(streaming)).unwrap();
     controller.set_global_display_policy(9, json!({"dd_configuration_option":"verify_only"}));
     let mut broker = Broker {
-        display_snapshot_ids: vec!["monitor.one".into(), "monitor.two".into()],
+        display_snapshot_ids: vec!["monitor.one".into(), "Monitor.Two".into()],
         display_entries: vec![
             json!({"id":"monitor.one","source":"\\\\.\\DISPLAY1","active":true}),
             json!({"id":"monitor.two","source":"\\\\.\\DISPLAY2","active":true}),
@@ -2791,7 +2791,7 @@ fn verify_only_freezes_unique_active_monitor_without_mutation_and_retries_exactl
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(reply.status, 200);
     let body = String::from_utf8(reply.body).unwrap();
-    assert!(body.contains("<verifiedDisplayId>monitor.two</verifiedDisplayId>"));
+    assert!(body.contains("<verifiedDisplayId>Monitor.Two</verifiedDisplayId>"));
     assert!(body.contains(
         "<displayTopologyRevision>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</displayTopologyRevision>"
     ));
