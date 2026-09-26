@@ -152,9 +152,7 @@ fn windows_default_roots_recover_after_steam_is_installed() {
     };
 
     assert!(
-        provider.start_scan_with_defaults(|| {
-            existing_windows_library_roots(vec![candidate.clone()])
-        })
+        provider.start_scan_with_defaults(|| { existing_library_roots(vec![candidate.clone()]) })
     );
     for _ in 0..100 {
         provider.tick();
@@ -166,7 +164,7 @@ fn windows_default_roots_recover_after_steam_is_installed() {
     let installed_root = fixture.library("late-steam");
     fixture.manifest(&installed_root, 42, "Later installation", 4);
     assert!(provider.start_scan_with_defaults(|| {
-        existing_windows_library_roots(vec![candidate.clone(), candidate.clone()])
+        existing_library_roots(vec![candidate.clone(), candidate.clone()])
     }));
     for _ in 0..100 {
         provider.tick();
@@ -191,6 +189,71 @@ fn configured_windows_roots_override_install_defaults() {
     }
     assert_eq!(provider.roots, vec![configured]);
     assert_eq!(provider.games[&7].name, "Configured game");
+}
+
+#[test]
+fn linux_session_defaults_recover_and_explicit_roots_override_them() {
+    let fixture = Libraries::new();
+    let home = fixture.0.join("home");
+    let xdg = fixture.0.join("xdg");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&xdg).unwrap();
+    let mut provider = Provider {
+        enabled: true,
+        automatic_roots: true,
+        ..Provider::default()
+    };
+    let defaults = || linux_default_library_roots(Some(&home), Some(&xdg), true);
+    assert!(defaults().is_empty());
+    assert!(linux_default_library_roots(Some(&home), Some(&xdg), false).is_empty());
+    assert!(provider.start_scan_with_defaults(defaults));
+    finish_provider(&mut provider);
+    assert_eq!(provider.status()["complete"], false);
+    assert_eq!(provider.status()["warnings"], json!(["no_library_roots"]));
+
+    let steam_root = fixture.library("home/.local/share/Steam");
+    fixture.manifest(&steam_root, 42, "Installed later", 4);
+    let xdg_root = fixture.library("xdg/Steam");
+    fixture.manifest(&xdg_root, 43, "XDG game", 4);
+    let flatpak_root = fixture.library("home/.var/app/com.valvesoftware.Steam/data/Steam");
+    fixture.manifest(&flatpak_root, 44, "Flatpak game", 4);
+    let snap_root = fixture.library("home/snap/steam/common/.local/share/Steam");
+    fixture.manifest(&snap_root, 45, "Snap game", 4);
+    assert_eq!(
+        defaults(),
+        vec![
+            steam_root.clone(),
+            flatpak_root,
+            snap_root,
+            xdg_root.clone()
+        ]
+    );
+    assert!(provider.start_scan_with_defaults(defaults));
+    finish_provider(&mut provider);
+    assert_eq!(provider.status()["complete"], true);
+    assert_eq!(provider.games[&42].name, "Installed later");
+    assert_eq!(provider.games[&43].name, "XDG game");
+    assert_eq!(provider.games[&44].name, "Flatpak game");
+    assert_eq!(provider.games[&45].name, "Snap game");
+
+    let configured = fixture.library("configured");
+    fixture.manifest(&configured, 7, "Explicit game", 4);
+    let mut explicit = Provider::new(vec![configured.clone()]);
+    explicit.set_enabled(true);
+    assert!(explicit.start_scan_with_defaults(|| panic!("defaults must not be read")));
+    finish_provider(&mut explicit);
+    assert_eq!(explicit.roots, vec![configured]);
+    assert_eq!(explicit.games.keys().copied().collect::<Vec<_>>(), vec![7]);
+}
+
+fn finish_provider(provider: &mut Provider) {
+    for _ in 0..10_000 {
+        provider.tick();
+        if !provider.scan_in_progress() {
+            return;
+        }
+    }
+    panic!("Steam provider scan did not finish");
 }
 
 #[test]

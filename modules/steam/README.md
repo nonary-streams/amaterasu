@@ -13,9 +13,11 @@ On Windows, an absent or empty roots setting discovers the current user's Steam
 installation from the registered Steam path, then Program Files and Local App
 Data defaults. Only existing roots with `steamapps` directories are scanned;
 each refresh rechecks these locations so an installation added later can be
-found. Explicit roots override this fallback. On other platforms, an absent
-setting means no roots until a session-owned discovery broker is available.
-Up to 32 configured roots and 64 discovered
+found. On Linux in a non-root user session, absent roots search the usual native,
+Flatpak, Snap, and `XDG_DATA_HOME/Steam` install locations. A machine host or
+root process does not infer desktop-user paths; it needs a session-owned
+discovery broker or explicit roots. Explicit roots override these defaults;
+macOS still needs explicit roots. Up to 32 configured roots and 64 discovered
 libraries are supported. Paths must be native absolute paths. Root symlinks are
 canonicalized to support ordinary Linux Steam layouts; manifest symlinks are
 rejected. This is trusted local-user discovery, not a filesystem sandbox or a
@@ -220,7 +222,7 @@ filesystem call can still block on unavailable storage.
 
 Behavior reference: sibling Vibeshine `src/steam_integration.h` and
 `src/steam_artwork.cpp`; source was not copied or translated. Other missing
-parity includes automatic per-session root discovery outside Windows,
+parity includes machine-host session-broker discovery and macOS default roots,
 persistent artwork caching and conversion, uninstalled owned games,
 app type filtering, play-history selection, launch options/Proton resolution,
 launch/process tracking, watchers, and Steam broker environment handling. This

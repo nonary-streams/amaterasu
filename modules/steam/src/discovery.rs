@@ -237,12 +237,12 @@ pub fn find_steam_executable(roots: &[PathBuf]) -> Option<PathBuf> {
     resolve_client_candidates(candidates)
 }
 
-/// On Windows an omitted root setting follows the current user's installed
-/// Steam locations. Other hosts still require explicit, session-owned roots.
+/// An omitted root setting follows the current user's common Steam installs.
+/// Linux machine hosts never infer desktop-user paths from the host's HOME.
 pub fn default_library_roots() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
-        existing_windows_library_roots(windows_default_install_roots(
+        existing_library_roots(windows_default_install_roots(
             windows_registered_steam_root(),
             std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
             std::env::var_os("ProgramFiles").map(PathBuf::from),
@@ -250,12 +250,21 @@ pub fn default_library_roots() -> Vec<PathBuf> {
         ))
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_default_library_roots(
+            std::env::var_os("HOME").as_deref().map(Path::new),
+            std::env::var_os("XDG_DATA_HOME").as_deref().map(Path::new),
+            linux_user_session_allowed(),
+        )
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
     Vec::new()
 }
 
-#[cfg(windows)]
-fn existing_windows_library_roots(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+#[cfg(any(windows, target_os = "linux"))]
+fn existing_library_roots(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut seen = BTreeSet::new();
     for candidate in candidates {
@@ -267,6 +276,57 @@ fn existing_windows_library_roots(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
         }
     }
     roots
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_default_library_roots(
+    home: Option<&Path>,
+    xdg_data_home: Option<&Path>,
+    user_session: bool,
+) -> Vec<PathBuf> {
+    if !user_session {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    if let Some(home) = home.filter(|path| path.is_absolute()) {
+        for relative in [
+            ".local/share/Steam",
+            ".steam/steam",
+            ".steam/root",
+            ".steam/debian-installation",
+            ".var/app/com.valvesoftware.Steam/data/Steam",
+            ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+            "snap/steam/common/.local/share/Steam",
+        ] {
+            candidates.push(home.join(relative));
+        }
+    }
+    if let Some(xdg_data_home) = xdg_data_home.filter(|path| path.is_absolute()) {
+        candidates.push(xdg_data_home.join("Steam"));
+    }
+    existing_library_roots(candidates)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_user_session_allowed() -> bool {
+    let machine_host = ["AMATERASU_MACHINE_HOST", "VIBESHINE_MACHINE_HOST"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    if machine_host {
+        return false;
+    }
+    let effective_uid = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))?
+                .split_whitespace()
+                .nth(1)?
+                .parse::<u32>()
+                .ok()
+        });
+    effective_uid.is_some_and(|uid| uid != 0)
 }
 
 fn resolve_client_candidates(candidates: Vec<PathBuf>) -> Option<PathBuf> {
