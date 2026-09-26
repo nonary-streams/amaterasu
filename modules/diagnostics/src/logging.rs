@@ -519,10 +519,10 @@ fn check_existing_path_has_no_symlinks(state_root: &Path, relative: &Path) -> io
         if let Component::Normal(name) = component {
             current.push(name);
             match fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
+                Ok(metadata) if is_reparse_or_symlink(&metadata) => {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
-                        "relative log path contains a symbolic link",
+                        "relative log path contains a symlink or reparse point",
                     ));
                 }
                 Ok(_) => {}
@@ -542,7 +542,7 @@ fn validate_state_root(path: &Path) -> io::Result<PathBuf> {
         ));
     }
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir() || is_reparse_or_symlink(&metadata) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "trusted state root is not a real directory",
@@ -556,6 +556,22 @@ fn validate_state_root(path: &Path) -> io::Result<PathBuf> {
         ));
     }
     Ok(canonical)
+}
+
+fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -779,6 +795,40 @@ mod tests {
         }
         assert!(SessionLog::new(Path::new("link/logs"), &state_root).is_err());
         fs::remove_dir_all(state_root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_junctions_are_rejected_as_roots_and_relative_components() {
+        let root = temp_root();
+        let outside = temp_root();
+        let junction = root.join("junction");
+        let created = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        if !created.status.success() {
+            // Junction creation can be disabled by the test environment.
+            fs::remove_dir_all(root).unwrap();
+            fs::remove_dir_all(outside).unwrap();
+            return;
+        }
+        assert!(is_reparse_or_symlink(
+            &fs::symlink_metadata(&junction).unwrap()
+        ));
+        assert!(validate_state_root(&junction).is_err());
+        let settings = LoggingSettings::from_value(json!({
+            "log_path":"junction/capture.log", "state_root":root
+        }))
+        .unwrap();
+        assert!(SessionLogger::open(settings).1.is_some());
+        fs::remove_dir(&junction).unwrap();
+        fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
     }
 

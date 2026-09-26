@@ -160,6 +160,10 @@ durable update. Only the broker identity `amaterasu.host-configuration` may use
 this action. Diagnostics validates the full response shape, positive revision,
 effective log path against its trusted state root, and sink readiness before
 swapping the active policy. Success returns `{"ok":true,"applied_revision":N}`.
+Explicit saved log levels must match the effective level; `product_default`
+accepts the host provider's stable `info` or prerelease `debug` result. Windows
+reparse points, including junctions, are rejected at the state root and in
+existing relative log path components.
 An identical revision and policy is idempotent without reopening the sink;
 older or conflicting revisions and failed sink preparation leave the previous
 logger and revision in place. The asynchronous reader also refuses to replace

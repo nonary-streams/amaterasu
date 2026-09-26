@@ -246,8 +246,9 @@ fn validate_configuration_shape(payload: &Value) -> Result<(), String> {
             return Err(format!("host configuration omitted {key}"));
         }
     }
+    let selected_level = values.get("min_log_level").and_then(Value::as_str);
     if !matches!(
-        values.get("min_log_level").and_then(Value::as_str),
+        selected_level,
         Some(
             "product_default"
                 | "verbose"
@@ -260,6 +261,19 @@ fn validate_configuration_shape(payload: &Value) -> Result<(), String> {
         )
     ) {
         return Err("host configuration minimum log level is invalid".into());
+    }
+    let effective_level = effective.get("min_log_level").and_then(Value::as_str);
+    // The host configuration provider resolves product_default using its own
+    // product channel. Diagnostics may be built at a different package version.
+    let matches_selection = match selected_level {
+        Some("product_default") => matches!(effective_level, Some("info" | "debug")),
+        Some(selected) => effective_level == Some(selected),
+        None => false,
+    };
+    if !matches_selection {
+        return Err(
+            "host configuration effective minimum log level differs from the saved policy".into(),
+        );
     }
     Ok(())
 }
@@ -587,6 +601,34 @@ mod hydration_tests {
             json!(state_root.join("elsewhere.log").to_string_lossy());
 
         assert!(persisted_logging_settings(&payload, Some(&state_root)).is_err());
+    }
+
+    #[test]
+    fn effective_level_must_match_explicit_policy_or_provider_default() {
+        let root = std::env::temp_dir().canonicalize().unwrap();
+        let mut payload = configuration(&root, 4, "amaterasu.log");
+        payload["values"]["min_log_level"] = json!("info");
+        assert!(persisted_logging_settings(&payload, Some(&root)).is_err());
+
+        payload["values"]["min_log_level"] = json!("product_default");
+        payload["effective"]["min_log_level"] = json!("info");
+        assert_eq!(
+            persisted_logging_settings(&payload, Some(&root))
+                .unwrap()
+                .0
+                .minimum_level,
+            2
+        );
+        payload["effective"]["min_log_level"] = json!("debug");
+        assert_eq!(
+            persisted_logging_settings(&payload, Some(&root))
+                .unwrap()
+                .0
+                .minimum_level,
+            1
+        );
+        payload["effective"]["min_log_level"] = json!("warning");
+        assert!(persisted_logging_settings(&payload, Some(&root)).is_err());
     }
 }
 
