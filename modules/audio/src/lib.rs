@@ -103,7 +103,7 @@ impl ManagedModule for AudioModule {
                     let _ = self
                         .controller
                         .lock()
-                        .map(|mut controller| controller.close(&caller, stream));
+                        .map(|mut controller| controller.rollback_unpublished(&caller, stream));
                 }
                 Ok(())
             }

@@ -515,6 +515,17 @@ impl Controller {
         Ok(json!({"ok":true}))
     }
 
+    /// Undo a newly created open whose reply was never delivered. An explicit
+    /// close keeps its operation record so retries still report stream_closed.
+    pub fn rollback_unpublished(&mut self, owner: &str, id: u64) {
+        if self.owned(owner, id).is_err() {
+            return;
+        }
+        self.operations
+            .retain(|(record_owner, _), record| record_owner != owner || record.stream != id);
+        self.streams.remove(&id);
+    }
+
     fn owned(&mut self, owner: &str, id: u64) -> AudioResult<&mut Stream> {
         self.streams
             .get_mut(&id)

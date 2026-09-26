@@ -983,6 +983,7 @@ struct Runtime {
     request: Option<Response>,
     complete: Option<serde_json::Value>,
     reject: bool,
+    accept_request: bool,
 }
 
 unsafe extern "C" fn invoke(
@@ -995,7 +996,13 @@ unsafe extern "C" fn invoke(
     let command: Command = serde_json::from_slice(unsafe { bytes.read().unwrap() }).unwrap();
     let response = match command {
         Command::Poll {} => runtime.request.take().unwrap_or(Response::Pending),
-        Command::CheckRequest { .. } => Response::Ok,
+        Command::CheckRequest { .. } => {
+            if runtime.accept_request {
+                Response::Ok
+            } else {
+                Response::error("request_ended", "cancelled")
+            }
+        }
         Command::Complete { payload, .. } => {
             runtime.complete = Some(payload);
             if runtime.reject {
@@ -1013,13 +1020,14 @@ unsafe extern "C" fn invoke(
 }
 
 #[test]
-fn cancelled_open_completion_closes_only_newly_created_streams() {
+fn cancelled_open_completion_rolls_back_only_newly_created_streams() {
     let (controller, observed) = controller(true);
     let shared = Arc::new(Mutex::new(controller));
     let mut runtime = Runtime {
         request: None,
         complete: None,
         reject: true,
+        accept_request: true,
     };
     let endpoint = HostApi {
         header: AbiHeader::of::<HostApi>(),
@@ -1046,15 +1054,76 @@ fn cancelled_open_completion_closes_only_newly_created_streams() {
     ));
     module.tick().unwrap();
     assert!(shared.lock().unwrap().streams.is_empty());
+    assert!(shared.lock().unwrap().operations.is_empty());
     assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+    runtime.accept_request = false;
+    runtime.complete = None;
+    runtime.request = Some(request(json!({
+        "action":"open","endpoint":"render.explicit","operation_id":"before-dispatch"
+    })));
+    module.tick().unwrap();
+    assert!(runtime.complete.is_none());
+    assert!(shared.lock().unwrap().operations.is_empty());
+    assert_eq!(observed.opens.lock().unwrap().len(), 1);
+    runtime.accept_request = true;
     runtime.reject = false;
     runtime.request = Some(request(
-        json!({"action":"open","endpoint":"render.explicit","operation_id":"two"}),
+        json!({"action":"open","endpoint":"render.explicit","operation_id":"one","continuous_audio":{"packet_ms":5}}),
     ));
     module.tick().unwrap();
+    assert_eq!(runtime.complete.as_ref().unwrap()["ok"], true);
+    assert_eq!(shared.lock().unwrap().operations.len(), 1);
     runtime.reject = true;
-    runtime.request = Some(request(json!({"action":"lookup","operation_id":"two"})));
+    runtime.request = Some(request(json!({"action":"lookup","operation_id":"one"})));
     module.tick().unwrap();
     assert_eq!(shared.lock().unwrap().streams.len(), 1);
     assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn unpublished_opens_release_operation_capacity_and_preserve_other_owners() {
+    let (mut controller, observed) = controller(true);
+    let bob = controller.handle("bob", open()).unwrap().created.unwrap();
+    for index in 0..128 {
+        let operation_id = format!("cancel-{index}");
+        let opened = controller
+            .handle(
+                "alice",
+                Operation::Open {
+                    endpoint: "render.explicit".into(),
+                    virtual_sink: None,
+                    channels: None,
+                    host_audio_enabled: true,
+                    operation_id: Some(operation_id.clone()),
+                    capture_sink_without_routing: false,
+                },
+            )
+            .unwrap();
+        let stream = opened.created.unwrap();
+        controller.rollback_unpublished("bob", stream);
+        assert_eq!(controller.streams.len(), 2);
+        controller.rollback_unpublished("alice", stream);
+        assert_eq!(controller.streams.len(), 1);
+        assert!(
+            !controller
+                .operations
+                .contains_key(&("alice".into(), operation_id))
+        );
+    }
+    assert_eq!(controller.operations.len(), 1);
+    assert_eq!(observed.drops.load(Ordering::SeqCst), 128);
+    assert!(controller.lookup("bob", "one").is_ok());
+
+    let stream = controller.handle("alice", open()).unwrap().created.unwrap();
+    controller.close("alice", stream).unwrap();
+    assert_eq!(
+        controller.handle("alice", open()).err(),
+        Some("stream_closed")
+    );
+    controller.rollback_unpublished("alice", stream);
+    assert_eq!(
+        controller.handle("alice", open()).err(),
+        Some("stream_closed")
+    );
+    assert!(controller.streams.contains_key(&bob));
 }
