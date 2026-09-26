@@ -520,7 +520,6 @@ impl Snapshot {
         }
         Ok(format!("{a:016x}{b:016x}"))
     }
-    #[cfg(any(windows, test))]
     pub(crate) fn clone_priority(&self) -> Vec<(String, Vec<String>)> {
         let is_clone = |path: &DisplayPath| {
             self.paths
