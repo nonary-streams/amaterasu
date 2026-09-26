@@ -1270,7 +1270,9 @@ def test_history_settings(api, administrator, reader):
         "expected_revision": updated["revision"],
     }, administrator)[0] == 400
     status, listed, _ = api.post("/v1/history/list_sessions", {"limit": 25}, administrator)
-    assert status == 200 and listed == {"ok": True, "sessions": []}, listed
+    assert status == 200 and listed == {
+        "ok": True, "sessions": [], "next_offset": None,
+    }, listed
     status, history_status, _ = api.post("/v1/history/history_status", token=administrator)
     assert status == 200 and history_status["status"]["available"], history_status
     return updated["settings"], updated["revision"]
