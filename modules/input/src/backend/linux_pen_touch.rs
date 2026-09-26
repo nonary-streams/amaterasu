@@ -370,13 +370,13 @@ impl LinuxPenTouch {
                 && matches!(
                     event,
                     Event::PenTouch {
-                        phase: PenTouchPhase::Cancel,
+                        phase: PenTouchPhase::Up | PenTouchPhase::Cancel,
                         ..
                     }
                 )
             {
                 // A failed Down may have reserved a contact before opening
-                // uinput. No native device exists to receive its cancellation.
+                // uinput. No native device exists to receive its terminal event.
                 return Ok(());
             }
             if device.is_none() {
@@ -717,6 +717,69 @@ fn with_phase(event: &Event, phase: PenTouchPhase) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn up_after_failed_device_creation_releases_only_its_reserved_contact() {
+        let mut pen_touch = LinuxPenTouch::new();
+        let unavailable_path = "\0";
+        let first_down = event(11, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 20);
+        let second_down = event(22, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 40);
+        for down in [&first_down, &second_down] {
+            assert!(pen_touch.inject(unavailable_path, down).is_err());
+        }
+        assert!(pen_touch.touch_device.is_none());
+        assert_eq!(pen_touch.tracker.touches.len(), 2);
+
+        pen_touch
+            .inject(
+                unavailable_path,
+                &with_phase(&first_down, PenTouchPhase::Up),
+            )
+            .unwrap();
+        assert!(pen_touch.touch_device.is_none());
+        assert!(!pen_touch.tracker.touches.contains_key(&11));
+        assert!(pen_touch.tracker.touches.contains_key(&22));
+        pen_touch
+            .inject(
+                unavailable_path,
+                &with_phase(&second_down, PenTouchPhase::Cancel),
+            )
+            .unwrap();
+        assert!(pen_touch.is_idle());
+
+        let pen_down = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Down,
+            50,
+            60,
+        );
+        assert!(pen_touch.inject(unavailable_path, &pen_down).is_err());
+        pen_touch
+            .inject(unavailable_path, &with_phase(&pen_down, PenTouchPhase::Up))
+            .unwrap();
+        assert!(pen_touch.is_idle());
+
+        // A later acquire can use a new owned device with the same pointer ID.
+        // /dev/null receives fake frames; this test never opens uinput.
+        pen_touch.touch_device = Some(Device {
+            file: std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .unwrap(),
+            created: false,
+        });
+        pen_touch.inject(unavailable_path, &first_down).unwrap();
+        assert!(pen_touch.tracker.touches.contains_key(&11));
+        pen_touch
+            .inject(
+                unavailable_path,
+                &with_phase(&first_down, PenTouchPhase::Up),
+            )
+            .unwrap();
+        pen_touch.stop().unwrap();
+        assert!(pen_touch.is_idle());
+    }
 
     #[test]
     fn owned_device_stays_available_when_uinput_path_disappears() {
