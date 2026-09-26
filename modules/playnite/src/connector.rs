@@ -1065,28 +1065,50 @@ fn watch_fullscreen_windows(
                 continue;
             }
         };
-        for byte in &buffer[..count] {
-            if *byte == b'\n' {
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                if let (Some(status), Some(extension_process)) =
-                    (parse_fullscreen_status(&line), extension_process.as_ref())
-                {
-                    let _ = events.send(FullscreenWatchEvent::Status {
-                        status,
-                        extension_process: extension_process.clone(),
-                    });
-                }
-                line.clear();
-            } else {
-                line.push(*byte);
-                if line.len() > MAX_STATUS_LINE_BYTES {
-                    return;
-                }
+        if consume_fullscreen_status_bytes(&mut line, &buffer[..count], |status| {
+            if let Some(extension_process) = extension_process.as_ref() {
+                let _ = events.send(FullscreenWatchEvent::Status {
+                    status,
+                    extension_process: extension_process.clone(),
+                });
+            }
+        })
+        .is_err()
+        {
+            // A malformed connection must not permanently end this session's
+            // watcher. Retire the pipe and reconnect to a verified process.
+            if let Some(extension_process) = extension_process.take() {
+                let _ = events.send(FullscreenWatchEvent::Disconnected { extension_process });
+            }
+            pipe = None;
+            line.clear();
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn consume_fullscreen_status_bytes(
+    line: &mut Vec<u8>,
+    bytes: &[u8],
+    mut on_status: impl FnMut(FullscreenStatus),
+) -> Result<(), ()> {
+    for byte in bytes {
+        if *byte == b'\n' {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if let Some(status) = parse_fullscreen_status(line) {
+                on_status(status);
+            }
+            line.clear();
+        } else {
+            line.push(*byte);
+            if line.len() > MAX_STATUS_LINE_BYTES {
+                return Err(());
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1313,6 +1335,38 @@ mod tests {
     };
     use crate::focus::FocusTarget;
     use crate::launch::State;
+
+    #[test]
+    fn oversized_fullscreen_status_disconnects_without_ending_later_observation() {
+        use super::{MAX_STATUS_LINE_BYTES, consume_fullscreen_status_bytes};
+
+        let status = b"{\"type\":\"status\",\"status\":{\"name\":\"playniteExiting\"}}\n";
+        let mut line = Vec::new();
+        let mut observed = Vec::new();
+        consume_fullscreen_status_bytes(&mut line, &status[..12], |event| observed.push(event))
+            .unwrap();
+        consume_fullscreen_status_bytes(&mut line, &status[12..], |event| observed.push(event))
+            .unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].kind, FullscreenStatusKind::PlayniteExiting);
+
+        assert!(
+            consume_fullscreen_status_bytes(
+                &mut line,
+                &vec![b'x'; MAX_STATUS_LINE_BYTES + 1],
+                |event| observed.push(event),
+            )
+            .is_err()
+        );
+        assert_eq!(observed.len(), 1);
+
+        // The watcher drops the offending pipe and clears its partial line.
+        // A newly authenticated connection can still deliver lifecycle state.
+        line.clear();
+        consume_fullscreen_status_bytes(&mut line, status, |event| observed.push(event)).unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[1].kind, FullscreenStatusKind::PlayniteExiting);
+    }
 
     #[cfg(windows)]
     #[test]
