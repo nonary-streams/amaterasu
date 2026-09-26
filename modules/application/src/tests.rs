@@ -94,6 +94,12 @@ fn controlled_child() {
             let marker = std::env::var("AMATERASU_TEST_MARKER").unwrap();
             std::fs::write(marker, b"detached").unwrap();
         }
+        "detached-output" => {
+            use std::io::Write;
+            let value = std::env::var("AMATERASU_TEST_VALUE").unwrap();
+            writeln!(std::io::stdout(), "OUT-{value}").unwrap();
+            writeln!(std::io::stderr(), "ERR-{value}").unwrap();
+        }
         "capture-env-cwd" => {
             let marker = std::env::var("AMATERASU_TEST_MARKER").unwrap();
             let value = std::env::var("AMATERASU_TEST_VALUE").unwrap();
@@ -877,6 +883,68 @@ fn typed_detached_commands_isolate_environment_and_cwd_from_primary_and_each_oth
 }
 
 #[test]
+fn typed_detached_output_is_appended_to_independent_child_files() {
+    let directory = test_directory("typed-detached-output");
+    let first_out = directory.join("first-stdout");
+    let first_err = directory.join("first-stderr");
+    let second_out = directory.join("second-stdout");
+    let second_err = directory.join("second-stderr");
+    std::fs::write(&first_out, "existing\n").unwrap();
+    let command = detached_command_for_current_test_with_arguments(&[]);
+    let mut request = launch("typed-detached-output", "exit");
+    request["detached"] = json!([
+        {"command":command,"environment":{"AMATERASU_TEST_CHILD":"detached-output","AMATERASU_TEST_VALUE":"first"},"stdout":first_out,"stderr":first_err},
+        {"command":command,"environment":{"AMATERASU_TEST_CHILD":"detached-output","AMATERASU_TEST_VALUE":"second"},"stdout":second_out,"stderr":second_err}
+    ]);
+    let mut manager = ProcessManager::default();
+    let started = manager.handle("alice", request.clone());
+    assert_eq!(started["ok"], true, "{started}");
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    assert_eq!(wait_for_exit(&mut manager, id)["process"]["success"], true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !first_err.exists() || !second_err.exists() {
+        assert!(Instant::now() < deadline, "detached output missing");
+        manager.reap_exited().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for (stdout, stderr, value) in [
+        (&first_out, &first_err, "first"),
+        (&second_out, &second_err, "second"),
+    ] {
+        let out = std::fs::read_to_string(stdout).unwrap();
+        let err = std::fs::read_to_string(stderr).unwrap();
+        assert!(out.contains(&format!("OUT-{value}")), "{out}");
+        assert!(err.contains(&format!("ERR-{value}")), "{err}");
+        assert!(!out.contains(if value == "first" {
+            "OUT-second"
+        } else {
+            "OUT-first"
+        }));
+        assert!(!err.contains(if value == "first" {
+            "ERR-second"
+        } else {
+            "ERR-first"
+        }));
+    }
+    assert!(
+        std::fs::read_to_string(&first_out)
+            .unwrap()
+            .starts_with("existing\n")
+    );
+    assert_eq!(
+        manager.handle("alice", request.clone())["process"]["process_id"],
+        id
+    );
+    request["detached"][0]["stdout"] = json!(directory.join("changed-stdout"));
+    assert_eq!(
+        manager.handle("alice", request)["code"],
+        "operation_conflict"
+    );
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn invalid_typed_detached_override_rejects_before_any_process_is_spawned() {
     let directory = test_directory("invalid-typed-detached");
     let marker = directory.join("primary-marker");
@@ -893,6 +961,21 @@ fn invalid_typed_detached_override_rejects_before_any_process_is_spawned() {
     assert!(!marker.exists());
     request["detached"][0]["environment"] = json!({});
     request["detached"][0]["cwd"] = json!("relative/path");
+    assert_eq!(
+        manager.handle("alice", request.clone())["code"],
+        "invalid_launch"
+    );
+    request["detached"] = json!([
+        detached_command_for_current_test(),
+        {"command":command,"stdout":"relative/output"}
+    ]);
+    assert_eq!(manager.handle("alice", request)["code"], "invalid_launch");
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!marker.exists());
+    let mut request = launch("invalid-detached-output", "capture-env-cwd");
+    request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker);
+    request["environment"]["AMATERASU_TEST_VALUE"] = json!("primary");
+    request["detached"] = json!([{"command":command,"stdout":"relative/output"}]);
     assert_eq!(manager.handle("alice", request)["code"], "invalid_launch");
     assert!(!marker.exists());
     assert_eq!(

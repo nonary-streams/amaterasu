@@ -131,10 +131,39 @@ pub(crate) struct DetachedChild {
 }
 
 impl DetachedChild {
+    pub fn output_redirection_supported(_elevated: bool) -> io::Result<bool> {
+        Ok(true)
+    }
+
     pub fn spawn(command: &mut Command, _elevated: bool) -> io::Result<Self> {
         Ok(Self {
             child: command.spawn()?,
         })
+    }
+
+    pub fn spawn_with_output(
+        command: &mut Command,
+        elevated: bool,
+        stdout: Option<&str>,
+        stderr: Option<&str>,
+    ) -> io::Result<Self> {
+        if let Some(path) = stdout {
+            command.stdout(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            );
+        }
+        if let Some(path) = stderr {
+            command.stderr(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            );
+        }
+        Self::spawn(command, elevated)
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {

@@ -65,6 +65,10 @@ pub(crate) struct DetachedChild {
 }
 
 impl DetachedChild {
+    pub fn output_redirection_supported(elevated: bool) -> io::Result<bool> {
+        Ok(active_user_token_for_system_host(elevated)?.is_none())
+    }
+
     pub fn spawn(command: &mut Command, elevated: bool) -> io::Result<Self> {
         let user_token = active_user_token_for_system_host(elevated)?;
         let process = if let Some(token) = user_token.as_ref() {
@@ -75,6 +79,42 @@ impl DetachedChild {
         } else {
             ProcessHandle::Standard(command.spawn()?)
         };
+        Ok(Self { process })
+    }
+
+    pub fn spawn_with_output(
+        command: &mut Command,
+        elevated: bool,
+        stdout: Option<&str>,
+        stderr: Option<&str>,
+    ) -> io::Result<Self> {
+        if stdout.is_none() && stderr.is_none() {
+            return Self::spawn(command, elevated);
+        }
+        let user_token = active_user_token_for_system_host(elevated)?;
+        if user_token.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "detached output requires an interactive-user broker on a SYSTEM host",
+            ));
+        }
+        if let Some(path) = stdout {
+            command.stdout(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            );
+        }
+        if let Some(path) = stderr {
+            command.stderr(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            );
+        }
+        let process = ProcessHandle::Standard(command.spawn()?);
         Ok(Self { process })
     }
 

@@ -197,7 +197,12 @@ impl ProcessRecord {
 
             // The source treats these as best-effort launchers. Their spawn
             // failure must not prevent the primary application from starting.
-            if let Ok(child) = DetachedChild::spawn(&mut command, self.spec.elevated) {
+            if let Ok(child) = DetachedChild::spawn_with_output(
+                &mut command,
+                self.spec.elevated,
+                detached.stdout.as_deref(),
+                detached.stderr.as_deref(),
+            ) {
                 self.detached_children.push(child);
             }
         }
@@ -780,6 +785,19 @@ impl ProcessManager {
                     preparation: preparation.into_vec(),
                 };
                 spec.validate(&operation_id).map_err(|_| "invalid_launch")?;
+                if spec
+                    .detached
+                    .iter()
+                    .any(|command| command.stdout.is_some() || command.stderr.is_some())
+                    && !self
+                        .records
+                        .values()
+                        .any(|record| record.owner == caller && record.operation_id == operation_id)
+                    && !DetachedChild::output_redirection_supported(spec.elevated)
+                        .map_err(|_| "detached_output_unavailable")?
+                {
+                    return Err("detached_output_unsupported");
+                }
                 self.launch(caller, operation_id, spec, detached_requests)
             }
             Action::Lookup { operation_id } => {

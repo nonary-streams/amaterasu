@@ -28,7 +28,7 @@ after `wait_all` is satisfied. A zero exit timeout skips graceful shutdown.
 Detached command strings use platform argv quoting, run best-effort before the
 primary executable, and are not attached to its process group or termination
 lifecycle. They inherit the app's explicit environment and working directory.
-The typed form accepts `{"command":"...","environment":{"NAME":"value"},"cwd":"/absolute/path"}`;
+The typed form accepts `{"command":"...","environment":{"NAME":"value"},"cwd":"/absolute/path","stdout":"/absolute/out.log","stderr":"/absolute/err.log"}`;
 `working_directory` is an alias for `cwd`. The per-command environment overlays
 the launch environment for that detached process only; its cwd overrides the
 launch cwd. The primary process and other detached commands keep their own
@@ -39,9 +39,18 @@ produce an empty string. Other dollar text remains literal, and an unclosed
 `$(...)` reference is invalid. Expansion is bounded and is not shell evaluation:
 the expanded string still goes through the host platform's argv parser and
 existing count, length, and argument limits. All overrides are validated before
-any command starts. Detached commands have no output redirection or independent elevation
-field; they receive the same launch-level `elevated` flag as the primary
-application. A detached-command spawn failure does not fail the main launch.
+any command starts. Optional stdout/stderr paths append child output without a
+shell; omitted streams remain null. Each detached command opens only its own
+files, so sibling and primary output stay separate. A Windows SYSTEM host
+rejects redirected launches with `detached_output_unsupported` before any child
+starts. Its `CreateProcessAsUserW` path cannot safely pass output handles across
+sessions, and temporary inheritable handles could leak to concurrent host
+spawns. Supporting that host requires a broker running as the selected user.
+Failure to obtain the active-user token returns `detached_output_unavailable`.
+A file-open or detached-command spawn failure remains best-effort and does not
+fail the main launch. Detached
+commands have no independent elevation field; they receive the same launch-level
+`elevated` flag as the primary application.
 
 Launch may also contain up to eight ordered preparation steps:
 
@@ -154,7 +163,7 @@ yields `operation_conflict`. Defaulted empty args/environment/preparation/detach
 list, policy defaults, and absent/null cwd are normalized before comparison;
 legacy detached strings and typed objects with empty overrides have the same
 retry identity; `working_directory` and `cwd` also normalize to the same value.
-Changing a detached override conflicts with the original operation. Host
+Changing a detached override or output path conflicts with the original operation. Host
 environment references resolved for the original request are retained on retry;
 paths are not canonicalized. Retries never
 rerun completed preparation or undo, and repeated termination of a terminal
@@ -176,7 +185,8 @@ Limits, measured in UTF-8 bytes unless otherwise stated:
   2,048 printable bytes, with up to 64 parsed arguments and 8,192 argument
   bytes combined. Each typed environment and its merged launch environment
   must each stay within the launch environment bounds; each typed cwd must be
-  an absolute path of 1–1,024 bytes.
+  an absolute path of 1–1,024 bytes. Each optional output path must also be
+  absolute, 1–1,024 bytes, and free of control characters.
 - Args: at most 64, each at most 1,024 bytes, 8,192 bytes combined, no NUL.
 - Environment: at most 32 keys, keys of 1–128 ASCII alphanumeric/underscore
   bytes, values at most 1,024 bytes without NUL, 4,096 key/value bytes combined.
@@ -188,6 +198,7 @@ Limits, measured in UTF-8 bytes unless otherwise stated:
 
 Errors use `{"ok":false,"code":"..."}`. Codes are `invalid_caller`,
 `request_too_large`, `invalid_request`, `invalid_launch`, `invalid_limit`,
+`detached_output_unsupported`, `detached_output_unavailable`,
 `operation_conflict`, `process_limit`, `process_not_found`, `process_wait_failed`,
 `process_kill_failed`, and `process_wait_timeout`. Missing and foreign process IDs share
 `process_not_found`. OS spawning errors create retained `launch_failed` records.
@@ -246,8 +257,8 @@ and [Toolhelp snapshots](https://learn.microsoft.com/en-us/windows/win32/toolhel
 
 Vibeshine's `docs/app_examples.md` was used only as a behavioral reference for
 application launch and working-directory requirements. Source was not copied.
-Detached launchers are a bounded argv-only subset: output handling and
-per-command elevation remain parity gaps. Desktop pseudo-apps, URI
+Detached launchers are a bounded argv-only subset: per-command elevation and
+output capture or rotation remain parity gaps. Desktop pseudo-apps, URI
 launch, and launcher-specific behavior also remain unimplemented.
 
 Tests invoke a controlled Rust test subprocess to verify actual launch, natural

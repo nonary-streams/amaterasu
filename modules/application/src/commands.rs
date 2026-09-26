@@ -16,6 +16,8 @@ pub(crate) struct DetachedCommand {
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
     pub cwd: Option<String>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -33,6 +35,10 @@ pub(crate) struct DetachedCommandRequest {
     pub environment: BTreeMap<String, String>,
     #[serde(default, alias = "working_directory")]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub stdout: Option<String>,
+    #[serde(default)]
+    pub stderr: Option<String>,
 }
 
 impl From<DetachedCommandInput> for DetachedCommandRequest {
@@ -42,6 +48,8 @@ impl From<DetachedCommandInput> for DetachedCommandRequest {
                 command,
                 environment: BTreeMap::new(),
                 cwd: None,
+                stdout: None,
+                stderr: None,
             },
             DetachedCommandInput::Typed(request) => request,
         }
@@ -71,6 +79,18 @@ pub(crate) fn prepare_detached_requests(
             }) {
                 return Err("detached cwd must be an absolute path");
             }
+            if [request.stdout.as_deref(), request.stderr.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|path| {
+                    path.is_empty()
+                        || path.len() > 1024
+                        || path.chars().any(char::is_control)
+                        || !CommandPath::new(path).is_absolute()
+                })
+            {
+                return Err("detached output must be an absolute path");
+            }
             let expanded =
                 expand_environment_references(&request.command, &request.environment, &|name| {
                     environment_reference_value(name, launch_environment, host_environment_lookup)
@@ -86,6 +106,8 @@ pub(crate) fn prepare_detached_requests(
             }
             validate_environment(&command.environment)?;
             command.cwd = request.cwd.clone();
+            command.stdout = request.stdout.clone();
+            command.stderr = request.stderr.clone();
             Ok(command)
         })
         .collect()
@@ -115,6 +137,8 @@ pub(crate) fn parse_detached_commands(
                 args: arguments,
                 environment: BTreeMap::new(),
                 cwd: None,
+                stdout: None,
+                stderr: None,
             })
         })
         .collect()
@@ -346,6 +370,8 @@ mod tests {
             command: "tool \"$(OVERRIDE)\" \"$(LAUNCH)\" \"$(HOST)\"".into(),
             environment: BTreeMap::from([("OVERRIDE".into(), "command value".into())]),
             cwd: None,
+            stdout: None,
+            stderr: None,
         }];
         let commands = prepare_detached_requests(&requests, &launch, &|name| {
             (name == "HOST").then(|| "host only".into())
