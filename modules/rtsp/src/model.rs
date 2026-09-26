@@ -925,7 +925,10 @@ fn valid_display_request(request: &serde_json::Value) -> bool {
         let id = policy.display_id.to_ascii_lowercase();
         if !targets.contains(&id)
             || !policy_targets.insert(id)
-            || (fields.get("mode_policies").is_some() && policy.configuration_option.is_some())
+            || (fields.get("mode_policies").is_some() && raw.get("configuration_option").is_some())
+            || (targets.len() > 1
+                && fields.get("mode_policy").is_some()
+                && policy.configuration_option.is_none())
             || policy
                 .resolution_option
                 .as_deref()
@@ -1303,7 +1306,12 @@ mod tests {
                 Err("display_request_unattested")
             );
         }
-        for invalid in [json!("ensure_everything"), json!("Ensure_Active"), json!(7)] {
+        for invalid in [
+            Value::Null,
+            json!("ensure_everything"),
+            json!("Ensure_Active"),
+            json!(7),
+        ] {
             let mut malformed = input.clone();
             malformed["display_request"]["mode_policies"][0]["configuration_option"] = invalid;
             let malformed: Open = serde_json::from_value(malformed).unwrap();
@@ -1392,6 +1400,19 @@ mod tests {
         invalid["display_request"]["mode_policy"]["display_id"] = json!("missing");
         let invalid: Open = serde_json::from_value(invalid).unwrap();
         assert_eq!(invalid.validate(false), Err("display_request_unattested"));
+        for missing in [None, Some(Value::Null)] {
+            let mut invalid = input.clone();
+            if let Some(value) = missing {
+                invalid["display_request"]["mode_policy"]["configuration_option"] = value;
+            } else {
+                invalid["display_request"]["mode_policy"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("configuration_option");
+            }
+            let invalid: Open = serde_json::from_value(invalid).unwrap();
+            assert_eq!(invalid.validate(false), Err("display_request_unattested"));
+        }
         for option in [
             "disabled",
             "verify_only",
