@@ -294,7 +294,7 @@ test("history editor confirms exact signed revision and settings readback", asyn
   const saved = { ...current, revision: 5, settings: { enabled: false, ttl_days: 14, db_size_limit_mb: 20 }, effective_enabled: true };
   const api = { async post(route, body) {
     calls.push([route, ordinary(body ?? {})]);
-    return route === "history/settings_get" ? saved : { ok: true };
+    return saved;
   } };
   assert.deepEqual(ordinary(await context.Amaterasu.saveHistorySettings(api, current, false, 14, 20)), saved);
   assert.deepEqual(calls, [
@@ -302,9 +302,48 @@ test("history editor confirms exact signed revision and settings readback", asyn
     ["history/settings_get", {}],
   ]);
   for (const stale of [current, { ...saved, revision: 6 }, { ...saved, settings: { ...saved.settings, ttl_days: 15 } }]) {
-    const staleApi = { async post(route) { return route === "history/settings_get" ? stale : { ok: true }; } };
+    const staleApi = { async post(route) { return route === "history/settings_get" ? stale : saved; } };
     await assert.rejects(context.Amaterasu.saveHistorySettings(staleApi, current, false, 14, 20), /could not be confirmed/);
   }
+  for (const rejected of [
+    { ok: false, code: "revision_conflict", revision: 5 },
+    { ok: false, code: "write_unresolved" },
+    { ...saved, revision: 6 },
+    { ...saved, settings: { ...saved.settings, ttl_days: 15 } },
+  ]) {
+    const routes = [];
+    const rejectedApi = { async post(route) {
+      routes.push(route);
+      return rejected;
+    } };
+    await assert.rejects(context.Amaterasu.saveHistorySettings(rejectedApi, current, false, 14, 20));
+    assert.deepEqual(routes, ["history/settings_update"]);
+  }
+});
+
+test("history editor ignores stale loads and errors after a newer load or save begins", async () => {
+  const gate = new context.Amaterasu.HistorySettingsLoadGate();
+  const replies = [];
+  const api = { post(route) {
+    assert.equal(route, "history/settings_get");
+    return new Promise((resolve, reject) => replies.push({ resolve, reject }));
+  } };
+  const old = gate.read(api);
+  const latest = gate.read(api);
+  const current = { ok: true, revision: 8, settings: { enabled: true, ttl_days: 14, db_size_limit_mb: 20 }, effective_enabled: true };
+  replies[1].resolve(current);
+  assert.equal((await latest).settings.revision, 8);
+  replies[0].resolve({ ...current, revision: 7 });
+  assert.equal(await old, null);
+
+  const duringSave = gate.read(api);
+  gate.invalidate();
+  replies[2].reject(new Error("outdated request failed"));
+  assert.equal(await duringSave, null);
+
+  const reloaded = gate.read(api);
+  replies[3].resolve({ ...current, revision: 9 });
+  assert.equal((await reloaded).settings.revision, 9);
 });
 
 test("history editor confirms durable save and separately reads signed runtime on save and reload", async () => {
@@ -325,7 +364,7 @@ test("history editor confirms durable save and separately reads signed runtime o
       assert.equal(body.expected_revision, stored.revision);
       stored = { ...stored, revision: stored.revision + 1, settings: body.settings, effective_enabled: false };
       runtime = { ...runtime, status: { ...runtime.status, enabled: true } };
-      return { ok: true };
+      return stored;
     }
     return route === "history/settings_get" ? stored : runtime;
   } };

@@ -89,10 +89,19 @@ namespace Amaterasu {
     sizeLimitMb: number,
   ): Promise<HistorySettingsReply> {
     const settings = parseHistorySettings(enabled, ttlDays, sizeLimitMb);
-    await api.post("history/settings_update", {
+    const updateReply = await api.post<unknown>("history/settings_update", {
       settings,
       expected_revision: current.revision,
     });
+    if (updateReply && typeof updateReply === "object" &&
+        (updateReply as Record<string, unknown>).code === "revision_conflict")
+      throw new Error("Session history settings changed in another editor. Refresh and try again.");
+    const updated = parseHistorySettingsReply(updateReply);
+    if (updated.revision !== current.revision + 1 ||
+        updated.settings.enabled !== settings.enabled ||
+        updated.settings.ttl_days !== settings.ttl_days ||
+        updated.settings.db_size_limit_mb !== settings.db_size_limit_mb)
+      throw new Error("Session history update did not confirm the requested settings. Refresh and check the current values.");
     const saved = parseHistorySettingsReply(await api.post<unknown>("history/settings_get"));
     if (saved.revision !== current.revision + 1 ||
         saved.settings.enabled !== settings.enabled ||
@@ -107,6 +116,28 @@ namespace Amaterasu {
   ): Promise<{ settings: HistorySettingsReply; runtime: HistoryRuntimeStatus | null }> {
     const settings = parseHistorySettingsReply(await api.post<unknown>("history/settings_get"));
     return { settings, runtime: await readHistoryRuntime(api) };
+  }
+
+  export class HistorySettingsLoadGate {
+    private generation = 0;
+
+    invalidate(): void {
+      this.generation += 1;
+    }
+
+    async read(api: Pick<Api, "post">): Promise<{
+      settings: HistorySettingsReply;
+      runtime: HistoryRuntimeStatus | null;
+    } | null> {
+      const generation = ++this.generation;
+      try {
+        const state = await readHistorySettingsState(api);
+        return generation === this.generation ? state : null;
+      } catch (error) {
+        if (generation !== this.generation) return null;
+        throw error;
+      }
+    }
   }
 
   async function readHistoryRuntime(api: Pick<Api, "post">): Promise<HistoryRuntimeStatus | null> {
@@ -953,6 +984,7 @@ namespace Amaterasu {
     const playniteArea = el("div");
     const inputArea = el("div");
     const historyArea = el("div");
+    const historyLoads = new HistorySettingsLoadGate();
     const pairingArea = el("div");
     context.content.append(
       sectionHeading(
@@ -1893,7 +1925,9 @@ namespace Amaterasu {
     async function loadHistorySettings(): Promise<void> {
       historyArea.replaceChildren(el("p", "muted", "Loading session history settings…"));
       try {
-        const { settings: reply, runtime } = await readHistorySettingsState(context.api);
+        const state = await historyLoads.read(context.api);
+        if (state === null) return;
+        const { settings: reply, runtime } = state;
         if (!context.content.isConnected) return;
         const form = el("form", "settings-form");
         const enabled = input("session_history_enabled", "", "checkbox");
@@ -1952,6 +1986,7 @@ namespace Amaterasu {
         form.addEventListener("submit", (event) => {
           event.preventDefault();
           void runAction(save, status, async () => {
+            historyLoads.invalidate();
             const updated = await saveHistorySettingsState(
               context.api,
               reply,
