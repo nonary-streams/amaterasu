@@ -502,6 +502,45 @@ fn approved_product_cannot_import_two_distinct_credential_roots() {
 }
 
 #[test]
+fn two_approved_products_cannot_seed_one_authentication_namespace() {
+    let fixture = TemporaryDirectory::new();
+    let sources: Vec<_> = [LegacyProduct::Sunshine, LegacyProduct::Vibeshine]
+        .into_iter()
+        .map(|product| {
+            let root = fixture.path().join(product.directory_name());
+            write(
+                &root.join("sunshine.conf"),
+                b"credentials_file = credentials/login.json\n",
+            );
+            write(
+                &root.join("credentials/login.json"),
+                br#"{"username":"admin","password":"verifier","salt":"salt"}"#,
+            );
+            source(product, &root)
+        })
+        .collect();
+    let approved: Vec<_> = sources
+        .iter()
+        .map(|source| ValidatedSensitiveSource {
+            product: source.product,
+            pairing: false,
+            authentication: true,
+        })
+        .collect();
+    let destination = fixture.path().join("Amaterasu");
+
+    assert!(preflight_legacy_configuration_with_sensitive_sources(&sources, &approved).is_err());
+    assert!(
+        import_legacy_configuration_with_sensitive_sources(&destination, &sources, &approved)
+            .is_err()
+    );
+    assert!(
+        !destination.exists(),
+        "failed preflight created import files"
+    );
+}
+
+#[test]
 fn empty_credentials_file_inherits_configured_file_state() {
     let fixture = TemporaryDirectory::new();
     let predecessor = fixture.path().join("Sunshine");
@@ -1113,6 +1152,58 @@ fn custom_configured_auxiliary_state_keeps_legacy_api_tokens_blocking() {
             }],
         )
         .is_err()
+    );
+}
+
+#[test]
+fn auxiliary_state_login_fields_do_not_request_authentication_approval() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Vibeshine");
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"vibeshine_file_state = private/web-record.json\n",
+    );
+    write(
+        &predecessor.join("private/web-record.json"),
+        br#"{"username":"auxiliary","password":"verifier","salt":"salt","root":{"api_tokens":[]}}"#,
+    );
+
+    let legacy_source = source(LegacyProduct::Vibeshine, &predecessor);
+    let plan = analyze_legacy_configuration(&[legacy_source]).unwrap();
+    assert!(
+        plan.critical_items
+            .iter()
+            .any(|item| item.item == "pairing_identity_state")
+    );
+    assert!(
+        !plan
+            .critical_items
+            .iter()
+            .any(|item| item.item == "legacy_administrator_credential")
+    );
+}
+
+#[test]
+fn default_auxiliary_state_login_fields_do_not_request_authentication_approval() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Vibeshine");
+    write(
+        &predecessor.join("vibeshine_state.json"),
+        br#"{"username":"auxiliary","password":"verifier","salt":"salt","root":{"api_tokens":[]}}"#,
+    );
+
+    let plan =
+        analyze_legacy_configuration(&[source(LegacyProduct::Vibeshine, &predecessor)]).unwrap();
+    assert!(
+        plan.critical_items
+            .iter()
+            .any(|item| item.item == "pairing_identity_state")
+    );
+    assert!(
+        !plan
+            .critical_items
+            .iter()
+            .any(|item| item.item == "legacy_administrator_credential")
     );
 }
 

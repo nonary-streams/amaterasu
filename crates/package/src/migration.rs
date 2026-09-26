@@ -155,6 +155,7 @@ struct CollectedConfigurationFiles {
     files: Vec<PathBuf>,
     copy_sources: BTreeMap<PathBuf, PathBuf>,
     configured_state_files: BTreeSet<PathBuf>,
+    auxiliary_state_files: BTreeSet<PathBuf>,
     configured_authentication_files: BTreeSet<PathBuf>,
 }
 
@@ -258,6 +259,7 @@ pub fn analyze_legacy_configuration(sources: &[LegacyConfigSource]) -> PackageRe
                 source.product,
                 &source.root.join(relative),
                 collected.configured_state_files.contains(relative),
+                collected.auxiliary_state_files.contains(relative),
                 collected.configured_authentication_files.contains(relative),
                 &mut plan,
             )?;
@@ -340,7 +342,11 @@ pub fn preflight_legacy_configuration_with_sensitive_sources(
 }
 
 fn reject_ambiguous_sensitive_sources(sources: &[LegacyConfigSource]) -> PackageResult<()> {
-    let mut counts = BTreeMap::<LegacyProduct, (usize, usize)>::new();
+    // Every predecessor family seeds the same destination pairing and
+    // authentication namespaces. A second source would silently keep the
+    // first seed while allowing handoff of both predecessors.
+    let mut pairing_sources = 0;
+    let mut authentication_sources = 0;
     for source in sources {
         let plan = analyze_legacy_configuration(std::slice::from_ref(source))?;
         let pairing = plan.critical_items.iter().any(|item| {
@@ -355,10 +361,9 @@ fn reject_ambiguous_sensitive_sources(sources: &[LegacyConfigSource]) -> Package
                 "credentials_file" | "legacy_administrator_credential"
             )
         });
-        let counts = counts.entry(source.product).or_default();
-        counts.0 += usize::from(pairing);
-        counts.1 += usize::from(authentication);
-        if counts.0 > 1 || counts.1 > 1 {
+        pairing_sources += usize::from(pairing);
+        authentication_sources += usize::from(authentication);
+        if pairing_sources > 1 || authentication_sources > 1 {
             return Err(
                 "multiple sensitive predecessor sources cannot share one destination".into(),
             );
@@ -467,6 +472,7 @@ fn analyze_source_file(
     product: LegacyProduct,
     path: &Path,
     is_configured_state_file: bool,
+    is_auxiliary_state_file: bool,
     is_configured_authentication_file: bool,
     plan: &mut ImportPlan,
 ) -> PackageResult<()> {
@@ -481,7 +487,15 @@ fn analyze_source_file(
             product,
             item: "pairing_identity_state".into(),
         });
-        classify_legacy_state_credentials(product, path, plan)?;
+        classify_legacy_state_credentials(
+            product,
+            path,
+            is_configured_authentication_file
+                || (!is_auxiliary_state_file
+                    && (is_configured_state_file
+                        || !matches!(filename, "vibeshine_state.json" | "vibepollo_state.json"))),
+            plan,
+        )?;
     }
     if filename == "apps.json" {
         return analyze_applications(product, path, plan);
@@ -513,15 +527,17 @@ fn analyze_source_file(
 fn classify_legacy_state_credentials(
     product: LegacyProduct,
     path: &Path,
+    is_authentication_candidate: bool,
     plan: &mut ImportPlan,
 ) -> PackageResult<()> {
     let value: serde_json::Value = match serde_json::from_slice(&read_configuration_file(path)?) {
         Ok(value) => value,
         Err(_) => return Ok(()),
     };
-    if ["username", "password", "salt"]
-        .iter()
-        .all(|key| value.get(key).is_some_and(serde_json::Value::is_string))
+    if is_authentication_candidate
+        && ["username", "password", "salt"]
+            .iter()
+            .all(|key| value.get(key).is_some_and(serde_json::Value::is_string))
     {
         plan.critical_items.push(PlanItem {
             product,
@@ -810,6 +826,7 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<CollectedCon
     let mut files = Vec::new();
     let mut copy_sources = BTreeMap::new();
     let mut configured_state_files = BTreeSet::new();
+    let mut auxiliary_state_files = BTreeSet::new();
     let mut configured_authentication_files = BTreeSet::new();
     for name in CONFIGURATION_FILES {
         let path = root.join(name);
@@ -828,6 +845,7 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<CollectedCon
         root,
         &mut files,
         &mut configured_state_files,
+        &mut auxiliary_state_files,
         &mut copy_sources,
     )?;
     for name in CONFIGURATION_DIRECTORIES {
@@ -841,6 +859,7 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<CollectedCon
         &mut files,
         &mut copy_sources,
         &mut configured_state_files,
+        &mut auxiliary_state_files,
         &mut configured_authentication_files,
     )?;
     files.sort();
@@ -848,6 +867,7 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<CollectedCon
         files,
         copy_sources,
         configured_state_files,
+        auxiliary_state_files,
         configured_authentication_files,
     }))
 }
@@ -959,6 +979,7 @@ fn collect_configured_state_files(
     root: &Path,
     files: &mut Vec<PathBuf>,
     configured_state_files: &mut BTreeSet<PathBuf>,
+    auxiliary_state_files: &mut BTreeSet<PathBuf>,
     copy_sources: &mut BTreeMap<PathBuf, PathBuf>,
 ) -> PackageResult<()> {
     let canonical_root = root.canonicalize().map_err(io_error)?;
@@ -1013,7 +1034,7 @@ fn collect_configured_state_files(
             }
             if previous.is_none() {
                 configured.insert(
-                    key,
+                    key.clone(),
                     ConfiguredStatePath {
                         relative: relative.to_path_buf(),
                         canonical_file: canonical_file.clone(),
@@ -1026,11 +1047,19 @@ fn collect_configured_state_files(
             };
             let copied = relative.to_path_buf();
             configured_state_files.insert(copied.clone());
+            if key == "vibeshine_file_state" {
+                auxiliary_state_files.insert(copied.clone());
+            }
             copy_sources.insert(copied.clone(), canonical);
             if !files.contains(&copied) {
                 files.push(copied);
             }
         }
+    }
+    if let Some(primary) = configured.get("file_state")
+        && let Some(primary_path) = &primary.canonical_file
+    {
+        auxiliary_state_files.retain(|relative| copy_sources.get(relative) != Some(primary_path));
     }
     Ok(())
 }
@@ -1136,6 +1165,7 @@ fn deduplicate_collected_paths(
     files: &mut Vec<PathBuf>,
     copy_sources: &mut BTreeMap<PathBuf, PathBuf>,
     configured_state_files: &mut BTreeSet<PathBuf>,
+    auxiliary_state_files: &mut BTreeSet<PathBuf>,
     configured_authentication_files: &mut BTreeSet<PathBuf>,
 ) -> PackageResult<()> {
     let mut path_by_identity = BTreeMap::<PathBuf, PathBuf>::new();
@@ -1150,6 +1180,9 @@ fn deduplicate_collected_paths(
             }
             if configured_state_files.remove(&relative) {
                 configured_state_files.insert(existing_relative.clone());
+            }
+            if auxiliary_state_files.remove(&relative) {
+                auxiliary_state_files.insert(existing_relative.clone());
             }
             if configured_authentication_files.remove(&relative) {
                 configured_authentication_files.insert(existing_relative.clone());

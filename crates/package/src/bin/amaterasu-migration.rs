@@ -176,11 +176,31 @@ fn run() -> Result<(), String> {
                 &validation.approvals,
             )?;
             if let Some(runtime) = runtime {
-                let materialized = finish_materialization(&receipt, || {
-                    materialize_import_plan(&runtime, &receipt.plan)
+                let (materialized, copied_validation) = finish_materialization(&receipt, || {
+                    let copied_products: BTreeSet<_> =
+                        sources.iter().map(|source| source.product).collect();
+                    let copied_sources: Vec<_> = copied_products
+                        .into_iter()
+                        .map(|product| LegacyConfigSource {
+                            product,
+                            root: destination
+                                .join(amaterasu_package::migration::LEGACY_IMPORT_DIRECTORY)
+                                .join(product.directory_name()),
+                        })
+                        .collect();
+                    let copied_validation = validate_sensitive_sources(&copied_sources)?;
+                    let copied_plan = preflight_legacy_configuration_with_sensitive_sources(
+                        &copied_sources,
+                        &copied_validation.approvals,
+                    )?;
+                    if copied_plan != receipt.plan {
+                        return Err("predecessor configuration changed while being imported".into());
+                    }
+                    let materialized = materialize_import_plan(&runtime, &receipt.plan)?;
+                    Ok((materialized, copied_validation))
                 })?;
                 let state = runtime_state_directory(&runtime)?;
-                seed_sensitive_sources(&destination, &validation, &state)?;
+                seed_sensitive_sources(&destination, &copied_validation, &state)?;
                 write_import_validation(&runtime, &sources)?;
                 println!(
                     "migration runtime state materialized: {} application(s), {} setting(s)",

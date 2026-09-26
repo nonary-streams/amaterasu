@@ -88,6 +88,39 @@ fn credential_import_seeds_runtime_and_failed_retry_revokes_handoff_approval() {
         seeded.exists(),
         "failed retry removed the durable auth seed"
     );
+
+    write_credential(&credential, &"0123456789abcdef".repeat(4));
+    let second_source = root.join("second-predecessor");
+    let second_credential = second_source.join("credentials/login.json");
+    fs::create_dir_all(second_credential.parent().unwrap()).unwrap();
+    fs::write(
+        second_source.join("vibeshine.conf"),
+        "credentials_file = credentials/login.json\n",
+    )
+    .unwrap();
+    write_credential(&second_credential, &"fedcba9876543210".repeat(4));
+    let ambiguous_destination = root.join("ambiguous-data");
+    let ambiguous_runtime = root.join("ambiguous-runtime");
+    fs::create_dir_all(&ambiguous_runtime).unwrap();
+    let ambiguous = Command::new(&migration)
+        .args(["import", "--destination"])
+        .arg(&ambiguous_destination)
+        .arg("--runtime")
+        .arg(&ambiguous_runtime)
+        .arg("--source")
+        .arg(format!("sunshine={}", source.display()))
+        .arg("--source")
+        .arg(format!("vibeshine={}", second_source.display()))
+        .output()
+        .unwrap();
+    assert!(!ambiguous.status.success(), "two credentials were accepted");
+    assert!(!ambiguous_destination.exists());
+    assert!(!authentication_namespace(&ambiguous_runtime).exists());
+    assert!(
+        !ambiguous_runtime
+            .join("installer-import-validated.json")
+            .exists()
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -162,6 +195,26 @@ fn failed_process_import_rolls_back_all_configured_files_and_retry_seeds_credent
     let first_hash = "0123456789abcdef".repeat(4);
     let corrected_hash = "fedcba9876543210".repeat(4);
     write_credential(&credential, &first_hash);
+
+    // Even a valid login must not be seeded when the auxiliary state contains
+    // an unsupported token. Preflight must leave both import and runtime clean.
+    fs::write(
+        source.join("private/auxiliary.json"),
+        br#"{"root":{"api_tokens":[{"token":"unsupported"}]}}"#,
+    )
+    .unwrap();
+    let unsupported = import(&migration, &source, &destination, &runtime);
+    assert!(
+        !unsupported.status.success(),
+        "unsupported token was accepted"
+    );
+    assert!(
+        !destination.exists(),
+        "failed preflight copied predecessor files"
+    );
+    assert!(!authentication_namespace(&runtime).exists());
+    assert!(!runtime.join("installer-import-validated.json").exists());
+    fs::write(source.join("private/auxiliary.json"), auxiliary_bytes).unwrap();
 
     // Another Amaterasu configuration occupies the target. The failed process
     // must remove its new archive files before the installer can retry.
