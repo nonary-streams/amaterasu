@@ -276,8 +276,11 @@ fn run_capture_loop<F>(
                 set_recovering(health, true);
                 continuity.begin_recovery();
                 drop(capture);
-                let mut retry_immediately = error == "default_endpoint_changed";
+                let mut retry_immediately = true;
                 loop {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     if !retry_immediately && !wait_for_retry(stop, recovery_policy.retry_delay) {
                         return;
                     }
@@ -305,6 +308,10 @@ fn run_capture_loop<F>(
                             fail(health, error);
                             return;
                         }
+                        Err(error) if permanent_reopen_error(error) => {
+                            fail(health, error);
+                            return;
+                        }
                         Err(_) if stop.load(Ordering::Acquire) => return,
                         Err(_) => {}
                     }
@@ -316,6 +323,18 @@ fn run_capture_loop<F>(
             }
         }
     }
+}
+
+fn permanent_reopen_error(error: &str) -> bool {
+    matches!(
+        error,
+        "invalid_endpoint"
+            | "not_render_endpoint"
+            | "invalid_channel_layout"
+            | "unsupported_channel_layout"
+            | "unsupported_format"
+            | "virtual_sink_format_unavailable"
+    )
 }
 
 fn wait_for_retry(stop: &AtomicBool, delay: Duration) -> bool {
@@ -514,6 +533,50 @@ mod tests {
     }
 
     #[test]
+    fn device_loss_reopens_immediately_before_retry_backoff() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let initial = FakeCapture::new(format, [Err("device_lost")]);
+        let (sender, packets) = mpsc::sync_channel(1);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runner = thread::spawn({
+            let health = health.clone();
+            let stop = stop.clone();
+            let attempts = attempts.clone();
+            move || {
+                run_capture_loop(
+                    Box::new(initial),
+                    move || {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok(Box::new(FakeCapture::new(format, [Ok(Some(packet(0, 0)))]))
+                            as Box<dyn CaptureDevice>)
+                    },
+                    &sender,
+                    &health,
+                    &stop,
+                    RecoveryPolicy {
+                        expected_endpoint: "render.fixed".into(),
+                        expected_format: format,
+                        follow_console_default: false,
+                        retry_delay: Duration::from_secs(30),
+                    },
+                );
+            }
+        });
+
+        let recovered = packets.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop.store(true, Ordering::Release);
+        runner.thread().unpark();
+        runner.join().unwrap();
+
+        assert_eq!(recovered.sequence, 0);
+        assert_ne!(recovered.flags & AUDIO_DISCONTINUITY, 0);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(!health.lock().unwrap().recovering);
+    }
+
+    #[test]
     fn recovery_wait_is_promptly_cancelled_by_shutdown() {
         let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
         let initial = FakeCapture::new(format, [Err("device_lost")]);
@@ -546,14 +609,16 @@ mod tests {
         });
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !health.lock().unwrap().recovering && Instant::now() < deadline {
+        while (!health.lock().unwrap().recovering || attempts.load(Ordering::SeqCst) == 0)
+            && Instant::now() < deadline
+        {
             thread::yield_now();
         }
         assert!(health.lock().unwrap().recovering);
         stop.store(true, Ordering::Release);
         runner.thread().unpark();
         runner.join().unwrap();
-        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -637,6 +702,35 @@ mod tests {
         );
         let health = health.lock().unwrap();
         assert_eq!(health.failure, Some("audio_format_changed"));
+        assert!(!health.recovering);
+    }
+
+    #[test]
+    fn unsupported_reopened_format_fails_instead_of_retrying_forever() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let initial = FakeCapture::new(format, [Err("device_lost")]);
+        let (sender, _packets) = mpsc::sync_channel(1);
+        let health = Mutex::new(Health::default());
+        let attempts = AtomicUsize::new(0);
+        run_capture_loop(
+            Box::new(initial),
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err("unsupported_format")
+            },
+            &sender,
+            &health,
+            &AtomicBool::new(false),
+            RecoveryPolicy {
+                expected_endpoint: "render.fixed".into(),
+                expected_format: format,
+                follow_console_default: false,
+                retry_delay: Duration::from_secs(30),
+            },
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let health = health.lock().unwrap();
+        assert_eq!(health.failure, Some("unsupported_format"));
         assert!(!health.recovering);
     }
 
