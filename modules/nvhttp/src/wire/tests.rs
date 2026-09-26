@@ -114,6 +114,7 @@ impl Broker {
                             "failure": null,
                             "cleanup_error": null,
                             "frame_limiter_settings":payload["frame_limiter_settings"],
+                            "catalog_revision": 0,
                             "config_overrides": {
                                 "fec_percentage": 37,
                                 "stream_audio": true,

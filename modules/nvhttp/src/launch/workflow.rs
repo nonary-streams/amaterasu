@@ -290,10 +290,11 @@ impl Controller {
         let record = self.records.get_mut(&job.record).expect("workflow record");
         match job.phase {
             Phase::PreflightApplication => match application_preflight_response(record, &payload) {
-                Ok((token, application_overrides, executable_path))
+                Ok((token, catalog_revision, application_overrides, executable_path))
                     if record.state == State::Starting =>
                 {
                     record.application_preflight_token = Some(token);
+                    record.application_catalog_revision = Some(catalog_revision);
                     record.executable_path = executable_path;
                     record.application_frame_limiter_settings =
                         application_overrides.frame_limiter_settings();
@@ -314,6 +315,13 @@ impl Controller {
                                     != Some(&application_overrides)
                                 {
                                     fail_record(record, "application_policy_mismatch", now);
+                                    self.finish_or_retain(job.record, now, replies);
+                                    return;
+                                }
+                                if payload["launch"]["catalog_revision"].as_u64()
+                                    != record.application_catalog_revision
+                                {
+                                    fail_record(record, "application_revision_mismatch", now);
                                     self.finish_or_retain(job.record, now, replies);
                                     return;
                                 }
@@ -862,7 +870,7 @@ pub(super) fn application_config_overrides(
 fn application_preflight_response(
     record: &Record,
     payload: &Value,
-) -> Result<(String, ApplicationConfigOverrides, Option<String>), &'static str> {
+) -> Result<(String, u64, ApplicationConfigOverrides, Option<String>), &'static str> {
     if payload["ok"] != true || payload["app_id"] != app_id(record.request.app_id) {
         return Err("invalid_application_preflight_response");
     }
@@ -872,7 +880,7 @@ fn application_preflight_response(
             !token.is_empty() && token.len() <= 256 && !token.chars().any(char::is_control)
         })
         .ok_or("invalid_application_preflight_response")?;
-    payload["catalog_revision"]
+    let catalog_revision = payload["catalog_revision"]
         .as_u64()
         .ok_or("invalid_application_preflight_response")?;
     let overrides = parse_application_config_overrides(payload.get("config_overrides"))
@@ -887,7 +895,12 @@ fn application_preflight_response(
     {
         return Err("invalid_application_preflight_response");
     }
-    Ok((token.to_owned(), overrides, executable_path))
+    Ok((
+        token.to_owned(),
+        catalog_revision,
+        overrides,
+        executable_path,
+    ))
 }
 
 fn parse_application_config_overrides(

@@ -899,6 +899,7 @@ struct Broker {
     application_input_overrides: Option<Value>,
     application_snapshot: Option<Value>,
     application_executable_path: Option<String>,
+    application_catalog_revision: u64,
 }
 
 impl Default for Broker {
@@ -935,6 +936,7 @@ impl Default for Broker {
             application_input_overrides: None,
             application_snapshot: None,
             application_executable_path: None,
+            application_catalog_revision: 1,
         }
     }
 }
@@ -1063,6 +1065,7 @@ impl Broker {
                 } else {
                     Value::Null
                 },
+                "catalog_revision": self.application_catalog_revision,
             });
             launch["frame_limiter_settings"] =
                 self.application_snapshot.clone().unwrap_or(Value::Null);
@@ -2429,6 +2432,36 @@ fn changed_application_policy_after_preflight_never_opens_rtsp() {
     broker.application_fec_percentage = Some(32);
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_ne!(reply.status, 200);
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+}
+
+#[test]
+fn changed_catalog_revision_after_preflight_stops_application_before_rtsp() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    for _ in 0..8 {
+        controller.poll(now, &mut |command| broker.send(command));
+        if controller
+            .records
+            .values()
+            .any(|record| record.stage == Stage::LaunchApplication)
+        {
+            break;
+        }
+    }
+    assert!(
+        controller
+            .records
+            .values()
+            .any(|record| record.application_catalog_revision == Some(1))
+    );
+
+    broker.application_catalog_revision = 2;
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_ne!(reply.status, 200);
+    assert!(broker.actions().contains(&("amaterasu.launch/1", "stop")));
     assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
 }
 
