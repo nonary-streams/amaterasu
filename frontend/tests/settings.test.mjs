@@ -1164,6 +1164,117 @@ test("Moonlight host editor reloads a durable update when the listener is not ac
   }, () => {}), false);
 });
 
+test("Moonlight host form reloads its revision and listener status after a persisted error", async () => {
+  class Element {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.listeners = new Map();
+      this.isConnected = false;
+      this.value = "";
+    }
+    setConnected(connected) {
+      this.isConnected = connected;
+      for (const child of this.children) child?.setConnected?.(connected);
+    }
+    append(...children) {
+      for (const child of children) {
+        if (child == null) continue;
+        this.children.push(child);
+        child?.setConnected?.(this.isConnected);
+      }
+    }
+    replaceChildren(...children) {
+      for (const child of this.children) child?.setConnected?.(false);
+      this.children = [];
+      this.append(...children);
+    }
+    addEventListener(name, callback) {
+      this.listeners.set(name, callback);
+    }
+    setAttribute() {}
+    reportValidity() { return true; }
+    setCustomValidity() {}
+    get options() { return this.children.filter((child) => child?.tagName === "option"); }
+    get valueAsNumber() { return Number(this.value); }
+    get textContent() {
+      return this.children.map((child) => typeof child === "string" ? child : child.textContent).join("");
+    }
+    set textContent(value) { this.replaceChildren(value); }
+    fire(name, event) { this.listeners.get(name)?.(event); }
+  }
+  const find = (node, predicate) => {
+    if (predicate(node)) return node;
+    for (const child of node.children ?? []) {
+      if (typeof child === "string") continue;
+      const result = find(child, predicate);
+      if (result) return result;
+    }
+    return null;
+  };
+  const dom = vm.createContext({
+    TextEncoder, URL, Error,
+    document: { createElement: (tagName) => new Element(tagName) },
+  });
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/settings.ts"]) {
+    vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
+      target: ts.ScriptTarget.ES2022,
+    }), dom);
+    vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+  }
+  class ApiError extends Error {
+    constructor(code) { super(code); this.code = code; }
+  }
+  dom.ApiError = ApiError;
+  const content = new Element("main");
+  content.setConnected(true);
+  const notices = [];
+  let stored = nvhttpHostSettings();
+  const routes = [];
+  let updates = 0;
+  dom.Amaterasu.renderSettings({
+    content,
+    notify: (message) => notices.push(message),
+    api: {
+      allows: (scope) => scope === "configuration.write",
+      async post(route, body) {
+        routes.push(route);
+        if (route === "nvhttp/settings") return stored;
+        if (route === "nvhttp/settings_update") {
+          updates += 1;
+          if (updates === 2) {
+            assert.equal(body.expected_revision, 9);
+            throw new Error("second update intentionally rejected");
+          }
+          stored = { ...nvhttpUpdatedHost(), active_http_port: null, active_rtsp_port: null,
+            listener_error: "listener disabled" };
+          throw new ApiError("listener_not_active");
+        }
+        throw new Error(`unavailable: ${route}`);
+      },
+    },
+  });
+  await new Promise(setImmediate);
+  const hostArea = content.children[4];
+  const oldForm = find(hostArea, (node) => node.tagName === "form");
+  assert.ok(oldForm);
+  assert.match(hostArea.textContent, /Revision 8/);
+  oldForm.fire("submit", { preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(oldForm.isConnected, false);
+  assert.match(hostArea.textContent, /Revision 9/);
+  assert.match(hostArea.textContent, /Active ports: HTTP off, HTTPS off, RTSP off/);
+  assert.match(hostArea.textContent, /listener disabled/);
+  assert.match(notices.at(-1), /were stored, but listener application is not confirmed/);
+  assert.deepEqual(routes.filter((route) => route.startsWith("nvhttp/")), [
+    "nvhttp/settings", "nvhttp/settings_update", "nvhttp/settings",
+  ]);
+  const freshForm = find(hostArea, (node) => node.tagName === "form");
+  freshForm.fire("submit", { preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(updates, 2);
+});
+
 test("capture output selection preserves exact IDs and automatic reset", () => {
   const parse = context.Amaterasu.parseOutputNameSelection;
   assert.equal(parse(""), "");
