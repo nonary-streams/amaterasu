@@ -172,16 +172,21 @@ pub(crate) fn prepare(root: &Path, token: *mut c_void) -> PackageResult<Prepared
             seed: None,
         });
     }
+    let staged = stage_seed_snapshot(&seed, &container, &sid)?;
+    Ok(PreparedUserState {
+        root: destination,
+        seed: Some(staged),
+    })
+}
+
+/// The machine seed can gain missing namespace values on a later validated
+/// import. Replace the previous snapshot only after the new copy is ready.
+fn stage_seed_snapshot(seed: &Path, container: &Path, sid: &str) -> PackageResult<PathBuf> {
+    remove_abandoned_pending_snapshots(container)?;
     let staged = container.join(format!(".seed-{sid}"));
-    if staged.try_exists().map_err(|error| error.to_string())? {
-        return Ok(PreparedUserState {
-            root: destination,
-            seed: Some(staged),
-        });
-    }
     let pending = container.join(format!(".pending-{}", random_identifier()?));
     create_real_directory(&pending)?;
-    let result = copy_real_tree(&seed, &pending);
+    let result = copy_real_tree(seed, &pending);
     if let Err(error) = result {
         let _ = fs::remove_dir_all(&pending);
         return Err(error);
@@ -191,17 +196,56 @@ pub(crate) fn prepare(root: &Path, token: *mut c_void) -> PackageResult<Prepared
             &pending,
             &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})"),
         )?;
-        secure_user_directories(&pending, &sid)?;
+        secure_user_directories(&pending, sid)?;
+        if staged.try_exists().map_err(|error| error.to_string())? {
+            canonical_real_directory(&staged, "existing staged migration seed")?;
+            validate_real_tree(&staged)?;
+            fs::remove_dir_all(&staged).map_err(|error| error.to_string())?;
+        }
         fs::rename(&pending, &staged).map_err(|error| error.to_string())?;
-        Ok(PreparedUserState {
-            root: destination,
-            seed: Some(staged),
-        })
+        Ok(staged)
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&pending);
     }
     result
+}
+
+/// A process can stop during the copy, before its temporary snapshot is
+/// renamed. The service holds the runtime lock while staging, so no pending
+/// snapshot is active when the next preparation starts.
+fn remove_abandoned_pending_snapshots(container: &Path) -> PackageResult<()> {
+    for entry in fs::read_dir(container).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry.file_name().to_string_lossy().starts_with(".pending-") {
+            continue;
+        }
+        let path = entry.path();
+        canonical_real_directory(&path, "abandoned staged migration seed")?;
+        validate_real_tree(&path)?;
+        // Rust's Windows remove_dir_all uses handle-relative traversal and
+        // does not follow links introduced after the checks above.
+        fs::remove_dir_all(&path).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Refuse to recursively remove a previous user-readable stage if it contains
+/// links, junctions, or other entries outside the regular seed format.
+fn validate_real_tree(root: &Path) -> PackageResult<()> {
+    reject_reparse(root)?;
+    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        reject_reparse(&path)?;
+        if metadata.is_dir() {
+            validate_real_tree(&path)?;
+        } else if !metadata.is_file() {
+            return Err("staged migration seed contains a non-regular entry".into());
+        }
+    }
+    Ok(())
 }
 
 /// The seed can include the migrated administrator verifier and pairing
@@ -584,8 +628,8 @@ mod tests {
         AccessAllowedAce, CloseHandle, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         GetCurrentProcess, GetSecurityDescriptorDacl, LocalFree, OpenProcessToken,
         SetFileSecurityW, canonical_real_directory, claim_pending_seed, copy_real_tree,
-        expected_sids, same_windows_path, sid_string, valid_sid, validate_dacl,
-        validate_descriptor, wide,
+        expected_sids, same_windows_path, sid_string, stage_seed_snapshot, valid_sid,
+        validate_dacl, validate_descriptor, wide,
     };
     use serde_json::Value;
     use std::collections::BTreeMap;
@@ -651,6 +695,73 @@ mod tests {
             fs::read(seed.join("namespaces/state.json")).unwrap(),
             b"seed"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_stage_refreshes_new_seed_keys_and_preserves_user_credential() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-state-root-refreshed-stage-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let machine = root.join("machine");
+        let container = root.join("container");
+        let user = root.join("user");
+        let namespace = "616d617465726173752e61757468656e7469636174696f6e";
+        let relative = std::path::Path::new("namespaces")
+            .join(namespace)
+            .join("state.json");
+        let pairing_namespace: String = "amaterasu.pairing"
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let pairing_relative = std::path::Path::new("namespaces")
+            .join(pairing_namespace)
+            .join("state.json");
+        fs::create_dir_all(machine.join("namespaces").join(namespace)).unwrap();
+        fs::create_dir_all(user.join("namespaces").join(namespace)).unwrap();
+        fs::create_dir(&container).unwrap();
+        fs::write(
+            machine.join(&relative),
+            br#"{"format_version":1,"revision":1,"values":{"authentication/v1":{"credential":"imported"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            user.join(&relative),
+            br#"{"format_version":1,"revision":7,"values":{"authentication/v1":{"credential":"current"}}}"#,
+        )
+        .unwrap();
+        let sid = current_sid();
+        let staged = stage_seed_snapshot(&machine, &container, &sid).unwrap();
+        assert!(!staged.join(&pairing_relative).exists());
+        let orphan = container.join(".pending-abandoned");
+        fs::create_dir(&orphan).unwrap();
+        fs::write(orphan.join("partial"), b"partial copy").unwrap();
+        assert!(stage_seed_snapshot(&root.join("missing-seed"), &container, &sid).is_err());
+        assert!(staged.join(&relative).exists());
+
+        // A later validated import added pairing after the first worker exited
+        // before applying its stage.
+        fs::create_dir_all(machine.join(pairing_relative.parent().unwrap())).unwrap();
+        fs::write(
+            machine.join(&pairing_relative),
+            br#"{"format_version":1,"revision":1,"values":{"pairing/v1":{"identity":"new"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stage_seed_snapshot(&machine, &container, &sid).unwrap(),
+            staged
+        );
+        assert!(!orphan.exists());
+        super::apply_pending_seed(&staged, &user).unwrap();
+        let result = read_seed_namespace(&user.join(&relative)).unwrap();
+        assert_eq!(result.values["authentication/v1"]["credential"], "current");
+        assert_eq!(result.revision, 7);
+        let pairing = read_seed_namespace(&user.join(&pairing_relative)).unwrap();
+        assert_eq!(pairing.values["pairing/v1"]["identity"], "new");
+        assert!(user.join(".migration-seed-applied").exists());
         let _ = fs::remove_dir_all(root);
     }
 
