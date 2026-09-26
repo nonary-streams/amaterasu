@@ -103,6 +103,10 @@ fn status_rpc_expires_launches_before_reporting_effective_recording() {
             102,
         )
         .unwrap();
+    let waiting = execute(&mut store, operation("history_status"), 400).unwrap();
+    assert_eq!(waiting["status"]["pending_activities"], 1);
+    assert_eq!(waiting["status"]["active_streams"], 0);
+    assert_eq!(waiting["status"]["effective_enabled"], true);
     let status = execute(&mut store, operation("history_status"), 401).unwrap();
     assert_eq!(status["status"]["pending_activities"], 0);
     assert_eq!(status["status"]["effective_enabled"], false);
