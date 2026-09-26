@@ -1358,6 +1358,93 @@ var Amaterasu;
         }
     }
     Amaterasu.readSteamArtwork = readSteamArtwork;
+    async function readLutrisArtwork(api, reference) {
+        if (reference.provider !== "lutris" ||
+            !Number.isSafeInteger(reference.game_id) ||
+            reference.game_id < 1 ||
+            !/^[0-9a-f]{64}$/.test(reference.revision))
+            throw new Error("Invalid Lutris artwork reference.");
+        let offset = 0;
+        let totalBytes = null;
+        let mimeType = null;
+        const chunks = [];
+        while (true) {
+            const reply = await api.post("lutris/artwork_read", {
+                game_id: reference.game_id,
+                revision: reference.revision,
+                offset,
+            });
+            if (reply.ok !== true ||
+                reply.game_id !== reference.game_id ||
+                reply.revision !== reference.revision ||
+                reply.offset !== offset ||
+                !Number.isSafeInteger(reply.total_bytes) ||
+                reply.total_bytes < 1 ||
+                reply.total_bytes > 16 * 1024 * 1024 ||
+                !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
+                typeof reply.data !== "string" ||
+                reply.data.length > 10924 ||
+                (totalBytes !== null && totalBytes !== reply.total_bytes) ||
+                (mimeType !== null && mimeType !== reply.mime_type))
+                throw new Error("Lutris artwork changed during transfer.");
+            totalBytes = reply.total_bytes;
+            mimeType = reply.mime_type;
+            const decoded = atob(reply.data);
+            if (decoded.length < 1 || decoded.length > 8192 || offset + decoded.length > totalBytes)
+                throw new Error("Invalid Lutris artwork chunk.");
+            const bytes = new Uint8Array(decoded.length);
+            for (let index = 0; index < decoded.length; index++)
+                bytes[index] = decoded.charCodeAt(index);
+            chunks.push(bytes.buffer);
+            const end = offset + decoded.length;
+            if (reply.next_offset === null) {
+                if (end !== totalBytes)
+                    throw new Error("Incomplete Lutris artwork transfer.");
+                return new Blob(chunks, { type: mimeType });
+            }
+            if (reply.next_offset !== end || end >= totalBytes || end % 8192 !== 0)
+                throw new Error("Invalid Lutris artwork cursor.");
+            offset = end;
+        }
+    }
+    Amaterasu.readLutrisArtwork = readLutrisArtwork;
+    function showCatalogArtwork(api, reference, art, content) {
+        if (!reference)
+            return;
+        if (reference.provider === "steam" && !api.allows("steam.read"))
+            return;
+        if (reference.provider === "lutris" && !api.allows("lutris.read"))
+            return;
+        const imageRead = reference.provider === "steam"
+            ? readSteamArtwork(api, reference)
+            : readLutrisArtwork(api, reference);
+        void imageRead.then((blob) => {
+            if (!content.isConnected || !art.isConnected)
+                return;
+            const url = URL.createObjectURL(blob);
+            const image = Amaterasu.el("img");
+            image.alt = "";
+            let released = false;
+            const observer = new MutationObserver(() => {
+                if (!content.isConnected || !art.isConnected)
+                    release();
+            });
+            const release = () => {
+                if (released)
+                    return;
+                released = true;
+                observer.disconnect();
+                URL.revokeObjectURL(url);
+            };
+            image.addEventListener("load", release, { once: true });
+            image.addEventListener("error", release, { once: true });
+            observer.observe(document, { childList: true, subtree: true });
+            image.src = url;
+            art.prepend(image);
+        }).catch(() => {
+        });
+    }
+    Amaterasu.showCatalogArtwork = showCatalogArtwork;
     function audioOverrideSelect(name, current) {
         const select = Amaterasu.el("select");
         select.name = name;
@@ -1742,20 +1829,7 @@ var Amaterasu;
                 : providerLaunch
                     ? "Playnite"
                     : "Application"));
-            if (row.entry.artwork?.provider === "steam" && api.allows("steam.read")) {
-                void readSteamArtwork(api, row.entry.artwork).then((blob) => {
-                    if (!content.isConnected || !art.isConnected)
-                        return;
-                    const url = URL.createObjectURL(blob);
-                    const image = Amaterasu.el("img");
-                    image.alt = "";
-                    image.addEventListener("load", () => URL.revokeObjectURL(url), { once: true });
-                    image.addEventListener("error", () => URL.revokeObjectURL(url), { once: true });
-                    image.src = url;
-                    art.prepend(image);
-                }).catch(() => {
-                });
-            }
+            showCatalogArtwork(api, row.entry.artwork, art, content);
             return Amaterasu.el("article", "app-card", art, Amaterasu.el("div", "app-details", Amaterasu.el("h2", "", row.entry.name), Amaterasu.el("p", "muted description", row.entry.description || "No description added."), Amaterasu.el("div", "tags", ...(row.entry.tags ?? []).map((tag) => Amaterasu.badge(tag))), Amaterasu.el("p", "path", Amaterasu.launchPath(row.entry)), Amaterasu.el("div", "card-footer", ...actions)));
         }
         function showProviderOverrideEditor(row, capabilities) {

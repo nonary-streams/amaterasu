@@ -10,9 +10,20 @@ namespace Amaterasu {
     data: string;
   }
 
+  interface LutrisArtworkChunk {
+    ok: boolean;
+    game_id: number;
+    revision: string;
+    offset: number;
+    next_offset: number | null;
+    total_bytes: number;
+    mime_type: string;
+    data: string;
+  }
+
   export async function readSteamArtwork(
-    api: Api,
-    reference: NonNullable<Entry["artwork"]>,
+    api: Pick<Api, "post">,
+    reference: Extract<NonNullable<Entry["artwork"]>, { provider: "steam" }>,
   ): Promise<Blob> {
     if (
       reference.provider !== "steam" ||
@@ -62,6 +73,97 @@ namespace Amaterasu {
         throw new Error("Invalid Steam artwork cursor.");
       offset = end;
     }
+  }
+
+  export async function readLutrisArtwork(
+    api: Pick<Api, "post">,
+    reference: Extract<NonNullable<Entry["artwork"]>, { provider: "lutris" }>,
+  ): Promise<Blob> {
+    if (
+      reference.provider !== "lutris" ||
+      !Number.isSafeInteger(reference.game_id) ||
+      reference.game_id < 1 ||
+      !/^[0-9a-f]{64}$/.test(reference.revision)
+    ) throw new Error("Invalid Lutris artwork reference.");
+    let offset = 0;
+    let totalBytes: number | null = null;
+    let mimeType: string | null = null;
+    const chunks: ArrayBuffer[] = [];
+    while (true) {
+      const reply = await api.post<LutrisArtworkChunk>("lutris/artwork_read", {
+        game_id: reference.game_id,
+        revision: reference.revision,
+        offset,
+      });
+      if (
+        reply.ok !== true ||
+        reply.game_id !== reference.game_id ||
+        reply.revision !== reference.revision ||
+        reply.offset !== offset ||
+        !Number.isSafeInteger(reply.total_bytes) ||
+        reply.total_bytes < 1 ||
+        reply.total_bytes > 16 * 1024 * 1024 ||
+        !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
+        typeof reply.data !== "string" ||
+        reply.data.length > 10924 ||
+        (totalBytes !== null && totalBytes !== reply.total_bytes) ||
+        (mimeType !== null && mimeType !== reply.mime_type)
+      ) throw new Error("Lutris artwork changed during transfer.");
+      totalBytes = reply.total_bytes;
+      mimeType = reply.mime_type;
+      const decoded = atob(reply.data);
+      if (decoded.length < 1 || decoded.length > 8192 || offset + decoded.length > totalBytes)
+        throw new Error("Invalid Lutris artwork chunk.");
+      const bytes = new Uint8Array(decoded.length);
+      for (let index = 0; index < decoded.length; index++)
+        bytes[index] = decoded.charCodeAt(index);
+      chunks.push(bytes.buffer);
+      const end = offset + decoded.length;
+      if (reply.next_offset === null) {
+        if (end !== totalBytes) throw new Error("Incomplete Lutris artwork transfer.");
+        return new Blob(chunks, { type: mimeType });
+      }
+      if (reply.next_offset !== end || end >= totalBytes || end % 8192 !== 0)
+        throw new Error("Invalid Lutris artwork cursor.");
+      offset = end;
+    }
+  }
+
+  export function showCatalogArtwork(
+    api: Pick<Api, "post" | "allows">,
+    reference: Entry["artwork"],
+    art: HTMLElement,
+    content: HTMLElement,
+  ): void {
+    if (!reference) return;
+    if (reference.provider === "steam" && !api.allows("steam.read")) return;
+    if (reference.provider === "lutris" && !api.allows("lutris.read")) return;
+    const imageRead = reference.provider === "steam"
+      ? readSteamArtwork(api, reference)
+      : readLutrisArtwork(api, reference);
+    void imageRead.then((blob) => {
+      if (!content.isConnected || !art.isConnected) return;
+      const url = URL.createObjectURL(blob);
+      const image = el("img") as HTMLImageElement;
+      image.alt = "";
+      let released = false;
+      const observer = new MutationObserver(() => {
+        if (!content.isConnected || !art.isConnected) release();
+      });
+      const release = (): void => {
+        if (released) return;
+        released = true;
+        observer.disconnect();
+        URL.revokeObjectURL(url);
+      };
+      image.addEventListener("load", release, { once: true });
+      image.addEventListener("error", release, { once: true });
+      observer.observe(document, { childList: true, subtree: true });
+      image.src = url;
+      art.prepend(image);
+    }).catch(() => {
+      // Keep initials when a provider image is missing or its revision changes.
+    });
   }
 
   function audioOverrideSelect(name: string, current: boolean | undefined): HTMLSelectElement {
@@ -687,20 +789,7 @@ namespace Amaterasu {
               : "Application",
         ),
       );
-      if (row.entry.artwork?.provider === "steam" && api.allows("steam.read")) {
-        void readSteamArtwork(api, row.entry.artwork).then((blob) => {
-          if (!content.isConnected || !art.isConnected) return;
-          const url = URL.createObjectURL(blob);
-          const image = el("img") as HTMLImageElement;
-          image.alt = "";
-          image.addEventListener("load", () => URL.revokeObjectURL(url), { once: true });
-          image.addEventListener("error", () => URL.revokeObjectURL(url), { once: true });
-          image.src = url;
-          art.prepend(image);
-        }).catch(() => {
-          // Keep the initials when local artwork is absent or changes mid-read.
-        });
-      }
+      showCatalogArtwork(api, row.entry.artwork, art, content);
       return el(
         "article",
         "app-card",

@@ -14,7 +14,9 @@ for (const source of ["src/model.ts", "src/catalog.ts"]) {
   );
 }
 const readSteamArtwork = context.Amaterasu.readSteamArtwork;
+const readLutrisArtwork = context.Amaterasu.readLutrisArtwork;
 const reference = { provider: "steam", app_id: 730, revision: "42" };
+const lutrisReference = { provider: "lutris", game_id: 42, revision: "a".repeat(64) };
 const windowsCapabilities = {
   frame_limiter_provider: ["auto", "rtss", "nvidia-control-panel"],
   rtss_frame_limit_type: [
@@ -352,4 +354,159 @@ test("Steam artwork accepts a 16 MiB transfer declaration but rejects larger ima
   }) };
   await assert.rejects(readSteamArtwork(oversized, reference), /changed during transfer/);
   assert.equal(calls, 1);
+});
+
+test("Lutris artwork reads signed 8 KiB chunks for the catalog digest", async () => {
+  const source = Buffer.alloc(8197, 0x51);
+  const offsets = [];
+  const api = { async post(route, request) {
+    assert.equal(route, "lutris/artwork_read");
+    assert.equal(request.game_id, lutrisReference.game_id);
+    assert.equal(request.revision, lutrisReference.revision);
+    offsets.push(request.offset);
+    const end = Math.min(request.offset + 8192, source.length);
+    return {
+      ok: true, game_id: request.game_id, revision: request.revision,
+      offset: request.offset, next_offset: end === source.length ? null : end,
+      total_bytes: source.length, mime_type: "image/webp",
+      data: source.subarray(request.offset, end).toString("base64"),
+    };
+  } };
+  const image = await readLutrisArtwork(api, lutrisReference);
+  assert.deepEqual(offsets, [0, 8192]);
+  assert.equal(image.type, "image/webp");
+  assert.deepEqual(Buffer.from(await image.arrayBuffer()), source);
+});
+
+test("Lutris artwork rejects malformed references, changed digests, cursors and size", async () => {
+  const valid = {
+    ok: true, game_id: 42, revision: lutrisReference.revision,
+    offset: 0, next_offset: null, total_bytes: 1,
+    mime_type: "image/png", data: Buffer.from([0x51]).toString("base64"),
+  };
+  for (const invalid of [
+    { ...lutrisReference, game_id: 0 },
+    { ...lutrisReference, game_id: Number.MAX_SAFE_INTEGER + 1 },
+    { ...lutrisReference, revision: "A".repeat(64) },
+    { ...lutrisReference, revision: "a".repeat(63) },
+  ]) {
+    await assert.rejects(readLutrisArtwork({ post: () => { throw new Error("request sent"); } }, invalid), /Invalid Lutris artwork reference/);
+  }
+  for (const reply of [
+    { ...valid, ok: false, code: "artwork_changed" },
+    { ...valid, game_id: 43 },
+    { ...valid, revision: "b".repeat(64) },
+    { ...valid, offset: 8192 },
+    { ...valid, total_bytes: 16 * 1024 * 1024 + 1 },
+    { ...valid, mime_type: "text/html" },
+    { ...valid, data: "!!!" },
+    { ...valid, data: Buffer.alloc(8193).toString("base64"), total_bytes: 8193 },
+    { ...valid, next_offset: 1, total_bytes: 2 },
+    { ...valid, next_offset: null, total_bytes: 2 },
+  ]) {
+    await assert.rejects(readLutrisArtwork({ post: async () => reply }, lutrisReference));
+  }
+  const changedSecondChunk = { async post(_route, request) {
+    return request.offset === 0
+      ? { ...valid, total_bytes: 8193, next_offset: 8192, data: Buffer.alloc(8192).toString("base64") }
+      : { ...valid, offset: 8192, total_bytes: 8193, revision: "b".repeat(64) };
+  } };
+  await assert.rejects(readLutrisArtwork(changedSecondChunk, lutrisReference), /changed during transfer/);
+});
+
+test("Lutris card refresh ignores stale A and revokes B on load or removal", async () => {
+  class Element {
+    constructor() { this.isConnected = true; this.children = []; this.listeners = new Map(); }
+    prepend(child) { this.children.unshift(child); }
+    addEventListener(type, listener) { this.listeners.set(type, listener); }
+    fire(type) { this.listeners.get(type)?.(); }
+  }
+  const created = [];
+  const revoked = [];
+  const observers = [];
+  const artworkContext = vm.createContext({
+    atob, Blob, Error,
+    URL: {
+      createObjectURL(blob) { created.push(blob); return `blob:${created.length}`; },
+      revokeObjectURL(url) { revoked.push(url); },
+    },
+    document: { createElement: () => new Element() },
+    MutationObserver: class {
+      constructor(callback) { this.callback = callback; observers.push(this); }
+      observe() {}
+      disconnect() { this.disconnected = true; }
+      notify() { if (!this.disconnected) this.callback(); }
+    },
+  });
+  vm.runInContext(ts.transpile(readFileSync("src/ui.ts", "utf8"), {
+    target: ts.ScriptTarget.ES2022,
+  }), artworkContext);
+  vm.runInContext("Object.assign(globalThis, Amaterasu)", artworkContext);
+  vm.runInContext(ts.transpile(readFileSync("src/catalog.ts", "utf8"), {
+    target: ts.ScriptTarget.ES2022,
+  }), artworkContext);
+  const show = artworkContext.Amaterasu.showCatalogArtwork;
+  const pending = new Map();
+  const api = {
+    allows: (scope) => scope === "lutris.read",
+    post(route, request) {
+      assert.equal(route, "lutris/artwork_read");
+      return new Promise((resolve) => pending.set(request.revision, resolve));
+    },
+  };
+  const content = new Element();
+  const oldArt = new Element();
+  const newArt = new Element();
+  const b = { ...lutrisReference, revision: "b".repeat(64) };
+  show(api, lutrisReference, oldArt, content);
+  oldArt.isConnected = false;
+  show(api, b, newArt, content);
+  pending.get(b.revision)({
+    ok: true, game_id: 42, revision: b.revision, offset: 0,
+    next_offset: null, total_bytes: 1, mime_type: "image/png", data: "UQ==",
+  });
+  await new Promise(setImmediate);
+  pending.get(lutrisReference.revision)({
+    ok: true, game_id: 42, revision: lutrisReference.revision, offset: 0,
+    next_offset: null, total_bytes: 1, mime_type: "image/png", data: "UQ==",
+  });
+  await new Promise(setImmediate);
+  assert.equal(oldArt.children.length, 0);
+  assert.equal(newArt.children.length, 1);
+  assert.equal(created.length, 1);
+  newArt.children[0].fire("load");
+  assert.deepEqual(revoked, ["blob:1"]);
+
+  const removedArt = new Element();
+  show(api, b, removedArt, content);
+  pending.get(b.revision)({
+    ok: true, game_id: 42, revision: b.revision, offset: 0,
+    next_offset: null, total_bytes: 1, mime_type: "image/png", data: "UQ==",
+  });
+  await new Promise(setImmediate);
+  removedArt.isConnected = false;
+  for (const observer of observers) observer.notify();
+  assert.deepEqual(revoked, ["blob:1", "blob:2"]);
+  assert.equal(observers.every((observer) => observer.disconnected), true);
+
+  show(api, undefined, new Element(), content);
+  show({ ...api, allows: () => false }, b, new Element(), content);
+  assert.equal(created.length, 2);
+
+  const steamArt = new Element();
+  show({
+    allows: (scope) => scope === "steam.read",
+    async post(route, request) {
+      assert.equal(route, "steam/artwork_read");
+      return {
+        ok: true, app_id: request.app_id, revision: request.revision,
+        offset: 0, next_offset: null, total_bytes: 1,
+        mime_type: "image/png", data: "UQ==",
+      };
+    },
+  }, reference, steamArt, content);
+  await new Promise(setImmediate);
+  assert.equal(steamArt.children.length, 1);
+  steamArt.children[0].fire("error");
+  assert.deepEqual(revoked, ["blob:1", "blob:2", "blob:3"]);
 });
