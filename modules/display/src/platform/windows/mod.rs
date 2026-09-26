@@ -295,8 +295,8 @@ mod tests {
         let readback = Snapshot {
             format_version: 1,
             paths: vec![
-                readback_path("monitor.one", 0, Some(false)),
                 readback_path("monitor.two", 1920, Some(true)),
+                readback_path("MONITOR.ONE", 0, Some(false)),
             ],
         };
         assert!(apply::verifies(&configuration, &readback));
