@@ -289,7 +289,6 @@ dependencies = [
  "amaterasu-module-sdk",
  "amaterasu-package",
  "httparse",
- "rustls",
  "serde",
  "serde_json",
 ]
