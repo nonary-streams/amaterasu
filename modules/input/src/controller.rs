@@ -1398,11 +1398,7 @@ impl<B: Backend> Controller<B> {
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();
-        value["cleanup_required"] = self
-            .lease
-            .as_ref()
-            .is_some_and(|lease| lease.cleanup_required)
-            .into();
+        value["cleanup_required"] = self.cleanup_required().into();
         value
     }
 }
@@ -1411,7 +1407,7 @@ impl<B: Backend> Drop for Controller<B> {
         // Graceful unload gets a final best-effort release pass. Linux also
         // destroys its owned uinput devices; Windows cannot undo OS rejection.
         let _ = self.finish_lease(Instant::now(), "cancelled");
-        if self.lease.is_some() {
+        if self.lease.is_some() || self.startup_cleanup_pending {
             let _ = self.backend.stop();
         }
     }

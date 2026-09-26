@@ -17,6 +17,7 @@ struct FakeBackend {
     fail_stop: bool,
     fail_start_once: bool,
     native_resource_owned: bool,
+    native_resource_trace: Option<Rc<std::cell::Cell<bool>>>,
     fail_controller_input: bool,
     reject_absolute: bool,
     supports_pen_touch: bool,
@@ -79,6 +80,9 @@ impl Backend for FakeBackend {
             ));
         }
         self.native_resource_owned = true;
+        if let Some(trace) = &self.native_resource_trace {
+            trace.set(true);
+        }
         if std::mem::take(&mut self.fail_start_once) {
             return Err(InputError::new(
                 "injection_failed",
@@ -173,6 +177,9 @@ impl Backend for FakeBackend {
             ))
         } else {
             self.native_resource_owned = false;
+            if let Some(trace) = &self.native_resource_trace {
+                trace.set(false);
+            }
             Ok(())
         }
     }
@@ -316,6 +323,29 @@ fn failed_startup_cleanup_blocks_acquire_until_retry_succeeds() {
         true
     );
     assert!(!controller.backend.native_resource_owned);
+}
+
+#[test]
+fn shutdown_retries_cleanup_of_a_partial_start_without_a_lease() {
+    let resource_owned = Rc::new(std::cell::Cell::new(false));
+    let mut controller = Controller::new(
+        FakeBackend {
+            fail_start_once: true,
+            fail_stop: true,
+            native_resource_trace: Some(resource_owned.clone()),
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let failed = controller.handle("owner", acquire_operation(), now, &mut || Ok(()));
+    assert_eq!(failed["error"]["code"], "injection_failed");
+    assert_eq!(failed["cleanup_required"], true);
+    assert!(resource_owned.get());
+    controller.backend.fail_stop = false;
+
+    drop(controller);
+    assert!(!resource_owned.get());
 }
 
 #[test]
