@@ -184,7 +184,17 @@ fn claim_pending_seed(data: &Path, sid: &str) -> PackageResult<bool> {
             return Err("migration seed claim is invalid".into());
         }
         reject_reparse(&claim)?;
-        return Ok(false);
+        if metadata.len() == 0 || metadata.len() > 128 {
+            return Err("migration seed claim is invalid".into());
+        }
+        let owner = fs::read_to_string(&claim).map_err(|error| error.to_string())?;
+        if !valid_sid(&owner) || owner.len() as u64 != metadata.len() {
+            return Err("migration seed claim is invalid".into());
+        }
+        // A crash after claiming but before publishing the per-user root must
+        // not permanently strand imported credentials. The caller holds the
+        // runtime root lock, and an existing destination was handled above.
+        return Ok(owner == sid);
     }
     use std::io::Write;
     let mut claim_file = fs::OpenOptions::new()
@@ -536,11 +546,28 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         assert!(claim_pending_seed(&root, "S-1-5-21-1").unwrap());
+        assert!(claim_pending_seed(&root, "S-1-5-21-1").unwrap());
         assert!(!claim_pending_seed(&root, "S-1-5-21-2").unwrap());
         assert_eq!(
             fs::read(root.join("state-seed-claim")).unwrap(),
             b"S-1-5-21-1"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incomplete_seed_claim_fails_closed_before_another_user_can_copy_it() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-state-root-incomplete-claim-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let claim = root.join("state-seed-claim");
+        fs::write(&claim, b"").unwrap();
+        assert!(claim_pending_seed(&root, "S-1-5-21-2").is_err());
+        fs::write(&claim, b"S-1-5-21-1\n").unwrap();
+        assert!(claim_pending_seed(&root, "S-1-5-21-1").is_err());
         let _ = fs::remove_dir_all(root);
     }
 
