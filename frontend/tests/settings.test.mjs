@@ -758,7 +758,7 @@ test("history editor confirms deferred toggles and durable restart readback", as
   const pendingLaunch = context.Amaterasu.historySettingsRuntimeDescription(saved.settings,
     context.Amaterasu.parseHistoryRuntimeStatus(runtime));
   assert.match(pendingLaunch, /enable is deferred until 1 pending launch resolves/);
-  assert.match(pendingLaunch, /0 active streams · 1 pending launches/);
+  assert.match(pendingLaunch, /0 active streams · 1 pending launch/);
   assert.doesNotMatch(pendingLaunch, /new streams/);
   runtime = { ...runtime, status: { ...runtime.status, active_streams: 1, pending_activities: 0 } };
   assert.deepEqual(calls.map(([route]) => route), [

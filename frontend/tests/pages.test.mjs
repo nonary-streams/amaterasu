@@ -127,12 +127,12 @@ test("history runtime status reports readiness, deferred settings, failures and 
   const waitingEnable = describe(historyStatus({ enabled: true, effective_enabled: false,
     active_streams: 0, pending_activities: 1 }));
   assert.match(waitingEnable, /enable is deferred until 1 pending launch resolves; the effective policy remains disabled/);
-  assert.match(waitingEnable, /0 active streams · 1 pending launches/);
+  assert.match(waitingEnable, /0 active streams · 1 pending launch/);
   assert.doesNotMatch(waitingEnable, /new streams/);
   const waitingDisable = describe(historyStatus({ enabled: false, effective_enabled: true,
     active_streams: 1, pending_activities: 2 }));
   assert.match(waitingDisable, /disable is deferred until 1 active stream ends and 2 pending launches resolve/);
-  assert.match(waitingDisable, /1 active streams · 2 pending launches/);
+  assert.match(waitingDisable, /1 active stream · 2 pending launches/);
   assert.doesNotMatch(waitingDisable, /new streams/);
   assert.match(describe(historyStatus({ enabled: true, effective_enabled: true,
     active_streams: 0, pending_activities: 0 })), /Recording is enabled for new streams.*0 pending launches/);

@@ -172,7 +172,7 @@ namespace Amaterasu {
     if (runtime.enabled !== settings.settings.enabled)
       return "Saved history settings confirmed. Runtime reports a different recording policy from this saved readback; refresh to check the current settings.";
     const policy = Amaterasu.historyRecordingPolicyDescription(runtime);
-    const activity = ` ${runtime.active_streams} active streams · ${runtime.pending_activities} pending launches.`;
+    const activity = ` ${Amaterasu.historyActivityDescription(runtime)}.`;
     const retention = runtime.effective_enabled
       ? ""
       : " Stored sessions remain readable. Automatic retention and deletion are paused until recording is enabled.";

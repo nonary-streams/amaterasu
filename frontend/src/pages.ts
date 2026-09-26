@@ -176,11 +176,17 @@ namespace Amaterasu {
       : `Recording is ${effective} for new streams.`;
   }
 
+  export function historyActivityDescription(status: HistoryRuntimeStatus): string {
+    const active = `${status.active_streams} active ${status.active_streams === 1 ? "stream" : "streams"}`;
+    const pending = `${status.pending_activities} pending ${status.pending_activities === 1 ? "launch" : "launches"}`;
+    return `${active} · ${pending}`;
+  }
+
   export function historyRuntimeDescription(status: HistoryRuntimeStatus): string[] {
     if (!status.available)
       return ["History storage is unavailable; recording and recorded session reads cannot run."];
     const lines = [historyRecordingPolicyDescription(status)];
-    lines.push(`${status.active_streams} active streams · ${status.pending_activities} pending launches · ${status.sessions} stored sessions · ${status.samples} samples · ${status.events} events · ${status.live_bytes} live bytes.`);
+    lines.push(`${historyActivityDescription(status)} · ${status.sessions} stored sessions · ${status.samples} samples · ${status.events} events · ${status.live_bytes} live bytes.`);
     if (status.configuration_ready && !status.effective_enabled)
       lines.push("Stored sessions remain readable. Automatic retention and deletion are paused until recording is enabled.");
     lines.push(`Last retention pass deleted ${status.last_prune.sessions_deleted} sessions; ${status.last_prune.live_bytes} live bytes against ${status.last_prune.size_limit_bytes === 0 ? "no size limit" : `${status.last_prune.size_limit_bytes} byte limit`}.`);
