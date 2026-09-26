@@ -220,7 +220,7 @@ impl WindowsPenTouch {
             effective_pen_tool: None,
             effective_pen_buttons: None,
             tilt: *tilt,
-            effective_tilt: None,
+            effective_tilt_axes: None,
         };
         let frame = {
             let state_slot = self.device_state_slot_mut(*device);
@@ -244,13 +244,14 @@ impl WindowsPenTouch {
             contact.effective_contact_area = contact
                 .contact_area_major
                 .zip(contact.contact_area_minor)
+                .map(|(major, minor)| (major, minor, contact.rotation_degrees))
                 .or_else(|| previous.and_then(|previous| previous.effective_contact_area));
             contact.effective_rotation_degrees = contact
                 .rotation_degrees
                 .or_else(|| previous.and_then(|previous| previous.effective_rotation_degrees));
-            contact.effective_tilt = contact
-                .tilt
-                .or_else(|| previous.and_then(|previous| previous.effective_tilt));
+            contact.effective_tilt_axes = pen_tilt_axes(contact.tilt, contact.rotation_degrees)
+                .map(|(x, y)| (x.round() as i32, y.round() as i32))
+                .or_else(|| previous.and_then(|previous| previous.effective_tilt_axes));
             state.contacts.insert(*pointer_id, contact);
             let frame = build_pointer_frame(
                 *device,
@@ -585,7 +586,9 @@ struct PointerContact {
     effective_pressure: Option<f32>,
     contact_area_major: Option<f32>,
     contact_area_minor: Option<f32>,
-    effective_contact_area: Option<(f32, f32)>,
+    // Pair area with the rotation used when its native bounds were emitted.
+    // A later orientation-only update must not rotate those existing bounds.
+    effective_contact_area: Option<(f32, f32, Option<u16>)>,
     rotation_degrees: Option<u16>,
     effective_rotation_degrees: Option<u16>,
     // Raw fields preserve exactly what the latest event reported. None and
@@ -597,7 +600,8 @@ struct PointerContact {
     effective_pen_tool: Option<PenTool>,
     effective_pen_buttons: Option<u8>,
     tilt: Option<u8>,
-    effective_tilt: Option<u8>,
+    // Keep the last emitted axis pair; tilt and rotation samples are sparse.
+    effective_tilt_axes: Option<(i32, i32)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -727,11 +731,6 @@ fn pointer_info_for_contact(
     } else {
         contact.rotation_degrees
     };
-    let tilt = if phase == PenTouchPhase::Down {
-        contact.tilt.or(contact.effective_tilt)
-    } else {
-        contact.tilt
-    };
 
     let mut pointer = POINTER_TYPE_INFO::default();
     match device {
@@ -776,10 +775,17 @@ fn pointer_info_for_contact(
                 pen_info.penMask |= PEN_MASK_ROTATION;
                 pen_info.rotation = u32::from(rotation);
             }
-            if let Some((tilt_x, tilt_y)) = pen_tilt_axes(tilt, rotation_degrees) {
+            let tilt_axes = pen_tilt_axes(contact.tilt, contact.rotation_degrees)
+                .map(|(x, y)| (x.round() as i32, y.round() as i32));
+            let tilt_axes = if phase == PenTouchPhase::Down {
+                tilt_axes.or(contact.effective_tilt_axes)
+            } else {
+                tilt_axes
+            };
+            if let Some((tilt_x, tilt_y)) = tilt_axes {
                 pen_info.penMask |= PEN_MASK_TILT_X | PEN_MASK_TILT_Y;
-                pen_info.tiltX = tilt_x.round() as i32;
-                pen_info.tiltY = tilt_y.round() as i32;
+                pen_info.tiltX = tilt_x;
+                pen_info.tiltY = tilt_y;
             }
 
             pointer.r#type = PT_PEN;
@@ -813,19 +819,22 @@ fn pointer_info_for_contact(
                 touch_info.touchMask |= TOUCH_MASK_PRESSURE;
                 touch_info.pressure = pressure_to_native(pressure);
             }
-            let contact_area = contact.contact_area_major.zip(contact.contact_area_minor);
+            let contact_area = contact
+                .contact_area_major
+                .zip(contact.contact_area_minor)
+                .map(|(major, minor)| (major, minor, contact.rotation_degrees));
             let contact_area = if phase == PenTouchPhase::Down {
                 contact_area.or(contact.effective_contact_area)
             } else {
                 contact_area
             };
-            if let Some((major, minor)) = contact_area {
+            if let Some((major, minor, area_rotation)) = contact_area {
                 let bounds = contact_rectangle(
                     screen_x,
                     screen_y,
                     major,
                     minor,
-                    rotation_degrees,
+                    area_rotation,
                     virtual_desktop,
                 );
                 touch_info.rcContact = bounds;
@@ -2214,6 +2223,150 @@ mod tests {
             backend.stop().unwrap();
             assert_eq!(state.borrow().destroyed, [1, 2, 3]);
         }
+    }
+
+    #[test]
+    fn pen_recovery_replays_last_emitted_tilt_axes_after_single_field_moves() {
+        let (mut backend, state) = backend();
+        let mut down = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Down,
+            32768,
+            32768,
+        );
+        if let Event::PenTouch {
+            rotation_degrees,
+            tilt,
+            ..
+        } = &mut down
+        {
+            *rotation_degrees = Some(0);
+            *tilt = Some(30);
+        }
+        backend.inject(&down).unwrap();
+        let initial_axes = {
+            let fake = state.borrow();
+            let info = pen_info(&fake.frames[0].1[0]);
+            (info.tiltX, info.tiltY)
+        };
+        let mut tilt_only = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Move,
+            32768,
+            32768,
+        );
+        if let Event::PenTouch { tilt, .. } = &mut tilt_only {
+            *tilt = Some(45);
+        }
+        backend.inject(&tilt_only).unwrap();
+        let mut rotation_only = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Move,
+            32768,
+            32768,
+        );
+        if let Event::PenTouch {
+            rotation_degrees, ..
+        } = &mut rotation_only
+        {
+            *rotation_degrees = Some(90);
+        }
+        backend.inject(&rotation_only).unwrap();
+        {
+            let fake = state.borrow();
+            assert_eq!(
+                pen_info(&fake.frames[1].1[0]).penMask & (PEN_MASK_TILT_X | PEN_MASK_TILT_Y),
+                0
+            );
+            assert_eq!(pen_info(&fake.frames[2].1[0]).penMask, PEN_MASK_ROTATION);
+        }
+        {
+            let mut fake = state.borrow_mut();
+            fake.fail_next_injection = true;
+            fake.lose_handle_on_next_failure = true;
+        }
+        let sparse = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Move,
+            32768,
+            32768,
+        );
+        assert_eq!(
+            backend.inject(&sparse).unwrap_err().code,
+            "injection_failed"
+        );
+        backend.inject(&sparse).unwrap();
+        let fake = state.borrow();
+        let replay = pen_info(&fake.frames[3].1[0]);
+        assert_eq!(replay.rotation, 90);
+        assert_eq!((replay.tiltX, replay.tiltY), initial_axes);
+        assert_eq!(
+            replay.penMask & (PEN_MASK_ROTATION | PEN_MASK_TILT_X | PEN_MASK_TILT_Y),
+            PEN_MASK_ROTATION | PEN_MASK_TILT_X | PEN_MASK_TILT_Y
+        );
+        drop(fake);
+        backend.stop().unwrap();
+        assert_eq!(state.borrow().destroyed, [1, 2]);
+    }
+
+    #[test]
+    fn touch_recovery_keeps_area_geometry_after_rotation_only_move() {
+        let (mut backend, state) = backend();
+        let mut down = event(7, PenTouchDevice::Touch, PenTouchPhase::Down, 32768, 32768);
+        if let Event::PenTouch {
+            contact_area_major,
+            contact_area_minor,
+            rotation_degrees,
+            ..
+        } = &mut down
+        {
+            *contact_area_major = Some(0.04);
+            *contact_area_minor = Some(0.01);
+            *rotation_degrees = Some(0);
+        }
+        backend.inject(&down).unwrap();
+        let original_bounds = touch_info(&state.borrow().frames[0].1[0]).rcContact;
+        let mut rotation_only = event(7, PenTouchDevice::Touch, PenTouchPhase::Move, 32768, 32768);
+        if let Event::PenTouch {
+            rotation_degrees, ..
+        } = &mut rotation_only
+        {
+            *rotation_degrees = Some(90);
+        }
+        backend.inject(&rotation_only).unwrap();
+        assert_eq!(
+            touch_info(&state.borrow().frames[1].1[0]).touchMask,
+            TOUCH_MASK_ORIENTATION
+        );
+        {
+            let mut fake = state.borrow_mut();
+            fake.fail_next_injection = true;
+            fake.lose_handle_on_next_failure = true;
+        }
+        let sparse = event(7, PenTouchDevice::Touch, PenTouchPhase::Move, 32768, 32768);
+        assert_eq!(
+            backend.inject(&sparse).unwrap_err().code,
+            "injection_failed"
+        );
+        backend.inject(&sparse).unwrap();
+        let fake = state.borrow();
+        let replay = touch_info(&fake.frames[2].1[0]);
+        assert_eq!(replay.orientation, 90);
+        assert_eq!(replay.rcContact.left, original_bounds.left);
+        assert_eq!(replay.rcContact.top, original_bounds.top);
+        assert_eq!(replay.rcContact.right, original_bounds.right);
+        assert_eq!(replay.rcContact.bottom, original_bounds.bottom);
+        assert_eq!(
+            replay.touchMask & (TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION),
+            TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION
+        );
+        drop(fake);
+        backend.stop().unwrap();
+        assert_eq!(state.borrow().destroyed, [1, 2]);
     }
 
     #[test]
