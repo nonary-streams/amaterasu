@@ -24,6 +24,7 @@ struct Endpoint {
     active_request: bool,
     verifier_reply: Option<Value>,
     deny_launch: bool,
+    deny_settlement: bool,
 }
 
 impl Endpoint {
@@ -44,7 +45,9 @@ impl Endpoint {
                 self.completions.push((*request, payload.clone()));
                 Response::Ok
             }
-            Command::Cancel { .. } => Response::error("unavailable", "deliberate failure"),
+            Command::Cancel { .. } | Command::ReleaseResult { .. } if self.deny_settlement => {
+                Response::error("unavailable", "deliberate settlement failure")
+            }
             _ => Response::Ok,
         }
     }
@@ -194,6 +197,25 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
     assert_eq!(verify["display_policy_snapshot"], snapshot);
     assert_eq!(verify["request_sha256"], digest);
     assert_eq!(verify["catalog_revision"], 0);
+    let verifier_operation = endpoint
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service,
+                operation_id,
+                ..
+            } if service == "amaterasu.launch/1" => Some(operation_id),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!verifier_operation.contains("abababababababab"));
+    assert!(
+        endpoint
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::ReleaseResult { request: 71 }))
+    );
     assert!(
         controller
             .records
@@ -264,6 +286,59 @@ fn forged_or_unavailable_display_admission_never_creates_a_ticket() {
 }
 
 #[test]
+fn uncertain_verifier_settlement_keeps_child_identity_until_release() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled":true,"bind":"127.0.0.1:0",
+        "allowed_principals":["amaterasu.nvhttp"]
+    }))
+    .unwrap();
+    let mut controller = Controller::new(settings).unwrap();
+    let config = attested_open();
+    let digest = config.display_request_sha256().unwrap();
+    let mut endpoint = Endpoint {
+        active_request: true,
+        verifier_reply: Some(json!({"ok":true,"verified":true,
+            "rtsp_operation_id":"rtsp-one","request_sha256":digest})),
+        deny_settlement: true,
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    controller.open(
+        OpenRequest {
+            request: 19,
+            caller: "amaterasu.nvhttp".into(),
+            config,
+            deadline: 5,
+        },
+        0,
+        &runtime,
+        false,
+    );
+    for now in 1..=5 {
+        controller.advance_display_admission(&runtime, now);
+    }
+    assert!(controller.display_admission.is_none());
+    assert_eq!(controller.display_cleanup.len(), 1);
+    assert!(controller.records.is_empty());
+    assert!(controller.job.is_none());
+    endpoint.deny_settlement = false;
+    controller.advance_display_cleanup(&runtime);
+    assert!(controller.display_cleanup.is_empty());
+    assert!(
+        endpoint
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::ReleaseResult { request: 71 }))
+    );
+    assert!(
+        endpoint
+            .completions
+            .iter()
+            .any(|(request, response)| *request == 19 && response["ok"] == false)
+    );
+}
+
+#[test]
 fn ticket_readback_keeps_the_admitted_frame_limiter_snapshot() {
     let mut record = record(State::Preparing);
     let snapshot = serde_json::json!({"version":1,"settings":{"frame_limiter_provider":"rtss"}});
@@ -322,7 +397,10 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         network: None,
         deadline: 5_000,
     });
-    let mut endpoint = Endpoint::default();
+    let mut endpoint = Endpoint {
+        deny_settlement: true,
+        ..Endpoint::default()
+    };
     let runtime = client(&mut endpoint);
 
     for now in 0..5 {

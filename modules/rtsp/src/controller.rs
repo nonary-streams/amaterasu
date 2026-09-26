@@ -34,6 +34,7 @@ const STATUS_INTERVAL_MS: u64 = 250;
 const MAX_RECORDS: usize = 128;
 const MAX_LIVE_TICKETS: usize = 2;
 const MAX_PENDING_NETWORK: usize = 16;
+const MAX_DISPLAY_CLEANUP: usize = 16;
 
 struct PendingNetwork {
     connection: u64,
@@ -77,6 +78,7 @@ pub struct Controller {
     pending_network: VecDeque<PendingNetwork>,
     job: Option<Job>,
     display_admission: Option<DisplayAdmission>,
+    display_cleanup: Vec<Call>,
     sequence: u64,
     status_after: u64,
 }
@@ -112,6 +114,7 @@ impl Controller {
             pending_network: VecDeque::new(),
             job: None,
             display_admission: None,
+            display_cleanup: Vec::new(),
             sequence: 0,
             status_after: 0,
         })
@@ -121,6 +124,7 @@ impl Controller {
         self.poll_transport(now);
         self.advance_job(runtime, now);
         self.advance_display_admission(runtime, now);
+        self.advance_display_cleanup(runtime);
         if self.job.is_none() {
             self.process_pending_network(now);
         }
@@ -142,6 +146,9 @@ impl Controller {
         }
         if let Some(admission) = self.display_admission.as_mut() {
             admission.call.shutdown(runtime);
+        }
+        for call in &mut self.display_cleanup {
+            call.shutdown(runtime);
         }
         for record in self.records.values_mut() {
             if let Some(call) = record.uncertain.as_mut() {

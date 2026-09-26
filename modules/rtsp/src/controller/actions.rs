@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 
 impl Controller {
     pub(super) fn poll_caller(&mut self, runtime: &RuntimeClient, now: u64) -> ModuleResult<()> {
@@ -135,6 +136,10 @@ impl Controller {
             return;
         }
         if config.display_request.is_some() && !verified {
+            if self.display_cleanup.len() >= MAX_DISPLAY_CLEANUP {
+                rpc::complete(runtime, request, error("display_admission_unavailable"));
+                return;
+            }
             if caller != "amaterasu.nvhttp" {
                 rpc::complete(runtime, request, error("permission_denied"));
                 return;
@@ -163,7 +168,10 @@ impl Controller {
             let call = Call::for_service(
                 "amaterasu.launch/1",
                 payload,
-                format!("rtsp-display-{}", &token[..32]),
+                format!(
+                    "rtsp-display-{:x}",
+                    Sha256::digest(format!("{token}:{}", config.operation_id).as_bytes())
+                ),
                 Some(request),
             );
             self.display_admission = Some(DisplayAdmission {
@@ -260,7 +268,18 @@ impl Controller {
             admission.call.cancel();
         }
         match admission.call.poll(runtime) {
-            Outcome::Waiting => self.display_admission = Some(admission),
+            Outcome::Waiting => {
+                if now >= admission.deadline || !rpc::active(runtime, admission.request) {
+                    rpc::complete(
+                        runtime,
+                        admission.request,
+                        error("display_admission_unavailable"),
+                    );
+                    self.display_cleanup.push(admission.call);
+                } else {
+                    self.display_admission = Some(admission);
+                }
+            }
             Outcome::Result(response) => {
                 if response["ok"] == true
                     && response["verified"] == true
@@ -279,14 +298,35 @@ impl Controller {
                     );
                 }
             }
-            Outcome::SettledFailure | Outcome::Uncertain => {
+            Outcome::SettledFailure => {
                 rpc::complete(
                     runtime,
                     admission.request,
                     error("display_admission_unavailable"),
                 );
             }
+            Outcome::Uncertain => {
+                admission.call.retry_settlement();
+                rpc::complete(
+                    runtime,
+                    admission.request,
+                    error("display_admission_unavailable"),
+                );
+                self.display_cleanup.push(admission.call);
+            }
         }
+    }
+
+    pub(super) fn advance_display_cleanup(&mut self, runtime: &RuntimeClient) {
+        self.display_cleanup
+            .retain_mut(|call| match call.poll(runtime) {
+                Outcome::SettledFailure => false,
+                Outcome::Waiting => true,
+                Outcome::Uncertain | Outcome::Result(_) => {
+                    call.retry_settlement();
+                    true
+                }
+            });
     }
 
     pub(super) fn close(
