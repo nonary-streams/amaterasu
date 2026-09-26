@@ -6,15 +6,22 @@ param(
     [Parameter(Mandatory)][string]$ExpectedHead,
     [Parameter(Mandatory)][string]$TaskFile,
     [Parameter(Mandatory)][string]$RunDirectory,
-    [ValidateSet('gpt-6-luna')][string]$Model = 'gpt-6-luna',
-    [ValidateSet('max')][string]$ReasoningEffort = 'max',
-    [ValidateSet('gpt-6-luna')][string]$SubagentModel = 'gpt-6-luna',
-    [ValidateSet('xhigh')][string]$SubagentReasoningEffort = 'xhigh',
+    [ValidateSet('gpt-6-sol')][string]$Model = 'gpt-6-sol',
+    [ValidateSet('xhigh', 'medium')][string]$ReasoningEffort,
+    [ValidateSet('gpt-6-sol')][string]$SubagentModel = 'gpt-6-sol',
+    [ValidateSet('medium')][string]$SubagentReasoningEffort = 'medium',
     [switch]$Coordinator,
     [switch]$PreflightOnly
 )
 
 $ErrorActionPreference = 'Stop'
+if (!$PSBoundParameters.ContainsKey('ReasoningEffort')) {
+    $ReasoningEffort = if ($Coordinator) { 'xhigh' } else { 'medium' }
+}
+if (($Coordinator -and $ReasoningEffort -ne 'xhigh') -or
+    (!$Coordinator -and $ReasoningEffort -ne 'medium')) {
+    throw 'Coordinators require gpt-6-sol/xhigh; standalone workers require gpt-6-sol/medium.'
+}
 $worktreePath = (Resolve-Path -LiteralPath $Worktree).Path
 $taskPath = (Resolve-Path -LiteralPath $TaskFile).Path
 $runPath = [IO.Path]::GetFullPath($RunDirectory)
@@ -35,7 +42,7 @@ if (!(Test-Path -LiteralPath $buildPath -PathType Container)) {
 }
 
 function Read-Git([string[]]$GitArguments) {
-    $result = & git -C $worktreePath @GitArguments
+    $result = & git -c "safe.directory=$worktreePath" -C $worktreePath @GitArguments
     if ($LASTEXITCODE -ne 0) { throw "Git preflight failed: $GitArguments" }
     return ($result -join "`n").Trim()
 }
@@ -44,12 +51,23 @@ $actualRoot = [IO.Path]::GetFullPath((Read-Git @('rev-parse', '--show-toplevel')
 if ($actualRoot -ne [IO.Path]::GetFullPath($worktreePath)) { throw 'Not a worktree root.' }
 if ((Read-Git @('branch', '--show-current')) -ne $ExpectedBranch) { throw 'Worker branch changed.' }
 if ((Read-Git @('rev-parse', 'HEAD')) -ne $ExpectedHead) { throw 'Worker base changed.' }
-if (Read-Git @('status', '--porcelain')) { throw 'Worker worktree has uncommitted changes.' }
+$dirtyPaths = @(Read-Git @('status', '--porcelain'))
+if ($dirtyPaths.Count -eq 1 -and !$dirtyPaths[0]) { $dirtyPaths = @() }
+if (!$Coordinator -and $dirtyPaths.Count -gt 0 -and $dirtyPaths[0]) {
+    throw 'Worker worktree has uncommitted changes.'
+}
 if (!(Test-Path -LiteralPath (Join-Path $worktreePath 'AGENTS.md'))) { throw 'AGENTS.md is missing.' }
 
 $targetPath = Join-Path $buildPath 'cargo-target'
 $role = if ($Coordinator) { 'coordinator' } else { 'worker' }
-$identity = [ordered]@{ slot = $Slot; role = $role; worktree = $worktreePath; branch = $ExpectedBranch; base = $ExpectedHead; cargo_target_dir = $targetPath; model = $Model; effort = $ReasoningEffort }
+$agentSettings = if ($Coordinator) {
+    @('-c', 'agents.enabled=true', '-c', 'agents.max_concurrent_threads_per_session=3',
+      '-c', "agents.default_subagent_model=`"$SubagentModel`"",
+      '-c', "agents.default_subagent_reasoning_effort=`"$SubagentReasoningEffort`"")
+} else { @('-c', 'agents.enabled=false') }
+$modelArguments = @('--model', $Model,
+    '-c', "model_reasoning_effort=`"$ReasoningEffort`"") + $agentSettings
+$identity = [ordered]@{ slot = $Slot; role = $role; worktree = $worktreePath; branch = $ExpectedBranch; base = $ExpectedHead; dirty_paths = $dirtyPaths; cargo_target_dir = $targetPath; cargo_build_jobs = 2; model = $Model; effort = $ReasoningEffort; subagent_model = $(if ($Coordinator) { $SubagentModel } else { $null }); subagent_effort = $(if ($Coordinator) { $SubagentReasoningEffort } else { $null }); codex_model_arguments = $modelArguments }
 if ($PreflightOnly) { $identity | ConvertTo-Json; return }
 
 New-Item -ItemType Directory -Path $runPath -Force | Out-Null
@@ -78,14 +96,14 @@ Assign disjoint paths and a feature-level acceptance test. No startup-only
 sessions or model verification approval round trips. Verify checkout state in
 the same command that starts useful work. You may act on all reserved feature
 paths without per-file approval. Escalate only an actual cross-team collision.
-The runner pins this coordinator to gpt-6-luna/max and every native worker to
-gpt-6-luna/xhigh. Do not override these models or spawn Sol workers. If you are
-continuing an older coordinator session launched as Sol, stop assigning new
-work and wait for every already-running worker to finish and commit. Record
-their SHAs and the remaining task in STATUS.json/INBOX.json, then exit for root
-to relaunch a fresh Luna Max codex exec on this same team worktree. The resumed
-session reads the mailbox and commits before continuing; do not terminate or
-duplicate workers or replay completed tasks.
+The runner pins this coordinator to gpt-6-sol/xhigh and every new native worker
+to gpt-6-sol/medium. Before dispatch, read your team STATUS.json, INBOX.json,
+READY.json, existing worker commits, and current dirty paths. Preserve any
+unfinished work and reservations. Never duplicate an active writer. If a
+legacy worker is still active, let it finish, validate, and commit its current
+increment before assigning that checkout again. Any older model policy in the
+checked-out plan or task history is superseded by this runner and current inbox.
+Do not reset any worktree.
 Keep your workers doing useful work; do not become a mailbox-only manager.
 Review worker changes locally, integrate into your team branch, and publish
 READY.json in your assigned team mailbox after checks pass. Include base/head,
@@ -116,13 +134,7 @@ do not spend the batch on repeated inventory scans or status documents.
 
 $(Get-Content -LiteralPath $taskPath -Raw)
 "@
-    $agentSettings = if ($Coordinator) {
-        @('-c', 'agents.enabled=true', '-c', 'agents.max_concurrent_threads_per_session=3',
-          '-c', "agents.default_subagent_model=`"$SubagentModel`"",
-          '-c', "agents.default_subagent_reasoning_effort=`"$SubagentReasoningEffort`"")
-    } else { @('-c', 'agents.enabled=false') }
-    $arguments = @('--ask-for-approval', 'never', 'exec', '--model', $Model,
-        '-c', "model_reasoning_effort=`"$ReasoningEffort`"") + $agentSettings + @(
+    $arguments = @('--ask-for-approval', 'never', 'exec') + $modelArguments + @(
         '--sandbox', 'danger-full-access', '--cd', $worktreePath, '--json',
         '--output-last-message', "$prefix.result.md", '-')
     $instructions | & codex @arguments 1> "$prefix.events.jsonl" 2> "$prefix.stderr.log"

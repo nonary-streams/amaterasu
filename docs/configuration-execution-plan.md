@@ -55,20 +55,23 @@ implementation. There is no single global build queue serviced by a model.
 Host-global device/port/service tests remain explicitly serialized.
 
 Start a team with scripts/run_configuration_worker.ps1 -Coordinator -Slot N.
-The runner accepts slots 1 through 6, checks checkout/base/clean state in code,
+The runner accepts slots 1 through 6, checks checkout and base state in code,
 locks the team slot, enables three native workers and writes structured logs.
+Coordinator restarts may resume a dirty checkout after inspecting its paths;
+standalone workers require a clean checkout at launch.
 Without -Coordinator it remains a non-delegating standalone worker runner.
-Coordinators are pinned to GPT-6 Luna Max and their native workers are pinned to
-GPT-6 Luna X-High. The runner rejects model and reasoning-effort overrides that
-would launch Sol or change those tiers.
+Coordinators are pinned to GPT-6 Sol XHigh and their new native workers are
+pinned to GPT-6 Sol Medium. The runner rejects model or reasoning-effort
+overrides that change those tiers.
 
 Models cannot be changed inside an already-running `codex exec` session. If a
-legacy coordinator is discovered running as Sol, it must stop assigning new
-work and wait for its current workers to finish and commit. It records their
-SHAs and remaining work in the team mailbox, then exits. The root integrator
-relaunches that slot as Luna Max on the same team worktree; the new session
-reads the status, inbox, ready file and worker commits before continuing. Never
-kill or duplicate active workers to switch the coordinator model.
+legacy coordinator is still running, ask it to stop assigning new work and let
+its active workers finish, validate, and commit. It records their SHAs, checks,
+unfinished work, and reservations in the team mailbox before exiting. The root
+integrator relaunches each available slot independently as Sol XHigh on its
+existing team worktree. The new session reads STATUS.json, INBOX.json,
+READY.json, and worker commits before dispatching Sol Medium workers. Never
+kill or duplicate active workers to switch models.
 
 Run local validation with:
 
@@ -204,13 +207,9 @@ Amaterasu has no UPnP mapping. The pinned implementation is in `src/config.cpp`,
 These transport and exposure gaps keep this ID pending.
 
 Each worker commits its owned implementation after rustfmt, meaningful tests,
-and Clippy. Use the repository's Nonary Git identity and include these exact
-lines in every plan or coordination commit, including mainline landing updates:
-
-```text
-Orchestrated By: GPT-6 Luna Max
-Planned By: GPT-6 Astra High
-```
+and Clippy. Use the repository's Nonary Git identity and actual session model
+and effort for new commit attribution. Preserve attribution in historical
+commits; do not rewrite it to match the new launch policy.
 
 Steam catalog reconciliation now owns explicit exclusions, app type selection,
 recent-play selection, and the policy for retaining stale entries in all-game
