@@ -173,6 +173,9 @@ fn prepare_configuration(
             ));
         }
     }
+    if hdr_only_target(configuration, &before, selected, route).is_some() {
+        return Ok(before);
+    }
     let requested = match selected {
         Some((selected, shape)) => {
             apply::preserving(configuration, &before, selected, route, shape)?
@@ -202,6 +205,26 @@ fn apply_configuration(
             "topology_changed",
             "display configuration changed before the durable apply boundary",
         ));
+    }
+    if let Some(target) = hdr_only_target(configuration, before, selected, route) {
+        guard()?;
+        if before.revision()? != query::snapshot()?.revision()? {
+            return Err(DisplayError::new(
+                "topology_changed",
+                "display configuration changed before the HDR-only apply boundary",
+            ));
+        }
+        let enabled = configuration
+            .displays
+            .iter()
+            .find(|display| display.id.eq_ignore_ascii_case(&target.id))
+            .and_then(|display| display.hdr_enabled)
+            .expect("HDR-only target has a requested state");
+        query::set_advanced_color(target, enabled).map_err(DisplayError::after_mutation)?;
+        let final_state = verify_applied_configuration(configuration, query::snapshot())?;
+        verify_requested_hdr(configuration, &final_state)?;
+        verify_exact_hdr_only_result(before, target, enabled, &final_state)?;
+        return Ok(());
     }
     let requested = match selected {
         Some((selected, shape)) => {
@@ -279,6 +302,60 @@ fn apply_configuration(
         return Err(DisplayError::new(
             "verification_failed",
             "untouched Windows display path changed during apply",
+        )
+        .after_mutation());
+    }
+    Ok(())
+}
+
+fn hdr_only_target<'a>(
+    configuration: &Configuration,
+    before: &'a Snapshot,
+    selected: Option<(&str, TopologyShape)>,
+    route: Option<&RouteBinding>,
+) -> Option<&'a crate::model::DisplayPath> {
+    if selected.is_some()
+        || route.is_some()
+        || !apply::verifies(configuration, before)
+        || before.paths.iter().any(|path| {
+            path.source.pixel_format
+                != windows_sys::Win32::Devices::Display::DISPLAYCONFIG_PIXELFORMAT_32BPP
+                || path.path_flags != windows_sys::Win32::Graphics::Gdi::DISPLAYCONFIG_PATH_ACTIVE
+        })
+    {
+        return None;
+    }
+    let mut changed = configuration.displays.iter().filter_map(|display| {
+        let saved = before
+            .paths
+            .iter()
+            .find(|path| path.id.eq_ignore_ascii_case(&display.id))?;
+        (saved.hdr_enabled.is_some()
+            && display.hdr_enabled.is_some()
+            && display.hdr_enabled != saved.hdr_enabled)
+            .then_some(saved)
+    });
+    let target = changed.next()?;
+    changed.next().is_none().then_some(target)
+}
+
+fn verify_exact_hdr_only_result(
+    before: &Snapshot,
+    target: &crate::model::DisplayPath,
+    enabled: bool,
+    current: &Snapshot,
+) -> DisplayResult<()> {
+    let mut exact_expected = before.clone();
+    exact_expected
+        .paths
+        .iter_mut()
+        .find(|path| path.id.eq_ignore_ascii_case(&target.id))
+        .expect("HDR-only target belongs to the baseline")
+        .hdr_enabled = Some(enabled);
+    if exact_expected.revision()? != current.revision()? {
+        return Err(DisplayError::new(
+            "verification_failed",
+            "HDR-only apply changed another CCD or display state",
         )
         .after_mutation());
     }
@@ -1199,6 +1276,82 @@ mod tests {
         rebound.paths[0].source_name = "foreign source".into();
         let error = verify_restoration_routes(&saved, &rebound).unwrap_err();
         assert_eq!(error.code, "topology_changed");
+        assert!(error.may_have_changed);
+    }
+
+    #[test]
+    fn hdr_only_path_skips_ccd_only_for_one_changed_active_target() {
+        let before = Snapshot {
+            format_version: 1,
+            paths: vec![
+                readback_path("monitor.one", 0, Some(false)),
+                readback_path("monitor.two", 1920, Some(false)),
+            ],
+        };
+        let mut wanted = before.configuration().unwrap();
+        wanted.displays[0].hdr_enabled = Some(true);
+        assert_eq!(
+            hdr_only_target(&wanted, &before, None, None).map(|path| path.id.as_str()),
+            Some("monitor.one")
+        );
+        assert!(
+            hdr_only_target(
+                &wanted,
+                &before,
+                Some(("monitor.one", TopologyShape::PreserveActive)),
+                None
+            )
+            .is_none()
+        );
+        wanted.displays[0].width += 1;
+        assert!(hdr_only_target(&wanted, &before, None, None).is_none());
+        wanted.displays[0].width -= 1;
+        wanted.displays[0].x += 1;
+        assert!(hdr_only_target(&wanted, &before, None, None).is_none());
+        wanted.displays[0].x -= 1;
+        wanted.displays[1].hdr_enabled = Some(true);
+        assert!(hdr_only_target(&wanted, &before, None, None).is_none());
+        wanted.displays[1].hdr_enabled = Some(false);
+        let mut noncanonical = before.clone();
+        noncanonical.paths[0].source.pixel_format = 3;
+        assert!(hdr_only_target(&wanted, &noncanonical, None, None).is_none());
+        noncanonical.paths[0].source.pixel_format =
+            windows_sys::Win32::Devices::Display::DISPLAYCONFIG_PIXELFORMAT_32BPP;
+        noncanonical.paths[0].path_flags = 0;
+        assert!(hdr_only_target(&wanted, &noncanonical, None, None).is_none());
+    }
+
+    #[test]
+    fn hdr_only_path_requires_queryable_recovery_baseline() {
+        let mut before = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.one", 0, None)],
+        };
+        let mut wanted = before.configuration().unwrap();
+        wanted.displays[0].hdr_enabled = Some(true);
+        assert!(hdr_only_target(&wanted, &before, None, None).is_none());
+        before.paths[0].hdr_enabled = Some(false);
+        assert!(hdr_only_target(&wanted, &before, None, None).is_some());
+    }
+
+    #[test]
+    fn hdr_only_result_preserves_nonpreferred_scaling_and_signal_timing() {
+        let before = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.one", 0, Some(false))],
+        };
+        assert_ne!(
+            before.paths[0].scaling,
+            windows_sys::Win32::Devices::Display::DISPLAYCONFIG_SCALING_PREFERRED
+        );
+        let mut after = before.clone();
+        after.paths[0].hdr_enabled = Some(true);
+        verify_exact_hdr_only_result(&before, &before.paths[0], true, &after).unwrap();
+
+        after.paths[0].signal.pixel_rate += 1;
+        let error =
+            verify_exact_hdr_only_result(&before, &before.paths[0], true, &after).unwrap_err();
+        assert_eq!(error.code, "verification_failed");
         assert!(error.may_have_changed);
     }
 }

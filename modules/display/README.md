@@ -221,7 +221,7 @@ If the saved monitor/source route is unavailable, the journal remains armed.
 1. Capture every active classic CCD path, including source modes/positions,
    target signal timings, rotation, scaling, refresh, clone-source association,
    path priority, and queryable per-target HDR state. Perform native
-   `SDC_VALIDATE` without effects.
+   `SDC_VALIDATE` without effects for CCD-changing requests.
 2. Store the full recovery snapshot, owner and generated lease in
    `physical-display/recovery`, using the state namespace revision CAS. Require
    a successful durable acknowledgement before any native apply.
@@ -229,11 +229,18 @@ If the saved monitor/source route is unavailable, the journal remains armed.
    Immediately before `SetDisplayConfig`, use the runtime's provider-only
    `CheckRequest` to reject cancelled/expired requests.
 4. Apply temporary CCD state with `SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY`;
-   force the mode set through the driver. Do not save session settings to the
-   Windows persistence database and do not use `SDC_ALLOW_CHANGES`.
+   force the mode set through the driver. A request changing only one active,
+   queryable HDR state skips both CCD validation and apply when every requested
+   display mode, position, rotation and clone association already matches the
+   durable snapshot. This path preserves the existing native pixel format,
+   signal timing, scaling, scan ordering and route; it requires 32bpp active
+   paths and does not handle activation or route changes. Do not save session
+   settings to the Windows persistence database and do not use
+   `SDC_ALLOW_CHANGES`.
 5. Query and verify the requested mode/topology. Apply any HDR request with
    `DisplayConfigSetDeviceInfo` and read back its state, then verify the requested
-   mode/topology again. A potentially partial
+   mode/topology again. The HDR-only path checks the entire resulting snapshot
+   against its baseline with only the requested HDR bit changed. A potentially partial
    failed apply attempts rollback to the durable snapshot. Failed rollback
    retains the journal and reports `recovery_required:true` with the lease.
 6. Explicit restore rebinds saved monitor identities to current adapter IDs,
