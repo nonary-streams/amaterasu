@@ -209,6 +209,57 @@ try {
         & $extension { Assert-SunshineIdentity 120 100 100 'relative.exe' 'relative.exe' 'amaterasu worker-user-serve' }
     } 'relative image path was accepted'
 
+    $connections = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+    $fullscreen = New-MockConnection ('e' * 32) $cache
+    $fullscreen.Role = 'launcher'; $fullscreen.Mode = 'fullscreen'; $fullscreen.Stream = [System.IO.MemoryStream]::new()
+    $fullscreen.ShutdownRequested = [System.Threading.ManualResetEventSlim]::new($false)
+    $fullscreen.ShutdownWritten = [System.Threading.ManualResetEventSlim]::new($false)
+    $desktop = New-MockConnection ('f' * 32) $cache
+    $desktop.Role = 'launcher'; $desktop.Mode = ''; $desktop.Stream = [System.IO.MemoryStream]::new()
+    $desktop.ShutdownRequested = [System.Threading.ManualResetEventSlim]::new($false)
+    $desktop.ShutdownWritten = [System.Threading.ManualResetEventSlim]::new($false)
+    $sunshine = New-MockConnection ('2' * 32) $cache
+    $sunshine.Role = 'sunshine'; $sunshine.Mode = ''; $sunshine.Stream = [System.IO.MemoryStream]::new()
+    $sunshine.ShutdownRequested = [System.Threading.ManualResetEventSlim]::new($false)
+    $sunshine.ShutdownWritten = [System.Threading.ManualResetEventSlim]::new($false)
+    Assert-True $connections.TryAdd('fullscreen', $fullscreen) 'fullscreen shutdown setup failed'
+    Assert-True $connections.TryAdd('desktop', $desktop) 'desktop shutdown setup failed'
+    Assert-True $connections.TryAdd('sunshine', $sunshine) 'sunshine shutdown setup failed'
+    Assert-True (& $extension { param($connection) Add-Frame $connection @('queued-before-shutdown') } $fullscreen) 'shutdown queue setup failed'
+    $writer = [System.IO.StringWriter]::new()
+    $writerWorker = [PowerShell]::Create()
+    try {
+        [void]$writerWorker.AddScript('param($path,$connection,$writer) Import-Module -Name $path -Force; [void]$connection.ShutdownRequested.Wait(2000); $module = Get-Module AmaterasuPlaynite; & $module { param($c,$w) Write-FullscreenShutdown $c $w } $connection $writer').AddArgument($ModulePath).AddArgument($fullscreen).AddArgument($writer)
+        $writerHandle = $writerWorker.BeginInvoke()
+        & $extension { param($items) $script:Connections = $items; $script:Stop = [System.Threading.CancellationTokenSource]::new(); $script:Subscriptions = @(); $script:Background = $null; OnApplicationStopped } $connections
+        [void]$writerWorker.EndInvoke($writerHandle)
+        Assert-True $fullscreen.ShutdownWritten.IsSet 'shutdown did not wait for writer confirmation'
+        $shutdownLines = @($writer.ToString().Trim().Split("`n") | Where-Object { $_ })
+        Assert-Equal $shutdownLines.Count 1 'fullscreen shutdown emitted multiple statuses'
+        Assert-Equal ($shutdownLines[0] | ConvertFrom-Json).status.name 'playniteExiting' 'fullscreen shutdown status missing'
+        Assert-Equal $fullscreen.Queue.Count 1 'shutdown did not bypass queued frames'
+        Assert-True (-not $desktop.ShutdownRequested.IsSet) 'desktop launcher received fullscreen shutdown'
+        Assert-True (-not $sunshine.ShutdownRequested.IsSet) 'sunshine received fullscreen shutdown'
+        Assert-True (-not $fullscreen.Stream.CanRead) 'fullscreen stream was not closed after confirmation'
+        Assert-True (-not $desktop.Stream.CanRead) 'desktop stream was not closed'
+        Assert-True (-not $sunshine.Stream.CanRead) 'sunshine stream was not closed'
+    } finally { $writerWorker.Dispose(); $writer.Dispose(); $fullscreen.Queue.Dispose(); $desktop.Queue.Dispose(); $sunshine.Queue.Dispose() }
+
+    $dead = New-MockConnection ('1' * 32) $cache
+    $dead.Role = 'launcher'; $dead.Mode = 'fullscreen'; $dead.Stream = [System.IO.MemoryStream]::new()
+    $dead.ShutdownRequested = [System.Threading.ManualResetEventSlim]::new($false)
+    $dead.ShutdownWritten = [System.Threading.ManualResetEventSlim]::new($false)
+    $deadConnections = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+    Assert-True $deadConnections.TryAdd('dead', $dead) 'dead writer setup failed'
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    & $extension { param($items) $script:Connections = $items; $script:Stop = [System.Threading.CancellationTokenSource]::new(); $script:Subscriptions = @(); $script:Background = $null; OnApplicationStopped } $deadConnections
+    $timer.Stop()
+    Assert-True ($timer.ElapsedMilliseconds -lt 1500) 'dead writer blocked Playnite shutdown'
+    Assert-True $dead.ShutdownRequested.IsSet 'dead writer did not receive shutdown request'
+    Assert-True (-not $dead.ShutdownWritten.IsSet) 'dead writer falsely confirmed a write'
+    Assert-True (-not $dead.Stream.CanRead) 'dead writer pipe was not closed'
+    $dead.Queue.Dispose()
+
     Write-Host 'PASS Playnite extension mock protocol, identity, bounds, and packaging checks'
 } finally {
     Remove-Module $extension -Force

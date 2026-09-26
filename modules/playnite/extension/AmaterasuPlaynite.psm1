@@ -284,6 +284,33 @@ function Invoke-ExtensionCommand($Connection, $Message) {
     }
 }
 
+function Write-FullscreenShutdown($Connection, $Writer) {
+    if (-not $Connection.ShutdownRequested.IsSet -or $Connection.ShutdownWritten.IsSet) { return $false }
+    $Writer.WriteLine((Convert-FrameLine @{ type='status'; status=@{ name='playniteExiting' } }))
+    $Writer.Flush()
+    $Connection.ShutdownWritten.Set()
+    return $true
+}
+
+function Request-FullscreenShutdown($Connections) {
+    $pending = [System.Collections.Generic.List[object]]::new()
+    foreach ($connection in $Connections.Values) {
+        if ($connection.Role -eq 'launcher' -and $connection.Mode -eq 'fullscreen' -and $connection.ShutdownRequested -and $connection.ShutdownWritten) {
+            $connection.ShutdownRequested.Set()
+            $pending.Add($connection)
+        }
+    }
+    return $pending.ToArray()
+}
+
+function Await-FullscreenShutdown([object[]]$Connections, [int]$TimeoutMilliseconds) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    foreach ($connection in $Connections) {
+        $remaining = [int][Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        [void]$connection.ShutdownWritten.Wait($remaining)
+    }
+}
+
 function Serve-DataConnection($Stream, $Api, $Dispatcher, $Connections, $Stop, $Signals, $Cache, $Slots, [uint32]$ControlPid) {
     $script:Connections = $Connections
     $script:Stop = $Stop
@@ -295,7 +322,7 @@ function Serve-DataConnection($Stream, $Api, $Dispatcher, $Connections, $Stop, $
     try {
         $hello = ConvertFrom-Json -InputObject (Read-BoundedHello $Stream) -ErrorAction Stop
         Assert-Hello $Stream $hello $ControlPid
-        $connection = @{ Role=[string]$hello.role; Nonce=[string]$hello.nonce; GameId=[string]$hello.gameId; Mode=[string]$hello.mode; Stream=$Stream; Api=$Api; Dispatcher=$Dispatcher; Signals=$Signals; Cache=$Cache; Queue=[System.Collections.Concurrent.BlockingCollection[object]]::new(8); LastDirty=[DateTime]::MinValue }
+        $connection = @{ Role=[string]$hello.role; Nonce=[string]$hello.nonce; GameId=[string]$hello.gameId; Mode=[string]$hello.mode; Stream=$Stream; Api=$Api; Dispatcher=$Dispatcher; Signals=$Signals; Cache=$Cache; Queue=[System.Collections.Concurrent.BlockingCollection[object]]::new(8); ShutdownRequested=[System.Threading.ManualResetEventSlim]::new($false); ShutdownWritten=[System.Threading.ManualResetEventSlim]::new($false); LastDirty=[DateTime]::MinValue }
         if ($connection.Role -eq 'sunshine') {
             foreach ($old in $Connections.Values) { if ($old.Role -eq 'sunshine') { $old.Stream.Dispose() } }
         }
@@ -304,6 +331,7 @@ function Serve-DataConnection($Stream, $Api, $Dispatcher, $Connections, $Stop, $
         if ($connection.Role -eq 'launcher') { Replay-RunningGame $connection }
         $read = $reader.ReadLineAsync()
         while (-not $Stop.IsCancellationRequested -and $Stream.IsConnected) {
+            if (Write-FullscreenShutdown $connection $writer) { break }
             if ($read.IsCompleted) {
                 $line = $read.GetAwaiter().GetResult()
                 if ($null -eq $line) { break }
@@ -317,6 +345,7 @@ function Serve-DataConnection($Stream, $Api, $Dispatcher, $Connections, $Stop, $
                 $connection.LastDirty = $dirtyAt
                 Queue-Snapshot $connection
             }
+            if (Write-FullscreenShutdown $connection $writer) { break }
             $frame = $null
             if ($connection.Queue.TryTake([ref]$frame, 100)) {
                 foreach ($line in [string[]]$frame) { $writer.WriteLine($line) }
@@ -417,6 +446,8 @@ function OnLibraryUpdated() {
 }
 
 function OnApplicationStopped() {
+    $pending = @(Request-FullscreenShutdown $script:Connections)
+    Await-FullscreenShutdown $pending 500
     $script:Stop.Cancel()
     foreach ($connection in $script:Connections.Values) { $connection.Stream.Dispose() }
     foreach ($subscription in $script:Subscriptions) { Unregister-Event -SubscriptionId $subscription.SubscriptionId -ErrorAction SilentlyContinue }
