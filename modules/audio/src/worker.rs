@@ -27,6 +27,8 @@ struct RecoveryPolicy {
 }
 
 pub trait Source: Send {
+    /// Return queued packets before a terminal error; once drained, report
+    /// the error here even if health has already marked the source failed.
     fn read(&mut self) -> AudioResult<Option<Packet>>;
     fn health(&self) -> Health;
 }
@@ -192,13 +194,19 @@ impl Worker {
 
 impl Source for Worker {
     fn read(&mut self) -> AudioResult<Option<Packet>> {
-        if let Some(error) = self.health().failure {
-            return Err(error);
-        }
         match self.packets.try_recv() {
             Ok(packet) => Ok(Some(packet)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err("audio_worker_stopped"),
+            Err(state) => {
+                // Capture may fail after it has already queued valid PCM. Drain
+                // those packets in order before exposing the terminal failure.
+                if let Some(error) = self.health().failure {
+                    return Err(error);
+                }
+                match state {
+                    TryRecvError::Empty => Ok(None),
+                    TryRecvError::Disconnected => Err("audio_worker_stopped"),
+                }
+            }
         }
     }
 
@@ -465,6 +473,57 @@ mod tests {
         assert_eq!(health.dropped_packets, 1);
         assert_eq!(health.discontinuities, 2);
         assert_eq!(receiver.try_recv().unwrap().sequence, 0);
+    }
+
+    #[test]
+    fn queued_pcm_drains_before_terminal_capture_failure_and_releases_capture() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let capture = FakeCapture::new(
+            format,
+            [
+                Ok(Some(packet(1_000, 0))),
+                Ok(Some(packet(2_000, 1))),
+                Err("audio_capture_failed"),
+            ],
+        )
+        .with_drop_counter(drops.clone());
+        let (sender, packets) = mpsc::sync_channel(QUEUE_PACKETS);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_health = health.clone();
+        let thread_stop = stop.clone();
+        let thread = thread::spawn(move || {
+            run_capture_loop(
+                Box::new(capture),
+                || panic!("terminal capture failure must not reopen"),
+                &sender,
+                &thread_health,
+                &thread_stop,
+                RecoveryPolicy {
+                    expected_endpoint: "render.fixed".into(),
+                    expected_format: format,
+                    follow_console_default: false,
+                    retry_delay: Duration::ZERO,
+                },
+            );
+        });
+        let mut worker = Worker {
+            packets,
+            health,
+            stop,
+            thread: Some(thread),
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while worker.health().failure.is_none() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(worker.health().failure, Some("audio_capture_failed"));
+        assert_eq!(worker.read().unwrap().unwrap().sequence, 0);
+        assert_eq!(worker.read().unwrap().unwrap().sequence, 1);
+        assert_eq!(worker.read().err(), Some("audio_capture_failed"));
+        drop(worker);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

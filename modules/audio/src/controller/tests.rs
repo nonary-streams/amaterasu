@@ -88,7 +88,13 @@ struct FakeSource {
 
 impl Source for FakeSource {
     fn read(&mut self) -> AudioResult<Option<Packet>> {
-        Ok(self.packets.pop_front())
+        if let Some(packet) = self.packets.pop_front() {
+            return Ok(Some(packet));
+        }
+        if let Some(error) = self.health().failure {
+            return Err(error);
+        }
+        Ok(None)
     }
 
     fn health(&self) -> Health {
@@ -950,6 +956,41 @@ fn rejected_packet_can_be_delivered_after_capture_fails_then_stream_is_released(
         unsafe { controller.read("alice", stream_id, callback) },
         MEDIA_CLOSED
     );
+}
+
+#[test]
+fn queued_packet_reaches_sink_before_terminal_capture_failure() {
+    let (mut controller, observed) = controller(true);
+    let stream_id = controller.handle("alice", open()).unwrap().created.unwrap();
+    observed.health.lock().unwrap().failure = Some("audio_capture_failed");
+    let mut sink = Sink {
+        reject: true,
+        packets: Vec::new(),
+    };
+    let callback = AudioSink {
+        context: (&mut sink as *mut Sink).cast(),
+        write,
+    };
+
+    // SAFETY: callback context remains live through each synchronous read.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        MEDIA_BUSY
+    );
+    sink.reject = false;
+    // SAFETY: callback context remains live through each synchronous read.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        STATUS_OK
+    );
+    assert_eq!(sink.packets[0].3, 7);
+    // SAFETY: callback context remains live through each synchronous read.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        MEDIA_BACKEND_ERROR
+    );
+    controller.close("alice", stream_id).unwrap();
+    assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
 }
 
 unsafe fn bind(factory: &Factory, owner: &str) -> *const AudioCaptureApi {
