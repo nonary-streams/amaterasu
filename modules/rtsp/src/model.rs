@@ -429,10 +429,15 @@ pub struct Open {
     pub frame_limiter_settings: Option<serde_json::Value>,
     #[serde(default)]
     pub frame_limiter_executable_path: Option<String>,
-    /// Reserved for an attested full display configuration. Open rejects every
-    /// non-null value until launch provenance can be verified at this boundary.
+    /// Full display configuration, admitted only after Launch verifies its
+    /// frozen policy source and authenticated operation binding.
     #[serde(default)]
     pub display_request: Option<serde_json::Value>,
+    /// Private Launch-issued capability, bound to this Open operation.
+    #[serde(default)]
+    pub display_admission_token: Option<String>,
+    #[serde(default)]
+    pub application_operation_id: Option<String>,
     /// Frozen sparse source policy for exact readback; this alone never changes a display.
     #[serde(default)]
     pub display_policy_snapshot: Option<serde_json::Value>,
@@ -496,12 +501,35 @@ pub struct Open {
     pub profile: Profile,
 }
 impl Open {
+    pub fn display_request_sha256(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let request = self.display_request.as_ref()?;
+        let bytes = serde_json::to_vec(request).ok()?;
+        let digest = Sha256::digest(bytes);
+        Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
         if self.frame_limiter_settings.is_some() != self.frame_limiter_executable_path.is_some() {
             return Err("invalid_frame_limiter_snapshot");
         }
-        if self.display_request.is_some() {
-            return Err("display_request_unattested");
+        match (
+            &self.display_request,
+            &self.display_admission_token,
+            &self.application_operation_id,
+            &self.display_policy_snapshot,
+        ) {
+            (None, None, None, _) => {}
+            (Some(request), Some(token), Some(operation), Some(snapshot))
+                if valid_display_request(request)
+                    && valid_display_policy_snapshot(snapshot)
+                    && snapshot.as_object().is_some_and(|fields| fields.len() == 7)
+                    && token.len() == 64
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    && valid_name(operation) => {}
+            _ => return Err("display_request_unattested"),
         }
         if self
             .display_policy_snapshot
@@ -691,6 +719,9 @@ impl Open {
         if let Some(path) = &self.frame_limiter_executable_path {
             payload["frame_limiter_executable_path"] = serde_json::json!(path);
         }
+        if let Some(request) = &self.display_request {
+            payload["display_request"] = request.clone();
+        }
         payload
     }
 
@@ -750,6 +781,155 @@ impl Open {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayTopology {
+    displays: Vec<DisplayMode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayMode {
+    id: String,
+    width: u32,
+    height: u32,
+    refresh: DisplayRefresh,
+    #[serde(rename = "x")]
+    _x: i32,
+    #[serde(rename = "y")]
+    _y: i32,
+    rotation: Option<String>,
+    #[serde(rename = "hdr_enabled")]
+    _hdr_enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayRefresh {
+    numerator: u32,
+    denominator: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayModePolicy {
+    display_id: String,
+    #[serde(rename = "remapping")]
+    _remapping: DisplayRemapping,
+    #[serde(rename = "context")]
+    _context: DisplayModeContext,
+    resolution_option: Option<String>,
+    #[serde(rename = "manual_resolution")]
+    _manual_resolution: Option<String>,
+    refresh_rate_option: Option<String>,
+    #[serde(rename = "manual_refresh_rate")]
+    _manual_refresh_rate: Option<String>,
+    hdr_option: Option<String>,
+    #[serde(rename = "effective_client_hdr_request")]
+    _effective_client_hdr_request: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayRemapping {
+    #[serde(default, rename = "mixed")]
+    _mixed: Vec<DisplayRemappingEntry>,
+    #[serde(default, rename = "resolution_only")]
+    _resolution_only: Vec<DisplayRemappingEntry>,
+    #[serde(default, rename = "refresh_rate_only")]
+    _refresh_rate_only: Vec<DisplayRemappingEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayRemappingEntry {
+    #[serde(default, rename = "requested_resolution")]
+    _requested_resolution: String,
+    #[serde(default, rename = "requested_fps")]
+    _requested_fps: String,
+    #[serde(default, rename = "final_resolution")]
+    _final_resolution: String,
+    #[serde(default, rename = "final_refresh_rate")]
+    _final_refresh_rate: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayModeContext {
+    #[serde(rename = "resolution_is_automatic")]
+    _resolution_is_automatic: bool,
+    #[serde(rename = "refresh_rate_is_automatic")]
+    _refresh_rate_is_automatic: bool,
+    #[serde(rename = "client_display_mode_override")]
+    _client_display_mode_override: bool,
+    #[serde(rename = "optimize_game_settings")]
+    _optimize_game_settings: bool,
+}
+
+fn valid_display_request(request: &serde_json::Value) -> bool {
+    let Some(fields) = request.as_object().filter(|fields| fields.len() == 2) else {
+        return false;
+    };
+    let Ok(topology) = serde_json::from_value::<DisplayTopology>(request["configuration"].clone())
+    else {
+        return false;
+    };
+    if topology.displays.is_empty() || topology.displays.len() > 16 {
+        return false;
+    }
+    let mut targets = std::collections::BTreeSet::new();
+    for display in &topology.displays {
+        if display.id.is_empty()
+            || display.id.len() > 4096
+            || display.width == 0
+            || display.height == 0
+            || display.refresh.numerator == 0
+            || display.refresh.denominator == 0
+            || display.rotation.as_deref().is_some_and(|rotation| {
+                !matches!(
+                    rotation,
+                    "identity" | "rotate90" | "rotate180" | "rotate270"
+                )
+            })
+            || !targets.insert(display.id.to_ascii_lowercase())
+        {
+            return false;
+        }
+    }
+    let policies: Vec<&serde_json::Value> =
+        match (fields.get("mode_policy"), fields.get("mode_policies")) {
+            (Some(policy), None) if targets.len() == 1 => vec![policy],
+            (None, Some(serde_json::Value::Array(policies))) if policies.len() == targets.len() => {
+                policies.iter().collect()
+            }
+            _ => return false,
+        };
+    let mut policy_targets = std::collections::BTreeSet::new();
+    for raw in policies {
+        let Ok(policy) = serde_json::from_value::<DisplayModePolicy>(raw.clone()) else {
+            return false;
+        };
+        let id = policy.display_id.to_ascii_lowercase();
+        if !targets.contains(&id)
+            || !policy_targets.insert(id)
+            || policy
+                .resolution_option
+                .as_deref()
+                .is_some_and(|option| !matches!(option, "auto" | "disabled" | "manual"))
+            || policy.refresh_rate_option.as_deref().is_some_and(|option| {
+                !matches!(option, "auto" | "disabled" | "manual" | "prefer_highest")
+            })
+            || policy
+                .hdr_option
+                .as_deref()
+                .is_some_and(|option| !matches!(option, "auto" | "disabled"))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
     let Some(fields) = snapshot.as_object() else {
         return false;
@@ -766,27 +946,45 @@ fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
     let Some(certificate_id) = snapshot["certificate_id"].as_str() else {
         return false;
     };
-    if fields.len() != 5
+    if !matches!(fields.len(), 5 | 7)
+        || (fields.len() == 7
+            && (snapshot
+                .get("global_revision")
+                .is_none_or(|revision| !revision.is_null() && !revision.is_u64())
+                || !snapshot["global_overrides"].is_object()))
         || snapshot["catalog_revision"].as_u64().is_none()
         || certificate_id.len() != 64
         || !certificate_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || application.keys().chain(client.keys()).any(|key| {
-            !matches!(
-                key.as_str(),
-                "dd_mode_remapping"
-                    | "dd_resolution_option"
-                    | "dd_manual_resolution"
-                    | "dd_refresh_rate_option"
-                    | "dd_manual_refresh_rate"
-                    | "dd_hdr_option"
-                    | "dd_configuration_option"
-                    | "dd_hdr_request_override"
+        || application
+            .keys()
+            .chain(client.keys())
+            .chain(
+                snapshot["global_overrides"]
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|overrides| overrides.keys()),
             )
-        })
+            .any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "dd_mode_remapping"
+                        | "dd_resolution_option"
+                        | "dd_manual_resolution"
+                        | "dd_refresh_rate_option"
+                        | "dd_manual_refresh_rate"
+                        | "dd_hdr_option"
+                        | "dd_configuration_option"
+                        | "dd_hdr_request_override"
+                )
+            })
     {
         return false;
     }
-    let mut resolved = application.clone();
+    let mut resolved = snapshot["global_overrides"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    resolved.extend(application.clone());
     resolved.extend(client.clone());
     &resolved == effective
 }
@@ -1014,12 +1212,6 @@ mod tests {
         input["display_request"] = display_request;
         let request: Open = serde_json::from_value(input.clone()).unwrap();
         assert_eq!(request.validate(false), Err("display_request_unattested"));
-        assert!(
-            request
-                .prepare("prepare", None)
-                .get("display_request")
-                .is_none()
-        );
         input["display_policy_snapshot"] = json!({
             "catalog_revision":7,
             "certificate_id":"ab".repeat(32),
@@ -1035,6 +1227,50 @@ mod tests {
                 .get("display_request")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn attested_display_request_keeps_exact_modes_and_rejects_incomplete_policy() {
+        let mut input = open_json();
+        let request = json!({
+            "configuration":{"displays":[
+                {"id":"one","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0},
+                {"id":"two","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":1920,"y":0}
+            ]},
+            "mode_policies":[
+                {"display_id":"one","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}},
+                {"display_id":"two","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}}
+            ]
+        });
+        input["display_request"] = request.clone();
+        input["display_admission_token"] = json!("ab".repeat(32));
+        input["application_operation_id"] = json!("launch-one");
+        input["display_policy_snapshot"] = json!({
+            "global_revision":1,"global_overrides":{},"catalog_revision":0,
+            "certificate_id":"cd".repeat(32),"application_overrides":{},
+            "client_overrides":{},"effective_overrides":{}
+        });
+        let selected: Open = serde_json::from_value(input.clone()).unwrap();
+        selected.validate(false).unwrap();
+        assert_eq!(
+            selected.prepare("prepare", None)["display_request"],
+            request
+        );
+        assert_eq!(selected.display_request_sha256().unwrap().len(), 64);
+
+        input["display_request"]["mode_policies"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        let incomplete: Open = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(
+            incomplete.validate(false),
+            Err("display_request_unattested")
+        );
+        input["display_request"] = request;
+        input["display_request"]["configuration"]["displays"][0]["unexpected"] = json!(true);
+        let malformed: Open = serde_json::from_value(input).unwrap();
+        assert_eq!(malformed.validate(false), Err("display_request_unattested"));
     }
 
     #[test]

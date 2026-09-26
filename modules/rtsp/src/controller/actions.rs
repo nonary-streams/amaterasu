@@ -42,7 +42,17 @@ impl Controller {
         runtime: &RuntimeClient,
     ) {
         match operation {
-            Operation::Open(config) => self.open(request, caller, *config, now, remaining, runtime),
+            Operation::Open(config) => self.open(
+                OpenRequest {
+                    request,
+                    caller,
+                    config: *config,
+                    deadline: now.saturating_add(remaining.min(PREPARE_BUDGET_MS)),
+                },
+                now,
+                runtime,
+                false,
+            ),
             Operation::NetworkConfigure {
                 port,
                 address_family,
@@ -67,13 +77,17 @@ impl Controller {
 
     pub(super) fn open(
         &mut self,
-        request: u64,
-        caller: String,
-        config: Open,
-        now: u64,
-        remaining: u64,
+        input: OpenRequest,
+        _now: u64,
         runtime: &RuntimeClient,
+        verified: bool,
     ) {
+        let OpenRequest {
+            request,
+            caller,
+            config,
+            deadline,
+        } = input;
         if !self.settings.enabled {
             rpc::complete(runtime, request, error("disabled"));
             return;
@@ -120,6 +134,49 @@ impl Controller {
             rpc::complete(runtime, request, error("capacity_exceeded"));
             return;
         }
+        if config.display_request.is_some() && !verified {
+            if caller != "amaterasu.nvhttp" {
+                rpc::complete(runtime, request, error("permission_denied"));
+                return;
+            }
+            let digest = config
+                .display_request_sha256()
+                .expect("validated display request");
+            let snapshot = config
+                .display_policy_snapshot
+                .as_ref()
+                .expect("validated snapshot");
+            let token = config
+                .display_admission_token
+                .as_deref()
+                .expect("validated token");
+            let payload = json!({
+                "action":"verify_display_admission",
+                "token":token,
+                "application_operation_id":config.application_operation_id,
+                "rtsp_operation_id":config.operation_id,
+                "request_sha256":digest,
+                "display_policy_snapshot":snapshot,
+                "certificate_id":snapshot["certificate_id"],
+                "catalog_revision":snapshot["catalog_revision"],
+            });
+            let call = Call::for_service(
+                "amaterasu.launch/1",
+                payload,
+                format!("rtsp-display-{}", &token[..32]),
+                Some(request),
+            );
+            self.display_admission = Some(DisplayAdmission {
+                request,
+                caller,
+                config,
+                deadline,
+                request_sha256: digest,
+                verified: false,
+                call,
+            });
+            return;
+        }
         let (ticket, session_token, udp_discovery) = match self.new_identity(config.discover_peers)
         {
             Ok(identity) => identity,
@@ -129,7 +186,7 @@ impl Controller {
             }
         };
         let url = format!("rtspenc://{local}/launch-{ticket:016x}");
-        let expires = now.saturating_add(remaining.min(PREPARE_BUDGET_MS));
+        let expires = deadline;
         let record = Record {
             id: ticket,
             owner: caller,
@@ -169,6 +226,67 @@ impl Controller {
             network: None,
             deadline: expires,
         });
+    }
+
+    pub(super) fn advance_display_admission(&mut self, runtime: &RuntimeClient, now: u64) {
+        let Some(mut admission) = self.display_admission.take() else {
+            return;
+        };
+        if admission.verified {
+            if self.job.is_some() {
+                self.display_admission = Some(admission);
+            } else if now < admission.deadline && rpc::active(runtime, admission.request) {
+                self.open(
+                    OpenRequest {
+                        request: admission.request,
+                        caller: admission.caller,
+                        config: admission.config,
+                        deadline: admission.deadline,
+                    },
+                    now,
+                    runtime,
+                    true,
+                );
+            } else {
+                rpc::complete(
+                    runtime,
+                    admission.request,
+                    error("display_admission_unavailable"),
+                );
+            }
+            return;
+        }
+        if now >= admission.deadline || !rpc::active(runtime, admission.request) {
+            admission.call.cancel();
+        }
+        match admission.call.poll(runtime) {
+            Outcome::Waiting => self.display_admission = Some(admission),
+            Outcome::Result(response) => {
+                if response["ok"] == true
+                    && response["verified"] == true
+                    && response["rtsp_operation_id"] == admission.config.operation_id
+                    && response["request_sha256"] == admission.request_sha256
+                    && now < admission.deadline
+                    && rpc::active(runtime, admission.request)
+                {
+                    admission.verified = true;
+                    self.display_admission = Some(admission);
+                } else {
+                    rpc::complete(
+                        runtime,
+                        admission.request,
+                        error("display_admission_denied"),
+                    );
+                }
+            }
+            Outcome::SettledFailure | Outcome::Uncertain => {
+                rpc::complete(
+                    runtime,
+                    admission.request,
+                    error("display_admission_unavailable"),
+                );
+            }
+        }
     }
 
     pub(super) fn close(

@@ -18,9 +18,18 @@ pub struct Call {
 
 impl Call {
     pub fn new(payload: Value, operation: String, parent: Option<u64>) -> Self {
+        Self::for_service("amaterasu.stream-session/1", payload, operation, parent)
+    }
+
+    pub fn for_service(
+        service: &str,
+        payload: Value,
+        operation: String,
+        parent: Option<u64>,
+    ) -> Self {
         Self {
             command: Command::Request {
-                service: "amaterasu.stream-session/1".into(),
+                service: service.into(),
                 payload,
                 operation_id: operation,
                 parent,

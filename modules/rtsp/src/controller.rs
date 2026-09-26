@@ -41,6 +41,23 @@ struct PendingNetwork {
     request: Request,
 }
 
+struct OpenRequest {
+    request: u64,
+    caller: String,
+    config: Open,
+    deadline: u64,
+}
+
+struct DisplayAdmission {
+    request: u64,
+    caller: String,
+    config: Open,
+    deadline: u64,
+    request_sha256: String,
+    verified: bool,
+    call: Call,
+}
+
 pub struct Controller {
     settings: Settings,
     bootstrap_settings: Settings,
@@ -59,6 +76,7 @@ pub struct Controller {
     records: BTreeMap<u64, Record>,
     pending_network: VecDeque<PendingNetwork>,
     job: Option<Job>,
+    display_admission: Option<DisplayAdmission>,
     sequence: u64,
     status_after: u64,
 }
@@ -93,6 +111,7 @@ impl Controller {
             records: BTreeMap::new(),
             pending_network: VecDeque::new(),
             job: None,
+            display_admission: None,
             sequence: 0,
             status_after: 0,
         })
@@ -101,13 +120,14 @@ impl Controller {
     pub fn tick(&mut self, runtime: &RuntimeClient, now: u64) -> ModuleResult<()> {
         self.poll_transport(now);
         self.advance_job(runtime, now);
+        self.advance_display_admission(runtime, now);
         if self.job.is_none() {
             self.process_pending_network(now);
         }
         if self.job.is_none() {
             self.schedule_background(now);
         }
-        if self.job.is_none() {
+        if self.job.is_none() && self.display_admission.is_none() {
             self.poll_caller(runtime, now)?;
         }
         self.reconcile_network_port(now);
@@ -119,6 +139,9 @@ impl Controller {
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
         if let Some(job) = self.job.as_mut() {
             job.call.shutdown(runtime);
+        }
+        if let Some(admission) = self.display_admission.as_mut() {
+            admission.call.shutdown(runtime);
         }
         for record in self.records.values_mut() {
             if let Some(call) = record.uncertain.as_mut() {

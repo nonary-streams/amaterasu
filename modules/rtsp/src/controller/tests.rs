@@ -21,13 +21,25 @@ const TEST_BASE_PORT: u16 = 47_989;
 struct Endpoint {
     commands: Vec<Command>,
     completions: Vec<(u64, Value)>,
+    active_request: bool,
+    verifier_reply: Option<Value>,
+    deny_launch: bool,
 }
 
 impl Endpoint {
     fn dispatch(&mut self, command: &Command) -> Response {
         match command {
+            Command::CheckRequest { .. } if self.active_request => Response::Ok,
             Command::CheckRequest { .. } => Response::error("request_ended", "cancelled"),
+            Command::Request { service, .. }
+                if self.deny_launch && service == "amaterasu.launch/1" =>
+            {
+                Response::error("permission_denied", "no Launch grant")
+            }
             Command::Request { .. } => Response::Accepted { id: 71 },
+            Command::TakeResult { .. } if self.verifier_reply.is_some() => Response::Result {
+                payload: self.verifier_reply.clone().unwrap(),
+            },
             Command::Complete { request, payload } => {
                 self.completions.push((*request, payload.clone()));
                 Response::Ok
@@ -110,6 +122,144 @@ fn record(state: State) -> Record {
         stream_state: Some("stopping".into()),
         revoke_after: None,
         cleanup_confirmed: false,
+    }
+}
+
+fn attested_open() -> Open {
+    serde_json::from_value(json!({
+        "operation_id":"rtsp-one","application_operation_id":"launch-one",
+        "display_admission_token":"ab".repeat(32),
+        "display_policy_snapshot":{"global_revision":1,"global_overrides":{},
+            "catalog_revision":0,"certificate_id":"cd".repeat(32),
+            "application_overrides":{},"client_overrides":{},"effective_overrides":{}},
+        "display_request":{"configuration":{"displays":[
+            {"id":"one","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0}
+        ]},"mode_policy":{"display_id":"one","remapping":{},"context":{
+            "resolution_is_automatic":true,"refresh_rate_is_automatic":true,
+            "client_display_mode_override":false,"optimize_game_settings":false}}},
+        "peer_ip":"127.0.0.1","video_port":50000,"audio_port":50002,
+        "key_hex":"00112233445566778899aabbccddeeff","key_id":1,"connect_data":2,
+        "capture":{"capture_provider":"dxgi","output":"display","encoder":1,"audio_endpoint":"default"}
+    })).unwrap()
+}
+
+#[test]
+fn display_verifier_runs_before_ticket_or_stream_prepare() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled":true,"bind":"127.0.0.1:0",
+        "allowed_principals":["amaterasu.nvhttp","other"]
+    }))
+    .unwrap();
+    let mut controller = Controller::new(settings).unwrap();
+    let config = attested_open();
+    let digest = config.display_request_sha256().unwrap();
+    let snapshot = config.display_policy_snapshot.clone().unwrap();
+    let mut endpoint = Endpoint {
+        active_request: true,
+        verifier_reply: Some(json!({"ok":true,"verified":true,
+            "rtsp_operation_id":"rtsp-one","request_sha256":digest})),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    controller.open(
+        OpenRequest {
+            request: 19,
+            caller: "amaterasu.nvhttp".into(),
+            config,
+            deadline: 5_000,
+        },
+        0,
+        &runtime,
+        false,
+    );
+    assert!(controller.records.is_empty());
+    assert!(controller.job.is_none());
+    controller.advance_display_admission(&runtime, 1);
+    assert!(controller.records.is_empty());
+    controller.advance_display_admission(&runtime, 2);
+    assert!(controller.records.is_empty());
+    controller.advance_display_admission(&runtime, 3);
+    assert_eq!(controller.records.len(), 1);
+    let verify = endpoint
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1" => Some(payload),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(verify["action"], "verify_display_admission");
+    assert_eq!(verify["display_policy_snapshot"], snapshot);
+    assert_eq!(verify["request_sha256"], digest);
+    assert_eq!(verify["catalog_revision"], 0);
+    assert!(
+        controller
+            .records
+            .values()
+            .next()
+            .unwrap()
+            .response()
+            .get("display_admission_token")
+            .is_none()
+    );
+    assert!(
+        controller.job.is_some(),
+        "stream Prepare starts only after verification"
+    );
+}
+
+#[test]
+fn forged_or_unavailable_display_admission_never_creates_a_ticket() {
+    for failure in ["wrong_caller", "wrong_hash", "rejected", "missing_grant"] {
+        let settings: Settings = serde_json::from_value(json!({
+            "enabled":true,"bind":"127.0.0.1:0",
+            "allowed_principals":["amaterasu.nvhttp","other"]
+        }))
+        .unwrap();
+        let mut controller = Controller::new(settings).unwrap();
+        let config = attested_open();
+        let digest = config.display_request_sha256().unwrap();
+        let mut endpoint = Endpoint {
+            active_request: true,
+            verifier_reply: Some(json!({"ok":true,"verified":true,
+                "rtsp_operation_id":"rtsp-one","request_sha256":if failure == "wrong_hash" { "00".repeat(32) } else { digest } })),
+            deny_launch: failure == "missing_grant",
+            ..Endpoint::default()
+        };
+        if failure == "rejected" {
+            endpoint.verifier_reply = Some(json!({"ok":false,"code":"display_admission_denied"}));
+        }
+        let runtime = client(&mut endpoint);
+        controller.open(
+            OpenRequest {
+                request: 19,
+                caller: if failure == "wrong_caller" {
+                    "other"
+                } else {
+                    "amaterasu.nvhttp"
+                }
+                .into(),
+                config,
+                deadline: 5_000,
+            },
+            0,
+            &runtime,
+            false,
+        );
+        for now in 1..4 {
+            controller.advance_display_admission(&runtime, now);
+        }
+        assert!(controller.records.is_empty(), "{failure}");
+        assert!(controller.job.is_none(), "{failure}");
+        assert!(
+            endpoint
+                .completions
+                .iter()
+                .any(|(_, reply)| reply["ok"] == false),
+            "{failure}"
+        );
     }
 }
 
