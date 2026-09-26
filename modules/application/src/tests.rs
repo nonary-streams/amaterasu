@@ -902,8 +902,19 @@ fn typed_detached_output_is_appended_to_independent_child_files() {
     let id = started["process"]["process_id"].as_u64().unwrap();
     assert_eq!(wait_for_exit(&mut manager, id)["process"]["success"], true);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !first_err.exists() || !second_err.exists() {
-        assert!(Instant::now() < deadline, "detached output missing");
+    while [
+        (&first_out, "OUT-first"),
+        (&first_err, "ERR-first"),
+        (&second_out, "OUT-second"),
+        (&second_err, "ERR-second"),
+    ]
+    .iter()
+    .any(|(path, marker)| {
+        !std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(marker)
+    }) {
+        assert!(Instant::now() < deadline, "detached output markers missing");
         manager.reap_exited().unwrap();
         std::thread::sleep(Duration::from_millis(5));
     }
