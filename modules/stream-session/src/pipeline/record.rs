@@ -272,6 +272,7 @@ impl Record {
                 if let Some(policies) = &request.mode_policies { value["mode_policies"] = json!(policies); }
                 value
             }),
+            "display_prepare_timeout_ms": self.config.display_prepare_timeout_ms,
             "display_state": self.display_state,
             "display_applied": self.display_lease.is_some() && self.display_state == "applied",
             "packet_bytes": self.packet_bytes,

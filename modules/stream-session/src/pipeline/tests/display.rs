@@ -460,6 +460,81 @@ fn prepared_display_lease_restores_on_expiry_without_start() {
 }
 
 #[test]
+fn staged_display_prepare_window_resets_to_ping_timeout_when_armed() {
+    let mut host = Harness::new();
+    host.broker.authenticated = false;
+    let mut request = prepare();
+    request["display_request"] = display_request();
+    request["display_prepare_timeout_ms"] = json!(60_000);
+    let prepared = host.response(1, request);
+    let id = prepared["session"].as_u64().unwrap();
+    let staged_until = host.pipeline.records[&id].prepared_until;
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["display_applied"], true);
+    assert_eq!(prepared["display_prepare_timeout_ms"], 60_000);
+    assert!(staged_until.saturating_sub(host.now) > 10_000);
+
+    host.now = staged_until - 15_000;
+    let mut armed = start(id);
+    armed["action"] = json!("start_when_authenticated");
+    assert_eq!(host.response(2, armed)["state"], "armed");
+    let auth_until = host.pipeline.records[&id].prepared_until;
+    assert!(auth_until < staged_until);
+    assert_eq!(auth_until - host.now, 10_000);
+    assert!(host.broker.display_lease.is_some());
+
+    host.now = auth_until;
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Failed);
+    assert_eq!(host.pipeline.records[&id].error, Some("prepare_expired"));
+    assert!(host.broker.display_lease.is_none());
+}
+
+#[test]
+fn staged_display_allows_direct_start_after_normal_ping_window() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["display_request"] = display_request();
+    request["display_prepare_timeout_ms"] = json!(60_000);
+    let prepared = host.response(1, request);
+    let id = prepared["session"].as_u64().unwrap();
+    host.now += 15_000;
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    assert!(host.broker.display_lease.is_none());
+}
+
+#[test]
+fn display_prepare_timeout_requires_display_and_bounded_duration() {
+    let mut missing_display = prepare();
+    missing_display["display_prepare_timeout_ms"] = json!(60_000);
+    assert_eq!(
+        Harness::new().response(1, missing_display)["code"],
+        "invalid_display_prepare_timeout"
+    );
+    for invalid in [json!(0), json!(120_001), json!(-1), json!("60000")] {
+        let mut request = prepare();
+        request["display_request"] = display_request();
+        request["display_prepare_timeout_ms"] = invalid;
+        let mut host = Harness::new();
+        let code = host.response(1, request)["code"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            code == "invalid_display_prepare_timeout" || code == "invalid_request",
+            "unexpected rejection: {code}"
+        );
+        assert!(!host.broker.calls.iter().any(|call| {
+            call.service == "amaterasu.display/1" && call.payload["action"] == "apply"
+        }));
+    }
+}
+
+#[test]
 fn lost_apply_result_adopts_only_its_operation_and_restores() {
     let mut host = Harness::new();
     let mut request = prepare();

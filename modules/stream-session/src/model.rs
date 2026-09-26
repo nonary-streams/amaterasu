@@ -354,6 +354,9 @@ pub struct PrepareConfig {
     pub connect_data: u32,
     #[serde(default = "default_ping_timeout_ms")]
     pub ping_timeout_ms: u32,
+    /// Time allowed for an authenticated launch to reach Start after display Apply.
+    #[serde(default)]
+    pub display_prepare_timeout_ms: Option<u32>,
     #[serde(default)]
     pub video: VideoWire,
     #[serde(default)]
@@ -376,6 +379,11 @@ impl PrepareConfig {
         self.validate_frame_limiter_snapshot()?;
         if self.ping_timeout_ms > i32::MAX as u32 {
             return Err("invalid_ping_timeout");
+        }
+        if let Some(timeout) = self.display_prepare_timeout_ms
+            && (self.display_request.is_none() || !(1..=120_000).contains(&timeout))
+        {
+            return Err("invalid_display_prepare_timeout");
         }
         self.validate_destination(allow_remote)?;
         self.validate_bindings(allow_remote)?;

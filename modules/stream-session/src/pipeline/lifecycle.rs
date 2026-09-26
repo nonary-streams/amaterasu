@@ -288,8 +288,12 @@ impl Pipeline {
             if known && record.display_status_verified && record.display_state == "leased" {
                 record.display_state = "applied".into();
                 record.state = State::Prepared;
-                record.prepared_until =
-                    now.saturating_add(u64::from(record.config.ping_timeout_ms));
+                record.prepared_until = now.saturating_add(u64::from(
+                    record
+                        .config
+                        .display_prepare_timeout_ms
+                        .unwrap_or(record.config.ping_timeout_ms),
+                ));
                 return self.deliver_success(record, job, now, send);
             }
             job.fail(record, "display_status_unverified", now);

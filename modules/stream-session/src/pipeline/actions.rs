@@ -207,6 +207,9 @@ impl Pipeline {
             return;
         }
         record.state = State::Armed;
+        if record.config.display_prepare_timeout_ms.is_some() {
+            record.prepared_until = now.saturating_add(u64::from(record.config.ping_timeout_ms));
+        }
         if rpc::complete(send, request, record.response()) {
             record.armed_accepted = true;
             record.next_auth_poll = now;
