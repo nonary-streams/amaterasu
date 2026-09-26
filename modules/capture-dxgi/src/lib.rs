@@ -1,6 +1,8 @@
 //! Windows desktop duplication with caller-owned streams and synchronous CPU frames.
 mod backend;
 mod controller;
+#[cfg(any(windows, test))]
+mod cursor;
 mod model;
 mod native;
 

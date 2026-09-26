@@ -122,8 +122,12 @@ Current limitations are explicit:
   unrotated duplication texture is checked against that rectangle and its
   DXGI rotation, then copied into tight BGRA rows. An unknown rotation returns
   `unsupported_rotation`; a mode/dimension change closes the stream.
-- Hardware cursor shape/position is not composed. DXGI may already include some
-  cursor pixels, but a separate hardware cursor is absent.
+- A separate DXGI hardware cursor is composed into returned BGRA frames when
+  `PointerPosition.Visible` is true. Color, masked-color, and monochrome shapes
+  are cached across move-only frames, clipped to the output, and captured with
+  the staging texture for delayed CPU readback. Hidden or desktop-embedded
+  pointers are not drawn again. Physical cursor behavior still needs hardware
+  validation, including rotated monitors and driver-specific shape formats.
 - HDR preservation/tone mapping, dirty/move rectangles, protected-content
   diagnostics, zero-copy GPU frames, and GPU resource sharing are not implemented.
 - CPU frames require a new staging texture and allocation per capture. This is a
@@ -133,7 +137,8 @@ Current limitations are explicit:
 Tests use fake sessions and owned byte arrays only. They cover rotation through
 90, 180, and 270 degrees with non-square, padded surfaces; native binding
 ownership/release, exact callback pixels, pending/busy/device-loss outcomes,
-row-pitch copying, cancellation, capacity, and shutdown. Windows code and native
+row-pitch copying, cursor shape composition and movement, cancellation, capacity,
+and shutdown. Windows code and native
 ABI compile for x86_64 MSVC. **No physical desktop capture has been run.** Manual
 Windows validation still needs adapter selection, sustained frames, monitor mode
 switch/access loss, device removal, cursor behavior, protected content, and

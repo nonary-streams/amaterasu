@@ -1,4 +1,5 @@
 use super::{Backend, CaptureSession, TouchSurface};
+use crate::cursor::{CursorState, Shape, ShapeKind};
 use crate::model::{
     CaptureError, CaptureResult, Frame, Output, frame_layout, orient_bgra_rows, verify_output_mode,
 };
@@ -189,6 +190,7 @@ struct PendingTexture {
     width: u32,
     height: u32,
     timestamp_us: u64,
+    cursor: Option<(Shape, i32, i32)>,
 }
 
 struct Session {
@@ -201,6 +203,7 @@ struct Session {
     pending: Option<PendingTexture>,
     started: Instant,
     sequence: u64,
+    cursor: CursorState,
 }
 
 impl Session {
@@ -244,6 +247,7 @@ impl Session {
             pending: None,
             started: Instant::now(),
             sequence: 0,
+            cursor: CursorState::default(),
         })
     }
 
@@ -262,11 +266,80 @@ impl Session {
         }
         // The guard releases ownership on every error and unwind path.
         let frame = AcquiredFrame(&self.duplication);
-        let result = self.copy_resource(resource);
+        let result = self.capture_frame(resource, &info);
         let release = frame.release();
         release?;
-        self.pending = Some(result?);
+        let (pending, cursor) = result?;
+        self.cursor = cursor;
+        self.pending = Some(pending);
         Ok(true)
+    }
+
+    fn capture_frame(
+        &self,
+        resource: Option<IDXGIResource>,
+        info: &DXGI_OUTDUPL_FRAME_INFO,
+    ) -> CaptureResult<(PendingTexture, CursorState)> {
+        let shape = (info.PointerShapeBufferSize != 0)
+            .then(|| self.read_pointer_shape(info.PointerShapeBufferSize))
+            .transpose()?;
+        let position = (info.LastMouseUpdateTime != 0).then(|| {
+            info.PointerPosition.Visible.as_bool().then_some((
+                info.PointerPosition.Position.x,
+                info.PointerPosition.Position.y,
+            ))
+        });
+        let mut cursor = self.cursor.clone();
+        cursor.update(shape, position);
+        let mut pending = self.copy_resource(resource)?;
+        pending.cursor = cursor.snapshot();
+        Ok((pending, cursor))
+    }
+
+    fn read_pointer_shape(&self, size: u32) -> CaptureResult<Shape> {
+        const MAX_POINTER_BYTES: u32 = 2 * 1024 * 1024;
+        if size > MAX_POINTER_BYTES {
+            return Err(CaptureError::new(
+                "invalid_frame",
+                "DXGI pointer shape exceeds 2 MiB",
+            ));
+        }
+        let mut bytes = vec![0; size as usize];
+        let mut required = 0;
+        let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+        // SAFETY: the duplication frame is owned until capture_frame returns.
+        // The vector remains allocated during the call; DXGI writes at most
+        // its supplied length and reports how many bytes are initialized.
+        unsafe {
+            self.duplication.GetFramePointerShape(
+                size,
+                bytes.as_mut_ptr().cast(),
+                &mut required,
+                &mut info,
+            )
+        }
+        .map_err(native_error)?;
+        if required > size {
+            return Err(CaptureError::new(
+                "invalid_frame",
+                "DXGI pointer shape exceeded its announced buffer",
+            ));
+        }
+        bytes.truncate(required as usize);
+        let kind = match info.Type as i32 {
+            value if value == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 => ShapeKind::Color,
+            value if value == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 => {
+                ShapeKind::MaskedColor
+            }
+            value if value == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 => ShapeKind::Monochrome,
+            _ => {
+                return Err(CaptureError::new(
+                    "unsupported_format",
+                    "DXGI returned an unknown pointer shape",
+                ));
+            }
+        };
+        Shape::new(kind, info.Width, info.Height, info.Pitch, bytes)
     }
 
     fn copy_resource(&self, resource: Option<IDXGIResource>) -> CaptureResult<PendingTexture> {
@@ -313,6 +386,7 @@ impl Session {
             width: description.Width,
             height: description.Height,
             timestamp_us: self.started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            cursor: None,
         })
     }
 
@@ -342,7 +416,7 @@ impl Session {
         // SAFETY: D3D11 guarantees initialized pixel bytes at each mapped
         // texture row. The map guard outlives all copying, and row padding
         // is never included in borrowed slices or the returned frame.
-        let bytes = unsafe {
+        let mut bytes = unsafe {
             orient_bgra_rows(
                 pending.width,
                 pending.height,
@@ -353,6 +427,9 @@ impl Session {
                 self.adapter.rotation,
             )
         }?;
+        if let Some((shape, x, y)) = &pending.cursor {
+            shape.compose(&mut bytes, self.adapter.width, self.adapter.height, *x, *y)?;
+        }
         self.sequence = self.sequence.saturating_add(1);
         let result = Frame {
             width: self.adapter.width,
