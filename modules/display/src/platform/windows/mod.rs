@@ -558,20 +558,7 @@ fn verify_restoration_routes(saved: &Snapshot, current: &Snapshot) -> DisplayRes
 }
 
 fn saved_clone_priorities_match(saved: &Snapshot, current: &Snapshot) -> bool {
-    let has_clone = saved.paths.iter().enumerate().any(|(index, path)| {
-        saved
-            .paths
-            .iter()
-            .skip(index + 1)
-            .any(|peer| peer.source_address == path.source_address)
-    });
-    !has_clone
-        || (saved.paths.len() == current.paths.len()
-            && saved
-                .paths
-                .iter()
-                .zip(&current.paths)
-                .all(|(saved, observed)| saved.id.eq_ignore_ascii_case(&observed.id)))
+    saved.clone_priority() == current.clone_priority()
 }
 
 fn verify_primary_path_priority(selected: &str, current: &Snapshot) -> DisplayResult<()> {
@@ -1120,6 +1107,27 @@ mod tests {
             &saved_with_peer,
             &reordered_peer
         ));
+
+        let mut independent_peer = readback_path("monitor.four", 3840, Some(false));
+        independent_peer.source_address.id = 4;
+        independent_peer.target_address.id = 5;
+        let mut independent_peer_two = readback_path("monitor.five", 5760, Some(false));
+        independent_peer_two.source_address.id = 6;
+        independent_peer_two.target_address.id = 7;
+        saved_with_peer.paths.push(independent_peer);
+        saved_with_peer.paths.push(independent_peer_two);
+        let mut independent_swapped = saved_with_peer.clone();
+        independent_swapped.paths.swap(3, 4);
+        assert!(saved_with_peer.equivalent(&independent_swapped));
+        assert_eq!(
+            saved_with_peer.revision().unwrap(),
+            independent_swapped.revision().unwrap()
+        );
+        assert!(saved_clone_priorities_match(
+            &saved_with_peer,
+            &independent_swapped
+        ));
+        assert!(verify_restoration_routes(&saved_with_peer, &independent_swapped).is_ok());
     }
 
     #[test]

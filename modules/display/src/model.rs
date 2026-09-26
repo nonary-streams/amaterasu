@@ -503,28 +503,7 @@ impl Snapshot {
         // Independent CCD paths may be reported in a different order without
         // changing the desktop. Clone path order is meaningful priority, so
         // bind it (and its position relative to independent paths) into CAS.
-        let is_clone = |path: &DisplayPath| {
-            self.paths
-                .iter()
-                .filter(|peer| peer.source_address == path.source_address)
-                .count()
-                > 1
-        };
-        let clone_priority: Vec<_> = self
-            .paths
-            .iter()
-            .enumerate()
-            .filter(|(_, path)| is_clone(path))
-            .map(|(index, path)| {
-                let mut independent_before: Vec<_> = self.paths[..index]
-                    .iter()
-                    .filter(|earlier| !is_clone(earlier))
-                    .map(|earlier| earlier.id.to_lowercase())
-                    .collect();
-                independent_before.sort();
-                (path.id.to_lowercase(), independent_before)
-            })
-            .collect();
+        let clone_priority = self.clone_priority();
         if !clone_priority.is_empty() {
             bytes.extend_from_slice(b"|clone-priority-v1|");
             bytes.extend(
@@ -540,6 +519,30 @@ impl Snapshot {
             b = (b ^ u64::from(byte)).wrapping_mul(0x100000001b3);
         }
         Ok(format!("{a:016x}{b:016x}"))
+    }
+    #[cfg(any(windows, test))]
+    pub(crate) fn clone_priority(&self) -> Vec<(String, Vec<String>)> {
+        let is_clone = |path: &DisplayPath| {
+            self.paths
+                .iter()
+                .filter(|peer| peer.source_address == path.source_address)
+                .count()
+                > 1
+        };
+        self.paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| is_clone(path))
+            .map(|(index, path)| {
+                let mut independent_before: Vec<_> = self.paths[..index]
+                    .iter()
+                    .filter(|earlier| !is_clone(earlier))
+                    .map(|earlier| earlier.id.to_lowercase())
+                    .collect();
+                independent_before.sort();
+                (path.id.to_lowercase(), independent_before)
+            })
+            .collect()
     }
     #[cfg(any(windows, test))]
     pub fn equivalent(&self, other: &Self) -> bool {
