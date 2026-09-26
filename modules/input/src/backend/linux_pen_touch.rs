@@ -71,6 +71,30 @@ struct ContactTracker {
 }
 
 impl ContactTracker {
+    fn validate_pen_lifecycle(
+        &self,
+        pointer_id: u32,
+        phase: PenTouchPhase,
+        event: &Event,
+    ) -> InputResult<()> {
+        let Some(pen) = self.pen.as_ref() else {
+            return if phase == PenTouchPhase::Down {
+                Ok(())
+            } else {
+                Err(pointer_not_active())
+            };
+        };
+        match phase {
+            PenTouchPhase::Down if pen.contact.initial_down != *event => {
+                Err(duplicate_down_mismatch())
+            }
+            PenTouchPhase::Down => Ok(()),
+            PenTouchPhase::Move | PenTouchPhase::Up | PenTouchPhase::Cancel => {
+                ensure_active_pointer(pointer_id_of(&pen.contact.initial_down), pointer_id)
+            }
+        }
+    }
+
     fn validate_touch_lifecycle(
         &self,
         pointer_id: u32,
@@ -129,6 +153,7 @@ impl ContactTracker {
         event: &Event,
         emit: &mut impl FnMut(Target, &[(u16, u16, i32)], &mut bool) -> InputResult<()>,
     ) -> InputResult<()> {
+        self.validate_pen_lifecycle(pointer_id, phase, event)?;
         let active_pointer = self
             .pen
             .as_ref()
@@ -539,6 +564,13 @@ impl LinuxPenTouch {
                 }
             )
         {
+            if let Event::PenTouch {
+                pointer_id, phase, ..
+            } = event
+            {
+                self.tracker
+                    .validate_pen_lifecycle(*pointer_id, *phase, event)?;
+            }
             // A failed frame can leave an arbitrary prefix in the kernel. The
             // device must be removed before any more reports reach that pen.
             destroy_device(&mut self.pen_device)?;
@@ -1305,6 +1337,27 @@ mod tests {
                 .native_write_attempted
         );
 
+        let mismatched_down = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Down,
+            11,
+            20,
+        );
+        assert_eq!(
+            pen_touch.inject("\0", &mismatched_down).unwrap_err().code,
+            "invalid_sequence"
+        );
+        assert!(
+            pen_touch.pen_device.is_some(),
+            "a rejected duplicate must not detach the failed device"
+        );
+        assert!(pen_touch.pen_write_failed);
+        assert_eq!(
+            pen_touch.tracker.pen.as_ref().unwrap().contact.initial_down,
+            down
+        );
+
         let malformed_pen = event(2, PenTouchDevice::Pen, PenTouchPhase::Move, 10, 20);
         assert!(pen_touch.inject("\0", &malformed_pen).is_err());
         assert!(pen_touch.pen_device.is_some());
@@ -1358,6 +1411,13 @@ mod tests {
         });
         pen_touch.inject("\0", &down).unwrap();
         assert!(pen_touch.tracker.pen.as_ref().unwrap().contact.down_written);
+        pen_touch
+            .inject("\0", &with_phase(&down, PenTouchPhase::Move))
+            .unwrap();
+        pen_touch
+            .inject("\0", &with_phase(&down, PenTouchPhase::Up))
+            .unwrap();
+        assert!(pen_touch.tracker.pen.is_none());
         pen_touch.stop().unwrap();
         assert!(pen_touch.is_idle());
     }
