@@ -825,6 +825,7 @@ struct DisplayModePolicy {
     #[serde(rename = "manual_refresh_rate")]
     _manual_refresh_rate: Option<String>,
     hdr_option: Option<String>,
+    configuration_option: Option<String>,
     #[serde(rename = "effective_client_hdr_request")]
     _effective_client_hdr_request: Option<bool>,
 }
@@ -935,6 +936,19 @@ fn valid_display_request(request: &serde_json::Value) -> bool {
                 .hdr_option
                 .as_deref()
                 .is_some_and(|option| !matches!(option, "auto" | "disabled"))
+            || policy
+                .configuration_option
+                .as_deref()
+                .is_some_and(|option| {
+                    !matches!(
+                        option,
+                        "disabled"
+                            | "verify_only"
+                            | "ensure_active"
+                            | "ensure_primary"
+                            | "ensure_only_display"
+                    )
+                })
         {
             return false;
         }
@@ -1252,8 +1266,8 @@ mod tests {
                 {"id":"two","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":1920,"y":0}
             ]},
             "mode_policies":[
-                {"display_id":"one","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}},
-                {"display_id":"two","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}}
+                {"display_id":"one","configuration_option":"ensure_primary","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}},
+                {"display_id":"two","configuration_option":"ensure_active","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}}
             ]
         });
         input["display_request"] = request.clone();
@@ -1272,6 +1286,40 @@ mod tests {
         );
         let original_digest = selected.display_request_sha256().unwrap();
         assert_eq!(original_digest.len(), 64);
+        let mut changed_option = input.clone();
+        changed_option["display_request"]["mode_policies"][0]["configuration_option"] =
+            json!("verify_only");
+        let changed_option: Open = serde_json::from_value(changed_option).unwrap();
+        changed_option.validate(false).unwrap();
+        assert_ne!(
+            changed_option.display_request_sha256().unwrap(),
+            original_digest
+        );
+        assert_eq!(
+            changed_option.prepare("prepare", None)["display_request"]["mode_policies"][0]["configuration_option"],
+            "verify_only"
+        );
+
+        for option in [
+            "disabled",
+            "verify_only",
+            "ensure_active",
+            "ensure_primary",
+            "ensure_only_display",
+        ] {
+            let mut allowed = input.clone();
+            allowed["display_request"]["mode_policies"][0]["configuration_option"] = json!(option);
+            serde_json::from_value::<Open>(allowed)
+                .unwrap()
+                .validate(false)
+                .unwrap();
+        }
+        for invalid in [json!("ensure_everything"), json!("Ensure_Active"), json!(7)] {
+            let mut malformed = input.clone();
+            malformed["display_request"]["mode_policies"][0]["configuration_option"] = invalid;
+            let malformed: Open = serde_json::from_value(malformed).unwrap();
+            assert_eq!(malformed.validate(false), Err("display_request_unattested"));
+        }
 
         for invalid in [
             json!(null),

@@ -137,7 +137,7 @@ fn attested_open() -> Open {
             "application_overrides":{},"client_overrides":{},"effective_overrides":{}},
         "display_request":{"expected_topology_revision":"aa".repeat(16),"configuration":{"displays":[
             {"id":"one","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0}
-        ]},"mode_policy":{"display_id":"one","remapping":{},"context":{
+        ]},"mode_policy":{"display_id":"one","configuration_option":"ensure_only_display","remapping":{},"context":{
             "resolution_is_automatic":true,"refresh_rate_is_automatic":true,
             "client_display_mode_override":false,"optimize_game_settings":false}}},
         "peer_ip":"127.0.0.1","video_port":50000,"audio_port":50002,
@@ -232,6 +232,10 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
         "stream Prepare starts only after verification"
     );
     let frozen = controller.records.values().next().unwrap().response();
+    assert_eq!(
+        frozen["display_request"]["mode_policy"]["configuration_option"],
+        "ensure_only_display"
+    );
     controller.open(
         OpenRequest {
             request: 20,
@@ -287,6 +291,51 @@ fn malformed_topology_revision_never_reaches_verifier_or_stream_prepare() {
         let mut controller = Controller::new(settings).unwrap();
         let mut config = attested_open();
         config.display_request.as_mut().unwrap()["expected_topology_revision"] = malformed;
+        let mut endpoint = Endpoint {
+            active_request: true,
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.open(
+            OpenRequest {
+                request: 19,
+                caller: "amaterasu.nvhttp".into(),
+                config,
+                deadline: 5_000,
+            },
+            0,
+            &runtime,
+            false,
+        );
+        assert!(controller.records.is_empty());
+        assert!(controller.job.is_none());
+        assert!(controller.display_admission.is_none());
+        assert!(
+            !endpoint
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::Request { .. }))
+        );
+        assert!(
+            endpoint
+                .completions
+                .iter()
+                .any(|(_, response)| response["code"] == "display_request_unattested")
+        );
+    }
+}
+
+#[test]
+fn invalid_configuration_option_never_reaches_verifier_or_stream_prepare() {
+    for invalid in [json!("ensure_everything"), json!("Ensure_Active"), json!(7)] {
+        let settings: Settings = serde_json::from_value(json!({
+            "enabled":true,"bind":"127.0.0.1:0",
+            "allowed_principals":["amaterasu.nvhttp"]
+        }))
+        .unwrap();
+        let mut controller = Controller::new(settings).unwrap();
+        let mut config = attested_open();
+        config.display_request.as_mut().unwrap()["mode_policy"]["configuration_option"] = invalid;
         let mut endpoint = Endpoint {
             active_request: true,
             ..Endpoint::default()
