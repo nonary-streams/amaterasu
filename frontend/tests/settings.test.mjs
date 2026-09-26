@@ -713,6 +713,10 @@ test("gamepad editor uses backend profiles and labels a selected unavailable pro
     { value: "auto", label: "auto", available: true },
     { value: "xone", label: "xone", available: true },
   ]);
+  assert.deepEqual(ordinary(choices("xone", ["auto"], ["xone"])), [
+    { value: "xone", label: "xone (recognized, unavailable on this backend)", available: false },
+    { value: "auto", label: "auto", available: true },
+  ]);
 
   const parsePolicy = context.Amaterasu.parseInputPolicy;
   assert.equal(
@@ -1147,6 +1151,14 @@ test("input form confirms cleanup-pending save, then reloads after a revision co
   const oldForm = find(inputArea, (node) => node.tagName === "form");
   assert.ok(oldForm);
   assert.equal(find(oldForm, (node) => node.name === "input_ds4_back_as_touchpad_click").checked, false);
+  const gamepadProfile = find(oldForm, (node) => node.name === "input_gamepad_profile");
+  assert.deepEqual(gamepadProfile.options.map((option) => option.value), ["auto"]);
+  gamepadProfile.value = "xone";
+  oldForm.fire("submit", { preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(updates, 0);
+  assert.equal(oldForm.isConnected, true);
+  gamepadProfile.value = "auto";
   oldForm.fire("submit", { preventDefault() {} });
   await new Promise(setImmediate);
   assert.equal(oldForm.isConnected, false);

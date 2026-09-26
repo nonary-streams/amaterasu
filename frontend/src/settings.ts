@@ -2712,7 +2712,7 @@ namespace Amaterasu {
         const gamepadProfileChoices = inputGamepadProfileChoices(
           settings.values.gamepad,
           runtimeStatus?.supported_profiles ?? ["auto"],
-          runtimeStatus?.recognized_profiles ?? recognizedInputGamepadProfiles,
+          runtimeStatus?.recognized_profiles ?? [settings.values.gamepad],
         );
         for (const choice of gamepadProfileChoices) {
           const option = el("option", "", choice.label);

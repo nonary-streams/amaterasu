@@ -4162,7 +4162,7 @@ var Amaterasu;
                 backButtonTimeout.step = "1";
                 const gamepadProfile = Amaterasu.el("select");
                 gamepadProfile.name = "input_gamepad_profile";
-                const gamepadProfileChoices = inputGamepadProfileChoices(settings.values.gamepad, runtimeStatus?.supported_profiles ?? ["auto"], runtimeStatus?.recognized_profiles ?? recognizedInputGamepadProfiles);
+                const gamepadProfileChoices = inputGamepadProfileChoices(settings.values.gamepad, runtimeStatus?.supported_profiles ?? ["auto"], runtimeStatus?.recognized_profiles ?? [settings.values.gamepad]);
                 for (const choice of gamepadProfileChoices) {
                     const option = Amaterasu.el("option", "", choice.label);
                     option.value = choice.value;
