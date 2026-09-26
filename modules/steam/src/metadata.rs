@@ -132,7 +132,6 @@ impl Scanner {
                             );
                         } else if state.last_played > 0 || state.playtime > 0 {
                             if games.len() >= 20_000 {
-                                self.history_ok = false;
                                 self.owned_history_ok = false;
                                 continue;
                             }
@@ -1046,6 +1045,42 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn uninstalled_candidate_limit_keeps_installed_recent_history_complete() {
+        let fixture = Fixture::new();
+        fixture.localconfig("100", &[(42, 1_800_000_000), (20_001, 1_900_000_000)]);
+        let mut scanner = Scanner::new(&[]);
+        scanner.history_roots = 1;
+        scanner.tasks.push_back(Task::LocalConfig {
+            path: fixture.0.join("userdata/100/config/localconfig.vdf"),
+            root: fixture.0.clone(),
+        });
+        let mut games = (1..=20_000)
+            .map(|id| {
+                let mut game = uninstalled_history_game(
+                    id,
+                    &fixture.0,
+                    LocalAppState {
+                        last_played: 0,
+                        playtime: 0,
+                    },
+                );
+                game.installed = true;
+                game.name = format!("Installed {id}");
+                (id, game)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert!(!scanner.tick(&mut games));
+        assert_eq!(games.len(), 20_000);
+        assert_eq!(games[&42].last_played, Some(1_800_000_000));
+        assert!(scanner.history_ok);
+        assert!(!scanner.owned_history_ok);
+        assert!(scanner.tick(&mut games));
+        assert!(scanner.availability().history_complete);
+        assert!(!scanner.availability().owned_history_complete);
     }
 
     #[test]
