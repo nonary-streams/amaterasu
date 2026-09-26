@@ -59,6 +59,10 @@ browser API calls.
   library scans; synchronization with the application catalog remains unavailable.
 - Session pagination, stop requests, and explicit finish-stop actions. No client
   connection or streaming state is fabricated.
+- Sessions shows signed history runtime status independently from recorded session
+  listing: configuration readiness, effective recording, storage failures, counts,
+  and the most recent retention result. Status can be refreshed without hiding the
+  session list when its request fails.
 - Process inventory and termination with confirmation, plus explicit status refresh.
 - Steam provider refresh, discovery pages, partial-scan warnings, and scan status.
 - Diagnostic records, bounded journal pagination, retention warnings, and counters.

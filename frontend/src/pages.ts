@@ -126,9 +126,55 @@ namespace Amaterasu {
     void load();
   }
 
+  export function parseHistoryRuntimeStatus(value: unknown): HistoryRuntimeStatus {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("History status reply is invalid.");
+    const reply = value as Record<string, unknown>;
+    if (reply.ok !== true || !reply.status || typeof reply.status !== "object" || Array.isArray(reply.status))
+      throw new Error("History status reply is invalid.");
+    const status = reply.status as Record<string, unknown>;
+    const prune = status.last_prune;
+    if (!prune || typeof prune !== "object" || Array.isArray(prune))
+      throw new Error("History retention status is invalid.");
+    const retention = prune as Record<string, unknown>;
+    for (const key of ["available", "configuration_ready", "enabled", "effective_enabled", "degraded"])
+      if (typeof status[key] !== "boolean") throw new Error(`History ${key} status is invalid.`);
+    for (const key of ["failed_operations", "active_streams", "sessions", "samples", "events", "live_bytes"])
+      if (!Number.isSafeInteger(status[key]) || (status[key] as number) < 0)
+        throw new Error(`History ${key} count is invalid.`);
+    for (const key of ["sessions_deleted", "live_bytes", "size_limit_bytes"])
+      if (!Number.isSafeInteger(retention[key]) || (retention[key] as number) < 0)
+        throw new Error(`History retention ${key} count is invalid.`);
+    if (typeof retention.size_limit_unmet !== "boolean")
+      throw new Error("History retention limit status is invalid.");
+    return status as unknown as HistoryRuntimeStatus;
+  }
+
+  export function historyRuntimeDescription(status: HistoryRuntimeStatus): string[] {
+    if (!status.available)
+      return ["History storage is unavailable; recording and recorded session reads cannot run."];
+    const lines = [status.configuration_ready
+      ? status.effective_enabled === status.enabled
+        ? status.effective_enabled ? "History recording is active." : "History recording is disabled."
+        : status.enabled
+          ? "History recording is pending; the enable change takes effect after active streams end."
+          : "History recording remains active; the disable change takes effect after active streams end."
+      : "History configuration is not ready; recording is not confirmed."];
+    lines.push(`${status.active_streams} active streams · ${status.sessions} stored sessions · ${status.samples} samples · ${status.events} events · ${status.live_bytes} live bytes.`);
+    lines.push(`Last retention pass deleted ${status.last_prune.sessions_deleted} sessions; ${status.last_prune.live_bytes} live bytes against ${status.last_prune.size_limit_bytes === 0 ? "no size limit" : `${status.last_prune.size_limit_bytes} byte limit`}.`);
+    if (status.last_prune.size_limit_unmet)
+      lines.push("The retention size limit remains unmet; active sessions are preserved.");
+    if (status.failed_operations > 0)
+      lines.push(`${status.failed_operations} history storage operations have failed since this service started.`);
+    if (status.degraded && status.failed_operations === 0 && !status.last_prune.size_limit_unmet && status.configuration_ready)
+      lines.push("History reports degraded operation.");
+    return lines;
+  }
+
   export function renderSessions(context: PageContext): void {
     const area = el("div");
     const status = el("div");
+    const historyRuntimeArea = el("div");
     const savedArea = el("div");
     const savedDetail = el("div");
     const savedStatus = el("div");
@@ -142,12 +188,28 @@ namespace Amaterasu {
         button("Refresh", () => {
           void load();
           void loadSaved();
+          void loadHistoryRuntime();
         }),
       ),
       status,
       area,
+      panel("History runtime status", historyRuntimeArea),
       panel("Recorded stream sessions", savedArea, savedStatus, savedDetail),
     );
+    async function loadHistoryRuntime(): Promise<void> {
+      historyRuntimeArea.replaceChildren(el("p", "muted", "Loading history runtime status…"));
+      try {
+        const runtime = parseHistoryRuntimeStatus(await context.api.post<unknown>("history/history_status"));
+        if (!context.content.isConnected) return;
+        historyRuntimeArea.replaceChildren(
+          ...historyRuntimeDescription(runtime).map((line) => el("p", "muted", line)),
+          button("Refresh history status", () => { void loadHistoryRuntime(); }),
+        );
+      } catch (error) {
+        if (context.content.isConnected)
+          historyRuntimeArea.replaceChildren(errorPanel(error, loadHistoryRuntime));
+      }
+    }
     async function load(): Promise<void> {
       try {
         const reply = await context.api.post<SessionReply>("session/list", {
@@ -341,6 +403,7 @@ namespace Amaterasu {
     }
     void load();
     void loadSaved();
+    void loadHistoryRuntime();
   }
 
   export function renderApplications(context: PageContext): void {

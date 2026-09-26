@@ -343,6 +343,25 @@ namespace Amaterasu {
     ok: boolean;
     sessions: HistorySessionSummary[];
   }
+  export interface HistoryRuntimeStatus {
+    available: boolean;
+    configuration_ready: boolean;
+    enabled: boolean;
+    effective_enabled: boolean;
+    degraded: boolean;
+    failed_operations: number;
+    active_streams: number;
+    sessions: number;
+    samples: number;
+    events: number;
+    live_bytes: number;
+    last_prune: {
+      sessions_deleted: number;
+      live_bytes: number;
+      size_limit_bytes: number;
+      size_limit_unmet: boolean;
+    };
+  }
   export interface HistoryDetailReply {
     ok: boolean;
     detail: {
