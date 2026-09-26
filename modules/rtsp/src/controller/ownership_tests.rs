@@ -1,4 +1,5 @@
 use super::*;
+use amaterasu_gamestream::{rtsp::Method, sdp::parse_announce};
 use amaterasu_module_sdk::abi::{self, AbiHeader, BorrowedBytes, HostApi, ReplySink};
 use std::{collections::BTreeSet, ffi::c_void};
 
@@ -22,6 +23,7 @@ struct Endpoint {
     lose_prepare_result_once: bool,
     prepare_result_lost: bool,
     cleanup_fails: bool,
+    reject_prepare: bool,
 }
 
 impl Endpoint {
@@ -95,6 +97,9 @@ impl Endpoint {
 
     fn downstream_result(&self, action: &str) -> Value {
         match action {
+            "prepare" if self.reject_prepare => json!({
+                "ok": false, "session": SESSION, "state": "failed", "code": "invalid_audio_configuration"
+            }),
             "prepare" => json!({
                 "ok": true,
                 "session": SESSION,
@@ -104,6 +109,8 @@ impl Endpoint {
                 "control_local": "127.0.0.1:51004"
             }),
             "lookup" => json!({"ok": true, "session": SESSION, "state": "prepared"}),
+            "start_when_authenticated" => json!({"ok": true, "session": SESSION,
+                "state": "armed", "cleanup_error": null}),
             "stop" if self.cleanup_fails => json!({
                 "ok": true,
                 "session": SESSION,
@@ -250,6 +257,282 @@ fn finish_prepare(controller: &mut Controller, runtime: &RuntimeClient) {
     for now in 0..3 {
         tick(controller, runtime, now);
     }
+}
+
+fn surround_announcement(channels: u32, packet_ms: u32) -> String {
+    let (mask, enabled) = match channels {
+        6 => (63, 1),
+        8 => (1599, 1),
+        _ => (3, 0),
+    };
+    include_str!("../../../../crates/gamestream/src/sdp/fixtures/moonlight-h264.sdp")
+        .replace(
+            "x-ss-general.encryptionEnabled:0",
+            "x-ss-general.encryptionEnabled:7",
+        )
+        .replace(
+            "x-nv-audio.surround.numChannels:2",
+            &format!("x-nv-audio.surround.numChannels:{channels}"),
+        )
+        .replace(
+            "x-nv-audio.surround.channelMask:3",
+            &format!("x-nv-audio.surround.channelMask:{mask}"),
+        )
+        .replace(
+            "x-nv-audio.surround.enable:0",
+            &format!("x-nv-audio.surround.enable:{enabled}"),
+        )
+        .replace(
+            "x-nv-aqos.packetDuration:5",
+            &format!("x-nv-aqos.packetDuration:{packet_ms}"),
+        )
+}
+
+fn surround_open(operation: &str, channels: u32, packet_ms: u32, bitrate: u32) -> Value {
+    let announcement = parse_announce(surround_announcement(channels, packet_ms).as_bytes())
+        .expect("supported surround SDP");
+    let mut request = open(operation);
+    request["capture"]["audio_endpoint"] = json!("");
+    request["virtual_sink"] = json!("Steam Streaming Speakers");
+    request["channels"] = json!(channels);
+    request["profile"] = json!({
+        "width": announcement.video.width,
+        "height": announcement.video.height,
+        "fps": announcement.video.fps,
+        "bitrate_kbps": announcement.video.bitrate_kbps,
+        "max_reference_frames": announcement.video.max_reference_frames,
+        "packet_size": announcement.packet_size,
+        "min_parity_shards": announcement.fec.minimum_packets,
+        "packet_ms": packet_ms,
+        "audio_bitrate": bitrate,
+        "encrypt_video": announcement.encryption.video,
+        "encrypt_audio": announcement.encryption.audio,
+    });
+    request
+}
+
+fn negotiation_request(method: Method, target: &str, cseq: u32, session: Option<&str>) -> Request {
+    let mut headers = Vec::new();
+    if let Some(session) = session {
+        headers.push(("session".into(), session.into()));
+    }
+    Request {
+        method,
+        target: target.into(),
+        cseq,
+        headers,
+        body: Vec::new(),
+    }
+}
+
+fn negotiate_announce(record: &mut Record, body: &str) -> bool {
+    let ticket = record.id;
+    let target = record.url.clone();
+    let session = record.session_token.clone();
+    let negotiation = record.negotiation.as_mut().expect("prepared negotiation");
+    negotiation
+        .handle(
+            ticket,
+            &negotiation_request(Method::Options, &target, 1, None),
+        )
+        .expect("options");
+    let mut describe = negotiation_request(Method::Describe, &target, 2, None);
+    describe
+        .headers
+        .push(("accept".into(), "application/sdp".into()));
+    negotiation.handle(ticket, &describe).expect("describe");
+    for (cseq, target) in [
+        (3, "streamid=audio/0/0"),
+        (4, "streamid=video/0/0"),
+        (5, "streamid=control/13/0"),
+    ] {
+        let mut setup = negotiation_request(
+            Method::Setup,
+            target,
+            cseq,
+            (cseq > 3).then_some(session.as_str()),
+        );
+        setup.headers.push((
+            "transport".into(),
+            "unicast;X-GS-ClientPort=50000-50001".into(),
+        ));
+        negotiation.handle(ticket, &setup).expect("setup");
+    }
+    let mut announce =
+        negotiation_request(Method::Announce, "streamid=control/13/0", 6, Some(&session));
+    announce
+        .headers
+        .push(("content-type".into(), "application/sdp".into()));
+    announce.body = body.as_bytes().to_vec();
+    let NegotiationStep::Action {
+        ticket: action_ticket,
+        action: Action::Announce(parsed),
+    } = negotiation
+        .handle(ticket, &announce)
+        .expect("parsed ANNOUNCE")
+    else {
+        panic!("expected ANNOUNCE action");
+    };
+    let accepted = record.accept_announce(&parsed);
+    record
+        .negotiation
+        .as_mut()
+        .unwrap()
+        .complete(ticket, action_ticket, accepted)
+        .expect("ANNOUNCE completion");
+    accepted
+}
+
+#[test]
+fn surround_open_prepare_announce_and_authenticated_start_use_exact_layout() {
+    for (channels, mask, layout, packet_ms, bitrate) in
+        [(6, 63, "5.1", 5, 256_000), (8, 1599, "7.1", 10, 512_000)]
+    {
+        let mut endpoint = Endpoint::default();
+        let opened = surround_open("surround", channels, packet_ms, bitrate);
+        endpoint.enqueue(1, "owner", opened.clone());
+        let runtime = runtime(&mut endpoint);
+        let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+        finish_prepare(&mut controller, &runtime);
+        let ticket = endpoint.completed(1)["ticket"].as_u64().unwrap();
+        let prepares: Vec<_> = endpoint
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Request { payload, .. } if payload["action"] == "prepare" => Some(payload),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prepares.len(), 1);
+        assert_eq!(
+            prepares[0]["audio"],
+            json!({"channels":channels,"channel_mask":mask,
+            "layout":layout,"packet_ms":packet_ms,"bitrate":bitrate})
+        );
+        endpoint.enqueue(2, "owner", opened.clone());
+        let mut changed = opened;
+        changed["channels"] = json!(if channels == 6 { 8 } else { 6 });
+        if channels == 6 {
+            changed["profile"]["audio_bitrate"] = json!(512_000);
+        }
+        endpoint.enqueue(3, "owner", changed);
+        tick(&mut controller, &runtime, 3);
+        tick(&mut controller, &runtime, 4);
+        assert_eq!(endpoint.completed(2), endpoint.completed(1));
+        assert_eq!(endpoint.completed(3)["code"], "operation_conflict");
+        assert_eq!(
+            endpoint
+                .downstream_requests()
+                .iter()
+                .filter(|(action, _, _)| *action == "prepare")
+                .count(),
+            1
+        );
+
+        let record = controller.records.get_mut(&ticket).unwrap();
+        let body = surround_announcement(channels, packet_ms);
+        assert!(negotiate_announce(record, &body));
+        let start = record
+            .authenticated_start_payload(SESSION)
+            .expect("accepted ANNOUNCE");
+        assert_eq!(start["configuration"]["channels"], channels);
+        assert_eq!(
+            start["configuration"]["virtual_sink"],
+            "Steam Streaming Speakers"
+        );
+        controller.job = Some(Job {
+            ticket,
+            phase: Phase::Arm,
+            call: Call::new(start, format!("surround-arm-{channels}"), None),
+            caller: None,
+            network: Some((0, 0)),
+            deadline: 5_000,
+        });
+        tick(&mut controller, &runtime, 5);
+        let started = endpoint
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request { payload, .. }
+                    if payload["action"] == "start_when_authenticated" =>
+                {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .expect("stream-session Start request");
+        assert_eq!(started["configuration"]["channels"], channels);
+        assert_eq!(
+            started["configuration"]["virtual_sink"],
+            "Steam Streaming Speakers"
+        );
+        for now in 6..11 {
+            tick(&mut controller, &runtime, now);
+        }
+        assert!(
+            endpoint
+                .downstream_requests()
+                .iter()
+                .any(|(action, _, _)| *action == "stop")
+        );
+    }
+}
+
+#[test]
+fn surround_wrong_announce_cannot_arm_and_failed_prepare_stops_owned_stream() {
+    for (announced_channels, announced_ms) in [(8, 5), (6, 10)] {
+        let mut endpoint = Endpoint::default();
+        endpoint.enqueue(1, "owner", surround_open("wrong-announce", 6, 5, 256_000));
+        let first_runtime = runtime(&mut endpoint);
+        let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+        finish_prepare(&mut controller, &first_runtime);
+        let ticket = endpoint.completed(1)["ticket"].as_u64().unwrap();
+        let record = controller.records.get_mut(&ticket).unwrap();
+        assert!(!negotiate_announce(
+            record,
+            &surround_announcement(announced_channels, announced_ms)
+        ));
+        assert!(record.authenticated_start_payload(SESSION).is_none());
+        assert!(
+            !endpoint
+                .downstream_requests()
+                .iter()
+                .any(|(action, _, _)| *action == "start_when_authenticated")
+        );
+    }
+    for (name, original, changed) in [("channelMask", "63", "3"), ("enable", "1", "0")] {
+        let body = surround_announcement(6, 5).replace(
+            &format!("x-nv-audio.surround.{name}:{original}"),
+            &format!("x-nv-audio.surround.{name}:{changed}"),
+        );
+        assert!(parse_announce(body.as_bytes()).is_err());
+    }
+
+    let mut endpoint = Endpoint {
+        reject_prepare: true,
+        ..Endpoint::default()
+    };
+    endpoint.enqueue(1, "owner", surround_open("failed-prepare", 8, 10, 512_000));
+    let runtime = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+    for now in 0..8 {
+        tick(&mut controller, &runtime, now);
+    }
+    assert_eq!(endpoint.completed(1)["state"], "failed");
+    assert_eq!(
+        endpoint
+            .downstream_requests()
+            .iter()
+            .map(|(action, _, _)| *action)
+            .collect::<Vec<_>>(),
+        ["prepare", "stop"]
+    );
+    assert!(
+        controller
+            .records
+            .values()
+            .all(|record| record.cleanup_confirmed)
+    );
 }
 
 #[test]
