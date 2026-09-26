@@ -100,6 +100,16 @@ fn setup_with_surfaces(
 
 #[test]
 fn touch_surface_is_published_only_when_provider_proves_valid_mapping() {
+    let geometry = CaptureGeometry::new(
+        DesktopRect::new(-1920, 0, 1920, 1080).unwrap(),
+        DesktopRect::new(-1920, 0, 3840, 1080).unwrap(),
+    )
+    .unwrap();
+    let moved = CaptureGeometry::new(
+        DesktopRect::new(0, 0, 1920, 1080).unwrap(),
+        DesktopRect::new(0, 0, 3840, 1080).unwrap(),
+    )
+    .unwrap();
     let valid = TouchSurface {
         width: 1920,
         height: 1080,
@@ -107,9 +117,25 @@ fn touch_surface_is_published_only_when_provider_proves_valid_mapping() {
         logical_height: 1080,
     };
     let cases = [
-        (Ok(Some(valid)), true, None),
-        (Ok(None), false, None),
         (
+            vec![Ok(Some(geometry)), Ok(Some(geometry))],
+            Ok(Some(valid)),
+            true,
+            None,
+        ),
+        (vec![Ok(Some(geometry))], Ok(None), false, None),
+        (vec![Ok(None)], Ok(Some(valid)), false, None),
+        (
+            vec![Err(CaptureError::new(
+                "geometry_unavailable",
+                "topology unavailable",
+            ))],
+            Ok(Some(valid)),
+            false,
+            None,
+        ),
+        (
+            vec![Ok(Some(geometry))],
             Err(CaptureError::new(
                 "geometry_unavailable",
                 "topology unavailable",
@@ -118,6 +144,40 @@ fn touch_surface_is_published_only_when_provider_proves_valid_mapping() {
             None,
         ),
         (
+            vec![Ok(Some(geometry))],
+            Ok(Some(TouchSurface {
+                width: 1280,
+                ..valid
+            })),
+            false,
+            None,
+        ),
+        (
+            vec![Ok(Some(geometry)), Ok(Some(moved))],
+            Ok(Some(valid)),
+            false,
+            None,
+        ),
+        (
+            vec![Ok(Some(geometry)), Ok(None)],
+            Ok(Some(valid)),
+            false,
+            None,
+        ),
+        (
+            vec![
+                Ok(Some(geometry)),
+                Err(CaptureError::new(
+                    "geometry_unavailable",
+                    "topology unavailable",
+                )),
+            ],
+            Ok(Some(valid)),
+            false,
+            None,
+        ),
+        (
+            vec![Ok(Some(geometry))],
             Ok(Some(TouchSurface {
                 logical_width: 0,
                 ..valid
@@ -126,9 +186,9 @@ fn touch_surface_is_published_only_when_provider_proves_valid_mapping() {
             Some("geometry_unavailable"),
         ),
     ];
-    for (provider, present, error) in cases {
-        let (controller, _) =
-            setup_with_surfaces(true, VecDeque::new(), VecDeque::from([provider]));
+    for (geometries, provider, present, error) in cases {
+        let (controller, drops) =
+            setup_with_surfaces(true, VecDeque::from(geometries), VecDeque::from([provider]));
         let mut controller = controller.lock().unwrap();
         let request = || Operation::Open {
             output: "fake".into(),
@@ -145,8 +205,10 @@ fn touch_surface_is_published_only_when_provider_proves_valid_mapping() {
                     .len(),
                 0
             );
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
             continue;
         }
+        assert_eq!(reply["ok"], true);
         assert_eq!(reply["touch_surface"].is_object(), present);
         if present {
             assert_eq!(reply["touch_surface"]["logical_width"], 1920);
@@ -167,6 +229,10 @@ fn touch_surface_is_published_only_when_provider_proves_valid_mapping() {
             status["streams"][0]["touch_surface"],
             reply["touch_surface"]
         );
+        let stream = reply["stream"].as_u64().unwrap();
+        assert!(controller.read("owner", stream, 0).unwrap().is_none());
+        controller.close("owner", stream).unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }
 
