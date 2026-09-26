@@ -283,6 +283,8 @@ namespace Amaterasu {
       gamepad?: string;
       keyboard?: boolean;
       mouse?: boolean;
+      native_pen_touch?: boolean;
+      [key: string]: unknown;
     };
   }
   export interface PairingClients {

@@ -856,6 +856,165 @@ namespace Amaterasu {
     return { fec_percentage: percentage };
   }
 
+  const forwardablePairingOverrideFields = [
+    "fec_percentage", "stream_audio", "audio_sink", "virtual_sink",
+    "audio_sink_capture_only", "back_button_timeout", "controller", "gamepad",
+    "keyboard", "mouse", "native_pen_touch",
+    "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
+    "frame_limiter_fps_limit", "frame_limiter_enable", "frame_limiter_provider",
+    "frame_limiter_disable_vsync", "frame_limiter_auto_virtual_framegen",
+    "rtss_frame_limit_type", "nvenc_spatial_aq", "high_resolution_scrolling",
+    "always_send_scancodes", "key_rightalt_to_key_win", "key_repeat_delay",
+    "key_repeat_frequency",
+  ];
+
+  export function unsupportedPairingOverrideFields(client: PairingClient): string[] {
+    const overrides = client.config_overrides ?? {};
+    return Object.entries(overrides)
+      .filter(([field, value]) => !forwardablePairingOverrideFields.includes(field) ||
+        !validStoredPairingOverride(field, value))
+      .map(([field]) => field);
+  }
+
+  function validStoredPairingOverride(field: string, value: unknown): boolean {
+    if (value === null || value === undefined) return false;
+    if (["stream_audio", "audio_sink_capture_only", "controller", "keyboard", "mouse",
+      "native_pen_touch", "frame_limiter_enable", "frame_limiter_disable_vsync",
+      "nvenc_spatial_aq", "high_resolution_scrolling", "always_send_scancodes",
+      "key_rightalt_to_key_win"].includes(field)) return typeof value === "boolean";
+    if (field === "audio_sink" || field === "virtual_sink")
+      return typeof value === "string" && new TextEncoder().encode(value).length <= 4096 &&
+        !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+    if (field === "gamepad")
+      return typeof value === "string" && recognizedInputGamepadProfiles.includes(value);
+    if (field === "frame_limiter_provider")
+      return typeof value === "string" && ["auto", "rtss", "nvidia-control-panel", "none",
+        "mangohud", "proton", "mangohud-proton"].includes(value);
+    if (field === "frame_limiter_auto_virtual_framegen")
+      return typeof value === "string" && ["enabled", "vrr", "legacy", "disabled"].includes(value);
+    if (field === "rtss_frame_limit_type")
+      return typeof value === "string" && ["async", "front edge sync", "back edge sync",
+        "nvidia reflex"].includes(value);
+    if (field === "fec_percentage")
+      return Number.isSafeInteger(value) && (value as number) >= 1 && (value as number) <= 255;
+    if (field === "video_max_batch_size_kb")
+      return Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 64;
+    if (field === "back_button_timeout" || field === "max_bitrate")
+      return Number.isSafeInteger(value) && (value as number) >= -0x8000_0000 &&
+        (value as number) <= 0x7fff_ffff;
+    if (field === "key_repeat_delay")
+      return Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 0x7fff_ffff;
+    if (field === "frame_limiter_fps_limit")
+      return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1000 &&
+        Math.abs(value * 1000 - Math.round(value * 1000)) <= 0.000001;
+    if (["minimum_fps_target", "key_repeat_frequency"].includes(field))
+      return typeof value === "number" && Number.isFinite(value) && value >= 0 &&
+        (field === "key_repeat_frequency" || value <= 1000);
+    return false;
+  }
+
+  export function parsePairingClientsReply(value: unknown): PairingClients {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Paired clients reply is invalid.");
+    const reply = value as Record<string, unknown>;
+    if (reply.ok !== true || !Number.isSafeInteger(reply.revision) ||
+        (reply.revision as number) < 0 || !Array.isArray(reply.clients))
+      throw new Error("Paired clients reply is invalid.");
+    const seen = new Set<string>();
+    for (const value of reply.clients) {
+      if (!value || typeof value !== "object" || Array.isArray(value))
+        throw new Error("Paired client metadata is invalid.");
+      const client = value as Record<string, unknown>;
+      if (typeof client.certificate_id !== "string" ||
+          !/^[0-9a-fA-F]{64}$/.test(client.certificate_id) ||
+          seen.has(client.certificate_id) ||
+          typeof client.client_id !== "string" || typeof client.name !== "string" ||
+          !Number.isSafeInteger(client.paired_at) || (client.paired_at as number) < 0 ||
+          (client.config_overrides !== undefined &&
+            (!client.config_overrides || typeof client.config_overrides !== "object" ||
+              Array.isArray(client.config_overrides))))
+        throw new Error("Paired client metadata is invalid.");
+      seen.add(client.certificate_id);
+    }
+    return reply as unknown as PairingClients;
+  }
+
+  function canonicalPairingOverrides(
+    values: Record<string, unknown>,
+  ): NonNullable<PairingClient["config_overrides"]> {
+    if (Object.keys(values).some((field) => !forwardablePairingOverrideFields.includes(field)))
+      throw new Error("The paired client has override fields this editor cannot preserve.");
+    return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== null && value !== undefined));
+  }
+
+  export async function savePairingClientOverrides(
+    api: Pick<Api, "post">,
+    current: PairingClients,
+    certificateId: string,
+    values: Record<string, unknown>,
+  ): Promise<PairingClients> {
+    const client = current.clients.find((candidate) => candidate.certificate_id === certificateId);
+    if (!client || !Number.isSafeInteger(current.revision) || current.revision >= Number.MAX_SAFE_INTEGER)
+      throw new Error("Paired client or settings revision is invalid.");
+    const unsupported = unsupportedPairingOverrideFields(client);
+    if (unsupported.length > 0)
+      throw new Error(`This client has overrides this editor cannot preserve: ${unsupported.join(", ")}.`);
+    const desired = canonicalPairingOverrides({ ...client.config_overrides, ...values });
+    const confirms = (reply: PairingClients): boolean => {
+      if (reply.revision !== current.revision + 1 || reply.clients.length !== current.clients.length)
+        return false;
+      return current.clients.every((before) => {
+        const after = reply.clients.find((candidate) => candidate.certificate_id === before.certificate_id);
+        if (!after || after.client_id !== before.client_id || after.name !== before.name ||
+            after.paired_at !== before.paired_at) return false;
+        return sameConfigurationValue(after.config_overrides ?? {},
+          before.certificate_id === certificateId ? desired : before.config_overrides ?? {});
+      });
+    };
+    const response = await api.post<unknown>("pairing/update_client_config_overrides", {
+      certificate_id: certificateId,
+      expected_revision: current.revision,
+      config_overrides: desired,
+    });
+    if (!response || typeof response !== "object" || Array.isArray(response) ||
+        (response as Record<string, unknown>).ok !== true ||
+        (response as Record<string, unknown>).certificate_id !== certificateId)
+      throw new Error("Paired client update reply did not confirm the selected certificate.");
+    const saved = parsePairingClientsReply(await api.post<unknown>("pairing/list_clients"));
+    if (!confirms(saved))
+      throw new Error("Paired client overrides could not be confirmed after saving. Refresh and check current values.");
+    return saved;
+  }
+
+  export class PairingClientsLoadGate {
+    private generation = 0;
+
+    invalidate(): void {
+      this.generation += 1;
+    }
+
+    async read(api: Pick<Api, "post">): Promise<{
+      settings: PairingClients;
+      inputStatus: InputRuntimeStatus | null;
+    } | null> {
+      const generation = ++this.generation;
+      try {
+        const settings = parsePairingClientsReply(await api.post<unknown>("pairing/list_clients"));
+        if (generation !== this.generation) return null;
+        let inputStatus: InputRuntimeStatus | null = null;
+        try {
+          inputStatus = parseInputRuntimeStatus(await api.post<unknown>("input/status"));
+        } catch {
+          // Stored paired-client choices remain visible without live input status.
+        }
+        return generation === this.generation ? { settings, inputStatus } : null;
+      } catch (error) {
+        if (generation !== this.generation) return null;
+        throw error;
+      }
+    }
+  }
+
   function sparseInputOverrideSelect(name: string, current: boolean | undefined): HTMLSelectElement {
     const select = el("select");
     select.name = name;
@@ -1614,6 +1773,7 @@ namespace Amaterasu {
     const historyArea = el("div");
     const historyLoads = new HistorySettingsLoadGate();
     const pairingArea = el("div");
+    const pairingLoads = new PairingClientsLoadGate();
     context.content.append(
       sectionHeading(
         "Settings",
@@ -2372,13 +2532,9 @@ namespace Amaterasu {
     async function loadPairing(): Promise<void> {
       pairingArea.replaceChildren(el("p", "muted", "Loading paired clients…"));
       try {
-        const settings = await context.api.post<PairingClients>("pairing/list_clients");
-        let inputStatus: InputRuntimeStatus | null = null;
-        try {
-          inputStatus = await context.api.post<InputRuntimeStatus>("input/status");
-        } catch {
-          // Paired audio/FEC values stay editable if the input backend is offline.
-        }
+        const loaded = await pairingLoads.read(context.api);
+        if (loaded === null) return;
+        const { settings, inputStatus } = loaded;
         if (!context.content.isConnected) return;
         if (settings.clients.length === 0) {
           pairingArea.replaceChildren(
@@ -2433,6 +2589,8 @@ namespace Amaterasu {
           keyboard.setAttribute("aria-label", `Keyboard input override for ${client.name}`);
           const mouse = sparseInputOverrideSelect("mouse", client.config_overrides?.mouse);
           mouse.setAttribute("aria-label", `Mouse input override for ${client.name}`);
+          const nativePenTouch = sparseInputOverrideSelect("native_pen_touch", client.config_overrides?.native_pen_touch);
+          nativePenTouch.setAttribute("aria-label", `Native pen/touch preference override for ${client.name}`);
           const streamAudio = el("select");
           streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
           const audioChoices: Array<[string, string]> = [
@@ -2503,35 +2661,39 @@ namespace Amaterasu {
             ? ""
             : String(client.config_overrides.audio_sink_capture_only);
           const status = el("div");
+          const unsupported = unsupportedPairingOverrideFields(client);
           const save = button(
             "Save",
             () => runAction(save, status, async () => {
+              pairingLoads.invalidate();
+              let saveStarted = false;
               try {
-                await context.api.post("pairing/update_client_config_overrides", {
-                  certificate_id: client.certificate_id,
-                  expected_revision: settings.revision,
-                  config_overrides: {
-                    ...parseClientFecOverride(fec.value),
-                    back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeout.value),
-                    stream_audio: parseStreamAudioOverride(streamAudio.value),
-                    audio_sink: parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
-                    virtual_sink: parseVirtualSinkOverride(virtualSinkMode.value, virtualSinkSelector.value),
-                    audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(captureOnly.value),
-                    controller: parseInputBooleanOverride(controller.value, "Controller input"),
-                    gamepad: parseGamepadProfileOverride(
-                      gamepad.value,
-                      inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])],
-                    ),
-                    keyboard: parseInputBooleanOverride(keyboard.value, "Keyboard input"),
-                    mouse: parseInputBooleanOverride(mouse.value, "Mouse input"),
-                  },
-                });
-                context.notify(`Streaming override saved for ${client.name}.`);
+                const values = {
+                  ...parseClientFecOverride(fec.value),
+                  back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeout.value),
+                  stream_audio: parseStreamAudioOverride(streamAudio.value),
+                  audio_sink: parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
+                  virtual_sink: parseVirtualSinkOverride(virtualSinkMode.value, virtualSinkSelector.value),
+                  audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(captureOnly.value),
+                  controller: parseInputBooleanOverride(controller.value, "Controller input"),
+                  gamepad: parseGamepadProfileOverride(
+                    gamepad.value,
+                    inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])],
+                  ),
+                  keyboard: parseInputBooleanOverride(keyboard.value, "Keyboard input"),
+                  mouse: parseInputBooleanOverride(mouse.value, "Mouse input"),
+                  native_pen_touch: parseInputBooleanOverride(nativePenTouch.value, "Native pen/touch preference"),
+                };
+                saveStarted = true;
+                await savePairingClientOverrides(context.api, settings, client.certificate_id, values);
                 await loadPairing();
+                context.notify(`Stored overrides confirmed for ${client.name}. Active stream application is not confirmed.`);
               } catch (error) {
-                if (error instanceof ApiError && error.code === "revision_conflict") {
-                  context.notify("Paired clients changed elsewhere. The list has been refreshed; review and save again.");
+                if (saveStarted) {
                   await loadPairing();
+                  context.notify(error instanceof ApiError && error.code === "revision_conflict"
+                    ? "Paired clients changed elsewhere. Review the refreshed overrides before saving again."
+                    : "Paired client override save could not be confirmed. Review the refreshed values before saving again.");
                   return;
                 }
                 throw error;
@@ -2539,20 +2701,22 @@ namespace Amaterasu {
             }),
             "primary",
           );
-          save.disabled = !context.api.allows("pairing.admin");
+          save.disabled = !context.api.allows("pairing.admin") || unsupported.length > 0;
+          if (unsupported.length > 0)
+            status.textContent = `Save unavailable: this client has stored overrides this editor cannot preserve (${unsupported.join(", ")}).`;
           const identity = el(
             "div",
             "",
             el("strong", "", client.name),
             el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
           );
-          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, el("div", "", save, status)];
+          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, el("div", "", save, status)];
         });
-        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", ""], rows);
+        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", ""], rows);
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
-            el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save uses the current pairing revision."),
+            el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save confirms the stored pairing revision; applying client input preferences during active streams is not yet implemented."),
             tableView,
             el("div", "actions", badge(`Revision ${settings.revision}`)),
           ),

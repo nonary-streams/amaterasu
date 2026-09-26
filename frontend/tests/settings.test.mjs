@@ -1361,6 +1361,239 @@ test("NVHTTP network settings preserve startup null and explicit blank overrides
   }
 });
 
+const pairedClients = () => ({
+  ok: true,
+  revision: 7,
+  clients: [
+    { certificate_id: "a".repeat(64), client_id: "living-room", name: "Living room",
+      paired_at: 100, config_overrides: {
+        fec_percentage: 20, native_pen_touch: false,
+        max_bitrate: 15000, frame_limiter_enable: false,
+      } },
+    { certificate_id: "b".repeat(64), client_id: "desk", name: "Desk",
+      paired_at: 200, config_overrides: { audio_sink: "headphones" } },
+  ],
+});
+
+test("paired-client editor preserves hidden overrides and confirms complete signed readback", async () => {
+  const current = pairedClients();
+  const values = { fec_percentage: 35, native_pen_touch: true, stream_audio: false };
+  const expected = { ...current.clients[0].config_overrides, ...values };
+  const saved = { ...current, revision: 8, clients: [
+    { ...current.clients[0], config_overrides: expected }, current.clients[1],
+  ] };
+  const routes = [];
+  const api = { async post(route, body) {
+    routes.push(route);
+    if (route === "pairing/update_client_config_overrides") {
+      assert.deepEqual(ordinary(body), {
+        certificate_id: "a".repeat(64), expected_revision: 7, config_overrides: expected,
+      });
+      return { ok: true, certificate_id: "a".repeat(64) };
+    }
+    assert.equal(route, "pairing/list_clients");
+    return saved;
+  } };
+  assert.deepEqual(ordinary(await context.Amaterasu.savePairingClientOverrides(
+    api, current, "a".repeat(64), values)), saved);
+  assert.deepEqual(routes, ["pairing/update_client_config_overrides", "pairing/list_clients"]);
+});
+
+test("paired-client editor rejects unknown fields, mismatched identity and stale readback", async () => {
+  const current = pairedClients();
+  const id = "a".repeat(64);
+  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(current.clients[0])), []);
+  const unsupported = pairedClients();
+  unsupported.clients[0].config_overrides.future_policy = true;
+  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(unsupported.clients[0])), ["future_policy"]);
+  const malformed = pairedClients();
+  malformed.clients[0].config_overrides.max_bitrate = "fast";
+  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(malformed.clients[0])), ["max_bitrate"]);
+  malformed.clients[0].config_overrides.max_bitrate = 15000;
+  malformed.clients[0].config_overrides.frame_limiter_fps_limit = 59.9401;
+  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(malformed.clients[0])), ["frame_limiter_fps_limit"]);
+  await assert.rejects(context.Amaterasu.savePairingClientOverrides({ async post() {
+    throw new Error("unexpected write");
+  } }, unsupported, id, { fec_percentage: 30 }), /cannot preserve/);
+  const desired = { ...current.clients[0].config_overrides, fec_percentage: 30 };
+  const committed = { ...current, revision: 8, clients: [
+    { ...current.clients[0], config_overrides: desired }, current.clients[1],
+  ] };
+  for (const readback of [
+    { ...committed, revision: 9 },
+    { ...committed, clients: [{ ...committed.clients[0], client_id: "changed" }, committed.clients[1]] },
+    { ...committed, clients: [{ ...committed.clients[0], config_overrides: { ...desired, max_bitrate: 14000 } }, committed.clients[1]] },
+    { ...committed, clients: [committed.clients[0], { ...committed.clients[1], config_overrides: {} }] },
+  ]) {
+    await assert.rejects(context.Amaterasu.savePairingClientOverrides({ async post(route) {
+      return route === "pairing/update_client_config_overrides"
+        ? { ok: true, certificate_id: id } : readback;
+    } }, current, id, { fec_percentage: 30 }));
+  }
+  await assert.rejects(context.Amaterasu.savePairingClientOverrides({ async post() {
+    return { ok: true, certificate_id: "b".repeat(64) };
+  } }, current, id, { fec_percentage: 30 }), /selected certificate/);
+});
+
+test("paired-client editor leaves uncertain writes unconfirmed for a fresh UI reload", async () => {
+  class ApiError extends Error { constructor(code) { super(code); this.code = code; } }
+  context.ApiError = ApiError;
+  const current = pairedClients();
+  const id = "a".repeat(64);
+  const routes = [];
+  const api = { async post(route) {
+    routes.push(route);
+    if (route === "pairing/update_client_config_overrides") throw new ApiError("state_unavailable");
+    return current;
+  } };
+  await assert.rejects(context.Amaterasu.savePairingClientOverrides(
+    api, current, id, { fec_percentage: 30 }), /state_unavailable/);
+  assert.deepEqual(routes, ["pairing/update_client_config_overrides"]);
+});
+
+test("paired-client loads discard old list or input status after refresh", async () => {
+  const gate = new context.Amaterasu.PairingClientsLoadGate();
+  let resolveOld;
+  const old = gate.read({ post: () => new Promise((resolve) => { resolveOld = resolve; }) });
+  const latest = gate.read({ async post(route) {
+    if (route === "pairing/list_clients") return pairedClients();
+    throw new Error("input unavailable");
+  } });
+  resolveOld(pairedClients());
+  assert.equal(await old, null);
+  assert.equal((await latest).settings.revision, 7);
+  let resolveStatus;
+  const pending = gate.read({ async post(route) {
+    if (route === "pairing/list_clients") return pairedClients();
+    return new Promise((resolve) => { resolveStatus = resolve; });
+  } });
+  await new Promise(setImmediate);
+  gate.invalidate();
+  resolveStatus({ ok: true });
+  assert.equal(await pending, null);
+});
+
+test("paired-client form preserves hidden fields, reloads conflict, and blocks unknown fields", async () => {
+  class Element {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.listeners = new Map();
+      this.isConnected = false;
+      this.value = "";
+      this.attributes = new Map();
+    }
+    setConnected(value) {
+      this.isConnected = value;
+      for (const child of this.children) child?.setConnected?.(value);
+    }
+    append(...children) {
+      for (const child of children) {
+        if (child == null) continue;
+        this.children.push(child);
+        child?.setConnected?.(this.isConnected);
+      }
+    }
+    replaceChildren(...children) {
+      for (const child of this.children) child?.setConnected?.(false);
+      this.children = [];
+      this.append(...children);
+    }
+    addEventListener(name, callback) { this.listeners.set(name, callback); }
+    setAttribute(name, value) { this.attributes.set(name, value); }
+    reportValidity() { return true; }
+    setCustomValidity() {}
+    get options() { return this.children.filter((child) => child?.tagName === "option"); }
+    get valueAsNumber() { return Number(this.value); }
+    get textContent() {
+      return this.children.map((child) => typeof child === "string" ? child : child.textContent).join("");
+    }
+    set textContent(value) { this.replaceChildren(value); }
+    fire(name, event = {}) { this.listeners.get(name)?.(event); }
+  }
+  const find = (node, predicate) => {
+    if (predicate(node)) return node;
+    for (const child of node.children ?? []) {
+      if (typeof child === "string") continue;
+      const result = find(child, predicate);
+      if (result) return result;
+    }
+    return null;
+  };
+  const dom = vm.createContext({
+    TextEncoder, URL, Error,
+    document: { createElement: (name) => new Element(name) },
+  });
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/settings.ts"]) {
+    vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
+      target: ts.ScriptTarget.ES2022,
+    }), dom);
+    vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+  }
+  class ApiError extends Error { constructor(code) { super(code); this.code = code; } }
+  dom.ApiError = ApiError;
+  const content = new Element("main");
+  content.setConnected(true);
+  const notices = [];
+  let stored = pairedClients();
+  let updates = 0;
+  let secondSubmittedRevision;
+  dom.Amaterasu.renderSettings({
+    content,
+    notify: (message) => notices.push(message),
+    api: {
+      allows: (scope) => scope === "pairing.admin",
+      async post(route, body) {
+        if (route === "pairing/list_clients") return stored;
+        if (route === "input/status") throw new Error("input offline");
+        if (route === "pairing/update_client_config_overrides") {
+          updates += 1;
+          if (updates === 2) {
+            secondSubmittedRevision = body.expected_revision;
+            stored = { ...stored, revision: 9, clients: [
+              { ...stored.clients[0], config_overrides: {
+                ...stored.clients[0].config_overrides, future_policy: true,
+              } }, stored.clients[1],
+            ] };
+            throw new ApiError("revision_conflict");
+          }
+          assert.equal(body.expected_revision, 7);
+          assert.equal(body.config_overrides.max_bitrate, 15000);
+          assert.equal(body.config_overrides.frame_limiter_enable, false);
+          assert.equal(body.config_overrides.native_pen_touch, true);
+          stored = { ...stored, revision: 8, clients: [
+            { ...stored.clients[0], config_overrides: body.config_overrides }, stored.clients[1],
+          ] };
+          return { ok: true, certificate_id: body.certificate_id };
+        }
+        throw new Error(`unavailable: ${route}`);
+      },
+    },
+  });
+  await new Promise(setImmediate);
+  const pairingArea = content.children[10];
+  const fec = find(pairingArea, (node) => node.name === `fec_${"a".repeat(64)}`);
+  const save = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
+  assert.ok(fec);
+  assert.ok(save);
+  fec.value = "35";
+  find(pairingArea, (node) => node.name === "native_pen_touch").value = "true";
+  save.fire("click");
+  await new Promise(setImmediate);
+  assert.equal(updates, 1);
+  assert.match(pairingArea.textContent, /Revision 8/);
+  assert.match(notices.at(-1), /Stored overrides confirmed.*Active stream application is not confirmed/);
+  const freshSave = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
+  freshSave.fire("click");
+  await new Promise(setImmediate);
+  assert.equal(secondSubmittedRevision, 8);
+  assert.match(pairingArea.textContent, /Revision 9/);
+  assert.match(notices.at(-1), /changed elsewhere/);
+  const blocked = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
+  assert.equal(blocked.disabled, true);
+  assert.match(pairingArea.textContent, /cannot preserve \(future_policy\)/);
+});
+
 function nvhttpHostSettings(revision = 8) {
   return {
     ok: true, revision,
