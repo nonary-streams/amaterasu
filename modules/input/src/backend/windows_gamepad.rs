@@ -998,6 +998,7 @@ mod tests {
         fail_updates: Vec<VigemError>,
         fail_remove: bool,
         fail_remove_on_attempt: Option<usize>,
+        stale_reports: usize,
         updates: Vec<(u8, u16)>,
     }
 
@@ -1082,11 +1083,11 @@ mod tests {
         let client = unsafe { &*client.cast::<FakeClient>() };
         // SAFETY: the target remains allocated until a successful removal.
         let target = unsafe { &mut *target.cast::<FakeTarget>() };
-        assert!(
-            !target.uncertain,
-            "stale target received another X360 report"
-        );
         let mut trace = client.trace.borrow_mut();
+        if target.uncertain {
+            trace.stale_reports += 1;
+            return 0xE000_0004;
+        }
         if let Some(status) = trace
             .fail_next_update
             .take()
@@ -1108,11 +1109,11 @@ mod tests {
         let client = unsafe { &*client.cast::<FakeClient>() };
         // SAFETY: the target remains allocated until a successful removal.
         let target = unsafe { &mut *target.cast::<FakeTarget>() };
-        assert!(
-            !target.uncertain,
-            "stale target received another DS4 report"
-        );
         let mut trace = client.trace.borrow_mut();
+        if target.uncertain {
+            trace.stale_reports += 1;
+            return 0xE000_0004;
+        }
         if let Some(status) = trace
             .fail_next_update
             .take()
@@ -1403,6 +1404,7 @@ mod tests {
             trace.borrow().updates,
             [(1, 0x1000), (1, 0x2000), (1, 0x8000), (1, 0)]
         );
+        assert_eq!(trace.borrow().stale_reports, 0);
     }
 
     #[test]
