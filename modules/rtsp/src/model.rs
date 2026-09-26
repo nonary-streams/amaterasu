@@ -502,7 +502,7 @@ impl Open {
             .frame_limiter_executable_path
             .as_deref()
             .is_some_and(|path| {
-                path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
+                path.trim().is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
             })
         {
             return Err("invalid_executable_path");
@@ -791,7 +791,9 @@ fn valid_frame_limiter_snapshot(snapshot: &serde_json::Value, stream_fps: u32) -
             settings["mangohud_limiter_method"].as_str(),
             Some("early" | "late")
         )
-        || settings["rtss_install_path"].as_str().is_none()
+        || settings["rtss_install_path"]
+            .as_str()
+            .is_none_or(|path| path.len() > 4096 || path.chars().any(char::is_control))
     {
         return false;
     }
@@ -1032,6 +1034,26 @@ mod tests {
             missing_path.validate(false),
             Err("invalid_frame_limiter_snapshot")
         );
+
+        for path in ["  ", "C:\\Games\\Bad\nName.exe"] {
+            let mut invalid = open_json();
+            invalid["frame_limiter_settings"] = prepare["frame_limiter_settings"].clone();
+            invalid["frame_limiter_executable_path"] = json!(path);
+            let invalid: Open = serde_json::from_value(invalid).unwrap();
+            assert_eq!(invalid.validate(false), Err("invalid_executable_path"));
+        }
+        for install_path in ["C:\\RTSS\\Bad\nName", &"x".repeat(4097)] {
+            let mut invalid = open_json();
+            invalid["frame_limiter_settings"] = prepare["frame_limiter_settings"].clone();
+            invalid["frame_limiter_settings"]["settings"]["rtss_install_path"] =
+                json!(install_path);
+            invalid["frame_limiter_executable_path"] = json!("C:\\Games\\Example.exe");
+            let invalid: Open = serde_json::from_value(invalid).unwrap();
+            assert_eq!(
+                invalid.validate(false),
+                Err("invalid_frame_limiter_snapshot")
+            );
+        }
     }
 
     #[test]
