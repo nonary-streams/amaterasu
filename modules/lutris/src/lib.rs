@@ -519,7 +519,7 @@ impl LutrisModule {
             "auto_sync":self.configuration.settings().auto_sync,
             "autosync_remove_uninstalled":self.configuration.settings().autosync_remove_uninstalled,
             "include_steam":self.configuration.settings().include_steam,
-            "available":available.supported_platform && available.database_available && available.executable_available,
+            "available":available.paired_source_available,
             "platform_supported":available.supported_platform,
             "database_available":available.database_available,
             "executable_available":available.executable_available,

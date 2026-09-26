@@ -66,6 +66,7 @@ pub struct Availability {
     pub supported_platform: bool,
     pub database_available: bool,
     pub executable_available: bool,
+    pub paired_source_available: bool,
 }
 
 pub fn discover() -> Result<Snapshot, String> {
@@ -100,6 +101,8 @@ fn scan_source(
 
 pub fn availability() -> Availability {
     let supported_platform = cfg!(target_os = "linux");
+    let native_database = supported_platform && default_database_path().is_some();
+    let native_executable = supported_platform && find_lutris_executable().is_some();
     #[cfg(target_os = "linux")]
     let flatpak_database = effective_uid().filter(|uid| *uid != 0).and_then(|uid| {
         std::env::var_os("HOME")
@@ -112,13 +115,28 @@ pub fn availability() -> Availability {
     let flatpak_executable = find_flatpak_executable();
     #[cfg(not(target_os = "linux"))]
     let flatpak_executable: Option<PathBuf> = None;
+    let flatpak_database_available = flatpak_database.is_some();
+    let flatpak_executable_available = flatpak_executable.is_some();
     Availability {
         supported_platform,
-        database_available: supported_platform
-            && (default_database_path().is_some() || flatpak_database.is_some()),
-        executable_available: supported_platform
-            && (find_lutris_executable().is_some() || flatpak_executable.is_some()),
+        database_available: native_database || flatpak_database_available,
+        executable_available: native_executable || flatpak_executable_available,
+        paired_source_available: paired_source_available(
+            native_database,
+            native_executable,
+            flatpak_database_available,
+            flatpak_executable_available,
+        ),
     }
+}
+
+fn paired_source_available(
+    native_database: bool,
+    native_executable: bool,
+    flatpak_database: bool,
+    flatpak_executable: bool,
+) -> bool {
+    (native_database && native_executable) || (flatpak_database && flatpak_executable)
 }
 
 fn discover_source() -> Result<(PathBuf, PathBuf, LaunchKind), String> {
@@ -736,6 +754,14 @@ mod tests {
         ] {
             assert!(!valid_flatpak_ref(bad));
         }
+    }
+
+    #[test]
+    fn availability_requires_database_and_client_from_the_same_installation() {
+        assert!(!paired_source_available(true, false, false, true));
+        assert!(!paired_source_available(false, true, true, false));
+        assert!(paired_source_available(true, true, false, false));
+        assert!(paired_source_available(false, false, true, true));
     }
 
     #[cfg(target_os = "linux")]
