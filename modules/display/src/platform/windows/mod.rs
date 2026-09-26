@@ -115,9 +115,10 @@ impl Platform for WindowsPlatform {
                 }
             }
         }
-        // HDR changes can cause a driver to renegotiate its mode or topology.
-        // Verify the complete CCD request again after the last HDR operation.
-        verify_applied_configuration(configuration, query::snapshot())
+        // HDR changes can affect another target or renegotiate mode/topology.
+        // Verify the complete request again after the last HDR operation.
+        let final_state = verify_applied_configuration(configuration, query::snapshot())?;
+        verify_requested_hdr(configuration, &final_state)
     }
     fn restore(
         &mut self,
@@ -149,16 +150,39 @@ impl Platform for WindowsPlatform {
 fn verify_applied_configuration(
     configuration: &Configuration,
     readback: DisplayResult<Snapshot>,
-) -> DisplayResult<()> {
-    if !apply::verifies(
-        configuration,
-        &readback.map_err(DisplayError::after_mutation)?,
-    ) {
+) -> DisplayResult<Snapshot> {
+    let readback = readback.map_err(DisplayError::after_mutation)?;
+    if !apply::verifies(configuration, &readback) {
         return Err(DisplayError::new(
             "verification_failed",
             "Windows display state differs from the requested configuration",
         )
         .after_mutation());
+    }
+    Ok(readback)
+}
+
+fn verify_requested_hdr(configuration: &Configuration, readback: &Snapshot) -> DisplayResult<()> {
+    for display in &configuration.displays {
+        let Some(requested) = display.hdr_enabled else {
+            continue;
+        };
+        let actual = readback
+            .paths
+            .iter()
+            .find(|path| path.id.eq_ignore_ascii_case(&display.id))
+            .ok_or_else(|| {
+                DisplayError::new("verification_failed", "requested HDR target disappeared")
+                    .after_mutation()
+            })?
+            .hdr_enabled;
+        if (requested && actual != Some(true)) || (!requested && actual == Some(true)) {
+            return Err(DisplayError::new(
+                "verification_failed",
+                "Windows HDR state differs from the requested state after all display changes",
+            )
+            .after_mutation());
+        }
     }
     Ok(())
 }
@@ -166,7 +190,67 @@ fn verify_applied_configuration(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DisplaySetting, Rational, Rotation};
+    use crate::model::{
+        Address, DisplayPath, DisplaySetting, Rational, Rotation, Signal, SourceMode,
+    };
+
+    fn readback_path(id: &str, x: i32, hdr_enabled: Option<bool>) -> DisplayPath {
+        let refresh = Rational {
+            numerator: 60,
+            denominator: 1,
+        };
+        DisplayPath {
+            id: id.into(),
+            source_name: id.into(),
+            source_address: Address {
+                adapter_low: 1,
+                adapter_high: 0,
+                id: x as u32,
+            },
+            target_address: Address {
+                adapter_low: 1,
+                adapter_high: 0,
+                id: x as u32 + 1,
+            },
+            source: SourceMode {
+                width: 1920,
+                height: 1080,
+                pixel_format: 4,
+                x,
+                y: 0,
+            },
+            signal: Signal {
+                pixel_rate: 148_500_000,
+                horizontal_sync: refresh,
+                vertical_sync: refresh,
+                active_width: 1920,
+                active_height: 1080,
+                total_width: 2200,
+                total_height: 1125,
+                video_standard: 0,
+                scan_line_ordering: 1,
+            },
+            rotation: 1,
+            scaling: 1,
+            refresh,
+            scan_line_ordering: 1,
+            output_technology: 5,
+            source_flags: 0,
+            target_flags: 0,
+            path_flags: 1,
+            hdr_enabled,
+        }
+    }
+
+    fn two_target_configuration(second_hdr: Option<bool>) -> Configuration {
+        let mut configuration = requested();
+        let mut second = configuration.displays[0].clone();
+        second.id = "monitor.two".into();
+        second.x = 1920;
+        second.hdr_enabled = second_hdr;
+        configuration.displays.push(second);
+        configuration
+    }
 
     fn requested() -> Configuration {
         Configuration {
@@ -203,5 +287,51 @@ mod tests {
         let error = verify_applied_configuration(&requested(), Err(readback_error)).unwrap_err();
         assert_eq!(error.code, "topology_changed");
         assert!(error.may_have_changed);
+    }
+
+    #[test]
+    fn final_hdr_readback_rejects_earlier_target_drift() {
+        let configuration = two_target_configuration(Some(true));
+        let readback = Snapshot {
+            format_version: 1,
+            paths: vec![
+                readback_path("monitor.one", 0, Some(false)),
+                readback_path("monitor.two", 1920, Some(true)),
+            ],
+        };
+        assert!(apply::verifies(&configuration, &readback));
+        let error = verify_requested_hdr(&configuration, &readback).unwrap_err();
+        assert_eq!(error.code, "verification_failed");
+        assert!(error.may_have_changed);
+    }
+
+    #[test]
+    fn final_hdr_readback_accepts_both_requested_targets() {
+        let configuration = two_target_configuration(Some(true));
+        let readback = Snapshot {
+            format_version: 1,
+            paths: vec![
+                readback_path("monitor.one", 0, Some(true)),
+                readback_path("monitor.two", 1920, Some(true)),
+            ],
+        };
+        assert!(apply::verifies(&configuration, &readback));
+        verify_requested_hdr(&configuration, &readback).unwrap();
+    }
+
+    #[test]
+    fn final_hdr_readback_accepts_unsupported_sdr_and_ignores_unspecified_hdr() {
+        let mut configuration = two_target_configuration(Some(false));
+        let readback = Snapshot {
+            format_version: 1,
+            paths: vec![
+                readback_path("monitor.one", 0, Some(true)),
+                readback_path("monitor.two", 1920, None),
+            ],
+        };
+        assert!(apply::verifies(&configuration, &readback));
+        verify_requested_hdr(&configuration, &readback).unwrap();
+        configuration.displays[0].hdr_enabled = None;
+        verify_requested_hdr(&configuration, &readback).unwrap();
     }
 }

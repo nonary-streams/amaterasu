@@ -150,8 +150,9 @@ inactive target may be activated with HDR-off requested: its HDR state is
 checked after CCD activation without changing an unjournaled HDR baseline.
 If it comes up HDR-on, apply fails and rolls back. This service reports
 `applied:true` only after CCD and requested HDR state verification. The requested
-mode and topology are read back again after the final HDR operation because an
-HDR change may cause the driver to renegotiate either. A late mismatch fails
+mode, topology, and every requested HDR state are read back again after the
+final HDR operation because an HDR change may affect another target or cause
+the driver to renegotiate a mode. A late mismatch fails
 apply and enters the journaled rollback path.
 
 Both restore and recover require the authenticated immediate caller that owns
