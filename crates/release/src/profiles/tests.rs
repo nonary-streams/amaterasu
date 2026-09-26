@@ -860,11 +860,55 @@ fn catalog_profiles_scope_lutris_steam_id_export_authorization() {
             if principal != "amaterasu.console" {
                 assert_eq!(
                     grants.call.contains("amaterasu.lutris/1"),
-                    principal == MANAGEMENT.id,
+                    principal == MANAGEMENT.id || principal == LAUNCH.id || principal == NVHTTP.id,
                     "unexpected Lutris call grant for {principal}"
                 );
             }
         }
+    }
+}
+
+#[test]
+fn generated_policies_grant_launch_only_the_expected_provider_calls() {
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-lutris-launch-grants-{}",
+        std::process::id()
+    ));
+    let development = development_policy(&root).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    let installer = installer_policy("__WEB__", BTreeMap::new());
+    let expected_calls = names(&[
+        "amaterasu.catalog/1",
+        "amaterasu.state/1",
+        "amaterasu.session/1",
+        "amaterasu.application/1",
+        "amaterasu.playnite/1",
+        "amaterasu.lutris/1",
+    ]);
+    let expected_dependencies = [
+        RUNTIME_ID,
+        CATALOG.id,
+        STATE.id,
+        SESSION.id,
+        APPLICATION.id,
+        PLAYNITE.id,
+        LUTRIS.id,
+    ];
+
+    assert_eq!(LAUNCH.dependencies, expected_dependencies);
+    for policy in [development, installer] {
+        assert_eq!(policy.principals[LAUNCH.id].call, expected_calls);
+        assert!(policy.principals.contains_key(LUTRIS.id));
+        assert!(
+            policy.principals[LUTRIS.id]
+                .provide
+                .contains("amaterasu.lutris/1")
+        );
+        assert!(
+            policy.principals[NVHTTP.id]
+                .call
+                .contains("amaterasu.lutris/1")
+        );
     }
 }
 

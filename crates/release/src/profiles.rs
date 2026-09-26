@@ -246,6 +246,7 @@ const NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.launch/1",
         "amaterasu.display/1",
         "amaterasu.playnite/1",
+        "amaterasu.lutris/1",
         "amaterasu.application/1",
         "amaterasu.rtsp/1",
         "amaterasu.stream-session/1",
@@ -296,6 +297,7 @@ const LAUNCH: ComponentDefinition = ComponentDefinition {
         "amaterasu.session/1",
         "amaterasu.application/1",
         "amaterasu.playnite/1",
+        "amaterasu.lutris/1",
     ],
     publishes: &[],
     native_provides: &[],
@@ -307,6 +309,7 @@ const LAUNCH: ComponentDefinition = ComponentDefinition {
         "amaterasu.session",
         "amaterasu.application",
         "amaterasu.playnite",
+        "amaterasu.lutris",
     ],
 };
 
@@ -680,7 +683,9 @@ impl PackageProfile {
                 CONFIGURATION,
                 CATALOG,
                 APPLICATION,
+                STEAM,
                 PLAYNITE,
+                LUTRIS,
                 LAUNCH,
                 DISPLAY,
                 PAIRING,
