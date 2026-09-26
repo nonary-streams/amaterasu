@@ -612,6 +612,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn interrupted_requested_bracket_is_replaced_by_current_recapture() {
+        let mut assembler = SnapshotAssembler::for_connection("current".into());
+        let start = br#"{"type":"snapshotStart","nonce":"current","requestId":"ticket"}"#;
+        assert!(assembler.receive_line_with_request(start).is_none());
+        assert!(
+            assembler
+                .receive_line_with_request(br#"{"type":"plugins","payload":[]}"#)
+                .is_none()
+        );
+        // The extension suppresses completion once its capture becomes dirty.
+        // A recapture on the same pipe starts a new bracket for the same ticket.
+        assert!(assembler.receive_line_with_request(start).is_none());
+        assert!(
+            assembler
+                .receive_line_with_request(br#"{"type":"plugins","payload":[]}"#)
+                .is_none()
+        );
+        assert!(
+            assembler
+                .receive_line_with_request(br#"{"type":"categories","payload":[]}"#)
+                .is_none()
+        );
+        assert!(
+            assembler
+                .receive_line_with_request(br#"{"type":"games","payload":[{"id":"fresh","name":"Updated","installed":true}]}"#)
+                .is_none()
+        );
+        let (request_id, snapshot) = assembler
+            .receive_line_with_request(
+                br#"{"type":"snapshotComplete","nonce":"current","requestId":"ticket","games":1}"#,
+            )
+            .expect("recaptured bracket must finish");
+        assert_eq!(request_id.as_deref(), Some("ticket"));
+        assert_eq!(
+            snapshot.expect("current bracket must be valid").games[0].id,
+            "fresh"
+        );
+    }
+
     fn game(id: &str, categories: &[&str], plugin: &str, last_played: &str) -> Game {
         Game {
             id: id.into(),

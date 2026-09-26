@@ -57,7 +57,7 @@ function New-MockConnection([string]$Nonce, $Cache) {
     return @{
         Nonce = $Nonce
         Cache = $Cache
-        Signals = [System.Collections.Concurrent.ConcurrentDictionary[string,DateTime]]::new()
+        Signals = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
         Queue = [System.Collections.Concurrent.BlockingCollection[object]]::new(8)
     }
 }
@@ -162,7 +162,8 @@ try {
         $new.Dispatcher = $api.MainView.UIDispatcher
         $new.Stream = [System.IO.MemoryStream]::new()
         & $extension { param($connection,$id) Queue-Snapshot $connection $id } $new $requestId
-        $queuedBeforeChange = $new.Queue.Take()
+        $queuedBeforeChange = $null
+        Assert-True $new.Queue.TryTake([ref]$queuedBeforeChange, 2000) 'initial requested snapshot was not queued'
         Assert-Equal $queuedBeforeChange.CapturedAt $updatedPayload.CapturedAt 'queued snapshot lost capture generation'
         Assert-Equal $queuedBeforeChange.RequestId $requestId 'queued snapshot lost request correlation'
         $staleWriter = [System.IO.StringWriter]::new()
@@ -170,9 +171,49 @@ try {
         Assert-True (-not (& $extension { param($connection,$frame,$writer) Write-QueuedFrame $connection $frame $writer } $new $queuedBeforeChange $staleWriter)) 'stale queued snapshot was sent'
         Assert-Equal $staleWriter.ToString() '' 'stale queued snapshot emitted a partial bracket'
         & $extension { param($connection,$id) Queue-Snapshot $connection $id } $new $queuedBeforeChange.RequestId
-        $recoveredFrame = $new.Queue.Take()
+        $recoveredFrame = $null
+        Assert-True $new.Queue.TryTake([ref]$recoveredFrame, 2000) 'stale requested snapshot was not recaptured'
         Assert-True ($recoveredFrame.CapturedAt -gt $queuedBeforeChange.CapturedAt) 'stale requested snapshot was not recaptured'
         Assert-Equal $recoveredFrame.RequestId $requestId 'recaptured snapshot lost request correlation'
+        $interruptWriter = [pscustomobject]@{
+            Lines = [System.Collections.Generic.List[string]]::new()
+            Signals = $new.Signals
+            CapturedAt = $recoveredFrame.CapturedAt
+        }
+        $interruptWriter | Add-Member -MemberType ScriptMethod -Name WriteLine -Value {
+            param([string]$line)
+            $this.Lines.Add($line)
+            if ($this.Lines.Count -eq 1) { $this.Signals['dirty'] = $this.CapturedAt.AddTicks(1) }
+        }
+        Assert-True (-not (& $extension { param($connection,$frame,$writer) Write-QueuedFrame $connection $frame $writer } $new $recoveredFrame $interruptWriter)) 'mid-frame library change completed a stale snapshot'
+        Assert-Equal $interruptWriter.Lines.Count 1 'mid-frame change emitted payload or completion'
+        Assert-Equal ($interruptWriter.Lines[0] | ConvertFrom-Json).type 'snapshotStart' 'interrupted frame lost its start marker'
+        $api.Database.Games[0].Name = 'Latest Game'
+        & $extension { param($connection,$id) Queue-Snapshot $connection $id } $new $recoveredFrame.RequestId
+        $afterInterrupt = $null
+        Assert-True $new.Queue.TryTake([ref]$afterInterrupt, 2000) 'mid-frame requested snapshot was not recaptured'
+        Assert-Equal $afterInterrupt.RequestId $requestId 'mid-frame recapture lost request correlation'
+        Assert-Equal ($afterInterrupt.Lines[0] | ConvertFrom-Json).nonce ('b' * 32) 'mid-frame recapture changed connection nonce'
+        Assert-Equal ($afterInterrupt.Lines[-1] | ConvertFrom-Json).requestId $requestId 'mid-frame recapture changed completion request ID'
+        Assert-Equal ($afterInterrupt.Lines[3] | ConvertFrom-Json).payload[0].name 'Latest Game' 'mid-frame recapture reused stale library data'
+        $afterInterrupt.BeforeComplete = {
+            & $extension { param($signals) Mark-LibraryDirty $signals } $new.Signals
+        }.GetNewClosure()
+        $finalBoundaryWriter = [System.IO.StringWriter]::new()
+        Assert-True (-not (& $extension { param($connection,$frame,$writer) Write-QueuedFrame $connection $frame $writer } $new $afterInterrupt $finalBoundaryWriter)) 'final-line dirty signal completed a stale snapshot'
+        $boundaryLines = @($finalBoundaryWriter.ToString().Trim().Split("`n"))
+        Assert-Equal $boundaryLines.Count 4 'final-line dirty signal emitted snapshotComplete'
+        Assert-Equal ($boundaryLines[0] | ConvertFrom-Json).nonce ('b' * 32) 'partial bracket changed nonce'
+        $api.Database.Games[0].Name = 'Newest Game'
+        & $extension { param($connection,$id) Queue-Snapshot $connection $id } $new $afterInterrupt.RequestId
+        $finalRecapture = $null
+        Assert-True $new.Queue.TryTake([ref]$finalRecapture, 2000) 'final-line requested snapshot was not recaptured'
+        Assert-Equal $finalRecapture.RequestId $requestId 'final-line recapture changed request ID'
+        Assert-Equal ($finalRecapture.Lines[0] | ConvertFrom-Json).nonce ('b' * 32) 'final-line recapture changed nonce'
+        Assert-Equal ($finalRecapture.Lines[-1] | ConvertFrom-Json).nonce ('b' * 32) 'final-line recapture changed completion nonce'
+        Assert-Equal ($finalRecapture.Lines[-1] | ConvertFrom-Json).requestId $requestId 'final-line recapture changed completion request ID'
+        Assert-Equal ($finalRecapture.Lines[3] | ConvertFrom-Json).payload[0].name 'Newest Game' 'final-line recapture retained stale game'
+        $finalBoundaryWriter.Dispose()
         $new.Signals.Clear()
         $freshWriter = [System.IO.StringWriter]::new()
         Assert-True (& $extension { param($connection,$frame,$writer) Write-QueuedFrame $connection $frame $writer } $new $queuedBeforeChange $freshWriter) 'fresh snapshot was dropped'

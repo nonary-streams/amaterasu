@@ -5,11 +5,25 @@ $script:ControlName = 'Sunshine.PlayniteExtension'
 $script:ModulePath = $PSCommandPath
 $script:Connections = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 $script:ConnectionSlots = [System.Threading.SemaphoreSlim]::new(8, 8)
-$script:Signals = [System.Collections.Concurrent.ConcurrentDictionary[string,DateTime]]::new()
+$script:Signals = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 $script:SnapshotCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 $script:Stop = [System.Threading.CancellationTokenSource]::new()
 $script:Background = $null
 $script:Subscriptions = @()
+
+function Get-SnapshotGeneration($Signals) {
+    if (-not $Signals) { return 0L }
+    [System.Threading.Monitor]::Enter($Signals)
+    try { return [long]$Signals['generation'] } finally { [System.Threading.Monitor]::Exit($Signals) }
+}
+
+function Mark-LibraryDirty($Signals) {
+    [System.Threading.Monitor]::Enter($Signals)
+    try {
+        $Signals['generation'] = [long]$Signals['generation'] + 1L
+        $Signals['dirty'] = [DateTime]::UtcNow
+    } finally { [System.Threading.Monitor]::Exit($Signals) }
+}
 
 if (-not ('AmaterasuPlaynitePeer' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -128,9 +142,10 @@ function Get-GameExecutable($Game) {
     return [System.IO.Path]::GetFullPath($path)
 }
 
-function Capture-SnapshotPayload($Api) {
+function Capture-SnapshotPayload($Api, $Signals = $null) {
     $PlayniteApi = $Api
     if (-not $PlayniteApi.MainView.UIDispatcher.CheckAccess()) { throw 'snapshot capture requires the Playnite UI thread' }
+    $generation = Get-SnapshotGeneration $Signals
     $lines = [System.Collections.Generic.List[string]]::new()
     $bytes = 0
     $plugins = @()
@@ -163,14 +178,15 @@ function Capture-SnapshotPayload($Api) {
     }
     if ($batch.Count) { Add-CapturedLine $lines @{ type='games'; payload=$batch.ToArray() } ([ref]$bytes) }
     if ($lines.Count -gt 510) { throw 'snapshot exceeds frame count' }
-    return @{ Lines=$lines.ToArray(); Games=$count; CapturedAt=[DateTime]::UtcNow }
+    if ($generation -ne (Get-SnapshotGeneration $Signals)) { throw 'Playnite library changed during snapshot capture' }
+    return @{ Lines=$lines.ToArray(); Games=$count; CapturedAt=[DateTime]::UtcNow; Generation=$generation }
 }
 
 function New-SnapshotFrame($Connection, [string]$RequestId = '', $Payload = $null) {
     if (-not $Payload -and -not $Connection.Cache.TryGetValue('payload', [ref]$Payload)) { throw 'no complete UI-thread snapshot exists' }
     $dirtyAt = [DateTime]::MinValue
     [void]$Connection.Signals.TryGetValue('dirty', [ref]$dirtyAt)
-    if ($Payload.CapturedAt -lt $dirtyAt) { throw 'Playnite library changed after cached snapshot' }
+    if ($Payload.CapturedAt -lt $dirtyAt -or $Payload.Generation -ne (Get-SnapshotGeneration $Connection.Signals)) { throw 'Playnite library changed after cached snapshot' }
     $marker = @{ type='snapshotStart'; nonce=[string]$Connection.Nonce }
     if ($RequestId) { $marker.requestId = $RequestId }
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -182,7 +198,7 @@ function New-SnapshotFrame($Connection, [string]$RequestId = '', $Payload = $nul
     return $lines.ToArray()
 }
 
-function Add-SnapshotFrame($Connection, [string[]]$Lines, [DateTime]$CapturedAt, [string]$RequestId = '') {
+function Add-SnapshotFrame($Connection, [string[]]$Lines, [DateTime]$CapturedAt, [long]$Generation, [string]$RequestId = '') {
     # Keep the capture generation with the bracket until the writer finishes.
     # A queued frame can become stale while a library event is being handled.
     if ($Lines.Count -gt 512) { return $false }
@@ -191,19 +207,40 @@ function Add-SnapshotFrame($Connection, [string[]]$Lines, [DateTime]$CapturedAt,
         $bytes += [System.Text.Encoding]::UTF8.GetByteCount($line) + 1
         if ($bytes -gt 8388608) { return $false }
     }
-    return $Connection.Queue.TryAdd(@{ Lines=$Lines; CapturedAt=$CapturedAt; RequestId=$RequestId })
+    return $Connection.Queue.TryAdd(@{ Lines=$Lines; CapturedAt=$CapturedAt; Generation=$Generation; RequestId=$RequestId })
 }
 
 function Write-QueuedFrame($Connection, $Frame, $Writer) {
     $snapshot = $Frame -is [System.Collections.IDictionary]
     $lines = if ($snapshot) { [string[]]$Frame.Lines } else { [string[]]$Frame }
-    foreach ($line in $lines) {
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
         if ($snapshot) {
-            $dirtyAt = [DateTime]::MinValue
-            [void]$Connection.Signals.TryGetValue('dirty', [ref]$dirtyAt)
-            if ($dirtyAt -gt $Frame.CapturedAt) { return $false }
+            if ($index -ne $lines.Count - 1) {
+                $dirtyAt = [DateTime]::MinValue
+                [void]$Connection.Signals.TryGetValue('dirty', [ref]$dirtyAt)
+                if ($dirtyAt -gt $Frame.CapturedAt -or [long]$Connection.Signals['generation'] -ne $Frame.Generation) { return $false }
+                $Writer.WriteLine($line)
+                continue
+            }
+            if ($Frame.BeforeComplete) { & $Frame.BeforeComplete }
+            [System.Threading.Monitor]::Enter($Connection.Signals)
+            try {
+                $dirtyAt = [DateTime]::MinValue
+                [void]$Connection.Signals.TryGetValue('dirty', [ref]$dirtyAt)
+                if ($dirtyAt -gt $Frame.CapturedAt -or [long]$Connection.Signals['generation'] -ne $Frame.Generation) { return $false }
+                if ($Writer -is [System.IO.StreamWriter]) {
+                    # The completion and dirty mark share one ordering point. Bound
+                    # the only pipe write performed while holding the UI signal lock.
+                    if (-not $Writer.WriteLineAsync([string]$line).Wait(1000)) {
+                        $Connection.Stream.Dispose()
+                        throw 'snapshot completion write timed out'
+                    }
+                } else { $Writer.WriteLine($line) }
+            } finally { [System.Threading.Monitor]::Exit($Connection.Signals) }
+        } else {
+            $Writer.WriteLine($line)
         }
-        $Writer.WriteLine($line)
     }
     return $true
 }
@@ -214,16 +251,17 @@ function Queue-Snapshot($Connection, [string]$RequestId = '') {
         [void]$Connection.Signals.TryGetValue('dirty', [ref]$dirtyAt)
         $cached = $null
         $hasCache = $Connection.Cache.TryGetValue('payload', [ref]$cached)
-        if (-not $hasCache -or $cached.CapturedAt -lt $dirtyAt) {
+        if (-not $hasCache -or $cached.CapturedAt -lt $dirtyAt -or $cached.Generation -ne (Get-SnapshotGeneration $Connection.Signals)) {
             $api = $Connection.Api
-            $fresh = $Connection.Dispatcher.Invoke([Func[object]]{ Capture-SnapshotPayload $api })
+            $signals = $Connection.Signals
+            $fresh = $Connection.Dispatcher.Invoke([Func[object]]{ Capture-SnapshotPayload $api $signals })
             if (-not $fresh -or $fresh.CapturedAt -lt $dirtyAt) { throw 'library changed during UI capture' }
             $Connection.Cache['payload'] = $fresh
         }
         $payload = $null
         if (-not $Connection.Cache.TryGetValue('payload', [ref]$payload)) { throw 'no complete UI-thread snapshot exists' }
         $frame = [string[]]@(New-SnapshotFrame $Connection $RequestId $payload)
-        if (-not (Add-SnapshotFrame $Connection $frame $payload.CapturedAt $RequestId)) { throw 'snapshot outbox full' }
+        if (-not (Add-SnapshotFrame $Connection $frame $payload.CapturedAt $payload.Generation $RequestId)) { throw 'snapshot outbox full' }
     } catch { $Connection.Stream.Dispose() }
 }
 
@@ -448,7 +486,7 @@ function Start-PipeServer($Api, $Dispatcher, $Connections, $Stop, $Signals, $Cac
 
 function OnApplicationStarted() {
     if ($script:Background) { return }
-    try { $script:SnapshotCache['payload'] = Capture-SnapshotPayload $PlayniteApi } catch { $discard = $null; [void]$script:SnapshotCache.TryRemove('payload', [ref]$discard) }
+    try { $script:SnapshotCache['payload'] = Capture-SnapshotPayload $PlayniteApi $script:Signals } catch { $discard = $null; [void]$script:SnapshotCache.TryRemove('payload', [ref]$discard) }
     $script:Stop = [System.Threading.CancellationTokenSource]::new()
     $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
     $runspace.Open()
@@ -457,16 +495,16 @@ function OnApplicationStarted() {
     [void]$worker.AddScript('param($modulePath,$api,$dispatcher,$connections,$stop,$signals,$cache,$slots) Import-Module -Name $modulePath -Force; Start-PipeServer $api $dispatcher $connections $stop $signals $cache $slots').AddArgument($script:ModulePath).AddArgument($PlayniteApi).AddArgument($dispatcher).AddArgument($script:Connections).AddArgument($script:Stop).AddArgument($script:Signals).AddArgument($script:SnapshotCache).AddArgument($script:ConnectionSlots)
     $script:Background = @{ Runspace=$runspace; Worker=$worker; Handle=$worker.BeginInvoke() }
     foreach ($eventName in @('ItemCollectionChanged','ItemUpdated')) {
-        try { $script:Subscriptions += Register-ObjectEvent -InputObject $PlayniteApi.Database.Games -EventName $eventName -MessageData $script:Signals -Action { $Event.MessageData['dirty'] = [DateTime]::UtcNow } } catch {}
+        try { $script:Subscriptions += Register-ObjectEvent -InputObject $PlayniteApi.Database.Games -EventName $eventName -MessageData $script:Signals -Action { Mark-LibraryDirty $Event.MessageData } } catch {}
     }
 }
 
 function OnGameStarted($evnArgs) { Send-Status 'gameStarted' $evnArgs.Game }
 function OnGameStopped($evnArgs) { Send-Status 'gameStopped' $evnArgs.Game }
 function OnLibraryUpdated() {
-    $script:Signals['dirty'] = [DateTime]::UtcNow
+    Mark-LibraryDirty $script:Signals
     try {
-        $payload = Capture-SnapshotPayload $PlayniteApi
+        $payload = Capture-SnapshotPayload $PlayniteApi $script:Signals
         $script:SnapshotCache['payload'] = $payload
     } catch {
         $discard = $null
