@@ -274,7 +274,9 @@ impl VigemConnection {
         let status =
             unsafe { (self.functions.target_remove)(self.client.as_ptr(), target.as_ptr()) };
         if !vigem_succeeded(status) {
-            self.reconnect_required.set(true);
+            if is_connection_failure(status) {
+                self.reconnect_required.set(true);
+            }
             return Err(vigem_error("target_remove", status));
         }
         // ViGEmClient documents that successful removal detaches the target and
@@ -366,6 +368,7 @@ struct VigemGamepad {
     target: Option<NonNull<c_void>>,
     profile: GamepadProfile,
     ds4_back_as_touchpad_click: bool,
+    replacement_pending: bool,
 }
 
 impl VigemGamepad {
@@ -389,6 +392,7 @@ impl VigemGamepad {
             target: Some(target),
             profile,
             ds4_back_as_touchpad_click,
+            replacement_pending: false,
         })
     }
 
@@ -413,15 +417,42 @@ impl VigemGamepad {
         // pointers must never be used or freed from the next client generation.
         self.target = None;
         self.connection = None;
+        self.replacement_pending = true;
     }
 
     fn bind_connection(&mut self, connection: Rc<VigemConnection>) {
         self.connection = Some(connection);
     }
+
+    fn allocate_target(&self) -> InputResult<NonNull<c_void>> {
+        match self.profile {
+            GamepadProfile::Ds4 => self.connection()?.create_ds4_target(),
+            GamepadProfile::Auto | GamepadProfile::X360 => self.connection()?.create_x360_target(),
+            _ => Err(InputError::new(
+                "controller_unavailable",
+                "requested gamepad profile is not supported by the ViGEm backend",
+            )),
+        }
+    }
+
+    fn retry_replacement(&mut self) -> InputResult<()> {
+        if let Some(target) = self.target {
+            // A failed report may already have reached the bus. Do not send
+            // another report to that target before it is detached.
+            self.connection()?.remove_target(target)?;
+            self.target = None;
+        }
+        self.target = Some(self.allocate_target()?);
+        self.replacement_pending = false;
+        Ok(())
+    }
 }
 
 impl GamepadDevice for VigemGamepad {
     fn update(&mut self, state: ControllerSnapshot) -> InputResult<()> {
+        if self.replacement_pending || self.target.is_none() {
+            self.retry_replacement()?;
+        }
         match self.profile {
             GamepadProfile::Ds4 => self.connection()?.update_ds4(
                 self.target()?,
@@ -449,24 +480,16 @@ impl GamepadDevice for VigemGamepad {
         if self.connection()?.reconnect_required.get() {
             return Err(error);
         }
+        if self.replacement_pending {
+            // The attempted detach already failed during this write. Leave
+            // the uncertain target untouched until the next tick or stop.
+            return Err(error);
+        }
         // Removal is the boundary after which a possibly applied report can no
         // longer reach applications. Retain the old target if detach fails so
         // lease cleanup can retry it; never allocate a replacement first.
-        self.release()?;
-        let replacement = match self.profile {
-            GamepadProfile::Ds4 => self.connection()?.create_ds4_target()?,
-            GamepadProfile::Auto | GamepadProfile::X360 => {
-                self.connection()?.create_x360_target()?
-            }
-            _ => {
-                return Err(InputError::new(
-                    "controller_unavailable",
-                    "requested gamepad profile is not supported by the ViGEm backend",
-                ));
-            }
-        };
-        self.target = Some(replacement);
-        Ok(())
+        self.replacement_pending = true;
+        self.retry_replacement()
     }
 
     fn release(&mut self) -> InputResult<()> {
@@ -474,24 +497,27 @@ impl GamepadDevice for VigemGamepad {
             // Detach even if a neutral report is rejected. Successful removal
             // is the stronger cleanup guarantee because the virtual device is
             // no longer connected to applications.
-            match self.profile {
-                GamepadProfile::Ds4 => {
-                    let _ = self.connection()?.update_ds4(
-                        target,
-                        ControllerSnapshot::default(),
-                        self.ds4_back_as_touchpad_click,
-                    );
+            if !self.replacement_pending {
+                match self.profile {
+                    GamepadProfile::Ds4 => {
+                        let _ = self.connection()?.update_ds4(
+                            target,
+                            ControllerSnapshot::default(),
+                            self.ds4_back_as_touchpad_click,
+                        );
+                    }
+                    GamepadProfile::Auto | GamepadProfile::X360 => {
+                        let _ = self
+                            .connection()?
+                            .update_x360(target, ControllerSnapshot::default());
+                    }
+                    _ => {}
                 }
-                GamepadProfile::Auto | GamepadProfile::X360 => {
-                    let _ = self
-                        .connection()?
-                        .update_x360(target, ControllerSnapshot::default());
-                }
-                _ => {}
             }
             self.connection()?.remove_target(target)?;
             self.target = None;
         }
+        self.replacement_pending = false;
         Ok(())
     }
 }
@@ -1239,6 +1265,76 @@ mod tests {
         assert_eq!(trace.borrow().attached, 1);
         assert_eq!(trace.borrow().disconnects, 0);
         gamepads.stop().unwrap();
+    }
+
+    #[test]
+    fn failed_target_detach_retries_before_replay_without_disturbing_other_slot() {
+        let trace = Rc::new(RefCell::new(FakeBusTrace::default()));
+        let mut gamepads = WindowsGamepads::new();
+        gamepads
+            .start_with_profile(GamepadProfile::X360, || {
+                Ok(fake_connection(1, trace.clone()))
+            })
+            .unwrap();
+        gamepads.inject(&controller_event(0, 1, 1 << 12)).unwrap();
+        gamepads.inject(&controller_event(1, 3, 1 << 13)).unwrap();
+
+        trace.borrow_mut().fail_next_update = Some(0xE000_0004);
+        trace.borrow_mut().fail_remove = true;
+        assert!(gamepads.inject(&controller_event(0, 3, 1 << 14)).is_err());
+        assert_eq!(trace.borrow().attached, 2);
+        assert_eq!(trace.borrow().disconnects, 0);
+        assert_eq!(trace.borrow().updates.len(), 2);
+
+        // A timer retry must not send the uncertain state to the old target.
+        gamepads.advance(Instant::now());
+        assert_eq!(trace.borrow().updates.len(), 2);
+        assert_eq!(trace.borrow().attached, 2);
+        gamepads.inject(&controller_event(1, 3, 1 << 15)).unwrap();
+        assert!(trace.borrow().updates.contains(&(1, 0x8000)));
+        assert_eq!(trace.borrow().disconnects, 0);
+
+        trace.borrow_mut().fail_remove = false;
+        gamepads.advance(Instant::now());
+        assert!(trace.borrow().updates.contains(&(1, 0x4000)));
+        assert_eq!(trace.borrow().attached, 2);
+        assert_eq!(trace.borrow().removals, 3);
+
+        trace.borrow_mut().fail_remove = true;
+        assert!(gamepads.stop().is_err());
+        assert_eq!(trace.borrow().attached, 2);
+        assert_eq!(trace.borrow().disconnects, 0);
+        trace.borrow_mut().fail_remove = false;
+        gamepads.stop().unwrap();
+        assert_eq!(trace.borrow().attached, 0);
+        assert_eq!(trace.borrow().disconnects, 1);
+        assert_eq!(trace.borrow().freed, 3);
+    }
+
+    #[test]
+    fn stop_retries_uncertain_target_detach_without_sending_a_neutral_report() {
+        let trace = Rc::new(RefCell::new(FakeBusTrace::default()));
+        let mut gamepads = WindowsGamepads::new();
+        gamepads
+            .start_with_profile(GamepadProfile::X360, || {
+                Ok(fake_connection(1, trace.clone()))
+            })
+            .unwrap();
+        gamepads.inject(&controller_event(0, 1, 1 << 12)).unwrap();
+        trace.borrow_mut().fail_next_update = Some(0xE000_0004);
+        trace.borrow_mut().fail_remove = true;
+        assert!(gamepads.inject(&controller_event(0, 1, 1 << 13)).is_err());
+        let delivered = trace.borrow().updates.len();
+
+        assert!(gamepads.stop().is_err());
+        assert_eq!(trace.borrow().updates.len(), delivered);
+        assert_eq!(trace.borrow().attached, 1);
+        trace.borrow_mut().fail_remove = false;
+        gamepads.stop().unwrap();
+        assert_eq!(trace.borrow().updates.len(), delivered);
+        assert_eq!(trace.borrow().attached, 0);
+        assert_eq!(trace.borrow().freed, 1);
+        assert_eq!(trace.borrow().disconnects, 1);
     }
 
     #[test]
