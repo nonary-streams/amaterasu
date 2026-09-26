@@ -608,7 +608,7 @@ pub enum Launch {
         )]
         exit_timeout_seconds: Option<u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        detached: Vec<String>,
+        detached: Vec<DetachedCommand>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         preparation: Vec<PreparationStep>,
     },
@@ -647,6 +647,67 @@ pub enum Launch {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         preparation: Vec<PreparationStep>,
     },
+}
+
+/// Keep legacy command strings and per-command settings in one catalog value.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DetachedCommand {
+    Legacy(String),
+    Configured(DetachedCommandSettings),
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetachedCommandSettings {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "working_directory"
+    )]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+}
+
+impl DetachedCommand {
+    fn validate(&self) -> Result<(), &'static str> {
+        let settings = match self {
+            Self::Legacy(command) => return validate_detached_command_text(command),
+            Self::Configured(settings) => settings,
+        };
+        validate_detached_command_text(&settings.command)?;
+        validate_command_environment(&settings.environment)?;
+        for path in [
+            settings.cwd.as_deref(),
+            settings.stdout.as_deref(),
+            settings.stderr.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_path(path)?;
+            if path.len() > 1_024 {
+                return Err("detached path exceeds bounds");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_detached_command_text(command: &str) -> Result<(), &'static str> {
+    if command.is_empty()
+        || command.len() > MAX_DETACHED_COMMAND_BYTES
+        || command.chars().any(char::is_control)
+    {
+        return Err("invalid detached command");
+    }
+    Ok(())
 }
 
 fn default_playnite_exit_timeout_seconds() -> u64 {
@@ -761,11 +822,7 @@ impl Entry {
                 }
                 if exit_timeout_seconds.is_some_and(|seconds| seconds > MAX_EXIT_TIMEOUT_SECONDS)
                     || detached.len() > MAX_DETACHED_COMMANDS
-                    || detached.iter().any(|command| {
-                        command.is_empty()
-                            || command.len() > MAX_DETACHED_COMMAND_BYTES
-                            || command.chars().any(char::is_control)
-                    })
+                    || detached.iter().any(|command| command.validate().is_err())
                 {
                     return Err("invalid per-application process policy");
                 }

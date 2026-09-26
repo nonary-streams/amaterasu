@@ -62,7 +62,7 @@ struct Harness {
     catalog_auto_detach: Option<bool>,
     catalog_wait_all: Option<bool>,
     catalog_exit_timeout_seconds: Option<u64>,
-    catalog_detached: Option<Vec<String>>,
+    catalog_detached: Option<Value>,
     catalog_steam_id: Option<String>,
     catalog_steam_install_dir: Option<String>,
     catalog_fec_percentage: Option<u8>,
@@ -2200,7 +2200,7 @@ fn persisted_process_lifecycle_policy_reaches_application_launch() {
     let mut harness = Harness::new();
     harness.catalog_wait_all = Some(false);
     harness.catalog_exit_timeout_seconds = Some(0);
-    harness.catalog_detached = Some(vec!["/opt/tools/overlay --launch".into()]);
+    harness.catalog_detached = Some(json!(["/opt/tools/overlay --launch"]));
     let mut pipeline = pipeline();
 
     let started = harness.request(&mut pipeline, "alice", launch("process-policy"));
@@ -2219,6 +2219,55 @@ fn persisted_process_lifecycle_policy_reaches_application_launch() {
         application_launch["detached"],
         json!(["/opt/tools/overlay --launch"])
     );
+}
+
+#[test]
+fn typed_detached_policy_reaches_application_and_invalid_policy_never_spawns() {
+    let output_directory = std::env::temp_dir().to_string_lossy().to_string();
+    let typed = json!({
+        "command":"overlay --launch",
+        "environment":{"OVERLAY_MODE":"quiet"},
+        "cwd":output_directory,
+        "stdout":std::env::temp_dir().join("overlay.out").to_string_lossy(),
+        "stderr":std::env::temp_dir().join("overlay.err").to_string_lossy()
+    });
+    let mut harness = Harness::new();
+    harness.catalog_detached = Some(json!(["legacy --launch", typed]));
+    let mut typed_pipeline = pipeline();
+    let started = harness.request(&mut typed_pipeline, "alice", launch("typed-detached"));
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let application_launch = harness
+        .commands
+        .iter()
+        .find(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "launch"
+        })
+        .map(|(_, payload, _)| payload)
+        .unwrap();
+    assert_eq!(
+        application_launch["detached"],
+        json!(["legacy --launch", typed])
+    );
+
+    for invalid in [
+        json!({"command":"overlay","cwd":"relative"}),
+        json!({"command":"overlay","stdout":"relative.out"}),
+        json!({"command":"overlay","environment":{"A-B":"bad"}}),
+        json!({"command":"overlay","unknown":true}),
+    ] {
+        let mut harness = Harness::new();
+        harness.catalog_detached = Some(json!([invalid]));
+        let mut pipeline = pipeline();
+        let failed = harness.request(&mut pipeline, "alice", launch("invalid-typed-detached"));
+        assert!(
+            ["invalid_catalog_response", "unsupported_launch_spec"]
+                .contains(&failed["launch"]["failure"].as_str().unwrap()),
+            "{failed}"
+        );
+        assert!(!harness.commands.iter().any(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "launch"
+        }));
+    }
 }
 
 #[test]

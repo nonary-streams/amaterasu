@@ -806,6 +806,62 @@ fn application_lifecycle_policy_rejects_ambiguous_or_unbounded_values() {
 }
 
 #[test]
+fn typed_detached_commands_persist_exact_settings_and_reject_invalid_inputs() {
+    let entry: Entry = serde_json::from_value(json!({
+        "name": "Typed detached lifecycle",
+        "launch": {
+            "kind": "executable",
+            "program": "/games/example/game",
+            "detached": [
+                "/games/example/legacy --quiet",
+                {
+                    "command": "/games/example/overlay --launch",
+                    "environment": {"OVERLAY_MODE": "quiet"},
+                    "working_directory": "/games/example",
+                    "stdout": "/games/example/overlay.out",
+                    "stderr": "/games/example/overlay.err"
+                }
+            ]
+        }
+    }))
+    .unwrap();
+    entry.validate().unwrap();
+    let encoded = serde_json::to_value(&entry).unwrap();
+    assert_eq!(
+        encoded["launch"]["detached"][0],
+        "/games/example/legacy --quiet"
+    );
+    assert_eq!(encoded["launch"]["detached"][1]["cwd"], "/games/example");
+    assert!(
+        encoded["launch"]["detached"][1]
+            .get("working_directory")
+            .is_none()
+    );
+    assert_eq!(
+        encoded["launch"]["detached"][1]["environment"]["OVERLAY_MODE"],
+        "quiet"
+    );
+    assert_eq!(
+        serde_json::to_value(serde_json::from_value::<Entry>(encoded.clone()).unwrap()).unwrap(),
+        encoded
+    );
+
+    for detached in [
+        json!({"command":"overlay","cwd":"relative"}),
+        json!({"command":"overlay","stdout":"relative.out"}),
+        json!({"command":"overlay","environment":{"A-B":"bad"}}),
+        json!({"command":"overlay","unknown":true}),
+        json!({"command":""}),
+    ] {
+        let entry = serde_json::from_value::<Entry>(json!({
+            "name":"Invalid typed detached",
+            "launch":{"kind":"executable","program":"/games/example/game","detached":[detached]}
+        }));
+        assert!(entry.is_err() || entry.unwrap().validate().is_err());
+    }
+}
+
+#[test]
 fn vibeshine_working_dir_alias_persists_as_the_canonical_launch_directory() {
     let entry: Entry = serde_json::from_value(json!({
         "name": "Game with a working directory",

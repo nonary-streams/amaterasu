@@ -193,7 +193,7 @@ pub enum CatalogLaunch {
         #[serde(default, alias = "exit-timeout")]
         exit_timeout_seconds: Option<u64>,
         #[serde(default)]
-        detached: Vec<String>,
+        detached: Vec<DetachedCommand>,
         #[serde(default)]
         preparation: Vec<PreparationStep>,
     },
@@ -261,6 +261,68 @@ pub struct ConfiguredCommand {
     pub timeout_ms: u64,
 }
 
+/// Catalog entries retain both the original string and the typed per-command form.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DetachedCommand {
+    Legacy(String),
+    Configured(DetachedCommandSettings),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetachedCommandSettings {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "working_directory"
+    )]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+}
+
+fn valid_detached_command(command: &DetachedCommand) -> bool {
+    let settings = match command {
+        DetachedCommand::Legacy(command) => return valid_detached_text(command),
+        DetachedCommand::Configured(settings) => settings,
+    };
+    if !valid_detached_text(&settings.command)
+        || settings.environment.len() > 32
+        || settings
+            .environment
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>()
+            > 4_096
+        || [
+            settings.cwd.as_deref(),
+            settings.stdout.as_deref(),
+            settings.stderr.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|path| !valid_native_path(path) || path.chars().any(char::is_control))
+    {
+        return false;
+    }
+    let mut keys = BTreeSet::new();
+    settings.environment.iter().all(|(key, value)| {
+        valid_environment_binding(key, value) && keys.insert(key.to_ascii_uppercase())
+    })
+}
+
+fn valid_detached_text(command: &str) -> bool {
+    !command.is_empty()
+        && command.len() <= MAX_DETACHED_COMMAND_BYTES
+        && !command.chars().any(char::is_control)
+}
+
 fn default_command_timeout_ms() -> u64 {
     DEFAULT_COMMAND_TIMEOUT_MS
 }
@@ -283,7 +345,7 @@ pub struct Executable {
     pub wait_all: bool,
     pub exit_timeout_seconds: u64,
     pub elevated: bool,
-    pub detached: Vec<String>,
+    pub detached: Vec<DetachedCommand>,
     pub preparation: Vec<PlannedPreparationStep>,
 }
 
@@ -921,11 +983,9 @@ impl Executable {
                     || !valid_arguments(&arguments)
                     || exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS
                     || detached.len() > MAX_DETACHED_COMMANDS
-                    || detached.iter().any(|command| {
-                        command.is_empty()
-                            || command.len() > MAX_DETACHED_COMMAND_BYTES
-                            || command.chars().any(char::is_control)
-                    })
+                    || detached
+                        .iter()
+                        .any(|command| !valid_detached_command(command))
                     || working_directory
                         .as_deref()
                         .is_some_and(|cwd| !valid_native_path(cwd))
