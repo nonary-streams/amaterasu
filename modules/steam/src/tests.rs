@@ -161,10 +161,12 @@ fn legacy_management_settings_updates_preserve_recent_and_tool_policy() {
 
 #[test]
 fn disabled_steam_rejects_refresh_and_drops_the_prior_discovery_snapshot() {
-    let mut provider = Provider::new(Vec::new());
-    provider.enabled = true;
-    provider.revision = 4;
-    provider.scan = Some(Scan::new(&[]));
+    let mut provider = Provider {
+        enabled: true,
+        revision: 4,
+        scan: Some(Scan::new(&[])),
+        ..Provider::default()
+    };
     provider.games.insert(
         42,
         Game {
@@ -208,7 +210,7 @@ fn disabled_steam_rejects_refresh_and_drops_the_prior_discovery_snapshot() {
 
 #[test]
 fn enabling_steam_allows_explicit_refresh_of_configured_roots() {
-    let mut provider = Provider::new(Vec::new());
+    let mut provider = Provider::default();
     let ActionResult::Immediate(disabled) = provider.handle_action(Action::Refresh {}) else {
         panic!("disabled refresh should fail synchronously");
     };
@@ -413,7 +415,13 @@ fn start_test_module(host: &mut Box<FakeHost>) -> SteamModule {
     };
     // SAFETY: `host` remains boxed and alive for each call made by the module.
     let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
-    SteamModule::start(runtime).unwrap()
+    let mut module = SteamModule::start(runtime).unwrap();
+    // Most fake-host tests supply snapshots directly; keep them independent
+    // of a Steam installation on the developer's Windows machine.
+    module.provider.automatic_roots = false;
+    module.provider.roots.clear();
+    module.provider.steam_executable = None;
+    module
 }
 
 fn persisted_settings(enabled: bool, revision: u64) -> Response {

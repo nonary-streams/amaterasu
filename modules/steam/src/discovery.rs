@@ -237,6 +237,38 @@ pub fn find_steam_executable(roots: &[PathBuf]) -> Option<PathBuf> {
     resolve_client_candidates(candidates)
 }
 
+/// On Windows an omitted root setting follows the current user's installed
+/// Steam locations. Other hosts still require explicit, session-owned roots.
+pub fn default_library_roots() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        existing_windows_library_roots(windows_default_install_roots(
+            windows_registered_steam_root(),
+            std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
+            std::env::var_os("ProgramFiles").map(PathBuf::from),
+            std::env::var_os("LocalAppData").map(PathBuf::from),
+        ))
+    }
+
+    #[cfg(not(windows))]
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn existing_windows_library_roots(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = BTreeSet::new();
+    for candidate in candidates {
+        let Ok(root) = candidate.canonicalize() else {
+            continue;
+        };
+        if root.join("steamapps").is_dir() && seen.insert(root.clone()) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
 fn resolve_client_candidates(candidates: Vec<PathBuf>) -> Option<PathBuf> {
     candidates.into_iter().find_map(|candidate| {
         let canonical = candidate.canonicalize().ok()?;
@@ -251,12 +283,29 @@ fn windows_default_client_candidates(
     program_files: Option<PathBuf>,
     local_app_data: Option<PathBuf>,
 ) -> Vec<PathBuf> {
+    windows_default_install_roots(
+        registered_root,
+        program_files_x86,
+        program_files,
+        local_app_data,
+    )
+    .into_iter()
+    .map(|root| root.join("steam.exe"))
+    .collect()
+}
+
+#[cfg(windows)]
+fn windows_default_install_roots(
+    registered_root: Option<PathBuf>,
+    program_files_x86: Option<PathBuf>,
+    program_files: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+) -> Vec<PathBuf> {
     registered_root
         .into_iter()
         .chain(program_files_x86.map(|path| path.join("Steam")))
         .chain(program_files.map(|path| path.join("Steam")))
         .chain(local_app_data.map(|path| path.join("Steam")))
-        .map(|root| root.join("steam.exe"))
         .collect()
 }
 

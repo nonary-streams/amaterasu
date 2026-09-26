@@ -60,6 +60,7 @@ enum Action {
 struct Provider {
     enabled: bool,
     roots: Vec<PathBuf>,
+    automatic_roots: bool,
     steam_executable: Option<PathBuf>,
     scan: Option<Scan>,
     games: BTreeMap<u32, Game>,
@@ -73,10 +74,17 @@ struct Provider {
 }
 
 impl Provider {
-    fn new(roots: Vec<PathBuf>) -> Self {
+    fn new(configured_roots: Vec<PathBuf>) -> Self {
+        let automatic_roots = configured_roots.is_empty();
+        let roots = if automatic_roots {
+            discovery::default_library_roots()
+        } else {
+            configured_roots
+        };
         let steam_executable = discovery::find_steam_executable(&roots);
         Self {
             roots,
+            automatic_roots,
             steam_executable,
             ..Self::default()
         }
@@ -100,8 +108,15 @@ impl Provider {
     }
 
     fn start_scan(&mut self) -> bool {
+        self.start_scan_with_defaults(discovery::default_library_roots)
+    }
+
+    fn start_scan_with_defaults(&mut self, defaults: impl FnOnce() -> Vec<PathBuf>) -> bool {
         if !self.enabled || self.scan.is_some() || self.revision == u64::MAX {
             return false;
+        }
+        if self.automatic_roots {
+            self.roots = defaults();
         }
         self.scan = Some(Scan::new(&self.roots));
         true

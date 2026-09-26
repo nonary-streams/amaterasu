@@ -140,6 +140,59 @@ fn windows_default_client_resolution_prefers_registered_custom_install() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_default_roots_recover_after_steam_is_installed() {
+    let fixture = Libraries::new();
+    let candidate = fixture.0.join("late-steam");
+    let mut provider = Provider {
+        enabled: true,
+        automatic_roots: true,
+        ..Provider::default()
+    };
+
+    assert!(
+        provider.start_scan_with_defaults(|| {
+            existing_windows_library_roots(vec![candidate.clone()])
+        })
+    );
+    for _ in 0..100 {
+        provider.tick();
+    }
+    assert!(!provider.scan_in_progress());
+    assert_eq!(provider.status()["complete"], false);
+    assert_eq!(provider.status()["game_count"], 0);
+
+    let installed_root = fixture.library("late-steam");
+    fixture.manifest(&installed_root, 42, "Later installation", 4);
+    assert!(provider.start_scan_with_defaults(|| {
+        existing_windows_library_roots(vec![candidate.clone(), candidate.clone()])
+    }));
+    for _ in 0..100 {
+        provider.tick();
+    }
+    assert!(!provider.scan_in_progress());
+    assert_eq!(provider.roots, vec![installed_root]);
+    assert_eq!(provider.status()["complete"], true);
+    assert_eq!(provider.games[&42].name, "Later installation");
+}
+
+#[cfg(windows)]
+#[test]
+fn configured_windows_roots_override_install_defaults() {
+    let fixture = Libraries::new();
+    let configured = fixture.library("configured");
+    fixture.manifest(&configured, 7, "Configured game", 4);
+    let mut provider = Provider::new(vec![configured.clone()]);
+    provider.set_enabled(true);
+    assert!(provider.start_scan_with_defaults(|| panic!("default lookup should be skipped")));
+    for _ in 0..100 {
+        provider.tick();
+    }
+    assert_eq!(provider.roots, vec![configured]);
+    assert_eq!(provider.games[&7].name, "Configured game");
+}
+
 #[test]
 fn discovery_tracks_local_artwork_changes_without_exposing_host_paths() {
     let fixture = Libraries::new();
