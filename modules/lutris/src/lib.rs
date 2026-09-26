@@ -273,12 +273,12 @@ impl LutrisModule {
                     manual,
                     Instant::now(),
                 ) {
-                    self.schedule_next_auto_sync();
+                    self.schedule_next_auto_sync(settings_epoch != self.settings_epoch);
                     return;
                 }
                 let Some(source_revision) = self.next_source_revision.checked_add(1) else {
                     self.last_error = Some("Lutris source revision exhausted".into());
-                    self.schedule_next_auto_sync();
+                    self.schedule_next_auto_sync(settings_epoch != self.settings_epoch);
                     return;
                 };
                 self.next_source_revision = source_revision;
@@ -299,7 +299,7 @@ impl LutrisModule {
             }
             Err(error) => {
                 self.last_error = Some(error);
-                self.schedule_next_auto_sync();
+                self.schedule_next_auto_sync(settings_epoch != self.settings_epoch);
             }
         }
     }
@@ -311,11 +311,12 @@ impl LutrisModule {
         match pending.reader.advance(&self.runtime)? {
             SteamProgress::Pending => self.steam_read = Some(pending),
             SteamProgress::Failed(error) => {
+                let settings_changed = pending.scan.settings_epoch != self.settings_epoch;
                 self.last_error = Some(format!("Steam dedupe snapshot unavailable: {error}"));
                 self.pending_source = None;
                 self.last_reconciled_source = None;
                 self.last_reconciled_at = None;
-                self.schedule_next_auto_sync();
+                self.schedule_next_auto_sync(settings_changed);
             }
             SteamProgress::Complete(steam_ids) => {
                 self.start_catalog_scan(pending.scan, &steam_ids);
@@ -325,6 +326,7 @@ impl LutrisModule {
     }
 
     fn start_catalog_scan(&mut self, scan: CapturedScan, steam_app_ids: &BTreeSet<u32>) {
+        let settings_changed = scan.settings_epoch != self.settings_epoch;
         match scan.start_catalog(&mut self.catalog, steam_app_ids) {
             Ok((_, signature, settings_epoch)) => {
                 self.pending_source = Some((signature, settings_epoch));
@@ -334,7 +336,7 @@ impl LutrisModule {
                 self.last_error = Some(error);
                 self.last_reconciled_source = None;
                 self.last_reconciled_at = None;
-                self.schedule_next_auto_sync();
+                self.schedule_next_auto_sync(settings_changed);
             }
         }
     }
@@ -350,16 +352,15 @@ impl LutrisModule {
         ) else {
             return;
         };
-        self.schedule_next_auto_sync();
-        if settings_changed && self.next_auto_sync.is_some() {
-            self.next_auto_sync = Some(Instant::now());
-        }
+        self.schedule_next_auto_sync(settings_changed);
     }
 
-    fn schedule_next_auto_sync(&mut self) {
-        let settings = self.configuration.settings();
-        self.next_auto_sync =
-            (settings.enabled && settings.auto_sync).then(|| Instant::now() + AUTO_SYNC_INTERVAL);
+    fn schedule_next_auto_sync(&mut self, settings_changed: bool) {
+        self.next_auto_sync = next_auto_sync_after_scan(
+            self.configuration.settings(),
+            settings_changed,
+            Instant::now(),
+        );
     }
 
     fn start_scan_if_due(&mut self) {
@@ -478,6 +479,20 @@ impl LutrisModule {
             response => Err(format!("Lutris request completion failed: {response:?}")),
         }
     }
+}
+
+fn next_auto_sync_after_scan(
+    settings: &ProductSettings,
+    settings_changed: bool,
+    now: Instant,
+) -> Option<Instant> {
+    (settings.enabled && settings.auto_sync).then(|| {
+        now + if settings_changed {
+            Duration::ZERO
+        } else {
+            AUTO_SYNC_INTERVAL
+        }
+    })
 }
 
 fn finish_reconciliation(
@@ -617,6 +632,52 @@ mod tests {
     #[test]
     fn auto_sync_interval_matches_pinned_host_policy() {
         assert_eq!(AUTO_SYNC_INTERVAL, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reenable_after_in_flight_discovery_failure_scans_immediately() {
+        let settings_at_start = ProductSettings {
+            enabled: true,
+            auto_sync: true,
+            ..ProductSettings::default()
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(Err("lutris_database_unreadable".into()))
+            .unwrap();
+        let mut worker = SnapshotWorker {
+            receiver: Some(receiver),
+            _thread: None,
+            settings: Some(settings_at_start.clone()),
+            manual: false,
+            settings_epoch: 3,
+        };
+
+        let mut disabled = settings_at_start.clone();
+        disabled.enabled = false;
+        let now = Instant::now();
+        assert_eq!(next_auto_sync_after_scan(&disabled, true, now), None);
+        assert!(!scan_is_due(&disabled, false, Some(now), now));
+
+        // The old scan fails after disable and re-enable have both been persisted.
+        let (captured, manual, captured_epoch, result) = worker.take_result().unwrap();
+        assert_eq!(captured, settings_at_start);
+        assert!(!manual);
+        assert_eq!(captured_epoch, 3);
+        assert_eq!(result, Err("lutris_database_unreadable".into()));
+        let current_epoch = 5;
+        let deadline =
+            next_auto_sync_after_scan(&settings_at_start, captured_epoch != current_epoch, now);
+        assert_eq!(deadline, Some(now));
+        assert!(scan_is_due(&settings_at_start, false, deadline, now));
+        assert_eq!(
+            next_auto_sync_after_scan(&settings_at_start, false, now),
+            Some(now + AUTO_SYNC_INTERVAL)
+        );
+
+        let mut manual_only = settings_at_start;
+        manual_only.auto_sync = false;
+        assert_eq!(next_auto_sync_after_scan(&manual_only, true, now), None);
     }
 
     #[test]

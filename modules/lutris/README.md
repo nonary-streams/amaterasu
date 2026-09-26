@@ -77,6 +77,8 @@ Manual refresh always submits a snapshot. A failed scan or reconciliation is
 retried on the next automatic discovery; only a validated catalog finish records
 the source as reconciled. If settings change during an in-flight scan, that scan
 finishes with its captured values and the new settings trigger another scan.
+If that old discovery or Steam deduplication fails after disable and re-enable,
+the current enabled settings still trigger an immediate automatic scan.
 The provider status keeps `refresh_pending` true through catalog completion and
 reports a catalog failure in `last_error`; a successful later reconciliation
 clears it.
