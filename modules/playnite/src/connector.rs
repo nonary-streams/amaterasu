@@ -328,6 +328,7 @@ enum SunshineCommand {
         line: Vec<u8>,
         command: String,
         request_id: String,
+        deadline: Instant,
         reply: Sender<Result<(), String>>,
     },
     Shutdown,
@@ -599,8 +600,13 @@ impl SunshineState {
                 line,
                 command,
                 request_id,
+                deadline,
                 reply,
             } => {
+                if Instant::now() >= deadline {
+                    let _ = reply.send(Err("Playnite command expired before dispatch".into()));
+                    return;
+                }
                 if self.pending_command.is_some() {
                     let _ = reply.send(Err("Playnite command already pending".into()));
                     return;
@@ -610,6 +616,9 @@ impl SunshineState {
                     return;
                 }
                 let result = self.connect().and_then(|_| {
+                    if Instant::now() >= deadline {
+                        return Err("Playnite command expired before pipe write".into());
+                    }
                     let pipe = self.pipe.as_ref().unwrap();
                     self.verify_server()?;
                     pipe.write_all(&line)
@@ -1088,14 +1097,27 @@ fn send_command(
 ) -> Result<(), String> {
     let (reply, response) = mpsc::channel();
     let request_id = fresh_connection_nonce()?;
+    let deadline = Instant::now() + CONNECT_TIMEOUT + CONNECT_TIMEOUT;
+    let deadline_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Playnite command clock was unavailable")?
+        .as_millis()
+        .saturating_add(16_000);
+    let deadline_unix_ms =
+        u64::try_from(deadline_unix_ms).map_err(|_| "Playnite command deadline was invalid")?;
+    let message = serde_json::json!({"type":"command","command":command,"id":game_id,"requestId":request_id,"deadlineUnixMs":deadline_unix_ms});
+    let mut line =
+        serde_json::to_vec(&message).map_err(|_| "Playnite command serialization failed")?;
+    line.push(b'\n');
     sunshine_actor_channels()
         .ok_or("Playnite Sunshine connector is not running")?
         .0
         .try_send(SunshineCommand::Send {
             processes: expected_processes.to_vec(),
-            line: extension_command_line_with_request(command, Some(game_id), Some(&request_id))?,
+            line,
             command: command.to_owned(),
             request_id,
+            deadline,
             reply,
         })
         .map_err(|_| "Playnite Sunshine connector stopped".to_owned())?;

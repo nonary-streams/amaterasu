@@ -43,14 +43,27 @@ function Assert-Hello($Data, $Hello, [uint32]$ControlPid) {
     if (-not $Hello -or $Hello.type -ne 'hello') { throw 'missing typed hello' }
     $pidValue = [uint32]$Hello.pid
     if ($pidValue -eq 0 -or $pidValue -ne $ControlPid -or $pidValue -ne [AmaterasuPlaynitePeer]::ClientPid($Data.SafePipeHandle)) { throw 'control/data pipe client differs from hello PID' }
+    Assert-RoleHello $Hello
+    $service = Get-CimInstance Win32_Service -Filter "Name='Amaterasu'" -ErrorAction Stop
+    $worker = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction Stop
+    $serviceProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($service.ProcessId)" -ErrorAction Stop
+    if (-not $service -or -not $worker -or -not $serviceProcess) { throw 'Amaterasu service identity unavailable' }
+    Assert-SunshineIdentity $pidValue ([uint32]$service.ProcessId) ([uint32]$worker.ParentProcessId) ([string]$worker.ExecutablePath) ([string]$serviceProcess.ExecutablePath) ([string]$worker.CommandLine)
+}
+
+function Assert-RoleHello($Hello) {
     if ($Hello.role -notin @('sunshine', 'launcher')) { throw 'unknown client role' }
     if ($Hello.role -eq 'sunshine') {
         if ([string]$Hello.nonce -notmatch '^[0-9a-f]{32}$') { throw 'invalid Sunshine connection nonce' }
-        $service = Get-CimInstance Win32_Service -Filter "Name='Amaterasu'" -ErrorAction Stop
-        $worker = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction Stop
-        $serviceProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($service.ProcessId)" -ErrorAction Stop
-        if (-not $service -or -not $worker -or -not $serviceProcess) { throw 'Amaterasu service identity unavailable' }
-        Assert-SunshineIdentity $pidValue ([uint32]$service.ProcessId) ([uint32]$worker.ParentProcessId) ([string]$worker.ExecutablePath) ([string]$serviceProcess.ExecutablePath) ([string]$worker.CommandLine)
+        if ($Hello.gameId -or $Hello.mode) { throw 'Sunshine hello carried launcher fields' }
+    } else {
+        if ($Hello.nonce) { throw 'launcher hello carried Sunshine nonce' }
+        if ($Hello.mode -eq 'fullscreen') {
+            if ($Hello.gameId) { throw 'fullscreen watch cannot claim a game ID' }
+        } else {
+            $parsed = [Guid]::Empty
+            if ($Hello.mode -or -not [Guid]::TryParse([string]$Hello.gameId, [ref]$parsed) -or $parsed -eq [Guid]::Empty) { throw 'launcher hello requires a game GUID' }
+        }
     }
 }
 
@@ -93,6 +106,13 @@ function Convert-FrameLine($Value) {
     return $line
 }
 
+function Add-CapturedLine($Lines, $Value, [ref]$Bytes) {
+    $line = Convert-FrameLine $Value
+    $Bytes.Value += [System.Text.Encoding]::UTF8.GetByteCount($line) + 1
+    if ($Bytes.Value -gt 8388096) { throw 'snapshot payload exceeds 8 MiB frame budget' }
+    $Lines.Add($line)
+}
+
 function Get-GameExecutable($Game) {
     $action = @($Game.GameActions | Where-Object { $_.IsPlayAction } | Select-Object -First 1)
     if (-not $action.Count) { $action = @($Game.GameActions | Select-Object -First 1) }
@@ -112,35 +132,36 @@ function Capture-SnapshotPayload($Api) {
     $PlayniteApi = $Api
     if (-not $PlayniteApi.MainView.UIDispatcher.CheckAccess()) { throw 'snapshot capture requires the Playnite UI thread' }
     $lines = [System.Collections.Generic.List[string]]::new()
+    $bytes = 0
     $plugins = @()
-    foreach ($plugin in @($PlayniteApi.Addons.Plugins)) {
+    foreach ($plugin in $PlayniteApi.Addons.Plugins) {
         $plugins += @{ id=[string]$plugin.Id; name=[string]$plugin.Name }
         if ($plugins.Count -gt 4096) { throw 'too many plugins' }
     }
-    $lines.Add((Convert-FrameLine @{ type='plugins'; payload=@($plugins) }))
+    Add-CapturedLine $lines @{ type='plugins'; payload=@($plugins) } ([ref]$bytes)
     $categories = @()
     $categoryNames = @{}
-    foreach ($category in @($PlayniteApi.Database.Categories)) {
+    foreach ($category in $PlayniteApi.Database.Categories) {
         $id = [string]$category.Id
         $categories += @{ id=$id; name=[string]$category.Name }
         $categoryNames[$id] = [string]$category.Name
         if ($categories.Count -gt 4096) { throw 'too many categories' }
     }
-    $lines.Add((Convert-FrameLine @{ type='categories'; payload=@($categories) }))
+    Add-CapturedLine $lines @{ type='categories'; payload=@($categories) } ([ref]$bytes)
     $count = 0
     $batch = [System.Collections.Generic.List[object]]::new()
-    foreach ($game in @($PlayniteApi.Database.Games)) {
+    foreach ($game in $PlayniteApi.Database.Games) {
         if (++$count -gt 50000) { throw 'too many games' }
         $names = @()
         foreach ($id in @($game.CategoryIds)) { if ($categoryNames.ContainsKey([string]$id)) { $names += $categoryNames[[string]$id] } }
         $lastPlayed = if ($game.LastActivity) { ([DateTime]$game.LastActivity).ToString('o') } else { '' }
         $batch.Add(@{ id=[string]$game.Id; name=[string]$game.Name; exe=(Get-GameExecutable $game); args=''; workingDir=''; installDir=[string]$game.InstallDirectory; categories=@($names); pluginId=[string]$game.PluginId; pluginName=''; lastPlayed=$lastPlayed; installed=[bool]$game.IsInstalled })
         if ($batch.Count -eq 100) {
-            $lines.Add((Convert-FrameLine @{ type='games'; payload=$batch.ToArray() }))
+            Add-CapturedLine $lines @{ type='games'; payload=$batch.ToArray() } ([ref]$bytes)
             $batch.Clear()
         }
     }
-    if ($batch.Count) { $lines.Add((Convert-FrameLine @{ type='games'; payload=$batch.ToArray() })) }
+    if ($batch.Count) { Add-CapturedLine $lines @{ type='games'; payload=$batch.ToArray() } ([ref]$bytes) }
     if ($lines.Count -gt 510) { throw 'snapshot exceeds frame count' }
     return @{ Lines=$lines.ToArray(); Games=$count; CapturedAt=[DateTime]::UtcNow }
 }
@@ -206,6 +227,17 @@ function Replay-RunningGame($Connection) {
 function Invoke-ExtensionCommand($Connection, $Message) {
     if ($Message.type -ne 'command' -or $Connection.Role -ne 'sunshine') { return }
     $requestId = [string]$Message.requestId
+    if ($Message.command -in @('launch', 'stop')) {
+        $deadline = 0L
+        if ($requestId -notmatch '^[0-9a-f]{32}$' -or
+            -not [long]::TryParse([string]$Message.deadlineUnixMs, [ref]$deadline) -or
+            [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $deadline) {
+            if ($requestId -match '^[0-9a-f]{32}$') {
+                [void](Add-Frame $Connection @((Convert-FrameLine @{ type='commandResult'; command=[string]$Message.command; requestId=$requestId; nonce=$Connection.Nonce; success=$false; error='expired or invalid command deadline' })))
+            }
+            return
+        }
+    }
     switch ([string]$Message.command) {
         'snapshot' { if ($requestId -match '^[0-9a-f]{32}$') { Queue-Snapshot $Connection $requestId }; break }
         'launch' {
