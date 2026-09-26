@@ -45,6 +45,10 @@ fn inactive_ensure_active_preserves_full_request_and_owned_lease_lifecycle() {
     request["display_request"] = inactive_ensure_active_request();
     let prepared = host.response(1, request.clone());
     let id = prepared["session"].as_u64().unwrap();
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["display_state"], "applied");
+    assert_eq!(prepared["display_applied"], true);
+    assert!(host.pipeline.records[&id].display_lease.is_some());
     assert_eq!(prepared["display_request"], request["display_request"]);
     assert_eq!(host.response(2, start(id))["display_state"], "applied");
     let operation = host.pipeline.records[&id].display_operation();
@@ -99,20 +103,20 @@ fn inactive_ensure_active_lost_result_reconciles_same_operation_and_restores() {
     inactive_broker(&mut host);
     let mut request = prepare();
     request["display_request"] = inactive_ensure_active_request();
-    let id = host.response(1, request)["session"].as_u64().unwrap();
-    host.broker.display_restart_on_lost_apply = true;
     host.broker.fault = Some(("amaterasu.display/1:apply".into(), Fault::AfterMutation));
-    let started = host.response(2, start(id));
-    assert_eq!(started["state"], "active");
-    assert_eq!(started["display_state"], "recovery_required");
+    let prepared = host.response(1, request);
+    let id = prepared["session"].as_u64().unwrap();
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["display_state"], "applied");
     assert_eq!(
         host.broker.display_operation.as_deref(),
         Some(host.pipeline.records[&id].display_operation().as_str())
     );
     assert_eq!(
-        host.response(3, json!({"action":"status","session":id}))["display_state"],
-        "recovery_required"
+        host.response(2, json!({"action":"status","session":id}))["display_state"],
+        "applied"
     );
+    assert_eq!(host.response(3, start(id))["state"], "active");
     assert_eq!(
         host.response(4, json!({"action":"stop","session":id}))["state"],
         "stopped"
@@ -120,7 +124,7 @@ fn inactive_ensure_active_lost_result_reconciles_same_operation_and_restores() {
     assert!(host.broker.display_lease.is_none());
     assert!(
         host.broker.calls.iter().any(
-            |call| call.service == "amaterasu.display/1" && call.payload["action"] == "recover"
+            |call| call.service == "amaterasu.display/1" && call.payload["action"] == "restore"
         )
     );
     assert_eq!(
@@ -143,13 +147,10 @@ fn inactive_target_other_options_and_wrong_operation_do_not_restore() {
         let mut request = prepare();
         request["display_request"] = inactive_ensure_active_request();
         request["display_request"]["mode_policy"]["configuration_option"] = json!(option);
-        let id = host.response(1, request)["session"].as_u64().unwrap();
-        assert_eq!(host.response(2, start(id))["state"], "active");
+        let rejected = host.response(1, request);
+        assert_eq!(rejected["state"], "failed");
+        assert_eq!(rejected["error"], "display_apply_rejected");
         assert!(host.broker.display_lease.is_none());
-        assert_eq!(
-            host.response(3, json!({"action":"stop","session":id}))["state"],
-            "stopped"
-        );
         assert!(
             !host
                 .broker
@@ -164,17 +165,10 @@ fn inactive_target_other_options_and_wrong_operation_do_not_restore() {
     inactive_broker(&mut host);
     let mut request = prepare();
     request["display_request"] = inactive_ensure_active_request();
-    let id = host.response(1, request)["session"].as_u64().unwrap();
     host.broker.display_race_on_lost_apply = true;
     host.broker.fault = Some(("amaterasu.display/1:apply".into(), Fault::BeforeMutation));
-    assert_eq!(
-        host.response(2, start(id))["display_state"],
-        "status_unverified"
-    );
-    assert_eq!(
-        host.response(3, json!({"action":"stop","session":id}))["state"],
-        "cleanup_failed"
-    );
+    let rejected = host.response(1, request);
+    assert_eq!(rejected["state"], "cleanup_failed");
     assert_eq!(
         host.broker.display_operation.as_deref(),
         Some("another-session-display")
@@ -301,9 +295,21 @@ fn full_frozen_topology_applies_once_and_restores_on_stop() {
     request["display_request"] = display_request();
     let prepared = host.response(1, request.clone());
     let id = prepared["session"].as_u64().unwrap();
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["display_state"], "applied");
+    assert_eq!(prepared["display_applied"], true);
+    assert_eq!(
+        host.pipeline.records[&id].display_lease.as_deref(),
+        Some("display-0000000000000001")
+    );
     assert_eq!(prepared["display_request"], request["display_request"]);
     assert_eq!(host.response(2, request)["session"], id);
-    assert_eq!(host.response(3, start(id))["display_state"], "applied");
+    let status = host.response(3, json!({"action":"status","session":id}));
+    assert_eq!(status["state"], "prepared");
+    assert_eq!(status["display_state"], "applied");
+    assert_eq!(status["display_applied"], true);
+    assert_eq!(status["display_request"], display_request());
+    assert_eq!(host.response(4, start(id))["display_state"], "applied");
     let applies: Vec<_> = host
         .broker
         .calls
@@ -329,7 +335,7 @@ fn full_frozen_topology_applies_once_and_restores_on_stop() {
     );
     assert!(applies[0].payload.get("mode_policy").is_none());
     assert_eq!(
-        host.response(4, json!({"action":"stop","session":id}))["state"],
+        host.response(5, json!({"action":"stop","session":id}))["state"],
         "stopped"
     );
     assert!(host.broker.display_lease.is_none());
@@ -408,18 +414,49 @@ fn incomplete_duplicate_and_unknown_display_policies_are_rejected() {
 }
 
 #[test]
-fn rejected_apply_keeps_stream_alive_without_lease() {
+fn rejected_apply_fails_prepare_without_lease() {
     let mut host = Harness::new();
     host.broker.display_apply_failure = true;
     let mut request = prepare();
     request["display_request"] = display_request();
-    let id = host.response(1, request)["session"].as_u64().unwrap();
-    assert_eq!(host.response(2, start(id))["state"], "active");
+    let rejected = host.response(1, request);
+    assert_eq!(rejected["state"], "failed");
+    assert_eq!(rejected["error"], "display_apply_rejected");
     assert!(host.broker.display_lease.is_none());
-    assert_eq!(
-        host.response(3, json!({"action":"stop","session":id}))["state"],
-        "stopped"
-    );
+}
+
+#[test]
+fn unavailable_display_fails_prepare_before_apply() {
+    let mut host = Harness::new();
+    host.broker.display_unavailable = true;
+    let mut request = prepare();
+    request["display_request"] = display_request();
+    let rejected = host.response(1, request);
+    assert_eq!(rejected["state"], "failed");
+    assert_eq!(rejected["error"], "display_unavailable");
+    assert!(host.broker.display_lease.is_none());
+    assert!(!host.broker.calls.iter().any(|call| {
+        call.service == "amaterasu.display/1" && call.payload["action"] == "apply"
+    }));
+}
+
+#[test]
+fn prepared_display_lease_restores_on_expiry_without_start() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["display_request"] = display_request();
+    let prepared = host.response(1, request);
+    let id = prepared["session"].as_u64().unwrap();
+    assert_eq!(prepared["display_state"], "applied");
+    assert!(host.broker.display_lease.is_some());
+    host.now = host.pipeline.records[&id].prepared_until;
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Failed);
+    assert_eq!(host.pipeline.records[&id].error, Some("prepare_expired"));
+    assert!(host.broker.display_lease.is_none());
+    assert!(host.broker.calls.iter().any(|call| {
+        call.service == "amaterasu.display/1" && call.payload["action"] == "restore"
+    }));
 }
 
 #[test]
@@ -427,15 +464,16 @@ fn lost_apply_result_adopts_only_its_operation_and_restores() {
     let mut host = Harness::new();
     let mut request = prepare();
     request["display_request"] = display_request();
-    let id = host.response(1, request)["session"].as_u64().unwrap();
     host.broker.fault = Some(("amaterasu.display/1:apply".into(), Fault::AfterMutation));
-    let response = host.response(2, start(id));
-    assert_eq!(response["state"], "active");
+    let response = host.response(1, request);
+    let id = response["session"].as_u64().unwrap();
+    assert_eq!(response["state"], "prepared");
     assert_eq!(
         host.pipeline.records[&id].display_lease.as_deref(),
         Some("display-0000000000000001")
     );
-    assert_eq!(response["display_state"], "leased");
+    assert_eq!(response["display_state"], "applied");
+    assert_eq!(response["display_applied"], true);
     assert_eq!(
         host.broker
             .calls
@@ -454,29 +492,16 @@ fn lost_apply_result_adopts_only_its_operation_and_restores() {
 }
 
 #[test]
-fn recovered_provider_journal_keeps_operation_identity_through_stop() {
+fn recovered_provider_journal_blocks_prepare_and_recovers_owned_lease() {
     let mut host = Harness::new();
     let mut request = prepare();
     request["display_request"] = display_request();
-    let id = host.response(1, request)["session"].as_u64().unwrap();
     host.broker.display_restart_on_lost_apply = true;
     host.broker.fault = Some(("amaterasu.display/1:apply".into(), Fault::AfterMutation));
-    assert_eq!(
-        host.response(2, start(id))["display_state"],
-        "recovery_required"
-    );
-    assert_eq!(
-        host.pipeline.records[&id].display_lease.as_deref(),
-        Some("display-0000000000000001")
-    );
-    assert_eq!(
-        host.broker.display_operation.as_deref(),
-        Some(host.pipeline.records[&id].display_operation().as_str())
-    );
-    assert_eq!(
-        host.response(3, json!({"action":"stop","session":id}))["state"],
-        "stopped"
-    );
+    let rejected = host.response(1, request);
+    assert_eq!(rejected["state"], "failed");
+    assert_eq!(rejected["error"], "display_status_unverified");
+    assert!(host.broker.display_lease.is_none());
     assert!(
         host.broker.calls.iter().any(
             |call| call.service == "amaterasu.display/1" && call.payload["action"] == "recover"
@@ -485,25 +510,23 @@ fn recovered_provider_journal_keeps_operation_identity_through_stop() {
 }
 
 #[test]
-fn same_operation_recovery_reply_retains_lease_for_recover() {
+fn same_operation_recovery_reply_needs_leased_status_before_prepare() {
     let mut host = Harness::new();
     host.broker.display_apply_recovery_reply = true;
     host.broker.display_recovery_required = false;
     let mut request = prepare();
     request["display_request"] = display_request();
-    let id = host.response(1, request)["session"].as_u64().unwrap();
-    assert_eq!(
-        host.response(2, start(id))["display_state"],
-        "recovery_required"
-    );
-    host.broker.display_recovery_required = true;
+    let prepared = host.response(1, request);
+    let id = prepared["session"].as_u64().unwrap();
+    assert_eq!(prepared["display_state"], "applied");
+    assert_eq!(host.response(2, start(id))["state"], "active");
     assert_eq!(
         host.response(3, json!({"action":"stop","session":id}))["state"],
         "stopped"
     );
     assert!(
         host.broker.calls.iter().any(
-            |call| call.service == "amaterasu.display/1" && call.payload["action"] == "recover"
+            |call| call.service == "amaterasu.display/1" && call.payload["action"] == "restore"
         )
     );
 }
@@ -513,19 +536,10 @@ fn concurrent_owner_lease_after_preflight_is_never_restored_by_this_session() {
     let mut host = Harness::new();
     let mut request = prepare();
     request["display_request"] = display_request();
-    let id = host.response(1, request)["session"].as_u64().unwrap();
     host.broker.display_race_on_lost_apply = true;
     host.broker.fault = Some(("amaterasu.display/1:apply".into(), Fault::BeforeMutation));
-    assert_eq!(host.response(2, start(id))["state"], "active");
-    assert_eq!(
-        host.pipeline.records[&id].display_state,
-        "status_unverified"
-    );
-    assert!(host.pipeline.records[&id].display_lease.is_none());
-    assert_eq!(
-        host.response(3, json!({"action":"stop","session":id}))["state"],
-        "cleanup_failed"
-    );
+    let rejected = host.response(1, request);
+    assert_eq!(rejected["state"], "cleanup_failed");
     assert_eq!(
         host.broker.display_lease.as_deref(),
         Some("display-0000000000000002")
@@ -547,17 +561,8 @@ fn wrong_display_operation_cannot_be_adopted_or_restored() {
     host.broker.display_wrong_status_operation = true;
     let mut request = prepare();
     request["display_request"] = display_request();
-    let id = host.response(1, request)["session"].as_u64().unwrap();
-    assert_eq!(host.response(2, start(id))["state"], "active");
-    assert!(host.pipeline.records[&id].display_lease.is_none());
-    assert_eq!(
-        host.pipeline.records[&id].display_state,
-        "status_unverified"
-    );
-    assert_eq!(
-        host.response(3, json!({"action":"stop","session":id}))["state"],
-        "cleanup_failed"
-    );
+    let rejected = host.response(1, request);
+    assert_eq!(rejected["state"], "cleanup_failed");
     assert!(host.broker.display_lease.is_some());
     assert!(
         !host
@@ -617,9 +622,9 @@ fn another_stream_does_not_reapply_an_owned_display_lease() {
     let mut second = prepare();
     second["operation_id"] = json!("second-prepare");
     second["display_request"] = display_request();
-    let second_id = host.response(3, second)["session"].as_u64().unwrap();
-    assert_eq!(host.response(4, start(second_id))["state"], "active");
-    assert_eq!(host.pipeline.records[&second_id].display_state, "busy");
+    let second_result = host.response(3, second);
+    assert_eq!(second_result["state"], "failed");
+    assert_eq!(second_result["error"], "display_unavailable");
     assert_eq!(
         host.broker
             .calls
@@ -629,10 +634,6 @@ fn another_stream_does_not_reapply_an_owned_display_lease() {
             )
             .count(),
         1
-    );
-    assert_eq!(
-        host.response(5, json!({"action":"stop","session":second_id}))["state"],
-        "stopped"
     );
     assert!(host.broker.display_lease.is_some());
     assert_eq!(
