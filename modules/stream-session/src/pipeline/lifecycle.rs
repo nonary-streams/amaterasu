@@ -115,6 +115,8 @@ impl Pipeline {
                         record.display_state = "runtime_unavailable".into();
                         if job.step == Step::ApplyDisplay && !pending.admission_rejected() {
                             job.step = Step::FindDisplay;
+                        } else if record.state == State::Preparing {
+                            job.fail(record, "display_unavailable", now);
                         } else {
                             record.display_attempted = false;
                             job.step = if record.config.frame_limiter_settings.is_some()
@@ -129,6 +131,10 @@ impl Pipeline {
                     }
                     if job.step == Step::FindDisplay {
                         record.display_state = "status_unavailable".into();
+                        if record.state == State::Preparing {
+                            job.fail(record, "display_status_unverified", now);
+                            return true;
+                        }
                         job.step = if record.config.frame_limiter_settings.is_some()
                             && !record.limiter_attempted
                         {
@@ -244,7 +250,7 @@ impl Pipeline {
             return true;
         }
         if job.step == Step::CheckDisplay {
-            job.step = if payload["ok"] == true
+            if payload["ok"] == true
                 && payload["state"] == "idle"
                 && payload["lease"].is_null()
                 && payload["native_supported"] == true
@@ -254,44 +260,23 @@ impl Pipeline {
                     .values()
                     .any(|other| other.display_attempted || other.display_lease.is_some())
             {
-                Step::ApplyDisplay
+                job.step = Step::ApplyDisplay;
             } else {
                 record.display_state = if payload["state"] == "idle" {
                     "unavailable".into()
                 } else {
                     "busy".into()
                 };
-                if record.config.frame_limiter_settings.is_some() && !record.limiter_attempted {
-                    Step::ApplyLimiter
-                } else {
-                    Step::AcquireOutput
-                }
-            };
+                job.fail(record, "display_unavailable", now);
+            }
             return true;
         }
         if job.step == Step::ApplyDisplay {
             super::display::accept_apply(record, &payload);
-            if record.display_lease.is_none() {
-                if payload["ok"] == false && payload["recovery_required"] != true {
-                    record.display_attempted = false;
-                    job.step = if record.config.frame_limiter_settings.is_some()
-                        && !record.limiter_attempted
-                    {
-                        Step::ApplyLimiter
-                    } else {
-                        Step::AcquireOutput
-                    };
-                } else {
-                    job.step = Step::FindDisplay;
-                }
+            if payload["ok"] == false && payload["recovery_required"] != true {
+                job.fail(record, "display_apply_rejected", now);
             } else {
-                job.step = if record.config.frame_limiter_settings.is_some()
-                    && !record.limiter_attempted
-                {
-                    Step::ApplyLimiter
-                } else {
-                    Step::AcquireOutput
-                };
+                job.step = Step::FindDisplay;
             }
             return true;
         }
@@ -300,12 +285,14 @@ impl Pipeline {
             if !known {
                 record.display_state = "status_unverified".into();
             }
-            job.step =
-                if record.config.frame_limiter_settings.is_some() && !record.limiter_attempted {
-                    Step::ApplyLimiter
-                } else {
-                    Step::AcquireOutput
-                };
+            if known && record.display_status_verified && record.display_state == "leased" {
+                record.display_state = "applied".into();
+                record.state = State::Prepared;
+                record.prepared_until =
+                    now.saturating_add(u64::from(record.config.ping_timeout_ms));
+                return self.deliver_success(record, job, now, send);
+            }
+            job.fail(record, "display_status_unverified", now);
             return true;
         }
         if payload["ok"] != true {
@@ -368,16 +355,18 @@ impl Pipeline {
                         record.state = State::Starting;
                         job.deadline = now.saturating_add(15000);
                     }
-                    job.step =
-                        if record.config.display_request.is_some() && !record.display_attempted {
-                            Step::CheckDisplay
-                        } else if record.config.frame_limiter_settings.is_some()
-                            && !record.limiter_attempted
-                        {
-                            Step::ApplyLimiter
-                        } else {
-                            Step::AcquireOutput
-                        };
+                    if record.config.display_request.is_some()
+                        && (record.display_lease.is_none() || !record.display_status_verified)
+                    {
+                        return Err("display_lease_missing");
+                    }
+                    job.step = if record.config.frame_limiter_settings.is_some()
+                        && !record.limiter_attempted
+                    {
+                        Step::ApplyLimiter
+                    } else {
+                        Step::AcquireOutput
+                    };
                     Ok(true)
                 } else if status["state"] == "discovering" {
                     if record.state == State::Armed {
@@ -575,6 +564,10 @@ impl Pipeline {
             }
             Resource::Control => {
                 record.control_local = Some(local_address(payload, "local")?);
+                if record.config.display_request.is_some() {
+                    job.step = Step::CheckDisplay;
+                    return Ok(true);
+                }
                 record.state = State::Prepared;
                 record.prepared_until =
                     now.saturating_add(u64::from(record.config.ping_timeout_ms));
