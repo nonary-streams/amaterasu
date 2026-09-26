@@ -50,6 +50,12 @@ pub(super) struct Record {
 }
 
 impl Record {
+    pub(super) fn begin_arm(&mut self, now: u64) -> u64 {
+        self.state = State::Arming;
+        self.expires = now.saturating_add(u64::from(self.config.ping_timeout_ms));
+        self.expires
+    }
+
     pub(super) fn accept_announce(
         &mut self,
         announce: &amaterasu_gamestream::sdp::Announce,

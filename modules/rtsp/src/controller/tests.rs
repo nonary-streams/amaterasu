@@ -429,6 +429,50 @@ fn nearly_expired_staged_admission_never_allocates_a_stream() {
 }
 
 #[test]
+fn staged_ready_expiry_rejects_play_before_negotiation_and_arm_uses_ping_window() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let mut expired = record(State::Ready);
+    expired.expires = 100;
+    controller.records.insert(expired.id, expired);
+    controller.handle_network(77, 5, request(Method::Play, "/", 7, true), 100);
+    let expired = &controller.records[&5];
+    assert!(expired.state == State::Closing);
+    assert_eq!(expired.failure, Some("prepare_expired"));
+    assert!(controller.job.is_none());
+
+    let mut accepted = record(State::Ready);
+    accepted.expires = 100;
+    accepted.config.ping_timeout_ms = 10_000;
+    let deadline = accepted.begin_arm(99);
+    assert_eq!(deadline, 10_099);
+    assert_eq!(accepted.expires, deadline);
+    assert!(accepted.state == State::Arming);
+}
+
+#[test]
+fn confirmed_stop_clears_display_readback_while_teardown_reply_is_pending() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let mut record = record(State::Closing);
+    record.display_applied = true;
+    record.cleanup_confirmed = true;
+    record.revoke_after = Some(77);
+    let job = Job {
+        ticket: record.id,
+        phase: Phase::Stop,
+        call: Call::new(json!({"action":"stop"}), "stop".into(), None),
+        caller: None,
+        network: None,
+        deadline: 5_000,
+    };
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+    controller.finish_cleanup_reply(&mut record, job, &runtime);
+    assert!(record.state == State::Closing);
+    assert_eq!(record.response()["display_applied"], false);
+    assert!(record.cleanup_confirmed);
+}
+
+#[test]
 fn malformed_topology_revision_never_reaches_verifier_or_stream_prepare() {
     for malformed in [
         serde_json::Value::Null,

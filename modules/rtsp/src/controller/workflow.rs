@@ -322,6 +322,9 @@ impl Controller {
         job: Job,
         runtime: &RuntimeClient,
     ) {
+        // The stream-session Stop/Status has confirmed cleanup even if RTSP is
+        // still waiting for the TEARDOWN reply to leave the network transport.
+        record.display_applied = false;
         if let Some((connection, action_ticket)) = job.network {
             let reply = record
                 .negotiation

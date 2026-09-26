@@ -57,6 +57,13 @@ impl Controller {
             self.records.insert(ticket, record);
             return;
         }
+        if record.state == State::Ready && now >= record.expires {
+            self.reply_status(connection, request.cseq, 454);
+            record.close(Some("prepare_expired"));
+            self.revoke_ticket(ticket);
+            self.records.insert(ticket, record);
+            return;
+        }
         let result = record
             .negotiation
             .as_mut()
@@ -109,7 +116,7 @@ impl Controller {
                     self.records.insert(ticket, record);
                     return;
                 };
-                record.state = State::Arming;
+                let deadline = record.begin_arm(now);
                 let call = Call::new(payload, self.operation_id(&record, "arm"), None);
                 self.job = Some(Job {
                     ticket,
@@ -117,7 +124,7 @@ impl Controller {
                     call,
                     caller: None,
                     network: Some((connection, action_ticket)),
-                    deadline: record.expires,
+                    deadline,
                 });
             }
             Ok(NegotiationStep::Action {
