@@ -1148,35 +1148,55 @@ fn constant_rate_repeats_owned_pixels_with_monotonic_metadata_and_stops_after_er
 }
 
 #[test]
-fn closed_capture_drops_constant_rate_cache_and_requires_a_new_stream() {
-    let events = Arc::new(Mutex::new(VecDeque::from([
-        Ok(Some(frame(7, 4, &[1, 2, 3, 4, 5, 6, 7, 8]))),
-        Err(CaptureError::new("access_lost", "capture item closed")),
-        Ok(None),
-    ])));
-    let drops = Arc::new(AtomicUsize::new(0));
-    let mut controller = Controller::new(
-        FakeBackend {
-            events: events.clone(),
-            geometries: Arc::new(Mutex::new(VecDeque::new())),
-            touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
-            drops: drops.clone(),
-        },
-        true,
-    );
-    let stream = open_constant_rate(&mut controller, "owner");
+fn terminal_capture_failure_drops_cached_pixels_and_allows_a_fresh_open() {
+    for failure in ["access_lost", "device_lost"] {
+        let first = frame(7, 4, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let first_pixels = Arc::downgrade(&first.bytes);
+        let events = Arc::new(Mutex::new(VecDeque::from([
+            Ok(Some(first)),
+            Err(CaptureError::new(failure, "capture source failed")),
+            Ok(Some(frame(9, 5, &[8, 7, 6, 5, 4, 3, 2, 1]))),
+        ])));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut controller = Controller::new(
+            FakeBackend {
+                events: events.clone(),
+                geometries: Arc::new(Mutex::new(VecDeque::new())),
+                touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
+                drops: drops.clone(),
+            },
+            true,
+        );
+        let stream = open_constant_rate(&mut controller, "owner");
 
-    assert!(controller.read("owner", stream, 0).unwrap().is_some());
-    assert_eq!(
-        controller.read("owner", stream, 0).unwrap_err().code,
-        "access_lost"
-    );
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        controller.read("owner", stream, 0).unwrap_err().code,
-        "not_found"
-    );
-    assert_eq!(events.lock().unwrap().len(), 1);
+        drop(controller.read("owner", stream, 0).unwrap());
+        assert!(first_pixels.upgrade().is_some());
+        assert_eq!(
+            controller.read("owner", stream, 0).unwrap_err().code,
+            failure
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(first_pixels.upgrade().is_none());
+        assert_eq!(
+            controller.read("owner", stream, 0).unwrap_err().code,
+            "not_found"
+        );
+        assert_eq!(events.lock().unwrap().len(), 1);
+
+        let reopened = open_constant_rate(&mut controller, "owner");
+        assert_ne!(reopened, stream);
+        assert_eq!(
+            controller
+                .read("owner", reopened, 0)
+                .unwrap()
+                .unwrap()
+                .bytes
+                .as_slice(),
+            [8, 7, 6, 5, 4, 3, 2, 1]
+        );
+        controller.close("owner", reopened).unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
 }
 
 #[test]

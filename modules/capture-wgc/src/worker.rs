@@ -52,7 +52,11 @@ mod implementation {
                         return;
                     }
                     while request_receiver.recv().is_ok() {
-                        if reply_sender.try_send(source.poll()).is_err() {
+                        let result = source.poll();
+                        let terminal = result.as_ref().is_err_and(|error| {
+                            error.code == "access_lost" || error.code == "device_lost"
+                        });
+                        if reply_sender.try_send(result).is_err() || terminal {
                             break;
                         }
                     }
@@ -128,6 +132,7 @@ mod tests {
     use crate::backend::CaptureSession;
     use crate::model::{CaptureError, CaptureResult, Frame};
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread::{self, ThreadId};
     use std::time::Duration;
@@ -264,5 +269,46 @@ mod tests {
         });
         assert!(matches!(result, Err(error) if error.code == "unsupported_platform"));
         assert_eq!(trace.lock().unwrap().len(), 1);
+    }
+
+    struct FailingSource {
+        failure: &'static str,
+        polls: Arc<AtomicUsize>,
+        dropped: mpsc::Sender<()>,
+    }
+
+    impl FrameSource for FailingSource {
+        fn poll(&mut self) -> CaptureResult<Option<Frame>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Err(CaptureError::new(self.failure, "capture source failed"))
+        }
+    }
+
+    impl Drop for FailingSource {
+        fn drop(&mut self) {
+            self.dropped.send(()).unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_failure_releases_source_and_prevents_another_poll() {
+        for failure in ["access_lost", "device_lost"] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let source_polls = polls.clone();
+            let (dropped, released) = mpsc::channel();
+            let mut worker = Worker::start(move || {
+                Ok(FailingSource {
+                    failure,
+                    polls: source_polls,
+                    dropped,
+                })
+            })
+            .unwrap();
+
+            assert_eq!(worker.read(1_000).unwrap_err().code, failure);
+            released.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(worker.read(1_000).unwrap_err().code, "access_lost");
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+        }
     }
 }
