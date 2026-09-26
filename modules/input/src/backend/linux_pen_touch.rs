@@ -60,6 +60,7 @@ struct TrackedPen {
 struct TrackedTouch {
     slot: TouchSlot,
     contact: TrackedContact,
+    replay_event: Event,
 }
 
 #[derive(Default)]
@@ -237,6 +238,7 @@ impl ContactTracker {
                         pointer_id,
                         TrackedTouch {
                             slot,
+                            replay_event: event.clone(),
                             contact: TrackedContact {
                                 initial_down: event.clone(),
                                 last_event: event.clone(),
@@ -251,6 +253,7 @@ impl ContactTracker {
                 let Some(touch) = self.touches.get_mut(&pointer_id) else {
                     return Err(pointer_not_active());
                 };
+                touch.replay_event = touch_replay_event(&touch.replay_event, event);
                 touch.contact.last_event = event.clone();
             }
             PenTouchPhase::Up | PenTouchPhase::Cancel => {
@@ -417,6 +420,45 @@ impl ContactTracker {
         }
     }
 
+    fn reset_touch_device_state(&mut self) {
+        for touch in self.touches.values_mut() {
+            touch.contact.down_written = false;
+            touch.contact.native_write_attempted = false;
+        }
+    }
+
+    fn replay_active_touches(
+        &mut self,
+        terminal_pointer: Option<u32>,
+        mut emit: impl FnMut(Target, &[(u16, u16, i32)], &mut bool) -> InputResult<()>,
+    ) -> InputResult<()> {
+        let mut active_contacts = 0;
+        for (pointer_id, touch) in &mut self.touches {
+            if Some(*pointer_id) == terminal_pointer
+                || matches!(
+                    touch.contact.last_event,
+                    Event::PenTouch {
+                        phase: PenTouchPhase::Up | PenTouchPhase::Cancel,
+                        ..
+                    }
+                )
+            {
+                // A failed terminal report is still tracked for its retry,
+                // but no contact needs to be recreated on the new device.
+                continue;
+            }
+            let down = with_phase(&touch.replay_event, PenTouchPhase::Down);
+            let frame = touch_frame(&down, touch.slot, active_contacts + 1)?;
+            let mut attempted = false;
+            let result = emit(Target::Touch, &frame, &mut attempted);
+            touch.contact.native_write_attempted |= attempted;
+            result?;
+            touch.contact.down_written = true;
+            active_contacts += 1;
+        }
+        Ok(())
+    }
+
     fn is_empty(&self) -> bool {
         self.pen.is_none() && self.touches.is_empty()
     }
@@ -427,6 +469,7 @@ pub(super) struct LinuxPenTouch {
     pen_device: Option<Device>,
     touch_device: Option<Device>,
     pen_write_failed: bool,
+    touch_write_failed: bool,
 }
 
 impl LinuxPenTouch {
@@ -436,6 +479,7 @@ impl LinuxPenTouch {
             pen_device: None,
             touch_device: None,
             pen_write_failed: false,
+            touch_write_failed: false,
         }
     }
 
@@ -445,6 +489,25 @@ impl LinuxPenTouch {
 
     pub(super) fn has_device(&self) -> bool {
         self.pen_device.is_some() || self.touch_device.is_some()
+    }
+
+    fn recover_touch_device(
+        &mut self,
+        terminal_pointer: Option<u32>,
+        mut create: impl FnMut() -> InputResult<Device>,
+    ) -> InputResult<()> {
+        destroy_device(&mut self.touch_device)?;
+        self.tracker.reset_touch_device_state();
+        self.tracker
+            .replay_active_touches(terminal_pointer, |_, frame, attempted| {
+                if self.touch_device.is_none() {
+                    self.touch_device = Some(create()?);
+                }
+                *attempted = true;
+                self.touch_device.as_ref().unwrap().emit(frame)
+            })?;
+        self.touch_write_failed = false;
+        Ok(())
     }
 
     pub(super) fn inject(&mut self, path: &str, event: &Event) -> InputResult<()> {
@@ -467,11 +530,33 @@ impl LinuxPenTouch {
                 pen.contact.native_write_attempted = false;
             }
         }
+        if self.touch_write_failed
+            && matches!(
+                event,
+                Event::PenTouch {
+                    device: PenTouchDevice::Touch,
+                    ..
+                }
+            )
+        {
+            // A partial frame can corrupt any slot on this shared device.
+            // Detach it before replaying every still-active pointer.
+            let terminal_pointer = match event {
+                Event::PenTouch {
+                    pointer_id,
+                    phase: PenTouchPhase::Up | PenTouchPhase::Cancel,
+                    ..
+                } => Some(*pointer_id),
+                _ => None,
+            };
+            self.recover_touch_device(terminal_pointer, || Device::create_touchscreen(path))?;
+        }
         let Self {
             tracker,
             pen_device,
             touch_device,
             pen_write_failed,
+            touch_write_failed,
         } = self;
         tracker.inject(event, |target, frame, attempted| {
             let device = match target {
@@ -505,6 +590,9 @@ impl LinuxPenTouch {
             if target == Target::Pen && result.is_err() {
                 *pen_write_failed = true;
             }
+            if target == Target::Touch && result.is_err() {
+                *touch_write_failed = true;
+            }
             result
         })
     }
@@ -515,6 +603,7 @@ impl LinuxPenTouch {
             pen_device,
             touch_device,
             pen_write_failed,
+            touch_write_failed,
         } = self;
         // Send per-pointer terminal frames first. If a write fails, destroying
         // our owned devices still removes all contacts from those devices.
@@ -542,6 +631,7 @@ impl LinuxPenTouch {
         let touch_destroy = destroy_device(touch_device);
         if touch_destroy.is_ok() {
             tracker.clear_target(Target::Touch);
+            *touch_write_failed = false;
         }
 
         pen_destroy?;
@@ -555,6 +645,36 @@ fn destroy_device(device: &mut Option<Device>) -> InputResult<()> {
     }
     *device = None;
     Ok(())
+}
+
+fn touch_replay_event(previous: &Event, current: &Event) -> Event {
+    let mut replay = current.clone();
+    if let (
+        Event::PenTouch {
+            pressure: previous_pressure,
+            contact_area_major: previous_major,
+            contact_area_minor: previous_minor,
+            ..
+        },
+        Event::PenTouch {
+            pressure,
+            contact_area_major,
+            contact_area_minor,
+            ..
+        },
+    ) = (previous, &mut replay)
+    {
+        // Omitted pressure and area samples leave those axes unchanged on a
+        // live uinput device. Carry their last values onto a fresh device.
+        if pressure.is_none() {
+            *pressure = *previous_pressure;
+        }
+        if contact_area_major.is_none() {
+            *contact_area_major = *previous_major;
+            *contact_area_minor = *previous_minor;
+        }
+    }
+    replay
 }
 
 fn duplicate_down_mismatch() -> InputError {
@@ -842,6 +962,141 @@ fn with_phase(event: &Event, phase: PenTouchPhase) -> Event {
 mod tests {
     use super::*;
 
+    fn fake_device(path: &str) -> Device {
+        Device {
+            file: std::fs::OpenOptions::new().write(true).open(path).unwrap(),
+            created: false,
+        }
+    }
+
+    #[test]
+    fn failed_touch_down_replays_on_replacement_and_stop_allows_reacquisition() {
+        let mut pen_touch = LinuxPenTouch::new();
+        pen_touch.touch_device = Some(fake_device("/dev/full"));
+        let down = event(11, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 20);
+        assert!(pen_touch.inject("\0", &down).is_err());
+        assert!(pen_touch.touch_write_failed);
+        let slot = pen_touch.tracker.touches.get(&11).unwrap().slot;
+
+        pen_touch.touch_device.as_mut().unwrap().created = true;
+        assert!(
+            pen_touch
+                .recover_touch_device(None, || Ok(fake_device("/dev/null")))
+                .is_err()
+        );
+        assert!(pen_touch.touch_write_failed);
+        assert!(pen_touch.touch_device.is_some());
+
+        pen_touch.pen_device = Some(fake_device("/dev/null"));
+        let pen_down = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Down,
+            10,
+            20,
+        );
+        pen_touch.inject("\0", &pen_down).unwrap();
+        pen_touch
+            .inject("\0", &with_phase(&pen_down, PenTouchPhase::Cancel))
+            .unwrap();
+        assert!(pen_touch.touch_device.is_some());
+        pen_touch.touch_device.as_mut().unwrap().created = false;
+        pen_touch
+            .recover_touch_device(None, || Ok(fake_device("/dev/null")))
+            .unwrap();
+        let contact = pen_touch.tracker.touches.get(&11).unwrap();
+        assert_eq!(contact.slot, slot);
+        assert!(contact.contact.down_written);
+        pen_touch.inject("\0", &down).unwrap();
+        pen_touch.touch_device = Some(fake_device("/dev/full"));
+        let moved = event(11, PenTouchDevice::Touch, PenTouchPhase::Move, 50, 60);
+        assert!(pen_touch.inject("\0", &moved).is_err());
+        assert!(pen_touch.touch_write_failed);
+        pen_touch
+            .recover_touch_device(None, || Ok(fake_device("/dev/null")))
+            .unwrap();
+        let contact = pen_touch.tracker.touches.get(&11).unwrap();
+        assert_eq!(contact.slot, slot);
+        assert_eq!(contact.replay_event, moved);
+        assert!(contact.contact.down_written);
+        pen_touch
+            .inject("\0", &with_phase(&down, PenTouchPhase::Up))
+            .unwrap();
+
+        pen_touch.touch_device = Some(fake_device("/dev/full"));
+        assert!(pen_touch.inject("\0", &down).is_err());
+        pen_touch.stop().unwrap();
+        assert!(pen_touch.is_idle());
+        pen_touch.touch_device = Some(fake_device("/dev/null"));
+        pen_touch.inject("\0", &down).unwrap();
+        pen_touch.stop().unwrap();
+        assert!(pen_touch.is_idle());
+    }
+
+    #[test]
+    fn terminal_retry_after_failed_touch_write_needs_no_new_uinput_path() {
+        for phase in [PenTouchPhase::Up, PenTouchPhase::Cancel] {
+            let mut pen_touch = LinuxPenTouch::new();
+            pen_touch.touch_device = Some(fake_device("/dev/full"));
+            let down = event(11, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 20);
+            assert!(pen_touch.inject("\0", &down).is_err());
+            pen_touch.inject("\0", &with_phase(&down, phase)).unwrap();
+            assert!(pen_touch.is_idle());
+        }
+    }
+
+    #[test]
+    fn failed_touch_terminal_replays_other_contacts_and_retries_release() {
+        for phase in [PenTouchPhase::Up, PenTouchPhase::Cancel] {
+            let mut pen_touch = LinuxPenTouch::new();
+            pen_touch.touch_device = Some(fake_device("/dev/null"));
+            let first = event(11, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 20);
+            let second = event(22, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 40);
+            pen_touch.inject("\0", &first).unwrap();
+            pen_touch.inject("\0", &second).unwrap();
+            let first_slot = pen_touch.tracker.touches.get(&11).unwrap().slot;
+            let second_slot = pen_touch.tracker.touches.get(&22).unwrap().slot;
+            pen_touch.touch_device = Some(fake_device("/dev/full"));
+            let terminal = with_phase(&first, phase);
+            assert!(pen_touch.inject("\0", &terminal).is_err());
+            assert!(pen_touch.touch_write_failed);
+
+            pen_touch
+                .recover_touch_device(None, || Ok(fake_device("/dev/null")))
+                .unwrap();
+            assert_eq!(pen_touch.tracker.touches.get(&11).unwrap().slot, first_slot);
+            assert!(
+                !pen_touch
+                    .tracker
+                    .touches
+                    .get(&11)
+                    .unwrap()
+                    .contact
+                    .down_written
+            );
+            assert_eq!(
+                pen_touch.tracker.touches.get(&22).unwrap().slot,
+                second_slot
+            );
+            assert!(
+                pen_touch
+                    .tracker
+                    .touches
+                    .get(&22)
+                    .unwrap()
+                    .contact
+                    .down_written
+            );
+            pen_touch.inject("\0", &terminal).unwrap();
+            assert!(!pen_touch.tracker.touches.contains_key(&11));
+            pen_touch
+                .inject("\0", &with_phase(&second, PenTouchPhase::Cancel))
+                .unwrap();
+            pen_touch.stop().unwrap();
+            assert!(pen_touch.is_idle());
+        }
+    }
+
     #[test]
     fn up_after_failed_device_creation_releases_only_its_reserved_contact() {
         let mut pen_touch = LinuxPenTouch::new();
@@ -1095,6 +1350,70 @@ mod tests {
         frame.iter().find_map(|(event_kind, event_code, value)| {
             (*event_kind == kind && *event_code == code).then_some(*value)
         })
+    }
+
+    #[test]
+    fn partial_touch_move_replays_all_live_slots_with_stable_tracking_ids() {
+        let mut tracker = ContactTracker::default();
+        let mut writer = FakeWriter::default();
+        let mut first = event(11, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 20);
+        if let Event::PenTouch {
+            contact_area_major,
+            contact_area_minor,
+            ..
+        } = &mut first
+        {
+            *contact_area_major = Some(0.8);
+            *contact_area_minor = Some(0.3);
+        }
+        let second = event(22, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 40);
+        emit(&mut tracker, &mut writer, &first).unwrap();
+        emit(&mut tracker, &mut writer, &second).unwrap();
+        let first_slot = tracker.touches.get(&11).unwrap().slot;
+        let second_slot = tracker.touches.get(&22).unwrap().slot;
+        writer.partial_next = Some(2);
+        let mut moved = event(11, PenTouchDevice::Touch, PenTouchPhase::Move, 50, 60);
+        if let Event::PenTouch { pressure, .. } = &mut moved {
+            *pressure = None;
+        }
+        assert!(emit(&mut tracker, &mut writer, &moved).is_err());
+
+        tracker.reset_touch_device_state();
+        let frame_count = writer.frames.len();
+        tracker
+            .replay_active_touches(None, |target, frame, attempted| {
+                *attempted = true;
+                writer.emit(target, frame)
+            })
+            .unwrap();
+        assert_eq!(writer.frames.len(), frame_count + 2);
+        for (frame, slot, x) in [
+            (&writer.frames[frame_count].1, first_slot, 50),
+            (&writer.frames[frame_count + 1].1, second_slot, 30),
+        ] {
+            assert_eq!(event_at(frame, EV_ABS, ABS_MT_SLOT), Some(slot.slot));
+            assert_eq!(
+                event_at(frame, EV_ABS, ABS_MT_TRACKING_ID),
+                Some(slot.tracking_id)
+            );
+            assert_eq!(event_at(frame, EV_ABS, ABS_MT_POSITION_X), Some(x));
+            assert_eq!(event_at(frame, EV_KEY, BTN_TOUCH), Some(1));
+        }
+        assert!(
+            tracker
+                .touches
+                .values()
+                .all(|touch| touch.contact.down_written)
+        );
+        let first_replay = &writer.frames[frame_count].1;
+        assert_eq!(
+            event_at(first_replay, EV_ABS, ABS_MT_PRESSURE),
+            Some(pressure_value(0.5))
+        );
+        assert_eq!(
+            event_at(first_replay, EV_ABS, ABS_MT_TOUCH_MAJOR),
+            Some(normalized_axis_value(0.8))
+        );
     }
 
     #[test]
