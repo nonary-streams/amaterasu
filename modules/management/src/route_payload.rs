@@ -240,12 +240,15 @@ fn history(action: &str, object: &Object) -> Result<(), &'static str> {
             Ok(())
         }
         "active_sessions" => {
-            fields(object, &[], &["limit"])?;
+            fields(object, &[], &["limit", "offset"])?;
             if object.get("limit").is_some_and(|value| {
                 !value
                     .as_u64()
                     .is_some_and(|limit| (1..=16).contains(&limit))
-            }) {
+            }) || object
+                .get("offset")
+                .is_some_and(|value| value.as_u64().is_none())
+            {
                 return Err(INVALID);
             }
             Ok(())

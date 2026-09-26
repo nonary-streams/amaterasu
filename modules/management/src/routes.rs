@@ -336,6 +336,27 @@ mod tests {
         let list = resolve("/v1/history/list_sessions").unwrap();
         assert!(payload(list, br#"{"limit":25,"offset":0}"#).is_ok());
         assert!(payload(list, br#"{"limit":26}"#).is_err());
+        let active = resolve("/v1/history/active_sessions").unwrap();
+        assert_eq!(active.scope, Some("session.read"));
+        assert_eq!(
+            payload(active, br#"{}"#).unwrap()["action"],
+            "active_sessions"
+        );
+        let second_page = payload(active, br#"{"limit":16,"offset":12}"#).unwrap();
+        assert_eq!(second_page["action"], "active_sessions");
+        assert_eq!(second_page["limit"], 16);
+        assert_eq!(second_page["offset"], 12);
+        for invalid in [
+            br#"{"offset":-1}"#.as_slice(),
+            br#"{"offset":1.5}"#,
+            br#"{"offset":"12"}"#,
+            br#"{"offset":null}"#,
+            br#"{"offset":true}"#,
+            br#"{"limit":17,"offset":12}"#,
+            br#"{"offset":12,"unrelated":true}"#,
+        ] {
+            assert!(payload(active, invalid).is_err());
+        }
         let detail = resolve("/v1/history/session_detail").unwrap();
         assert!(payload(detail, br#"{"session_id":"session-1"}"#).is_ok());
         assert!(payload(detail, br#"{"session_id":""}"#).is_err());
