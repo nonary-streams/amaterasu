@@ -46,9 +46,10 @@ mute state.
 
 While an assigned virtual sink is capturing, the worker checks the render
 defaults every 100 ms and reapplies that sink if another application changes a
-role. This also covers a virtual sink that was already the Console default at
-open. The final lease still restores the defaults captured before the virtual
-sink was assigned. A transient policy call failure is retried at the next check.
+role or Windows leaves a previously selected role unset. This also covers a
+virtual sink that was already the Console default at open. The final lease
+still restores the defaults captured before the virtual sink was assigned. A
+transient policy call failure is retried at the next check.
 The pinned Vibeshine path skips its initial role assignment when the selected
 sink string equals the host sink string; its encoded virtual format selector
 usually differs even when both resolve to the same endpoint ID. This provider

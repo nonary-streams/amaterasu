@@ -310,8 +310,7 @@ impl RoutePolicy {
             .into_iter()
             .filter(|role| {
                 (active.assigned_roles[role.index()]
-                    || (active.original[role.index()].as_deref() == Some(endpoint)
-                        && current[role.index()].is_some()))
+                    || active.original[role.index()].as_deref() == Some(endpoint))
                     && current[role.index()].as_deref() != Some(endpoint)
             })
             .map(|role| RoleAssignment {
@@ -627,6 +626,59 @@ mod tests {
         );
         policy.complete_restore(true);
         assert_eq!(policy.endpoint_with_pending_restore(), None);
+    }
+
+    #[test]
+    fn virtual_sink_retries_an_unset_initial_default_without_claiming_other_roles() {
+        let original = [
+            Some("render.virtual".into()),
+            Some("render.user".into()),
+            None,
+        ];
+        let mut current = [None, original[1].clone(), None];
+        let mut policy = RoutePolicy::new();
+        assert_eq!(
+            policy.acquire_with_tracking("render.virtual", &original, true),
+            Ok(AcquirePlan::Tracked)
+        );
+
+        let expected = vec![RoleAssignment {
+            role: DefaultRole::Console,
+            endpoint: "render.virtual".into(),
+        }];
+        assert_eq!(
+            policy.refresh_assignments("render.virtual", &current),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            policy.attempt_assignment("render.virtual", DefaultRole::Console, || {
+                Err("audio_route_change_failed")
+            }),
+            Err("audio_route_change_failed")
+        );
+        assert_eq!(
+            policy.refresh_assignments("render.virtual", &current),
+            Ok(expected)
+        );
+        policy
+            .attempt_assignment("render.virtual", DefaultRole::Console, || {
+                current[DefaultRole::Console.index()] = Some("render.virtual".into());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            policy.refresh_assignments("render.virtual", &current),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            policy.release("render.virtual", &current),
+            Ok(ReleasePlan::Restore(Vec::new()))
+        );
+        assert!(policy.pending_restore_complete(&current));
+        policy.complete_restore(true);
+        assert_eq!(policy.endpoint_with_pending_restore(), None);
+        assert_eq!(current[DefaultRole::Multimedia.index()], original[1]);
+        assert_eq!(current[DefaultRole::Communications.index()], None);
     }
 
     #[test]
