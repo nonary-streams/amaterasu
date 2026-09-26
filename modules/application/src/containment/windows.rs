@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 #[path = "windows_user_process.rs"]
 mod windows_user_process;
 use windows_sys::Win32::Foundation::{
-    ERROR_MORE_DATA, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LPARAM,
+    ERROR_MORE_DATA, ERROR_TIMEOUT, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LPARAM,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::JobObjects::*;
@@ -142,8 +142,8 @@ impl SuspendedProcess {
         self.process.raw_handle()
     }
 
-    fn terminate(&mut self) {
-        let _ = self.process.terminate();
+    fn terminate(&mut self) -> io::Result<()> {
+        self.process.terminate()
     }
 
     fn resume(&self) -> io::Result<()> {
@@ -228,21 +228,39 @@ impl ContainedChild {
         };
         if let Err(error) = setup {
             // Assignment/resume errors fail closed: never run an uncontained child.
-            if assigned != 0 {
+            let job_termination = if assigned != 0 {
                 // SAFETY: the job owns this child and kill-on-close is enabled.
-                let _ = unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
-            }
-            child.terminate();
-            // Keep the process handle until the suspended or failed-resume child
-            // has exited. A successful termination request is asynchronous.
+                if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0 {
+                    Some(io::Error::last_os_error())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let process_termination = child.terminate().err();
+            // Termination is asynchronous. Retain the process handle through a
+            // bounded confirmation attempt; report an unsettled child explicitly.
             let deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < deadline {
-                if child.process.try_wait().ok().flatten().is_some() {
+            let mut wait_failure = None;
+            loop {
+                match child.process.try_wait() {
+                    Ok(Some(_)) => return Err(error),
+                    Ok(None) => {}
+                    Err(wait_error) => wait_failure = Some(wait_error),
+                }
+                if Instant::now() >= deadline {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            return Err(error);
+            eprintln!(
+                "Application launch could not confirm child exit after {error} (job termination: {job_termination:?}, process termination: {process_termination:?}, last wait error: {wait_failure:?})"
+            );
+            // The manager retains raw OS errors in launch_failed records. Use
+            // ERROR_TIMEOUT so the caller can distinguish unsettled ownership
+            // from the original assignment or resume error.
+            return Err(io::Error::from_raw_os_error(ERROR_TIMEOUT as i32));
         }
         Ok(Self {
             child,
