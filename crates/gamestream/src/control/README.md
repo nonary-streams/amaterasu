@@ -73,10 +73,18 @@ Translation requires an authoritative `AbsoluteViewport` expressed as an
 inclusive rectangle in Windows virtual-desktop normalized coordinates. Given that
 trusted rectangle, client coordinates and reference dimensions are checked and
 scaled with integer rounding. Without it, absolute input is explicitly
-unsupported; the current stream-session integration does not supply one.
+unsupported. Stream-session supplies a viewport only when video reports valid
+capture geometry and the acquired input backend supports absolute pointers.
 
-Touch, pen, controller arrival/motion/touch/battery, host rumble/LED/HDR feedback,
-legacy startup/input, loss-stat messages, and old termination variants are not
+Authenticated `SS_TOUCH` and `SS_PEN` records are decoded with exact sizes and
+preserve touch pointer IDs, the fixed pen identity, contact fields, and pen
+metadata. Hover remains unsupported. Stream-session forwards these records only
+with an active input lease, native pen/touch capability and policy, and valid
+`touch_port` metadata from video. Current production video providers do not emit
+that metadata, so live pen/touch input remains disabled until they do.
+
+Controller arrival/motion/touch/battery, host rumble/LED/HDR feedback, legacy
+startup/input, loss-stat messages, and old termination variants are not
 implemented. Unsupported input records remain bounded by the enclosing control
 payload limit. Text is at most 32 bytes; the primary client normally sends one
 complete Unicode code point per packet. NUL and malformed UTF-8 are rejected.

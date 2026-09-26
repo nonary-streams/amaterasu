@@ -84,8 +84,11 @@ all owned resources. This bounds detection to the capture cadence and scheduler
 latency, but does not make display hotplug and input dispatch atomic. Per-monitor
 DPI behavior still requires hardware qualification.
 
-Text, controllers, haptics, ambiguous key encodings, and unmapped keys are
-reported honestly without effects. The pending queue holds at most 128 translated
+Controller state uses the acquired backend capability. Touch and pen require its
+native policy and capability plus validated `touch_port` metadata from video;
+without that metadata, packets are counted as unsupported and streaming continues.
+Text, haptics, ambiguous key encodings, and unmapped keys are reported honestly
+without effects. The pending queue holds at most 128 input
 events and sends at most 64 per input request. Overflow, lease expiry, provider
 rejection, or any ambiguous batch result fails the session and releases held
 input; a batch is never replayed under another operation ID.
