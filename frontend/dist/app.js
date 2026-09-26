@@ -2207,16 +2207,52 @@ var Amaterasu;
         if (status.ok !== true || typeof status.ready !== "boolean" ||
             (revision !== null && (!Number.isSafeInteger(revision) || revision < 1)))
             throw new Error("Diagnostics logging status is invalid.");
+        if (Object.hasOwn(status, "logging_sink")) {
+            const sink = status.logging_sink;
+            if (!sink || typeof sink !== "object" || Array.isArray(sink))
+                throw new Error("Diagnostics logging sink status is invalid.");
+            const { state, failure } = sink;
+            if ((state !== "disabled" && state !== "healthy" && state !== "failed") ||
+                (state === "failed" ? failure !== "open" && failure !== "write" : failure !== null))
+                throw new Error("Diagnostics logging sink status is invalid.");
+        }
         return status;
     }
     Amaterasu.parseDiagnosticsLoggingStatus = parseDiagnosticsLoggingStatus;
+    async function readHostLoggingState(api) {
+        const settings = parseHostConfigurationReply(await api.post("host-configuration/get"));
+        return { settings, diagnostics: await readDiagnosticsLoggingStatus(api) };
+    }
+    Amaterasu.readHostLoggingState = readHostLoggingState;
+    async function readDiagnosticsLoggingStatus(api) {
+        try {
+            return parseDiagnosticsLoggingStatus(await api.post("diagnostics/status"));
+        }
+        catch {
+            return null;
+        }
+    }
+    async function saveHostLoggingState(api, current, level, path) {
+        const settings = await saveHostLoggingSettings(api, current, level, path);
+        return { settings, diagnostics: await readDiagnosticsLoggingStatus(api) };
+    }
+    Amaterasu.saveHostLoggingState = saveHostLoggingState;
     function diagnosticsLoggingDescription(savedRevision, status) {
         if (!status)
             return "Saved host logging policy; diagnostics status is unavailable. Refresh to check whether it applied.";
         if (!status.ready)
             return "Saved host logging policy; diagnostics is not ready. Refresh after it starts.";
-        if (status.logging_configuration_revision === savedRevision)
-            return `Diagnostics is using saved host logging revision ${savedRevision}.`;
+        if (status.logging_configuration_revision === savedRevision) {
+            if (!status.logging_sink)
+                return `Diagnostics is using saved host logging revision ${savedRevision}; disk delivery is unverified.`;
+            if (status.logging_sink.state === "disabled")
+                return `Diagnostics is using saved host logging revision ${savedRevision}; disk logging is disabled.`;
+            if (status.logging_sink.state === "failed")
+                return status.logging_sink.failure === "open"
+                    ? `Diagnostics is using saved host logging revision ${savedRevision}, but opening the disk log failed. Disk delivery is not working.`
+                    : `Diagnostics is using saved host logging revision ${savedRevision}, but writing the disk log failed. Disk delivery is not working.`;
+            return `Diagnostics is using saved host logging revision ${savedRevision}; disk logging is healthy.`;
+        }
         if (status.logging_configuration_revision === null || status.logging_configuration_revision < savedRevision)
             return `Saved host logging revision ${savedRevision} is pending in diagnostics. Refresh to check again.`;
         return `Diagnostics is using a newer host logging revision ${status.logging_configuration_revision}. Refresh the saved policy.`;
@@ -2843,10 +2879,7 @@ var Amaterasu;
         async function loadHostLogging() {
             hostLoggingArea.replaceChildren(Amaterasu.el("p", "muted", "Loading host logging policy…"));
             try {
-                const settings = parseHostConfigurationReply(await context.api.post("host-configuration/get"));
-                const diagnosticsStatus = await context.api.post("diagnostics/status")
-                    .then(parseDiagnosticsLoggingStatus, () => null)
-                    .catch(() => null);
+                const { settings, diagnostics: diagnosticsStatus } = await readHostLoggingState(context.api);
                 if (!context.content.isConnected)
                     return;
                 const form = Amaterasu.el("form", "settings-form");
@@ -2880,7 +2913,8 @@ var Amaterasu;
                         return;
                     void Amaterasu.runAction(save, status, async () => {
                         try {
-                            await saveHostLoggingSettings(context.api, settings, level.value, path.value);
+                            const saved = await saveHostLoggingState(context.api, settings, level.value, path.value);
+                            context.notify(diagnosticsLoggingDescription(saved.settings.revision, saved.diagnostics));
                         }
                         catch (error) {
                             if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
@@ -2891,7 +2925,6 @@ var Amaterasu;
                             throw error;
                         }
                         await loadHostLogging();
-                        context.notify("Host logging policy saved and confirmed. Check diagnostics status for application.");
                     });
                 });
                 hostLoggingArea.replaceChildren(Amaterasu.panel("Host logging", form));
