@@ -78,20 +78,22 @@ impl Backend for WindowsBackend {
         let worker_output = output_id.clone();
         let worker_target = target_id.clone();
         let capture_cursor = self.capture_cursor;
-        let (worker, device_adapter) = Worker::start_with_metadata(move || {
+        let (worker, (device_adapter, closed)) = Worker::start_with_metadata(move || {
             let monitor = match worker_target {
                 Some(target) => resolve_monitor(&worker_output, Some(&target))?.1,
                 None => find_monitor(&worker_output)?,
             };
             let session = Session::open(monitor, capture_cursor)?;
             let device_adapter = session.readback.device_adapter();
-            Ok((session, device_adapter))
+            let closed = session.closed.clone();
+            Ok((session, (device_adapter, closed)))
         })?;
         Ok(Box::new(WindowsSession {
             worker,
             output_id,
             target_id,
             device_adapter,
+            closed,
         }))
     }
 }
@@ -101,11 +103,12 @@ struct WindowsSession {
     output_id: String,
     target_id: Option<String>,
     device_adapter: Value,
+    closed: Arc<AtomicBool>,
 }
 
 impl CaptureSession for WindowsSession {
     fn read(&mut self, wait_ms: u32) -> CaptureResult<Option<Frame>> {
-        self.worker.read(wait_ms)
+        while_item_open(&self.closed, || self.worker.read(wait_ms))
     }
 
     fn geometry(&mut self) -> CaptureResult<Option<CaptureGeometry>> {
@@ -430,6 +433,33 @@ impl Drop for Apartment {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use std::sync::{atomic::AtomicUsize, mpsc};
+
+    struct DelayedFrame {
+        release: mpsc::Receiver<()>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl FrameSource for DelayedFrame {
+        fn poll(&mut self) -> CaptureResult<Option<Frame>> {
+            self.release.recv().unwrap();
+            Ok(Some(Frame {
+                width: 1,
+                height: 1,
+                stride: 4,
+                timestamp_us: 40_000,
+                capture_pacing_timestamp_us: 10_000,
+                sequence: 1,
+                bytes: Arc::new(vec![1, 2, 3, 4]),
+            }))
+        }
+    }
+
+    impl Drop for DelayedFrame {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn closed_item_discards_a_frame_completed_during_readback() {
@@ -450,5 +480,35 @@ mod lifecycle_tests {
         });
 
         assert!(matches!(result, Err(error) if error.code == "access_lost"));
+    }
+
+    #[test]
+    fn monitor_close_discards_delayed_readback_and_joins_worker() {
+        let (release, gate) = mpsc::channel();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let worker_dropped = dropped.clone();
+        let worker = Worker::start(move || {
+            Ok(DelayedFrame {
+                release: gate,
+                dropped: worker_dropped,
+            })
+        })
+        .unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut session = WindowsSession {
+            worker,
+            output_id: "test-output".into(),
+            target_id: None,
+            device_adapter: Value::Null,
+            closed: closed.clone(),
+        };
+
+        assert!(session.read(0).unwrap().is_none());
+        closed.store(true, Ordering::Release);
+        release.send(()).unwrap();
+        assert_eq!(session.read(1_000).unwrap_err().code, "access_lost");
+        assert_eq!(session.read(0).unwrap_err().code, "access_lost");
+        drop(session);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 }
