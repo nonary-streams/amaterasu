@@ -1132,6 +1132,38 @@ test("Moonlight host editor ignores delayed loads and errors after a newer refre
   assert.equal((await reloaded).settings.revision, 10);
 });
 
+test("Moonlight host editor reloads a durable update when the listener is not active", async () => {
+  const gate = new context.Amaterasu.NvhttpSettingsLoadGate();
+  let stored = nvhttpHostSettings();
+  let visible = (await gate.read({ post: async () => stored })).settings;
+  const routes = [];
+  const api = { async post(route) {
+    routes.push(route);
+    if (route === "nvhttp/settings_update") {
+      stored = { ...nvhttpUpdatedHost(), active_http_port: null, active_rtsp_port: null,
+        listener_error: "listener disabled" };
+      return { ok: false, code: "listener_not_active", persisted: true };
+    }
+    assert.equal(route, "nvhttp/settings");
+    return stored;
+  } };
+  const notices = [];
+  await assert.rejects(context.Amaterasu.saveNvhttpHostSettings(api, visible, nvhttpHostUpdate()));
+  const handled = await context.Amaterasu.recoverNvhttpSaveFailure(
+    "listener_not_active",
+    async () => { visible = (await gate.read(api)).settings; },
+    (message) => notices.push(message),
+  );
+  assert.equal(handled, true);
+  assert.deepEqual(routes, ["nvhttp/settings_update", "nvhttp/settings"]);
+  assert.equal(visible.revision, 9);
+  assert.equal(visible.active_http_port, null);
+  assert.match(notices[0], /were stored, but listener application is not confirmed/);
+  assert.equal(await context.Amaterasu.recoverNvhttpSaveFailure("invalid_request", async () => {
+    throw new Error("unexpected reload");
+  }, () => {}), false);
+});
+
 test("capture output selection preserves exact IDs and automatic reset", () => {
   const parse = context.Amaterasu.parseOutputNameSelection;
   assert.equal(parse(""), "");

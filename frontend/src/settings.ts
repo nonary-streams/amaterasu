@@ -411,6 +411,21 @@ namespace Amaterasu {
     }
   }
 
+  export async function recoverNvhttpSaveFailure(
+    code: string,
+    reload: () => Promise<void>,
+    notify: (message: string) => void,
+  ): Promise<boolean> {
+    if (code !== "revision_conflict" &&
+        !["listener_apply_pending", "listener_apply_failed", "listener_not_active"].includes(code))
+      return false;
+    await reload();
+    notify(code === "revision_conflict"
+      ? "Host settings changed elsewhere. Review the latest values before saving."
+      : "Host settings were stored, but listener application is not confirmed. Review the active ports and listener error.");
+    return true;
+  }
+
   const hostLogLevels: HostLogLevel[] = [
     "product_default", "verbose", "debug", "info", "warning", "error", "fatal", "none",
   ];
@@ -2801,11 +2816,11 @@ namespace Amaterasu {
               context.notify("Host settings saved and read back. Future-stream options apply to new streams; check active listener status below.");
               await loadHost();
             } catch (error) {
-              if (error instanceof ApiError && ["revision_conflict", "listener_apply_pending", "listener_apply_failed"].includes(error.code)) {
-                await loadHost();
-                context.notify(error.code === "revision_conflict"
-                  ? "Host settings changed elsewhere. Review the latest values before saving."
-                  : "Host settings may have been stored, but listener application is not confirmed. Review the active ports and listener error.");
+              if (error instanceof ApiError && await recoverNvhttpSaveFailure(
+                error.code,
+                loadHost,
+                (message) => context.notify(message),
+              )) {
                 return;
               }
               throw error;

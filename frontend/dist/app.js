@@ -2432,6 +2432,17 @@ var Amaterasu;
         }
     }
     Amaterasu.NvhttpSettingsLoadGate = NvhttpSettingsLoadGate;
+    async function recoverNvhttpSaveFailure(code, reload, notify) {
+        if (code !== "revision_conflict" &&
+            !["listener_apply_pending", "listener_apply_failed", "listener_not_active"].includes(code))
+            return false;
+        await reload();
+        notify(code === "revision_conflict"
+            ? "Host settings changed elsewhere. Review the latest values before saving."
+            : "Host settings were stored, but listener application is not confirmed. Review the active ports and listener error.");
+        return true;
+    }
+    Amaterasu.recoverNvhttpSaveFailure = recoverNvhttpSaveFailure;
     const hostLogLevels = [
         "product_default", "verbose", "debug", "info", "warning", "error", "fatal", "none",
     ];
@@ -4118,11 +4129,7 @@ var Amaterasu;
                             await loadHost();
                         }
                         catch (error) {
-                            if (error instanceof Amaterasu.ApiError && ["revision_conflict", "listener_apply_pending", "listener_apply_failed"].includes(error.code)) {
-                                await loadHost();
-                                context.notify(error.code === "revision_conflict"
-                                    ? "Host settings changed elsewhere. Review the latest values before saving."
-                                    : "Host settings may have been stored, but listener application is not confirmed. Review the active ports and listener error.");
+                            if (error instanceof Amaterasu.ApiError && await recoverNvhttpSaveFailure(error.code, loadHost, (message) => context.notify(message))) {
                                 return;
                             }
                             throw error;
