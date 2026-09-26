@@ -426,6 +426,13 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
         {
             Self::release_slot(&mut self.devices[slot])?;
         }
+        // Existing live slots may still be updated while cleanup retries, but
+        // failed removal must not allocate another native target.
+        if self.devices[slot].is_none()
+            && let Some(error) = first_error
+        {
+            return Err(error);
+        }
         if self.devices[slot].is_none() {
             self.devices[slot] = Some(GamepadSlot::new(create(number as u8)?));
         }
@@ -892,6 +899,83 @@ mod tests {
         fail_release.set(false);
         slots.stop().unwrap();
         assert!(slots.is_empty());
+    }
+
+    #[test]
+    fn failed_removal_blocks_new_target_until_detach_then_releases_new_target() {
+        struct NativeTarget {
+            number: u8,
+            fail_first_release: Rc<std::cell::Cell<bool>>,
+            history: Rc<RefCell<Vec<(u8, ControllerSnapshot)>>>,
+            destroyed: Rc<RefCell<Vec<u8>>>,
+        }
+
+        impl GamepadDevice for NativeTarget {
+            fn update(&mut self, state: ControllerSnapshot) -> InputResult<()> {
+                self.history.borrow_mut().push((self.number, state));
+                if state == ControllerSnapshot::default()
+                    && self.number == 0
+                    && self.fail_first_release.replace(false)
+                {
+                    return Err(InputError::new(
+                        "detach_failed",
+                        "old target still attached",
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        impl Drop for NativeTarget {
+            fn drop(&mut self) {
+                self.destroyed.borrow_mut().push(self.number);
+            }
+        }
+
+        let fail_first_release = Rc::new(std::cell::Cell::new(true));
+        let history = Rc::new(RefCell::new(Vec::new()));
+        let destroyed = Rc::new(RefCell::new(Vec::new()));
+        let allocated = Rc::new(RefCell::new(Vec::new()));
+        let mut slots = GamepadSlots::new();
+        let pressed = ControllerSnapshot {
+            buttons: 1,
+            ..ControllerSnapshot::default()
+        };
+        let now = Instant::now();
+        let mut create = |number| {
+            allocated.borrow_mut().push(number);
+            Ok(NativeTarget {
+                number,
+                fail_first_release: fail_first_release.clone(),
+                history: history.clone(),
+                destroyed: destroyed.clone(),
+            })
+        };
+
+        slots.apply(0, 1, pressed, -1, now, &mut create).unwrap();
+        assert_eq!(
+            slots
+                .apply(1, 1 << 1, pressed, -1, now, &mut create)
+                .unwrap_err()
+                .code,
+            "detach_failed"
+        );
+        assert_eq!(*allocated.borrow(), [0], "new target must wait for detach");
+        assert!(destroyed.borrow().is_empty());
+
+        slots
+            .apply(1, 1 << 1, pressed, -1, now, &mut create)
+            .unwrap();
+        assert_eq!(*allocated.borrow(), [0, 1]);
+        assert_eq!(*destroyed.borrow(), [0]);
+        assert_eq!(history.borrow().last(), Some(&(1, pressed)));
+
+        slots.stop().unwrap();
+        assert_eq!(*destroyed.borrow(), [0, 1]);
+        assert_eq!(
+            history.borrow().last(),
+            Some(&(1, ControllerSnapshot::default()))
+        );
     }
 
     #[test]
