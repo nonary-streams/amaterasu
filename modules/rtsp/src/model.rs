@@ -433,6 +433,9 @@ pub struct VideoEncryptionPolicySnapshot {
 #[serde(deny_unknown_fields)]
 pub struct Open {
     pub operation_id: String,
+    /// NVHTTP's nonce-bound RTSP operation, reused as the History session ID.
+    #[serde(default)]
+    pub history_activity_id: Option<String>,
     pub peer_ip: IpAddr,
     #[serde(default)]
     pub frame_limiter_settings: Option<serde_json::Value>,
@@ -766,6 +769,10 @@ impl Open {
         }
         if let Some(request) = &self.display_request {
             payload["display_request"] = request.clone();
+        }
+        if let Some(activity_id) = &self.history_activity_id {
+            payload["history_activity_id"] = serde_json::json!(activity_id);
+            payload["rtsp_operation_id"] = serde_json::json!(self.operation_id);
         }
         payload
     }

@@ -108,6 +108,16 @@ impl Controller {
             rpc::complete(runtime, request, error(code));
             return;
         }
+        if config
+            .history_activity_id
+            .as_deref()
+            .is_some_and(|activity_id| {
+                caller != "amaterasu.nvhttp" || activity_id != config.operation_id
+            })
+        {
+            rpc::complete(runtime, request, error("history_activity_denied"));
+            return;
+        }
         if display_preflight_deadline
             .is_some_and(|expiry| expiry.saturating_sub(now) <= PREPARE_BUDGET_MS)
         {

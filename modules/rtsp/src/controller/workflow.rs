@@ -132,6 +132,15 @@ impl Controller {
             {
                 return Err("frame_limiter_snapshot_unverified");
             }
+            match record.config.history_activity_id.as_deref() {
+                Some(activity_id)
+                    if payload["history_activity_id"].as_str() == Some(activity_id)
+                        && payload["rtsp_operation_id"].as_str()
+                            == Some(record.config.operation_id.as_str()) => {}
+                None if payload["history_activity_id"].is_null()
+                    && payload["rtsp_operation_id"].is_null() => {}
+                _ => return Err("history_activity_unverified"),
+            }
             if record.display_prepare_timeout_ms.is_some_and(|expected| {
                 payload["display_prepare_timeout_ms"].as_u64() != Some(u64::from(expected))
             }) {

@@ -18,12 +18,14 @@ struct Endpoint {
     commands: Vec<Command>,
     completion_attempts: Vec<(u64, Value)>,
     downstream_actions: BTreeMap<u64, String>,
+    downstream_payloads: BTreeMap<u64, Value>,
     next_downstream: u64,
     rejected_completions: BTreeSet<u64>,
     lose_prepare_result_once: bool,
     prepare_result_lost: bool,
     cleanup_fails: bool,
     reject_prepare: bool,
+    wrong_history_reply: bool,
 }
 
 impl Endpoint {
@@ -78,6 +80,7 @@ impl Endpoint {
                         .expect("downstream action")
                         .into(),
                 );
+                self.downstream_payloads.insert(request, payload.clone());
                 Response::Accepted { id: request }
             }
             Command::TakeResult { request } => {
@@ -87,7 +90,7 @@ impl Endpoint {
                     .map(String::as_str)
                     .expect("known downstream request");
                 Response::Result {
-                    payload: self.downstream_result(action),
+                    payload: self.downstream_result(*request, action),
                 }
             }
             Command::Cancel { .. } | Command::ReleaseResult { .. } => Response::Ok,
@@ -95,19 +98,24 @@ impl Endpoint {
         }
     }
 
-    fn downstream_result(&self, action: &str) -> Value {
+    fn downstream_result(&self, request: u64, action: &str) -> Value {
         match action {
             "prepare" if self.reject_prepare => json!({
                 "ok": false, "session": SESSION, "state": "failed", "code": "invalid_audio_configuration"
             }),
-            "prepare" => json!({
-                "ok": true,
-                "session": SESSION,
-                "state": "prepared",
-                "audio_local": "127.0.0.1:51000",
-                "video_local": "127.0.0.1:51002",
-                "control_local": "127.0.0.1:51004"
-            }),
+            "prepare" => {
+                let sent = &self.downstream_payloads[&request];
+                json!({
+                    "ok": true,
+                    "session": SESSION,
+                    "state": "prepared",
+                    "audio_local": "127.0.0.1:51000",
+                    "video_local": "127.0.0.1:51002",
+                    "control_local": "127.0.0.1:51004",
+                    "history_activity_id":if self.wrong_history_reply { json!("foreign-operation") } else { sent["history_activity_id"].clone() },
+                    "rtsp_operation_id":sent["rtsp_operation_id"]
+                })
+            }
             "lookup" => json!({"ok": true, "session": SESSION, "state": "prepared"}),
             "start_when_authenticated" => json!({"ok": true, "session": SESSION,
                 "state": "armed", "cleanup_error": null}),
@@ -602,6 +610,103 @@ fn successful_prepare_and_exact_retry_share_one_owned_allocation() {
     assert_eq!(endpoint.downstream_requests().len(), 1);
     assert_eq!(endpoint.downstream_requests()[0].0, "prepare");
     assert_eq!(endpoint.downstream_requests()[0].2, Some(1));
+}
+
+#[test]
+fn history_activity_attaches_to_the_exact_signed_rtsp_operation() {
+    let mut endpoint = Endpoint::default();
+    let mut tagged = open("nvhttp-activity-one");
+    tagged["history_activity_id"] = json!("nvhttp-activity-one");
+    endpoint.enqueue(1, "amaterasu.nvhttp", tagged.clone());
+    endpoint.enqueue(2, "amaterasu.nvhttp", tagged.clone());
+    let mut changed = tagged.clone();
+    changed["history_activity_id"] = json!("foreign-operation");
+    endpoint.enqueue(3, "amaterasu.nvhttp", changed);
+    endpoint.enqueue(4, "owner", tagged);
+    endpoint.enqueue(5, "amaterasu.nvhttp", open("nvhttp-activity-one"));
+    let runtime = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["amaterasu.nvhttp", "owner"])).unwrap();
+
+    for now in 0..10 {
+        tick(&mut controller, &runtime, now);
+    }
+
+    assert_eq!(endpoint.completed(1)["state"], "ready");
+    assert_eq!(endpoint.completed(1), endpoint.completed(2));
+    assert_eq!(
+        endpoint.completed(1)["history_activity_id"],
+        "nvhttp-activity-one"
+    );
+    assert_eq!(endpoint.completed(3)["code"], "history_activity_denied");
+    assert_eq!(endpoint.completed(4)["code"], "history_activity_denied");
+    assert_eq!(endpoint.completed(5)["code"], "operation_conflict");
+    let prepares: Vec<_> = endpoint
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request { payload, .. } if payload["action"] == "prepare" => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(prepares.len(), 1);
+    assert_eq!(prepares[0]["history_activity_id"], "nvhttp-activity-one");
+    assert_eq!(prepares[0]["rtsp_operation_id"], "nvhttp-activity-one");
+    assert_eq!(controller.records.len(), 1);
+    let ticket = endpoint.completed(1)["ticket"].clone();
+    endpoint.enqueue(
+        6,
+        "amaterasu.nvhttp",
+        json!({"action":"status","ticket":ticket}),
+    );
+    tick(&mut controller, &runtime, 10);
+    assert_eq!(
+        endpoint.completed(6)["history_activity_id"],
+        "nvhttp-activity-one"
+    );
+}
+
+#[test]
+fn history_prepare_mismatch_cleans_up_and_legacy_open_omits_identity() {
+    let mut endpoint = Endpoint {
+        wrong_history_reply: true,
+        ..Endpoint::default()
+    };
+    let mut tagged = open("nvhttp-activity-two");
+    tagged["history_activity_id"] = json!("nvhttp-activity-two");
+    endpoint.enqueue(1, "amaterasu.nvhttp", tagged);
+    let runtime_client = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["amaterasu.nvhttp"])).unwrap();
+    for now in 0..6 {
+        tick(&mut controller, &runtime_client, now);
+    }
+    assert_eq!(
+        endpoint.completed(1)["failure"],
+        "history_activity_unverified"
+    );
+    assert!(
+        endpoint
+            .downstream_requests()
+            .iter()
+            .any(|(action, _, _)| *action == "stop")
+    );
+
+    let mut endpoint = Endpoint::default();
+    endpoint.enqueue(1, "owner", open("legacy-operation"));
+    let runtime = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+    finish_prepare(&mut controller, &runtime);
+    assert_eq!(endpoint.completed(1)["state"], "ready");
+    assert!(endpoint.completed(1)["history_activity_id"].is_null());
+    let prepare = endpoint
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request { payload, .. } if payload["action"] == "prepare" => Some(payload),
+            _ => None,
+        })
+        .unwrap();
+    assert!(prepare.get("history_activity_id").is_none());
+    assert!(prepare.get("rtsp_operation_id").is_none());
 }
 
 #[test]

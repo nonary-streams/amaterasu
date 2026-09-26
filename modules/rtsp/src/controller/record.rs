@@ -82,6 +82,7 @@ impl Record {
             "rtsp_url":self.url,"session":self.session,"stream_state":self.stream_state,
             "frame_limiter_settings":self.config.frame_limiter_settings,
             "frame_limiter_executable_path":self.config.frame_limiter_executable_path,
+            "history_activity_id":self.config.history_activity_id,
             "display_request":self.config.display_request,
             "display_applied":self.display_applied,
             "display_policy_snapshot":self.config.display_policy_snapshot,
