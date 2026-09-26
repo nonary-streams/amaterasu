@@ -26,6 +26,8 @@ pub struct Game {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_played: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub playtime_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub artwork_revision: Option<String>,
     #[serde(skip)]
     pub artwork_source_path: Option<String>,
@@ -47,6 +49,7 @@ pub struct Scan {
     pub finished: bool,
     pub appinfo_complete: bool,
     pub history_complete: bool,
+    pub owned_history_complete: bool,
     metadata: Option<MetadataScanner>,
     artwork_roots: Vec<PathBuf>,
 }
@@ -140,6 +143,7 @@ impl Scan {
                 let availability = metadata.availability();
                 self.appinfo_complete = availability.appinfo_complete;
                 self.history_complete = availability.history_complete;
+                self.owned_history_complete = availability.owned_history_complete;
                 self.finished = true;
             }
         } else {
@@ -570,6 +574,7 @@ fn read_game(
             Err(_) => None,
         },
         last_played: None,
+        playtime_minutes: None,
         artwork_revision,
         artwork_source_path: artwork.source_path,
         artwork_is_remote,

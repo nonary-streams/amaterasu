@@ -787,6 +787,7 @@ fn source_fingerprint(provider: &Provider) -> SourceFingerprint {
         fingerprint.write_bool(game.installed);
         fingerprint.write_u64(game.last_updated);
         fingerprint.write_optional_string(game.app_type.as_deref());
+        fingerprint.write_u64(game.playtime_minutes.unwrap_or_default());
         write_optional_u64(&mut fingerprint, game.last_played);
         fingerprint.write_optional_string(game.artwork_revision.as_deref());
         fingerprint.write_optional_string(game.artwork_source_path.as_deref());
@@ -1080,6 +1081,7 @@ mod tests {
             last_updated: 0,
             app_type: Some("game".into()),
             last_played: Some(2_000_000_000),
+            playtime_minutes: None,
             artwork_revision: None,
             artwork_source_path: None,
             artwork_is_remote: false,
@@ -1107,6 +1109,7 @@ mod tests {
             snapshot_complete: true,
             appinfo_complete: true,
             history_complete: true,
+            owned_history_complete: true,
             ..Provider::default()
         }
     }
@@ -1168,6 +1171,15 @@ mod tests {
             json!(["-applaunch", "10"])
         );
         assert_eq!(records[0]["entry"]["tags"], json!(["steam"]));
+        let recent = ProductSettings {
+            sync_all_installed: false,
+            recent_games: 10,
+            recent_max_age_days: 30,
+            ..settings
+        };
+        let recent_records = catalog_records(&games, &recent, &executable, 2_000_000_000).unwrap();
+        assert_eq!(recent_records.len(), 1);
+        assert_eq!(recent_records[0]["source_id"], "steam:10");
     }
 
     #[test]
@@ -1637,6 +1649,57 @@ mod tests {
                 }
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn all_installed_can_import_with_only_manifests_when_tool_filter_is_disabled() {
+        let executable = std::env::current_exe().unwrap();
+        let provider = Provider {
+            steam_executable: Some(executable.clone()),
+            games: [(42, game(42, "New install", true))].into_iter().collect(),
+            snapshot_complete: true,
+            revision: 1,
+            ..Provider::default()
+        };
+        let settings = ProductSettings {
+            include_tools: true,
+            sync_all_installed: true,
+            autosync_remove_uninstalled: true,
+            ..ProductSettings::default()
+        };
+        assert!(!provider.appinfo_complete && !provider.history_complete);
+        assert!(catalog_source_error(&provider, &settings).is_none());
+        let records =
+            catalog_records(&provider.games, &settings, &executable, 2_000_000_000).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0]["entry"]["launch"]["arguments"],
+            json!(["-applaunch", "42"])
+        );
+
+        let filtered = ProductSettings {
+            include_tools: false,
+            ..settings
+        };
+        let with_incomplete_uninstalled_candidate = Provider {
+            appinfo_complete: true,
+            owned_history_complete: false,
+            history_complete: true,
+            ..provider
+        };
+        assert!(should_remove_stale(&filtered));
+        assert!(catalog_source_error(&with_incomplete_uninstalled_candidate, &filtered).is_none());
+        assert_eq!(
+            catalog_records(
+                &with_incomplete_uninstalled_candidate.games,
+                &filtered,
+                &executable,
+                2_000_000_000,
+            )
+            .unwrap()
+            .len(),
+            1
         );
     }
 

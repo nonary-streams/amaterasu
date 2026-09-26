@@ -97,14 +97,28 @@ App types are read from the configured Steam install's binary
 `appcache/appinfo.vdf`; play history is read from every numeric account's
 `userdata/<account>/config/localconfig.vdf`, taking the newest timestamp across
 accounts. These files are parsed locally and need no Steam Web API key. If the
-active selection policy needs app types or recent history and those sources are
-missing, malformed, oversized, or incomplete, the catalog is left unchanged.
-Malformed history for an unrelated or uninstalled app does not make the source
-incomplete; only installed apps in the current snapshot affect selection.
+active selection policy needs app types or recent history and
+those sources are missing, malformed, oversized, or incomplete, the catalog is
+left unchanged. A valid positive `LastPlayed` or `Playtime` also exposes a
+previously played, now uninstalled app when appinfo supplies its name and type.
+This is play-history evidence, not proof of current license ownership. Such an
+app remains `installed=false`, appears once in discovery with its available
+playtime and artwork, and is never imported into the launchable Catalog in
+either all-installed or recent mode. A missing name/type suppresses that
+candidate and marks owned history incomplete without affecting installed-game
+appinfo readiness. Malformed unrelated uninstalled history
+does not suppress installed-game history, but marks ownership history incomplete
+for provider discovery until a later valid scan. All-installed Catalog selection
+continues from complete manifests when `include_tools=true`, even on a new
+installation without localconfig or appinfo. It never selects uninstalled games.
 Configure the Steam installation root (or its `steamapps` directory) as well
 as library roots so those sidecars can be found. Discovery and list remain
-available when metadata is incomplete. Status includes
-`catalog_sources.appinfo` and `catalog_sources.play_history`.
+available when metadata is incomplete. Status `complete` covers manifest
+traversal only; an uninstalled discovery omission is not authoritative when
+`catalog_sources.owned_history` is false. Catalog cleanup follows installed
+manifest membership and the active selection policy. Status includes
+`catalog_sources.appinfo`, `catalog_sources.play_history`, and
+`catalog_sources.owned_history`.
 
 Catalog entries use stable source IDs `steam:<appid>` and launch the resolved
 Steam client with `-applaunch <appid>`. Exclusions affect catalog imports only;

@@ -1,4 +1,5 @@
 //! Bounded readers for Steam's local app-type and play-history sidecars.
+use crate::artwork;
 use crate::discovery::Game;
 use crate::keyvalues::{self, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -23,24 +24,32 @@ const MAX_LOCALCONFIG_TASKS: usize = 256;
 pub struct Availability {
     pub appinfo_complete: bool,
     pub history_complete: bool,
+    pub owned_history_complete: bool,
 }
 
 enum Task {
     AppInfo(AppInfoScan),
-    LocalConfig(PathBuf),
+    LocalConfig { path: PathBuf, root: PathBuf },
 }
 
 pub struct Scanner {
     roots: VecDeque<PathBuf>,
     tasks: VecDeque<Task>,
+    appinfo_scans: VecDeque<AppInfoScan>,
     seen_roots: BTreeSet<PathBuf>,
     appinfo_files: usize,
     history_roots: usize,
     localconfig_tasks: usize,
     appinfo_ok: bool,
+    candidate_appinfo_ok: bool,
     history_ok: bool,
+    owned_history_ok: bool,
     appinfo_found: BTreeSet<u32>,
     appinfo_typed: BTreeSet<u32>,
+    appinfo_named: BTreeSet<u32>,
+    artwork_roots: Vec<PathBuf>,
+    pending_artwork: VecDeque<u32>,
+    artwork_queued: bool,
     complete: bool,
     availability: Availability,
 }
@@ -48,7 +57,7 @@ pub struct Scanner {
 impl Scanner {
     pub fn new(roots: &[PathBuf]) -> Self {
         let roots_truncated = roots.len() > MAX_METADATA_ROOTS;
-        let roots = roots
+        let roots: VecDeque<PathBuf> = roots
             .iter()
             .take(MAX_METADATA_ROOTS)
             .map(|root| {
@@ -62,17 +71,25 @@ impl Scanner {
                 }
             })
             .collect();
+        let artwork_roots = roots.iter().cloned().collect();
         Self {
             roots,
             tasks: VecDeque::new(),
+            appinfo_scans: VecDeque::new(),
             seen_roots: BTreeSet::new(),
             appinfo_files: 0,
             history_roots: 0,
             localconfig_tasks: 0,
             appinfo_ok: !roots_truncated,
+            candidate_appinfo_ok: !roots_truncated,
             history_ok: !roots_truncated,
+            owned_history_ok: !roots_truncated,
             appinfo_found: BTreeSet::new(),
             appinfo_typed: BTreeSet::new(),
+            appinfo_named: BTreeSet::new(),
+            artwork_roots,
+            pending_artwork: VecDeque::new(),
+            artwork_queued: false,
             complete: false,
             availability: Availability::default(),
         }
@@ -92,23 +109,48 @@ impl Scanner {
                 Ok(true) => {
                     self.appinfo_found.extend(scan.found_records);
                     self.appinfo_typed.extend(scan.found_types);
+                    self.appinfo_named.extend(scan.found_names);
+                    self.candidate_appinfo_ok &= scan.candidate_ok;
                 }
                 Ok(false) => self.tasks.push_front(Task::AppInfo(scan)),
                 Err(_) => self.appinfo_ok = false,
             }
             return false;
         }
-        if let Some(Task::LocalConfig(path)) = self.tasks.pop_front() {
+        if let Some(Task::LocalConfig { path, root }) = self.tasks.pop_front() {
             match read_localconfig(&path, games) {
-                Ok(last_played) => {
-                    for (app_id, timestamp) in last_played {
+                Ok(history) => {
+                    self.owned_history_ok &= history.candidates_complete;
+                    for (app_id, state) in history.apps {
                         if let Some(game) = games.get_mut(&app_id) {
                             game.last_played =
-                                Some(game.last_played.unwrap_or_default().max(timestamp));
+                                Some(game.last_played.unwrap_or_default().max(state.last_played));
+                            game.playtime_minutes = Some(
+                                game.playtime_minutes
+                                    .unwrap_or_default()
+                                    .max(state.playtime),
+                            );
+                        } else if state.last_played > 0 || state.playtime > 0 {
+                            if games.len() >= 20_000 {
+                                self.history_ok = false;
+                                self.owned_history_ok = false;
+                                continue;
+                            }
+                            let candidate = uninstalled_history_game(app_id, &root, state);
+                            if serde_json::to_vec(&candidate)
+                                .map_or(true, |bytes| bytes.len() > 8192)
+                            {
+                                self.owned_history_ok = false;
+                                continue;
+                            }
+                            games.insert(app_id, candidate);
                         }
                     }
                 }
-                Err(_) => self.history_ok = false,
+                Err(_) => {
+                    self.history_ok = false;
+                    self.owned_history_ok = false;
+                }
             }
             return false;
         }
@@ -116,19 +158,58 @@ impl Scanner {
             self.process_root(root);
             return false;
         }
+        if let Some(scan) = self.appinfo_scans.pop_front() {
+            self.tasks.push_front(Task::AppInfo(scan));
+            return false;
+        }
 
-        let required_apps = games
+        if !self.artwork_queued {
+            self.pending_artwork = games
+                .values()
+                .filter(|game| !game.installed && !game.name.is_empty())
+                .map(|game| game.app_id)
+                .collect();
+            self.artwork_queued = true;
+        }
+        if let Some(app_id) = self.pending_artwork.pop_front() {
+            if let Some(game) = games.get_mut(&app_id) {
+                let library = Path::new(&game.library_directory);
+                let art = artwork::discover(app_id, library, &self.artwork_roots);
+                game.artwork_is_remote = art.revision.is_none();
+                game.artwork_revision =
+                    art.revision.or_else(|| artwork::remote_revision(app_id, 0));
+                game.artwork_source_path = art.source_path;
+                game.artwork_candidate_signature = art.candidate_signature;
+            }
+            return false;
+        }
+
+        let installed_apps = games
             .values()
             .filter(|game| game.installed)
+            .map(|game| game.app_id)
+            .collect::<BTreeSet<_>>();
+        let uninstalled_apps = games
+            .values()
+            .filter(|game| !game.installed)
             .map(|game| game.app_id)
             .collect::<BTreeSet<_>>();
         self.availability = Availability {
             appinfo_complete: self.appinfo_files > 0
                 && self.appinfo_ok
-                && required_apps.is_subset(&self.appinfo_found)
-                && required_apps.is_subset(&self.appinfo_typed),
+                && installed_apps.is_subset(&self.appinfo_found)
+                && installed_apps.is_subset(&self.appinfo_typed),
             history_complete: self.history_roots > 0 && self.history_ok,
+            owned_history_complete: self.history_roots > 0
+                && self.history_ok
+                && self.owned_history_ok
+                && self.appinfo_ok
+                && self.candidate_appinfo_ok
+                && uninstalled_apps.is_subset(&self.appinfo_found)
+                && uninstalled_apps.is_subset(&self.appinfo_typed)
+                && uninstalled_apps.is_subset(&self.appinfo_named),
         };
+        games.retain(|_, game| game.installed || !game.name.is_empty());
         self.complete = true;
         true
     }
@@ -159,31 +240,45 @@ impl Scanner {
             return;
         }
 
-        if let Some(metadata) = appinfo_metadata {
+        let appinfo = if let Some(metadata) = appinfo_metadata {
             self.appinfo_files += 1;
             match regular_metadata(&appinfo_path, metadata) {
                 Ok(()) => match AppInfoScan::open(&appinfo_path) {
-                    Ok(scan) => self.tasks.push_back(Task::AppInfo(scan)),
-                    Err(_) => self.appinfo_ok = false,
+                    Ok(scan) => Some(scan),
+                    Err(_) => {
+                        self.appinfo_ok = false;
+                        None
+                    }
                 },
-                Err(_) => self.appinfo_ok = false,
+                Err(_) => {
+                    self.appinfo_ok = false;
+                    None
+                }
             }
         } else {
             self.appinfo_ok = false;
-        }
+            None
+        };
 
         match userdata_metadata {
             Some(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
                 self.history_roots += 1;
-                self.enqueue_user_configs(&userdata_path);
+                self.enqueue_user_configs(&userdata_path, &root);
             }
-            _ => self.history_ok = false,
+            _ => {
+                self.history_ok = false;
+                self.owned_history_ok = false;
+            }
+        }
+        if let Some(appinfo) = appinfo {
+            self.appinfo_scans.push_back(appinfo);
         }
     }
 
-    fn enqueue_user_configs(&mut self, userdata: &Path) {
+    fn enqueue_user_configs(&mut self, userdata: &Path, root: &Path) {
         let Ok(entries) = fs::read_dir(userdata) else {
             self.history_ok = false;
+            self.owned_history_ok = false;
             return;
         };
         let mut users = Vec::new();
@@ -191,6 +286,7 @@ impl Scanner {
         for entry in entries {
             let Ok(entry) = entry else {
                 self.history_ok = false;
+                self.owned_history_ok = false;
                 continue;
             };
             let name = entry.file_name();
@@ -201,27 +297,34 @@ impl Scanner {
             accounts_seen += 1;
             if accounts_seen > MAX_USER_ACCOUNTS {
                 self.history_ok = false;
+                self.owned_history_ok = false;
                 break;
             }
             let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
                 self.history_ok = false;
+                self.owned_history_ok = false;
                 continue;
             };
             if metadata.is_dir() && !metadata.file_type().is_symlink() {
                 users.push(entry.path());
             } else {
                 self.history_ok = false;
+                self.owned_history_ok = false;
             }
         }
         users.sort();
         for user in users {
             if self.localconfig_tasks >= MAX_LOCALCONFIG_TASKS {
                 self.history_ok = false;
+                self.owned_history_ok = false;
                 break;
             }
             let path = user.join("config/localconfig.vdf");
             self.localconfig_tasks += 1;
-            self.tasks.push_back(Task::LocalConfig(path));
+            self.tasks.push_back(Task::LocalConfig {
+                path,
+                root: root.to_path_buf(),
+            });
         }
     }
 }
@@ -244,10 +347,38 @@ fn regular_metadata(path: &Path, metadata: Metadata) -> Result<(), String> {
     Ok(())
 }
 
-fn read_localconfig(
-    path: &Path,
-    games: &BTreeMap<u32, Game>,
-) -> Result<BTreeMap<u32, u64>, String> {
+#[derive(Clone, Copy)]
+struct LocalAppState {
+    last_played: u64,
+    playtime: u64,
+}
+
+struct LocalConfigRead {
+    apps: BTreeMap<u32, LocalAppState>,
+    candidates_complete: bool,
+}
+
+fn uninstalled_history_game(app_id: u32, root: &Path, state: LocalAppState) -> Game {
+    Game {
+        stable_id: format!("steam:{app_id}"),
+        app_id,
+        name: String::new(),
+        install_directory: String::new(),
+        library_directory: root.to_string_lossy().into_owned(),
+        state_flags: 0,
+        installed: false,
+        last_updated: 0,
+        app_type: None,
+        last_played: (state.last_played > 0).then_some(state.last_played),
+        playtime_minutes: (state.playtime > 0).then_some(state.playtime),
+        artwork_revision: None,
+        artwork_source_path: None,
+        artwork_is_remote: false,
+        artwork_candidate_signature: String::new(),
+    }
+}
+
+fn read_localconfig(path: &Path, games: &BTreeMap<u32, Game>) -> Result<LocalConfigRead, String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
@@ -275,7 +406,8 @@ fn read_localconfig(
     let Value::Object(apps) = apps else {
         return Err("Steam localconfig apps must be an object".into());
     };
-    let mut last_played = BTreeMap::new();
+    let mut history = BTreeMap::new();
+    let mut candidates_complete = true;
     for (raw_app_id, app) in apps {
         let Ok(app_id) = raw_app_id.parse::<u32>() else {
             continue;
@@ -285,22 +417,50 @@ fn read_localconfig(
         }
         // Other apps can have malformed local history without affecting this
         // scan's installed games. Steam's localconfig is shared by all apps.
-        if !games.get(&app_id).is_some_and(|game| game.installed) {
-            continue;
-        }
+        let installed = games.get(&app_id).is_some_and(|game| game.installed);
         let Value::Object(fields) = app else {
-            return Err("Steam localconfig app data must be an object".into());
+            if installed {
+                return Err("Steam localconfig app data must be an object".into());
+            }
+            candidates_complete = false;
+            continue;
         };
-        let timestamp = match fields.get("lastplayed") {
+        let last_played = match fields.get("lastplayed") {
             Some(Value::Text(value)) => value
                 .parse::<u64>()
-                .map_err(|_| "Steam localconfig has an invalid LastPlayed timestamp")?,
-            Some(_) => return Err("Steam localconfig LastPlayed must be text".into()),
-            None => 0,
+                .map_err(|_| "Steam localconfig has an invalid LastPlayed timestamp"),
+            Some(_) => Err("Steam localconfig LastPlayed must be text"),
+            None => Ok(0),
         };
-        last_played.insert(app_id, timestamp);
+        let playtime = match fields.get("playtime") {
+            Some(Value::Text(value)) => value
+                .parse::<u64>()
+                .map_err(|_| "Steam localconfig has invalid Playtime"),
+            Some(_) => Err("Steam localconfig Playtime must be text"),
+            None => Ok(0),
+        };
+        let (last_played, playtime) = match (last_played, playtime) {
+            (Ok(last_played), Ok(playtime)) => (last_played, playtime),
+            (Err(error), _) | (_, Err(error)) if installed => return Err(error.into()),
+            _ => {
+                candidates_complete = false;
+                continue;
+            }
+        };
+        if installed || last_played > 0 || playtime > 0 {
+            history.insert(
+                app_id,
+                LocalAppState {
+                    last_played,
+                    playtime,
+                },
+            );
+        }
     }
-    Ok(last_played)
+    Ok(LocalConfigRead {
+        apps: history,
+        candidates_complete,
+    })
 }
 
 struct AppInfoScan {
@@ -310,6 +470,8 @@ struct AppInfoScan {
     keys: Vec<String>,
     found_records: BTreeSet<u32>,
     found_types: BTreeSet<u32>,
+    found_names: BTreeSet<u32>,
+    candidate_ok: bool,
     records_seen: usize,
     finished: bool,
 }
@@ -352,6 +514,8 @@ impl AppInfoScan {
             keys,
             found_records: BTreeSet::new(),
             found_types: BTreeSet::new(),
+            found_names: BTreeSet::new(),
+            candidate_ok: true,
             records_seen: 0,
             finished: false,
         })
@@ -399,13 +563,29 @@ impl AppInfoScan {
                 .checked_add(u64::from(entry_size))
                 .filter(|end| *end <= self.string_table_offset)
                 .ok_or("Steam appinfo record exceeds its string table boundary")?;
-            if let Some(game) = games.get_mut(&app_id).filter(|game| game.installed) {
+            if let Some(game) = games.get_mut(&app_id) {
                 if !self.found_records.insert(app_id) {
-                    return Err("Steam appinfo contains a duplicate app ID".into());
+                    if game.installed {
+                        return Err("Steam appinfo contains a duplicate app ID".into());
+                    }
+                    self.candidate_ok = false;
+                    self.file
+                        .seek(SeekFrom::Start(entry_end))
+                        .map_err(|error| error.to_string())?;
+                    self.offset = entry_end;
+                    continue;
                 }
                 let value_bytes = entry_size - 60;
                 if value_bytes > MAX_APPINFO_RECORD_BYTES {
-                    return Err("Steam appinfo record exceeds its byte limit".into());
+                    if game.installed {
+                        return Err("Steam appinfo record exceeds its byte limit".into());
+                    }
+                    self.candidate_ok = false;
+                    self.file
+                        .seek(SeekFrom::Start(entry_end))
+                        .map_err(|error| error.to_string())?;
+                    self.offset = entry_end;
+                    continue;
                 }
                 self.file
                     .seek(SeekFrom::Current(60))
@@ -414,24 +594,20 @@ impl AppInfoScan {
                 self.file
                     .read_exact(&mut data)
                     .map_err(|error| error.to_string())?;
-                let mut cursor = 0;
-                let mut nodes = 0;
-                let root =
-                    parse_binary_object(&data, &mut cursor, data.len(), &self.keys, 0, &mut nodes)?;
-                if cursor != data.len() {
-                    return Err("Steam appinfo record has trailing binary data".into());
+                match appinfo_fields(&data, &self.keys) {
+                    Ok((app_type, name)) => {
+                        game.app_type = Some(app_type);
+                        self.found_types.insert(app_id);
+                        if !game.installed
+                            && let Some(name) = name
+                        {
+                            game.name = name;
+                            self.found_names.insert(app_id);
+                        }
+                    }
+                    Err(error) if game.installed => return Err(error),
+                    Err(_) => self.candidate_ok = false,
                 }
-                let metadata = root.field("appinfo").unwrap_or(&root);
-                let common = metadata.field("common")?;
-                let app_type = common.field("type")?.text()?.trim();
-                if app_type.is_empty()
-                    || app_type.len() > 64
-                    || app_type.chars().any(char::is_control)
-                {
-                    return Err("Steam appinfo type is invalid".into());
-                }
-                game.app_type = Some(app_type.to_owned());
-                self.found_types.insert(app_id);
             } else {
                 self.file
                     .seek(SeekFrom::Start(entry_end))
@@ -441,6 +617,30 @@ impl AppInfoScan {
         }
         Ok(false)
     }
+}
+
+fn appinfo_fields(data: &[u8], keys: &[String]) -> Result<(String, Option<String>), String> {
+    let mut cursor = 0;
+    let mut nodes = 0;
+    let root = parse_binary_object(data, &mut cursor, data.len(), keys, 0, &mut nodes)?;
+    if cursor != data.len() {
+        return Err("Steam appinfo record has trailing binary data".into());
+    }
+    let metadata = root.field("appinfo").unwrap_or(&root);
+    let common = metadata.field("common")?;
+    let app_type = common.field("type")?.text()?.trim();
+    if app_type.is_empty() || app_type.len() > 64 || app_type.chars().any(char::is_control) {
+        return Err("Steam appinfo type is invalid".into());
+    }
+    let name = common
+        .field("name")
+        .ok()
+        .and_then(|value| value.text().ok());
+    let name = name
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && name.len() <= 160 && !name.chars().any(char::is_control))
+        .map(str::to_owned);
+    Ok((app_type.to_owned(), name))
 }
 
 fn parse_string_table(bytes: &[u8]) -> Result<(Vec<String>, usize), String> {
@@ -625,8 +825,16 @@ mod tests {
         }
 
         fn appinfo(&self, entries: &[(u32, &str)]) {
+            let named = entries
+                .iter()
+                .map(|(id, kind)| (*id, *kind, None))
+                .collect::<Vec<_>>();
+            self.appinfo_with_names(&named);
+        }
+
+        fn appinfo_with_names(&self, entries: &[(u32, &str, Option<&str>)]) {
             let mut records = Vec::new();
-            for (app_id, app_type) in entries {
+            for (app_id, app_type, name) in entries {
                 let mut object = vec![0x00];
                 push_u32(&mut object, 0); // appinfo
                 object.push(0x00);
@@ -635,6 +843,12 @@ mod tests {
                 push_u32(&mut object, 2); // type
                 object.extend_from_slice(app_type.as_bytes());
                 object.push(0);
+                if let Some(name) = name {
+                    object.push(0x01);
+                    push_u32(&mut object, 3); // name
+                    object.extend_from_slice(name.as_bytes());
+                    object.push(0);
+                }
                 object.push(0x08); // common end
                 object.push(0x08); // appinfo end
                 object.push(0x08); // root end
@@ -650,8 +864,8 @@ mod tests {
             push_u32(&mut bytes, 31);
             bytes.extend_from_slice(&string_table_offset.to_le_bytes());
             bytes.extend_from_slice(&records);
-            push_u32(&mut bytes, 3);
-            for key in ["appinfo", "common", "type"] {
+            push_u32(&mut bytes, 4);
+            for key in ["appinfo", "common", "type", "name"] {
                 bytes.extend_from_slice(key.as_bytes());
                 bytes.push(0);
             }
@@ -716,6 +930,150 @@ mod tests {
         assert_eq!(game.last_played, Some(1_800_000_000));
         assert!(scan.appinfo_complete);
         assert!(scan.history_complete);
+    }
+
+    #[test]
+    fn previously_played_uninstalled_games_recover_without_duplicating_installs() {
+        let fixture = Fixture::new();
+        fixture.installed_manifest(42);
+        fixture.appinfo_with_names(&[
+            (42, "game", Some("Installed cache name")),
+            (77, "game", Some("Previously played")),
+            (88, "tool", Some("Old tool")),
+        ]);
+        fixture.localconfig("100", &[(42, 1_700_000_000), (77, 1_800_000_000)]);
+        let localconfig = fixture.0.join("userdata/100/config/localconfig.vdf");
+        fs::write(
+            &localconfig,
+            "UserLocalConfigStore { Software { Valve { Steam { apps { 42 { LastPlayed 1700000000 } 77 { LastPlayed 1800000000 } 88 { Playtime 15 } } } } } }",
+        ).unwrap();
+
+        let first = scan_to_completion(fixture.steam_root());
+        assert!(first.appinfo_complete && first.history_complete && first.owned_history_complete);
+        assert_eq!(first.games.len(), 3);
+        assert!(first.games[&42].installed);
+        assert_eq!(first.games[&42].name, "Game-42");
+        assert!(!first.games[&77].installed);
+        assert_eq!(first.games[&77].name, "Previously played");
+        assert_eq!(first.games[&77].last_played, Some(1_800_000_000));
+        assert_eq!(first.games[&77].stable_id, "steam:77");
+        assert!(first.games[&77].artwork_revision.is_some());
+        assert_eq!(first.games[&88].playtime_minutes, Some(15));
+        assert_eq!(first.games[&88].last_played, None);
+        assert_eq!(
+            serde_json::to_value(&first.games[&88]).unwrap()["playtime_minutes"],
+            15
+        );
+
+        fixture.localconfig("100", &[(42, 1_700_000_000)]);
+        let removed = scan_to_completion(fixture.steam_root());
+        assert!(removed.appinfo_complete && removed.owned_history_complete);
+        assert!(!removed.games.contains_key(&77));
+        fixture.localconfig("100", &[(42, 1_700_000_000), (77, 1_800_000_000)]);
+        let recovered = scan_to_completion(fixture.steam_root());
+        assert_eq!(recovered.games[&77].name, "Previously played");
+    }
+
+    #[test]
+    fn missing_candidate_name_or_malformed_history_cannot_authorize_cleanup() {
+        let fixture = Fixture::new();
+        fixture.installed_manifest(42);
+        fixture.appinfo(&[(42, "game"), (77, "game")]);
+        fixture.localconfig("100", &[(42, 1_700_000_000), (77, 1_800_000_000)]);
+        let missing_name = scan_to_completion(fixture.steam_root());
+        assert!(missing_name.appinfo_complete);
+        assert!(!missing_name.owned_history_complete);
+        assert!(!missing_name.games.contains_key(&77));
+        assert!(missing_name.games[&42].installed);
+
+        fixture.appinfo_with_names(&[(42, "game", None), (77, "", Some("Invalid type"))]);
+        let malformed_appinfo = scan_to_completion(fixture.steam_root());
+        assert!(malformed_appinfo.appinfo_complete);
+        assert!(!malformed_appinfo.owned_history_complete);
+        assert!(malformed_appinfo.games[&42].installed);
+        assert!(!malformed_appinfo.games.contains_key(&77));
+
+        fixture.appinfo_with_names(&[(42, "game", None), (77, "game", Some("Old game"))]);
+        let prior = scan_to_completion(fixture.steam_root());
+        assert_eq!(prior.games[&77].name, "Old game");
+        fs::write(
+            fixture.0.join("userdata/100/config/localconfig.vdf"),
+            "UserLocalConfigStore { Software { Valve { Steam { apps { 42 { LastPlayed 1700000000 } 77 { LastPlayed broken } } } } } }",
+        ).unwrap();
+        let malformed = scan_to_completion(fixture.steam_root());
+        assert!(malformed.history_complete);
+        assert!(!malformed.owned_history_complete);
+        assert!(malformed.games[&42].installed);
+        assert!(!malformed.games.contains_key(&77));
+        fixture.localconfig("100", &[(42, 1_700_000_000), (77, 1_800_000_000)]);
+        let recovered = scan_to_completion(fixture.steam_root());
+        assert!(recovered.owned_history_complete);
+        assert_eq!(recovered.games[&77].name, "Old game");
+    }
+
+    #[test]
+    fn each_uninstalled_artwork_lookup_gets_its_own_scanner_tick() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("steam.exe"), "client").unwrap();
+        fixture.appinfo_with_names(&[
+            (77, "game", Some("First old game")),
+            (88, "game", Some("Second old game")),
+        ]);
+        fixture.localconfig("100", &[(77, 1_800_000_000), (88, 1_700_000_000)]);
+        let mut scanner = Scanner::new(std::slice::from_ref(&fixture.0));
+        let mut games = BTreeMap::new();
+        for _ in 0..100 {
+            scanner.tick(&mut games);
+            if scanner.artwork_queued {
+                break;
+            }
+        }
+        assert!(scanner.artwork_queued);
+        assert_eq!(scanner.pending_artwork.len(), 1);
+        assert_eq!(
+            games
+                .values()
+                .filter(|game| game.artwork_revision.is_some())
+                .count(),
+            1
+        );
+        scanner.tick(&mut games);
+        assert!(scanner.pending_artwork.is_empty());
+        assert_eq!(
+            games
+                .values()
+                .filter(|game| game.artwork_revision.is_some())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn later_root_history_can_use_earlier_root_appinfo() {
+        let first = Fixture::new();
+        let second = Fixture::new();
+        first.installed_manifest(42);
+        first.appinfo_with_names(&[
+            (42, "game", None),
+            (77, "game", Some("First root cache name")),
+        ]);
+        first.localconfig("100", &[(42, 1_700_000_000)]);
+        fs::create_dir_all(second.0.join("steamapps")).unwrap();
+        fs::write(second.0.join("steam.exe"), "client").unwrap();
+        second.appinfo(&[(42, "game")]);
+        second.localconfig("200", &[(77, 1_800_000_000)]);
+        let mut scan = crate::discovery::Scan::new(&[first.0.clone(), second.0.clone()]);
+        for _ in 0..20_000 {
+            scan.tick();
+            if scan.finished {
+                break;
+            }
+        }
+        assert!(scan.finished);
+        assert!(scan.appinfo_complete && scan.owned_history_complete);
+        assert!(scan.games[&42].installed);
+        assert_eq!(scan.games[&77].name, "First root cache name");
+        assert!(!scan.games[&77].installed);
     }
 
     #[test]

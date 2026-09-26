@@ -515,6 +515,7 @@ fn escaped_metadata_pages_fit_runtime_budget_without_losing_entries() {
                 last_updated: 0,
                 app_type: None,
                 last_played: None,
+                playtime_minutes: None,
                 artwork_revision: None,
                 artwork_source_path: None,
                 artwork_is_remote: false,

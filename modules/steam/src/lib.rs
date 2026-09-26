@@ -70,6 +70,7 @@ struct Provider {
     warning_count: u64,
     appinfo_complete: bool,
     history_complete: bool,
+    owned_history_complete: bool,
     remote_artwork: artwork::RemoteArtworkWorker,
 }
 
@@ -102,6 +103,7 @@ impl Provider {
             self.warning_count = 0;
             self.appinfo_complete = false;
             self.history_complete = false;
+            self.owned_history_complete = false;
             self.revision = self.revision.saturating_add(1);
             self.snapshot_complete = false;
         }
@@ -149,6 +151,7 @@ impl Provider {
             self.snapshot_complete = scan.warning_count == 0;
             self.appinfo_complete = scan.appinfo_complete;
             self.history_complete = scan.history_complete;
+            self.owned_history_complete = scan.owned_history_complete;
             self.revision = self.revision.saturating_add(1);
         }
     }
@@ -289,7 +292,7 @@ impl Provider {
         json!({"ok":true,"enabled":self.enabled,"scanning":self.scan.is_some(),"revision":self.revision,
             "game_count":self.games.len(),"warning_count":self.warning_count,"warnings":self.warnings,
             "complete":self.has_complete_snapshot(),
-            "catalog_sources":{"appinfo":self.appinfo_complete,"play_history":self.history_complete},
+            "catalog_sources":{"appinfo":self.appinfo_complete,"play_history":self.history_complete,"owned_history":self.owned_history_complete},
             "visited_entries":self.scan.as_ref().map_or(0, |scan| scan.visited_entries)})
     }
 
@@ -322,7 +325,8 @@ impl Provider {
             None
         };
         json!({"ok":true,"enabled":self.enabled,"revision":self.revision,"games":games,"next_after":next_after,
-            "scanning":self.scan.is_some(),"complete":self.has_complete_snapshot()})
+            "scanning":self.scan.is_some(),"complete":self.has_complete_snapshot(),
+            "catalog_sources":{"appinfo":self.appinfo_complete,"play_history":self.history_complete,"owned_history":self.owned_history_complete}})
     }
 }
 
