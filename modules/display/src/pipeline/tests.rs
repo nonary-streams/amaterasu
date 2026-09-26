@@ -129,6 +129,7 @@ fn hdr_apply(option: &str, requested: Option<bool>) -> Value {
 }
 #[derive(Default)]
 struct FakePlatform {
+    current_snapshot: Option<Snapshot>,
     effects: Vec<&'static str>,
     prepared_mode: Option<(u32, u32, Rational)>,
     applied_mode: Option<(u32, u32, Rational)>,
@@ -156,6 +157,20 @@ impl Platform for FakePlatform {
     }
     fn supported(&self) -> bool {
         true
+    }
+    fn snapshot(&mut self) -> DisplayResult<Snapshot> {
+        if let Some(current) = &self.current_snapshot {
+            return Ok(current.clone());
+        }
+        let mut current = if self.reorder_readback {
+            two_display_snapshot()
+        } else {
+            snapshot()
+        };
+        if self.topology_changed {
+            current.paths[0].source.width += 1;
+        }
+        Ok(current)
     }
     fn enumerate(&mut self, _: Option<&str>, _: usize, _: usize) -> DisplayResult<Value> {
         Ok(json!({"ok":true,"entries":[]}))
@@ -210,7 +225,11 @@ impl Platform for FakePlatform {
         if self.inactive {
             before.paths[0].id = "monitor.other".into();
         }
+        if self.topology_changed {
+            before.paths[0].source.width += 1;
+        }
         before.paths[0].hdr_enabled = self.hdr_supported.then_some(self.hdr_state);
+        self.current_snapshot = Some(before.clone());
         Ok(before)
     }
     fn apply(
@@ -490,6 +509,131 @@ impl State {
         }
         panic!("display pipeline stalled")
     }
+}
+#[test]
+fn snapshot_returns_complete_multi_monitor_configuration_and_stable_revision() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            reorder_readback: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let first = state.run(&mut pipeline, "owner", json!({"action":"snapshot"}));
+    let second = state.run(&mut pipeline, "owner", json!({"action":"snapshot"}));
+    assert_eq!(
+        first["configuration"]["displays"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(first["topology_revision"], second["topology_revision"]);
+    assert!(state.journal.is_none());
+    let mut reordered = two_display_snapshot();
+    let before = reordered.revision().unwrap();
+    reordered.paths.reverse();
+    assert_eq!(before, reordered.revision().unwrap());
+    reordered.paths[0].source.width += 1;
+    assert_ne!(before, reordered.revision().unwrap());
+}
+
+#[test]
+fn stale_topology_revision_rejects_apply_without_journal_or_native_effect() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let current = state.run(&mut pipeline, "owner", json!({"action":"snapshot"}));
+    pipeline.platform.topology_changed = true;
+    let response = state.run(&mut pipeline, "owner", json!({"action":"apply","configuration":configuration(),"expected_topology_revision":current["topology_revision"],"operation_id":"session-1"}));
+    assert_eq!(response["error"]["code"], "topology_changed");
+    assert!(state.journal.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+}
+
+#[test]
+fn revisioned_apply_rejects_inactive_id_and_ambiguous_snapshot() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            inactive: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let mut active = snapshot();
+    active.paths[0].id = "monitor.other".into();
+    active.paths[0].hdr_enabled = None;
+    let revision = active.revision().unwrap();
+    pipeline.platform.current_snapshot = Some(active);
+    let inactive = state.run(&mut pipeline, "owner", json!({"action":"apply","configuration":configuration(),"expected_topology_revision":revision}));
+    assert_eq!(inactive["error"]["code"], "unsupported_display");
+    assert!(state.journal.is_none());
+    let mut ambiguous = two_display_snapshot();
+    ambiguous.paths[1].id = "MONITOR.ONE".into();
+    assert_eq!(ambiguous.validate().unwrap_err().code, "invalid_snapshot");
+    assert!(pipeline.platform.effects.is_empty());
+}
+
+#[test]
+fn revisioned_apply_cannot_omit_active_monitor() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            reorder_readback: true,
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let topology = state.run(&mut pipeline, "owner", json!({"action":"snapshot"}));
+    let response = state.run(&mut pipeline, "owner", json!({"action":"apply","configuration":configuration(),"expected_topology_revision":topology["topology_revision"]}));
+    assert_eq!(response["error"]["code"], "unsupported_display");
+    assert!(state.journal.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+}
+
+#[test]
+fn durable_operation_identity_prevents_same_caller_adoption_and_survives_restart() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let applied = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"apply","configuration":configuration(),"operation_id":"session-1"}),
+    );
+    assert_eq!(applied["applied"], true);
+    assert_eq!(state.journal.as_ref().unwrap()["operation_id"], "session-1");
+    let retry = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"apply","configuration":configuration(),"operation_id":"session-1"}),
+    );
+    assert_eq!(retry["lease"], applied["lease"]);
+    assert_eq!(retry["applied"], false);
+    assert_eq!(pipeline.platform.effects, ["apply"]);
+    let other = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"apply","configuration":configuration(),"operation_id":"session-2"}),
+    );
+    assert_eq!(other["error"]["code"], "display_busy");
+    let changed = state.run(&mut pipeline, "owner", json!({"action":"apply","configuration":two_display_configuration(),"operation_id":"session-1"}));
+    assert_eq!(changed["error"]["code"], "operation_conflict");
+    let changed_revision = state.run(&mut pipeline, "owner", json!({"action":"apply","configuration":configuration(),"operation_id":"session-1","expected_topology_revision":"00000000000000000000000000000000"}));
+    assert_eq!(changed_revision["error"]["code"], "operation_conflict");
+    let foreign = state.run(&mut pipeline, "foreign", json!({"action":"status"}));
+    assert!(foreign["operation_id"].is_null());
+    assert!(foreign["lease"].is_null());
+    let mut restarted = Pipeline::new(FakePlatform::default(), true);
+    let owner = state.run(&mut restarted, "owner", json!({"action":"status"}));
+    assert_eq!(owner["operation_id"], "session-1");
+    assert_eq!(owner["state"], "recovery_required");
+    let retry = state.run(
+        &mut restarted,
+        "owner",
+        json!({"action":"apply","configuration":configuration(),"operation_id":"session-1"}),
+    );
+    assert_eq!(retry["state"], "recovery_required");
+    assert_eq!(retry["applied"], false);
+    assert!(restarted.platform.effects.is_empty());
 }
 #[test]
 fn durable_journal_precedes_effects_and_only_owner_can_restore() {
@@ -1546,6 +1690,9 @@ fn expired_native_boundary_keeps_recovery_without_effects() {
         owner: "owner".into(),
         lease: "display-0000000000000001".into(),
         snapshot: snapshot(),
+        operation_id: None,
+        requested_configuration: None,
+        expected_topology_revision: None,
     };
     let mut pipeline = Pipeline::new(FakePlatform::default(), true);
     pipeline.pending = Some(Pending {
@@ -1605,6 +1752,9 @@ fn invalid_journals_and_stale_leases_are_never_overwritten() {
             owner: "owner".into(),
             lease: "current".into(),
             snapshot: snapshot(),
+            operation_id: None,
+            requested_configuration: None,
+            expected_topology_revision: None,
         })
         .unwrap(),
     );

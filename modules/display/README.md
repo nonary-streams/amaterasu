@@ -97,6 +97,7 @@ Moonlight gate.
 
 ```json
 {"action":"status"}
+{"action":"snapshot"}
 {"action":"enumerate","offset":0,"limit":16}
 {"action":"enumerate","display":"<id returned by enumeration>","offset":0,"limit":32}
 {"action":"apply","configuration":{"displays":[{"id":"<id returned by enumeration>","width":1920,"height":1080,"refresh":{"numerator":60000,"denominator":1001},"x":0,"y":0,"rotation":"identity"}]}}
@@ -106,8 +107,25 @@ Moonlight gate.
 {"action":"recover","lease":"display-0000000000000001"}
 ```
 
+`snapshot` returns the complete active CCD configuration and an opaque
+`topology_revision` from a validated active-path set. It rejects incomplete
+paths and ambiguous monitor IDs. Pass that revision as
+`expected_topology_revision` on Apply to require the same active topology at
+durable prepare and the native apply boundary. A revisioned Apply selects only
+exactly the currently active ID set, so an omitted monitor cannot be disabled
+by a partial policy. Legacy Apply still permits validated inactive target
+activation. Hotplug or display changes return `topology_changed` before the
+journal or native mutation when detected at prepare.
+
+Apply can carry a stable ASCII `operation_id` (1–128 graphic bytes). It is
+persisted with the recovery journal before native mutation and returned in
+owner-visible Status with the lease. An exact no-policy retry with the same
+owner, ID, concrete configuration, and expected revision returns the existing
+lease as `recovery_required` with `applied:false`; it cannot claim a native
+effect without fresh readback. A changed request using the same ID conflicts.
+
 `status` returns native support, startup mutation policy, `state` (`idle`, `leased`
-or `recovery_required`), `owned_by_caller`, and the lease only to its owner. After a
+or `recovery_required`), `owned_by_caller`, and the lease and operation ID only to its owner. After a
 module restart every outstanding journal is reported as requiring recovery.
 
 Enumeration without `display` returns connected monitor identities, friendly

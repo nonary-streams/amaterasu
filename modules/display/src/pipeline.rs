@@ -1,4 +1,4 @@
-use crate::model::{Configuration, DisplayError, DisplayResult, Journal, Operation};
+use crate::model::{Configuration, DisplayError, DisplayResult, Journal, Operation, Snapshot};
 use crate::platform::Platform;
 use crate::{JOURNAL_KEY, SERVICE, STATE_SERVICE};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
@@ -105,6 +105,16 @@ impl<P: Platform> Pipeline<P> {
         incoming: Incoming,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        if let Operation::Snapshot = incoming.operation {
+            let result = self.platform.snapshot().and_then(|snapshot| {
+                Ok(json!({"ok":true,"configuration":snapshot.configuration()?,"topology_revision":snapshot.revision()?}))
+            });
+            return complete(
+                send,
+                incoming.context.request,
+                result.unwrap_or_else(DisplayError::payload),
+            );
+        }
         if let Operation::Enumerate {
             display,
             offset,
@@ -247,7 +257,7 @@ impl<P: Platform> Pipeline<P> {
             return complete(
                 send,
                 context.request,
-                json!({"ok":true,"platform":self.platform.name(),"native_supported":self.platform.supported(),"mutation_enabled":self.allow_mutation,"state":state,"owned_by_caller":own,"lease":journal.as_ref().filter(|_| own).map(|journal| &journal.lease)}),
+                json!({"ok":true,"platform":self.platform.name(),"native_supported":self.platform.supported(),"mutation_enabled":self.allow_mutation,"state":state,"owned_by_caller":own,"lease":journal.as_ref().filter(|_| own).map(|journal| &journal.lease),"operation_id":journal.as_ref().filter(|_| own).and_then(|journal| journal.operation_id.as_ref())}),
             );
         }
         if !self.allow_mutation {
@@ -273,16 +283,79 @@ impl<P: Platform> Pipeline<P> {
         match operation {
             Operation::Apply {
                 mut configuration,
+                expected_topology_revision,
+                operation_id,
                 mode_policy,
                 mode_policies,
             } => {
-                if journal.is_some() {
+                if let Some(journal) = journal {
+                    if operation_id.is_some()
+                        && operation_id == journal.operation_id
+                        && journal.owner == context.caller
+                    {
+                        if mode_policy.is_none()
+                            && mode_policies.is_none()
+                            && expected_topology_revision == journal.expected_topology_revision
+                            && journal
+                                .requested_configuration
+                                .as_ref()
+                                .is_some_and(|saved| {
+                                    serde_json::to_value(saved).ok()
+                                        == serde_json::to_value(&configuration).ok()
+                                })
+                        {
+                            // The reply may have been lost while a driver or third party
+                            // changed the desktop. Never claim an unverified native effect.
+                            return complete(
+                                send,
+                                context.request,
+                                json!({"ok":true,"applied":false,"state":"recovery_required","lease":journal.lease,"operation_id":operation_id}),
+                            );
+                        }
+                        return complete(
+                            send,
+                            context.request,
+                            failure(
+                                "operation_conflict",
+                                "operation identity already has a different display request",
+                            ),
+                        );
+                    }
                     return complete(
                         send,
                         context.request,
                         failure(
                             "display_busy",
                             "a display lease or recovery journal already exists",
+                        ),
+                    );
+                }
+                if operation_id.as_ref().is_some_and(|id| {
+                    id.is_empty()
+                        || id.len() > 128
+                        || !id.bytes().all(|byte| byte.is_ascii_graphic())
+                }) {
+                    return complete(
+                        send,
+                        context.request,
+                        failure(
+                            "invalid_request",
+                            "operation_id must be 1..128 printable characters",
+                        ),
+                    );
+                }
+                if expected_topology_revision.as_ref().is_some_and(|revision| {
+                    revision.len() != 32
+                        || !revision
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                }) {
+                    return complete(
+                        send,
+                        context.request,
+                        failure(
+                            "invalid_request",
+                            "expected_topology_revision must be a provider snapshot token",
                         ),
                     );
                 }
@@ -313,7 +386,14 @@ impl<P: Platform> Pipeline<P> {
                         return complete(send, context.request, error.payload());
                     }
                 }
-                self.prepare(context, revision, configuration, send)
+                self.prepare(
+                    context,
+                    revision,
+                    configuration,
+                    expected_topology_revision,
+                    operation_id,
+                    send,
+                )
             }
             Operation::Restore { lease } | Operation::Recover { lease } => {
                 let Some(journal) = journal else {
@@ -358,6 +438,8 @@ impl<P: Platform> Pipeline<P> {
         context: Context,
         revision: u64,
         configuration: Configuration,
+        expected_topology_revision: Option<String>,
+        operation_id: Option<String>,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         if let Err(error) = configuration.validate() {
@@ -367,6 +449,38 @@ impl<P: Platform> Pipeline<P> {
             Ok(snapshot) => snapshot,
             Err(error) => return complete(send, context.request, error.payload()),
         };
+        if let Some(expected) = &expected_topology_revision {
+            if snapshot.revision().as_ref().ok() != Some(expected) {
+                return complete(
+                    send,
+                    context.request,
+                    failure(
+                        "topology_changed",
+                        "active display topology changed before journal prepare",
+                    ),
+                );
+            }
+            if let Err(error) = snapshot
+                .configuration()
+                .and_then(|_| validate_active_ids(&configuration, &snapshot))
+            {
+                return complete(send, context.request, error.payload());
+            }
+        }
+        let readback = self
+            .platform
+            .snapshot()
+            .and_then(|current| current.revision());
+        if readback.as_ref().ok() != snapshot.revision().as_ref().ok() {
+            return complete(
+                send,
+                context.request,
+                failure(
+                    "topology_changed",
+                    "active display topology changed during journal prepare",
+                ),
+            );
+        }
         let Some(generation) = revision.checked_add(1) else {
             return complete(
                 send,
@@ -378,6 +492,9 @@ impl<P: Platform> Pipeline<P> {
             owner: context.caller.clone(),
             lease: format!("display-{generation:016x}"),
             snapshot,
+            operation_id,
+            requested_configuration: Some(configuration.clone()),
+            expected_topology_revision,
         };
         if journal.validate().is_err()
             || serde_json::to_vec(&journal).map_or(true, |bytes| bytes.len() > 12_000)
@@ -422,7 +539,7 @@ impl<P: Platform> Pipeline<P> {
                 complete(
                     send,
                     context.request,
-                    json!({"ok":true,"applied":true,"lease":journal.lease}),
+                    json!({"ok":true,"applied":true,"lease":journal.lease,"operation_id":journal.operation_id}),
                 )
             }
             Err(error) => {
@@ -450,6 +567,25 @@ impl<P: Platform> Pipeline<P> {
         let payload = json!({"action":"delete","key":JOURNAL_KEY,"expected_revision":revision});
         self.submit(context, payload, Stage::Clearing(reply), send)
     }
+}
+fn validate_active_ids(configuration: &Configuration, snapshot: &Snapshot) -> DisplayResult<()> {
+    let requested: BTreeSet<_> = configuration
+        .displays
+        .iter()
+        .map(|display| display.id.to_lowercase())
+        .collect();
+    let active: BTreeSet<_> = snapshot
+        .paths
+        .iter()
+        .map(|path| path.id.to_lowercase())
+        .collect();
+    if requested != active {
+        return Err(DisplayError::new(
+            "unsupported_display",
+            "revisioned apply requires exactly the active display identities",
+        ));
+    }
+    Ok(())
 }
 fn collect_mode_policies(
     configuration: &Configuration,

@@ -11,6 +11,7 @@ pub const MAX_DISPLAYS: usize = 16;
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Status,
+    Snapshot,
     Enumerate {
         display: Option<String>,
         offset: Option<usize>,
@@ -18,6 +19,10 @@ pub enum Operation {
     },
     Apply {
         configuration: Configuration,
+        #[serde(default)]
+        expected_topology_revision: Option<String>,
+        #[serde(default)]
+        operation_id: Option<String>,
         #[serde(default)]
         mode_policy: Option<ModePolicy>,
         #[serde(default)]
@@ -401,14 +406,17 @@ impl Snapshot {
         for path in &self.paths {
             if path.id.is_empty()
                 || path.id.len() > 1024
-                || !ids.insert(&path.id)
+                || !ids.insert(path.id.to_lowercase())
                 || path.source_name.is_empty()
                 || path.source_name.len() > 128
                 || path.source.width == 0
                 || path.source.height == 0
                 || path.refresh.denominator == 0
+                || path.refresh.numerator == 0
                 || path.signal.vertical_sync.denominator == 0
+                || path.signal.vertical_sync.numerator == 0
                 || path.signal.horizontal_sync.denominator == 0
+                || path.signal.horizontal_sync.numerator == 0
                 || !(1..=4).contains(&path.rotation)
             {
                 return Err(DisplayError::new(
@@ -418,6 +426,52 @@ impl Snapshot {
             }
         }
         Ok(())
+    }
+    pub fn configuration(&self) -> Result<Configuration, DisplayError> {
+        self.validate()?;
+        let displays = self
+            .paths
+            .iter()
+            .map(|path| DisplaySetting {
+                id: path.id.clone(),
+                width: path.source.width,
+                height: path.source.height,
+                refresh: path.refresh,
+                x: path.source.x,
+                y: path.source.y,
+                rotation: match path.rotation {
+                    1 => Rotation::Identity,
+                    2 => Rotation::Rotate90,
+                    3 => Rotation::Rotate180,
+                    4 => Rotation::Rotate270,
+                    _ => unreachable!("validated rotation"),
+                },
+                hdr_enabled: path.hdr_enabled,
+            })
+            .collect();
+        let configuration = Configuration { displays };
+        configuration.validate().map_err(|_| {
+            DisplayError::new(
+                "unsupported_topology",
+                "active topology cannot form a complete configuration",
+            )
+        })?;
+        Ok(configuration)
+    }
+    pub fn revision(&self) -> Result<String, DisplayError> {
+        self.validate()?;
+        let mut paths = self.paths.clone();
+        paths.sort_by_key(|path| path.id.to_lowercase());
+        let bytes = serde_json::to_vec(&paths)
+            .map_err(|error| DisplayError::new("invalid_snapshot", error.to_string()))?;
+        // Two independent noncryptographic lanes make a compact opaque CCD state token.
+        let mut a = 0xcbf29ce484222325_u64;
+        let mut b = 0x84222325cbf29ce4_u64;
+        for byte in bytes {
+            a = (a ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            b = (b ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+        Ok(format!("{a:016x}{b:016x}"))
     }
     #[cfg(any(windows, test))]
     pub fn equivalent(&self, other: &Self) -> bool {
@@ -446,6 +500,12 @@ pub struct Journal {
     pub owner: String,
     pub lease: String,
     pub snapshot: Snapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_configuration: Option<Configuration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_topology_revision: Option<String>,
 }
 impl Journal {
     pub fn validate(&self) -> Result<(), DisplayError> {
@@ -453,6 +513,13 @@ impl Journal {
             || self.owner.len() > 128
             || self.lease.is_empty()
             || self.lease.len() > 128
+            || self.operation_id.as_ref().is_some_and(|id| {
+                id.is_empty() || id.len() > 128 || !id.bytes().all(|byte| byte.is_ascii_graphic())
+            })
+            || self
+                .requested_configuration
+                .as_ref()
+                .is_some_and(|configuration| configuration.validate().is_err())
         {
             return Err(DisplayError::new(
                 "invalid_journal",

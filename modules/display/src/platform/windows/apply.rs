@@ -23,6 +23,17 @@ pub fn requested(configuration: &Configuration) -> DisplayResult<ConfigurationBu
                 candidates.push(*candidate);
             }
         }
+        let mut targets = std::collections::BTreeSet::new();
+        for candidate in &candidates {
+            let target = address(candidate.targetInfo.adapterId, candidate.targetInfo.id);
+            targets.insert((target.adapter_low, target.adapter_high, target.id));
+        }
+        if targets.len() > 1 {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "display ID resolves to multiple physical targets",
+            ));
+        }
         candidates.sort_by_key(|path| path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0);
         let mut path = candidates
             .into_iter()

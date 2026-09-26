@@ -11,6 +11,7 @@ pub trait Platform {
         limit: usize,
     ) -> DisplayResult<Value>;
     fn available_modes(&mut self, display: &str) -> DisplayResult<Vec<AvailableMode>>;
+    fn snapshot(&mut self) -> DisplayResult<Snapshot>;
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot>;
     fn apply(
         &mut self,
@@ -43,6 +44,9 @@ impl Platform for NativePlatform {
         unsupported()
     }
     fn available_modes(&mut self, _: &str) -> DisplayResult<Vec<AvailableMode>> {
+        unsupported()
+    }
+    fn snapshot(&mut self) -> DisplayResult<Snapshot> {
         unsupported()
     }
     fn prepare(&mut self, _: &Configuration) -> DisplayResult<Snapshot> {

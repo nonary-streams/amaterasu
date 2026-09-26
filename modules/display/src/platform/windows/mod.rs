@@ -79,6 +79,17 @@ impl Platform for WindowsPlatform {
         apply::set(&requested, false)?;
         Ok(before)
     }
+    fn snapshot(&mut self) -> DisplayResult<Snapshot> {
+        let first = query::snapshot()?;
+        let second = query::snapshot()?;
+        if first.revision()? != second.revision()? {
+            return Err(DisplayError::new(
+                "topology_changed",
+                "active display topology changed during snapshot read",
+            ));
+        }
+        Ok(second)
+    }
     fn available_modes(&mut self, display: &str) -> DisplayResult<Vec<AvailableMode>> {
         query::available_modes(display)
     }
@@ -88,7 +99,7 @@ impl Platform for WindowsPlatform {
         before: &Snapshot,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
-        if !before.equivalent(&query::snapshot()?) {
+        if before.revision()? != query::snapshot()?.revision()? {
             return Err(DisplayError::new(
                 "topology_changed",
                 "display configuration changed before the durable apply boundary",
@@ -97,6 +108,12 @@ impl Platform for WindowsPlatform {
         let requested = apply::requested(configuration)?;
         apply::set(&requested, false)?;
         guard()?;
+        if before.revision()? != query::snapshot()?.revision()? {
+            return Err(DisplayError::new(
+                "topology_changed",
+                "display topology changed after native validation",
+            ));
+        }
         apply::set(&requested, true).map_err(DisplayError::after_mutation)?;
         verify_applied_configuration(configuration, query::snapshot())?;
         for display in &configuration.displays {
