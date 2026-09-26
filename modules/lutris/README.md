@@ -95,13 +95,10 @@ before cleanup is submitted.
 
 Each enabled scan captures its complete settings at scan start. Disabling Lutris
 discards discovery and Steam deduplication results that have not entered catalog
-reconciliation. It also stops undispatched Catalog batches and Finish, canceling
-and releasing an accepted child request before a fresh scan proceeds. A Finish
-already accepted by Catalog may complete under its captured settings; the
-provider waits for its result and does not publish its artwork. Disabled
-settings prevent later scans from starting, and disabling alone does not remove
-already imported catalog rows. Stale removal for an accepted Finish follows
-its captured `autosync_remove_uninstalled` value.
+reconciliation. A catalog transaction already started finishes using its captured
+settings. Disabled settings prevent later scans from starting, and disabling
+alone does not remove already imported catalog rows. Stale removal for an
+already started transaction follows its captured `autosync_remove_uninstalled` value.
 
 Automatic discovery checks the installed rows every 30 seconds after the
 previous scan and catalog work finish. A catalog snapshot is submitted when the
