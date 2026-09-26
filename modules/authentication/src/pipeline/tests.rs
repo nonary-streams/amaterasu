@@ -1060,6 +1060,88 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
 }
 
 #[test]
+fn imported_primary_login_survives_reload_without_accepting_split_or_auxiliary_sources() {
+    let source = std::env::temp_dir().join(format!(
+        "amaterasu-auth-primary-auxiliary-source-{}",
+        std::process::id()
+    ));
+    let state_root = std::env::temp_dir().join(format!(
+        "amaterasu-auth-primary-auxiliary-state-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&source);
+    let _ = std::fs::remove_dir_all(&state_root);
+    std::fs::create_dir_all(&source).unwrap();
+    let salt = "AbCdEfGhIjKlMnOp";
+    let password = "primary administrator password";
+    let primary = json!({
+        "username":"PrimaryAdmin",
+        "password":crate::crypto::token_digest(&format!("{password}{salt}")),
+        "salt":salt
+    });
+    let auxiliary = json!({
+        "username":"AuxiliaryAdmin",
+        "password":crate::crypto::token_digest(&format!("auxiliary password{salt}")),
+        "salt":salt
+    });
+    std::fs::write(source.join("vibeshine_state.json"), auxiliary.to_string()).unwrap();
+    assert!(matches!(
+        crate::migration::import_legacy_authentication(&source),
+        Err("legacy_authentication_credential_ambiguous")
+    ));
+    std::fs::write(source.join("apollo_state.json"), primary.to_string()).unwrap();
+    std::fs::write(source.join("sunshine_state.json"), primary.to_string()).unwrap();
+    assert!(matches!(
+        crate::migration::import_legacy_authentication(&source),
+        Err("legacy_authentication_credential_ambiguous")
+    ));
+    std::fs::remove_file(source.join("apollo_state.json")).unwrap();
+    let import = crate::migration::import_legacy_authentication(&source).unwrap();
+    assert_eq!(
+        crate::migration::seed_authentication_state(&state_root, &import).unwrap(),
+        crate::migration::AuthenticationSeedOutcome::Seeded
+    );
+
+    let saved: Value = serde_json::from_slice(
+        &std::fs::read(crate::migration::namespace_path(&state_root)).unwrap(),
+    )
+    .unwrap();
+    let mut state = StateHarness::new();
+    state.revision = saved["revision"].as_u64().unwrap();
+    state.stored = Some(saved["values"][STATE_KEY].clone());
+    let mut loaded_authentication = Pipeline::new(settings());
+    let login = state.request(
+        &mut loaded_authentication,
+        "frontend",
+        json!({"action":"login","username":"primaryadmin","password":password}),
+        100,
+    );
+    assert_eq!(login["ok"], true);
+    assert_eq!(login["subject"], "PrimaryAdmin");
+    assert_eq!(
+        state.request(
+            &mut loaded_authentication,
+            "frontend",
+            json!({"action":"login","username":"AuxiliaryAdmin","password":"auxiliary password"}),
+            101,
+        )["code"],
+        "unauthorized"
+    );
+
+    std::fs::write(
+        source.join("vibeshine_state.json"),
+        r#"{"root":{"api_tokens":[{"token":"legacy-token"}]}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        crate::migration::import_legacy_authentication(&source),
+        Err("legacy_authentication_tokens_unsupported")
+    ));
+    std::fs::remove_dir_all(source).unwrap();
+    std::fs::remove_dir_all(state_root).unwrap();
+}
+
+#[test]
 fn imported_credential_replaces_stale_session_only_namespace_and_authenticates_after_restart() {
     let source = std::env::temp_dir().join(format!(
         "amaterasu-auth-import-consumer-source-{}",

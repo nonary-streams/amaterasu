@@ -13,6 +13,7 @@ const STATE_FILES: &[&str] = &[
     "vibeshine_state.json",
     "vibepollo_state.json",
 ];
+const PRIMARY_STATE_FILES: &[&str] = &["apollo_state.json", "sunshine_state.json"];
 const PRINCIPAL: &str = "amaterasu.authentication";
 const STATE_KEY: &str = "authentication/v1";
 
@@ -141,16 +142,27 @@ fn credential_candidates(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
     match &configured_state.primary_file_state {
         ConfiguredPrimaryState::Configured(path) => Ok(vec![path.clone()]),
         ConfiguredPrimaryState::Missing => Ok(Vec::new()),
-        ConfiguredPrimaryState::NotConfigured => legacy_state_candidates(root, &configured_state),
+        ConfiguredPrimaryState::NotConfigured => default_primary_state_candidates(root),
     }
 }
 
 fn token_validation_candidates(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
-    if configured_credential_file(root)?.is_some() {
-        return Ok(Vec::new());
-    }
     let configured_state = configured_state_paths(root)?;
     legacy_state_candidates(root, &configured_state)
+}
+
+fn default_primary_state_candidates(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
+    let mut files = Vec::new();
+    for name in PRIMARY_STATE_FILES {
+        if root
+            .join(name)
+            .try_exists()
+            .map_err(|_| "legacy_authentication_layout")?
+        {
+            files.push(regular_contained_file(root, Path::new(name))?);
+        }
+    }
+    Ok(files)
 }
 
 fn legacy_state_candidates(
@@ -696,7 +708,40 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_primary_state_keeps_default_and_auxiliary_discovery() {
+    fn explicit_credentials_still_reject_tokens_in_auxiliary_state() {
+        let source = temporary_directory("explicit-credentials-auxiliary-tokens");
+        std::fs::create_dir_all(source.join("private")).unwrap();
+        std::fs::write(
+            source.join("private/credentials.json"),
+            credential_record("Admin", "correct password", "CredentialSalt12"),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("private/auxiliary.json"),
+            r#"{"root":{"api_tokens":[]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "credentials_file = private/credentials.json\nvibeshine_file_state = private/auxiliary.json\n",
+        )
+        .unwrap();
+        assert!(import_legacy_authentication(&source).is_ok());
+
+        std::fs::write(
+            source.join("private/auxiliary.json"),
+            r#"{"root":{"api_tokens":[{"token":"legacy-token"}]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_tokens_unsupported")
+        ));
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn unconfigured_primary_state_uses_default_primary_and_checks_auxiliary() {
         let source = temporary_directory("unconfigured-primary-state-discovery");
         std::fs::create_dir_all(source.join("private")).unwrap();
         std::fs::write(
@@ -718,14 +763,21 @@ mod tests {
 
         let candidates = credential_candidates(&root).unwrap();
         assert!(candidates.contains(&source.join("sunshine_state.json").canonicalize().unwrap()));
-        assert!(
-            candidates.contains(
-                &source
-                    .join("private/auxiliary.json")
-                    .canonicalize()
-                    .unwrap()
-            )
+        assert_eq!(candidates.len(), 1);
+        let imported = import_legacy_authentication(&source).unwrap();
+        assert_eq!(
+            imported.document.credential.as_ref().unwrap().username,
+            "Legacy"
         );
+        std::fs::write(
+            source.join("private/auxiliary.json"),
+            r#"{"root":{"api_tokens":[{"token":"legacy-token"}]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_tokens_unsupported")
+        ));
         let _ = std::fs::remove_dir_all(source);
     }
 
@@ -811,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn imports_a_vibeshine_file_state_path_with_a_quoted_hash_and_trailing_comment() {
+    fn does_not_promote_a_vibeshine_file_state_to_login_credentials() {
         let source = temporary_directory("vibeshine-file-state-hash-source");
         std::fs::create_dir_all(source.join("private")).unwrap();
         let salt = "AbCdEfGhIjKlMnOp";
@@ -831,11 +883,10 @@ mod tests {
         )
         .unwrap();
 
-        let imported = import_legacy_authentication(&source).unwrap();
-        assert_eq!(
-            imported.document.credential.as_ref().unwrap().username,
-            "Admin"
-        );
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_credential_ambiguous")
+        ));
         let _ = std::fs::remove_dir_all(source);
     }
 
@@ -874,7 +925,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn imports_case_variant_vibeshine_file_state_spellings_as_one_windows_candidate() {
+    fn checks_case_variant_vibeshine_file_state_spellings_without_promoting_them() {
         let source = temporary_directory("windows-vibeshine-file-state-case-alias");
         std::fs::create_dir_all(source.join("private")).unwrap();
         let salt = "AbCdEfGhIjKlMnOp";
@@ -895,13 +946,12 @@ mod tests {
         .unwrap();
 
         let root = canonical_directory(&source).unwrap();
-        let candidates = credential_candidates(&root).unwrap();
+        let candidates = token_validation_candidates(&root).unwrap();
         assert_eq!(candidates.len(), 1);
-        let imported = import_legacy_authentication(&source).unwrap();
-        assert_eq!(
-            imported.document.credential.as_ref().unwrap().username,
-            "Admin"
-        );
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_credential_ambiguous")
+        ));
         let _ = std::fs::remove_dir_all(source);
     }
 
