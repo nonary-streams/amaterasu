@@ -740,12 +740,13 @@ impl CatalogSync {
         {
             let canceled_for_process_change = transaction.canceled_for_process_change;
             if let Call::Waiting { request } = transaction.call {
-                match runtime.send_ephemeral(Command::TakeResult { request }) {
-                    Ok(Response::Pending) | Err(_) => {
-                        transaction.call = Call::Waiting { request };
-                        self.transaction = Some(transaction);
-                    }
-                    _ => {}
+                // An old provider call may sit in the broker until its full
+                // timeout. Revoke and release it so the new Playnite instance
+                // can reconcile immediately. Catalog generation/revision
+                // checks reject any old mutation already dispatched there.
+                if !settle_canceled_request(runtime, request) {
+                    transaction.call = Call::Waiting { request };
+                    self.transaction = Some(transaction);
                 }
             }
             self.last_error = Some(
@@ -832,6 +833,20 @@ impl CatalogSync {
             self.last_error = Some(error);
         }
     }
+}
+
+fn settle_canceled_request(runtime: &RuntimeClient, request: u64) -> bool {
+    for command in [
+        Command::Cancel { request },
+        Command::ReleaseResult { request },
+    ] {
+        match runtime.send_ephemeral(command) {
+            Ok(Response::Ok) => {}
+            Ok(Response::Error { code, .. }) if code == "not_found" => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn prepare_entries(games: &[Game]) -> Result<(Vec<Vec<Value>>, u64), String> {
@@ -952,6 +967,7 @@ mod tests {
         let response = match command {
             Command::Request { .. } => Response::Accepted { id: 42 },
             Command::TakeResult { .. } => Response::Pending,
+            Command::Cancel { .. } | Command::ReleaseResult { .. } => Response::Ok,
             _ => return STATUS_INVALID_ARGUMENT,
         };
         // SAFETY: context points to the live test host for this callback.
@@ -1182,10 +1198,93 @@ mod tests {
         );
         sync.advance(&runtime, 9).unwrap();
         assert!(matches!(
-            host.commands.last(),
-            Some(Command::TakeResult { request: 42 })
+            host.commands.as_slice(),
+            [
+                Command::Request { .. },
+                Command::Cancel { request: 42 },
+                Command::ReleaseResult { request: 42 }
+            ]
         ));
+        assert!(!sync.busy());
         assert!(sync.take_completed_launchable_game_ids().is_none());
+        sync.start(&snapshot, &settings, 9, 0).unwrap();
+        sync.advance(&runtime, 9).unwrap();
+        assert!(matches!(
+            host.commands.last(),
+            Some(Command::Request { .. })
+        ));
+        assert!(sync.busy());
+    }
+
+    #[test]
+    fn canceled_partial_import_does_not_block_or_authorize_reconnected_snapshot() {
+        let old_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        let current_id = "b1b2c3d4-1234-5678-9abc-0123456789ab";
+        let settings = ProductSettings {
+            sync_all_installed: true,
+            ..ProductSettings::default()
+        };
+        let snapshot = |id| Snapshot {
+            games: vec![game(id, "Game", r"C:\Games\game.exe")],
+            categories: vec![],
+            plugins: vec![],
+        };
+        let mut sync = CatalogSync::default();
+        sync.start(&snapshot(old_id), &settings, 7, 0).unwrap();
+        sync.transaction.as_mut().unwrap().call = Call::Waiting { request: 42 };
+        sync.cancel_after_process_change();
+
+        let mut host = Box::new(FakeCatalogHost::default());
+        let endpoint = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&mut *host as *mut FakeCatalogHost).cast(),
+            invoke: invoke_fake_catalog_host,
+        };
+        // SAFETY: host remains boxed and alive through every runtime call.
+        let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+        sync.advance(&runtime, 7).unwrap();
+        assert!(!sync.busy());
+        assert!(sync.take_completed_launchable_game_ids().is_none());
+        assert!(matches!(
+            host.commands.as_slice(),
+            [
+                Command::Cancel { request: 42 },
+                Command::ReleaseResult { request: 42 }
+            ]
+        ));
+
+        sync.start(&snapshot(current_id), &settings, 8, 0).unwrap();
+        let mut transaction = sync.transaction.take().unwrap();
+        finish_inventory(&mut transaction, vec![], 5);
+        assert_eq!(transaction.stage, Stage::Begin);
+        assert!(
+            !transaction
+                .consume(json!({
+                    "ok":true,"revision":5,"generation":2,"next_sequence":0
+                }))
+                .unwrap()
+        );
+        assert_eq!(transaction.payload()["entries"][0]["source_id"], current_id);
+        assert!(
+            !transaction
+                .consume(json!({
+                    "ok":true,"revision":6,"generation":2,"next_sequence":1
+                }))
+                .unwrap()
+        );
+        assert_eq!(transaction.stage, Stage::Finish);
+        sync.finish_call(
+            transaction,
+            json!({
+                "ok":true,"revision":6,"generation":2,"complete":true,
+                "cleanup_pending":false,"remove_stale":false,
+                "remove_uninstalled":true,"remove_expired":true,"remove_selection":true
+            }),
+        );
+        assert_eq!(
+            sync.take_completed_launchable_game_ids(),
+            Some(std::collections::BTreeSet::from([current_id.into()]))
+        );
     }
 
     #[test]
