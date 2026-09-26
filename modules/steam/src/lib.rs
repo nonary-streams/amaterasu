@@ -72,6 +72,11 @@ struct Provider {
     history_complete: bool,
     owned_history_complete: bool,
     remote_artwork: artwork::RemoteArtworkWorker,
+    local_artwork: artwork::LocalArtworkWorker,
+    local_artwork_responses: VecDeque<(u64, Value)>,
+    artwork_validation_pending: bool,
+    artwork_validation_complete: bool,
+    artwork_validation_retry_at: Option<Instant>,
     upgrade_queue: VecDeque<u32>,
     upgrade_pending: Option<PendingArtworkUpgrade>,
     upgrade_serial: u64,
@@ -113,8 +118,12 @@ impl Provider {
         }
         self.enabled = enabled;
         self.artwork_generation = self.artwork_generation.saturating_add(1);
+        self.local_artwork.set_generation(self.artwork_generation);
         if !enabled {
             self.scan = None;
+            self.artwork_validation_pending = false;
+            self.artwork_validation_complete = false;
+            self.artwork_validation_retry_at = None;
             self.games.clear();
             self.upgrade_queue.clear();
             self.upgrade_pending = None;
@@ -140,8 +149,12 @@ impl Provider {
             self.roots = defaults();
         }
         self.artwork_generation = self.artwork_generation.saturating_add(1);
+        self.local_artwork.set_generation(self.artwork_generation);
         self.upgrade_pending = None;
         self.upgrade_queue.clear();
+        self.artwork_validation_pending = false;
+        self.artwork_validation_complete = false;
+        self.artwork_validation_retry_at = None;
         self.scan = Some(Scan::new(&self.roots));
         true
     }
@@ -158,16 +171,73 @@ impl Provider {
         if !self.enabled {
             return;
         }
+        self.process_local_artwork();
+        if self.scan.is_none()
+            && self
+                .artwork_validation_retry_at
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.artwork_validation_retry_at = None;
+            self.start_scan();
+        }
         if let Some(scan) = &mut self.scan {
             scan.tick();
         }
-        if self.scan.as_ref().is_some_and(|scan| scan.finished) {
+        if self.scan.as_ref().is_some_and(|scan| scan.finished)
+            && !self.artwork_validation_pending
+            && !self.artwork_validation_complete
+        {
+            let scan = self.scan.as_ref().expect("finished scan exists");
+            if scan
+                .games
+                .values()
+                .all(|game| game.artwork_source_path.is_none())
+            {
+                self.artwork_validation_complete = true;
+            } else {
+                let targets = scan
+                    .games
+                    .values()
+                    .map(|game| artwork::LocalArtworkTarget {
+                        app_id: game.app_id,
+                        library: PathBuf::from(&game.library_directory),
+                    })
+                    .collect();
+                match self
+                    .local_artwork
+                    .enqueue(artwork::LocalArtworkRequest::Validate {
+                        generation: self.artwork_generation,
+                        roots: self.roots.clone(),
+                        targets,
+                    }) {
+                    Ok(()) => self.artwork_validation_pending = true,
+                    Err("artwork_busy") => {}
+                    Err(_) => {
+                        let scan = self.scan.as_mut().expect("finished scan exists");
+                        scan.warning_count += 1;
+                        scan.warnings.push("artwork_validation_unavailable".into());
+                        for game in scan.games.values_mut() {
+                            game.artwork_source_path = None;
+                            game.artwork_local_revision = None;
+                            game.artwork_is_remote = true;
+                            game.artwork_revision =
+                                artwork::remote_revision(game.app_id, game.last_updated);
+                        }
+                        self.artwork_validation_complete = true;
+                    }
+                }
+            }
+        }
+        if self.artwork_validation_complete && self.scan.as_ref().is_some_and(|scan| scan.finished)
+        {
             let scan = self.scan.take().expect("finished scan exists");
+            self.artwork_validation_complete = false;
             // The Steam client can be installed, moved, or removed while the
             // provider is running. Resolve it with each discovery snapshot so
             // reconciliation never keeps a stale launch program.
             self.steam_executable = discovery::find_steam_executable(&self.roots);
             self.artwork_generation = self.artwork_generation.saturating_add(1);
+            self.local_artwork.set_generation(self.artwork_generation);
             self.upgrade_pending = None;
             let mut games = scan.games;
             for (app_id, game) in &mut games {
@@ -367,8 +437,91 @@ impl Provider {
 
         let mut allowed_roots = vec![PathBuf::from(&game.library_directory)];
         allowed_roots.extend(self.roots.iter().cloned());
-        let chunk = artwork::read_chunk(source_path, revision, &allowed_roots, offset)?;
-        Ok(Some(artwork_chunk_payload(app_id, offset, chunk)))
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(remaining_ms))
+            .ok_or("invalid_request")?;
+        self.local_artwork
+            .enqueue(artwork::LocalArtworkRequest::Read {
+                generation: self.artwork_generation,
+                request_id,
+                app_id,
+                source_path: source_path.to_owned(),
+                revision: revision.to_owned(),
+                allowed_roots,
+                offset,
+                deadline,
+            })?;
+        Ok(None)
+    }
+
+    fn process_local_artwork(&mut self) {
+        for completion in self.local_artwork.drain() {
+            match completion {
+                artwork::LocalArtworkCompletion::Validated {
+                    generation,
+                    artwork,
+                    complete,
+                } => {
+                    if generation != self.artwork_generation || !self.artwork_validation_pending {
+                        continue;
+                    }
+                    self.artwork_validation_pending = false;
+                    let Some(scan) = self.scan.as_mut() else {
+                        continue;
+                    };
+                    if !complete || artwork.len() != scan.games.len() {
+                        self.scan = None;
+                        self.artwork_validation_retry_at =
+                            Some(Instant::now() + Duration::from_secs(5 * 60));
+                        self.warnings.push("artwork_validation_incomplete".into());
+                        self.warning_count = self.warning_count.saturating_add(1);
+                        continue;
+                    }
+                    for (app_id, metadata) in artwork {
+                        let Some(game) = scan.games.get_mut(&app_id) else {
+                            continue;
+                        };
+                        game.artwork_source_path = metadata.source_path;
+                        game.artwork_local_revision = metadata.revision.clone();
+                        game.artwork_is_remote = metadata.revision.is_none();
+                        game.artwork_revision = metadata
+                            .revision
+                            .or_else(|| artwork::remote_revision(app_id, game.last_updated));
+                        game.artwork_candidate_signature = metadata.candidate_signature;
+                        game.artwork_needs_remote_upgrade = metadata.needs_remote_upgrade;
+                    }
+                    self.artwork_validation_complete = true;
+                }
+                artwork::LocalArtworkCompletion::Read {
+                    generation,
+                    request_id,
+                    app_id,
+                    revision,
+                    offset,
+                    result,
+                } => {
+                    let current = generation == self.artwork_generation
+                        && self.games.get(&app_id).is_some_and(|game| {
+                            !game.artwork_is_remote
+                                && game.artwork_revision.as_deref() == Some(revision.as_str())
+                        });
+                    let payload = if !current {
+                        json!({"ok":false,"code":"artwork_changed"})
+                    } else {
+                        match result {
+                            Ok(chunk) => artwork_chunk_payload(app_id, offset, chunk),
+                            Err(code) => json!({"ok":false,"code":code}),
+                        }
+                    };
+                    self.local_artwork_responses
+                        .push_back((request_id, payload));
+                }
+            }
+        }
+    }
+
+    fn drain_local_artwork(&mut self) -> Vec<(u64, Value)> {
+        self.local_artwork_responses.drain(..).collect()
     }
 
     fn drain_remote_artwork(&mut self) -> Vec<(u64, Value)> {
@@ -586,6 +739,15 @@ impl ManagedModule for SteamModule {
 
     fn tick(&mut self) -> ModuleResult<()> {
         self.provider.tick();
+        for (request, payload) in self.provider.drain_local_artwork() {
+            self.complete(
+                request,
+                with_catalog_sync_status(
+                    with_settings_ready(payload, self.configuration.is_ready()),
+                    self.catalog_sync.status(),
+                ),
+            )?;
+        }
         for (request, payload) in self.provider.drain_remote_artwork() {
             self.complete(
                 request,

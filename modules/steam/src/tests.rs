@@ -34,10 +34,12 @@ fn upgrade_game(app_id: u32, needs_upgrade: bool) -> Game {
 }
 
 fn remote_test_jpeg() -> Vec<u8> {
-    let mut bytes = vec![
-        0xff, 0xd8, 0xff, 0xc0, 0, 17, 8, 3, 132, 2, 88, 3, 1, 17, 0, 2, 17, 0, 3, 17, 0,
-    ];
-    bytes.extend_from_slice(&[0xff, 0xd9]);
+    use image::ImageEncoder;
+    let pixels = vec![128_u8; 600 * 900 * 3];
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+        .write_image(&pixels, 600, 900, image::ExtendedColorType::Rgb8)
+        .unwrap();
     bytes
 }
 
@@ -104,6 +106,7 @@ fn low_resolution_art_promotes_only_after_successful_current_remote_fetch() {
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0].0, 10);
     assert_eq!(responses[0].1["revision"], remote);
+    assert_eq!(responses[0].1["mime_type"], "image/png");
 }
 
 #[test]
@@ -386,10 +389,22 @@ fn artwork_read_uses_only_the_current_app_revision_and_never_returns_a_path() {
         },
     );
 
-    let payload = provider
-        .read_artwork(11, 42, &revision, 0, 1_000)
-        .unwrap()
-        .unwrap();
+    assert!(
+        provider
+            .read_artwork(11, 42, &revision, 0, 1_000)
+            .unwrap()
+            .is_none()
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let payload = loop {
+        provider.process_local_artwork();
+        if let Some((id, payload)) = provider.drain_local_artwork().pop() {
+            assert_eq!(id, 11);
+            break payload;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    };
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["app_id"], 42);
     assert_eq!(payload["revision"], revision);

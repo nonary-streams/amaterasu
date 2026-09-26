@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 amaterasu-module-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 ureq = { version = "3.4", default-features = false, features = ["rustls", "platform-verifier"] }
 
 [lints]

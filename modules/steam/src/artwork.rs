@@ -1,7 +1,9 @@
 //! Bounded local Steam artwork discovery for catalog synchronization.
+use image::codecs::png::PngEncoder;
+use image::{ImageEncoder, ImageFormat, ImageReader, Limits};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
@@ -18,6 +20,7 @@ pub const MAX_ARTWORK_BYTES: u64 = 16 * 1024 * 1024;
 // Bound the pixel buffer an image decoder would allocate after the compressed
 // transfer has passed its byte limit (four bytes per pixel).
 const MAX_DECODED_ARTWORK_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ARTWORK_DIMENSION: u32 = 8192;
 const MAX_REMOTE_CACHE_IMAGES: usize = 4;
 const REMOTE_CACHE_DIRECTORY: &str = "amaterasu-steam-artwork-v1";
 const MAX_TEMP_NAME_ATTEMPTS: u64 = 8;
@@ -50,18 +53,6 @@ struct LocalArtworkCandidate {
     height: u32,
 }
 
-impl LocalArtworkCandidate {
-    fn is_better_than(&self, previous: &Self) -> bool {
-        (self.role_priority, self.pixel_area, self.width, self.height)
-            > (
-                previous.role_priority,
-                previous.pixel_area,
-                previous.width,
-                previous.height,
-            )
-    }
-}
-
 #[derive(Debug)]
 pub struct ArtworkChunk {
     pub revision: String,
@@ -76,6 +67,17 @@ struct CachedRemoteArtwork {
     app_id: u32,
     revision: String,
     bytes: Vec<u8>,
+}
+
+struct CachedLocalArtwork {
+    source_path: PathBuf,
+    revision: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+pub struct LocalArtworkCache {
+    images: VecDeque<CachedLocalArtwork>,
 }
 
 #[derive(Default)]
@@ -104,6 +106,194 @@ pub struct RemoteArtworkCompletion {
     pub revision: String,
     pub offset: u64,
     pub result: Result<ArtworkChunk, &'static str>,
+}
+
+pub struct LocalArtworkTarget {
+    pub app_id: u32,
+    pub library: PathBuf,
+}
+
+pub enum LocalArtworkRequest {
+    Validate {
+        generation: u64,
+        roots: Vec<PathBuf>,
+        targets: Vec<LocalArtworkTarget>,
+    },
+    Read {
+        generation: u64,
+        request_id: u64,
+        app_id: u32,
+        source_path: String,
+        revision: String,
+        allowed_roots: Vec<PathBuf>,
+        offset: u64,
+        deadline: Instant,
+    },
+}
+
+pub enum LocalArtworkCompletion {
+    Validated {
+        generation: u64,
+        artwork: BTreeMap<u32, ArtworkMetadata>,
+        complete: bool,
+    },
+    Read {
+        generation: u64,
+        request_id: u64,
+        app_id: u32,
+        revision: String,
+        offset: u64,
+        result: Result<ArtworkChunk, &'static str>,
+    },
+}
+
+#[derive(Default)]
+pub struct LocalArtworkWorker {
+    requests: Option<mpsc::SyncSender<LocalArtworkRequest>>,
+    completions: Option<mpsc::Receiver<LocalArtworkCompletion>>,
+    stopped: Arc<AtomicBool>,
+    current_generation: Arc<AtomicU64>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl LocalArtworkWorker {
+    pub fn set_generation(&self, generation: u64) {
+        self.current_generation.store(generation, Ordering::Release);
+    }
+
+    pub fn enqueue(&mut self, request: LocalArtworkRequest) -> Result<(), &'static str> {
+        self.start_if_needed()?;
+        self.requests
+            .as_ref()
+            .ok_or("artwork_unavailable")?
+            .try_send(request)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => "artwork_busy",
+                mpsc::TrySendError::Disconnected(_) => "artwork_unavailable",
+            })
+    }
+
+    pub fn drain(&mut self) -> Vec<LocalArtworkCompletion> {
+        self.completions
+            .as_ref()
+            .map_or_else(Vec::new, |receiver| receiver.try_iter().collect())
+    }
+
+    fn start_if_needed(&mut self) -> Result<(), &'static str> {
+        if self.requests.is_some() {
+            return Ok(());
+        }
+        let (request_sender, request_receiver) = mpsc::sync_channel(1);
+        let (completion_sender, completion_receiver) = mpsc::sync_channel(2);
+        let stopped = Arc::clone(&self.stopped);
+        let current_generation = Arc::clone(&self.current_generation);
+        let worker_thread = thread::Builder::new()
+            .name("steam-artwork-local".into())
+            .spawn(move || {
+                let mut cache = LocalArtworkCache::default();
+                while let Ok(request) = request_receiver.recv() {
+                    if stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let completion = match request {
+                        LocalArtworkRequest::Validate {
+                            generation,
+                            roots,
+                            targets,
+                        } => {
+                            let mut artwork = BTreeMap::new();
+                            let deadline = Instant::now() + Duration::from_secs(15);
+                            let target_count = targets.len();
+                            for target in targets {
+                                if stopped.load(Ordering::Acquire)
+                                    || current_generation.load(Ordering::Acquire) != generation
+                                    || Instant::now() >= deadline
+                                {
+                                    break;
+                                }
+                                artwork.insert(
+                                    target.app_id,
+                                    discover_with_validation(
+                                        target.app_id,
+                                        &target.library,
+                                        &roots,
+                                        Some(&mut cache),
+                                        Some(&|| {
+                                            stopped.load(Ordering::Acquire)
+                                                || current_generation.load(Ordering::Acquire)
+                                                    != generation
+                                                || Instant::now() >= deadline
+                                        }),
+                                    ),
+                                );
+                            }
+                            LocalArtworkCompletion::Validated {
+                                generation,
+                                complete: artwork.len() == target_count
+                                    && Instant::now() < deadline,
+                                artwork,
+                            }
+                        }
+                        LocalArtworkRequest::Read {
+                            generation,
+                            request_id,
+                            app_id,
+                            source_path,
+                            revision,
+                            allowed_roots,
+                            offset,
+                            deadline,
+                        } => {
+                            let result = if Instant::now() >= deadline
+                                || current_generation.load(Ordering::Acquire) != generation
+                            {
+                                Err("request_ended")
+                            } else {
+                                read_chunk_cached(
+                                    &mut cache,
+                                    &source_path,
+                                    &revision,
+                                    &allowed_roots,
+                                    offset,
+                                )
+                            };
+                            let result = if Instant::now() >= deadline {
+                                Err("request_ended")
+                            } else {
+                                result
+                            };
+                            LocalArtworkCompletion::Read {
+                                generation,
+                                request_id,
+                                app_id,
+                                revision,
+                                offset,
+                                result,
+                            }
+                        }
+                    };
+                    if completion_sender.send(completion).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|_| "artwork_unavailable")?;
+        self.requests = Some(request_sender);
+        self.completions = Some(completion_receiver);
+        self.thread = Some(worker_thread);
+        Ok(())
+    }
+}
+
+impl Drop for LocalArtworkWorker {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        self.completions.take();
+        self.requests.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -208,11 +398,7 @@ impl RemoteArtworkCache {
         }
         self.failed_until.remove(&app_id);
 
-        let bytes = match fetcher(app_id).and_then(|bytes| {
-            validate_remote_artwork(&bytes)
-                .then_some(bytes)
-                .ok_or("unsupported_artwork")
-        }) {
+        let bytes = match fetcher(app_id).and_then(|bytes| convert_remote_jpeg(&bytes)) {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.remember_failure(app_id, now);
@@ -255,7 +441,7 @@ impl RemoteArtworkCache {
         Some(
             self.disk_root
                 .as_ref()?
-                .join(format!("{app_id}-{revision}.jpg")),
+                .join(format!("{app_id}-{revision}.png")),
         )
     }
 
@@ -286,7 +472,7 @@ impl RemoteArtworkCache {
         (bytes.len() as u64 == opened.len()
             && path.canonicalize().ok().as_ref() == Some(&path)
             && self.disk_directory_valid()
-            && validate_remote_artwork(&bytes))
+            && validate_cached_png(&bytes))
         .then_some(bytes)
     }
 
@@ -294,7 +480,7 @@ impl RemoteArtworkCache {
         let Some(path) = self.disk_path(app_id, revision) else {
             return;
         };
-        if !validate_remote_artwork(bytes) || bytes.len() as u64 > MAX_ARTWORK_BYTES {
+        if !validate_cached_png(bytes) {
             return;
         }
         if !self.reclaim_or_bound_temporary_files() {
@@ -428,7 +614,7 @@ impl RemoteArtworkCache {
         {
             return false;
         }
-        !validate_remote_artwork(&bytes)
+        !validate_cached_png(&bytes)
     }
 
     fn make_disk_room(&self) -> bool {
@@ -450,7 +636,12 @@ impl RemoteArtworkCache {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            let Some(stem) = name.strip_suffix(".jpg") else {
+            // Older releases stored the same opaque key as JPEG. Count those
+            // entries during eviction so conversion does not grow this child.
+            let Some(stem) = name
+                .strip_suffix(".png")
+                .or_else(|| name.strip_suffix(".jpg"))
+            else {
                 continue;
             };
             let Some((app_id, revision)) = stem.split_once('-') else {
@@ -676,6 +867,91 @@ fn validate_remote_artwork(bytes: &[u8]) -> bool {
         })
 }
 
+fn convert_remote_jpeg(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if !validate_remote_artwork(bytes) {
+        return Err("unsupported_artwork");
+    }
+    convert_to_png(bytes, ImageFormat::Jpeg)
+}
+
+fn validate_cached_png(bytes: &[u8]) -> bool {
+    if bytes.is_empty()
+        || bytes.len() as u64 > MAX_ARTWORK_BYTES
+        || image_mime_from_header(bytes) != Some("image/png")
+    {
+        return false;
+    }
+    let Some((width, height)) = png_dimensions(bytes) else {
+        return false;
+    };
+    width >= 600
+        && height >= 900
+        && u64::from(width) * 3 == u64::from(height) * 2
+        && decoded_size_is_bounded(width, height)
+        && decode_image(bytes, ImageFormat::Png).is_ok()
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    (bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR")
+        .then(|| {
+            (
+                u32::from_be_bytes(bytes[16..20].try_into().expect("four bytes")),
+                u32::from_be_bytes(bytes[20..24].try_into().expect("four bytes")),
+            )
+        })
+}
+
+fn decode_image(bytes: &[u8], format: ImageFormat) -> Result<image::DynamicImage, &'static str> {
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(MAX_DECODED_ARTWORK_BYTES);
+    limits.max_image_width = Some(MAX_ARTWORK_DIMENSION);
+    limits.max_image_height = Some(MAX_ARTWORK_DIMENSION);
+    reader.limits(limits);
+    let image = reader.decode().map_err(|_| "unsupported_artwork")?;
+    if !decoded_size_is_bounded(image.width(), image.height()) {
+        return Err("unsupported_artwork");
+    }
+    Ok(image)
+}
+
+fn convert_to_png(bytes: &[u8], format: ImageFormat) -> Result<Vec<u8>, &'static str> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_ARTWORK_BYTES {
+        return Err("unsupported_artwork");
+    }
+    let image = decode_image(bytes, format)?;
+    let pixels = image.to_rgba8();
+    let mut encoded = BoundedArtworkWriter::default();
+    PngEncoder::new(&mut encoded)
+        .write_image(
+            pixels.as_raw(),
+            image.width(),
+            image.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|_| "unsupported_artwork")?;
+    Ok(encoded.bytes)
+}
+
+#[derive(Default)]
+struct BoundedArtworkWriter {
+    bytes: Vec<u8>,
+}
+
+impl Write for BoundedArtworkWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > MAX_ARTWORK_BYTES as usize {
+            return Err(std::io::Error::other("converted artwork exceeds limit"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < 4 || !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
         return None;
@@ -795,6 +1071,16 @@ fn remote_agent() -> &'static Agent {
 /// bounded Steam cache and grid directory entries and never follows an artwork
 /// file symlink outside a canonical Steam root.
 pub fn discover(app_id: u32, library: &Path, configured_roots: &[PathBuf]) -> ArtworkMetadata {
+    discover_with_validation(app_id, library, configured_roots, None, None)
+}
+
+fn discover_with_validation(
+    app_id: u32,
+    library: &Path,
+    configured_roots: &[PathBuf],
+    mut cache: Option<&mut LocalArtworkCache>,
+    cancelled: Option<&dyn Fn() -> bool>,
+) -> ArtworkMetadata {
     let mut roots = Vec::new();
     let mut seen_roots = BTreeSet::new();
     for root in std::iter::once(library).chain(configured_roots.iter().map(PathBuf::as_path)) {
@@ -815,15 +1101,24 @@ pub fn discover(app_id: u32, library: &Path, configured_roots: &[PathBuf]) -> Ar
     }
 
     let candidate_signature = local_candidate_signature(&candidates);
-    let mut best_candidate: Option<LocalArtworkCandidate> = None;
-    for candidate in candidates {
-        let replace = best_candidate
-            .as_ref()
-            .is_none_or(|previous| candidate.is_better_than(previous));
-        if replace {
-            best_candidate = Some(candidate);
+    candidates.sort_by(|left, right| {
+        (
+            right.role_priority,
+            right.pixel_area,
+            right.width,
+            right.height,
+        )
+            .cmp(&(left.role_priority, left.pixel_area, left.width, left.height))
+            .then_with(|| left.canonical_path.cmp(&right.canonical_path))
+    });
+    let best_candidate = candidates.into_iter().find(|candidate| {
+        if cancelled.is_some_and(|cancelled| cancelled()) {
+            return false;
         }
-    }
+        cache
+            .as_deref_mut()
+            .is_none_or(|cache| validate_local_candidate(candidate, cache))
+    });
 
     match best_candidate {
         Some(candidate) => ArtworkMetadata {
@@ -839,6 +1134,54 @@ pub fn discover(app_id: u32, library: &Path, configured_roots: &[PathBuf]) -> Ar
             ..ArtworkMetadata::default()
         },
     }
+}
+
+fn validate_local_candidate(
+    candidate: &LocalArtworkCandidate,
+    cache: &mut LocalArtworkCache,
+) -> bool {
+    let source_path = candidate.canonical_path.to_string_lossy();
+    let Some(revision) = candidate.metadata.revision.as_deref() else {
+        return false;
+    };
+    if read_chunk_cached(
+        cache,
+        &source_path,
+        revision,
+        &[candidate
+            .canonical_path
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .to_path_buf()],
+        0,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    if image_mime(&candidate.canonical_path) == Some("image/png") {
+        let Ok(file) = File::open(&candidate.canonical_path) else {
+            return false;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_ARTWORK_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 != candidate.byte_length
+        {
+            return false;
+        }
+        return decode_image(&bytes, ImageFormat::Png).is_ok()
+            && candidate
+                .canonical_path
+                .metadata()
+                .ok()
+                .is_some_and(|metadata| {
+                    revision_for_metadata(&candidate.canonical_path, &metadata) == revision
+                });
+    }
+    true
 }
 
 fn local_candidate_signature(candidates: &[LocalArtworkCandidate]) -> String {
@@ -1108,10 +1451,12 @@ fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
 }
 
 fn decoded_size_is_bounded(width: u32, height: u32) -> bool {
-    u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|pixels| pixels.checked_mul(4))
-        .is_some_and(|bytes| bytes <= MAX_DECODED_ARTWORK_BYTES)
+    width <= MAX_ARTWORK_DIMENSION
+        && height <= MAX_ARTWORK_DIMENSION
+        && u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .is_some_and(|bytes| bytes <= MAX_DECODED_ARTWORK_BYTES)
 }
 
 fn webp_dimensions(header: &[u8]) -> Option<(u32, u32)> {
@@ -1141,7 +1486,24 @@ fn webp_dimensions(header: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
+#[cfg(test)]
 pub fn read_chunk(
+    source_path: &str,
+    expected_revision: &str,
+    allowed_roots: &[PathBuf],
+    offset: u64,
+) -> Result<ArtworkChunk, &'static str> {
+    read_chunk_cached(
+        &mut LocalArtworkCache::default(),
+        source_path,
+        expected_revision,
+        allowed_roots,
+        offset,
+    )
+}
+
+pub fn read_chunk_cached(
+    cache: &mut LocalArtworkCache,
     source_path: &str,
     expected_revision: &str,
     allowed_roots: &[PathBuf],
@@ -1190,12 +1552,79 @@ pub fn read_chunk(
     }
     let file_revision = revision_for_metadata(&canonical_source, &file_metadata);
     if file_revision != expected_revision {
+        cache
+            .images
+            .retain(|image| image.source_path != canonical_source);
         return Err("artwork_changed");
     }
 
     let mut header = [0_u8; 12];
     let header_bytes = file.read(&mut header).map_err(|_| "artwork_unavailable")?;
     let mime_type = image_mime_from_header(&header[..header_bytes]).ok_or("unsupported_artwork")?;
+    if mime_type != "image/png" {
+        if let Some(index) = cache.images.iter().position(|image| {
+            image.source_path == canonical_source && image.revision == expected_revision
+        }) {
+            if revision_for_metadata(
+                &canonical_source,
+                &file.metadata().map_err(|_| "artwork_changed")?,
+            ) != expected_revision
+                || source_path.canonicalize().map_err(|_| "artwork_changed")? != canonical_source
+            {
+                cache
+                    .images
+                    .retain(|image| image.source_path != canonical_source);
+                return Err("artwork_changed");
+            }
+            let image = cache.images.remove(index).expect("located image exists");
+            let result = chunk_from_bytes(&image.bytes, expected_revision, offset);
+            cache.images.push_back(image);
+            return result;
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| "artwork_unavailable")?;
+        let mut source_bytes = Vec::with_capacity(file_metadata.len() as usize);
+        (&mut file)
+            .take(file_metadata.len() + 1)
+            .read_to_end(&mut source_bytes)
+            .map_err(|_| "artwork_changed")?;
+        if source_bytes.len() as u64 != file_metadata.len()
+            || revision_for_metadata(
+                &canonical_source,
+                &file.metadata().map_err(|_| "artwork_changed")?,
+            ) != expected_revision
+            || source_path.canonicalize().map_err(|_| "artwork_changed")? != canonical_source
+        {
+            return Err("artwork_changed");
+        }
+        let format = if mime_type == "image/jpeg" {
+            ImageFormat::Jpeg
+        } else {
+            ImageFormat::WebP
+        };
+        let converted = convert_to_png(&source_bytes, format)?;
+        if revision_for_metadata(
+            &canonical_source,
+            &file.metadata().map_err(|_| "artwork_changed")?,
+        ) != expected_revision
+            || source_path.canonicalize().map_err(|_| "artwork_changed")? != canonical_source
+        {
+            return Err("artwork_changed");
+        }
+        let result = chunk_from_bytes(&converted, expected_revision, offset);
+        cache
+            .images
+            .retain(|image| image.source_path != canonical_source);
+        if cache.images.len() == MAX_REMOTE_CACHE_IMAGES {
+            cache.images.pop_front();
+        }
+        cache.images.push_back(CachedLocalArtwork {
+            source_path: canonical_source,
+            revision: expected_revision.to_owned(),
+            bytes: converted,
+        });
+        return result;
+    }
     let total_bytes = file_metadata.len();
     if offset >= total_bytes {
         return Err("invalid_cursor");
@@ -1544,6 +1973,35 @@ mod tests {
         bytes
     }
 
+    fn valid_png(width: u32, height: u32) -> Vec<u8> {
+        let pixels = vec![32_u8; width as usize * height as usize * 4];
+        let mut encoded = Vec::new();
+        PngEncoder::new(&mut encoded)
+            .write_image(&pixels, width, height, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        encoded
+    }
+
+    #[test]
+    fn validation_skips_corrupt_full_portrait_before_publishing_fallback() {
+        let root = TemporaryRoot::new();
+        let directory = root.0.join("appcache/librarycache");
+        fs::create_dir_all(&directory).unwrap();
+        let corrupt = directory.join("42_library_600x900_2x.jpg");
+        let fallback = directory.join("42_library_600x900.png");
+        fs::write(&corrupt, synthetic_jpeg(600, 900, 64)).unwrap();
+        fs::write(&fallback, valid_png(300, 450)).unwrap();
+        let mut cache = LocalArtworkCache::default();
+        let artwork = discover_with_validation(42, &root.0, &[], Some(&mut cache), None);
+        assert_eq!(artwork.source_path.as_deref(), fallback.to_str());
+        assert!(artwork.needs_remote_upgrade);
+
+        fs::write(&fallback, synthetic_png(600, 900)).unwrap();
+        let artwork = discover_with_validation(42, &root.0, &[], Some(&mut cache), None);
+        assert!(artwork.source_path.is_none());
+        assert!(artwork.revision.is_none());
+    }
+
     #[test]
     fn falls_back_to_user_grid_and_ignores_unbounded_or_empty_sources() {
         let root = TemporaryRoot::new();
@@ -1584,28 +2042,30 @@ mod tests {
         let cache = root.0.join("appcache/librarycache");
         fs::create_dir_all(&cache).unwrap();
         let image = cache.join("42_library_600x900_2x.jpg");
-        let bytes = synthetic_jpeg(600, 900, ARTWORK_CHUNK_BYTES + 3);
+        let bytes = valid_jpeg();
+        let converted = convert_to_png(&bytes, ImageFormat::Jpeg).unwrap();
         fs::write(&image, &bytes).unwrap();
         let discovered = discover(42, &root.0, &[]);
         let source_path = discovered.source_path.unwrap();
         let revision = discovered.revision.unwrap();
 
         let first = read_chunk(&source_path, &revision, std::slice::from_ref(&root.0), 0).unwrap();
-        assert_eq!(first.mime_type, "image/jpeg");
-        assert!(first.data.starts_with("/9j/"));
-        assert_eq!(first.total_bytes, bytes.len() as u64);
+        assert_eq!(first.mime_type, "image/png");
+        assert!(first.data.starts_with("iVBOR"));
+        assert_eq!(first.total_bytes, converted.len() as u64);
         assert_eq!(first.next_offset, Some(ARTWORK_CHUNK_BYTES as u64));
-        assert_eq!(first.data, base64_encode(&bytes[..ARTWORK_CHUNK_BYTES]));
+        assert_eq!(first.data, base64_encode(&converted[..ARTWORK_CHUNK_BYTES]));
 
         let last = read_chunk(
             &source_path,
             &revision,
             std::slice::from_ref(&root.0),
-            ARTWORK_CHUNK_BYTES as u64,
+            ((converted.len() - 1) / ARTWORK_CHUNK_BYTES * ARTWORK_CHUNK_BYTES) as u64,
         )
         .unwrap();
         assert_eq!(last.next_offset, None);
-        assert_eq!(last.data, base64_encode(&bytes[ARTWORK_CHUNK_BYTES..]));
+        let last_offset = (converted.len() - 1) / ARTWORK_CHUNK_BYTES * ARTWORK_CHUNK_BYTES;
+        assert_eq!(last.data, base64_encode(&converted[last_offset..]));
         assert_eq!(
             read_chunk(&source_path, &revision, std::slice::from_ref(&root.0), 1).unwrap_err(),
             "invalid_cursor"
@@ -1618,6 +2078,71 @@ mod tests {
             read_chunk(&source_path, &revision, &[], 0).unwrap_err(),
             "artwork_outside_roots"
         );
+    }
+
+    #[test]
+    fn local_webp_conversion_is_cached_and_stale_revision_is_rejected() {
+        use image::codecs::webp::WebPEncoder;
+        let root = TemporaryRoot::new();
+        let cache_dir = root.0.join("appcache/librarycache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let image_path = cache_dir.join("42_library_600x900_2x.webp");
+        let pixels = vec![64_u8; 300 * 450 * 4];
+        let mut webp = Vec::new();
+        WebPEncoder::new_lossless(&mut webp)
+            .write_image(&pixels, 300, 450, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        fs::write(&image_path, &webp).unwrap();
+        let discovered = discover(42, &root.0, &[]);
+        let revision = discovered.revision.unwrap();
+        let mut cache = LocalArtworkCache::default();
+        let first = read_chunk_cached(
+            &mut cache,
+            image_path.to_str().unwrap(),
+            &revision,
+            std::slice::from_ref(&root.0),
+            0,
+        )
+        .unwrap();
+        assert_eq!(first.mime_type, "image/png");
+        assert_eq!(cache.images.len(), 1);
+        let again = read_chunk_cached(
+            &mut cache,
+            image_path.to_str().unwrap(),
+            &revision,
+            std::slice::from_ref(&root.0),
+            0,
+        )
+        .unwrap();
+        assert_eq!(again.data, first.data);
+        fs::write(&image_path, b"changed").unwrap();
+        assert_eq!(
+            read_chunk_cached(
+                &mut cache,
+                image_path.to_str().unwrap(),
+                &revision,
+                std::slice::from_ref(&root.0),
+                0,
+            )
+            .unwrap_err(),
+            "artwork_changed"
+        );
+        assert!(cache.images.is_empty());
+    }
+
+    #[test]
+    fn remote_decode_failure_does_not_enter_cache_or_publish_png() {
+        let revision = remote_revision(42, 123).unwrap();
+        let mut cache = RemoteArtworkCache::default();
+        let malformed = synthetic_jpeg(600, 900, 64);
+        assert!(validate_remote_artwork(&malformed));
+        assert_eq!(
+            cache
+                .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| Ok(malformed))
+                .unwrap_err(),
+            "unsupported_artwork"
+        );
+        assert!(cache.images.is_empty());
     }
 
     fn synthetic_jpeg(width: u16, height: u16, total_bytes: usize) -> Vec<u8> {
@@ -1649,6 +2174,29 @@ mod tests {
         bytes
     }
 
+    fn valid_jpeg() -> Vec<u8> {
+        use image::codecs::jpeg::JpegEncoder;
+        static JPEG: OnceLock<Vec<u8>> = OnceLock::new();
+        JPEG.get_or_init(|| {
+            let mut pixels = Vec::with_capacity(600 * 900 * 3);
+            for y in 0..900_u32 {
+                for x in 0..600_u32 {
+                    pixels.extend_from_slice(&[
+                        (x.wrapping_mul(37) ^ y.wrapping_mul(19)) as u8,
+                        (x.wrapping_mul(11) ^ y.wrapping_mul(43)) as u8,
+                        (x.wrapping_mul(53) ^ y.wrapping_mul(7)) as u8,
+                    ]);
+                }
+            }
+            let mut encoded = Vec::new();
+            JpegEncoder::new_with_quality(&mut encoded, 75)
+                .write_image(&pixels, 600, 900, image::ExtendedColorType::Rgb8)
+                .unwrap();
+            encoded
+        })
+        .clone()
+    }
+
     #[test]
     fn remote_artwork_revision_and_url_are_stable_and_derived_only_from_app_id() {
         assert_eq!(
@@ -1667,25 +2215,27 @@ mod tests {
 
     #[test]
     fn remote_artwork_cache_fetches_once_and_serves_the_same_chunk_contract() {
-        let bytes = synthetic_jpeg(600, 900, ARTWORK_CHUNK_BYTES + 19);
+        let source = valid_jpeg();
+        let bytes = convert_remote_jpeg(&source).unwrap();
         let revision = remote_revision(42, 123).unwrap();
         let mut cache = RemoteArtworkCache::default();
         let now = Instant::now();
         let first = cache
-            .read_chunk_with(42, 123, &revision, 0, now, |_| Ok(bytes.clone()))
+            .read_chunk_with(42, 123, &revision, 0, now, |_| Ok(source.clone()))
             .unwrap();
-        assert_eq!(first.mime_type, "image/jpeg");
+        assert_eq!(first.mime_type, "image/png");
         assert_eq!(first.total_bytes, bytes.len() as u64);
         assert_eq!(first.next_offset, Some(ARTWORK_CHUNK_BYTES as u64));
         assert_eq!(first.data, base64_encode(&bytes[..ARTWORK_CHUNK_BYTES]));
 
+        let last_offset = ((bytes.len() - 1) / ARTWORK_CHUNK_BYTES * ARTWORK_CHUNK_BYTES) as u64;
         let last = cache
-            .read_chunk_with(42, 123, &revision, ARTWORK_CHUNK_BYTES as u64, now, |_| {
+            .read_chunk_with(42, 123, &revision, last_offset, now, |_| {
                 panic!("cache hit must not fetch again")
             })
             .unwrap();
         assert_eq!(last.next_offset, None);
-        assert_eq!(last.data, base64_encode(&bytes[ARTWORK_CHUNK_BYTES..]));
+        assert_eq!(last.data, base64_encode(&bytes[last_offset as usize..]));
         assert_eq!(last.revision, revision);
     }
 
@@ -1693,16 +2243,17 @@ mod tests {
     fn remote_artwork_survives_cache_restart_and_rejects_corrupt_disk_bytes() {
         let root = TemporaryRoot::new();
         let revision = remote_revision(42, 123).unwrap();
-        let bytes = synthetic_jpeg(600, 900, ARTWORK_CHUNK_BYTES + 19);
+        let source = valid_jpeg();
+        let bytes = convert_remote_jpeg(&source).unwrap();
         let now = Instant::now();
         let mut first = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
         first
-            .read_chunk_with(42, 123, &revision, 0, now, |_| Ok(bytes.clone()))
+            .read_chunk_with(42, 123, &revision, 0, now, |_| Ok(source.clone()))
             .unwrap();
         let path = root
             .0
             .join(REMOTE_CACHE_DIRECTORY)
-            .join(format!("42-{revision}.jpg"));
+            .join(format!("42-{revision}.png"));
         assert_eq!(fs::read(&path).unwrap(), bytes);
 
         let mut restarted = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
@@ -1711,12 +2262,15 @@ mod tests {
                 panic!("valid persistent portrait must not fetch")
             })
             .unwrap();
-        assert_eq!(from_disk.data, base64_encode(&bytes[ARTWORK_CHUNK_BYTES..]));
+        assert_eq!(
+            from_disk.data,
+            base64_encode(&bytes[ARTWORK_CHUNK_BYTES..2 * ARTWORK_CHUNK_BYTES])
+        );
 
         fs::write(&path, b"corrupt").unwrap();
         let mut recovered = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
         recovered
-            .read_chunk_with(42, 123, &revision, 0, now, |_| Ok(bytes.clone()))
+            .read_chunk_with(42, 123, &revision, 0, now, |_| Ok(source.clone()))
             .unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(recovered.images.len(), 1);
@@ -1736,12 +2290,20 @@ mod tests {
         let child = root.0.join(REMOTE_CACHE_DIRECTORY);
         let abandoned = child.join(format!("42-{revision}.{}.tmp", std::process::id()));
         fs::write(&abandoned, b"abandoned previous process write").unwrap();
-        let bytes = synthetic_jpeg(600, 900, 64);
+        let source = valid_jpeg();
+        let bytes = convert_remote_jpeg(&source).unwrap();
         cache
-            .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| Ok(bytes.clone()))
+            .read_chunk_with(
+                42,
+                123,
+                &revision,
+                0,
+                Instant::now(),
+                |_| Ok(source.clone()),
+            )
             .unwrap();
         assert_eq!(
-            fs::read(child.join(format!("42-{revision}.jpg"))).unwrap(),
+            fs::read(child.join(format!("42-{revision}.png"))).unwrap(),
             bytes
         );
         assert_eq!(
@@ -1755,7 +2317,7 @@ mod tests {
         let root = TemporaryRoot::new();
         let child = root.0.join(REMOTE_CACHE_DIRECTORY);
         let revision = remote_revision(42, 123).unwrap();
-        let entry = child.join(format!("42-{revision}.jpg"));
+        let entry = child.join(format!("42-{revision}.png"));
         let cache = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
         fs::write(&entry, b"corrupt").unwrap();
         let active_clock = SystemTime::now()
@@ -1774,9 +2336,17 @@ mod tests {
         let unrelated = root.0.join(format!("42-{revision}.999.1.0.tmp"));
         fs::write(&unrelated, b"unrelated parent").unwrap();
         let mut cache = cache;
-        let bytes = synthetic_jpeg(600, 900, 64);
+        let source = valid_jpeg();
+        let bytes = convert_remote_jpeg(&source).unwrap();
         cache
-            .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| Ok(bytes.clone()))
+            .read_chunk_with(
+                42,
+                123,
+                &revision,
+                0,
+                Instant::now(),
+                |_| Ok(source.clone()),
+            )
             .unwrap();
         assert_eq!(fs::read(entry).unwrap(), bytes);
         assert_eq!(fs::read(active).unwrap(), b"active writer");
@@ -1801,13 +2371,13 @@ mod tests {
             )
             .unwrap();
         }
-        let bytes = synthetic_jpeg(600, 900, 64);
+        let bytes = valid_jpeg();
         assert!(
             cache
                 .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| Ok(bytes))
                 .is_ok()
         );
-        assert!(!child.join(format!("42-{revision}.jpg")).exists());
+        assert!(!child.join(format!("42-{revision}.png")).exists());
         assert_eq!(
             fs::read_dir(child).unwrap().count(),
             MAX_REMOTE_CACHE_TEMP_FILES
@@ -1826,7 +2396,7 @@ mod tests {
             let revision = remote_revision(app_id, 123).unwrap();
             cache
                 .read_chunk_with(app_id, 123, &revision, 0, Instant::now(), |_| {
-                    Ok(synthetic_jpeg(600, 900, 64))
+                    Ok(valid_jpeg())
                 })
                 .unwrap();
         }
@@ -1865,17 +2435,15 @@ mod tests {
 
         let mut cache = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
         let revision = remote_revision(42, 123).unwrap();
-        let target = other.0.join("portrait.jpg");
+        let target = other.0.join("portrait.png");
         fs::write(&target, synthetic_jpeg(600, 900, 64)).unwrap();
-        let entry = child.join(format!("42-{revision}.jpg"));
+        let entry = child.join(format!("42-{revision}.png"));
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &entry).unwrap();
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&target, &entry).unwrap();
         cache
-            .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| {
-                Ok(synthetic_jpeg(600, 900, 64))
-            })
+            .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| Ok(valid_jpeg()))
             .unwrap();
         assert!(
             fs::symlink_metadata(&entry)
@@ -1890,23 +2458,31 @@ mod tests {
     fn remote_artwork_accepts_the_reference_limit_and_rejects_bytes_above_it() {
         let revision = remote_revision(42, 123).unwrap();
         let mut cache = RemoteArtworkCache::default();
-        let bytes = synthetic_jpeg(600, 900, MAX_ARTWORK_BYTES as usize);
-        assert_eq!(bytes.len() as u64, MAX_ARTWORK_BYTES);
+        let valid = valid_jpeg();
+        let bytes = convert_remote_jpeg(&valid).unwrap();
+        let source = [
+            &valid[..valid.len() - 2],
+            &vec![0_u8; MAX_ARTWORK_BYTES as usize - valid.len()][..],
+            &[0xff, 0xd9],
+        ]
+        .concat();
+        assert!(validate_remote_artwork(&source));
+        assert_eq!(source.len() as u64, MAX_ARTWORK_BYTES);
         let first = cache
-            .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| Ok(bytes))
+            .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| Ok(valid))
             .unwrap();
-        assert_eq!(first.total_bytes, MAX_ARTWORK_BYTES);
+        assert_eq!(first.total_bytes, bytes.len() as u64);
         assert_eq!(first.next_offset, Some(ARTWORK_CHUNK_BYTES as u64));
 
-        let last_offset = MAX_ARTWORK_BYTES - ARTWORK_CHUNK_BYTES as u64;
+        let last_offset = ((bytes.len() - 1) / ARTWORK_CHUNK_BYTES * ARTWORK_CHUNK_BYTES) as u64;
         let last = cache
             .read_chunk_with(42, 123, &revision, last_offset, Instant::now(), |_| {
                 panic!("cached full-size artwork must not be fetched again")
             })
             .unwrap();
-        assert_eq!(last.total_bytes, MAX_ARTWORK_BYTES);
+        assert_eq!(last.total_bytes, bytes.len() as u64);
         assert_eq!(last.next_offset, None);
-        assert_eq!(last.data.len(), ARTWORK_CHUNK_BYTES.div_ceil(3) * 4);
+        assert_eq!(last.data, base64_encode(&bytes[last_offset as usize..]));
 
         let oversized = synthetic_jpeg(600, 900, MAX_ARTWORK_BYTES as usize + 1);
         assert!(!validate_remote_artwork(&oversized));
@@ -1971,7 +2547,7 @@ mod tests {
                 .unwrap_err(),
             "artwork_unavailable"
         );
-        let bytes = synthetic_jpeg(600, 900, 64);
+        let bytes = valid_jpeg();
         assert!(
             cache
                 .read_chunk_with(
@@ -2003,7 +2579,7 @@ mod tests {
     #[test]
     fn artwork_fetch_runs_off_the_calling_thread() {
         let mut worker = RemoteArtworkWorker::default();
-        let bytes = synthetic_jpeg(600, 900, 64);
+        let bytes = valid_jpeg();
         worker
             .start_with_fetcher(move |_| {
                 thread::sleep(Duration::from_millis(250));
@@ -2031,7 +2607,7 @@ mod tests {
                 assert_eq!(completion.request_id, 7);
                 assert_eq!(completion.app_id, 42);
                 assert_eq!(completion.revision, revision);
-                assert_eq!(completion.result.unwrap().mime_type, "image/jpeg");
+                assert_eq!(completion.result.unwrap().mime_type, "image/png");
                 return;
             }
             thread::sleep(Duration::from_millis(10));
@@ -2042,7 +2618,7 @@ mod tests {
     #[test]
     fn artwork_worker_queue_is_bounded_while_a_fetch_is_running() {
         let mut worker = RemoteArtworkWorker::default();
-        let bytes = synthetic_jpeg(600, 900, 64);
+        let bytes = valid_jpeg();
         let (started_sender, started_receiver) = mpsc::channel();
         let (release_sender, release_receiver) = mpsc::channel();
         let release_receiver = Arc::new(std::sync::Mutex::new(release_receiver));

@@ -152,12 +152,14 @@ edits.
 This still does not provide complete Vibeshine Steam sync parity. Steam artwork
 is local-first: discovery prefers portraits over headers and icons, then picks
 the largest bounded image of that class across the configured Steam roots. A
-supported local image is served from its source file; otherwise list records
+supported local PNG is served from its source file; local JPEG and WebP are
+decoded to bounded PNG and cached by source revision for chunk reads. Otherwise list records
 carry a stable opaque reference to the fixed Steam CDN portrait. The authenticated
 `POST /v1/steam/artwork_read` action fetches that image on demand and returns the
 same bounded chunks as local artwork. The CDN fetch follows no redirects, uses
-an eight-second timeout, accepts only JPEG portraits up to 16 MiB, keeps up to
-four images in memory, and cools down failed app IDs for ten minutes. The
+an eight-second timeout, accepts only JPEG portraits up to 16 MiB, converts
+them to bounded PNG before publication, keeps up to four images in memory,
+and cools down failed app IDs for ten minutes. The
 authenticated chunk route and frontend assembly use the same 16 MiB image
 limit. A selected local image below 600 by 900 pixels or outside a 2:3 portrait
 ratio stays available while a complete discovery schedules a bounded CDN fetch
@@ -170,7 +172,7 @@ fixed CDN reference and the UI's existing icon fallback on fetch failure.
 An existing `steam_artwork_cache_root` in trusted startup settings enables a
 four-image disk cache across module restarts. The provider creates and uses
 only an `amaterasu-steam-artwork-v1` child of that root; it never enumerates or
-removes files in the parent. Cache entries are bounded and validated before
+removes files in the parent. Converted PNG cache entries are bounded and validated before
 serving. A corrupt ordinary entry falls back to the CDN and is atomically
 replaced after a valid fetch. Crash leftovers cannot block a new write because
 temporary names are unique. Before every disk write, the provider reclaims
@@ -180,9 +182,8 @@ count toward the four-image eviction limit. The host must overwrite any
 package-supplied value with its own dedicated, access-controlled private root.
 Path checks reject links and reparse points, but filesystem checks cannot
 eliminate races if another process can mutate that root. Without host-enforced
-ownership and access controls, the disk cache must remain disabled;
-until that host injection exists, remote images remain memory cached only.
-Remote images are not converted to PNG.
+ownership and access controls, the disk cache must remain disabled. Host
+injection of the private root is a separate integration and native service gate.
 Manual mode needs another `force_sync` to reconcile a later promotion; ordinary
 `refresh` remains discovery-only.
 The sync fingerprint also includes an internal, bounded signature over every
@@ -257,12 +258,13 @@ the relevant metadata source incomplete, so catalog cleanup waits for another
 scan. Filesystem operations advance over ticks; a dedicated single worker
 handles remote image requests, with one queued request and bounded network
 timeout. The worker is joined during module destruction. An individual
-filesystem call can still block on unavailable storage.
+filesystem call can still block on unavailable storage. Local artwork validation
+and JPEG/WebP conversion run on a separate bounded worker before a completed
+scan publishes its artwork references; signed local chunk reads use that worker.
 
 Behavior reference: sibling Vibeshine `src/steam_integration.h` and
 `src/steam_artwork.cpp`; source was not copied or translated. Other missing
-parity includes machine-host session-broker discovery,
-PNG artwork conversion for consumers that require it, uninstalled owned games,
+parity includes machine-host session-broker discovery, uninstalled owned games,
 app type filtering, play-history selection, launch options/Proton resolution,
 launch/process tracking, watchers, and Steam broker environment handling. This
 provider neither modifies Steam files.
