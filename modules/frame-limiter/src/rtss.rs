@@ -1,4 +1,4 @@
-//! Narrow dynamic binding for RTSS profile control.
+//! Read-only RTSS profile inspection with an explicit safe-mutation gate.
 use crate::lease::{FrameLimitProvider, ProfileValues, ProviderError};
 #[cfg(all(windows, target_pointer_width = "64"))]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -7,9 +7,6 @@ use std::path::{Path, PathBuf};
 
 #[cfg(all(windows, target_pointer_width = "64"))]
 const LIMITER_DISABLED_FLAG: u32 = 1 << 2;
-#[cfg(all(windows, target_pointer_width = "64"))]
-const MAX_PROFILE_SNAPSHOT_BYTES: u64 = 64 * 1024;
-
 pub(crate) struct RtssProvider {
     #[cfg(all(windows, target_pointer_width = "64"))]
     api: Option<WindowsRtssApi>,
@@ -33,6 +30,15 @@ impl RtssProvider {
 }
 
 #[cfg(all(windows, target_pointer_width = "64"))]
+fn regular_profile_exists(path: &Path) -> Result<bool, ProviderError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        _ => Err(ProviderError::ReadFailed("rtss_profile_path_invalid")),
+    }
+}
+
+#[cfg(all(windows, target_pointer_width = "64"))]
 impl FrameLimitProvider for RtssProvider {
     fn select_installation(&mut self, path: &str) -> Result<String, ProviderError> {
         let canonical = resolve_install_path(path)?;
@@ -45,11 +51,7 @@ impl FrameLimitProvider for RtssProvider {
     fn profile_exists(&mut self, profile: &str) -> Result<bool, ProviderError> {
         validate_profile_name(profile)?;
         let path = self.profile_path(profile)?;
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            _ => Err(ProviderError::ReadFailed("rtss_profile_path_invalid")),
-        }
+        regular_profile_exists(&path)
     }
 
     fn read_profile(&mut self, profile: &str) -> Result<ProfileValues, ProviderError> {
@@ -59,77 +61,26 @@ impl FrameLimitProvider for RtssProvider {
         api.read_profile_values()
     }
 
-    fn read_profile_contents(&mut self, profile: &str) -> Result<Vec<u8>, ProviderError> {
-        validate_profile_name(profile)?;
-        let path = self.profile_path(profile)?;
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|_| ProviderError::ReadFailed("rtss_profile_contents_unavailable"))?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.len() > MAX_PROFILE_SNAPSHOT_BYTES
-        {
-            return Err(ProviderError::ReadFailed(
-                "rtss_profile_contents_unsupported",
-            ));
-        }
-        std::fs::read(path)
-            .map_err(|_| ProviderError::ReadFailed("rtss_profile_contents_unavailable"))
+    fn ensure_safe_writes_supported(&mut self) -> Result<(), ProviderError> {
+        Err(ProviderError::Unavailable(
+            "rtss_conditional_profile_write_unsupported",
+        ))
     }
 
     fn write_profile_verified(
         &mut self,
-        profile: &str,
-        values: ProfileValues,
+        _profile: &str,
+        _expected: ProfileValues,
+        _values: ProfileValues,
     ) -> Result<(), ProviderError> {
-        validate_profile_name(profile)?;
-        let api = self.api()?;
-        api.load_profile(profile)?;
-        api.write_profile_values(values)?;
-        api.save_profile(profile)?;
-        api.update_profiles();
-        api.load_profile(profile)?;
-        let actual = api.read_profile_values()?;
-        if actual != values || !self.profile_exists(profile)? {
-            return Err(ProviderError::VerifyFailed(
-                "rtss_profile_readback_mismatch",
-            ));
-        }
-        Ok(())
-    }
-
-    fn delete_profile_verified(
-        &mut self,
-        profile: &str,
-        expected: ProfileValues,
-        expected_contents: &[u8],
-    ) -> Result<(), ProviderError> {
-        validate_profile_name(profile)?;
-        let path = self.profile_path(profile)?;
-        let contents = self.read_profile_contents(profile)?;
-        if contents != expected_contents {
-            return Err(ProviderError::VerifyFailed(
-                "rtss_profile_contents_changed_before_delete",
-            ));
-        }
-        let api = self.api()?;
-        api.load_profile(profile)?;
-        if api.read_profile_values()? != expected {
-            return Err(ProviderError::VerifyFailed(
-                "rtss_profile_changed_before_delete",
-            ));
-        }
-        api.delete_profile(profile)?;
-        api.update_profiles();
-        match std::fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            _ => {
-                return Err(ProviderError::VerifyFailed(
-                    "rtss_profile_delete_unverified",
-                ));
-            }
-        }
-        api.load_profile(profile)?;
-        Ok(())
+        // The RTSS profile API separates property writes from unconditional
+        // SaveProfile and offers no compare-and-save operation. Since an RTSS
+        // UI or another process does not share our lease lock, mutation cannot
+        // preserve external edits safely. Keep native writes unavailable until
+        // RTSS provides a conditional profile update primitive.
+        Err(ProviderError::PreconditionFailed(
+            "rtss_conditional_profile_write_unsupported",
+        ))
     }
 
     fn limiter_disabled(&mut self) -> Result<bool, ProviderError> {
@@ -151,23 +102,15 @@ impl FrameLimitProvider for RtssProvider {
         Err(ProviderError::Unavailable("rtss_64_bit_windows_required"))
     }
 
-    fn read_profile_contents(&mut self, _profile: &str) -> Result<Vec<u8>, ProviderError> {
+    fn ensure_safe_writes_supported(&mut self) -> Result<(), ProviderError> {
         Err(ProviderError::Unavailable("rtss_64_bit_windows_required"))
     }
 
     fn write_profile_verified(
         &mut self,
         _profile: &str,
-        _values: ProfileValues,
-    ) -> Result<(), ProviderError> {
-        Err(ProviderError::Unavailable("rtss_64_bit_windows_required"))
-    }
-
-    fn delete_profile_verified(
-        &mut self,
-        _profile: &str,
         _expected: ProfileValues,
-        _expected_contents: &[u8],
+        _values: ProfileValues,
     ) -> Result<(), ProviderError> {
         Err(ProviderError::Unavailable("rtss_64_bit_windows_required"))
     }
@@ -191,23 +134,15 @@ impl FrameLimitProvider for RtssProvider {
         Err(ProviderError::Unavailable("rtss_supported_on_windows_only"))
     }
 
-    fn read_profile_contents(&mut self, _profile: &str) -> Result<Vec<u8>, ProviderError> {
+    fn ensure_safe_writes_supported(&mut self) -> Result<(), ProviderError> {
         Err(ProviderError::Unavailable("rtss_supported_on_windows_only"))
     }
 
     fn write_profile_verified(
         &mut self,
         _profile: &str,
-        _values: ProfileValues,
-    ) -> Result<(), ProviderError> {
-        Err(ProviderError::Unavailable("rtss_supported_on_windows_only"))
-    }
-
-    fn delete_profile_verified(
-        &mut self,
-        _profile: &str,
         _expected: ProfileValues,
-        _expected_contents: &[u8],
+        _values: ProfileValues,
     ) -> Result<(), ProviderError> {
         Err(ProviderError::Unavailable("rtss_supported_on_windows_only"))
     }
@@ -262,11 +197,8 @@ const RTSS_SHARED_MEMORY_NAME: &str = "RTSSSharedMemoryV2";
 #[cfg(all(windows, target_pointer_width = "64"))]
 type GetProfileProperty = unsafe extern "system" fn(*const i8, *mut u8, u32) -> i32;
 #[cfg(all(windows, target_pointer_width = "64"))]
-type SetProfileProperty = unsafe extern "system" fn(*const i8, *const u8, u32) -> i32;
 #[cfg(all(windows, target_pointer_width = "64"))]
 type ProfileOperation = unsafe extern "system" fn(*const i8);
-#[cfg(all(windows, target_pointer_width = "64"))]
-type UpdateProfiles = unsafe extern "system" fn();
 #[cfg(all(windows, target_pointer_width = "64"))]
 type GetFlags = unsafe extern "system" fn() -> u32;
 
@@ -274,11 +206,7 @@ type GetFlags = unsafe extern "system" fn() -> u32;
 struct WindowsRtssApi {
     library: *mut std::ffi::c_void,
     get_profile_property: GetProfileProperty,
-    set_profile_property: SetProfileProperty,
     load_profile: ProfileOperation,
-    save_profile: ProfileOperation,
-    delete_profile: ProfileOperation,
-    update_profiles: UpdateProfiles,
     get_flags: GetFlags,
 }
 
@@ -325,11 +253,7 @@ impl WindowsRtssApi {
             Ok(Self {
                 library,
                 get_profile_property: resolve_symbol(library, b"GetProfileProperty\0")?,
-                set_profile_property: resolve_symbol(library, b"SetProfileProperty\0")?,
                 load_profile: resolve_symbol(library, b"LoadProfile\0")?,
-                save_profile: resolve_symbol(library, b"SaveProfile\0")?,
-                delete_profile: resolve_symbol(library, b"DeleteProfile\0")?,
-                update_profiles: resolve_symbol(library, b"UpdateProfiles\0")?,
                 get_flags: resolve_symbol(library, b"GetFlags\0")?,
             })
         };
@@ -357,35 +281,6 @@ impl WindowsRtssApi {
         })
     }
 
-    fn write_profile_values(&self, values: ProfileValues) -> Result<(), ProviderError> {
-        self.set_i32_property("FramerateLimit", values.frame_limit)?;
-        self.set_i32_property("FramerateLimitDenominator", values.frame_limit_denominator)?;
-        self.set_i32_property("SyncLimiter", values.sync_limiter)
-    }
-
-    fn save_profile(&self, profile: &str) -> Result<(), ProviderError> {
-        let profile = std::ffi::CString::new(profile)
-            .map_err(|_| ProviderError::WriteFailed("rtss_profile_name_invalid"))?;
-        // SAFETY: the profile name is a valid NUL-terminated ANSI string. This
-        // is the RTSS API write path; the module never edits profile files.
-        unsafe { (self.save_profile)(profile.as_ptr()) };
-        Ok(())
-    }
-
-    fn delete_profile(&self, profile: &str) -> Result<(), ProviderError> {
-        let profile = std::ffi::CString::new(profile)
-            .map_err(|_| ProviderError::WriteFailed("rtss_profile_name_invalid"))?;
-        // SAFETY: this is called only for a profile created by this lease after
-        // its exact applied values have been read back.
-        unsafe { (self.delete_profile)(profile.as_ptr()) };
-        Ok(())
-    }
-
-    fn update_profiles(&self) {
-        // SAFETY: the function pointer belongs to the live RTSSHooks module.
-        unsafe { (self.update_profiles)() };
-    }
-
     fn limiter_disabled(&self) -> Result<bool, ProviderError> {
         // SAFETY: GetFlags is a read-only RTSSHooks export with no arguments.
         let flags = unsafe { (self.get_flags)() };
@@ -411,24 +306,6 @@ impl WindowsRtssApi {
             ));
         }
         Ok(value)
-    }
-
-    fn set_i32_property(&self, property: &str, value: i32) -> Result<(), ProviderError> {
-        let property = std::ffi::CString::new(property)
-            .map_err(|_| ProviderError::WriteFailed("rtss_property_name_invalid"))?;
-        // SAFETY: value points to a live four-byte integer for the duration of
-        // the synchronous RTSS property update call.
-        let success = unsafe {
-            (self.set_profile_property)(
-                property.as_ptr(),
-                (&value as *const i32).cast(),
-                std::mem::size_of::<i32>() as u32,
-            )
-        };
-        if success == 0 {
-            return Err(ProviderError::WriteFailed("rtss_profile_property_rejected"));
-        }
-        Ok(())
     }
 }
 

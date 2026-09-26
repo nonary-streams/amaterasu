@@ -18,26 +18,29 @@ auto-detection.
 
 ## Runtime behavior
 
-64-bit Windows `apply` supports RTSS when the request selects `rtss` or `auto`,
-policy requires a limiter, the limit is known, RTSS is running, and its profile
-API is available. The module finds the running `RTSS.exe`, loads the sibling
-`RTSSHooks64.dll` from that installation, and applies the exact rational FPS
-limit, denominator, and sync-limiter value to the executable profile. It reads
-all three values back before returning `applied: true` and a lease. The
-`SyncLimiter` numeric mapping follows the RTSS community interface; RTSS does
-not publish a stable vendor API contract for this property. `auto` has no
-unimplemented fallback: if RTSS cannot be used, the response is
-`runtime_unavailable`. Other providers, 32-bit Windows, and non-Windows RTSS
-requests also remain unavailable.
+64-bit Windows can detect a running RTSS process and inspect profile values
+through `RTSSHooks64.dll`, but it cannot safely mutate those profiles through
+the available API. The RTSS profile interface separates `SetProfileProperty`
+from an unconditional, void `SaveProfile` call and offers no compare-and-save
+operation or lock shared with the RTSS UI. An external writer could change the
+profile after a comparison and have that change overwritten by the save. The
+module therefore leaves those mutation calls unbound. A policy-required RTSS
+apply returns `runtime_unavailable` with
+`rtss_conditional_profile_write_unsupported`, `applied: false`, and no lease.
+Other providers, 32-bit Windows, and non-Windows RTSS requests also remain
+unavailable. `auto` has no unimplemented fallback.
 
 The RTSS limiter-disabled flag is global, so the module only reads it. If RTSS
 has disabled the limiter globally, apply reports unavailable without changing
 the flag or other applications' profiles. RTSS cannot apply the separate
 `frame_limiter_disable_vsync` setting, so requests that enable it are declined
-before any provider mutation. Settings that cannot be read and restored exactly
-are also declined. An explicit relative RTSS install path is accepted by
-settings validation but currently returns unavailable; leave the field empty
-for auto-detection or supply an absolute path to the running installation.
+before any provider mutation. The read-only probe requires an existing regular
+executable profile to inspect values; a missing profile makes a requested apply
+unavailable with `rtss_profile_missing_safe_create_unsupported`. The module
+does not create or delete profiles. An explicit relative RTSS install path is
+accepted by settings validation but currently returns unavailable; leave the
+field empty for auto-detection or supply an absolute path to the running
+installation.
 
 A lease belongs to the broker caller and `session_id`. An exact request retry
 returns the same lease while RTSS still matches, and the retry check runs
@@ -50,33 +53,31 @@ it is restored or resolved. `status` lists only that caller's leases and may
 filter by session. When no owned lease exists, `status` probes the RTSS process
 and required API and reports provider availability separately from lease state.
 
-`restore` accepts exactly one `session_id` or lease token. For an existing
-profile it restores only the three limiter properties owned by the lease,
-preserving other profile settings. If apply created the profile, the module
-stores its full profile-file bytes (up to 64 KiB) and compares them before
-deleting the whole profile. If the bytes changed, or a restart finds a created
-profile without a durable byte snapshot, status reports a stale lease and
-restore leaves the profile in place. For a profile that was absent before
-apply, restore verifies that it is absent and that the global limiter flag is
-unchanged; inherited Global profile values may change independently. RTSS has
-no conditional delete API, so an external writer could still race the final
-byte comparison and profile deletion. A changed state detected before restore
-is never overwritten. The journal keeps the latest 256 completed lease
-tombstones; a repeated restore returns `restored` while its tombstone remains,
-then returns `not_found` after eviction. Callers should use unique session IDs.
+The provider-independent lease manager supports exact restore and retains a
+lease after restore failure. The native RTSS adapter currently cannot execute
+that write safely, so restore of a retained RTSS lease returns
+`restore_failed` with `rtss_conditional_profile_write_unsupported`; its token is
+kept for retry if a future provider gains safe conditional writes. A detected
+external change is reported as `stale_lease` and is never overwritten. Legacy
+leases from a runtime that created a profile remain stale; recovery never
+deletes or overwrites that profile. The journal keeps the latest 256 completed
+lease tombstones; a repeated restore returns `restored` while its tombstone
+remains, then returns `not_found` after eviction. Callers should use unique
+session IDs.
 
 The lease journal is stored under the current user's `LOCALAPPDATA` (falling
 back to `APPDATA`) in `Amaterasu/frame-limiter/leases.json`. The runtime API's
 state-root grant is restricted to the state module. Before an RTSS mutation,
 the module atomically persists a pending lease with its exact before and
-intended values. On startup it reconciles that record with RTSS: an exact
-applied state becomes active, an exact before-state is finalized as no effect,
-and a third state remains stale for owner-visible recovery. A created profile
-is promoted only when its full file snapshot was durably saved; a crash between
-profile creation and that save is explicitly reported as stale. A readback
-mismatch is rolled back only when the current profile and global limiter flag
-still match the attempted change and, for a lease-created profile, its exact
-byte snapshot.
+intended values. On startup, a provider with safe mutation support reconciles
+that record with its provider: an exact applied state becomes active, an exact
+before-state is finalized as no effect, and a third state remains stale for
+owner-visible recovery. If write capability is unavailable, an unverified
+pending effect remains stale even when current values happen to match the
+intent. Older journal records for lease-created profiles are kept stale rather
+than automatically deleting or overwriting the profile. A readback mismatch is
+rolled back only when the current profile and global limiter flag still match
+the attempted change.
 
 ## Policy behavior
 
@@ -93,14 +94,14 @@ be absent or zero, the result remains `FollowStream`.
 
 ## Remaining integration and platform gates
 
-The frame-limiter service now has an RTSS runtime, but Team 2 still needs to
-call apply with the frozen launch snapshot, persist the returned lease with its
-session, and retry restore during stop. No Team 2 files were changed in this
-slice. Live RTSS DLL property readback, save/update behavior, and hardware
-restore were not exercised because RTSS is not installed and running in the
+The lifecycle contract is implemented behind the fake-provider test seam, but
+Team 2 cannot receive an applied RTSS lease until RTSS supplies a safe
+conditional profile-write API or a supported shared locking protocol. No Team 2
+files were changed in this slice. Live RTSS process/API detection and profile
+readback were not exercised because RTSS is not installed and running in the
 build environment. RTSS hooks may also be blocked by a game's anti-cheat. The
-community `SyncLimiter` numeric mapping and the RTSS API's real save/update and
-restore behavior still require verification against supported RTSS versions.
+community `SyncLimiter` numeric mapping and read behavior still require
+verification against supported RTSS versions.
 NVIDIA Control Panel, VSync control, MangoHUD, and Proton runtime providers
 remain unimplemented; unsupported provider choices return `runtime_unavailable`.
 
