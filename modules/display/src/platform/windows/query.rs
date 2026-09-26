@@ -1,5 +1,8 @@
 use super::conversion::{address, decode_path};
-use crate::model::{AvailableMode, DisplayError, DisplayResult, Rational, Snapshot};
+use crate::model::{
+    Address, AvailableMode, DisplayError, DisplayPath, DisplayResult, Rational, RouteBinding,
+    Snapshot,
+};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use windows_sys::Win32::Devices::Display::*;
@@ -190,13 +193,19 @@ pub fn check_legacy_hdr_recovery(snapshot: &Snapshot) -> DisplayResult<()> {
 /// An inactive target has no saved HDR baseline. Inspect the state after CCD
 /// activation without changing HDR; rollback restores the prior topology if
 /// Windows activated the target with HDR already enabled.
-pub fn verify_newly_active_hdr_is_off(id: &str) -> DisplayResult<()> {
+pub fn verify_newly_active_hdr_is_off(route: &RouteBinding) -> DisplayResult<()> {
     let active = query(QDC_ONLY_ACTIVE_PATHS)?;
-    let path = active
-        .paths
-        .iter()
-        .find(|path| names(path).is_ok_and(|device| device.id.eq_ignore_ascii_case(id)))
+    let path = unique_active_target(&active, &route.id)?
         .ok_or_else(|| DisplayError::new("topology_changed", "requested target is not active"))?;
+    if address(path.targetInfo.adapterId, path.targetInfo.id) != route.target_address
+        || address(path.sourceInfo.adapterId, path.sourceInfo.id) != route.source_address
+        || path.targetInfo.outputTechnology != route.output_technology
+    {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "newly active HDR route changed",
+        ));
+    }
     if advanced_color_enabled(path)? != Some(false) {
         return Err(DisplayError::new(
             "verification_failed",
@@ -206,13 +215,31 @@ pub fn verify_newly_active_hdr_is_off(id: &str) -> DisplayResult<()> {
     Ok(())
 }
 
-pub fn set_advanced_color(id: &str, enabled: bool) -> DisplayResult<()> {
+fn verify_advanced_color_route(
+    saved_target: &Address,
+    saved_output_technology: i32,
+    target: Address,
+    output_technology: i32,
+) -> DisplayResult<()> {
+    if target != *saved_target || output_technology != saved_output_technology {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "HDR target no longer uses the saved physical route",
+        ));
+    }
+    Ok(())
+}
+
+pub fn set_advanced_color(saved: &DisplayPath, enabled: bool) -> DisplayResult<()> {
     let active = query(QDC_ONLY_ACTIVE_PATHS)?;
-    let path = active
-        .paths
-        .iter()
-        .find(|path| names(path).is_ok_and(|device| device.id.eq_ignore_ascii_case(id)))
+    let path = unique_active_target(&active, &saved.id)?
         .ok_or_else(|| DisplayError::new("unsupported_display", "HDR target is not active"))?;
+    verify_advanced_color_route(
+        &saved.target_address,
+        saved.output_technology,
+        address(path.targetInfo.adapterId, path.targetInfo.id),
+        path.targetInfo.outputTechnology,
+    )?;
     match advanced_color_enabled(path)? {
         Some(current) if current == enabled => return Ok(()),
         Some(_) => {}
@@ -242,11 +269,14 @@ pub fn set_advanced_color(id: &str, enabled: bool) -> DisplayResult<()> {
         "DisplayConfigSetDeviceInfo(advanced color)",
     )?;
     let current = query(QDC_ONLY_ACTIVE_PATHS)?;
-    let current = current
-        .paths
-        .iter()
-        .find(|path| names(path).is_ok_and(|device| device.id.eq_ignore_ascii_case(id)))
+    let current = unique_active_target(&current, &saved.id)?
         .ok_or_else(|| DisplayError::new("topology_changed", "HDR target disappeared"))?;
+    verify_advanced_color_route(
+        &saved.target_address,
+        saved.output_technology,
+        address(current.targetInfo.adapterId, current.targetInfo.id),
+        current.targetInfo.outputTechnology,
+    )?;
     if advanced_color_enabled(current)? != Some(enabled) {
         return Err(DisplayError::new(
             "verification_failed",
@@ -254,6 +284,22 @@ pub fn set_advanced_color(id: &str, enabled: bool) -> DisplayResult<()> {
         ));
     }
     Ok(())
+}
+
+fn unique_active_target<'a>(
+    active: &'a ConfigurationBuffers,
+    id: &str,
+) -> DisplayResult<Option<&'a DISPLAYCONFIG_PATH_INFO>> {
+    let mut matching = None;
+    for path in &active.paths {
+        if names(path)?.id.eq_ignore_ascii_case(id) && matching.replace(path).is_some() {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "HDR target identity is ambiguous",
+            ));
+        }
+    }
+    Ok(matching)
 }
 
 pub fn snapshot() -> DisplayResult<Snapshot> {
@@ -443,7 +489,8 @@ pub fn check(code: i32, operation: &str) -> DisplayResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_advanced_color_flags;
+    use super::{decode_advanced_color_flags, verify_advanced_color_route};
+    use crate::model::Address;
 
     #[test]
     fn advanced_color_support_and_enablement_bits_are_distinct() {
@@ -452,5 +499,31 @@ mod tests {
         assert_eq!(decode_advanced_color_flags(3).unwrap(), Some(true));
         assert!(decode_advanced_color_flags(2).is_err());
         assert!(decode_advanced_color_flags(5).is_err());
+    }
+
+    #[test]
+    fn advanced_color_write_requires_saved_physical_route() {
+        let saved = Address {
+            adapter_low: 1,
+            adapter_high: 2,
+            id: 3,
+        };
+        assert!(verify_advanced_color_route(&saved, 4, saved.clone(), 4).is_ok());
+        let foreign = Address {
+            id: 5,
+            ..saved.clone()
+        };
+        assert_eq!(
+            verify_advanced_color_route(&saved, 4, foreign, 4)
+                .unwrap_err()
+                .code,
+            "topology_changed"
+        );
+        assert_eq!(
+            verify_advanced_color_route(&saved, 4, saved.clone(), 6)
+                .unwrap_err()
+                .code,
+            "topology_changed"
+        );
     }
 }

@@ -122,9 +122,16 @@ impl Platform for WindowsPlatform {
         apply::set(&requested, false)?;
         guard()?;
         apply::set(&requested, true).map_err(DisplayError::after_mutation)?;
+        let rebound = query::snapshot().map_err(DisplayError::after_mutation)?;
+        verify_restoration_routes(snapshot, &rebound)?;
         for path in &snapshot.paths {
             if let Some(enabled) = path.hdr_enabled {
-                query::set_advanced_color(&path.id, enabled)
+                let current = rebound
+                    .paths
+                    .iter()
+                    .find(|candidate| candidate.id.eq_ignore_ascii_case(&path.id))
+                    .expect("verified restoration contains each saved target");
+                query::set_advanced_color(current, enabled)
                     .map_err(DisplayError::after_mutation)?;
             }
         }
@@ -237,16 +244,28 @@ fn apply_configuration(
                     .iter()
                     .any(|path| path.id.eq_ignore_ascii_case(&display.id))
             {
-                query::verify_newly_active_hdr_is_off(&display.id)
+                let route = route.ok_or_else(|| {
+                    DisplayError::new("topology_changed", "inactive HDR target has no bound route")
+                        .after_mutation()
+                })?;
+                query::verify_newly_active_hdr_is_off(route)
                     .map_err(DisplayError::after_mutation)?;
             } else {
-                query::set_advanced_color(&display.id, enabled)
-                    .map_err(DisplayError::after_mutation)?;
+                let saved = before
+                    .paths
+                    .iter()
+                    .find(|path| path.id.eq_ignore_ascii_case(&display.id))
+                    .ok_or_else(|| {
+                        DisplayError::new("topology_changed", "HDR target has no saved route")
+                            .after_mutation()
+                    })?;
+                guard().map_err(DisplayError::after_mutation)?;
+                query::set_advanced_color(saved, enabled).map_err(DisplayError::after_mutation)?;
             }
         }
     }
     if let Some(route) = route {
-        query::verify_newly_active_hdr_is_off(&route.id).map_err(DisplayError::after_mutation)?;
+        query::verify_newly_active_hdr_is_off(route).map_err(DisplayError::after_mutation)?;
     }
     let final_state = verify_applied_configuration(configuration, query::snapshot())?;
     verify_requested_hdr(configuration, &final_state)?;
@@ -260,6 +279,32 @@ fn apply_configuration(
         return Err(DisplayError::new(
             "verification_failed",
             "untouched Windows display path changed during apply",
+        )
+        .after_mutation());
+    }
+    Ok(())
+}
+
+fn verify_restoration_routes(saved: &Snapshot, current: &Snapshot) -> DisplayResult<()> {
+    let mut expected = saved.clone();
+    for path in &mut expected.paths {
+        path.hdr_enabled = current
+            .paths
+            .iter()
+            .find(|candidate| candidate.id.eq_ignore_ascii_case(&path.id))
+            .map(|candidate| candidate.hdr_enabled)
+            .ok_or_else(|| {
+                DisplayError::new(
+                    "topology_changed",
+                    "saved HDR target disappeared during restore",
+                )
+                .after_mutation()
+            })?;
+    }
+    if !expected.equivalent(current) {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "restored display routes differ from the recovery baseline",
         )
         .after_mutation());
     }
@@ -1137,5 +1182,23 @@ mod tests {
         verify_requested_hdr(&configuration, &readback).unwrap();
         configuration.displays[0].hdr_enabled = None;
         verify_requested_hdr(&configuration, &readback).unwrap();
+    }
+
+    #[test]
+    fn hdr_restore_rebinds_after_target_luid_changes() {
+        let saved = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.one", 0, Some(true))],
+        };
+        let mut rebound = saved.clone();
+        rebound.paths[0].target_address.adapter_low += 1;
+        rebound.paths[0].source_address.adapter_low += 1;
+        rebound.paths[0].hdr_enabled = Some(false);
+        verify_restoration_routes(&saved, &rebound).unwrap();
+
+        rebound.paths[0].source_name = "foreign source".into();
+        let error = verify_restoration_routes(&saved, &rebound).unwrap_err();
+        assert_eq!(error.code, "topology_changed");
+        assert!(error.may_have_changed);
     }
 }
