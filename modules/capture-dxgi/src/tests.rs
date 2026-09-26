@@ -515,6 +515,87 @@ fn row_pitch_copy_excludes_padding_and_checks_bounds() {
 }
 
 #[test]
+fn rotated_duplication_surfaces_produce_tight_desktop_oriented_pixels() {
+    // Six distinct BGRA pixels in a 3x2 surface. Padding is deliberately
+    // distinct and must never reach the output frame.
+    let mut surface = Vec::new();
+    for row in [[1_u8, 2, 3], [4, 5, 6]] {
+        for value in row {
+            surface.extend_from_slice(&[value, 10 + value, 20 + value, 255]);
+        }
+        surface.extend_from_slice(&[0xee; 4]);
+    }
+    for (rotation, width, height, expected) in [
+        (1, 3, 2, vec![1, 2, 3, 4, 5, 6]),
+        (2, 2, 3, vec![4, 1, 5, 2, 6, 3]),
+        (3, 3, 2, vec![6, 5, 4, 3, 2, 1]),
+        (4, 2, 3, vec![3, 6, 2, 5, 1, 4]),
+    ] {
+        // SAFETY: two 16-byte rows have twelve initialized pixel bytes each.
+        let frame =
+            unsafe { model::orient_bgra_rows(3, 2, 16, surface.as_ptr(), width, height, rotation) }
+                .unwrap();
+        assert_eq!(frame.len(), (width * height * 4) as usize);
+        assert_eq!(
+            frame
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|pixel| pixel[0])
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(frame.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255));
+        assert!(!frame.contains(&0xee));
+    }
+    // Returned storage owns its pixels after the mapped source is overwritten.
+    let owned = unsafe { model::orient_bgra_rows(3, 2, 16, surface.as_ptr(), 2, 3, 2) }.unwrap();
+    surface.fill(0);
+    assert_eq!(
+        owned
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| pixel[0])
+            .collect::<Vec<_>>(),
+        [4, 1, 5, 2, 6, 3]
+    );
+}
+
+#[test]
+fn rotated_surface_validation_rejects_stale_modes_before_dereferencing_pixels() {
+    let null = std::ptr::null();
+    // SAFETY: invalid dimensions, row pitch, and rotation all reject before
+    // any pointer dereference. The valid layout with null pointer also rejects.
+    unsafe {
+        assert_eq!(
+            model::orient_bgra_rows(3, 2, 12, null, 3, 2, 2)
+                .unwrap_err()
+                .code,
+            "access_lost"
+        );
+        assert_eq!(
+            model::orient_bgra_rows(3, 2, 8, null, 2, 3, 2)
+                .unwrap_err()
+                .code,
+            "invalid_frame"
+        );
+        assert_eq!(
+            model::orient_bgra_rows(3, 2, 12, null, 3, 2, 0)
+                .unwrap_err()
+                .code,
+            "unsupported_rotation"
+        );
+        assert_eq!(
+            model::orient_bgra_rows(3, 2, 12, null, 2, 3, 2)
+                .unwrap_err()
+                .code,
+            "invalid_frame"
+        );
+    }
+}
+
+#[test]
 fn native_callback_delivers_pixels_then_reports_pending_and_device_loss() {
     let events = Arc::new(Mutex::new(VecDeque::from([
         Ok(Some(Frame {

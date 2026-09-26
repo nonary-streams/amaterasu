@@ -1,5 +1,5 @@
 use super::{Backend, CaptureSession, TouchSurface};
-use crate::model::{CaptureError, CaptureResult, Frame, Output, copy_bgra_rows, frame_layout};
+use crate::model::{CaptureError, CaptureResult, Frame, Output, frame_layout, orient_bgra_rows};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 use amaterasu_windows_capture_geometry::{
     GeometryError, SelectedOutput, resolve_with, with_verified_physical_topology,
@@ -54,10 +54,16 @@ impl Backend for WindowsBackend {
                 "output is not attached to the desktop",
             ));
         }
-        if output.metadata.rotation != DXGI_MODE_ROTATION_IDENTITY.0 as u32 {
+        if !matches!(
+            output.metadata.rotation,
+            value if value == DXGI_MODE_ROTATION_IDENTITY.0 as u32
+                || value == DXGI_MODE_ROTATION_ROTATE90.0 as u32
+                || value == DXGI_MODE_ROTATION_ROTATE180.0 as u32
+                || value == DXGI_MODE_ROTATION_ROTATE270.0 as u32
+        ) {
             return Err(CaptureError::new(
                 "unsupported_rotation",
-                "rotated output capture is not implemented",
+                "DXGI reported an unknown output rotation",
             ));
         }
         frame_layout(output.metadata.width, output.metadata.height)?;
@@ -330,22 +336,25 @@ impl Session {
             context: &self.context,
             texture: &pending.texture,
         };
-        let (stride, _) = frame_layout(pending.width, pending.height)?;
+        let (stride, _) = frame_layout(self.adapter.width, self.adapter.height)?;
         // SAFETY: D3D11 guarantees initialized pixel bytes at each mapped
         // texture row. The map guard outlives all copying, and row padding
         // is never included in borrowed slices or the returned frame.
         let bytes = unsafe {
-            copy_bgra_rows(
+            orient_bgra_rows(
                 pending.width,
                 pending.height,
                 mapped.RowPitch,
                 mapped.pData.cast::<u8>(),
+                self.adapter.width,
+                self.adapter.height,
+                self.adapter.rotation,
             )
         }?;
         self.sequence = self.sequence.saturating_add(1);
         let result = Frame {
-            width: pending.width,
-            height: pending.height,
+            width: self.adapter.width,
+            height: self.adapter.height,
             stride,
             bytes,
             timestamp_us: pending.timestamp_us,
@@ -369,8 +378,14 @@ impl CaptureSession for Session {
         let Some(target_id) = &self.target_id else {
             return Ok(None);
         };
-        resolve_output(&self.output_id, Some(target_id))
-            .map(|(selection, _)| Some(selection.geometry))
+        let (selection, output) = resolve_output(&self.output_id, Some(target_id))?;
+        if output.metadata.rotation != self.adapter.rotation {
+            return Err(CaptureError::new(
+                "access_lost",
+                "captured output rotation changed; enumerate and reopen",
+            ));
+        }
+        Ok(Some(selection.geometry))
     }
 
     fn touch_surface(&mut self) -> CaptureResult<Option<TouchSurface>> {

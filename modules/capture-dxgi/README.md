@@ -116,8 +116,10 @@ can still stall internally; nonblocking polling is not a hard real-time guarante
 
 Current limitations are explicit:
 
-- Rotated outputs are rejected with `unsupported_rotation`; no rotated pixels
-  or metadata conversion is invented.
+- Rotated outputs are returned in the output rectangle's orientation. The
+  unrotated duplication texture is checked against that rectangle and its
+  DXGI rotation, then copied into tight BGRA rows. An unknown rotation returns
+  `unsupported_rotation`; a mode/dimension change closes the stream.
 - Hardware cursor shape/position is not composed. DXGI may already include some
   cursor pixels, but a separate hardware cursor is absent.
 - HDR preservation/tone mapping, dirty/move rectangles, protected-content
@@ -126,7 +128,8 @@ Current limitations are explicit:
   correctness path, not yet a benchmarked low-latency GPU pipeline.
 - Linux/macOS report `unsupported_platform`; there is no fallback capture backend.
 
-Tests use fake sessions and owned byte arrays only. They cover native binding
+Tests use fake sessions and owned byte arrays only. They cover rotation through
+90, 180, and 270 degrees with non-square, padded surfaces; native binding
 ownership/release, exact callback pixels, pending/busy/device-loss outcomes,
 row-pitch copying, cancellation, capacity, and shutdown. Windows code and native
 ABI compile for x86_64 MSVC. **No physical desktop capture has been run.** Manual
