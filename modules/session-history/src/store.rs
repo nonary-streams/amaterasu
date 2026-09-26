@@ -12,6 +12,8 @@ const SCHEMA_VERSION: i64 = 2;
 const SECONDS_PER_DAY: i64 = 86_400;
 const PRUNE_INTERVAL_SECONDS: i64 = 3_600;
 const BYTES_PER_MEBIBYTE: u64 = 1024 * 1024;
+// The broker rejects completed response payloads above this serialized size.
+const MAX_DETAIL_RESPONSE_BYTES: usize = 16_384;
 
 #[derive(Debug)]
 pub enum HistoryError {
@@ -345,7 +347,7 @@ impl HistoryStore {
         let event_count = child_count(&self.connection, "events", session_id)?;
         let samples = read_samples(&self.connection, session_id)?;
         let events = read_events(&self.connection, session_id)?;
-        Ok(SessionDetail {
+        let mut detail = SessionDetail {
             session,
             sample_count,
             event_count,
@@ -353,7 +355,9 @@ impl HistoryStore {
             events_truncated: event_count > events.len(),
             samples,
             events,
-        })
+        };
+        bound_detail_response(&mut detail)?;
+        Ok(detail)
     }
 
     pub fn active_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>, HistoryError> {
@@ -530,6 +534,25 @@ impl HistoryStore {
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn bound_detail_response(detail: &mut SessionDetail) -> Result<(), HistoryError> {
+    while serde_json::to_vec(&serde_json::json!({"ok": true, "detail": detail}))
+        .map_err(|_| HistoryError::Database)?
+        .len()
+        > MAX_DETAIL_RESPONSE_BYTES
+    {
+        if !detail.events.is_empty() {
+            detail.events.remove(0);
+            detail.events_truncated = true;
+        } else if !detail.samples.is_empty() {
+            detail.samples.remove(0);
+            detail.samples_truncated = true;
+        } else {
+            return Err(HistoryError::Database);
+        }
+    }
+    Ok(())
 }
 
 fn apply_schema(connection: &Connection) -> Result<(), HistoryError> {
@@ -1392,6 +1415,53 @@ mod tests {
             store.active_sessions(17),
             Err(HistoryError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn detail_with_near_limit_events_fits_broker_response() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 10).unwrap();
+        configure(&mut store, HistorySettings::default(), 10);
+        store.begin_session(&metadata("large-detail"), 10).unwrap();
+        for index in 0..MAX_DETAIL_SAMPLES {
+            store
+                .record_sample(&SessionSample {
+                    session_id: "large-detail".into(),
+                    recorded_at_unix: 11 + index as i64,
+                    frames_sent: index as u64,
+                    bytes_sent: 123_456,
+                    dropped_frames: 0,
+                    actual_fps: 60.0,
+                    actual_bitrate_kbps: 20_000.0,
+                    encode_latency_ms: 1.0,
+                })
+                .unwrap();
+        }
+        for index in 0..MAX_DETAIL_EVENTS {
+            store
+                .record_event(&event(
+                    "large-detail",
+                    60 + index as i64,
+                    json!({"index": index, "data": "x".repeat(4_000)}),
+                ))
+                .unwrap();
+        }
+        store.end_session("large-detail", 80).unwrap();
+
+        let detail = store.session_detail("large-detail").unwrap();
+        let response = json!({"ok":true,"detail":detail});
+        assert!(serde_json::to_vec(&response).unwrap().len() <= MAX_DETAIL_RESPONSE_BYTES);
+        assert_eq!(detail.sample_count, MAX_DETAIL_SAMPLES);
+        assert_eq!(detail.samples.len(), MAX_DETAIL_SAMPLES);
+        assert!(detail.event_count > detail.events.len());
+        assert!(detail.events_truncated);
+        assert_eq!(detail.events.last().unwrap().event_type, "stream_ended");
+        assert!(detail.events.iter().any(|event| {
+            event
+                .payload
+                .as_ref()
+                .is_some_and(|payload| payload["index"] == 7)
+        }));
     }
 
     #[test]
