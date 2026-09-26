@@ -88,8 +88,9 @@ reports a catalog failure in `last_error`; a successful later reconciliation
 clears it.
 Local artwork revisions are SHA-256 digests of the validated opened image bytes.
 An image-only change updates the opaque Catalog reference on the next scan.
-Artwork discovery is limited to 256 MiB and eight seconds per snapshot; if the
-budget is reached, game rows still reconcile and provider
+Artwork discovery limits accepted image bytes to 256 MiB and checks an
+eight-second deadline between image reads; a slow individual read may exceed
+that deadline. If the budget is reached, game rows still reconcile and provider
 status reports `artwork_scan_incomplete`. Previously known artwork revisions are
 retained for games the partial scan did not reach; a complete scan clears images
 that are genuinely absent. Readback still rejects a retained revision if the
