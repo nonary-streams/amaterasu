@@ -409,18 +409,22 @@ impl Snapshot {
     }
     #[cfg(any(windows, test))]
     pub fn equivalent(&self, other: &Self) -> bool {
-        self.paths.len() == other.paths.len()
-            && self.paths.iter().zip(&other.paths).all(|(left, right)| {
-                left.id == right.id
-                    && left.source_name == right.source_name
-                    && left.source == right.source
-                    && left.signal == right.signal
-                    && left.rotation == right.rotation
-                    && left.scaling == right.scaling
-                    && left.refresh.equivalent(right.refresh)
-                    && left.scan_line_ordering == right.scan_line_ordering
-                    && (left.hdr_enabled == right.hdr_enabled
-                        || (left.hdr_enabled.is_none() && right.hdr_enabled == Some(false)))
+        self.validate().is_ok()
+            && other.validate().is_ok()
+            && self.paths.len() == other.paths.len()
+            && self.paths.iter().all(|left| {
+                other.paths.iter().any(|right| {
+                    left.id == right.id
+                        && left.source_name == right.source_name
+                        && left.source == right.source
+                        && left.signal == right.signal
+                        && left.rotation == right.rotation
+                        && left.scaling == right.scaling
+                        && left.refresh.equivalent(right.refresh)
+                        && left.scan_line_ordering == right.scan_line_ordering
+                        && (left.hdr_enabled == right.hdr_enabled
+                            || (left.hdr_enabled.is_none() && right.hdr_enabled == Some(false)))
+                })
             })
     }
 }

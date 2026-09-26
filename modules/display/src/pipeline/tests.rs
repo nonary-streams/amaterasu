@@ -56,6 +56,17 @@ fn snapshot() -> Snapshot {
         }],
     }
 }
+fn two_display_snapshot() -> Snapshot {
+    let mut before = snapshot();
+    let mut second = before.paths[0].clone();
+    second.id = "monitor.two".into();
+    second.source_name = "DISPLAY2".into();
+    second.source_address.id = 2;
+    second.target_address.id = 3;
+    second.source.x = 1920;
+    before.paths.push(second);
+    before
+}
 fn configuration() -> Value {
     json!({"displays":[{"id":"monitor.one","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0}]})
 }
@@ -93,6 +104,7 @@ struct FakePlatform {
     hdr_state: bool,
     hdr_mutations: usize,
     prepared_hdr: Option<Option<bool>>,
+    reorder_readback: bool,
 }
 impl Platform for FakePlatform {
     fn name(&self) -> &'static str {
@@ -124,7 +136,11 @@ impl Platform for FakePlatform {
         }
         self.prepared_hdr = Some(display.hdr_enabled);
         self.prepared_mode = Some((display.width, display.height, display.refresh));
-        let mut before = snapshot();
+        let mut before = if self.reorder_readback {
+            two_display_snapshot()
+        } else {
+            snapshot()
+        };
         if self.inactive {
             before.paths[0].id = "monitor.other".into();
         }
@@ -137,6 +153,13 @@ impl Platform for FakePlatform {
         before: &Snapshot,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
+        if self.reorder_readback {
+            let mut readback = before.clone();
+            readback.paths.reverse();
+            if !before.equivalent(&readback) {
+                return Err(DisplayError::new("topology_changed", "reordered readback"));
+            }
+        }
         assert_eq!(before.paths[0].hdr_enabled.unwrap_or(false), self.hdr_state);
         if self.topology_changed {
             return Err(DisplayError::new("topology_changed", "external change"));
@@ -202,13 +225,107 @@ impl Platform for FakePlatform {
         if self.restore_failure {
             return Err(DisplayError::new("platform_error", "restore failed").after_mutation());
         }
+        if self.reorder_readback {
+            let mut readback = before.clone();
+            readback.paths.reverse();
+            if !before.equivalent(&readback) {
+                return Err(
+                    DisplayError::new("verification_failed", "reordered restore").after_mutation(),
+                );
+            }
+        }
         if let Some(enabled) = before.paths[0].hdr_enabled {
             self.hdr_state = enabled;
         }
+        self.applied_mode = Some((
+            before.paths[0].source.width,
+            before.paths[0].source.height,
+            before.paths[0].refresh,
+        ));
         self.inactive = before.paths[0].id != "monitor.one";
         Ok(())
     }
 }
+
+#[test]
+fn remapped_mode_survives_reordered_readback_and_restores() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            reorder_readback: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply", "configuration":configuration(),
+            "mode_policy":{
+                "display_id":"monitor.one",
+                "context":{
+                    "resolution_is_automatic":true,
+                    "refresh_rate_is_automatic":true,
+                    "client_display_mode_override":false,
+                    "optimize_game_settings":true
+                },
+                "remapping":{"mixed":[{
+                    "requested_resolution":"1280x720",
+                    "requested_fps":"60",
+                    "final_resolution":"1920x1080",
+                    "final_refresh_rate":"120"
+                }]}
+            }
+        }),
+    );
+    assert_eq!(applied["applied"], true);
+    assert_eq!(
+        pipeline.platform.prepared_mode,
+        pipeline.platform.applied_mode
+    );
+    assert_eq!(pipeline.platform.prepared_mode.unwrap().0, 1920);
+    assert_eq!(pipeline.platform.prepared_mode.unwrap().2.numerator, 120);
+    assert!(state.journal.is_some());
+
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert_eq!(pipeline.platform.effects, ["apply", "restore"]);
+    assert_eq!(
+        pipeline.platform.applied_mode,
+        Some((
+            1920,
+            1080,
+            Rational {
+                numerator: 60,
+                denominator: 1
+            }
+        ))
+    );
+    assert!(state.journal.is_none());
+}
+
+#[test]
+fn reordered_readback_still_detects_a_changed_refresh_rate() {
+    let before = two_display_snapshot();
+    let mut readback = before.clone();
+    readback.paths.reverse();
+    readback.paths[0].refresh.numerator = 75;
+    assert!(!before.equivalent(&readback));
+}
+
+#[test]
+fn reordered_readback_rejects_duplicate_identity() {
+    let before = two_display_snapshot();
+    let mut readback = before.clone();
+    readback.paths[1] = readback.paths[0].clone();
+    assert!(!before.equivalent(&readback));
+}
+
 #[derive(Default)]
 struct State {
     revision: u64,
