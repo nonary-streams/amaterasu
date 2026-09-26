@@ -248,27 +248,30 @@ fn build_request(
     body: &[u8],
     transport: Transport,
 ) -> Result<Request, Failure> {
-    if transport == Transport::Tls && fields.authorization.is_none() && fields.cookie.is_some() {
-        require_cookie_origin(
-            fields,
-            &format!("https://{}", fields.host.unwrap_or_default()),
-        )?;
-    }
     let bearer = if !preflight && route.scope.is_some() {
-        let bearer = fields
-            .authorization
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .or_else(|| {
-                (transport == Transport::Tls)
-                    .then(|| cookie(fields.cookie, "__Secure-amaterasu-access"))
-                    .flatten()
-            })
-            .filter(|value| {
-                !value.is_empty()
-                    && value.len() <= 128
-                    && value.bytes().all(|byte| byte.is_ascii_graphic())
-            })
-            .ok_or(Failure::new(401, "unauthorized"))?;
+        let validate = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value.bytes().all(|byte| byte.is_ascii_graphic())
+        };
+        let bearer = if let Some(authorization) = fields.authorization {
+            authorization
+                .strip_prefix("Bearer ")
+                .filter(|value| validate(value))
+        } else if transport == Transport::Tls {
+            let access = cookie(fields.cookie, "__Secure-amaterasu-access")
+                .filter(|value| valid_token(value));
+            if access.is_some() {
+                require_cookie_origin(
+                    fields,
+                    &format!("https://{}", fields.host.unwrap_or_default()),
+                )?;
+            }
+            access
+        } else {
+            None
+        }
+        .ok_or(Failure::new(401, "unauthorized"))?;
         Some(bearer.to_owned())
     } else {
         None
@@ -312,18 +315,22 @@ fn browser_request(
         return Err(Failure::new(400, "invalid_json_body"));
     };
     if action != BrowserAuth::Login {
-        let name = if action == BrowserAuth::Refresh || action == BrowserAuth::Logout {
-            "__Secure-amaterasu-refresh"
-        } else {
-            "__Secure-amaterasu-access"
-        };
-        let token = cookie(fields.cookie, name)
-            .filter(|value| valid_token(value))
-            .ok_or(Failure::new(401, "unauthorized"))?;
+        let refresh =
+            cookie(fields.cookie, "__Secure-amaterasu-refresh").filter(|value| valid_token(value));
+        let access =
+            cookie(fields.cookie, "__Secure-amaterasu-access").filter(|value| valid_token(value));
         payload = match action {
-            BrowserAuth::Refresh => json!({"action":"refresh","refresh_token":token}),
-            BrowserAuth::Logout => json!({"action":"logout","refresh_token":token}),
-            BrowserAuth::Session => json!({"action":"verify","bearer":token,"required_scopes":[]}),
+            BrowserAuth::Refresh => {
+                json!({"action":"refresh","refresh_token":refresh.ok_or(Failure::new(401, "unauthorized"))?})
+            }
+            BrowserAuth::Logout => match (refresh, access) {
+                (Some(token), _) => json!({"action":"logout","refresh_token":token}),
+                (None, Some(token)) => json!({"action":"logout","bearer":token}),
+                (None, None) => json!({}),
+            },
+            BrowserAuth::Session => {
+                json!({"action":"verify","bearer":access.ok_or(Failure::new(401, "unauthorized"))?,"required_scopes":[]})
+            }
             BrowserAuth::Login => unreachable!(),
         };
     }
@@ -669,6 +676,60 @@ mod tests {
             parse(valid.as_bytes(), HOST, &[]).err().unwrap().status,
             403
         );
+    }
+
+    #[test]
+    fn malformed_authorization_never_falls_back_to_cookie_without_csrf() {
+        let token = format!("ama_{}", "c".repeat(64));
+        let allowed = vec!["https://allowed.example".to_owned()];
+        for (origin, csrf) in [
+            (format!("https://{HOST}"), ""),
+            (
+                "https://allowed.example".to_owned(),
+                "X-Amaterasu-CSRF: 1\r\n",
+            ),
+            (format!("https://{HOST}"), "X-Amaterasu-CSRF: 1\r\n"),
+        ] {
+            let request = format!(
+                "POST /v1/catalog/list HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nOrigin: {origin}\r\nAuthorization: junk\r\n{csrf}Cookie: __Secure-amaterasu-access={token}\r\n\r\n{{}}"
+            );
+            assert_eq!(
+                parse_transport(request.as_bytes(), HOST, &allowed, Transport::Tls)
+                    .err()
+                    .unwrap()
+                    .status,
+                401
+            );
+        }
+        let request = format!(
+            "POST /v1/catalog/list HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nOrigin: https://allowed.example\r\nX-Amaterasu-CSRF: 1\r\nCookie: __Secure-amaterasu-access={token}\r\n\r\n{{}}"
+        );
+        assert_eq!(
+            parse_transport(request.as_bytes(), HOST, &allowed, Transport::Tls)
+                .err()
+                .unwrap()
+                .status,
+            403
+        );
+    }
+
+    #[test]
+    fn browser_logout_uses_access_when_refresh_is_missing_and_can_clear_without_tokens() {
+        let access = format!("ama_{}", "d".repeat(64));
+        let request = |cookie_header: &str| {
+            format!(
+                "POST /v1/auth/browser/logout HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nOrigin: https://{HOST}\r\nX-Amaterasu-CSRF: 1\r\n{cookie_header}\r\n{{}}"
+            )
+        };
+        let access_only = request(&format!("Cookie: __Secure-amaterasu-access={access}\r\n"));
+        let parsed = parse_transport(access_only.as_bytes(), HOST, &[], Transport::Tls)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.payload, json!({"action":"logout","bearer":access}));
+        let missing = parse_transport(request("").as_bytes(), HOST, &[], Transport::Tls)
+            .unwrap()
+            .unwrap();
+        assert_eq!(missing.payload, json!({}));
     }
 
     #[test]

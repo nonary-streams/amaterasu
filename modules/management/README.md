@@ -66,7 +66,9 @@ and set host-only Secure, HttpOnly, SameSite=Strict access and refresh cookies s
 to `/v1` and `/v1/auth/browser` respectively. Remembered refresh cookies persist
 until the signed authentication expiry. Browser session verifies the access cookie;
 a remembered client can refresh after a browser restart when that session cookie
-is absent. Logout revokes the refresh pair and clears both cookies. A failed
+is absent. Logout revokes the refresh pair (or the access session if refresh is
+missing) and clears both cookies. With neither valid cookie, it clears them
+locally and returns `session_missing` without claiming server revocation. A failed
 refresh never clears cookies because another tab may have completed rotation.
 Cookie-authenticated POSTs require an exact same HTTPS Origin and
 `X-Amaterasu-CSRF: 1`; browser routes do not send credentialed CORS headers.

@@ -116,6 +116,7 @@ impl Server {
                         connections.push(Connection {
                             stream,
                             tls,
+                            tls_closing: false,
                             deadline: Instant::now() + CONNECTION_TIMEOUT,
                             stage: Stage::Reading(Vec::new()),
                             origin: None,
@@ -135,6 +136,7 @@ impl Server {
 struct Connection {
     stream: TcpStream,
     tls: Option<ServerConnection>,
+    tls_closing: bool,
     deadline: Instant,
     origin: Option<String>,
     stage: Stage,
@@ -357,8 +359,14 @@ impl Connection {
 
     fn write_response(&mut self, bytes: Vec<u8>, mut offset: usize) {
         if offset == bytes.len() {
-            if self.tls.as_ref().is_some_and(|tls| tls.wants_write()) {
-                self.stage = Stage::Writing { bytes, offset };
+            if let Some(tls) = &mut self.tls {
+                if !self.tls_closing {
+                    tls.send_close_notify();
+                    self.tls_closing = true;
+                }
+                if tls.wants_write() {
+                    self.stage = Stage::Writing { bytes, offset };
+                }
             }
             return;
         }
@@ -372,7 +380,7 @@ impl Connection {
             Ok(0) => {}
             Ok(length) => {
                 offset += length;
-                if offset < bytes.len() || self.tls.as_ref().is_some_and(|tls| tls.wants_write()) {
+                if offset < bytes.len() || self.tls.is_some() {
                     self.stage = Stage::Writing { bytes, offset };
                 }
             }
@@ -443,6 +451,10 @@ impl Connection {
     ) -> ModuleResult<()> {
         let RequestTarget::Api(route) = request.target else {
             if let RequestTarget::BrowserAuth(action) = request.target {
+                if action == BrowserAuth::Logout && request.payload == json!({}) {
+                    self.respond_browser_auth(action, json!({"ok":false,"code":"session_missing"}));
+                    return Ok(());
+                }
                 if let Some(request_id) =
                     self.submit(runtime, crate::AUTH_SERVICE, request.payload, operation)?
                 {
@@ -521,6 +533,12 @@ impl Connection {
     fn respond_browser_auth(&mut self, action: BrowserAuth, mut payload: Value) {
         let status = service_status(&payload, true, false);
         let mut cookies = Vec::new();
+        if action == BrowserAuth::Logout
+            && (status == 200
+                || payload.get("code").and_then(Value::as_str) == Some("session_missing"))
+        {
+            cookies.extend(browser_cookie_expirations());
+        }
         if status == 200 && payload.get("ok").and_then(Value::as_bool) == Some(true) {
             if action != BrowserAuth::Logout && !valid_browser_metadata(&payload) {
                 self.fail(502, "invalid_auth_reply");
@@ -563,9 +581,6 @@ impl Connection {
                     self.fail(502, "invalid_auth_reply");
                     return;
                 }
-            } else if action == BrowserAuth::Logout {
-                cookies.push("__Secure-amaterasu-access=; Path=/v1; Max-Age=0; Secure; HttpOnly; SameSite=Strict".into());
-                cookies.push("__Secure-amaterasu-refresh=; Path=/v1/auth/browser; Max-Age=0; Secure; HttpOnly; SameSite=Strict".into());
             }
         }
         if let Some(object) = payload.as_object_mut() {
@@ -577,6 +592,13 @@ impl Connection {
             offset: 0,
         };
     }
+}
+
+fn browser_cookie_expirations() -> [String; 2] {
+    [
+        "__Secure-amaterasu-access=; Path=/v1; Max-Age=0; Secure; HttpOnly; SameSite=Strict".into(),
+        "__Secure-amaterasu-refresh=; Path=/v1/auth/browser; Max-Age=0; Secure; HttpOnly; SameSite=Strict".into(),
+    ]
 }
 
 fn valid_auth_token(token: &str) -> bool {
@@ -656,6 +678,7 @@ mod tests {
         let mut connection = Connection {
             stream: client,
             tls: None,
+            tls_closing: false,
             deadline: Instant::now() + CONNECTION_TIMEOUT,
             origin: None,
             stage: Stage::Closed,
@@ -699,6 +722,22 @@ mod tests {
     }
 
     #[test]
+    fn logout_without_a_valid_cookie_clears_local_cookies_without_claiming_revocation() {
+        let reply = browser_reply(
+            BrowserAuth::Logout,
+            json!({"ok":false,"code":"session_missing"}),
+        );
+        assert!(reply.starts_with("HTTP/1.1 401"));
+        assert!(reply.contains("__Secure-amaterasu-access=; Path=/v1; Max-Age=0"));
+        assert!(reply.contains("__Secure-amaterasu-refresh=; Path=/v1/auth/browser; Max-Age=0"));
+        let unavailable = browser_reply(
+            BrowserAuth::Logout,
+            json!({"ok":false,"code":"service_unavailable"}),
+        );
+        assert!(!unavailable.contains("Set-Cookie:"));
+    }
+
+    #[test]
     fn saturated_tls_plaintext_buffer_retains_unsent_response() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -714,6 +753,7 @@ mod tests {
         let mut connection = Connection {
             stream: client,
             tls: Some(tls),
+            tls_closing: false,
             deadline: Instant::now() + CONNECTION_TIMEOUT,
             origin: None,
             stage: Stage::Closed,
