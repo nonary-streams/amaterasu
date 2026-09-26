@@ -294,9 +294,6 @@ impl Engine {
         // Legacy usernames can be matched without regard to ASCII case, but
         // the authenticated identity must remain the saved administrator name.
         let subject = credential.username.clone();
-        if self.sessions.len() >= MAX_SESSIONS {
-            return Err("session_limit");
-        }
         let (bearer, digest) = crypto::issue_bearer()?;
         let (refresh_token, refresh_digest) = crypto::issue_bearer()?;
         let refresh_ttl = if remember_me {
@@ -326,10 +323,24 @@ impl Engine {
             .as_ref()
             .expect("credential checked above");
         let credential_digest = crypto::token_digest(&credential.password_hash);
+        document.validate().map_err(|_| "resource_limit")?;
         self.sessions
             .retain(|_, session| session.credential_digest == credential_digest);
         self.refresh_index
             .retain(|_, session_id| self.sessions.contains_key(session_id));
+        if self.sessions.len() >= MAX_SESSIONS {
+            // A client can lose every bearer during a reload while its
+            // remembered sessions remain durable. Reclaim the session with
+            // the earliest refresh deadline after password proof and token
+            // generation; the digest provides a stable tie break.
+            let earliest_expiring_session_id = self
+                .sessions
+                .iter()
+                .min_by_key(|(session_id, session)| (session.refresh_expires_at, *session_id))
+                .map(|(session_id, _)| session_id.clone())
+                .expect("a full session set has a reclaimable session");
+            self.remove_session(&earliest_expiring_session_id);
+        }
         self.sessions.insert(
             digest.clone(),
             Session {
@@ -344,7 +355,6 @@ impl Engine {
             },
         );
         self.refresh_index.insert(refresh_digest, digest);
-        document.validate().map_err(|_| "resource_limit")?;
         let sessions = self.build_session_document(&scope_digest)?;
         if upgraded {
             Ok(Change::WriteBoth {

@@ -1142,6 +1142,167 @@ fn imported_primary_login_survives_reload_without_accepting_split_or_auxiliary_s
 }
 
 #[test]
+fn correct_login_reclaims_one_full_remembered_session_durably() {
+    let mut state = StateHarness::new();
+    let configured_settings = settings_with_ttls(5_000, 5_000);
+    let mut pipeline = Pipeline::new(configured_settings.clone());
+    state.setup(&mut pipeline);
+    let login = json!({"action":"login","username":"admin","password":"correct horse battery staple","remember_me":true});
+    let mut original_sessions = Vec::new();
+    for index in 0..16 {
+        let issued = state.request(&mut pipeline, "frontend", login.clone(), 100 + index * 61);
+        assert_eq!(issued["ok"], true);
+        original_sessions.push(issued);
+    }
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        16
+    );
+
+    let mut restarted = Pipeline::new(configured_settings.clone());
+    let stored_before_failure = state.session_stored.clone();
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"login","username":"admin","password":"wrong","remember_me":true}),
+            1_076
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(state.session_stored, stored_before_failure);
+    state.fail_session_write = true;
+    assert_eq!(
+        state.request(&mut restarted, "frontend", login.clone(), 1_077),
+        error("state_unavailable")
+    );
+    assert_eq!(state.session_stored, stored_before_failure);
+    state.fail_session_write = false;
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":original_sessions[0]["bearer"],"required_scopes":[]}),
+            1_078
+        )["ok"],
+        true
+    );
+
+    let mut after_failed_write = Pipeline::new(configured_settings.clone());
+    assert_eq!(
+        state.request(
+            &mut after_failed_write,
+            "frontend",
+            json!({"action":"verify","bearer":original_sessions[0]["bearer"],"required_scopes":[]}),
+            1_078
+        )["ok"],
+        true
+    );
+    let replacement = state.request(&mut after_failed_write, "frontend", login, 1_079);
+    assert_eq!(replacement["ok"], true);
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        16
+    );
+
+    let mut after_replacement = Pipeline::new(configured_settings.clone());
+    assert_eq!(
+        state.request(
+            &mut after_replacement,
+            "frontend",
+            json!({"action":"verify","bearer":original_sessions[0]["bearer"],"required_scopes":[]}),
+            1_080
+        )["code"],
+        "unauthorized"
+    );
+    for token in original_sessions
+        .iter()
+        .skip(1)
+        .chain(std::iter::once(&replacement))
+    {
+        assert_eq!(
+            state.request(
+                &mut after_replacement,
+                "frontend",
+                json!({"action":"verify","bearer":token["bearer"],"required_scopes":[]}),
+                1_080
+            )["ok"],
+            true
+        );
+    }
+    assert_eq!(
+        state.request(
+            &mut after_replacement,
+            "frontend",
+            json!({"action":"refresh","refresh_token":original_sessions[0]["refresh_token"]}),
+            1_080
+        )["code"],
+        "unauthorized"
+    );
+    let rotated = state.request(
+        &mut after_replacement,
+        "frontend",
+        json!({"action":"refresh","refresh_token":replacement["refresh_token"]}),
+        1_080,
+    );
+    assert_eq!(rotated["ok"], true);
+
+    let mut after_rotation = Pipeline::new(configured_settings.clone());
+    assert_eq!(
+        state.request(
+            &mut after_rotation,
+            "frontend",
+            json!({"action":"verify","bearer":replacement["bearer"],"required_scopes":[]}),
+            1_081
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut after_rotation,
+            "frontend",
+            json!({"action":"refresh","refresh_token":replacement["refresh_token"]}),
+            1_081
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut after_rotation,
+            "frontend",
+            json!({"action":"verify","bearer":rotated["bearer"],"required_scopes":[]}),
+            1_081
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut after_rotation,
+            "frontend",
+            json!({"action":"logout","refresh_token":rotated["refresh_token"]}),
+            1_082
+        )["ok"],
+        true
+    );
+    let mut after_logout = Pipeline::new(configured_settings);
+    assert_eq!(
+        state.request(
+            &mut after_logout,
+            "frontend",
+            json!({"action":"verify","bearer":rotated["bearer"],"required_scopes":[]}),
+            1_083
+        )["code"],
+        "unauthorized"
+    );
+}
+
+#[test]
 fn imported_credential_replaces_stale_session_only_namespace_and_authenticates_after_restart() {
     let source = std::env::temp_dir().join(format!(
         "amaterasu-auth-import-consumer-source-{}",
