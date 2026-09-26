@@ -87,8 +87,11 @@ Versions 1.0 through 1.2 remain available as unchanged prefixes for older
 consumers. The 1.1 `geometry` callback returns the validated open-stream
 geometry, or `MEDIA_UNSUPPORTED` when open could not prove geometry. Once
 geometry was advertised, a changed rectangle, missing display, or changed
-physical target closes the stream. `MEDIA_BUSY` reports temporary controller
-contention and may be retried without consuming a frame.
+physical target closes the stream. Fresh frames and constant-rate cached repeats
+recheck that geometry before pixel delivery, including moves that preserve the
+capture dimensions. If Open could not prove geometry, capture remains available
+without a touch mapping. `MEDIA_BUSY` reports temporary controller contention
+and may be retried without consuming a frame.
 
 The v1.2 freshness callback reports whether delivered pixels came from a fresh
 WGC frame or cached reuse. The v1.3 `read_frame_with_capture_timestamp` callback

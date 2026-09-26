@@ -632,6 +632,82 @@ fn native_geometry_is_owner_scoped_and_change_closes_the_stream() {
 }
 
 #[test]
+fn frame_delivery_rechecks_same_size_output_location() {
+    let initial = CaptureGeometry::new(
+        DesktopRect::new(-1920, 0, 1920, 1080).unwrap(),
+        DesktopRect::new(-1920, 0, 3840, 1080).unwrap(),
+    )
+    .unwrap();
+    let moved = CaptureGeometry::new(
+        DesktopRect::new(0, 0, 1920, 1080).unwrap(),
+        DesktopRect::new(0, 0, 3840, 1080).unwrap(),
+    )
+    .unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let backend = FakeBackend {
+        events: Arc::new(Mutex::new(VecDeque::from([
+            Ok(Some(frame(1, 1, &[1, 2, 3, 4, 5, 6, 7, 8]))),
+            Ok(None),
+        ]))),
+        geometries: Arc::new(Mutex::new(VecDeque::from([
+            Ok(Some(initial)),
+            Ok(Some(initial)),
+            Ok(Some(moved)),
+        ]))),
+        touch_surfaces: Arc::new(Mutex::new(VecDeque::from([Ok(None)]))),
+        drops: drops.clone(),
+    };
+    let mut controller = Controller::new(backend, true);
+    let stream = open_constant_rate(&mut controller, "owner");
+
+    assert!(controller.read("owner", stream, 0).unwrap().is_some());
+    assert_eq!(
+        controller.read("owner", stream, 0).unwrap_err().code,
+        "access_lost"
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        controller.read("owner", stream, 0).unwrap_err().code,
+        "not_found"
+    );
+}
+
+#[test]
+fn lost_authoritative_geometry_cannot_deliver_a_fresh_frame() {
+    let initial = CaptureGeometry::new(
+        DesktopRect::new(0, 0, 1920, 1080).unwrap(),
+        DesktopRect::new(0, 0, 1920, 1080).unwrap(),
+    )
+    .unwrap();
+    let backend = FakeBackend {
+        events: Arc::new(Mutex::new(VecDeque::from([Ok(Some(frame(
+            1,
+            1,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+        )))]))),
+        geometries: Arc::new(Mutex::new(VecDeque::from([
+            Ok(Some(initial)),
+            Err(CaptureError::new(
+                "geometry_unavailable",
+                "topology unavailable",
+            )),
+        ]))),
+        touch_surfaces: Arc::new(Mutex::new(VecDeque::from([Ok(None)]))),
+        drops: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut controller = Controller::new(backend, true);
+    let stream = open(&mut controller, "owner");
+    assert_eq!(
+        controller.read("owner", stream, 0).unwrap_err().code,
+        "access_lost"
+    );
+    assert_eq!(
+        controller.read("owner", stream, 0).unwrap_err().code,
+        "not_found"
+    );
+}
+
+#[test]
 fn operation_lookup_recovers_owned_stream_without_marking_replays_as_new() {
     let (controller, drops) = setup(true);
     let mut controller = controller.lock().unwrap();

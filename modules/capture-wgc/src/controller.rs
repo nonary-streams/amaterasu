@@ -263,7 +263,7 @@ impl<B: Backend> Controller<B> {
                 "frame wait must be at most 16 ms",
             ));
         }
-        let result = {
+        let mut result = {
             let stream = self.streams.get_mut(&id).expect("authorized stream");
             match stream.session.read(wait_ms) {
                 Ok(Some(mut frame)) if stream.constant_rate => match stream.stamp(&mut frame) {
@@ -307,6 +307,31 @@ impl<B: Backend> Controller<B> {
                 }
             }
         };
+        if result.as_ref().is_ok_and(Option::is_some) {
+            // The frame pool checks pixel dimensions, but an output can move on
+            // the desktop without changing its size. Verify the Open snapshot
+            // before publishing either a fresh frame or a cached repeat.
+            let stream = self.streams.get_mut(&id).expect("authorized stream");
+            let geometry_result = match stream.session.geometry() {
+                Ok(current) if current == stream.geometry => Ok(()),
+                Err(error) if error.code == "geometry_unavailable" && stream.geometry.is_none() => {
+                    Ok(())
+                }
+                Ok(_)
+                | Err(CaptureError {
+                    code: "geometry_unavailable",
+                    ..
+                }) => Err(CaptureError::new(
+                    "access_lost",
+                    "capture desktop geometry changed; enumerate and reopen",
+                )),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = geometry_result {
+                stream.last_frame = None;
+                result = Err(error);
+            }
+        }
         if result
             .as_ref()
             .is_err_and(|error| error.code == "access_lost" || error.code == "device_lost")
