@@ -202,7 +202,7 @@ fn run() -> Result<(), String> {
                 })?;
                 let state = runtime_state_directory(&runtime)?;
                 seed_sensitive_sources(&destination, &copied_validation, &state)?;
-                write_import_validation(&runtime, &sources)?;
+                write_import_validation(&runtime, &destination, &sources)?;
                 println!(
                     "migration runtime state materialized: {} application(s), {} setting(s)",
                     materialized.applications, materialized.settings
@@ -443,14 +443,15 @@ fn ensure_copied_sensitive_requirements(
     };
     if requirements(original) != requirements(copied)
         || original.critical_items != copied.critical_items
-        || original.checks.len() != copied.checks.len()
         || original
             .checks
             .iter()
-            .zip(&copied.checks)
-            .any(|(approved, imported)| {
-                approved.product != imported.product
-                    || approved.fingerprints != imported.fingerprints
+            .filter(|approved| approved.pairing_needed || approved.authentication_needed)
+            .any(|approved| {
+                !copied.checks.iter().any(|imported| {
+                    approved.product == imported.product
+                        && approved.fingerprints == imported.fingerprints
+                })
             })
     {
         return Err("predecessor sensitive state changed while being imported".into());
@@ -590,6 +591,15 @@ struct ImportValidation {
     schema: u32,
     validated: bool,
     families: Vec<LegacyFamily>,
+    sources: Vec<ImportValidationSource>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ImportValidationSource {
+    product: LegacyProduct,
+    root: PathBuf,
+    fingerprints: std::collections::BTreeMap<PathBuf, String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -614,8 +624,45 @@ struct BundleCoordination {
 
 fn write_import_validation(
     runtime: &std::path::Path,
+    destination: &std::path::Path,
     sources: &[LegacyConfigSource],
 ) -> Result<(), String> {
+    let mut bindings = Vec::with_capacity(sources.len());
+    for source in sources {
+        let root = source
+            .root
+            .canonicalize()
+            .map_err(|_| "predecessor source is unavailable after seeding")?;
+        let live = LegacyConfigSource {
+            product: source.product,
+            root: root.clone(),
+        };
+        let copied = LegacyConfigSource {
+            product: source.product,
+            root: destination
+                .join(amaterasu_package::migration::LEGACY_IMPORT_DIRECTORY)
+                .join(source.product.directory_name()),
+        };
+        let copied_fingerprints =
+            amaterasu_package::migration::sensitive_source_fingerprints(&copied)?;
+        let live_fingerprints = amaterasu_package::migration::sensitive_source_fingerprints(&live)?;
+        let fingerprints: std::collections::BTreeMap<_, _> = live_fingerprints
+            .keys()
+            .filter_map(|path| {
+                copied_fingerprints
+                    .get(path)
+                    .map(|digest| (path.clone(), digest.clone()))
+            })
+            .collect();
+        if fingerprints != live_fingerprints {
+            return Err("predecessor configuration changed after sensitive seeding".into());
+        }
+        bindings.push(ImportValidationSource {
+            product: source.product,
+            root,
+            fingerprints,
+        });
+    }
     let mut families: Vec<_> = sources
         .iter()
         .map(|source| legacy_family(source.product))
@@ -625,9 +672,10 @@ fn write_import_validation(
     amaterasu_package::write_json_atomically(
         &runtime.join(IMPORT_VALIDATION_FILE),
         &ImportValidation {
-            schema: 2,
+            schema: 3,
             validated: true,
             families,
+            sources: bindings,
         },
     )
 }
@@ -764,7 +812,40 @@ fn handoff_predecessor(runtime: &std::path::Path) -> Result<(), String> {
             },
         )
     };
-    handoff::stop_with_recovery_state(&mut controller, &mut state.records, true, &mut persist)
+    if let Err(error) =
+        stop_with_revalidated_source(&mut controller, &mut state.records, &mut persist, || {
+            require_import_validation(runtime, &registrations)
+        })
+    {
+        if state
+            .records
+            .iter()
+            .all(|record| !record.stop_attempted && !record.stopped)
+        {
+            persist(&state.records)?;
+            fs::remove_file(&path).map_err(|failure| failure.to_string())?;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn stop_with_revalidated_source<C: ServiceController>(
+    controller: &mut C,
+    records: &mut [HandoffRecord],
+    persist: &mut dyn FnMut(&[HandoffRecord]) -> Result<(), String>,
+    revalidate: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    handoff::stop_with_recovery_state(controller, records, true, persist)?;
+    if let Err(error) = revalidate() {
+        return match handoff::rollback(controller, records) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; predecessor recovery also failed: {rollback_error}"
+            )),
+        };
+    }
+    Ok(())
 }
 
 fn require_import_validation(
@@ -773,9 +854,20 @@ fn require_import_validation(
 ) -> Result<(), String> {
     let validation: ImportValidation =
         amaterasu_package::read_json(&runtime.join(IMPORT_VALIDATION_FILE))?;
-    if validation.schema != 2
+    if validation.schema != 3
         || !validation.validated
         || validation.families.len() > 4
+        || validation.sources.is_empty()
+        || validation.sources.iter().any(|source| {
+            !validation.families.contains(&legacy_family(source.product))
+                || amaterasu_package::migration::sensitive_source_fingerprints(
+                    &LegacyConfigSource {
+                        product: source.product,
+                        root: source.root.clone(),
+                    },
+                )
+                .map_or(true, |current| current != source.fingerprints)
+        })
         || validation.families.iter().any(|family| {
             !registrations
                 .iter()
@@ -1211,6 +1303,9 @@ impl ServiceController for WindowsServiceController {
         sc_status(&["stop", service.name()])
     }
     fn start(&mut self, service: LegacyService) -> Result<(), String> {
+        if self.snapshot(service)?.running {
+            return Ok(());
+        }
         sc_status(&["start", service.name()])
     }
     fn set_start_mode(&mut self, service: LegacyService, mode: StartMode) -> Result<(), String> {
@@ -1483,6 +1578,76 @@ fn usage() -> &'static str {
 mod handoff_cli_tests {
     use super::*;
 
+    struct RecheckController {
+        running: bool,
+        starts: usize,
+        fail_start: bool,
+    }
+
+    impl ServiceController for RecheckController {
+        fn snapshot(&mut self, _: LegacyService) -> Result<ServiceSnapshot, String> {
+            Ok(ServiceSnapshot {
+                exists: true,
+                running: self.running,
+                start_mode: StartMode::Automatic,
+            })
+        }
+
+        fn stop(&mut self, _: LegacyService) -> Result<(), String> {
+            self.running = false;
+            Ok(())
+        }
+
+        fn start(&mut self, _: LegacyService) -> Result<(), String> {
+            self.starts += 1;
+            if self.fail_start {
+                return Err("restart failed".into());
+            }
+            self.running = true;
+            Ok(())
+        }
+
+        fn set_start_mode(&mut self, _: LegacyService, _: StartMode) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn changed_source_during_stop_restarts_predecessor_or_retains_recovery_state() {
+        for fail_start in [false, true] {
+            let mut controller = RecheckController {
+                running: true,
+                starts: 0,
+                fail_start,
+            };
+            let mut records =
+                handoff::preflight(&mut controller, [LegacyFamily::Sunshine]).unwrap();
+            let mut persisted = Vec::new();
+            let error = stop_with_revalidated_source(
+                &mut controller,
+                &mut records,
+                &mut |current| {
+                    persisted.push(current.to_vec());
+                    Ok(())
+                },
+                || Err("source changed during stop".into()),
+            )
+            .unwrap_err();
+            assert!(error.contains("source changed during stop"));
+            assert_eq!(controller.starts, 1);
+            assert_eq!(persisted.len(), 2);
+            if fail_start {
+                assert!(error.contains("restart failed"));
+                assert!(!controller.running);
+                assert!(records[0].stop_attempted);
+                assert!(persisted[1][0].stop_attempted);
+            } else {
+                assert!(controller.running);
+                assert!(!records[0].stop_attempted);
+            }
+        }
+    }
+
     #[test]
     fn missing_default_login_in_copied_snapshot_cannot_authorize_handoff() {
         let root = std::env::temp_dir().join(format!(
@@ -1647,15 +1812,34 @@ mod handoff_cli_tests {
         let _ = fs::remove_dir_all(&root);
         let runtime = root.join("runtime");
         fs::create_dir_all(&runtime).unwrap();
+        let destination = root.join("data");
         let source = LegacyConfigSource {
             product: LegacyProduct::Sunshine,
             root: root.join("predecessor"),
         };
+        let copied = destination.join("legacy-imports/sunshine");
+        for location in [&source.root, &copied] {
+            fs::create_dir_all(location.join("credentials")).unwrap();
+            fs::write(
+                location.join("sunshine.conf"),
+                b"credentials_file = credentials/login.json\n",
+            )
+            .unwrap();
+            fs::write(location.join("credentials/login.json"), b"credential").unwrap();
+        }
         let registrations = [MsiRegistration {
             family: LegacyFamily::Sunshine,
             product_code: "{00000000-0000-0000-0000-000000000001}".into(),
         }];
-        write_import_validation(&runtime, std::slice::from_ref(&source)).unwrap();
+        write_import_validation(&runtime, &destination, std::slice::from_ref(&source)).unwrap();
+        require_import_validation(&runtime, &registrations).unwrap();
+        fs::write(
+            source.root.join("credentials/login.json"),
+            b"changed credential",
+        )
+        .unwrap();
+        assert!(require_import_validation(&runtime, &registrations).is_err());
+        fs::write(source.root.join("credentials/login.json"), b"credential").unwrap();
         require_import_validation(&runtime, &registrations).unwrap();
 
         // The next attempt starts before validation/copy/seed. Its seed failure
@@ -1683,7 +1867,7 @@ mod handoff_cli_tests {
         assert!(require_import_validation(&runtime, &registrations).is_err());
 
         // A later successful retry can publish fresh authorization.
-        write_import_validation(&runtime, &[source]).unwrap();
+        write_import_validation(&runtime, &destination, &[source]).unwrap();
         require_import_validation(&runtime, &registrations).unwrap();
         let _ = fs::remove_dir_all(root);
     }

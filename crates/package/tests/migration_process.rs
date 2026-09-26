@@ -252,9 +252,10 @@ fn main() {
     let args: Vec<_> = env::args_os().skip(1).collect();
     let status = Command::new(env::var_os("REAL_AUTH_HELPER").unwrap())
         .args(&args).status().unwrap();
-    if status.success() && args.first().is_some_and(|arg| arg == "validate") {
+    if status.success() && args.first().is_some_and(|arg| arg == &env::var_os("SWAP_ON").unwrap()) {
         let source = args.get(2).unwrap();
-        if source == &env::var_os("SWAP_SOURCE").unwrap() {
+        if args.first().is_some_and(|arg| arg == "seed")
+            || source == &env::var_os("SWAP_SOURCE").unwrap() {
             fs::write(env::var_os("SWAP_CREDENTIAL").unwrap(),
                 env::var_os("SWAP_CONTENT").unwrap().to_string_lossy().as_bytes()).unwrap();
         }
@@ -286,6 +287,7 @@ fn main() {
         .env("SWAP_SOURCE", &source)
         .env("SWAP_CREDENTIAL", &credential)
         .env("SWAP_CONTENT", &replacement)
+        .env("SWAP_ON", "validate")
         .output()
         .unwrap();
     assert!(!retry.status.success(), "swapped credential was accepted");
@@ -316,6 +318,7 @@ fn main() {
         .env("SWAP_SOURCE", &source)
         .env("SWAP_CREDENTIAL", &credential)
         .env("SWAP_CONTENT", &replacement)
+        .env("SWAP_ON", "validate")
         .output()
         .unwrap();
     assert!(!fresh_attempt.status.success());
@@ -332,6 +335,54 @@ fn main() {
             .exists()
     );
     assert!(!fresh_destination.exists());
+
+    // A source edit after the helper has durably seeded A must also prevent
+    // handoff approval, even though the old authentication state is retained.
+    write_credential(&credential, &approved_hash);
+    let seeded_destination = root.join("seeded-data");
+    let seeded_runtime = root.join("seeded-runtime");
+    fs::create_dir_all(&seeded_runtime).unwrap();
+    let after_seed = Command::new(&migration)
+        .args(["import", "--destination"])
+        .arg(&seeded_destination)
+        .arg("--runtime")
+        .arg(&seeded_runtime)
+        .arg("--source")
+        .arg(format!("sunshine={}", source.display()))
+        .env("REAL_AUTH_HELPER", &helper)
+        .env(
+            "SWAP_SOURCE",
+            seeded_destination.join("legacy-imports/sunshine"),
+        )
+        .env("SWAP_CREDENTIAL", &credential)
+        .env("SWAP_CONTENT", &replacement)
+        .env("SWAP_ON", "seed")
+        .output()
+        .unwrap();
+    assert!(
+        !after_seed.status.success(),
+        "{}; source: {}",
+        output_text(&after_seed),
+        String::from_utf8_lossy(&fs::read(&credential).unwrap())
+    );
+    assert!(
+        output_text(&after_seed)
+            .contains("predecessor configuration changed after sensitive seeding"),
+        "{}",
+        output_text(&after_seed)
+    );
+    assert!(
+        !seeded_runtime
+            .join("installer-import-validated.json")
+            .exists()
+    );
+    let seeded_state: Value =
+        serde_json::from_slice(&fs::read(authentication_namespace(&seeded_runtime)).unwrap())
+            .unwrap();
+    assert_eq!(
+        seeded_state["values"]["authentication/v1"]["credential"]["password_hash"],
+        approved_hash
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -253,7 +253,7 @@ pub fn rollback<C: ServiceController>(
         }
         let service = LegacyService::for_family(record.family);
         controller.set_start_mode(service, record.before.start_mode)?;
-        if record.before.running {
+        if record.before.running && !controller.snapshot(service)?.running {
             controller.start(service)?;
         }
         record.stop_attempted = false;
@@ -317,6 +317,22 @@ mod tests {
         rollback(&mut controller, &mut records).unwrap();
         assert_eq!(controller.starts, 1);
         assert!(controller.states[&LegacyFamily::Sunshine].running);
+    }
+
+    #[test]
+    fn recovery_snapshot_can_be_replayed_after_service_was_restarted() {
+        let mut controller = controller();
+        let mut records = preflight(&mut controller, [LegacyFamily::Sunshine]).unwrap();
+        stop_after_import_validation(&mut controller, &mut records, true).unwrap();
+        let persisted = records.clone();
+        rollback(&mut controller, &mut records).unwrap();
+        assert!(controller.states[&LegacyFamily::Sunshine].running);
+
+        // A crash before the cleared flags reach disk replays the old intent.
+        let mut restored = persisted;
+        rollback(&mut controller, &mut restored).unwrap();
+        assert_eq!(controller.starts, 1);
+        assert!(!restored[0].stop_attempted);
     }
 
     #[test]
