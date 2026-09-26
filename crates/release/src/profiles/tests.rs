@@ -364,7 +364,10 @@ fn platform_registers_host_configuration_with_runtime_and_state_dependencies() {
 
     assert_eq!(provider.library, "amaterasu_host_configuration");
     assert_eq!(provider.provides, &["amaterasu.host-configuration/1"]);
-    assert_eq!(provider.calls, &["amaterasu.state/1"]);
+    assert_eq!(
+        provider.calls,
+        &["amaterasu.state/1", "amaterasu.diagnostics/1"]
+    );
     assert!(provider.dependencies.contains(&RUNTIME_ID));
     assert!(provider.dependencies.contains(&STATE.id));
     let pairing = platform
@@ -419,6 +422,7 @@ fn platform_registers_host_configuration_with_runtime_and_state_dependencies() {
 fn diagnostics_and_management_receive_narrow_host_configuration_grants() {
     let host_configuration_service = "amaterasu.host-configuration/1";
     let state_service = "amaterasu.state/1";
+    let diagnostics_service = "amaterasu.diagnostics/1";
     assert_eq!(
         DIAGNOSTICS.calls,
         &[host_configuration_service, state_service]
@@ -457,8 +461,15 @@ fn diagnostics_and_management_receive_narrow_host_configuration_grants() {
                 .provide
                 .contains(host_configuration_service)
         );
-        assert_eq!(host_configuration.call.len(), 1);
+        assert_eq!(host_configuration.call.len(), 2);
         assert!(host_configuration.call.contains(state_service));
+        assert!(host_configuration.call.contains(diagnostics_service));
+        assert!(!host_configuration.call.contains(host_configuration_service));
+        assert!(
+            !policy.principals[PAIRING.id]
+                .call
+                .contains(diagnostics_service)
+        );
         assert_eq!(policy.settings[PAIRING.id]["host_configuration"], true);
         assert_eq!(
             policy.principals[PAIRING.id].call.len(),

@@ -120,7 +120,7 @@ const HOST_CONFIGURATION: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.host-configuration",
     library: "amaterasu_host_configuration",
     provides: &["amaterasu.host-configuration/1"],
-    calls: &["amaterasu.state/1"],
+    calls: &["amaterasu.state/1", "amaterasu.diagnostics/1"],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
