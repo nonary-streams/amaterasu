@@ -253,6 +253,7 @@ pub struct HistoryStatus {
     pub degraded: bool,
     pub failed_operations: u64,
     pub active_streams: usize,
+    pub pending_activities: usize,
     pub sessions: usize,
     pub samples: usize,
     pub events: usize,

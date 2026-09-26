@@ -79,6 +79,35 @@ fn status_reports_storage_unavailability_without_failing_the_module() {
     assert_eq!(response["ok"], true);
     assert_eq!(response["status"]["available"], false);
     assert_eq!(response["status"]["degraded"], true);
+    assert_eq!(response["status"]["pending_activities"], 0);
+}
+
+#[test]
+fn status_rpc_expires_launches_before_reporting_effective_recording() {
+    let directory = std::env::temp_dir().join(format!(
+        "amaterasu-history-pending-status-{}-{}",
+        std::process::id(),
+        amaterasu_storage::random_identifier().unwrap()
+    ));
+    let mut store = HistoryStore::open(&directory.join("history.db"), 100).unwrap();
+    store
+        .apply_configuration(HistorySettings::default(), 100)
+        .unwrap();
+    assert!(store.begin_stream_activity("pending", 101).unwrap());
+    store
+        .apply_configuration(
+            HistorySettings {
+                enabled: false,
+                ..HistorySettings::default()
+            },
+            102,
+        )
+        .unwrap();
+    let status = execute(&mut store, operation("history_status"), 401).unwrap();
+    assert_eq!(status["status"]["pending_activities"], 0);
+    assert_eq!(status["status"]["effective_enabled"], false);
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

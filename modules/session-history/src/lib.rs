@@ -358,10 +358,13 @@ fn execute(
             let page = store.active_sessions_page(limit.unwrap_or(16), offset.unwrap_or(0))?;
             Ok(json!({"ok": true, "sessions": page.sessions, "next_offset": page.next_offset}))
         }
-        Operation::HistoryStatus {} => Ok(json!({
-            "ok": true,
-            "status": store.status()?,
-        })),
+        Operation::HistoryStatus {} => {
+            store.prune_if_due(now_unix);
+            Ok(json!({
+                "ok": true,
+                "status": store.status()?,
+            }))
+        }
         Operation::DeleteSession { session_id } => {
             store.delete_session(&session_id)?;
             Ok(json!({"ok": true}))
@@ -399,6 +402,7 @@ fn unavailable_status() -> Value {
             "degraded": true,
             "failed_operations": 0,
             "active_streams": 0,
+            "pending_activities": 0,
             "sessions": 0,
             "samples": 0,
             "events": 0,

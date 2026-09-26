@@ -642,6 +642,7 @@ impl HistoryStore {
                 || self.last_prune.size_limit_unmet,
             failed_operations: self.failed_operations,
             active_streams: self.active_streams.len(),
+            pending_activities: self.pending_activities.len(),
             sessions: table_count(&self.connection, "sessions")?,
             samples: table_count(&self.connection, "samples")?,
             events: table_count(&self.connection, "events")?,
@@ -1185,7 +1186,10 @@ mod tests {
         let mut store = HistoryStore::open(&database.path(), 100).unwrap();
         configure(&mut store, HistorySettings::default(), 100);
         assert!(store.begin_stream_activity("launch", 101).unwrap());
+        assert_eq!(store.status().unwrap().pending_activities, 1);
+        assert_eq!(store.status().unwrap().active_streams, 0);
         assert!(store.begin_stream_activity("launch", 200).unwrap());
+        assert_eq!(store.status().unwrap().pending_activities, 1);
         configure(
             &mut store,
             HistorySettings {
@@ -1200,6 +1204,8 @@ mod tests {
                 .begin_session_at(&metadata("launch"), 210, 210)
                 .unwrap()
         );
+        assert_eq!(store.status().unwrap().pending_activities, 0);
+        assert_eq!(store.status().unwrap().active_streams, 1);
         assert_eq!(store.status().unwrap().events, 1);
         assert!(store.end_session("launch", 220, 220).unwrap());
         assert!(!store.settings().1);
@@ -1216,6 +1222,7 @@ mod tests {
         configure(&mut store, HistorySettings::default(), 100);
         assert!(store.begin_stream_activity("cancelled", 101).unwrap());
         assert!(store.begin_stream_activity("expired", 102).unwrap());
+        assert_eq!(store.status().unwrap().pending_activities, 2);
         configure(
             &mut store,
             HistorySettings {
@@ -1225,10 +1232,12 @@ mod tests {
             103,
         );
         assert!(store.end_stream_activity("cancelled", 104).unwrap());
+        assert_eq!(store.status().unwrap().pending_activities, 1);
         assert!(store.settings().1);
         // A retry cannot extend the first deadline of 402.
         assert!(store.begin_stream_activity("expired", 401).unwrap());
         store.prune_if_due(402);
+        assert_eq!(store.status().unwrap().pending_activities, 0);
         assert!(!store.settings().1);
         assert!(store.begin_stream_activity("expired", 403).is_err());
         assert!(
@@ -1255,6 +1264,7 @@ mod tests {
             101,
         );
         assert!(store.begin_stream_activity("launch", 102).unwrap());
+        assert_eq!(store.status().unwrap().pending_activities, 1);
         configure(&mut store, HistorySettings::default(), 103);
         assert!(!store.settings().1);
         assert!(
@@ -1269,6 +1279,7 @@ mod tests {
         drop(store);
         let mut reopened = HistoryStore::open(&path, 107).unwrap();
         configure(&mut reopened, HistorySettings::default(), 107);
+        assert_eq!(reopened.status().unwrap().pending_activities, 0);
         assert!(reopened.begin_stream_activity("launch", 108).unwrap());
     }
 
