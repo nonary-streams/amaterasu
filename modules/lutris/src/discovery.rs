@@ -117,6 +117,14 @@ pub fn availability() -> Availability {
     let flatpak_executable: Option<PathBuf> = None;
     let flatpak_database_available = flatpak_database.is_some();
     let flatpak_executable_available = flatpak_executable.is_some();
+    #[cfg(target_os = "linux")]
+    let flatpak_installed = !(native_database && native_executable)
+        && flatpak_database_available
+        && flatpak_executable
+            .as_deref()
+            .is_some_and(flatpak_user_app_installed);
+    #[cfg(not(target_os = "linux"))]
+    let flatpak_installed = false;
     Availability {
         supported_platform,
         database_available: native_database || flatpak_database_available,
@@ -126,6 +134,7 @@ pub fn availability() -> Availability {
             native_executable,
             flatpak_database_available,
             flatpak_executable_available,
+            flatpak_installed,
         ),
     }
 }
@@ -135,8 +144,10 @@ fn paired_source_available(
     native_executable: bool,
     flatpak_database: bool,
     flatpak_executable: bool,
+    flatpak_installed: bool,
 ) -> bool {
-    (native_database && native_executable) || (flatpak_database && flatpak_executable)
+    (native_database && native_executable)
+        || (flatpak_database && flatpak_executable && flatpak_installed)
 }
 
 fn discover_source() -> Result<(PathBuf, PathBuf, LaunchKind), String> {
@@ -845,10 +856,12 @@ mod tests {
 
     #[test]
     fn availability_requires_database_and_client_from_the_same_installation() {
-        assert!(!paired_source_available(true, false, false, true));
-        assert!(!paired_source_available(false, true, true, false));
-        assert!(paired_source_available(true, true, false, false));
-        assert!(paired_source_available(false, false, true, true));
+        assert!(!paired_source_available(true, false, false, true, true));
+        assert!(!paired_source_available(false, true, true, false, true));
+        assert!(paired_source_available(true, true, false, false, false));
+        assert!(paired_source_available(true, true, true, true, false));
+        assert!(!paired_source_available(false, false, true, true, false));
+        assert!(paired_source_available(false, false, true, true, true));
     }
 
     #[cfg(target_os = "linux")]
