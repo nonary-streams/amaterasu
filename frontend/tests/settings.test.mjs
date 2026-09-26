@@ -410,6 +410,100 @@ test("host logging editor discards delayed loads and failures after refresh or s
   assert.equal((await reloaded).settings.revision, 9);
 });
 
+test("host logging form refreshes its revision after an ambiguous persisted save", async () => {
+  class Element {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.listeners = new Map();
+      this.isConnected = false;
+      this.value = "";
+    }
+    setConnected(connected) {
+      this.isConnected = connected;
+      for (const child of this.children) child?.setConnected?.(connected);
+    }
+    append(...children) {
+      for (const child of children) {
+        if (child == null) continue;
+        this.children.push(child);
+        child?.setConnected?.(this.isConnected);
+      }
+    }
+    replaceChildren(...children) {
+      for (const child of this.children) child?.setConnected?.(false);
+      this.children = [];
+      this.append(...children);
+    }
+    addEventListener(name, callback) { this.listeners.set(name, callback); }
+    setAttribute() {}
+    reportValidity() { return true; }
+    get textContent() {
+      return this.children.map((child) => typeof child === "string" ? child : child.textContent).join("");
+    }
+    set textContent(value) { this.replaceChildren(value); }
+    fire(name, event) { this.listeners.get(name)?.(event); }
+  }
+  const find = (node, predicate) => {
+    if (predicate(node)) return node;
+    for (const child of node.children ?? []) {
+      if (typeof child === "string") continue;
+      const found = find(child, predicate);
+      if (found) return found;
+    }
+    return null;
+  };
+  const dom = vm.createContext({ TextEncoder, URL, Error,
+    document: { createElement: (name) => new Element(name) } });
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/settings.ts"]) {
+    vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
+    vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+  }
+  dom.ApiError = class ApiError extends Error {};
+  const content = new Element("main");
+  content.setConnected(true);
+  const notices = [];
+  let stored = hostConfiguration();
+  let failReadback = false;
+  const submittedRevisions = [];
+  dom.Amaterasu.renderSettings({ content, notify: (message) => notices.push(message), api: {
+    allows: (scope) => scope === "configuration.write",
+    async post(route, body) {
+      if (route === "host-configuration/get") {
+        if (failReadback) {
+          failReadback = false;
+          throw new Error("readback unavailable");
+        }
+        return stored;
+      }
+      if (route === "host-configuration/update") {
+        submittedRevisions.push(body.expected_revision);
+        stored = { ...stored, revision: stored.revision + 1,
+          values: { ...stored.values, log_path: body.log_path, min_log_level: body.min_log_level } };
+        if (submittedRevisions.length === 1) failReadback = true;
+        return stored;
+      }
+      if (route === "diagnostics/refresh_logging")
+        return { ok: true, requested_revision: body.minimum_revision,
+          logging_configuration_revision: null, ready: true };
+      throw new Error(`unavailable: ${route}`);
+    },
+  } });
+  await new Promise(setImmediate);
+  const hostLoggingArea = content.children[3];
+  const originalForm = find(hostLoggingArea, (node) => node.tagName === "form");
+  assert.match(hostLoggingArea.textContent, /Revision 6/);
+  originalForm.fire("submit", { preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(originalForm.isConnected, false);
+  assert.match(hostLoggingArea.textContent, /Revision 7/);
+  assert.match(notices.at(-1), /could not be confirmed/);
+  find(hostLoggingArea, (node) => node.tagName === "form").fire("submit", { preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.deepEqual(submittedRevisions, [6, 7]);
+  assert.match(hostLoggingArea.textContent, /Revision 8/);
+});
+
 test("diagnostics status distinguishes saved, pending, unavailable and newer logging revisions", () => {
   const parseStatus = context.Amaterasu.parseDiagnosticsLoggingStatus;
   const describe = context.Amaterasu.diagnosticsLoggingDescription;
@@ -449,6 +543,11 @@ test("signed host logging save confirms readback and reader adoption after resta
       return stored;
     }
     if (route === "host-configuration/get") return stored;
+    if (route === "diagnostics/refresh_logging") {
+      assert.deepEqual(ordinary(body), { minimum_revision: stored.revision });
+      return { ok: true, requested_revision: body.minimum_revision,
+        logging_configuration_revision: readerRevision, ready: true };
+    }
     assert.equal(route, "diagnostics/status");
     if (diagnosticsFailure) throw new Error("secret/path: connection failed");
     return diagnosticsReply ?? { ok: true, ready: true,
@@ -459,8 +558,9 @@ test("signed host logging save confirms readback and reader adoption after resta
   const saved = await context.Amaterasu.saveHostLoggingState(api, loaded.settings, "info", "logs/new.log");
   assert.equal(saved.settings.revision, 7);
   assert.equal(saved.settings.values.log_path, "logs/new.log");
+  assert.equal(saved.refreshScheduled, true);
   assert.match(describe(saved.settings.revision, saved.diagnostics), /pending/);
-  assert.deepEqual(calls, ["host-configuration/get", "diagnostics/status", "host-configuration/update", "host-configuration/get", "diagnostics/status"]);
+  assert.deepEqual(calls, ["host-configuration/get", "diagnostics/status", "host-configuration/update", "host-configuration/get", "diagnostics/refresh_logging", "diagnostics/status"]);
   // The reader restarts with the persisted policy and reports the saved revision.
   readerRevision = stored.revision;
   sink = { state: "failed", failure: "open" };
@@ -492,6 +592,44 @@ test("signed host logging save confirms readback and reader adoption after resta
   assert.match(describe(7, denied.diagnostics), /diagnostics.read permission/);
   assert.doesNotMatch([loaded, saved, openFailure, writeFailure, recovered, disabled, malformed, failedRequest, denied]
     .map(({ settings, diagnostics }) => describe(settings.revision, diagnostics)).join(" "), /logs\/new\.log|secret|password/);
+});
+
+test("failed logging refresh or status keeps the confirmed save pending or unknown", async () => {
+  let stored = hostConfiguration();
+  let statusFails = false;
+  const calls = [];
+  const api = { async post(route, body) {
+    calls.push(route);
+    if (route === "host-configuration/update") {
+      assert.equal(body.expected_revision, stored.revision);
+      stored = { ...stored, revision: stored.revision + 1,
+        values: { ...stored.values, log_path: body.log_path, min_log_level: body.min_log_level } };
+      return stored;
+    }
+    if (route === "host-configuration/get") return stored;
+    if (route === "diagnostics/refresh_logging") {
+      assert.deepEqual(ordinary(body), { minimum_revision: stored.revision });
+      throw new Error("refresh unavailable");
+    }
+    assert.equal(route, "diagnostics/status");
+    if (statusFails) throw new Error("status unavailable");
+    return { ok: true, ready: true, logging_configuration_revision: stored.revision - 1,
+      logging_sink: { state: "healthy", failure: null } };
+  } };
+  const pending = await context.Amaterasu.saveHostLoggingState(api, stored, "warning", "logs/pending.log");
+  assert.equal(pending.settings.revision, 7);
+  assert.equal(pending.refreshScheduled, false);
+  assert.match(context.Amaterasu.diagnosticsLoggingDescription(7, pending.diagnostics), /pending/);
+  assert.doesNotMatch(context.Amaterasu.diagnosticsLoggingDescription(7, pending.diagnostics), /disk logging is healthy/);
+  statusFails = true;
+  const unknown = await context.Amaterasu.saveHostLoggingState(api, stored, "info", "logs/unknown.log");
+  assert.equal(unknown.settings.revision, 8);
+  assert.equal(unknown.refreshScheduled, false);
+  assert.match(context.Amaterasu.diagnosticsLoggingDescription(8, unknown.diagnostics), /status request failed/);
+  assert.deepEqual(calls, [
+    "host-configuration/update", "host-configuration/get", "diagnostics/refresh_logging", "diagnostics/status",
+    "host-configuration/update", "host-configuration/get", "diagnostics/refresh_logging", "diagnostics/status",
+  ]);
 });
 
 test("diagnostics sink parser rejects malformed health and preserves legacy or unavailable status", async () => {

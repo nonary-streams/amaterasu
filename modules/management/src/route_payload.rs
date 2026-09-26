@@ -27,6 +27,17 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.input/1" => input(route.action, object),
         "amaterasu.session-history/1" => history(route.action, object),
         "amaterasu.diagnostics/1" if route.action == "status" => fields(object, &[], &[]),
+        "amaterasu.diagnostics/1" if route.action == "refresh_logging" => {
+            fields(object, &["minimum_revision"], &[])?;
+            if object
+                .get("minimum_revision")
+                .and_then(Value::as_u64)
+                .is_none_or(|revision| revision == 0)
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }

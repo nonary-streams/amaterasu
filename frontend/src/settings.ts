@@ -587,9 +587,24 @@ namespace Amaterasu {
     current: HostConfiguration,
     level: string,
     path: string,
-  ): Promise<{ settings: HostConfiguration; diagnostics: DiagnosticsStatusRead }> {
+  ): Promise<{ settings: HostConfiguration; diagnostics: DiagnosticsStatusRead; refreshScheduled: boolean }> {
     const settings = await saveHostLoggingSettings(api, current, level, path);
-    return { settings, diagnostics: await readDiagnosticsLoggingStatus(api) };
+    let refreshScheduled = false;
+    try {
+      const reply = await api.post<unknown>("diagnostics/refresh_logging", {
+        minimum_revision: settings.revision,
+      });
+      if (reply && typeof reply === "object" && !Array.isArray(reply)) {
+        const response = reply as Record<string, unknown>;
+        const applied = response.logging_configuration_revision;
+        refreshScheduled = response.ok === true && response.requested_revision === settings.revision &&
+          typeof response.ready === "boolean" &&
+          (applied === null || (Number.isSafeInteger(applied) && (applied as number) > 0));
+      }
+    } catch {
+      // A failed refresh request does not undo the confirmed settings update.
+    }
+    return { settings, diagnostics: await readDiagnosticsLoggingStatus(api), refreshScheduled };
   }
 
   export function diagnosticsLoggingDescription(
@@ -1946,14 +1961,21 @@ namespace Amaterasu {
             hostLoggingLoads.invalidate();
             try {
               const saved = await saveHostLoggingState(context.api, settings, level.value, path.value);
-              context.notify(diagnosticsLoggingDescription(saved.settings.revision, saved.diagnostics));
+              const description = diagnosticsLoggingDescription(saved.settings.revision, saved.diagnostics);
+              context.notify(saved.refreshScheduled
+                ? description
+                : `Diagnostics refresh could not be scheduled. ${description}`);
             } catch (error) {
               if (error instanceof ApiError && error.code === "revision_conflict") {
                 await loadHostLogging();
                 context.notify("Host configuration changed elsewhere. Review the latest logging settings and save again.");
                 return;
               }
-              throw error;
+              // A failed update reply or readback can occur after persistence. Reload
+              // before another save so the editor never reuses an uncertain revision.
+              await loadHostLogging();
+              context.notify("Host logging save could not be confirmed. Review the refreshed policy before saving again.");
+              return;
             }
             await loadHostLogging();
           });

@@ -164,6 +164,11 @@ pub fn resolve(path: &str) -> Option<Route> {
             "status",
             Some("diagnostics.read"),
         ),
+        ("diagnostics", "refresh_logging") => (
+            "amaterasu.diagnostics/1",
+            "refresh_logging",
+            Some("configuration.write"),
+        ),
         ("diagnostics", "counters") => (
             "amaterasu.diagnostics/1",
             "counters",
@@ -384,6 +389,27 @@ mod tests {
             br#"{"scope":"diagnostics.write"}"#.as_slice(),
             br#"{"action":"query"}"#,
             br#"{"limit":1}"#,
+        ] {
+            assert!(payload(route, body).is_err());
+        }
+    }
+
+    #[test]
+    fn diagnostics_logging_refresh_requires_configuration_write_and_a_positive_revision() {
+        let route = resolve("/v1/diagnostics/refresh_logging").unwrap();
+        assert_eq!(route.service, "amaterasu.diagnostics/1");
+        assert_eq!(route.scope, Some("configuration.write"));
+        assert_eq!(
+            payload(route, br#"{"minimum_revision":7}"#).unwrap()["action"],
+            "refresh_logging"
+        );
+        for body in [
+            br#"{}"#.as_slice(),
+            br#"{"minimum_revision":0}"#,
+            br#"{"minimum_revision":-1}"#,
+            br#"{"minimum_revision":1.5}"#,
+            br#"{"minimum_revision":"7"}"#,
+            br#"{"minimum_revision":7,"scope":"diagnostics.write"}"#,
         ] {
             assert!(payload(route, body).is_err());
         }

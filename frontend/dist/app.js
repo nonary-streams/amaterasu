@@ -2571,7 +2571,22 @@ var Amaterasu;
     }
     async function saveHostLoggingState(api, current, level, path) {
         const settings = await saveHostLoggingSettings(api, current, level, path);
-        return { settings, diagnostics: await readDiagnosticsLoggingStatus(api) };
+        let refreshScheduled = false;
+        try {
+            const reply = await api.post("diagnostics/refresh_logging", {
+                minimum_revision: settings.revision,
+            });
+            if (reply && typeof reply === "object" && !Array.isArray(reply)) {
+                const response = reply;
+                const applied = response.logging_configuration_revision;
+                refreshScheduled = response.ok === true && response.requested_revision === settings.revision &&
+                    typeof response.ready === "boolean" &&
+                    (applied === null || (Number.isSafeInteger(applied) && applied > 0));
+            }
+        }
+        catch {
+        }
+        return { settings, diagnostics: await readDiagnosticsLoggingStatus(api), refreshScheduled };
     }
     Amaterasu.saveHostLoggingState = saveHostLoggingState;
     function diagnosticsLoggingDescription(savedRevision, result) {
@@ -3744,7 +3759,10 @@ var Amaterasu;
                         hostLoggingLoads.invalidate();
                         try {
                             const saved = await saveHostLoggingState(context.api, settings, level.value, path.value);
-                            context.notify(diagnosticsLoggingDescription(saved.settings.revision, saved.diagnostics));
+                            const description = diagnosticsLoggingDescription(saved.settings.revision, saved.diagnostics);
+                            context.notify(saved.refreshScheduled
+                                ? description
+                                : `Diagnostics refresh could not be scheduled. ${description}`);
                         }
                         catch (error) {
                             if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
@@ -3752,7 +3770,9 @@ var Amaterasu;
                                 context.notify("Host configuration changed elsewhere. Review the latest logging settings and save again.");
                                 return;
                             }
-                            throw error;
+                            await loadHostLogging();
+                            context.notify("Host logging save could not be confirmed. Review the refreshed policy before saving again.");
+                            return;
                         }
                         await loadHostLogging();
                     });
