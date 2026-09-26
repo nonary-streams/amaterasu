@@ -599,17 +599,21 @@ impl Broker {
         match action {
             "apply" => {
                 if self.limiter_unavailable {
-                    return json!({"ok":true,"state":"runtime_unavailable","applied":false});
+                    return json!({"ok":true,"version":1,"action":"apply",
+                        "session_id":payload["session_id"],
+                        "state":"runtime_unavailable","applied":false});
                 }
                 let session = payload["session_id"].as_str().unwrap();
                 if self.limiter_session.as_deref() == Some(session) {
-                    return json!({"ok":true,"state":"already_applied","applied":true,
+                    return json!({"ok":true,"version":1,"action":"apply",
+                        "session_id":session,"state":"already_applied","applied":true,
                         "lease":self.limiter_lease});
                 }
                 let lease = format!("limiter-{session}");
                 self.limiter_session = Some(session.into());
                 self.limiter_lease = Some(lease.clone());
-                json!({"ok":true,"state":"applied","applied":true,"lease":lease})
+                json!({"ok":true,"version":1,"action":"apply","session_id":session,
+                    "state":"applied","applied":true,"lease":lease})
             }
             "status" => {
                 if self.limiter_malformed_status {
@@ -630,12 +634,14 @@ impl Broker {
             "restore" => {
                 if self.limiter_restore_failures > 0 {
                     self.limiter_restore_failures -= 1;
-                    return json!({"ok":true,"state":"restore_failed","applied":true});
+                    return json!({"ok":true,"version":1,"action":"restore",
+                        "state":"restore_failed","applied":true});
                 }
                 assert_eq!(payload["lease"], json!(self.limiter_lease));
                 self.limiter_lease = None;
                 self.limiter_session = None;
-                json!({"ok":true,"state":"restored","applied":false})
+                json!({"ok":true,"version":1,"action":"restore",
+                    "state":"restored","applied":false})
             }
             _ => panic!("unexpected frame limiter action"),
         }

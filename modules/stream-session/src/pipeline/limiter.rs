@@ -22,7 +22,8 @@ pub(super) fn apply(record: &Record) -> Value {
 /// An apply is owned only after the provider says it verified the effect.
 /// Status can also reveal a lease after an uncertain apply result.
 pub(super) fn accept_apply(record: &mut Record, response: &Value) {
-    if response["ok"] == true
+    if matches_session_reply(record, response, "apply")
+        && response["ok"] == true
         && response["applied"] == true
         && matches!(
             response["state"].as_str(),
@@ -34,18 +35,25 @@ pub(super) fn accept_apply(record: &mut Record, response: &Value) {
         record.limiter_state = "applied".into();
         return;
     }
-    record.limiter_state = if response["applied"] == true {
-        "apply_unverified".into()
-    } else {
-        response["state"]
-            .as_str()
-            .unwrap_or("runtime_unavailable")
-            .into()
-    };
-    adopt_cleanup_lease(record, response);
+    record.limiter_state =
+        if !matches_session_reply(record, response, "apply") || response["applied"] == true {
+            "apply_unverified".into()
+        } else {
+            response["state"]
+                .as_str()
+                .unwrap_or("runtime_unavailable")
+                .into()
+        };
+    if matches_session_reply(record, response, "apply") {
+        adopt_cleanup_lease(record, response);
+    }
 }
 
 pub(super) fn accept_status(record: &mut Record, response: &Value) {
+    if !matches_session_reply(record, response, "status") || response["ok"] != true {
+        record.limiter_state = "status_unverified".into();
+        return;
+    }
     adopt_cleanup_lease(record, response);
     if record.limiter_lease.is_none() {
         record.limiter_state = response["state"]
@@ -84,7 +92,12 @@ fn adopt_cleanup_lease(record: &mut Record, response: &Value) {
 }
 
 pub(super) fn accept_restore(record: &mut Record, response: &Value) -> bool {
-    if response["ok"] == true && response["state"] == "restored" {
+    if response["ok"] == true
+        && response["version"] == 1
+        && response["action"] == "restore"
+        && response["state"] == "restored"
+        && response["applied"] == false
+    {
         record.limiter_lease = None;
         record.limiter_state = "restored".into();
         true
@@ -95,6 +108,12 @@ pub(super) fn accept_restore(record: &mut Record, response: &Value) -> bool {
             .into();
         false
     }
+}
+
+fn matches_session_reply(record: &Record, response: &Value, action: &str) -> bool {
+    response["version"] == 1
+        && response["action"] == action
+        && response["session_id"] == record.limiter_session()
 }
 
 /// Module unload has no tick loop. Spend a fixed number of broker turns on

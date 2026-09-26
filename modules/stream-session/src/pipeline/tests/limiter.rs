@@ -250,3 +250,63 @@ fn shutdown_does_not_dispatch_an_unsent_apply() {
     ));
     assert!(host.broker.limiter_lease.is_none());
 }
+
+#[test]
+fn limiter_replies_must_match_the_frozen_session_and_action() {
+    let mut host = Harness::new();
+    let (request, _) = limiter_prepare();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    let session = record.limiter_session();
+
+    super::super::limiter::accept_apply(
+        record,
+        &json!({"ok":true,"version":1,"action":"apply","session_id":"foreign",
+            "state":"applied","applied":true,"lease":"foreign-lease"}),
+    );
+    assert_eq!(record.limiter_lease, None);
+    assert_eq!(record.limiter_state, "apply_unverified");
+
+    super::super::limiter::accept_apply(
+        record,
+        &json!({"ok":true,"version":2,"action":"apply","session_id":session,
+            "state":"applied","applied":true,"lease":"wrong-version"}),
+    );
+    assert_eq!(record.limiter_lease, None);
+
+    super::super::limiter::accept_status(
+        record,
+        &json!({"ok":true,"version":1,"action":"status","session_id":"foreign",
+            "state":"applied","leases":[{"session_id":session,
+                "lease":"foreign-lease","applied":true}]}),
+    );
+    assert_eq!(record.limiter_lease, None);
+    assert_eq!(record.limiter_state, "status_unverified");
+
+    super::super::limiter::accept_status(
+        record,
+        &json!({"ok":true,"version":1,"action":"apply","session_id":session,
+            "state":"applied","leases":[{"session_id":session,
+                "lease":"wrong-action","applied":true}]}),
+    );
+    assert_eq!(record.limiter_lease, None);
+
+    super::super::limiter::accept_apply(
+        record,
+        &json!({"ok":true,"version":1,"action":"apply","session_id":session,
+            "state":"applied","applied":true,"lease":"owned-lease"}),
+    );
+    assert_eq!(record.limiter_lease.as_deref(), Some("owned-lease"));
+    assert!(!super::super::limiter::accept_restore(
+        record,
+        &json!({"ok":true,"version":1,"action":"status","state":"restored",
+            "applied":false}),
+    ));
+    assert_eq!(record.limiter_lease.as_deref(), Some("owned-lease"));
+    assert!(super::super::limiter::accept_restore(
+        record,
+        &json!({"ok":true,"version":1,"action":"restore","state":"restored",
+            "applied":false}),
+    ));
+    assert_eq!(record.limiter_lease, None);
+}
