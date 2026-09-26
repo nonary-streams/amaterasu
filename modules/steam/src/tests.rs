@@ -341,6 +341,8 @@ fn new_scan_retires_in_flight_upgrade_before_its_old_completion() {
 fn expired_client_read_does_not_demote_a_promoted_remote_reference() {
     let mut provider = Provider {
         enabled: true,
+        revision: 1,
+        snapshot_complete: true,
         ..Provider::default()
     };
     let mut game = upgrade_game(42, true);
@@ -379,6 +381,8 @@ fn expired_client_read_does_not_demote_a_promoted_remote_reference() {
 fn failed_remote_read_restores_local_artwork_with_a_new_revision() {
     let mut provider = Provider {
         enabled: true,
+        revision: 1,
+        snapshot_complete: true,
         ..Provider::default()
     };
     let mut game = upgrade_game(42, true);
@@ -411,7 +415,7 @@ fn failed_remote_read_restores_local_artwork_with_a_new_revision() {
         Some("local-42")
     );
     assert!(!provider.games[&42].artwork_is_remote);
-    assert_eq!(provider.revision, 1);
+    assert_eq!(provider.revision, 2);
 }
 
 #[test]
@@ -474,6 +478,9 @@ fn artwork_read_uses_only_the_current_app_revision_and_never_returns_a_path() {
     let artwork = artwork::discover(42, &root, &[]);
     let revision = artwork.revision.clone().unwrap();
     let mut provider = Provider::new(vec![root.clone()]);
+    provider.enabled = true;
+    provider.revision = 1;
+    provider.snapshot_complete = true;
     provider.games.insert(
         42,
         Game {

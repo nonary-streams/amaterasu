@@ -446,6 +446,56 @@ fn invalid_manifests_do_not_hide_valid_entries_and_partial_scan_is_visible() {
 }
 
 #[test]
+fn interrupted_and_partial_refreshes_cannot_authorize_stale_artwork() {
+    let fixture = Libraries::new();
+    let root = fixture.library("steam-install");
+    fixture.manifest(&root, 42, "Removed", 4);
+    let mut provider = Provider {
+        enabled: true,
+        roots: vec![root.clone()],
+        ..Provider::default()
+    };
+
+    assert!(provider.start_scan());
+    finish_provider(&mut provider);
+    assert!(provider.has_complete_snapshot());
+    let old_revision = provider.games[&42].artwork_revision.clone().unwrap();
+
+    fs::remove_file(root.join("steamapps/appmanifest_42.acf")).unwrap();
+    fixture.manifest(&root, 43, "Installed", 4);
+    assert!(provider.start_scan());
+    assert_eq!(
+        provider.read_artwork(1, 42, &old_revision, 0, 1_000),
+        Err("artwork_unavailable")
+    );
+    provider.set_enabled(false);
+    assert!(!provider.has_complete_snapshot());
+    assert!(provider.games.is_empty());
+    provider.set_enabled(true);
+
+    fs::write(root.join("steamapps/appmanifest_44.acf"), "broken").unwrap();
+    assert!(provider.start_scan());
+    finish_provider(&mut provider);
+    assert!(!provider.has_complete_snapshot());
+    assert_eq!(provider.games.keys().copied().collect::<Vec<_>>(), vec![43]);
+    let partial_revision = provider.games[&43].artwork_revision.clone().unwrap();
+    assert_eq!(
+        provider.read_artwork(2, 43, &partial_revision, 0, 1_000),
+        Err("artwork_unavailable")
+    );
+
+    fs::remove_file(root.join("steamapps/appmanifest_44.acf")).unwrap();
+    assert!(provider.start_scan());
+    finish_provider(&mut provider);
+    assert!(provider.has_complete_snapshot());
+    assert_eq!(provider.games.keys().copied().collect::<Vec<_>>(), vec![43]);
+    assert_eq!(
+        provider.read_artwork(3, 42, &old_revision, 0, 1_000),
+        Err("artwork_unavailable")
+    );
+}
+
+#[test]
 fn pagination_requires_matching_snapshot_and_refresh_is_atomic() {
     let fixture = Libraries::new();
     let root = fixture.library("root");

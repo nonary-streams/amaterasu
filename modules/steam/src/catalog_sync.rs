@@ -299,6 +299,11 @@ impl CatalogSync {
         now: Instant,
     ) -> ModuleResult<()> {
         self.observe_settings(provider, settings, now);
+        if provider.scan_in_progress() {
+            // An explicit refresh may overlap a snapshot transaction. Stop
+            // before its next catalog step, especially a stale cleanup finish.
+            self.cancel_transaction_for_changed_source(None);
+        }
         self.observe_discovery(provider, settings, now);
 
         if self.automatic_scan_due(provider, settings, now) {
@@ -325,6 +330,7 @@ impl CatalogSync {
             } else if self.sync_requested
                 && settings.enabled
                 && settings.auto_sync
+                && !provider.scan_in_progress()
                 && provider.has_complete_snapshot()
                 && let Err(error) = self.start_transaction(provider, settings, false)
             {
@@ -581,6 +587,11 @@ impl CatalogSync {
         settings: &ProductSettings,
         force_sync: bool,
     ) -> ModuleResult<()> {
+        if provider.scan_in_progress() || !provider.has_complete_snapshot() {
+            return Err(
+                "Steam discovery has no completed snapshot; catalog was left unchanged".into(),
+            );
+        }
         if let Some(message) = catalog_source_error(provider, settings) {
             return Err(message);
         }
@@ -1530,6 +1541,33 @@ mod tests {
         sync.transaction = None;
         provider.scan = Some(crate::discovery::Scan::new(&[]));
         assert!(!sync.automatic_scan_due(&provider, &settings, deadline));
+    }
+
+    #[test]
+    fn catalog_plan_requires_a_completed_current_discovery_snapshot() {
+        let mut provider = complete_provider();
+        let settings = ProductSettings {
+            include_tools: true,
+            ..auto_sync_settings()
+        };
+        let mut sync = CatalogSync::new();
+        provider.scan = Some(crate::discovery::Scan::new(&[]));
+        assert!(sync.start_transaction(&provider, &settings, false).is_err());
+        assert!(sync.transaction.is_none());
+
+        provider.scan = None;
+        provider.snapshot_complete = false;
+        provider.games.clear();
+        provider.games.insert(43, game(43, "Installed", true));
+        assert!(sync.start_transaction(&provider, &settings, false).is_err());
+        assert!(sync.transaction.is_none());
+
+        provider.snapshot_complete = true;
+        provider.steam_executable = Some(std::env::current_exe().unwrap());
+        sync.start_transaction(&provider, &settings, false).unwrap();
+        let records = &sync.transaction.as_ref().unwrap().entries;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0][0]["source_id"], "steam:43");
     }
 
     #[test]

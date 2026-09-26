@@ -434,6 +434,11 @@ impl Provider {
         if app_id == 0 {
             return Err("invalid_request");
         }
+        // A refresh can invalidate membership before it publishes a new
+        // snapshot. Never use an in-flight or warned scan as artwork authority.
+        if !self.enabled || self.scan_in_progress() || !self.has_complete_snapshot() {
+            return Err("artwork_unavailable");
+        }
         let Some(game) = self.games.get(&app_id) else {
             return Err("artwork_unavailable");
         };
