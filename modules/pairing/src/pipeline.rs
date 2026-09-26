@@ -43,6 +43,7 @@ pub struct Pipeline {
     deferred_import: Option<DeferredImport>,
     identity: Arc<Shared>,
     host_configuration: HostConfigurationState,
+    refresh_identity: Option<Arc<ConfiguredIdentity>>,
     host_configuration_retry_seconds: u64,
 }
 
@@ -87,6 +88,7 @@ impl Pipeline {
             deferred_import: None,
             identity,
             host_configuration,
+            refresh_identity: None,
             host_configuration_retry_seconds: 1,
         }
     }
@@ -134,12 +136,17 @@ impl Pipeline {
     ) -> ModuleResult<bool> {
         match &self.host_configuration {
             HostConfigurationState::Disabled => return Ok(true),
-            HostConfigurationState::Ready { refresh_at, .. } if now < *refresh_at => {
+            HostConfigurationState::Ready { refresh_at, .. }
+                if now < *refresh_at || self.pending.is_some() =>
+            {
                 return Ok(true);
             }
             HostConfigurationState::Failed { retry_at } if now < *retry_at => return Ok(false),
-            HostConfigurationState::Ready { .. } | HostConfigurationState::Failed { .. } => {
-                self.identity.invalidate();
+            HostConfigurationState::Ready { identity, .. } => {
+                self.refresh_identity = Some(identity.clone());
+                self.host_configuration = HostConfigurationState::Start;
+            }
+            HostConfigurationState::Failed { .. } => {
                 self.host_configuration = HostConfigurationState::Start;
             }
             HostConfigurationState::WaitingReadiness(_) | HostConfigurationState::WaitingGet(_) => {
@@ -187,6 +194,13 @@ impl Pipeline {
                     self.fail_host_configuration(now);
                     return Ok(false);
                 };
+                if self
+                    .refresh_identity
+                    .as_ref()
+                    .is_some_and(|previous| previous.provider_revision != revision)
+                {
+                    self.identity.invalidate();
+                }
                 if payload["ok"] != true || payload["ready"] != true {
                     self.fail_host_configuration(now);
                     return Ok(false);
@@ -201,8 +215,22 @@ impl Pipeline {
                 };
                 match ConfiguredIdentity::load(certificate_path, private_key_path, revision, now) {
                     Ok(identity) => {
+                        let configured_identity = match self.refresh_identity.take() {
+                            Some(previous)
+                                if previous.provider_revision == identity.provider_revision
+                                    && previous.certificate_pem == identity.certificate_pem
+                                    && previous.private_key_pem == identity.private_key_pem =>
+                            {
+                                previous
+                            }
+                            Some(_) => {
+                                self.identity.invalidate();
+                                Arc::new(identity)
+                            }
+                            None => Arc::new(identity),
+                        };
                         self.host_configuration = HostConfigurationState::Ready {
-                            identity: Arc::new(identity),
+                            identity: configured_identity,
                             refresh_at: now.saturating_add(HOST_CONFIGURATION_REFRESH_SECONDS),
                         };
                         self.host_configuration_retry_seconds = 1;
@@ -222,6 +250,7 @@ impl Pipeline {
     }
 
     fn fail_host_configuration(&mut self, now: u64) {
+        self.refresh_identity = None;
         self.host_configuration = HostConfigurationState::Failed {
             retry_at: now.saturating_add(self.host_configuration_retry_seconds),
         };

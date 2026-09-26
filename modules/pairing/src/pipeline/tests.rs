@@ -1151,6 +1151,7 @@ struct HostConfigurationHarness {
     state_revision: u64,
     state_requests: usize,
     state_writes: usize,
+    state_save_pending: bool,
     polls: usize,
 }
 
@@ -1169,6 +1170,7 @@ impl HostConfigurationHarness {
             state_revision: 0,
             state_requests: 0,
             state_writes: 0,
+            state_save_pending: false,
             polls: 0,
         }
     }
@@ -1264,6 +1266,7 @@ impl HostConfigurationHarness {
                     "value":self.state_document.clone()
                 }),
             },
+            Command::TakeResult { request: 73 } if self.state_save_pending => Response::Pending,
             Command::TakeResult { request: 73 } => Response::Result {
                 payload: json!({"ok":true,"revision":self.state_revision}),
             },
@@ -1563,7 +1566,7 @@ fn refreshed_configuration_revokes_old_tls_identity_when_new_files_are_invalid()
         pipeline
             .identity
             .get(time + HOST_CONFIGURATION_REFRESH_SECONDS)
-            .is_err()
+            .is_ok()
     );
     pipeline
         .tick_at(time + HOST_CONFIGURATION_REFRESH_SECONDS, |command| {
@@ -1579,6 +1582,111 @@ fn refreshed_configuration_revokes_old_tls_identity_when_new_files_are_invalid()
         pipeline.host_configuration,
         HostConfigurationState::Failed { .. }
     ));
+    assert!(
+        pipeline
+            .identity
+            .get(time + HOST_CONFIGURATION_REFRESH_SECONDS)
+            .is_err()
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn unchanged_configuration_refresh_keeps_the_published_tls_snapshot() {
+    let (directory, effective) = configured_fixture_files();
+    let mut harness = HostConfigurationHarness::new(effective);
+    harness.state_document = Some(stored_document_with_fixture_identity(json!([])));
+    let mut pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+    let time = now();
+    let response = harness.request(&mut pipeline, "console", json!({"action":"identity"}), time);
+    assert_eq!(response["ok"], true, "{response}");
+    let original = pipeline.identity.get(time).unwrap();
+
+    for _ in 0..3 {
+        pipeline
+            .tick_at(time + HOST_CONFIGURATION_REFRESH_SECONDS, |command| {
+                harness.send(command)
+            })
+            .unwrap();
+        let current = pipeline
+            .identity
+            .get(time + HOST_CONFIGURATION_REFRESH_SECONDS)
+            .unwrap();
+        assert!(Arc::ptr_eq(&original, &current));
+    }
+    assert_eq!(harness.actions, ["readiness", "get", "readiness", "get"]);
+    assert!(matches!(
+        pipeline.host_configuration,
+        HostConfigurationState::Ready { .. }
+    ));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn pending_state_save_finishes_under_its_original_configuration_revision() {
+    let (directory, effective) = configured_fixture_files();
+    let durable = stored_document_with_fixture_identity(paired_fixture_client());
+    let certificate_id = durable["clients"][0]["certificate_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut harness = HostConfigurationHarness::new(effective);
+    harness.state_document = Some(durable);
+    let mut pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+    let time = now();
+    let response = harness.request(&mut pipeline, "console", json!({"action":"identity"}), time);
+    assert_eq!(response["ok"], true, "{response}");
+
+    harness.enqueue(
+        "console",
+        json!({
+            "action":"update_client_config_overrides",
+            "certificate_id":certificate_id,
+            "config_overrides":{"fec_percentage":73},
+            "expected_revision":0
+        }),
+    );
+    pipeline
+        .tick_at(time, |command| harness.send(command))
+        .unwrap();
+    pipeline
+        .tick_at(time, |command| harness.send(command))
+        .unwrap();
+    assert!(matches!(
+        pipeline.pending.as_ref().map(|pending| &pending.stage),
+        Some(Stage::Saving { .. })
+    ));
+    harness.state_save_pending = true;
+    harness.revision = 5;
+    harness.effective["cert"] = "/missing/host-cert.pem".into();
+
+    pipeline
+        .tick_at(time + HOST_CONFIGURATION_REFRESH_SECONDS, |command| {
+            harness.send(command)
+        })
+        .unwrap();
+    assert_eq!(harness.actions, ["readiness", "get"]);
+    assert!(harness.output.is_none());
+    harness.state_save_pending = false;
+    pipeline
+        .tick_at(time + HOST_CONFIGURATION_REFRESH_SECONDS, |command| {
+            harness.send(command)
+        })
+        .unwrap();
+    assert_eq!(harness.output.as_ref().unwrap()["ok"], true);
+    assert_eq!(pipeline.configured_identity().unwrap().provider_revision, 4);
+    assert_eq!(harness.actions, ["readiness", "get"]);
+
+    for _ in 0..3 {
+        pipeline
+            .tick_at(time + HOST_CONFIGURATION_REFRESH_SECONDS, |command| {
+                harness.send(command)
+            })
+            .unwrap();
+    }
+    assert_eq!(harness.actions, ["readiness", "get", "readiness", "get"]);
     assert!(
         pipeline
             .identity
