@@ -1314,6 +1314,17 @@ def main():
         console = Console(harness)
         try:
             api = Api(console)
+            deadline = time.monotonic() + 20
+            while True:
+                logging_status = console.request("amaterasu.diagnostics/1", {
+                    "action": "status",
+                })
+                assert logging_status["ok"], logging_status
+                if (logging_status["ready"]
+                        and logging_status["logging_configuration_revision"] is not None):
+                    break
+                assert time.monotonic() < deadline, logging_status
+                time.sleep(0.05)
             assert console.request("amaterasu.diagnostics/1", {
                 "action": "record", "level": "info", "target": "integration",
                 "message": "filtered parity log record",
