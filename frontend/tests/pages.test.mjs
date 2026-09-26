@@ -490,3 +490,61 @@ test("Steam force sync reports unobservable progress to refresh-only sessions", 
   );
   assert.equal(harness.timers.size, 0);
 });
+
+test("recorded history follows returned offsets across short pages", async () => {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  const offsets = [];
+  const replies = [
+    { sessions: [historySummary("first")], next_offset: 1 },
+    { sessions: [historySummary("second"), historySummary("third")], next_offset: 3 },
+    { sessions: [historySummary("fourth")], next_offset: null },
+    { sessions: [historySummary("second"), historySummary("third")], next_offset: 3 },
+  ];
+  pages.renderSessions({
+    content,
+    notify() {},
+    navigate() {},
+    api: {
+      allows: () => false,
+      async post(route, payload) {
+        if (route === "session/list") return { sessions: [], next_offset: null };
+        if (route === "history/history_status") throw new Error("status unavailable");
+        if (route === "history/list_sessions") {
+          offsets.push(payload.offset);
+          return { ok: true, ...replies.shift() };
+        }
+        throw new Error(`Unexpected route ${route}`);
+      },
+    },
+  });
+  const savedPagerButton = (label) => findAll(
+    content,
+    (node) => node.tagName === "button" && node.textContent === label,
+  )[1];
+  await waitFor(() => offsets.length === 1 && savedPagerButton("Next →"), "first history page");
+  assert.equal(savedPagerButton("← Previous").disabled, true);
+  savedPagerButton("Next →").click();
+  await waitFor(() => offsets.length === 2 && content.textContent.includes("second") && savedPagerButton("Next →"), "second history page");
+  assert.equal(offsets[1], 1);
+  savedPagerButton("Next →").click();
+  await waitFor(() => offsets.length === 3 && content.textContent.includes("fourth") && savedPagerButton("Next →"), "final history page");
+  assert.equal(offsets[2], 3);
+  assert.equal(savedPagerButton("Next →").disabled, true);
+  savedPagerButton("← Previous").click();
+  await waitFor(() => offsets.length === 4 && content.textContent.includes("second") && savedPagerButton("Next →"), "previous history page");
+  assert.equal(offsets[3], 1);
+});
+
+function historySummary(sessionId) {
+  return {
+    session_id: sessionId,
+    protocol: "rtsp",
+    client_name: "Client",
+    device_name: "Device",
+    app_name: sessionId,
+    started_at_unix: 100,
+    ended_at_unix: 120,
+    duration_seconds: 20,
+  };
+}

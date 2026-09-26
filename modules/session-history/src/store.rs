@@ -23,6 +23,11 @@ pub enum HistoryError {
     ActiveSession,
 }
 
+pub struct SessionPage {
+    pub sessions: Vec<SessionSummary>,
+    pub next_offset: Option<usize>,
+}
+
 impl HistoryError {
     pub fn is_database(&self) -> bool {
         matches!(self, Self::Database)
@@ -319,26 +324,21 @@ impl HistoryStore {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub fn list_sessions(
         &self,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SessionSummary>, HistoryError> {
-        if !(1..=MAX_SESSION_LIMIT).contains(&limit) {
-            return Err(HistoryError::Invalid("limit must be from 1 through 25"));
-        }
-        let offset = i64::try_from(offset)
-            .map_err(|_| HistoryError::Invalid("offset exceeds SQLite integer range"))?;
-        let mut statement = self.connection.prepare(
-            "SELECT session_id, protocol, client_name, device_name, app_name, width, height,
-                    target_fps, target_bitrate_kbps, codec, started_at_unix, ended_at_unix,
-                    duration_seconds
-             FROM sessions
-             ORDER BY started_at_unix DESC, session_id DESC
-             LIMIT ?1 OFFSET ?2",
-        )?;
-        let rows = statement.query_map(params![limit as i64, offset], summary_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        Ok(self.list_sessions_page(limit, offset)?.sessions)
+    }
+
+    pub fn list_sessions_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SessionPage, HistoryError> {
+        self.session_page(limit, offset, false)
     }
 
     pub fn session_detail(&self, session_id: &str) -> Result<SessionDetail, HistoryError> {
@@ -360,19 +360,55 @@ impl HistoryStore {
         Ok(detail)
     }
 
+    #[cfg(test)]
     pub fn active_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>, HistoryError> {
-        if !(1..=MAX_ACTIVE_LIMIT).contains(&limit) {
-            return Err(HistoryError::Invalid("limit must be from 1 through 16"));
+        Ok(self.active_sessions_page(limit, 0)?.sessions)
+    }
+
+    pub fn active_sessions_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SessionPage, HistoryError> {
+        self.session_page(limit, offset, true)
+    }
+
+    fn session_page(
+        &self,
+        limit: usize,
+        offset: usize,
+        active_only: bool,
+    ) -> Result<SessionPage, HistoryError> {
+        let maximum = if active_only {
+            MAX_ACTIVE_LIMIT
+        } else {
+            MAX_SESSION_LIMIT
+        };
+        if !(1..=maximum).contains(&limit) {
+            return Err(HistoryError::Invalid("session page limit is out of range"));
         }
-        let mut statement = self.connection.prepare(
+        let offset_sql = i64::try_from(offset)
+            .map_err(|_| HistoryError::Invalid("offset exceeds SQLite integer range"))?;
+        let sql = if active_only {
             "SELECT session_id, protocol, client_name, device_name, app_name, width, height,
                     target_fps, target_bitrate_kbps, codec, started_at_unix, ended_at_unix,
                     duration_seconds
              FROM sessions WHERE ended_at_unix IS NULL
-             ORDER BY started_at_unix DESC, session_id DESC LIMIT ?1",
-        )?;
-        let rows = statement.query_map(params![limit as i64], summary_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+             ORDER BY started_at_unix DESC, session_id DESC LIMIT ?1 OFFSET ?2"
+        } else {
+            "SELECT session_id, protocol, client_name, device_name, app_name, width, height,
+                    target_fps, target_bitrate_kbps, codec, started_at_unix, ended_at_unix,
+                    duration_seconds
+             FROM sessions
+             ORDER BY started_at_unix DESC, session_id DESC LIMIT ?1 OFFSET ?2"
+        };
+        let mut statement = self.connection.prepare(sql)?;
+        let rows =
+            statement.query_map(params![(limit + 1) as i64, offset_sql], summary_from_row)?;
+        let mut sessions = rows.collect::<Result<Vec<_>, _>>()?;
+        let has_more = sessions.len() > limit;
+        sessions.truncate(limit);
+        bound_session_page(sessions, offset, has_more)
     }
 
     pub fn delete_session(&mut self, session_id: &str) -> Result<(), HistoryError> {
@@ -553,6 +589,46 @@ fn bound_detail_response(detail: &mut SessionDetail) -> Result<(), HistoryError>
         }
     }
     Ok(())
+}
+
+fn bound_session_page(
+    mut sessions: Vec<SessionSummary>,
+    offset: usize,
+    has_more: bool,
+) -> Result<SessionPage, HistoryError> {
+    let full_length = sessions.len();
+    loop {
+        let next_offset = if has_more || sessions.len() < full_length {
+            Some(
+                offset
+                    .checked_add(sessions.len())
+                    .ok_or(HistoryError::Invalid(
+                        "session page offset exceeds integer range",
+                    ))?,
+            )
+        } else {
+            None
+        };
+        let page = SessionPage {
+            sessions,
+            next_offset,
+        };
+        if serde_json::to_vec(&serde_json::json!({
+            "ok": true,
+            "sessions": &page.sessions,
+            "next_offset": page.next_offset,
+        }))
+        .map_err(|_| HistoryError::Database)?
+        .len()
+            <= MAX_DETAIL_RESPONSE_BYTES
+        {
+            return Ok(page);
+        }
+        sessions = page.sessions;
+        if sessions.pop().is_none() {
+            return Err(HistoryError::Database);
+        }
+    }
 }
 
 fn apply_schema(connection: &Connection) -> Result<(), HistoryError> {
@@ -1462,6 +1538,115 @@ mod tests {
                 .as_ref()
                 .is_some_and(|payload| payload["index"] == 7)
         }));
+    }
+
+    #[test]
+    fn maximal_session_summaries_page_without_skips_after_restart() {
+        let database = TemporaryDatabase::new();
+        let path = database.path();
+        let mut store = HistoryStore::open(&path, 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        let mut expected = Vec::new();
+        for index in 0..35 {
+            let session_id = format!("session-{index:02}{}", "x".repeat(118));
+            let mut session = metadata(&session_id);
+            session.protocol = "p".repeat(32);
+            session.client_name = "c".repeat(128);
+            session.device_name = "d".repeat(128);
+            session.app_name = "a".repeat(128);
+            session.codec = "v".repeat(32);
+            session.width = u32::MAX;
+            session.height = u32::MAX;
+            session.target_fps = u32::MAX;
+            session.target_bitrate_kbps = u32::MAX;
+            store.begin_session(&session, 100 + index).unwrap();
+            expected.push(session_id);
+        }
+        expected.reverse();
+
+        let mut active_offset = 0;
+        let mut active_ids = Vec::new();
+        loop {
+            let page = store.active_sessions_page(16, active_offset).unwrap();
+            assert!(
+                serde_json::to_vec(
+                    &json!({"ok":true,"sessions":page.sessions,"next_offset":page.next_offset})
+                )
+                .unwrap()
+                .len()
+                    <= MAX_DETAIL_RESPONSE_BYTES
+            );
+            active_ids.extend(
+                page.sessions
+                    .iter()
+                    .map(|session| session.session_id.clone()),
+            );
+            match page.next_offset {
+                Some(next) => {
+                    assert_eq!(next, active_offset + page.sessions.len());
+                    active_offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(active_ids, expected);
+        drop(store);
+
+        let reopened = HistoryStore::open(&path, 200).unwrap();
+        let mut offset = 0;
+        let mut saved_ids = Vec::new();
+        let mut saw_short_page = false;
+        loop {
+            let page = reopened.list_sessions_page(25, offset).unwrap();
+            assert!(
+                serde_json::to_vec(
+                    &json!({"ok":true,"sessions":page.sessions,"next_offset":page.next_offset})
+                )
+                .unwrap()
+                .len()
+                    <= MAX_DETAIL_RESPONSE_BYTES
+            );
+            saw_short_page |= page.sessions.len() < 25 && page.next_offset.is_some();
+            saved_ids.extend(
+                page.sessions
+                    .iter()
+                    .map(|session| session.session_id.clone()),
+            );
+            match page.next_offset {
+                Some(next) => {
+                    assert_eq!(next, offset + page.sessions.len());
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert!(saw_short_page);
+        assert_eq!(saved_ids, expected);
+        assert!(
+            reopened
+                .active_sessions_page(16, 0)
+                .unwrap()
+                .sessions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn exact_full_last_page_has_no_continuation() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        store.begin_session(&metadata("first"), 100).unwrap();
+        store.begin_session(&metadata("second"), 101).unwrap();
+
+        let full = store.list_sessions_page(2, 0).unwrap();
+        assert_eq!(full.sessions.len(), 2);
+        assert_eq!(full.next_offset, None);
+        let first = store.active_sessions_page(1, 0).unwrap();
+        assert_eq!(first.next_offset, Some(1));
+        let last = store.active_sessions_page(1, 1).unwrap();
+        assert_eq!(last.sessions.len(), 1);
+        assert_eq!(last.next_offset, None);
     }
 
     #[test]

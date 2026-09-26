@@ -335,18 +335,18 @@ fn execute(
             "ok": true,
             "recorded": store.record_event(&event)?,
         })),
-        Operation::ListSessions { limit, offset } => Ok(json!({
-            "ok": true,
-            "sessions": store.list_sessions(limit.unwrap_or(25), offset.unwrap_or(0))?,
-        })),
+        Operation::ListSessions { limit, offset } => {
+            let page = store.list_sessions_page(limit.unwrap_or(25), offset.unwrap_or(0))?;
+            Ok(json!({"ok": true, "sessions": page.sessions, "next_offset": page.next_offset}))
+        }
         Operation::SessionDetail { session_id } => Ok(json!({
             "ok": true,
             "detail": store.session_detail(&session_id)?,
         })),
-        Operation::ActiveSessions { limit } => Ok(json!({
-            "ok": true,
-            "sessions": store.active_sessions(limit.unwrap_or(16))?,
-        })),
+        Operation::ActiveSessions { limit, offset } => {
+            let page = store.active_sessions_page(limit.unwrap_or(16), offset.unwrap_or(0))?;
+            Ok(json!({"ok": true, "sessions": page.sessions, "next_offset": page.next_offset}))
+        }
         Operation::HistoryStatus {} => Ok(json!({
             "ok": true,
             "status": store.status()?,

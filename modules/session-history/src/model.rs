@@ -169,6 +169,8 @@ pub enum Operation {
     ActiveSessions {
         #[serde(default)]
         limit: Option<usize>,
+        #[serde(default)]
+        offset: Option<usize>,
     },
     HistoryStatus {},
     DeleteSession {

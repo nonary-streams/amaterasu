@@ -342,6 +342,7 @@ namespace Amaterasu {
   export interface HistoryListReply {
     ok: boolean;
     sessions: HistorySessionSummary[];
+    next_offset: number | null;
   }
   export interface HistoryRuntimeStatus {
     available: boolean;

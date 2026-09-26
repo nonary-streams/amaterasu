@@ -181,6 +181,7 @@ namespace Amaterasu {
     let offset = 0;
     const history = [0];
     let savedOffset = 0;
+    const savedHistory = [0];
     context.content.append(
       sectionHeading(
         "Sessions",
@@ -333,15 +334,17 @@ namespace Amaterasu {
             ? table(["Application / client", "Started", "Duration", "Actions"], rows)
             : empty("No recorded streams", "Completed streams appear here when history recording is enabled."),
           pager(
-            savedOffset > 0
+            savedHistory.length > 1
               ? () => {
-                  savedOffset = Math.max(0, savedOffset - 25);
+                  savedHistory.pop();
+                  savedOffset = savedHistory[savedHistory.length - 1] ?? 0;
                   void loadSaved();
                 }
               : null,
-            reply.sessions.length === 25
+            reply.next_offset != null
               ? () => {
-                  savedOffset += 25;
+                  savedOffset = reply.next_offset!;
+                  savedHistory.push(savedOffset);
                   void loadSaved();
                 }
               : null,
