@@ -111,10 +111,8 @@ may still have committed; read the current revision before retrying.
 
 `update` is a full replacement. `expected_revision` compares to the document
 revision; the provider increments it once and writes with the state namespace's
-revision as `expected_revision` in the state CAS. After that durable write,
-the provider sends the GET-shaped configuration to diagnostics as
-`apply_host_logging`. Success requires diagnostics to confirm the same applied
-revision, after opening the requested logging sink:
+revision as `expected_revision` in the state CAS. Success is returned only
+after the state service confirms the durable write:
 
 ```json
 {"ok":true,"ready":true,"version":1,"revision":1,
@@ -128,24 +126,8 @@ revision, after opening the requested logging sink:
    "pkey":"C:\\ProgramData\\...\\credentials\\cakey.pem",
    "cert":"C:\\ProgramData\\...\\credentials\\cacert.pem",
    "log_path":"C:\\ProgramData\\...\\amaterasu.log",
-   "min_log_level":"info"},
- "logging":{"saved_revision":1,"applied_revision":1,"status":"applied"}}
+   "min_log_level":"info"}}
 ```
-
-An explicit diagnostics rejection leaves its prior logger active. The provider
-then restores the previous settings through another state CAS, using the next
-document revision to keep revisions monotonic. A confirmed compensation reports
-`logging_apply_failed` with `logging.status: "rolled_back"`. If the
-compensating write is explicitly rejected, it reports `logging_rollback_failed`
-with `logging.status: "rollback_failed"`. An ambiguous compensation reports
-`logging_rollback_unconfirmed`. When a write or diagnostics apply
-has an ambiguous transport or timeout outcome, the provider does not claim
-success or issue a speculative rollback. It reports `save_unconfirmed` or
-`logging_application_unconfirmed`, including the attempted or saved revision.
-The caller should GET the configuration and inspect diagnostics status before
-retrying. A signed deployment must grant this provider access to
-`amaterasu.diagnostics/1`; an explicit grant denial is compensated like any
-other definite apply failure.
 
 Document revision conflicts return `revision_conflict` and
 `error.current_revision`. State unavailability, malformed responses, storage

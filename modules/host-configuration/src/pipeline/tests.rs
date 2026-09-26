@@ -169,7 +169,7 @@ fn management_update_uses_store_revision_cas_and_returns_only_after_confirmation
     let mut state_write_payload = None;
     let mut completed = None;
 
-    for tick_number in 1..=4 {
+    for tick_number in 1..=3 {
         pipeline
             .tick(|command| match (tick_number, command) {
                 (1, Command::Poll {}) => Ok(incoming.take().unwrap_or(Response::Pending)),
@@ -212,22 +212,7 @@ fn management_update_uses_store_revision_cas_and_returns_only_after_confirmation
                     payload: json!({"ok":true,"revision":13}),
                 }),
                 (3, Command::ReleaseResult { request: 23 }) => Ok(Response::Ok),
-                (
-                    3,
-                    Command::Request {
-                        service, payload, ..
-                    },
-                ) => {
-                    assert_eq!(service, DIAGNOSTICS_SERVICE);
-                    assert_eq!(payload["action"], "apply_host_logging");
-                    assert_eq!(payload["configuration"]["revision"], 6);
-                    Ok(Response::Accepted { id: 24 })
-                }
-                (4, Command::TakeResult { request: 24 }) => Ok(Response::Result {
-                    payload: json!({"ok":true,"applied_revision":6}),
-                }),
-                (4, Command::ReleaseResult { request: 24 }) => Ok(Response::Ok),
-                (4, Command::Complete { payload, .. }) => {
+                (3, Command::Complete { payload, .. }) => {
                     completed = Some(payload);
                     Ok(Response::Ok)
                 }
@@ -242,229 +227,12 @@ fn management_update_uses_store_revision_cas_and_returns_only_after_confirmation
     assert_eq!(state_write_payload.unwrap()["value"]["revision"], 6);
     assert_eq!(response["ok"], true);
     assert_eq!(response["revision"], 6);
-    assert_eq!(response["logging"]["status"], "applied");
     assert_eq!(response["values"]["log_path"], "service.log");
     assert_eq!(
         response["effective"]["log_path"],
         root.join("service.log").to_string_lossy().as_ref()
     );
     std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn failed_logging_apply_restores_previous_document_with_a_new_revision() {
-    let root = test_root();
-    let mut pipeline = Pipeline::new(Ok(root.clone()));
-    let mut incoming = Some(request(
-        "amaterasu.management",
-        json!({
-            "action":"update","expected_revision":5,
-            "file_state":"state.json","vibeshine_file_state":"legacy.json",
-            "credentials_file":"","pkey":"key.pem","cert":"cert.pem",
-            "log_path":"service.log","min_log_level":"warning"
-        }),
-    ));
-    let mut completed = None;
-
-    for tick_number in 1..=5 {
-        pipeline
-            .tick(|command| match (tick_number, command) {
-                (1, Command::Poll {}) => Ok(incoming.take().unwrap()),
-                (
-                    1,
-                    Command::Request {
-                        service, payload, ..
-                    },
-                ) => {
-                    assert_eq!(service, crate::STATE_SERVICE);
-                    assert_eq!(payload["action"], "get");
-                    Ok(Response::Accepted { id: 22 })
-                }
-                (2, Command::TakeResult { request: 22 }) => Ok(Response::Result {
-                    payload: json!({
-                        "ok":true,"revision":12,"found":true,
-                        "value":Document::from_settings(5, crate::settings::Settings::default())
-                    }),
-                }),
-                (2, Command::ReleaseResult { request: 22 }) => Ok(Response::Ok),
-                (2, Command::Request { payload, .. }) => {
-                    assert_eq!(payload["action"], "set");
-                    assert_eq!(payload["expected_revision"], 12);
-                    assert_eq!(payload["value"]["revision"], 6);
-                    Ok(Response::Accepted { id: 23 })
-                }
-                (3, Command::TakeResult { request: 23 }) => Ok(Response::Result {
-                    payload: json!({"ok":true,"revision":13}),
-                }),
-                (3, Command::ReleaseResult { request: 23 }) => Ok(Response::Ok),
-                (
-                    3,
-                    Command::Request {
-                        service,
-                        payload,
-                        parent,
-                        ..
-                    },
-                ) => {
-                    assert_eq!(service, DIAGNOSTICS_SERVICE);
-                    assert_eq!(payload["configuration"]["revision"], 6);
-                    assert_eq!(parent, Some(7));
-                    Ok(Response::Accepted { id: 24 })
-                }
-                (4, Command::TakeResult { request: 24 }) => Ok(Response::Result {
-                    payload: json!({"ok":false,"error":{"code":"sink_unavailable"}}),
-                }),
-                (4, Command::ReleaseResult { request: 24 }) => Ok(Response::Ok),
-                (
-                    4,
-                    Command::Request {
-                        service,
-                        payload,
-                        parent,
-                        ..
-                    },
-                ) => {
-                    assert_eq!(service, crate::STATE_SERVICE);
-                    assert_eq!(parent, None);
-                    assert_eq!(payload["action"], "set");
-                    assert_eq!(payload["expected_revision"], 13);
-                    assert_eq!(payload["value"]["revision"], 7);
-                    assert_eq!(payload["value"]["log_path"], "amaterasu.log");
-                    assert_eq!(payload["value"]["min_log_level"], "product_default");
-                    Ok(Response::Accepted { id: 25 })
-                }
-                (5, Command::TakeResult { request: 25 }) => Ok(Response::Result {
-                    payload: json!({"ok":true,"revision":14}),
-                }),
-                (5, Command::ReleaseResult { request: 25 }) => Ok(Response::Ok),
-                (5, Command::Complete { payload, .. }) => {
-                    completed = Some(payload);
-                    Ok(Response::Ok)
-                }
-                (_, Command::Poll {}) => Ok(Response::Pending),
-                (_, command) => panic!("unexpected command in rollback flow: {command:?}"),
-            })
-            .unwrap();
-    }
-
-    let response = completed.unwrap();
-    assert_eq!(response["error"]["code"], "logging_apply_failed");
-    assert_eq!(response["logging"]["saved_revision"], 6);
-    assert_eq!(response["logging"]["status"], "rolled_back");
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn timed_out_logging_apply_reports_saved_revision_without_claiming_rollback() {
-    let mut pipeline = Pipeline::new(Ok(test_root()));
-    pipeline.pending = Some(Pending {
-        request_id: 7,
-        deadline: Instant::now() - Duration::from_secs(1),
-        state_request_id: 24,
-        stage: Stage::Applying {
-            response: json!({"revision":6}),
-            previous: Document::default(),
-            saved_state_revision: 13,
-        },
-        phase: PendingPhase::Waiting,
-    });
-    let mut completed = None;
-    pipeline
-        .tick(|command| match command {
-            Command::Cancel { request: 24 } | Command::ReleaseResult { request: 24 } => {
-                Ok(Response::Ok)
-            }
-            Command::Complete { payload, .. } => {
-                completed = Some(payload);
-                Ok(Response::Ok)
-            }
-            Command::Poll {} => Ok(Response::Pending),
-            Command::Request { .. } => panic!("ambiguous apply must not start a rollback"),
-            command => panic!("unexpected command after timed-out apply: {command:?}"),
-        })
-        .unwrap();
-    let response = completed.unwrap();
-    assert_eq!(response["error"]["code"], "logging_application_unconfirmed");
-    assert_eq!(response["logging"]["saved_revision"], 6);
-    assert_eq!(response["logging"]["applied_revision"], Value::Null);
-}
-
-#[test]
-fn accepted_state_errors_preserve_uncertain_save_and_rollback_outcomes() {
-    let check = |stage: Stage, outcome: ChildOutcome, expected_code: &str| {
-        let pending = Pending {
-            request_id: 7,
-            deadline: Instant::now() + Duration::from_secs(30),
-            state_request_id: 25,
-            stage,
-            phase: PendingPhase::Waiting,
-        };
-        let mut completed = None;
-        Pipeline::new(Err("unused trusted root".into()))
-            .consume(pending, outcome, &mut |command| match command {
-                Command::Complete { payload, .. } => {
-                    completed = Some(payload);
-                    Ok(Response::Ok)
-                }
-                command => panic!("uncertain result issued unexpected command: {command:?}"),
-            })
-            .unwrap();
-        let response = completed.unwrap();
-        assert_eq!(response["error"]["code"], expected_code);
-        let expected_status = match expected_code {
-            "logging_rollback_unconfirmed" => "rollback_unconfirmed",
-            "logging_rollback_failed" => "rollback_failed",
-            _ => "save_unconfirmed",
-        };
-        assert_eq!(response["logging"]["status"], expected_status);
-        assert_eq!(
-            response["logging"]["saved_revision"],
-            if expected_code == "save_unconfirmed" {
-                Value::Null
-            } else {
-                json!(6)
-            }
-        );
-    };
-
-    let saving = || Stage::Saving {
-        expected_state_revision: 12,
-        response: json!({"revision":6}),
-        previous: Document::default(),
-    };
-    let rollback = || Stage::RollingBack {
-        saved_revision: 6,
-        expected_state_revision: 13,
-    };
-    let transport_failure = || ChildOutcome::Failure {
-        code: "deadline_exceeded".into(),
-        message: "result expired after persistence".into(),
-    };
-    let storage_failure = || {
-        ChildOutcome::Payload(json!({
-            "ok":false,"error":{"code":"storage_error","message":"directory sync failed"}
-        }))
-    };
-
-    check(saving(), transport_failure(), "save_unconfirmed");
-    check(saving(), storage_failure(), "save_unconfirmed");
-    check(
-        rollback(),
-        transport_failure(),
-        "logging_rollback_unconfirmed",
-    );
-    check(
-        rollback(),
-        storage_failure(),
-        "logging_rollback_unconfirmed",
-    );
-    check(
-        rollback(),
-        ChildOutcome::Payload(json!({
-            "ok":false,"error":{"code":"revision_conflict","message":"CAS rejected"}
-        })),
-        "logging_rollback_failed",
-    );
 }
 
 #[test]
