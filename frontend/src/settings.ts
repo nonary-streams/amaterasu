@@ -196,20 +196,59 @@ namespace Amaterasu {
       sessionTokenTtlSeconds,
       rememberMeRefreshTokenTtlSeconds,
     );
-    await api.post("auth/settings_update", {
+    const updated = parseAuthTokenSettingsReply(await api.post<unknown>("auth/settings_update", {
       ...values,
       expected_revision: revision,
-    });
-    const saved = await api.post<AuthTokenSettings>("auth/settings");
+    }));
+    if (updated.revision !== revision + 1 ||
+        updated.values.session_token_ttl_seconds !== values.session_token_ttl_seconds ||
+        updated.values.remember_me_refresh_token_ttl_seconds !== values.remember_me_refresh_token_ttl_seconds)
+      throw new Error("Authentication settings update could not be confirmed. Refresh and check the current values.");
+    const saved = parseAuthTokenSettingsReply(await api.post<unknown>("auth/settings"));
     if (
-      !Number.isSafeInteger(saved?.revision) ||
-      saved.revision <= revision ||
-      saved.values?.session_token_ttl_seconds !== values.session_token_ttl_seconds ||
-      saved.values?.remember_me_refresh_token_ttl_seconds !==
-        values.remember_me_refresh_token_ttl_seconds
+      saved.revision !== updated.revision ||
+      saved.values.session_token_ttl_seconds !== values.session_token_ttl_seconds ||
+      saved.values.remember_me_refresh_token_ttl_seconds !== values.remember_me_refresh_token_ttl_seconds
     )
       throw new Error("Authentication settings could not be confirmed after saving. Refresh and check the current values.");
     return saved;
+  }
+
+  export function parseAuthTokenSettingsReply(value: unknown): AuthTokenSettings {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Authentication settings reply is invalid.");
+    const reply = value as Record<string, unknown>;
+    if (reply.ok !== true || !Number.isSafeInteger(reply.revision) || (reply.revision as number) < 0 ||
+        reply.values === null || typeof reply.values !== "object" || Array.isArray(reply.values))
+      throw new Error("Authentication settings reply is invalid.");
+    const values = reply.values as Record<string, unknown>;
+    return {
+      ok: true,
+      revision: reply.revision as number,
+      values: parseAuthTokenLifetimes(
+        values.session_token_ttl_seconds as number,
+        values.remember_me_refresh_token_ttl_seconds as number,
+      ),
+    };
+  }
+
+  export class AuthTokenSettingsLoadGate {
+    private generation = 0;
+
+    invalidate(): void {
+      this.generation += 1;
+    }
+
+    async read(api: Pick<Api, "post">): Promise<AuthTokenSettings | null> {
+      const generation = ++this.generation;
+      try {
+        const settings = parseAuthTokenSettingsReply(await api.post<unknown>("auth/settings"));
+        return generation === this.generation ? settings : null;
+      } catch (error) {
+        if (generation !== this.generation) return null;
+        throw error;
+      }
+    }
   }
 
   const hostLogLevels: HostLogLevel[] = [
@@ -977,6 +1016,7 @@ namespace Amaterasu {
   export function renderSettings(context: PageContext): void {
     const area = el("div");
     const authArea = el("div");
+    const authLoads = new AuthTokenSettingsLoadGate();
     const hostLoggingArea = el("div");
     const hostArea = el("div");
     const steamArea = el("div");
@@ -1017,7 +1057,8 @@ namespace Amaterasu {
     async function loadAuth(): Promise<void> {
       authArea.replaceChildren(el("p", "muted", "Loading authentication lifetimes…"));
       try {
-        const settings = await context.api.post<AuthTokenSettings>("auth/settings");
+        const settings = await authLoads.read(context.api);
+        if (settings === null) return;
         if (!context.content.isConnected) return;
         const form = el("form", "settings-form");
         const sessionTtl = input(
@@ -1059,6 +1100,7 @@ namespace Amaterasu {
         form.addEventListener("submit", (event) => {
           event.preventDefault();
           void runAction(save, status, async () => {
+            authLoads.invalidate();
             try {
               await saveAuthTokenLifetimes(
                 context.api,

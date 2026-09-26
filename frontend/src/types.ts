@@ -231,6 +231,7 @@ namespace Amaterasu {
     revision: number;
   }
   export interface AuthTokenSettings {
+    ok: true;
     revision: number;
     values: {
       session_token_ttl_seconds: number;

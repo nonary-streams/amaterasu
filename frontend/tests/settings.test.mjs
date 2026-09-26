@@ -46,6 +46,7 @@ test("authentication lifetime editor accepts bounded whole seconds", () => {
 test("authentication editor signs a revisioned update and confirms persisted readback", async () => {
   const calls = [];
   let stored = {
+    ok: true,
     revision: 7,
     values: {
       session_token_ttl_seconds: 7200,
@@ -63,13 +64,14 @@ test("authentication editor signs a revisioned update and confirms persisted rea
         expected_revision: 7,
       });
       stored = {
+        ok: true,
         revision: stored.revision + 1,
         values: {
           session_token_ttl_seconds: body.session_token_ttl_seconds,
           remember_me_refresh_token_ttl_seconds: body.remember_me_refresh_token_ttl_seconds,
         },
       };
-      return { ok: true };
+      return ordinary(stored);
     },
   };
   const initial = await api.post("auth/settings");
@@ -98,10 +100,12 @@ test("authentication editor reports conflicts and unconfirmed writes", async () 
     async post(route, body) {
       if (route === "auth/settings_update") {
         assert.equal(body.expected_revision, 4);
-        return { ok: true };
+        return { ok: true, revision: 5,
+          values: { session_token_ttl_seconds: 60, remember_me_refresh_token_ttl_seconds: 3600 } };
       }
       assert.equal(route, "auth/settings");
       return {
+        ok: true,
         revision: 4,
         values: { session_token_ttl_seconds: 60, remember_me_refresh_token_ttl_seconds: 3600 },
       };
@@ -112,20 +116,64 @@ test("authentication editor reports conflicts and unconfirmed writes", async () 
     /could not be confirmed/,
   );
   for (const readback of [
-    { revision: 5, values: { session_token_ttl_seconds: 61, remember_me_refresh_token_ttl_seconds: 3600 } },
-    { revision: "5", values: { session_token_ttl_seconds: 60, remember_me_refresh_token_ttl_seconds: 3600 } },
+    { ok: true, revision: 5, values: { session_token_ttl_seconds: 61, remember_me_refresh_token_ttl_seconds: 3600 } },
+    { ok: true, revision: 6, values: { session_token_ttl_seconds: 60, remember_me_refresh_token_ttl_seconds: 3600 } },
+    { ok: true, revision: "5", values: { session_token_ttl_seconds: 60, remember_me_refresh_token_ttl_seconds: 3600 } },
     null,
   ]) {
     const api = {
       async post(route) {
-        return route === "auth/settings_update" ? { ok: true } : readback;
+        return route === "auth/settings_update" ? {
+          ok: true, revision: 5,
+          values: { session_token_ttl_seconds: 60, remember_me_refresh_token_ttl_seconds: 3600 },
+        } : readback;
       },
     };
     await assert.rejects(
       context.Amaterasu.saveAuthTokenLifetimes(api, 4, 60, 3600),
-      /could not be confirmed/,
+      /could not be confirmed|reply is invalid/,
     );
   }
+  for (const rejected of [
+    { ok: false, error: { code: "revision_conflict" } },
+    { ok: true, revision: 6, values: { session_token_ttl_seconds: 60, remember_me_refresh_token_ttl_seconds: 3600 } },
+    { ok: true, revision: 5, values: { session_token_ttl_seconds: 61, remember_me_refresh_token_ttl_seconds: 3600 } },
+    { ok: true, revision: 5, values: { session_token_ttl_seconds: 0, remember_me_refresh_token_ttl_seconds: 3600 } },
+  ]) {
+    const calls = [];
+    await assert.rejects(context.Amaterasu.saveAuthTokenLifetimes({ async post(route) {
+      calls.push(route);
+      return rejected;
+    } }, 4, 60, 3600));
+    assert.deepEqual(calls, ["auth/settings_update"]);
+  }
+});
+
+test("authentication editor discards old loads and failures after refresh or save starts", async () => {
+  const gate = new context.Amaterasu.AuthTokenSettingsLoadGate();
+  const pending = [];
+  const api = { post(route) {
+    assert.equal(route, "auth/settings");
+    return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  } };
+  const old = gate.read(api);
+  const latest = gate.read(api);
+  const settings = {
+    ok: true, revision: 8,
+    values: { session_token_ttl_seconds: 60, remember_me_refresh_token_ttl_seconds: 3600 },
+  };
+  pending[1].resolve(settings);
+  assert.equal((await latest).revision, 8);
+  pending[0].resolve({ ...settings, revision: 7 });
+  assert.equal(await old, null);
+
+  const duringSave = gate.read(api);
+  gate.invalidate();
+  pending[2].reject(new Error("old load failed"));
+  assert.equal(await duringSave, null);
+  const reloaded = gate.read(api);
+  pending[3].resolve({ ...settings, revision: 9 });
+  assert.equal((await reloaded).revision, 9);
 });
 
 function hostConfiguration(revision = 6) {
