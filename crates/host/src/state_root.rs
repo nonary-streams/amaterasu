@@ -22,6 +22,7 @@ const CONTAINER_INHERIT_ACE: u8 = 0x02;
 const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+const MAX_SID_LENGTH: usize = 184;
 
 #[repr(C)]
 struct SidAndAttributes {
@@ -184,7 +185,7 @@ fn claim_pending_seed(data: &Path, sid: &str) -> PackageResult<bool> {
             return Err("migration seed claim is invalid".into());
         }
         reject_reparse(&claim)?;
-        if metadata.len() == 0 || metadata.len() > 128 {
+        if metadata.len() == 0 || metadata.len() > MAX_SID_LENGTH as u64 {
             return Err("migration seed claim is invalid".into());
         }
         let owner = fs::read_to_string(&claim).map_err(|error| error.to_string())?;
@@ -497,7 +498,7 @@ fn wide(value: &OsStr) -> PackageResult<Vec<u16>> {
 
 fn valid_sid(value: &str) -> bool {
     value.starts_with("S-1-")
-        && value.len() <= 184
+        && value.len() <= MAX_SID_LENGTH
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'S')
@@ -552,6 +553,12 @@ mod tests {
             fs::read(root.join("state-seed-claim")).unwrap(),
             b"S-1-5-21-1"
         );
+        fs::remove_file(root.join("state-seed-claim")).unwrap();
+        let long_sid = format!("S-1-5{}", "-4294967295".repeat(12));
+        assert!(long_sid.len() > 128 && valid_sid(&long_sid));
+        assert!(claim_pending_seed(&root, &long_sid).unwrap());
+        assert!(claim_pending_seed(&root, &long_sid).unwrap());
+        assert!(!claim_pending_seed(&root, "S-1-5-21-2").unwrap());
         let _ = fs::remove_dir_all(root);
     }
 
