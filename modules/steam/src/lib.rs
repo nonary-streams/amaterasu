@@ -76,6 +76,9 @@ struct Provider {
     local_artwork_responses: VecDeque<(u64, Value)>,
     artwork_validation_pending: bool,
     artwork_validation_complete: bool,
+    artwork_validation_results: BTreeMap<u32, artwork::ArtworkMetadata>,
+    artwork_verification_after: Option<u32>,
+    artwork_verification_done: bool,
     artwork_validation_retry_at: Option<Instant>,
     upgrade_queue: VecDeque<u32>,
     upgrade_pending: Option<PendingArtworkUpgrade>,
@@ -123,6 +126,9 @@ impl Provider {
             self.scan = None;
             self.artwork_validation_pending = false;
             self.artwork_validation_complete = false;
+            self.artwork_validation_results.clear();
+            self.artwork_verification_after = None;
+            self.artwork_verification_done = false;
             self.artwork_validation_retry_at = None;
             self.games.clear();
             self.upgrade_queue.clear();
@@ -154,6 +160,9 @@ impl Provider {
         self.upgrade_queue.clear();
         self.artwork_validation_pending = false;
         self.artwork_validation_complete = false;
+        self.artwork_validation_results.clear();
+        self.artwork_verification_after = None;
+        self.artwork_verification_done = false;
         self.artwork_validation_retry_at = None;
         self.scan = Some(Scan::new(&self.roots));
         true
@@ -198,40 +207,62 @@ impl Provider {
                 let targets = scan
                     .games
                     .values()
+                    .filter(|game| !self.artwork_validation_results.contains_key(&game.app_id))
                     .map(|game| artwork::LocalArtworkTarget {
                         app_id: game.app_id,
                         library: PathBuf::from(&game.library_directory),
                     })
-                    .collect();
-                match self
-                    .local_artwork
-                    .enqueue(artwork::LocalArtworkRequest::Validate {
-                        generation: self.artwork_generation,
-                        roots: self.roots.clone(),
-                        targets,
-                    }) {
-                    Ok(()) => self.artwork_validation_pending = true,
-                    Err("artwork_busy") => {}
-                    Err(_) => {
-                        let scan = self.scan.as_mut().expect("finished scan exists");
-                        scan.warning_count += 1;
-                        scan.warnings.push("artwork_validation_unavailable".into());
-                        for game in scan.games.values_mut() {
-                            game.artwork_source_path = None;
-                            game.artwork_local_revision = None;
-                            game.artwork_is_remote = true;
-                            game.artwork_revision =
-                                artwork::remote_revision(game.app_id, game.last_updated);
+                    .collect::<Vec<_>>();
+                if targets.is_empty() {
+                    self.artwork_validation_complete = true;
+                } else {
+                    match self
+                        .local_artwork
+                        .enqueue(artwork::LocalArtworkRequest::Validate {
+                            generation: self.artwork_generation,
+                            roots: self.roots.clone(),
+                            targets,
+                        }) {
+                        Ok(()) => self.artwork_validation_pending = true,
+                        Err("artwork_busy") => {}
+                        Err(_) => {
+                            self.scan = None;
+                            self.artwork_validation_results.clear();
+                            self.artwork_validation_retry_at =
+                                Some(Instant::now() + Duration::from_secs(5 * 60));
+                            self.warnings.push("artwork_validation_unavailable".into());
+                            self.warning_count = self.warning_count.saturating_add(1);
                         }
-                        self.artwork_validation_complete = true;
                     }
                 }
             }
         }
-        if self.artwork_validation_complete && self.scan.as_ref().is_some_and(|scan| scan.finished)
+        if self.artwork_validation_complete && !self.artwork_verification_done {
+            self.verify_artwork_batch();
+        }
+        if self.artwork_validation_complete
+            && self.artwork_verification_done
+            && self.scan.as_ref().is_some_and(|scan| scan.finished)
         {
-            let scan = self.scan.take().expect("finished scan exists");
+            let mut scan = self.scan.take().expect("finished scan exists");
             self.artwork_validation_complete = false;
+            self.artwork_verification_after = None;
+            self.artwork_verification_done = false;
+            if !self.artwork_validation_results.is_empty() {
+                for (app_id, metadata) in std::mem::take(&mut self.artwork_validation_results) {
+                    let Some(game) = scan.games.get_mut(&app_id) else {
+                        continue;
+                    };
+                    game.artwork_source_path = metadata.source_path;
+                    game.artwork_local_revision = metadata.revision.clone();
+                    game.artwork_is_remote = metadata.revision.is_none();
+                    game.artwork_revision = metadata
+                        .revision
+                        .or_else(|| artwork::remote_revision(app_id, game.last_updated));
+                    game.artwork_candidate_signature = metadata.candidate_signature;
+                    game.artwork_needs_remote_upgrade = metadata.needs_remote_upgrade;
+                }
+            }
             // The Steam client can be installed, moved, or removed while the
             // provider is running. Resolve it with each discovery snapshot so
             // reconciliation never keeps a stale launch program.
@@ -460,37 +491,27 @@ impl Provider {
                 artwork::LocalArtworkCompletion::Validated {
                     generation,
                     artwork,
-                    complete,
                 } => {
                     if generation != self.artwork_generation || !self.artwork_validation_pending {
                         continue;
                     }
                     self.artwork_validation_pending = false;
-                    let Some(scan) = self.scan.as_mut() else {
+                    let Some(scan) = self.scan.as_ref() else {
                         continue;
                     };
-                    if !complete || artwork.len() != scan.games.len() {
+                    if artwork
+                        .keys()
+                        .any(|app_id| !scan.games.contains_key(app_id))
+                    {
                         self.scan = None;
+                        self.artwork_validation_results.clear();
                         self.artwork_validation_retry_at =
                             Some(Instant::now() + Duration::from_secs(5 * 60));
-                        self.warnings.push("artwork_validation_incomplete".into());
-                        self.warning_count = self.warning_count.saturating_add(1);
                         continue;
                     }
-                    for (app_id, metadata) in artwork {
-                        let Some(game) = scan.games.get_mut(&app_id) else {
-                            continue;
-                        };
-                        game.artwork_source_path = metadata.source_path;
-                        game.artwork_local_revision = metadata.revision.clone();
-                        game.artwork_is_remote = metadata.revision.is_none();
-                        game.artwork_revision = metadata
-                            .revision
-                            .or_else(|| artwork::remote_revision(app_id, game.last_updated));
-                        game.artwork_candidate_signature = metadata.candidate_signature;
-                        game.artwork_needs_remote_upgrade = metadata.needs_remote_upgrade;
-                    }
-                    self.artwork_validation_complete = true;
+                    self.artwork_validation_results.extend(artwork);
+                    self.artwork_validation_complete =
+                        self.artwork_validation_results.len() == scan.games.len();
                 }
                 artwork::LocalArtworkCompletion::Read {
                     generation,
@@ -518,6 +539,43 @@ impl Provider {
                 }
             }
         }
+    }
+
+    fn verify_artwork_batch(&mut self) {
+        let after = self.artwork_verification_after.unwrap_or(0);
+        let batch = self
+            .artwork_validation_results
+            .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+            .take(17)
+            .map(|(app_id, metadata)| (*app_id, metadata.clone()))
+            .collect::<Vec<_>>();
+        for (app_id, metadata) in batch.iter().take(16) {
+            let Some(source_path) = metadata.source_path.as_deref() else {
+                continue;
+            };
+            let current = metadata.revision.as_deref().is_some_and(|revision| {
+                self.scan
+                    .as_ref()
+                    .and_then(|scan| scan.games.get(app_id))
+                    .is_some_and(|game| {
+                        let mut roots = vec![PathBuf::from(&game.library_directory)];
+                        roots.extend(self.roots.iter().cloned());
+                        artwork::local_revision_is_current(source_path, revision, &roots)
+                    })
+            });
+            if !current {
+                self.scan = None;
+                self.artwork_validation_complete = false;
+                self.artwork_validation_results.clear();
+                self.artwork_verification_after = None;
+                self.artwork_validation_retry_at = Some(Instant::now() + Duration::from_secs(1));
+                return;
+            }
+        }
+        if let Some((app_id, _)) = batch.iter().take(16).next_back() {
+            self.artwork_verification_after = Some(*app_id);
+        }
+        self.artwork_verification_done = batch.len() <= 16;
     }
 
     fn drain_local_artwork(&mut self) -> Vec<(u64, Value)> {

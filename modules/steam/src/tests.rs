@@ -6,6 +6,7 @@ use amaterasu_module_sdk::abi::{
     STATUS_OK,
 };
 use amaterasu_module_sdk::{Command, ManagedModule, Response};
+use image::ImageEncoder;
 use serde_json::json;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
@@ -34,7 +35,6 @@ fn upgrade_game(app_id: u32, needs_upgrade: bool) -> Game {
 }
 
 fn remote_test_jpeg() -> Vec<u8> {
-    use image::ImageEncoder;
     let pixels = vec![128_u8; 600 * 900 * 3];
     let mut bytes = Vec::new();
     image::codecs::jpeg::JpegEncoder::new(&mut bytes)
@@ -52,6 +52,114 @@ fn drain_artwork_until(provider: &mut Provider, deadline: Instant) -> Vec<(u64, 
         std::thread::sleep(Duration::from_millis(1));
     }
     panic!("fake artwork worker did not finish");
+}
+
+#[test]
+fn local_validation_resumes_batches_without_publishing_partial_scans() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-steam-validation-{}-{unique}",
+        std::process::id()
+    ));
+    let artwork_directory = root.join("appcache/librarycache");
+    std::fs::create_dir_all(&artwork_directory).unwrap();
+    let mut provider = Provider {
+        enabled: true,
+        snapshot_complete: true,
+        revision: 1,
+        roots: vec![root.clone()],
+        ..Provider::default()
+    };
+    provider.games.insert(99, upgrade_game(99, false));
+    provider.local_artwork.set_validation_batch_targets(2);
+    provider
+        .local_artwork
+        .set_validation_batch_duration(Duration::from_nanos(1));
+    let mut scan = Scan::default();
+    scan.finished = true;
+    for app_id in 1..=6 {
+        let path = artwork_directory.join(format!("{app_id}_library_600x900_2x.jpg"));
+        if app_id == 1 {
+            let mut corrupt = vec![
+                0xff, 0xd8, 0xff, 0xc0, 0, 17, 8, 3, 132, 2, 88, 3, 1, 17, 0, 2, 17, 0, 3, 17, 0,
+            ];
+            corrupt.extend_from_slice(&[0xff, 0xd9]);
+            std::fs::write(&path, corrupt).unwrap();
+            let fallback = artwork_directory.join("1_library_600x900.png");
+            let pixels = vec![64_u8; 300 * 450 * 4];
+            let mut png = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(&pixels, 300, 450, image::ExtendedColorType::Rgba8)
+                .unwrap();
+            std::fs::write(fallback, png).unwrap();
+        } else {
+            std::fs::write(&path, remote_test_jpeg()).unwrap();
+        }
+        let mut game = upgrade_game(app_id, false);
+        game.library_directory = root.display().to_string();
+        game.artwork_source_path = Some(path.display().to_string());
+        scan.games.insert(app_id, game);
+    }
+    provider.scan = Some(scan);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while provider.artwork_validation_results.len() < 2 {
+        provider.tick();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(provider.artwork_validation_results.len(), 2);
+    assert!(provider.games.contains_key(&99));
+    assert_eq!(provider.revision, 1);
+
+    while provider.scan.is_some() {
+        provider.tick();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(provider.revision, 2);
+    assert_eq!(provider.games.len(), 6);
+    assert!(!provider.games.contains_key(&99));
+    assert!(provider.games.values().all(|game| !game.artwork_is_remote));
+    assert!(provider.games[&1].artwork_needs_remote_upgrade);
+    assert!(
+        provider.games[&1]
+            .artwork_source_path
+            .as_deref()
+            .unwrap()
+            .ends_with("1_library_600x900.png")
+    );
+    drop(provider);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn disabling_steam_discards_partial_local_validation() {
+    let mut provider = Provider {
+        enabled: true,
+        ..Provider::default()
+    };
+    provider.local_artwork.set_validation_batch_targets(1);
+    let mut scan = Scan::default();
+    scan.finished = true;
+    for app_id in 1..=6 {
+        scan.games.insert(app_id, upgrade_game(app_id, false));
+    }
+    provider.scan = Some(scan);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while provider.artwork_validation_results.is_empty() {
+        provider.tick();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    provider.set_enabled(false);
+    assert!(provider.artwork_validation_results.is_empty());
+    assert!(provider.scan.is_none());
+    provider.process_local_artwork();
+    assert!(provider.artwork_validation_results.is_empty());
 }
 
 #[test]

@@ -1,11 +1,12 @@
 //! Bounded local Steam artwork discovery for catalog synchronization.
 use image::codecs::png::PngEncoder;
 use image::{ImageEncoder, ImageFormat, ImageReader, Limits};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,6 +31,7 @@ const REMOTE_TEMP_GRACE: Duration = Duration::from_secs(60 * 60);
 static NEXT_REMOTE_TEMP: AtomicU64 = AtomicU64::new(0);
 const MAX_REMOTE_FAILURES: usize = 64;
 const REMOTE_FETCH_QUEUE_CAPACITY: usize = 1;
+const LOCAL_VALIDATION_BATCH_TARGETS: usize = 256;
 const REMOTE_FAILURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const REMOTE_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 pub const ARTWORK_CHUNK_BYTES: usize = 8 * 1024;
@@ -135,7 +137,6 @@ pub enum LocalArtworkCompletion {
     Validated {
         generation: u64,
         artwork: BTreeMap<u32, ArtworkMetadata>,
-        complete: bool,
     },
     Read {
         generation: u64,
@@ -153,12 +154,26 @@ pub struct LocalArtworkWorker {
     completions: Option<mpsc::Receiver<LocalArtworkCompletion>>,
     stopped: Arc<AtomicBool>,
     current_generation: Arc<AtomicU64>,
+    validation_batch_targets: Arc<AtomicUsize>,
+    validation_batch_nanos: Arc<AtomicU64>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl LocalArtworkWorker {
     pub fn set_generation(&self, generation: u64) {
         self.current_generation.store(generation, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn set_validation_batch_targets(&self, targets: usize) {
+        self.validation_batch_targets
+            .store(targets.max(1), Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn set_validation_batch_duration(&self, duration: Duration) {
+        self.validation_batch_nanos
+            .store(duration.as_nanos().max(1) as u64, Ordering::Release);
     }
 
     pub fn enqueue(&mut self, request: LocalArtworkRequest) -> Result<(), &'static str> {
@@ -187,6 +202,8 @@ impl LocalArtworkWorker {
         let (completion_sender, completion_receiver) = mpsc::sync_channel(2);
         let stopped = Arc::clone(&self.stopped);
         let current_generation = Arc::clone(&self.current_generation);
+        let validation_batch_targets = Arc::clone(&self.validation_batch_targets);
+        let validation_batch_nanos = Arc::clone(&self.validation_batch_nanos);
         let worker_thread = thread::Builder::new()
             .name("steam-artwork-local".into())
             .spawn(move || {
@@ -202,35 +219,44 @@ impl LocalArtworkWorker {
                             targets,
                         } => {
                             let mut artwork = BTreeMap::new();
-                            let deadline = Instant::now() + Duration::from_secs(15);
-                            let target_count = targets.len();
+                            let nanos = validation_batch_nanos.load(Ordering::Acquire);
+                            let budget = if nanos == 0 {
+                                Duration::from_secs(15)
+                            } else {
+                                Duration::from_nanos(nanos)
+                            };
+                            let deadline = Instant::now() + budget;
+                            let target_limit =
+                                match validation_batch_targets.load(Ordering::Acquire) {
+                                    0 => LOCAL_VALIDATION_BATCH_TARGETS,
+                                    configured => configured,
+                                };
                             for target in targets {
                                 if stopped.load(Ordering::Acquire)
                                     || current_generation.load(Ordering::Acquire) != generation
-                                    || Instant::now() >= deadline
+                                    || (!artwork.is_empty() && Instant::now() >= deadline)
+                                    || artwork.len() >= target_limit
                                 {
                                     break;
                                 }
-                                artwork.insert(
+                                let validated = discover_with_validation(
                                     target.app_id,
-                                    discover_with_validation(
-                                        target.app_id,
-                                        &target.library,
-                                        &roots,
-                                        Some(&mut cache),
-                                        Some(&|| {
-                                            stopped.load(Ordering::Acquire)
-                                                || current_generation.load(Ordering::Acquire)
-                                                    != generation
-                                                || Instant::now() >= deadline
-                                        }),
-                                    ),
+                                    &target.library,
+                                    &roots,
+                                    Some(&mut cache),
+                                    Some(&|| {
+                                        stopped.load(Ordering::Acquire)
+                                            || current_generation.load(Ordering::Acquire)
+                                                != generation
+                                    }),
                                 );
+                                let Some(validated) = validated else {
+                                    break;
+                                };
+                                artwork.insert(target.app_id, validated);
                             }
                             LocalArtworkCompletion::Validated {
                                 generation,
-                                complete: artwork.len() == target_count
-                                    && Instant::now() < deadline,
                                 artwork,
                             }
                         }
@@ -1071,7 +1097,7 @@ fn remote_agent() -> &'static Agent {
 /// bounded Steam cache and grid directory entries and never follows an artwork
 /// file symlink outside a canonical Steam root.
 pub fn discover(app_id: u32, library: &Path, configured_roots: &[PathBuf]) -> ArtworkMetadata {
-    discover_with_validation(app_id, library, configured_roots, None, None)
+    discover_with_validation(app_id, library, configured_roots, None, None).unwrap_or_default()
 }
 
 fn discover_with_validation(
@@ -1080,7 +1106,7 @@ fn discover_with_validation(
     configured_roots: &[PathBuf],
     mut cache: Option<&mut LocalArtworkCache>,
     cancelled: Option<&dyn Fn() -> bool>,
-) -> ArtworkMetadata {
+) -> Option<ArtworkMetadata> {
     let mut roots = Vec::new();
     let mut seen_roots = BTreeSet::new();
     for root in std::iter::once(library).chain(configured_roots.iter().map(PathBuf::as_path)) {
@@ -1111,8 +1137,10 @@ fn discover_with_validation(
             .cmp(&(left.role_priority, left.pixel_area, left.width, left.height))
             .then_with(|| left.canonical_path.cmp(&right.canonical_path))
     });
+    let interrupted = Cell::new(false);
     let best_candidate = candidates.into_iter().find(|candidate| {
         if cancelled.is_some_and(|cancelled| cancelled()) {
+            interrupted.set(true);
             return false;
         }
         cache
@@ -1120,7 +1148,10 @@ fn discover_with_validation(
             .is_none_or(|cache| validate_local_candidate(candidate, cache))
     });
 
-    match best_candidate {
+    if interrupted.get() {
+        return None;
+    }
+    Some(match best_candidate {
         Some(candidate) => ArtworkMetadata {
             candidate_signature,
             needs_remote_upgrade: candidate.role_priority != 3
@@ -1133,7 +1164,7 @@ fn discover_with_validation(
             candidate_signature,
             ..ArtworkMetadata::default()
         },
-    }
+    })
 }
 
 fn validate_local_candidate(
@@ -1652,6 +1683,32 @@ pub fn read_chunk_cached(
     })
 }
 
+pub fn local_revision_is_current(
+    source_path: &str,
+    expected_revision: &str,
+    allowed_roots: &[PathBuf],
+) -> bool {
+    let source = Path::new(source_path);
+    if !fs::symlink_metadata(source).is_ok_and(|metadata| metadata.file_type().is_file()) {
+        return false;
+    }
+    let Ok(canonical) = source.canonicalize() else {
+        return false;
+    };
+    if !allowed_roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .take(MAX_ARTWORK_ROOTS)
+        .any(|root| canonical.starts_with(root))
+    {
+        return false;
+    }
+    canonical
+        .metadata()
+        .ok()
+        .is_some_and(|metadata| revision_for_metadata(&canonical, &metadata) == expected_revision)
+}
+
 fn revision_for_metadata(path: &Path, metadata: &fs::Metadata) -> String {
     let modified_nanos = metadata
         .modified()
@@ -1992,12 +2049,12 @@ mod tests {
         fs::write(&corrupt, synthetic_jpeg(600, 900, 64)).unwrap();
         fs::write(&fallback, valid_png(300, 450)).unwrap();
         let mut cache = LocalArtworkCache::default();
-        let artwork = discover_with_validation(42, &root.0, &[], Some(&mut cache), None);
+        let artwork = discover_with_validation(42, &root.0, &[], Some(&mut cache), None).unwrap();
         assert_eq!(artwork.source_path.as_deref(), fallback.to_str());
         assert!(artwork.needs_remote_upgrade);
 
         fs::write(&fallback, synthetic_png(600, 900)).unwrap();
-        let artwork = discover_with_validation(42, &root.0, &[], Some(&mut cache), None);
+        let artwork = discover_with_validation(42, &root.0, &[], Some(&mut cache), None).unwrap();
         assert!(artwork.source_path.is_none());
         assert!(artwork.revision.is_none());
     }
