@@ -8,6 +8,104 @@ use crate::model::{
     Address, AvailableMode, Configuration, DisplayError, DisplayResult, RouteBinding, Snapshot,
 };
 use serde_json::{Value, json};
+use std::time::Duration;
+
+const CCD_SETTLE_ATTEMPTS: usize = 6;
+const CCD_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
+
+fn settled_readback(
+    mut read: impl FnMut() -> DisplayResult<Snapshot>,
+    mut validate_identity: impl FnMut(&Snapshot) -> DisplayResult<()>,
+    mut verify: impl FnMut(&Snapshot) -> DisplayResult<()>,
+    mut wait: impl FnMut(),
+) -> DisplayResult<Snapshot> {
+    for attempt in 0..CCD_SETTLE_ATTEMPTS {
+        match read() {
+            Ok(snapshot) => {
+                validate_identity(&snapshot).map_err(DisplayError::after_mutation)?;
+                match verify(&snapshot) {
+                    Ok(()) => return Ok(snapshot),
+                    Err(error) if attempt + 1 == CCD_SETTLE_ATTEMPTS => {
+                        return Err(error.after_mutation());
+                    }
+                    Err(_) => {}
+                }
+            }
+            // A failed native query can mean hotplug or lost identity. Only a
+            // successfully decoded state with the expected physical routes
+            // is safe to treat as asynchronously settling.
+            Err(error) => return Err(error.after_mutation()),
+        }
+        wait();
+    }
+    unreachable!("bounded CCD settling always returns on its last attempt")
+}
+
+fn settle(
+    validate_identity: impl FnMut(&Snapshot) -> DisplayResult<()>,
+    verify: impl FnMut(&Snapshot) -> DisplayResult<()>,
+) -> DisplayResult<Snapshot> {
+    settled_readback(query::snapshot, validate_identity, verify, || {
+        std::thread::sleep(CCD_SETTLE_INTERVAL)
+    })
+}
+
+fn reject_foreign_apply_state(
+    configuration: &Configuration,
+    before: &Snapshot,
+    route: Option<&RouteBinding>,
+    current: &Snapshot,
+) -> DisplayResult<()> {
+    for path in &current.paths {
+        if let Some(saved) = before
+            .paths
+            .iter()
+            .find(|saved| saved.id.eq_ignore_ascii_case(&path.id))
+        {
+            if path.target_address != saved.target_address || path.source_name != saved.source_name
+            {
+                return Err(DisplayError::new(
+                    "topology_changed",
+                    "display physical identity changed after CCD apply",
+                ));
+            }
+        } else if !configuration
+            .displays
+            .iter()
+            .any(|wanted| wanted.id.eq_ignore_ascii_case(&path.id))
+            || route.is_none_or(|bound| {
+                !bound.id.eq_ignore_ascii_case(&path.id)
+                    || bound.target_address != path.target_address
+                    || bound.source_address != path.source_address
+                    || bound.source_name != path.source_name
+            })
+        {
+            return Err(DisplayError::new(
+                "topology_changed",
+                "new display used an unexpected physical route",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_foreign_restore_state(
+    saved: &Snapshot,
+    previous: &Snapshot,
+    current: &Snapshot,
+) -> DisplayResult<()> {
+    if current.paths.iter().any(|path| {
+        !saved.paths.iter().chain(&previous.paths).any(|expected| {
+            expected.id.eq_ignore_ascii_case(&path.id) && expected.source_name == path.source_name
+        })
+    }) {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "unexpected display route after CCD restore",
+        ));
+    }
+    Ok(())
+}
 #[derive(Default)]
 pub struct WindowsPlatform;
 impl Platform for WindowsPlatform {
@@ -118,12 +216,15 @@ impl Platform for WindowsPlatform {
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
         query::check_legacy_hdr_recovery(snapshot)?;
+        let previous = query::snapshot()?;
         let requested = apply::restoration(snapshot)?;
         apply::set(&requested, false)?;
         guard()?;
         apply::set(&requested, true).map_err(DisplayError::after_mutation)?;
-        let rebound = query::snapshot().map_err(DisplayError::after_mutation)?;
-        verify_restoration_routes(snapshot, &rebound)?;
+        let rebound = settle(
+            |current| reject_foreign_restore_state(snapshot, &previous, current),
+            |current| verify_restoration_routes(snapshot, current),
+        )?;
         for path in &snapshot.paths {
             if let Some(enabled) = path.hdr_enabled {
                 let current = rebound
@@ -135,13 +236,19 @@ impl Platform for WindowsPlatform {
                     .map_err(DisplayError::after_mutation)?;
             }
         }
-        if !snapshot.equivalent(&query::snapshot().map_err(DisplayError::after_mutation)?) {
-            return Err(DisplayError::new(
-                "verification_failed",
-                "restored CCD mode/topology does not exactly match the saved snapshot",
-            )
-            .after_mutation());
-        }
+        settle(
+            |current| reject_foreign_restore_state(snapshot, &previous, current),
+            |current| {
+                if snapshot.equivalent(current) {
+                    Ok(())
+                } else {
+                    Err(DisplayError::new(
+                        "verification_failed",
+                        "restored CCD mode/topology does not exactly match the saved snapshot",
+                    ))
+                }
+            },
+        )?;
         Ok(())
     }
 }
@@ -221,9 +328,14 @@ fn apply_configuration(
             .and_then(|display| display.hdr_enabled)
             .expect("HDR-only target has a requested state");
         query::set_advanced_color(target, enabled).map_err(DisplayError::after_mutation)?;
-        let final_state = verify_applied_configuration(configuration, query::snapshot())?;
-        verify_requested_hdr(configuration, &final_state)?;
-        verify_exact_hdr_only_result(before, target, enabled, &final_state)?;
+        settle(
+            |current| reject_foreign_apply_state(configuration, before, route, current),
+            |current| {
+                verify_applied_configuration(configuration, Ok(current.clone()))?;
+                verify_requested_hdr(configuration, current)?;
+                verify_exact_hdr_only_result(before, target, enabled, current)
+            },
+        )?;
         return Ok(());
     }
     let requested = match selected {
@@ -252,10 +364,16 @@ fn apply_configuration(
         }
     }
     apply::set(&requested, true).map_err(DisplayError::after_mutation)?;
-    let initial_state = verify_applied_configuration(configuration, query::snapshot())?;
-    if let Some(route) = route {
-        verify_activated_route(route, &initial_state)?;
-    }
+    settle(
+        |current| reject_foreign_apply_state(configuration, before, route, current),
+        |current| {
+            verify_applied_configuration(configuration, Ok(current.clone()))?;
+            if let Some(route) = route {
+                verify_activated_route(route, current)?;
+            }
+            Ok(())
+        },
+    )?;
     for display in &configuration.displays {
         if selected.is_some_and(|(id, _)| !display.id.eq_ignore_ascii_case(id)) {
             continue;
@@ -290,21 +408,27 @@ fn apply_configuration(
     if let Some(route) = route {
         query::verify_newly_active_hdr_is_off(route).map_err(DisplayError::after_mutation)?;
     }
-    let final_state = verify_applied_configuration(configuration, query::snapshot())?;
-    verify_requested_hdr(configuration, &final_state)?;
-    if let Some(route) = route {
-        verify_activated_route(route, &final_state)?;
-    }
-    if let Some((selected, TopologyShape::PreserveActive | TopologyShape::TranslateActive)) =
-        selected
-        && !apply::verifies_untouched(configuration, before, &final_state, selected)
-    {
-        return Err(DisplayError::new(
-            "verification_failed",
-            "untouched Windows display path changed during apply",
-        )
-        .after_mutation());
-    }
+    settle(
+        |current| reject_foreign_apply_state(configuration, before, route, current),
+        |current| {
+            verify_applied_configuration(configuration, Ok(current.clone()))?;
+            verify_requested_hdr(configuration, current)?;
+            if let Some(route) = route {
+                verify_activated_route(route, current)?;
+            }
+            if let Some((selected, TopologyShape::PreserveActive | TopologyShape::TranslateActive)) =
+                selected
+                && !apply::verifies_untouched(configuration, before, current, selected)
+            {
+                return Err(DisplayError::new(
+                    "verification_failed",
+                    "untouched Windows display path changed during apply",
+                )
+                .after_mutation());
+            }
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
@@ -1176,6 +1300,166 @@ mod tests {
         };
         let error = verify_applied_configuration(&requested(), Ok(empty_topology)).unwrap_err();
         assert_eq!(error.code, "verification_failed");
+        assert!(error.may_have_changed);
+    }
+
+    #[test]
+    fn ccd_settling_waits_for_exact_applied_mode() {
+        let requested = requested();
+        let mut before = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.one", 0, Some(true))],
+        };
+        before.paths[0].source.width = 1280;
+        let mut after = before.clone();
+        after.paths[0].source.width = 1920;
+        let mut reads = 0;
+        let mut waits = 0;
+        let result = settled_readback(
+            || {
+                reads += 1;
+                Ok(if reads < 3 {
+                    before.clone()
+                } else {
+                    after.clone()
+                })
+            },
+            |current| reject_foreign_apply_state(&requested, &before, None, current),
+            |current| {
+                verify_applied_configuration(&requested, Ok(current.clone()))?;
+                verify_requested_hdr(&requested, current)
+            },
+            || waits += 1,
+        );
+        assert!(result.is_ok());
+        assert_eq!((reads, waits), (3, 2));
+    }
+
+    #[test]
+    fn ccd_settling_keeps_failed_verification_as_mutated() {
+        let requested = requested();
+        let before = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.one", 0, Some(false))],
+        };
+        let mut reads = 0;
+        let error = settled_readback(
+            || {
+                reads += 1;
+                Ok(before.clone())
+            },
+            |current| reject_foreign_apply_state(&requested, &before, None, current),
+            |current| verify_requested_hdr(&requested, current),
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(reads, CCD_SETTLE_ATTEMPTS);
+        assert_eq!(error.code, "verification_failed");
+        assert!(error.may_have_changed);
+    }
+
+    #[test]
+    fn ccd_settling_rejects_foreign_route_before_retry() {
+        let requested = requested();
+        let before = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.one", 0, Some(false))],
+        };
+        let mut foreign = before.clone();
+        foreign.paths[0].target_address.id += 1;
+        let mut reads = 0;
+        let error = settled_readback(
+            || {
+                reads += 1;
+                Ok(foreign.clone())
+            },
+            |current| reject_foreign_apply_state(&requested, &before, None, current),
+            |_| Ok(()),
+            || panic!("foreign route must not be retried"),
+        )
+        .unwrap_err();
+        assert_eq!(reads, 1);
+        assert_eq!(error.code, "topology_changed");
+        assert!(error.may_have_changed);
+    }
+
+    #[test]
+    fn ccd_settling_does_not_retry_native_topology_errors() {
+        let mut reads = 0;
+        let error = settled_readback(
+            || {
+                reads += 1;
+                Err(DisplayError::new(
+                    "topology_changed",
+                    "hotplug during query",
+                ))
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+            || panic!("native topology errors must not be retried"),
+        )
+        .unwrap_err();
+        assert_eq!(reads, 1);
+        assert_eq!(error.code, "topology_changed");
+        assert!(error.may_have_changed);
+    }
+
+    #[test]
+    fn ccd_restore_settles_from_previous_topology_then_requires_exact_baseline() {
+        let saved = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.one", 0, Some(false))],
+        };
+        let mut previous = saved.clone();
+        previous
+            .paths
+            .push(readback_path("monitor.two", 1920, Some(false)));
+        let mut reads = 0;
+        let result = settled_readback(
+            || {
+                reads += 1;
+                Ok(if reads == 1 {
+                    previous.clone()
+                } else {
+                    saved.clone()
+                })
+            },
+            |current| reject_foreign_restore_state(&saved, &previous, current),
+            |current| {
+                if saved.equivalent(current) {
+                    Ok(())
+                } else {
+                    Err(DisplayError::new(
+                        "verification_failed",
+                        "restore is still settling",
+                    ))
+                }
+            },
+            || {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(reads, 2);
+    }
+
+    #[test]
+    fn ccd_restore_rejects_foreign_route_before_retry() {
+        let saved = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.one", 0, Some(false))],
+        };
+        let previous = saved.clone();
+        let foreign = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.foreign", 0, Some(false))],
+        };
+        let error = settled_readback(
+            || Ok(foreign.clone()),
+            |current| reject_foreign_restore_state(&saved, &previous, current),
+            |_| Ok(()),
+            || panic!("foreign restore route must not be retried"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "topology_changed");
         assert!(error.may_have_changed);
     }
 
