@@ -490,6 +490,74 @@ fn diagnostics_and_management_receive_narrow_host_configuration_grants() {
 }
 
 #[test]
+fn signed_policy_delivers_parented_host_logging_apply_to_diagnostics() {
+    let mut broker = Broker::new(installer_policy("__WEB__", BTreeMap::new())).unwrap();
+    for component in [HOST_CONFIGURATION, DIAGNOSTICS] {
+        assert!(matches!(
+            broker.dispatch(
+                component.id,
+                Command::Register {
+                    service: component.provides[0].into(),
+                },
+            ),
+            Response::Ok
+        ));
+    }
+
+    let parent = broker.dispatch(
+        MANAGEMENT.id,
+        Command::Request {
+            service: "amaterasu.host-configuration/1".into(),
+            payload: json!({"action":"update"}),
+            timeout_ms: 30_000,
+            operation_id: "host-logging-update".into(),
+            parent: None,
+        },
+    );
+    let Response::Accepted { id: parent_id } = parent else {
+        panic!("management host configuration update was rejected: {parent:?}");
+    };
+    assert!(matches!(
+        broker.dispatch(HOST_CONFIGURATION.id, Command::Poll {}),
+        Response::Request { id, initiator, .. }
+            if id == parent_id && initiator == MANAGEMENT.id
+    ));
+
+    let child = broker.dispatch(
+        HOST_CONFIGURATION.id,
+        Command::Request {
+            service: "amaterasu.diagnostics/1".into(),
+            payload: json!({"action":"apply_host_logging"}),
+            timeout_ms: 30_000,
+            operation_id: "host-logging-apply".into(),
+            parent: Some(parent_id),
+        },
+    );
+    let Response::Accepted { id: child_id } = child else {
+        panic!("parented diagnostics apply was rejected: {child:?}");
+    };
+    assert!(matches!(
+        broker.dispatch(DIAGNOSTICS.id, Command::Poll {}),
+        Response::Request { id, initiator, .. }
+            if id == child_id && initiator == MANAGEMENT.id
+    ));
+
+    assert!(matches!(
+        broker.dispatch(
+            PAIRING.id,
+            Command::Request {
+                service: "amaterasu.diagnostics/1".into(),
+                payload: json!({"action":"apply_host_logging"}),
+                timeout_ms: 30_000,
+                operation_id: "unauthorized-logging-apply".into(),
+                parent: None,
+            },
+        ),
+        Response::Error { code, .. } if code == "permission_denied"
+    ));
+}
+
+#[test]
 fn launch_can_call_only_the_typed_playnite_provider_service_it_uses() {
     assert!(LAUNCH.calls.contains(&"amaterasu.playnite/1"));
     assert!(LAUNCH.dependencies.contains(&PLAYNITE.id));
