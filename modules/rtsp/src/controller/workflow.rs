@@ -111,6 +111,19 @@ impl Controller {
             if payload["ok"] != true || payload["state"] != "prepared" {
                 return Err("prepare_rejected");
             }
+            if record
+                .display_preflight_deadline
+                .is_some_and(|expiry| now >= expiry)
+            {
+                return Err("display_admission_expired");
+            }
+            if let Some(expected) = &record.config.display_request
+                && (payload["display_request"] != *expected
+                    || payload["display_applied"] != true
+                    || payload["display_state"] != "applied")
+            {
+                return Err("display_lease_unverified");
+            }
             let session = response_session(payload).ok_or("invalid_prepare_response")?;
             let audio = local_port(payload, "audio_local")?;
             let video = local_port(payload, "video_local")?;
@@ -143,8 +156,11 @@ impl Controller {
             record.negotiation = Some(negotiation);
             record.needs_lookup = false;
             record.stream_state = Some("prepared".into());
+            record.display_applied = record.config.display_request.is_some();
             record.state = State::Ready;
-            record.expires = now.saturating_add(u64::from(record.config.ping_timeout_ms));
+            record.expires = now
+                .saturating_add(u64::from(record.config.ping_timeout_ms))
+                .min(record.display_preflight_deadline.unwrap_or(u64::MAX));
             Ok(())
         })();
         if let Err(code) = prepared {

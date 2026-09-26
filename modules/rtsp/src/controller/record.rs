@@ -39,6 +39,9 @@ pub(super) struct Record {
     pub uncertain_phase: Option<Phase>,
     pub needs_lookup: bool,
     pub stream_state: Option<String>,
+    /// True only after stream-session reports an applied, owned display lease.
+    pub display_applied: bool,
+    pub display_preflight_deadline: Option<u64>,
     pub revoke_after: Option<u64>,
     pub cleanup_confirmed: bool,
 }
@@ -71,6 +74,7 @@ impl Record {
             "frame_limiter_settings":self.config.frame_limiter_settings,
             "frame_limiter_executable_path":self.config.frame_limiter_executable_path,
             "display_request":self.config.display_request,
+            "display_applied":self.display_applied,
             "display_policy_snapshot":self.config.display_policy_snapshot,
             "failure":self.failure,"cleanup_error":self.cleanup_error})
     }

@@ -123,6 +123,8 @@ fn record(state: State) -> Record {
         uncertain_phase: None,
         needs_lookup: false,
         stream_state: Some("stopping".into()),
+        display_applied: false,
+        display_preflight_deadline: None,
         revoke_after: None,
         cleanup_confirmed: false,
     }
@@ -154,14 +156,16 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
     }))
     .unwrap();
     let mut controller = Controller::new(settings).unwrap();
-    let config = attested_open();
+    let mut config = attested_open();
+    config.ping_timeout_ms = 120_000;
     let retry_config = config.clone();
     let digest = config.display_request_sha256().unwrap();
     let snapshot = config.display_policy_snapshot.clone().unwrap();
     let mut endpoint = Endpoint {
         active_request: true,
         verifier_reply: Some(json!({"ok":true,"verified":true,
-            "rtsp_operation_id":"rtsp-one","request_sha256":digest})),
+            "rtsp_operation_id":"rtsp-one","request_sha256":digest,
+            "preflight_remaining_ms":10_000})),
         ..Endpoint::default()
     };
     let runtime = client(&mut endpoint);
@@ -171,6 +175,7 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
             caller: "amaterasu.nvhttp".into(),
             config,
             deadline: 5_000,
+            display_preflight_deadline: None,
         },
         0,
         &runtime,
@@ -184,6 +189,21 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
     assert!(controller.records.is_empty());
     controller.advance_display_admission(&runtime, 3);
     assert_eq!(controller.records.len(), 1);
+    let admitted = controller.records.values().next().unwrap();
+    assert_eq!(admitted.display_preflight_deadline, Some(10_000));
+    assert_eq!(admitted.expires, 5_000);
+    controller.advance_job(&runtime, 4);
+    let prepare = endpoint
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.stream-session/1" => Some(payload),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(prepare["ping_timeout_ms"], 4_997);
     let verify = endpoint
         .commands
         .iter()
@@ -242,6 +262,7 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
             caller: "amaterasu.nvhttp".into(),
             config: retry_config.clone(),
             deadline: 5_000,
+            display_preflight_deadline: None,
         },
         4,
         &runtime,
@@ -262,6 +283,7 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
             caller: "amaterasu.nvhttp".into(),
             config: changed,
             deadline: 5_000,
+            display_preflight_deadline: None,
         },
         4,
         &runtime,
@@ -274,6 +296,58 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
             .any(|(request, response)| *request == 21 && response["code"] == "operation_conflict")
     );
     assert_eq!(controller.records.len(), 1);
+}
+
+#[test]
+fn frozen_display_prepare_requires_owned_applied_readback_before_ticket_ready() {
+    for failure in ["missing_lease", "wrong_request", "expired", "valid"] {
+        let settings: Settings = serde_json::from_value(json!({
+            "enabled":true,"bind":"127.0.0.1:0","allowed_principals":["amaterasu.nvhttp"]
+        }))
+        .unwrap();
+        let mut controller = Controller::new(settings).unwrap();
+        let mut record = record(State::Preparing);
+        record.config = attested_open();
+        record.display_preflight_deadline = Some(100);
+        let job = Job {
+            ticket: record.id,
+            phase: Phase::Prepare,
+            call: Call::new(json!({"action":"prepare"}), "prepare".into(), Some(19)),
+            caller: Some(19),
+            network: None,
+            deadline: 5_000,
+        };
+        let mut prepared = json!({
+            "ok":true,"state":"prepared","session":23,
+            "audio_local":"127.0.0.1:51000","video_local":"127.0.0.1:51002",
+            "control_local":"127.0.0.1:51004",
+            "display_request":record.config.display_request,
+            "display_applied":true,"display_state":"applied",
+        });
+        match failure {
+            "missing_lease" => prepared["display_applied"] = json!(false),
+            "wrong_request" => {
+                prepared["display_request"]["expected_topology_revision"] = json!("bb".repeat(16))
+            }
+            _ => {}
+        }
+        let now = if failure == "expired" { 100 } else { 10 };
+        let mut endpoint = Endpoint {
+            active_request: true,
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.prepared(&mut record, job, &prepared, now, &runtime);
+        if failure == "valid" {
+            assert!(record.state == State::Ready);
+            assert_eq!(record.response()["display_applied"], true);
+            assert_eq!(record.expires, 100);
+        } else {
+            assert!(record.state == State::Closing, "{failure}");
+            assert_eq!(record.response()["display_applied"], false);
+            assert!(record.failure.is_some());
+        }
+    }
 }
 
 #[test]
@@ -302,6 +376,7 @@ fn malformed_topology_revision_never_reaches_verifier_or_stream_prepare() {
                 caller: "amaterasu.nvhttp".into(),
                 config,
                 deadline: 5_000,
+                display_preflight_deadline: None,
             },
             0,
             &runtime,
@@ -347,6 +422,7 @@ fn invalid_configuration_option_never_reaches_verifier_or_stream_prepare() {
                 caller: "amaterasu.nvhttp".into(),
                 config,
                 deadline: 5_000,
+                display_preflight_deadline: None,
             },
             0,
             &runtime,
@@ -414,6 +490,7 @@ fn forged_or_unavailable_display_admission_never_creates_a_ticket() {
                 .into(),
                 config,
                 deadline: 5_000,
+                display_preflight_deadline: None,
             },
             0,
             &runtime,
@@ -463,6 +540,7 @@ fn uncertain_verifier_settlement_keeps_child_identity_until_release() {
             caller: "amaterasu.nvhttp".into(),
             config,
             deadline: 5,
+            display_preflight_deadline: None,
         },
         0,
         &runtime,
@@ -538,6 +616,8 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         uncertain_phase: None,
         needs_lookup: true,
         stream_state: None,
+        display_applied: false,
+        display_preflight_deadline: None,
         revoke_after: None,
         cleanup_confirmed: false,
     };

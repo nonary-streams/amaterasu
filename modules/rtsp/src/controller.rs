@@ -47,6 +47,7 @@ struct OpenRequest {
     caller: String,
     config: Open,
     deadline: u64,
+    display_preflight_deadline: Option<u64>,
 }
 
 struct DisplayAdmission {
@@ -56,6 +57,8 @@ struct DisplayAdmission {
     deadline: u64,
     request_sha256: String,
     verified: bool,
+    verification_started_at: u64,
+    display_preflight_deadline: Option<u64>,
     call: Call,
 }
 

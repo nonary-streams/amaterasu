@@ -49,6 +49,7 @@ impl Controller {
                     caller,
                     config: *config,
                     deadline: now.saturating_add(remaining.min(PREPARE_BUDGET_MS)),
+                    display_preflight_deadline: None,
                 },
                 now,
                 runtime,
@@ -79,7 +80,7 @@ impl Controller {
     pub(super) fn open(
         &mut self,
         input: OpenRequest,
-        _now: u64,
+        now: u64,
         runtime: &RuntimeClient,
         verified: bool,
     ) {
@@ -88,6 +89,7 @@ impl Controller {
             caller,
             config,
             deadline,
+            display_preflight_deadline,
         } = input;
         if !self.settings.enabled {
             rpc::complete(runtime, request, error("disabled"));
@@ -104,6 +106,12 @@ impl Controller {
         }
         if let Err(code) = config.validate(self.settings.allow_remote) {
             rpc::complete(runtime, request, error(code));
+            return;
+        }
+        if display_preflight_deadline
+            .is_some_and(|expiry| expiry.saturating_sub(now) <= PREPARE_BUDGET_MS)
+        {
+            rpc::complete(runtime, request, error("display_admission_expired"));
             return;
         }
         let local = match self.advertised_local_for_peer(config.peer_ip) {
@@ -181,6 +189,8 @@ impl Controller {
                 deadline,
                 request_sha256: digest,
                 verified: false,
+                verification_started_at: now,
+                display_preflight_deadline: None,
                 call,
             });
             return;
@@ -215,15 +225,25 @@ impl Controller {
             uncertain_phase: None,
             needs_lookup: true,
             stream_state: None,
+            display_applied: false,
+            display_preflight_deadline,
             revoke_after: None,
             cleanup_confirmed: false,
         };
         let media_binds = self.media_binds_for_open(local.ip());
-        let payload = record.config.prepare_with_media_binds(
+        let mut payload = record.config.prepare_with_media_binds(
             &record.operation(),
             record.udp_discovery.as_ref(),
             media_binds,
         );
+        if let Some(expiry) = record.display_preflight_deadline {
+            // Stream-session starts its prepared timer after Apply/readback. Reserve
+            // the whole Prepare budget so an orphaned lease cannot outlive Launch's
+            // staged admission if this RTSP module stops before explicit cleanup.
+            let remaining = expiry.saturating_sub(now).saturating_sub(PREPARE_BUDGET_MS);
+            payload["ping_timeout_ms"] =
+                json!(u64::from(record.config.ping_timeout_ms).min(remaining));
+        }
         let operation = self.operation_id(&record, "prepare");
         self.records.insert(ticket, record);
         self.job = Some(Job {
@@ -250,6 +270,7 @@ impl Controller {
                         caller: admission.caller,
                         config: admission.config,
                         deadline: admission.deadline,
+                        display_preflight_deadline: admission.display_preflight_deadline,
                     },
                     now,
                     runtime,
@@ -281,14 +302,24 @@ impl Controller {
                 }
             }
             Outcome::Result(response) => {
+                let remaining = response
+                    .get("preflight_remaining_ms")
+                    .and_then(Value::as_u64);
+                let valid_remaining = response["preflight_remaining_ms"].is_null()
+                    || remaining.is_some_and(|value| (1..=120_000).contains(&value));
+                let preflight_deadline =
+                    remaining.map(|value| admission.verification_started_at.saturating_add(value));
                 if response["ok"] == true
                     && response["verified"] == true
                     && response["rtsp_operation_id"] == admission.config.operation_id
                     && response["request_sha256"] == admission.request_sha256
+                    && valid_remaining
+                    && preflight_deadline.is_none_or(|expiry| now < expiry)
                     && now < admission.deadline
                     && rpc::active(runtime, admission.request)
                 {
                     admission.verified = true;
+                    admission.display_preflight_deadline = preflight_deadline;
                     self.display_admission = Some(admission);
                 } else {
                     rpc::complete(
