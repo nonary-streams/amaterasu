@@ -125,6 +125,8 @@ fn record(state: State) -> Record {
         stream_state: Some("stopping".into()),
         display_applied: false,
         display_preflight_deadline: None,
+        display_lease_ready_until: None,
+        display_prepare_timeout_ms: None,
         revoke_after: None,
         cleanup_confirmed: false,
     }
@@ -157,7 +159,7 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
     .unwrap();
     let mut controller = Controller::new(settings).unwrap();
     let mut config = attested_open();
-    config.ping_timeout_ms = 120_000;
+    config.ping_timeout_ms = 1_000;
     let retry_config = config.clone();
     let digest = config.display_request_sha256().unwrap();
     let snapshot = config.display_policy_snapshot.clone().unwrap();
@@ -191,6 +193,7 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
     assert_eq!(controller.records.len(), 1);
     let admitted = controller.records.values().next().unwrap();
     assert_eq!(admitted.display_preflight_deadline, Some(10_000));
+    assert_eq!(admitted.display_lease_ready_until, Some(5_000));
     assert_eq!(admitted.expires, 5_000);
     controller.advance_job(&runtime, 4);
     let prepare = endpoint
@@ -203,7 +206,8 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(prepare["ping_timeout_ms"], 4_997);
+    assert_eq!(prepare["ping_timeout_ms"], 1_000);
+    assert_eq!(prepare["display_prepare_timeout_ms"], 4_997);
     let verify = endpoint
         .commands
         .iter()
@@ -300,15 +304,23 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
 
 #[test]
 fn frozen_display_prepare_requires_owned_applied_readback_before_ticket_ready() {
-    for failure in ["missing_lease", "wrong_request", "expired", "valid"] {
+    for failure in [
+        "missing_lease",
+        "wrong_request",
+        "missing_timeout",
+        "expired",
+        "valid",
+    ] {
         let settings: Settings = serde_json::from_value(json!({
-            "enabled":true,"bind":"127.0.0.1:0","allowed_principals":["amaterasu.nvhttp"]
+            "enabled":true,"bind":"127.0.0.1:0","allowed_principals":["caller"]
         }))
         .unwrap();
         let mut controller = Controller::new(settings).unwrap();
         let mut record = record(State::Preparing);
         record.config = attested_open();
         record.display_preflight_deadline = Some(100);
+        record.display_lease_ready_until = Some(50);
+        record.display_prepare_timeout_ms = Some(40);
         let job = Job {
             ticket: record.id,
             phase: Phase::Prepare,
@@ -323,12 +335,14 @@ fn frozen_display_prepare_requires_owned_applied_readback_before_ticket_ready() 
             "control_local":"127.0.0.1:51004",
             "display_request":record.config.display_request,
             "display_applied":true,"display_state":"applied",
+            "display_prepare_timeout_ms":40,
         });
         match failure {
             "missing_lease" => prepared["display_applied"] = json!(false),
             "wrong_request" => {
                 prepared["display_request"]["expected_topology_revision"] = json!("bb".repeat(16))
             }
+            "missing_timeout" => prepared["display_prepare_timeout_ms"] = Value::Null,
             _ => {}
         }
         let now = if failure == "expired" { 100 } else { 10 };
@@ -341,13 +355,77 @@ fn frozen_display_prepare_requires_owned_applied_readback_before_ticket_ready() 
         if failure == "valid" {
             assert!(record.state == State::Ready);
             assert_eq!(record.response()["display_applied"], true);
-            assert_eq!(record.expires, 100);
+            assert_eq!(record.expires, 50);
+            let exact_retry = record.config.clone();
+            finish_record(&mut record);
+            assert_eq!(record.response()["display_applied"], false);
+            controller.records.insert(record.id, record);
+            controller.open(
+                OpenRequest {
+                    request: 20,
+                    caller: "caller".into(),
+                    config: exact_retry,
+                    deadline: 5_000,
+                    display_preflight_deadline: None,
+                },
+                20,
+                &runtime,
+                false,
+            );
+            assert!(endpoint.completions.iter().any(|(request, response)| {
+                *request == 20
+                    && response["state"] == "closed"
+                    && response["display_applied"] == false
+            }));
         } else {
             assert!(record.state == State::Closing, "{failure}");
             assert_eq!(record.response()["display_applied"], false);
             assert!(record.failure.is_some());
         }
     }
+}
+
+#[test]
+fn nearly_expired_staged_admission_never_allocates_a_stream() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled":true,"bind":"127.0.0.1:0","allowed_principals":["amaterasu.nvhttp"]
+    }))
+    .unwrap();
+    let mut controller = Controller::new(settings).unwrap();
+    let config = attested_open();
+    let digest = config.display_request_sha256().unwrap();
+    let mut endpoint = Endpoint {
+        active_request: true,
+        verifier_reply: Some(json!({
+            "ok":true,"verified":true,"rtsp_operation_id":config.operation_id,
+            "request_sha256":digest,"preflight_remaining_ms":5_000
+        })),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    controller.open(
+        OpenRequest {
+            request: 19,
+            caller: "amaterasu.nvhttp".into(),
+            config,
+            deadline: 5_000,
+            display_preflight_deadline: None,
+        },
+        0,
+        &runtime,
+        false,
+    );
+    for now in 1..=3 {
+        controller.advance_display_admission(&runtime, now);
+    }
+    assert!(controller.records.is_empty());
+    assert!(controller.job.is_none());
+    assert!(
+        endpoint
+            .completions
+            .iter()
+            .any(|(_, response)| { response["code"] == "display_admission_expired" })
+    );
 }
 
 #[test]
@@ -618,6 +696,8 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         stream_state: None,
         display_applied: false,
         display_preflight_deadline: None,
+        display_lease_ready_until: None,
+        display_prepare_timeout_ms: None,
         revoke_after: None,
         cleanup_confirmed: false,
     };

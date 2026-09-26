@@ -205,7 +205,7 @@ impl Controller {
         };
         let url = format!("rtspenc://{local}/launch-{ticket:016x}");
         let expires = deadline;
-        let record = Record {
+        let mut record = Record {
             id: ticket,
             owner: caller,
             config,
@@ -227,6 +227,8 @@ impl Controller {
             stream_state: None,
             display_applied: false,
             display_preflight_deadline,
+            display_lease_ready_until: None,
+            display_prepare_timeout_ms: None,
             revoke_after: None,
             cleanup_confirmed: false,
         };
@@ -236,13 +238,25 @@ impl Controller {
             record.udp_discovery.as_ref(),
             media_binds,
         );
-        if let Some(expiry) = record.display_preflight_deadline {
+        if record.config.display_request.is_some() {
             // Stream-session starts its prepared timer after Apply/readback. Reserve
             // the whole Prepare budget so an orphaned lease cannot outlive Launch's
             // staged admission if this RTSP module stops before explicit cleanup.
-            let remaining = expiry.saturating_sub(now).saturating_sub(PREPARE_BUDGET_MS);
-            payload["ping_timeout_ms"] =
-                json!(u64::from(record.config.ping_timeout_ms).min(remaining));
+            let remaining = record
+                .display_preflight_deadline
+                .map_or(u64::MAX, |expiry| {
+                    expiry.saturating_sub(now).saturating_sub(PREPARE_BUDGET_MS)
+                });
+            let effective_timeout = if record.display_preflight_deadline.is_some() {
+                remaining.min(STAGED_DISPLAY_PREPARE_MAX_MS)
+            } else {
+                u64::from(record.config.ping_timeout_ms)
+            };
+            if record.display_preflight_deadline.is_some() {
+                payload["display_prepare_timeout_ms"] = json!(effective_timeout);
+                record.display_prepare_timeout_ms = Some(effective_timeout as u32);
+            }
+            record.display_lease_ready_until = Some(now.saturating_add(effective_timeout));
         }
         let operation = self.operation_id(&record, "prepare");
         self.records.insert(ticket, record);

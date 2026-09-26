@@ -124,6 +124,11 @@ impl Controller {
             {
                 return Err("display_lease_unverified");
             }
+            if record.display_prepare_timeout_ms.is_some_and(|expected| {
+                payload["display_prepare_timeout_ms"].as_u64() != Some(u64::from(expected))
+            }) {
+                return Err("display_lease_unverified");
+            }
             let session = response_session(payload).ok_or("invalid_prepare_response")?;
             let audio = local_port(payload, "audio_local")?;
             let video = local_port(payload, "video_local")?;
@@ -156,11 +161,16 @@ impl Controller {
             record.negotiation = Some(negotiation);
             record.needs_lookup = false;
             record.stream_state = Some("prepared".into());
+            let expires = record
+                .display_lease_ready_until
+                .unwrap_or_else(|| now.saturating_add(u64::from(record.config.ping_timeout_ms)))
+                .min(record.display_preflight_deadline.unwrap_or(u64::MAX));
+            if record.config.display_request.is_some() && expires <= now {
+                return Err("display_lease_expired");
+            }
             record.display_applied = record.config.display_request.is_some();
             record.state = State::Ready;
-            record.expires = now
-                .saturating_add(u64::from(record.config.ping_timeout_ms))
-                .min(record.display_preflight_deadline.unwrap_or(u64::MAX));
+            record.expires = expires;
             Ok(())
         })();
         if let Err(code) = prepared {

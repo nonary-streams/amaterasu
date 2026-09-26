@@ -42,6 +42,9 @@ pub(super) struct Record {
     /// True only after stream-session reports an applied, owned display lease.
     pub display_applied: bool,
     pub display_preflight_deadline: Option<u64>,
+    /// Conservative Ready deadline measured when stream-session Prepare is sent.
+    pub display_lease_ready_until: Option<u64>,
+    pub display_prepare_timeout_ms: Option<u32>,
     pub revoke_after: Option<u64>,
     pub cleanup_confirmed: bool,
 }
