@@ -48,6 +48,10 @@ class FakeElement {
       )
       .join("");
   }
+
+  set textContent(value) {
+    this.replaceChildren(String(value));
+  }
 }
 
 const pageTestContext = createPageContext();
@@ -556,6 +560,157 @@ function historySummary(sessionId) {
     duration_seconds: 20,
   };
 }
+
+test("recorded deletion follows signed runtime status while list and detail stay readable", async () => {
+  let runtime = historyStatus({ enabled: false, effective_enabled: false });
+  const calls = [];
+  const api = {
+    allows: (scope) => scope === "session.write",
+    async post(route) {
+      calls.push(route);
+      if (route === "session/list") return { sessions: [], next_offset: null };
+      if (route === "history/history_status") return runtime;
+      if (route === "history/list_sessions")
+        return { ok: true, sessions: [historySummary("stored")], next_offset: null };
+      if (route === "history/session_detail") return historyDetail("stored");
+      throw new Error(`Unexpected route ${route}`);
+    },
+  };
+  const mount = () => {
+    const content = new FakeElement("main");
+    content.setConnected(true);
+    pages.renderSessions({ content, api, notify() {}, navigate() {} });
+    return content;
+  };
+  let content = mount();
+  await waitFor(() => findButton(content, "Delete")?.disabled &&
+    content.textContent.includes("Deletion is unavailable while history recording is disabled"), "disabled history readback");
+  findButton(content, "Details").click();
+  await waitFor(() => content.textContent.includes("History for stored"), "stored detail while disabled");
+  assert.equal(calls.filter((route) => route === "history/delete_session").length, 0);
+
+  runtime = historyStatus({ enabled: false, effective_enabled: true, active_streams: 1 });
+  findButton(content, "Refresh history status").click();
+  await waitFor(() => findButton(content, "Delete")?.disabled === false, "pending disable effective writer");
+
+  runtime = historyStatus({ enabled: false, effective_enabled: false, active_streams: 0 });
+  content.setConnected(false);
+  content = mount();
+  await waitFor(() => findButton(content, "Delete")?.disabled &&
+    content.textContent.includes("Deletion is unavailable while history recording is disabled"), "disabled restart readback");
+  runtime = historyStatus();
+  findButton(content, "Refresh history status").click();
+  await waitFor(() => findButton(content, "Delete")?.disabled === false, "re-enabled writer");
+  runtime = historyStatus({ enabled: false, effective_enabled: false });
+  const previousConfirm = pageTestContext.confirmAction;
+  let confirmations = 0;
+  pageTestContext.confirmAction = async () => { confirmations += 1; return true; };
+  try {
+    findButton(content, "Delete").click();
+    await waitFor(() => findButton(content, "Delete")?.disabled &&
+      content.textContent.includes("Deletion is unavailable while history recording is disabled"), "delete preflight after writer shutdown");
+  } finally {
+    pageTestContext.confirmAction = previousConfirm;
+  }
+  assert.equal(confirmations, 0);
+  assert.equal(calls.filter((route) => route === "history/delete_session").length, 0);
+  findButton(content, "Details").click();
+  await waitFor(() => content.textContent.includes("History for stored"), "detail after rejected delete");
+});
+
+test("recorded deletion rechecks signed status after a long-open confirmation", async () => {
+  let runtime = historyStatus();
+  const calls = [];
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  pages.renderSessions({ content, notify() {}, navigate() {}, api: {
+    allows: (scope) => scope === "session.write",
+    async post(route) {
+      calls.push(route);
+      if (route === "session/list") return { sessions: [], next_offset: null };
+      if (route === "history/history_status") return runtime;
+      if (route === "history/list_sessions")
+        return { ok: true, sessions: [historySummary("stored")], next_offset: null };
+      if (route === "history/session_detail") return historyDetail("stored");
+      throw new Error(`Unexpected route ${route}`);
+    },
+  } });
+  await waitFor(() => findButton(content, "Delete")?.disabled === false, "enabled history writer");
+  const previousConfirm = pageTestContext.confirmAction;
+  let finishConfirmation;
+  let confirmations = 0;
+  pageTestContext.confirmAction = () => {
+    confirmations += 1;
+    return new Promise((resolve) => { finishConfirmation = resolve; });
+  };
+  try {
+    findButton(content, "Delete").click();
+    await waitFor(() => confirmations === 1, "delete confirmation");
+    runtime = historyStatus({ enabled: false, effective_enabled: false });
+    finishConfirmation(true);
+    await waitFor(() => findButton(content, "Delete")?.disabled &&
+      content.textContent.includes("Deletion is unavailable while history recording is disabled"), "disabled writer after confirmation");
+  } finally {
+    pageTestContext.confirmAction = previousConfirm;
+  }
+  assert.equal(calls.filter((route) => route === "history/history_status").length, 3);
+  assert.equal(calls.filter((route) => route === "history/delete_session").length, 0);
+  findButton(content, "Details").click();
+  await waitFor(() => content.textContent.includes("History for stored"), "stored detail after confirmation");
+});
+
+test("history status failure and stale status or list replies cannot re-enable deletion", async () => {
+  const pendingStatuses = [];
+  const pendingLists = [];
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  pages.renderSessions({ content, notify() {}, navigate() {}, api: {
+    allows: (scope) => scope === "session.write",
+    async post(route) {
+      if (route === "session/list") return { sessions: [], next_offset: null };
+      if (route === "history/history_status")
+        return new Promise((resolve, reject) => pendingStatuses.push({ resolve, reject }));
+      if (route === "history/list_sessions")
+        return new Promise((resolve) => pendingLists.push(resolve));
+      throw new Error(`Unexpected route ${route}`);
+    },
+  } });
+  pendingLists[0]({ ok: true, sessions: [historySummary("stored")], next_offset: null });
+  pendingStatuses[0].resolve(historyStatus());
+  await waitFor(() => findButton(content, "Delete")?.disabled === false, "initial enabled readback");
+
+  findButton(content, "Refresh history status").click();
+  assert.equal(findButton(content, "Delete").disabled, true);
+  findButton(content, "Refresh").click();
+  await waitFor(() => pendingStatuses.length === 3 && pendingLists.length === 2, "overlapping refreshes");
+  pendingStatuses[2].resolve(historyStatus({ enabled: false, effective_enabled: false }));
+  pendingLists[1]({ ok: true, sessions: [historySummary("current")], next_offset: null });
+  await waitFor(() => content.textContent.includes("current") &&
+    findButton(content, "Delete")?.disabled, "newer disabled readback");
+  pendingStatuses[1].resolve(historyStatus());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(findButton(content, "Delete").disabled, true);
+  assert.doesNotMatch(content.textContent, /Deletion is unavailable until history runtime status can be confirmed/);
+
+  findButton(content, "Refresh history status").click();
+  pendingStatuses[3].reject(new Error("status unavailable"));
+  await waitFor(() => content.textContent.includes("Deletion is unavailable until history runtime status can be confirmed"), "unavailable status");
+  assert.equal(findButton(content, "Delete").disabled, true);
+  assert.ok(findButton(content, "Details"));
+
+  findButton(content, "Refresh").click();
+  findButton(content, "Refresh").click();
+  await waitFor(() => pendingStatuses.length === 6 && pendingLists.length === 4, "overlapping list refreshes");
+  pendingStatuses[5].resolve(historyStatus({ enabled: false, effective_enabled: false }));
+  pendingLists[3]({ ok: true, sessions: [historySummary("latest")], next_offset: null });
+  await waitFor(() => content.textContent.includes("latest"), "latest history page");
+  pendingStatuses[4].resolve(historyStatus());
+  pendingLists[2]({ ok: true, sessions: [historySummary("stale")], next_offset: null });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(content.textContent, /latest/);
+  assert.doesNotMatch(content.textContent, /stale/);
+  assert.equal(findButton(content, "Delete").disabled, true);
+});
 
 function historyDetail(sessionId) {
   return {

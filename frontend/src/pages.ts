@@ -221,6 +221,11 @@ namespace Amaterasu {
     const savedHistory = [0];
     let savedListRequest = 0;
     let savedDetailRequest = 0;
+    let historyStatusRequest = 0;
+    let historyDeleteAvailable = false;
+    let historyDeleteReason = "Checking history status before deletion is available.";
+    let deleteControls: { button: HTMLButtonElement; ended: boolean }[] = [];
+    const deleteNotice = el("p", "muted", historyDeleteReason);
     let selectedSavedSession: string | null = null;
     context.content.append(
       sectionHeading(
@@ -228,8 +233,8 @@ namespace Amaterasu {
         "Inspect and stop sessions owned by this management console.",
         button("Refresh", () => {
           void load();
-          void loadSaved();
           void loadHistoryRuntime();
+          void loadSaved();
         }),
       ),
       status,
@@ -237,18 +242,39 @@ namespace Amaterasu {
       panel("History runtime status", historyRuntimeArea),
       panel("Recorded stream sessions", savedArea, savedStatus, savedDetail),
     );
-    async function loadHistoryRuntime(): Promise<void> {
+    function applyHistoryDeleteAvailability(): void {
+      deleteNotice.textContent = historyDeleteReason;
+      for (const control of deleteControls)
+        control.button.disabled = !control.ended || !context.api.allows("session.write") || !historyDeleteAvailable;
+    }
+    async function loadHistoryRuntime(): Promise<boolean> {
+      const request = ++historyStatusRequest;
+      historyDeleteAvailable = false;
+      historyDeleteReason = "Checking history status before deletion is available.";
+      applyHistoryDeleteAvailability();
       historyRuntimeArea.replaceChildren(el("p", "muted", "Loading history runtime status…"));
       try {
         const runtime = parseHistoryRuntimeStatus(await context.api.post<unknown>("history/history_status"));
-        if (!context.content.isConnected) return;
+        if (!context.content.isConnected || request !== historyStatusRequest) return false;
+        historyDeleteAvailable = runtime.available && runtime.configuration_ready && runtime.effective_enabled;
+        historyDeleteReason = historyDeleteAvailable
+          ? ""
+          : runtime.available && runtime.configuration_ready && !runtime.effective_enabled
+            ? "Deletion is unavailable while history recording is disabled. Stored sessions remain readable."
+            : "Deletion is unavailable until history storage and configuration are ready.";
+        applyHistoryDeleteAvailability();
         historyRuntimeArea.replaceChildren(
           ...historyRuntimeDescription(runtime).map((line) => el("p", "muted", line)),
           button("Refresh history status", () => { void loadHistoryRuntime(); }),
         );
+        return historyDeleteAvailable;
       } catch (error) {
-        if (context.content.isConnected)
-          historyRuntimeArea.replaceChildren(errorPanel(error, loadHistoryRuntime));
+        if (context.content.isConnected && request === historyStatusRequest) {
+          historyDeleteReason = "Deletion is unavailable until history runtime status can be confirmed. Stored sessions remain readable.";
+          applyHistoryDeleteAvailability();
+          historyRuntimeArea.replaceChildren(errorPanel(error, () => { void loadHistoryRuntime(); }));
+        }
+        return false;
       }
     }
     async function load(): Promise<void> {
@@ -338,11 +364,13 @@ namespace Amaterasu {
         if (reply.ok !== true || !Array.isArray(reply.sessions) ||
           (reply.next_offset != null && (!Number.isSafeInteger(reply.next_offset) || reply.next_offset <= savedOffset)))
           throw new Error("History session page is invalid.");
+        const currentDeleteControls: typeof deleteControls = [];
         const rows = reply.sessions.map((session) => {
           const details = button("Details", () => loadSavedDetail(session.session_id));
           const remove = button(
             "Delete",
             async () => {
+              if (!historyDeleteAvailable || !(await loadHistoryRuntime())) return;
               if (
                 !(await confirmAction(
                   "Delete this recorded session?",
@@ -351,6 +379,8 @@ namespace Amaterasu {
                 ))
               )
                 return;
+              // The writer may have drained while the confirmation was open.
+              if (!historyDeleteAvailable || !(await loadHistoryRuntime())) return;
               await runAction(remove, savedStatus, async () => {
                 await context.api.post("history/delete_session", {
                   session_id: session.session_id,
@@ -363,11 +393,11 @@ namespace Amaterasu {
                 context.notify("Recorded session deleted.");
                 await loadSaved();
               });
+              await loadHistoryRuntime();
             },
             "quiet danger-text",
           );
-          remove.disabled =
-            session.ended_at_unix == null || !context.api.allows("session.write");
+          currentDeleteControls.push({ button: remove, ended: session.ended_at_unix != null });
           return [
             el("div", "", el("strong", "", session.app_name || session.session_id),
               el("small", "muted block", session.client_name || session.protocol)),
@@ -377,7 +407,10 @@ namespace Amaterasu {
             el("div", "actions", details, remove),
           ];
         });
+        deleteControls = currentDeleteControls;
+        applyHistoryDeleteAvailability();
         savedArea.replaceChildren(
+          deleteNotice,
           reply.sessions.length
             ? table(["Application / client", "Started", "Duration", "Actions"], rows)
             : empty("No recorded streams", "Completed streams appear here when history recording is enabled."),
@@ -452,8 +485,8 @@ namespace Amaterasu {
       }
     }
     void load();
-    void loadSaved();
     void loadHistoryRuntime();
+    void loadSaved();
   }
 
   export function renderApplications(context: PageContext): void {
