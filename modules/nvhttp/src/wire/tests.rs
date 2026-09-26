@@ -3,6 +3,22 @@ use crate::launch::{CaptureConfig, CaptureProvider, StreamProfile, StreamingConf
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[test]
+fn paired_client_display_mode_decodes_only_as_optional_string() {
+    let parsed: ClientConfigOverrides =
+        serde_json::from_value(json!({"display_mode":"1920x1080x59.94"})).unwrap();
+    assert_eq!(parsed.display_mode.as_deref(), Some("1920x1080x59.94"));
+    assert!(
+        serde_json::from_value::<ClientConfigOverrides>(json!({"display_mode":59.94})).is_err()
+    );
+    assert!(
+        serde_json::from_value::<ClientConfigOverrides>(json!({"display_mode":null}))
+            .unwrap()
+            .display_mode
+            .is_none()
+    );
+}
+
 #[derive(Default)]
 struct Broker {
     next: u64,

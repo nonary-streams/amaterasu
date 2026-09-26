@@ -1,4 +1,7 @@
-use super::{CaptureProvider, LaunchRequest, PeerIdentity, VideoEncryptionPolicySnapshot};
+use super::{
+    CaptureProvider, LaunchRequest, PeerIdentity, PhysicalDisplayMode,
+    VideoEncryptionPolicySnapshot,
+};
 use crate::frame_limiter::FrameLimiterSettings;
 use crate::launch::{CLEANUP_DEADLINE, MONITOR_INTERVAL};
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
@@ -44,6 +47,8 @@ pub struct Record {
     pub id: u64,
     pub peer: PeerIdentity,
     pub request: LaunchRequest,
+    /// Frozen requested physical mode; this does not assert a host display topology.
+    pub physical_display_mode: PhysicalDisplayMode,
     pub device_name: String,
     pub application_operation: String,
     pub rtsp_operation: String,
@@ -163,10 +168,16 @@ impl Record {
         connection: u64,
         deadline: Instant,
     ) -> Self {
+        let physical_display_mode = peer.client_display_mode.unwrap_or(PhysicalDisplayMode {
+            width: request.width,
+            height: request.height,
+            refresh_millihz: request.fps * 1_000,
+        });
         Self {
             id,
             peer,
             request,
+            physical_display_mode,
             device_name,
             application_operation,
             rtsp_operation,

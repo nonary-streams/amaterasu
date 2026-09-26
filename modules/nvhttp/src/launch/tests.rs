@@ -233,6 +233,93 @@ fn request(key: u8) -> LaunchRequest {
     }
 }
 
+fn peer_with_display_mode(marker: u8, display_mode: &str) -> Result<PeerIdentity, &'static str> {
+    let certificate = vec![marker; 32];
+    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())?.with_paired_identity(
+        format!("client-{marker}"),
+        fingerprint(&certificate),
+        ClientConfigOverrides {
+            display_mode: Some(display_mode.to_owned()),
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn paired_physical_mode_freezes_independently_of_stream_cadence_and_retry() {
+    let now = Instant::now();
+    let mut streaming = config();
+    streaming.profile.max_fps = 120;
+    let mut controller = Controller::new(Some(streaming)).unwrap();
+    let paired = peer_with_display_mode(19, "1920x1080x59.94").unwrap();
+    let mut stream = request(19);
+    stream.fps = 120;
+    let mut broker = Broker::default();
+
+    assert!(
+        controller
+            .launch(10, stream.clone(), paired.clone(), now)
+            .is_none()
+    );
+    let (_, first_reply) = poll_until_reply(&mut controller, &mut broker, now);
+    let first_body = String::from_utf8(first_reply.body).unwrap();
+    assert!(first_body.contains("<streamWidth>1280</streamWidth>"));
+    assert!(first_body.contains("<streamHeight>720</streamHeight>"));
+    assert!(first_body.contains("<streamFps>120</streamFps>"));
+    assert!(first_body.contains("<physicalDisplayWidth>1920</physicalDisplayWidth>"));
+    assert!(first_body.contains("<physicalDisplayHeight>1080</physicalDisplayHeight>"));
+    assert!(
+        first_body.contains("<physicalDisplayRefreshMilliHz>59940</physicalDisplayRefreshMilliHz>")
+    );
+    assert!(first_body.contains("<clientDisplayModeOverride>1</clientDisplayModeOverride>"));
+    assert_eq!(
+        broker.application_snapshot.as_ref().unwrap()["requested_stream_fps_millihz"],
+        120000
+    );
+    assert_eq!(
+        broker.application_snapshot.as_ref().unwrap()["client_display_mode_override_millihz"],
+        59940
+    );
+    assert_eq!(opened_rtsp_payload(&broker)["profile"]["fps"], 120);
+    controller.reply_delivered(10, now);
+
+    let retry = controller
+        .launch(11, stream, paired, now)
+        .expect("ready retry");
+    assert_eq!(String::from_utf8(retry.body).unwrap(), first_body);
+}
+
+#[test]
+fn malformed_paired_physical_mode_rejects_before_launch_and_absent_inherits_stream() {
+    for malformed in [
+        "",
+        "1920x1080x0",
+        "1920x1080x59.9999",
+        "1920X1080x60",
+        "1920x1080x+60",
+        "1920x1080x60x1",
+    ] {
+        assert!(
+            peer_with_display_mode(20, malformed).is_err(),
+            "{malformed}"
+        );
+    }
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(21), peer(21), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    let body = String::from_utf8(reply.body).unwrap();
+    assert!(body.contains("<physicalDisplayWidth>1280</physicalDisplayWidth>"));
+    assert!(body.contains("<physicalDisplayRefreshMilliHz>60000</physicalDisplayRefreshMilliHz>"));
+    assert!(body.contains("<clientDisplayModeOverride>0</clientDisplayModeOverride>"));
+    assert!(
+        broker.application_snapshot.as_ref().unwrap()["client_display_mode_override_millihz"]
+            .is_null()
+    );
+    assert!(opened_rtsp_payload(&broker)["display_request"].is_null());
+}
+
 #[test]
 fn settings_reject_unsupported_packetization_before_launch() {
     let mut invalid = config();

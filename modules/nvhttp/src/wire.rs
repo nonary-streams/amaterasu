@@ -575,6 +575,7 @@ fn response_code(response: &ModuleResult<Response>) -> &str {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ClientConfigOverrides {
+    pub(super) display_mode: Option<String>,
     pub(super) fec_percentage: Option<u8>,
     pub(super) max_bitrate: Option<i32>,
     pub(super) minimum_fps_target: Option<f64>,

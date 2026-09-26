@@ -258,7 +258,8 @@ fn valid_display_rule(kind: &str, rule: &Value) -> bool {
         || (uses_refresh
             && (!requested_fps.is_empty()
                 && !requested_fps.bytes().all(|byte| byte.is_ascii_digit())
-                || (!requested_fps.is_empty() && requested_fps.parse::<u32>().is_err())
+                || (!requested_fps.is_empty()
+                    && !requested_fps.parse::<u32>().is_ok_and(|fps| fps > 0))
                 || !valid_manual_refresh(final_refresh_rate)))
     {
         return false;
@@ -3302,6 +3303,12 @@ mod tests {
             },
             DisplayPolicyUpdate {
                 dd_mode_remapping: FieldUpdate::Value(json!({"mixed":[{}]})),
+                ..Default::default()
+            },
+            DisplayPolicyUpdate {
+                dd_mode_remapping: FieldUpdate::Value(json!({"refresh_rate_only":[{
+                    "requested_fps":"0", "final_refresh_rate":"60"
+                }]})),
                 ..Default::default()
             },
         ]

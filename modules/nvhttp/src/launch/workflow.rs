@@ -1205,7 +1205,7 @@ fn frame_limiter_launch_snapshot(record: &Record) -> Value {
         "version":1,
         "settings":settings.effective(),
         "requested_stream_fps_millihz":requested_stream_fps_millihz,
-        "client_display_mode_override_millihz":null,
+        "client_display_mode_override_millihz":record.peer.client_display_mode.map(|mode| mode.refresh_millihz),
         "lossless_scaling_limit_millihz":null,
         "virtual_display_active":null,
         "physical_framegen_capture":null,

@@ -55,6 +55,62 @@ pub struct LaunchRequest {
     pub key_id: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhysicalDisplayMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+}
+
+impl PhysicalDisplayMode {
+    fn parse(value: &str) -> Option<Self> {
+        let mut parts = value.split('x');
+        let width = decimal_component(parts.next()?)?;
+        let height = decimal_component(parts.next()?)?;
+        let refresh = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        let refresh_millihz = if let Some((whole, fractional)) = refresh.split_once('.') {
+            let whole = decimal_component(whole)?;
+            if fractional.is_empty()
+                || fractional.len() > 3
+                || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            let scale = 10_u32.pow(3 - fractional.len() as u32);
+            whole
+                .checked_mul(1_000)?
+                .checked_add(fractional.parse::<u32>().ok()?.checked_mul(scale)?)?
+        } else {
+            let rate = decimal_component(refresh)?;
+            if rate > 1_000 {
+                rate
+            } else {
+                rate.checked_mul(1_000)?
+            }
+        };
+        (10_000..=1_000_000)
+            .contains(&refresh_millihz)
+            .then_some(Self {
+                width,
+                height,
+                refresh_millihz,
+            })
+    }
+}
+
+fn decimal_component(value: &str) -> Option<u32> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let component = value.parse::<u32>().ok()?;
+    (1..=i32::MAX as u32)
+        .contains(&component)
+        .then_some(component)
+}
+
 #[derive(Clone, PartialEq)]
 pub struct PeerIdentity {
     remote: IpAddr,
@@ -82,6 +138,7 @@ pub struct PeerIdentity {
     client_key_repeat_frequency: Option<f64>,
     client_frame_limiter_settings: FrameLimiterSettings,
     client_display_overrides: Value,
+    client_display_mode: Option<PhysicalDisplayMode>,
 }
 
 impl PeerIdentity {
@@ -118,6 +175,7 @@ impl PeerIdentity {
             client_key_repeat_frequency: None,
             client_frame_limiter_settings: FrameLimiterSettings::default(),
             client_display_overrides: json!({}),
+            client_display_mode: None,
         })
     }
 
@@ -128,6 +186,10 @@ impl PeerIdentity {
         config_overrides: ClientConfigOverrides,
     ) -> Result<Self, &'static str> {
         let client_display_overrides = config_overrides.display_overrides();
+        let client_display_mode = match config_overrides.display_mode.as_deref() {
+            Some(mode) => Some(PhysicalDisplayMode::parse(mode).ok_or("invalid_paired_identity")?),
+            None => None,
+        };
         let ClientConfigOverrides {
             fec_percentage,
             max_bitrate,
@@ -213,6 +275,7 @@ impl PeerIdentity {
         self.client_key_repeat_frequency = key_repeat_frequency;
         self.client_frame_limiter_settings = client_frame_limiter_settings;
         self.client_display_overrides = client_display_overrides;
+        self.client_display_mode = client_display_mode;
         Ok(self)
     }
 
@@ -865,17 +928,34 @@ fn private_error(status: u16, message: &str) -> Reply {
 }
 
 fn success_reply(record: &Record) -> Reply {
-    let mut reply = xml::response(
-        200,
-        "OK",
-        &[
-            (
-                "sessionUrl0",
-                record.rtsp_url.as_deref().unwrap_or_default(),
-            ),
-            ("gamesession", "1"),
-        ],
-    );
+    let stream_width = record.request.width.to_string();
+    let stream_height = record.request.height.to_string();
+    let stream_fps = record.request.fps.to_string();
+    let physical_width = record.physical_display_mode.width.to_string();
+    let physical_height = record.physical_display_mode.height.to_string();
+    let physical_refresh = record.physical_display_mode.refresh_millihz.to_string();
+    let fields = [
+        (
+            "sessionUrl0",
+            record.rtsp_url.as_deref().unwrap_or_default(),
+        ),
+        ("gamesession", "1"),
+        ("streamWidth", stream_width.as_str()),
+        ("streamHeight", stream_height.as_str()),
+        ("streamFps", stream_fps.as_str()),
+        (
+            "clientDisplayModeOverride",
+            if record.peer.client_display_mode.is_some() {
+                "1"
+            } else {
+                "0"
+            },
+        ),
+        ("physicalDisplayWidth", physical_width.as_str()),
+        ("physicalDisplayHeight", physical_height.as_str()),
+        ("physicalDisplayRefreshMilliHz", physical_refresh.as_str()),
+    ];
+    let mut reply = xml::response(200, "OK", &fields);
     reply.requires_paired_tls = true;
     reply
 }
