@@ -152,6 +152,11 @@ fn run() -> Result<(), String> {
                 return Err("import does not accept --output".into());
             }
             let destination = destination.ok_or("--destination is required")?;
+            // A previous successful attempt cannot authorize handoff after this
+            // attempt fails validation, materialization, or sensitive seeding.
+            if let Some(runtime) = &runtime {
+                invalidate_import_validation(runtime)?;
+            }
             if sources.is_empty() && discovered_only {
                 println!("migration completed: no predecessor configuration found");
                 return Ok(());
@@ -526,6 +531,14 @@ fn write_import_validation(
     )
 }
 
+fn invalidate_import_validation(runtime: &std::path::Path) -> Result<(), String> {
+    match fs::remove_file(runtime.join(IMPORT_VALIDATION_FILE)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("prior import validation could not be invalidated".into()),
+    }
+}
+
 fn legacy_family(product: LegacyProduct) -> LegacyFamily {
     match product {
         LegacyProduct::Apollo => LegacyFamily::Apollo,
@@ -620,24 +633,7 @@ fn handoff_predecessor(runtime: &std::path::Path) -> Result<(), String> {
                 .into(),
         );
     }
-    let validation: ImportValidation =
-        amaterasu_package::read_json(&runtime.join(IMPORT_VALIDATION_FILE))?;
-    if validation.schema != 2
-        || !validation.validated
-        || validation.families.len() > 4
-        || validation.families.iter().any(|family| {
-            !registrations
-                .iter()
-                .any(|registration| registration.family == *family)
-        })
-        || !registrations
-            .iter()
-            .all(|registration| validation.families.contains(&registration.family))
-    {
-        return Err(
-            "legacy import validation is missing or does not match the detected predecessor".into(),
-        );
-    }
+    require_import_validation(runtime, &registrations)?;
     let mut controller = platform_service_controller()?;
     let records = handoff::preflight(
         &mut controller,
@@ -668,6 +664,31 @@ fn handoff_predecessor(runtime: &std::path::Path) -> Result<(), String> {
         )
     };
     handoff::stop_with_recovery_state(&mut controller, &mut state.records, true, &mut persist)
+}
+
+fn require_import_validation(
+    runtime: &std::path::Path,
+    registrations: &[MsiRegistration],
+) -> Result<(), String> {
+    let validation: ImportValidation =
+        amaterasu_package::read_json(&runtime.join(IMPORT_VALIDATION_FILE))?;
+    if validation.schema != 2
+        || !validation.validated
+        || validation.families.len() > 4
+        || validation.families.iter().any(|family| {
+            !registrations
+                .iter()
+                .any(|registration| registration.family == *family)
+        })
+        || !registrations
+            .iter()
+            .all(|registration| validation.families.contains(&registration.family))
+    {
+        return Err(
+            "legacy import validation is missing or does not match the detected predecessor".into(),
+        );
+    }
+    Ok(())
 }
 
 fn persist_handoff_state(path: &std::path::Path, state: &HandoffState) -> Result<(), String> {
@@ -1360,6 +1381,54 @@ fn usage() -> &'static str {
 #[cfg(test)]
 mod handoff_cli_tests {
     use super::*;
+
+    #[test]
+    fn failed_credential_import_retry_revokes_previous_handoff_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-credential-retry-handoff-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = root.join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        let source = LegacyConfigSource {
+            product: LegacyProduct::Sunshine,
+            root: root.join("predecessor"),
+        };
+        let registrations = [MsiRegistration {
+            family: LegacyFamily::Sunshine,
+            product_code: "{00000000-0000-0000-0000-000000000001}".into(),
+        }];
+        write_import_validation(&runtime, std::slice::from_ref(&source)).unwrap();
+        require_import_validation(&runtime, &registrations).unwrap();
+
+        // The next attempt starts before validation/copy/seed. Its seed failure
+        // must leave no retirement gate from the earlier successful attempt.
+        invalidate_import_validation(&runtime).unwrap();
+        let check = SourceValidation {
+            product: LegacyProduct::Sunshine,
+            pairing_needed: false,
+            authentication_needed: true,
+            pairing_valid: true,
+            authentication_valid: true,
+        };
+        let validation = SensitiveValidation {
+            approvals: aggregate_sensitive_approvals(std::slice::from_ref(&check)),
+            checks: vec![check],
+        };
+        assert!(
+            seed_sensitive_sources_with(&root, &validation, &runtime.join("state"), |_, _, _| {
+                Ok(false)
+            })
+            .is_err()
+        );
+        assert!(require_import_validation(&runtime, &registrations).is_err());
+
+        // A later successful retry can publish fresh authorization.
+        write_import_validation(&runtime, &[source]).unwrap();
+        require_import_validation(&runtime, &registrations).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn approved_credential_copy_still_requires_seeding_after_source_disappears() {
