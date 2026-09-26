@@ -32,6 +32,7 @@ impl State {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
+    ReserveHistory,
     PreflightApplication,
     SnapshotDisplay,
     EnumerateDisplay,
@@ -44,6 +45,7 @@ pub enum Stage {
     Cleanup,
     VerifyRtspCleanup,
     VerifyApplicationCleanup,
+    ReleaseHistory,
     Terminal,
 }
 
@@ -56,6 +58,9 @@ pub struct Record {
     pub device_name: String,
     pub application_operation: String,
     pub rtsp_operation: String,
+    pub history_release_required: bool,
+    pub history_reserved: bool,
+    pub history_state: &'static str,
     pub connect_data: u32,
     pub global_fec_percentage: u8,
     pub global_stream_audio: bool,
@@ -194,6 +199,9 @@ impl Record {
             device_name,
             application_operation,
             rtsp_operation,
+            history_release_required: false,
+            history_reserved: false,
+            history_state: "unavailable",
             connect_data,
             global_fec_percentage,
             global_stream_audio,
@@ -264,7 +272,7 @@ impl Record {
             rtsp_cleanup_blocked: false,
             application_cleanup_blocked: false,
             state: State::Starting,
-            stage: Stage::PreflightApplication,
+            stage: Stage::ReserveHistory,
             adopted: false,
             revoked: false,
             launch_connection: Some(connection),

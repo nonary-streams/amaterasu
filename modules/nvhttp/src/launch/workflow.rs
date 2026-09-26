@@ -15,9 +15,11 @@ use std::time::Instant;
 const LAUNCH_SERVICE: &str = "amaterasu.launch/1";
 const RTSP_SERVICE: &str = "amaterasu.rtsp/1";
 const DISPLAY_SERVICE: &str = "amaterasu.display/1";
+const STREAM_SESSION_SERVICE: &str = "amaterasu.stream-session/1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
+    ReserveHistory,
     PreflightApplication,
     SnapshotDisplay,
     EnumerateDisplay,
@@ -33,6 +35,7 @@ pub enum Phase {
     VerifyRtspStopped,
     StopApplication,
     VerifyApplicationStopped,
+    ReleaseHistory,
 }
 
 pub struct Job {
@@ -108,6 +111,7 @@ impl Controller {
                 record.retrying_uncertainty = false;
                 record.cleanup_error = Some("broker_settlement_unconfirmed");
                 match job.phase {
+                    Phase::ReserveHistory | Phase::ReleaseHistory => {}
                     Phase::OpenRtsp | Phase::StopRtsp | Phase::LookupRtsp => {
                         record.rtsp_cleanup_blocked = true;
                     }
@@ -145,6 +149,15 @@ impl Controller {
             record.application_reconcile = None;
         }
         let (service, mut payload, timeout_ms) = match phase {
+            Phase::ReserveHistory => {
+                record.history_release_required = true;
+                (
+                    STREAM_SESSION_SERVICE,
+                    json!({"action":"reserve_history_activity", "activity_id":record.rtsp_operation,
+                        "rtsp_operation_id":record.rtsp_operation}),
+                    5_000,
+                )
+            }
             Phase::PreflightApplication => (
                 LAUNCH_SERVICE,
                 json!({
@@ -320,7 +333,16 @@ impl Controller {
                 json!({"action":"stop","launch_id":record.application_launch}),
                 15_000,
             ),
+            Phase::ReleaseHistory => (
+                STREAM_SESSION_SERVICE,
+                json!({"action":"release_history_activity", "activity_id":record.rtsp_operation,
+                    "rtsp_operation_id":record.rtsp_operation}),
+                5_000,
+            ),
         };
+        if matches!(phase, Phase::OpenRtsp) && record.history_reserved {
+            payload["history_activity_id"] = json!(record.rtsp_operation);
+        }
         if matches!(phase, Phase::OpenRtsp)
             && let Some(policy) = record.video_encryption_policy
         {
@@ -352,6 +374,30 @@ impl Controller {
     ) {
         let record = self.records.get_mut(&job.record).expect("workflow record");
         match job.phase {
+            Phase::ReserveHistory => {
+                if record.cleanup_error == Some("broker_settlement_unconfirmed") {
+                    record.cleanup_error = None;
+                }
+                record.history_reserved = payload["ok"] == true
+                    && payload["reserved"] == true
+                    && payload["activity_id"] == record.rtsp_operation
+                    && payload["rtsp_operation_id"] == record.rtsp_operation;
+                let declined = payload["ok"] == true
+                    && payload["reserved"] == false
+                    && payload["activity_id"] == record.rtsp_operation
+                    && payload["rtsp_operation_id"] == record.rtsp_operation;
+                if declined {
+                    record.history_release_required = false;
+                }
+                record.history_state = if record.history_reserved {
+                    "reserved"
+                } else {
+                    "unavailable"
+                };
+                if record.state == State::Starting {
+                    record.stage = Stage::PreflightApplication;
+                }
+            }
             Phase::PreflightApplication => match application_preflight_response(record, &payload) {
                 Ok((token, catalog_revision, application_overrides, executable_path))
                     if record.state == State::Starting =>
@@ -592,6 +638,23 @@ impl Controller {
                     record.stage = Stage::Cleanup;
                 }
             }
+            Phase::ReleaseHistory => {
+                let confirmed = payload["ok"] == true
+                    && payload["released"].is_boolean()
+                    && payload["activity_id"] == record.rtsp_operation
+                    && payload["rtsp_operation_id"] == record.rtsp_operation;
+                if confirmed {
+                    record.history_release_required = false;
+                    record.history_state = if payload["released"] == true {
+                        "released"
+                    } else {
+                        "unavailable"
+                    };
+                } else {
+                    record.cleanup_error = Some("history_release_unconfirmed");
+                    record.stage = Stage::Cleanup;
+                }
+            }
         }
         self.finish_or_retain(job.record, now, replies);
     }
@@ -599,6 +662,20 @@ impl Controller {
     fn rejected(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
         let record = self.records.get_mut(&job.record).expect("workflow record");
         match job.phase {
+            Phase::ReserveHistory => {
+                if record.cleanup_error == Some("broker_settlement_unconfirmed") {
+                    record.cleanup_error = None;
+                }
+                record.history_state = "unavailable";
+                record.history_release_required = false;
+                if record.state == State::Starting {
+                    record.stage = Stage::PreflightApplication;
+                }
+            }
+            Phase::ReleaseHistory => {
+                record.cleanup_error = Some("history_release_unavailable");
+                record.stage = Stage::Cleanup;
+            }
             Phase::LookupApplication => {
                 record.fail_cleanup("application_lookup_unavailable");
             }
@@ -643,6 +720,19 @@ impl Controller {
         let record = self.records.get_mut(&job.record).expect("workflow record");
         record.stage = Stage::Cleanup;
         match job.phase {
+            Phase::ReserveHistory => {
+                if record.cleanup_error == Some("broker_settlement_unconfirmed") {
+                    record.cleanup_error = None;
+                }
+                record.history_state = "unavailable";
+                if record.state == State::Starting {
+                    record.stage = Stage::PreflightApplication;
+                }
+            }
+            Phase::ReleaseHistory => {
+                record.cleanup_error = Some("history_release_unavailable");
+                record.stage = Stage::Cleanup;
+            }
             Phase::PreflightApplication => {
                 record.request_cleanup(
                     Some("application_preflight_unavailable"),
@@ -695,7 +785,9 @@ impl Controller {
         }
         if matches!(
             job.phase,
-            Phase::PreflightApplication
+            Phase::ReserveHistory
+                | Phase::ReleaseHistory
+                | Phase::PreflightApplication
                 | Phase::SnapshotDisplay
                 | Phase::EnumerateDisplay
                 | Phase::ConfirmDisplay
@@ -716,6 +808,15 @@ impl Controller {
                 && record.rtsp_reconcile.is_none()
                 && record.application_reconcile.is_none()
             {
+                if record.history_release_required {
+                    if let Some(error) = record.cleanup_error {
+                        record.fail_cleanup(error);
+                        reply_failure(record, replies);
+                        return;
+                    }
+                    record.stage = Stage::ReleaseHistory;
+                    return;
+                }
                 record.finish_cleanup();
                 if let Some(connection) = record.cancel_connection {
                     replies.push((connection, super::cancel_reply()));
@@ -736,6 +837,7 @@ impl Controller {
 impl Phase {
     fn name(self) -> &'static str {
         match self {
+            Self::ReserveHistory => "reserve-history",
             Self::PreflightApplication => "preflight-launch",
             Self::SnapshotDisplay => "snapshot-display",
             Self::EnumerateDisplay => "enumerate-display",
@@ -751,6 +853,7 @@ impl Phase {
             Self::VerifyRtspStopped => "verify-rtsp-stop",
             Self::StopApplication => "stop-application",
             Self::VerifyApplicationStopped => "verify-application-stop",
+            Self::ReleaseHistory => "release-history",
         }
     }
 }
@@ -764,7 +867,8 @@ fn needs_work(record: &Record, now: Instant) -> bool {
     }
     matches!(
         record.stage,
-        Stage::PreflightApplication
+        Stage::ReserveHistory
+            | Stage::PreflightApplication
             | Stage::SnapshotDisplay
             | Stage::EnumerateDisplay
             | Stage::ConfirmDisplay
@@ -774,7 +878,10 @@ fn needs_work(record: &Record, now: Instant) -> bool {
     ) || (record.stage == Stage::Live && now >= record.next_monitor)
         || matches!(
             record.stage,
-            Stage::Cleanup | Stage::VerifyRtspCleanup | Stage::VerifyApplicationCleanup
+            Stage::Cleanup
+                | Stage::VerifyRtspCleanup
+                | Stage::VerifyApplicationCleanup
+                | Stage::ReleaseHistory
         )
 }
 
@@ -786,6 +893,7 @@ fn next_phase(record: &Record) -> Phase {
         return phase;
     }
     match record.stage {
+        Stage::ReserveHistory => Phase::ReserveHistory,
         Stage::PreflightApplication => Phase::PreflightApplication,
         Stage::SnapshotDisplay => Phase::SnapshotDisplay,
         Stage::EnumerateDisplay => Phase::EnumerateDisplay,
@@ -817,8 +925,17 @@ fn next_phase(record: &Record) -> Phase {
         {
             Phase::StopApplication
         }
+        Stage::Cleanup
+            if !record.rtsp_requested
+                && !record.application_requested
+                && record.uncertain.is_empty()
+                && record.history_release_required =>
+        {
+            Phase::ReleaseHistory
+        }
         Stage::VerifyRtspCleanup => Phase::VerifyRtspStopped,
         Stage::VerifyApplicationCleanup => Phase::VerifyApplicationStopped,
+        Stage::ReleaseHistory => Phase::ReleaseHistory,
         _ => unreachable!("scheduled record has work"),
     }
 }

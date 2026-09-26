@@ -1041,6 +1041,16 @@ struct Broker {
     next: u64,
     results: BTreeMap<u64, Value>,
     commands: Vec<Command>,
+    history_reserve_unavailable: bool,
+    history_reserve_wrong_identity: bool,
+    history_release_unavailable: bool,
+    history_release_in_use_once: bool,
+    history_reserved: bool,
+    lose_history_reserve_once: bool,
+    lost_history_reserve: bool,
+    lose_history_release_result_once: bool,
+    lost_history_release_result: bool,
+    history_release_request: Option<u64>,
     application_state: &'static str,
     fail_rtsp_cleanup: bool,
     wrong_application_id: bool,
@@ -1098,6 +1108,16 @@ impl Default for Broker {
             next: 0,
             results: BTreeMap::new(),
             commands: Vec::new(),
+            history_reserve_unavailable: false,
+            history_reserve_wrong_identity: false,
+            history_release_unavailable: false,
+            history_release_in_use_once: false,
+            history_reserved: false,
+            lose_history_reserve_once: false,
+            lost_history_reserve: false,
+            lose_history_release_result_once: false,
+            lost_history_release_result: false,
+            history_release_request: None,
             application_state: "active",
             fail_rtsp_cleanup: false,
             wrong_application_id: false,
@@ -1158,6 +1178,15 @@ impl Broker {
             Command::Request {
                 service, payload, ..
             } => {
+                if self.lose_history_reserve_once
+                    && !self.lost_history_reserve
+                    && service == "amaterasu.stream-session/1"
+                    && payload["action"] == "reserve_history_activity"
+                {
+                    self.lost_history_reserve = true;
+                    self.history_reserved = true;
+                    return Err("lost history reservation admission".into());
+                }
                 if self.lose_rtsp_open_once
                     && !self.lost_rtsp_open
                     && service == "amaterasu.rtsp/1"
@@ -1168,6 +1197,13 @@ impl Broker {
                 }
                 self.next += 1;
                 let request = self.next;
+                if service == "amaterasu.stream-session/1"
+                    && payload["action"] == "release_history_activity"
+                    && self.lose_history_release_result_once
+                    && !self.lost_history_release_result
+                {
+                    self.history_release_request = Some(request);
+                }
                 if self.hold_launch_export_result
                     && service == "amaterasu.launch/1"
                     && payload["action"] == "launch_export"
@@ -1185,6 +1221,13 @@ impl Broker {
                 let result = self.response(&service, &payload);
                 self.results.insert(request, result);
                 Ok(Response::Accepted { id: request })
+            }
+            Command::TakeResult { request }
+                if self.history_release_request == Some(request)
+                    && !self.lost_history_release_result =>
+            {
+                self.lost_history_release_result = true;
+                Err("lost history release result".into())
             }
             Command::TakeResult { request }
                 if self.hold_launch_export_result
@@ -1216,6 +1259,39 @@ impl Broker {
 
     fn response(&mut self, service: &str, payload: &Value) -> Value {
         let action = payload["action"].as_str().unwrap_or_default();
+        if service == "amaterasu.stream-session/1" {
+            return match action {
+                "reserve_history_activity" => {
+                    if self.history_reserve_unavailable {
+                        json!({"ok":true,"reserved":false,"activity_id":payload["activity_id"],
+                            "rtsp_operation_id":payload["rtsp_operation_id"]})
+                    } else if self.history_reserve_wrong_identity {
+                        self.history_reserved = true;
+                        json!({"ok":true,"reserved":true,"activity_id":"foreign-activity",
+                            "rtsp_operation_id":payload["rtsp_operation_id"]})
+                    } else {
+                        self.history_reserved = true;
+                        json!({"ok":true,"reserved":true,"activity_id":payload["activity_id"],
+                            "rtsp_operation_id":payload["rtsp_operation_id"]})
+                    }
+                }
+                "release_history_activity" => {
+                    if self.history_release_in_use_once {
+                        self.history_release_in_use_once = false;
+                        json!({"ok":false,"code":"history_activity_in_use"})
+                    } else if self.history_release_unavailable {
+                        json!({"ok":false,"released":false,"activity_id":payload["activity_id"],
+                            "rtsp_operation_id":payload["rtsp_operation_id"]})
+                    } else {
+                        let was_reserved = self.history_reserved;
+                        self.history_reserved = false;
+                        json!({"ok":true,"released":was_reserved,"activity_id":payload["activity_id"],
+                            "rtsp_operation_id":payload["rtsp_operation_id"]})
+                    }
+                }
+                _ => panic!("unexpected stream-session action: {action}"),
+            };
+        }
         if service == "amaterasu.display/1" {
             return match action {
                 "snapshot" => {
@@ -1527,6 +1603,164 @@ fn launch_ready(controller: &mut Controller, broker: &mut Broker, now: Instant) 
     );
     controller.reply_delivered(connection, now);
     assert_eq!(controller.current_game(&peer(1)), 1);
+}
+
+#[test]
+fn history_reservation_precedes_preflight_and_releases_after_stream_cleanup() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    let actions = broker.actions();
+    assert_eq!(actions[0], ("amaterasu.stream-session/1", "reserve_history_activity"));
+    let opened = broker.commands.iter().find_map(|command| match command {
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+        _ => None,
+    }).unwrap();
+    assert_eq!(opened["history_activity_id"], opened["operation_id"]);
+    assert!(broker.history_reserved);
+
+    assert!(controller.cancel(20, &peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let actions = broker.actions();
+    let position = |service, action| actions.iter().position(|entry| *entry == (service, action)).unwrap();
+    assert!(position("amaterasu.rtsp/1", "close") < position("amaterasu.launch/1", "stop"));
+    assert!(position("amaterasu.launch/1", "stop") < position("amaterasu.stream-session/1", "release_history_activity"));
+    assert!(!broker.history_reserved);
+}
+
+#[test]
+fn missing_history_reservation_is_visible_and_does_not_tag_rtsp() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker { history_reserve_unavailable: true, ..Broker::default() };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    assert!(String::from_utf8(reply.body).unwrap().contains("<historyActivityState>unavailable</historyActivityState>"));
+    let opened = broker.commands.iter().find_map(|command| match command {
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+        _ => None,
+    }).unwrap();
+    assert!(opened.get("history_activity_id").is_none());
+    assert!(!broker.actions().contains(&("amaterasu.stream-session/1", "release_history_activity")));
+}
+
+#[test]
+fn mismatched_history_reservation_does_not_tag_rtsp_and_is_released() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        history_reserve_wrong_identity: true,
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    controller.reply_delivered(connection, now);
+    assert_eq!(controller.records.values().next().unwrap().history_state, "unavailable");
+    let opened = broker.commands.iter().find_map(|command| match command {
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+        _ => None,
+    }).unwrap();
+    assert!(opened.get("history_activity_id").is_none());
+    assert!(broker.history_reserved);
+    assert!(controller.cancel(20, &peer(1), now).is_none());
+    let (_, stopped) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(stopped.status, 200);
+    assert!(!broker.history_reserved);
+}
+
+#[test]
+fn lost_history_reservation_admission_retries_same_id_and_releases_on_cancel() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker { lose_history_reserve_once: true, ..Broker::default() };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    controller.reply_delivered(connection, now);
+    assert!(broker.history_reserved);
+    let reserve_requests: Vec<_> = broker.commands.iter().filter_map(|command| match command {
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.stream-session/1" && payload["action"] == "reserve_history_activity" => Some(payload),
+        _ => None,
+    }).collect();
+    assert_eq!(reserve_requests.len(), 2);
+    assert_eq!(reserve_requests[0], reserve_requests[1]);
+    assert!(controller.cancel(20, &peer(1), now).is_none());
+    let (_, stopped) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(stopped.status, 200);
+    assert!(!broker.history_reserved);
+}
+
+#[test]
+fn failed_history_release_retains_cleanup_ownership_for_retry() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    broker.history_release_unavailable = true;
+    assert!(controller.cancel(20, &peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 503);
+    assert!(controller.busy());
+    assert!(broker.history_reserved);
+    broker.history_release_unavailable = false;
+    assert!(controller.cancel(21, &peer(1), now).is_none());
+    let (_, retry) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(retry.status, 200);
+    assert!(!broker.history_reserved);
+}
+
+#[test]
+fn history_in_use_release_keeps_cleanup_owned_until_retry() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    broker.history_release_in_use_once = true;
+    assert!(controller.cancel(20, &peer(1), now).is_none());
+    let (_, first) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(first.status, 503);
+    assert!(broker.history_reserved);
+    assert!(controller.busy());
+    assert!(controller.cancel(21, &peer(1), now).is_none());
+    let (_, second) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(second.status, 200);
+    assert!(!broker.history_reserved);
+    let actions = broker.actions();
+    let stopped = actions.iter().position(|entry| *entry == ("amaterasu.launch/1", "stop")).unwrap();
+    let first_release = actions.iter().position(|entry| *entry == ("amaterasu.stream-session/1", "release_history_activity")).unwrap();
+    assert!(stopped < first_release);
+}
+
+#[test]
+fn lost_history_release_result_accepts_idempotent_terminal_readback() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    broker.lose_history_release_result_once = true;
+    assert!(controller.cancel(20, &peer(1), now).is_none());
+    let (_, first) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(first.status, 503);
+    assert!(!broker.history_reserved);
+    assert!(controller.busy());
+    assert!(controller.cancel(21, &peer(1), now).is_none());
+    let (_, retry) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(retry.status, 200);
+    let releases: Vec<_> = broker.commands.iter().filter_map(|command| match command {
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.stream-session/1" && payload["action"] == "release_history_activity" => Some(payload),
+        _ => None,
+    }).collect();
+    assert_eq!(releases.len(), 2);
+    assert_eq!(releases[0], releases[1]);
 }
 
 fn opened_audio_endpoint(broker: &Broker) -> &str {
@@ -2153,8 +2387,9 @@ fn success_requires_active_application_and_ready_rtsp_then_retries_same_url() {
     assert_eq!(retry.status, 200);
     controller.reply_delivered(11, now);
     assert_eq!(
-        broker.actions()[..3],
+        broker.actions()[..4],
         [
+            ("amaterasu.stream-session/1", "reserve_history_activity"),
             ("amaterasu.launch/1", "preflight_export"),
             ("amaterasu.launch/1", "launch_export"),
             ("amaterasu.rtsp/1", "open")
@@ -2733,6 +2968,11 @@ fn malformed_preflight_override_fails_before_application_launch() {
             .actions()
             .contains(&("amaterasu.launch/1", "launch_export"))
     );
+    assert!(broker.actions().contains(&(
+        "amaterasu.stream-session/1",
+        "release_history_activity"
+    )));
+    assert!(!broker.history_reserved);
 }
 
 #[test]
@@ -3240,20 +3480,21 @@ fn expired_preflight_settles_without_scheduling_application_cleanup() {
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
-    assert!(
-        controller
-            .poll(now, &mut |command| broker.send(command))
-            .is_empty()
-    );
+    for _ in 0..8 {
+        assert!(controller.poll(now, &mut |command| broker.send(command)).is_empty());
+        if broker.actions().contains(&("amaterasu.launch/1", "preflight_export")) {
+            break;
+        }
+    }
+    assert!(broker.actions().contains(&("amaterasu.launch/1", "preflight_export")));
     let expired = now + std::time::Duration::from_secs(41);
     assert!(
         controller
             .poll(expired, &mut |command| broker.send(command))
             .is_empty()
     );
-    let replies = controller.poll(expired, &mut |command| broker.send(command));
-    assert_eq!(replies.len(), 1);
-    assert_ne!(replies[0].1.status, 200);
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, expired);
+    assert_ne!(reply.status, 200);
     assert!(
         !broker
             .actions()

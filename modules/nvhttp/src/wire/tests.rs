@@ -38,7 +38,10 @@ impl Broker {
             } => {
                 assert!(matches!(
                     service.as_str(),
-                    PAIRING_SERVICE | "amaterasu.launch/1" | "amaterasu.rtsp/1"
+                    PAIRING_SERVICE
+                        | "amaterasu.launch/1"
+                        | "amaterasu.rtsp/1"
+                        | "amaterasu.stream-session/1"
                 ));
                 self.next += 1;
                 self.accepted.push(payload.clone());
@@ -59,6 +62,14 @@ impl Broker {
                 }
                 let service = &self.services[&request];
                 let result = match (service.as_str(), payload["action"].as_str().unwrap()) {
+                    ("amaterasu.stream-session/1", "reserve_history_activity") => json!({
+                        "ok":true,"reserved":true,"activity_id":payload["activity_id"],
+                        "rtsp_operation_id":payload["rtsp_operation_id"]
+                    }),
+                    ("amaterasu.stream-session/1", "release_history_activity") => json!({
+                        "ok":true,"released":true,"activity_id":payload["activity_id"],
+                        "rtsp_operation_id":payload["rtsp_operation_id"]
+                    }),
                     (PAIRING_SERVICE, "identity") => {
                         json!({"ok":true,"host_id":"12345678-1234-4234-8234-123456789abc"})
                     }

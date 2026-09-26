@@ -949,6 +949,7 @@ fn success_reply(record: &Record) -> Reply {
             record.rtsp_url.as_deref().unwrap_or_default(),
         ),
         ("gamesession", "1"),
+        ("historyActivityState", record.history_state),
         ("streamWidth", stream_width.as_str()),
         ("streamHeight", stream_height.as_str()),
         ("streamFps", stream_fps.as_str()),
