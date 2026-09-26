@@ -2425,16 +2425,31 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                 &[],
                 &[
                     "fec_percentage",
+                    "max_bitrate",
+                    "minimum_fps_target",
+                    "video_max_batch_size_kb",
+                    "frame_limiter_fps_limit",
+                    "frame_limiter_enable",
+                    "frame_limiter_provider",
+                    "frame_limiter_disable_vsync",
+                    "frame_limiter_auto_virtual_framegen",
+                    "rtss_frame_limit_type",
                     "stream_audio",
                     "audio_sink",
                     "virtual_sink",
                     "audio_sink_capture_only",
+                    "nvenc_spatial_aq",
                     "back_button_timeout",
                     "controller",
                     "gamepad",
                     "keyboard",
                     "mouse",
                     "native_pen_touch",
+                    "high_resolution_scrolling",
+                    "always_send_scancodes",
+                    "key_rightalt_to_key_win",
+                    "key_repeat_delay",
+                    "key_repeat_frequency",
                 ],
             )?;
             if let Some(percentage) = config_overrides.get("fec_percentage")
@@ -2456,9 +2471,210 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
             optional_audio_sink_capture_only(config_overrides)?;
             optional_back_button_timeout(config_overrides)?;
             optional_input_overrides(config_overrides)?;
+            optional_paired_client_extended_overrides(config_overrides)?;
             Ok(())
         }
         _ => Err(INVALID),
+    }
+}
+
+fn optional_paired_client_extended_overrides(overrides: &Object) -> Result<(), &'static str> {
+    for key in [
+        "frame_limiter_enable",
+        "frame_limiter_disable_vsync",
+        "nvenc_spatial_aq",
+        "high_resolution_scrolling",
+        "always_send_scancodes",
+        "key_rightalt_to_key_win",
+    ] {
+        if overrides
+            .get(key)
+            .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
+        {
+            return Err(INVALID);
+        }
+    }
+    if overrides.get("max_bitrate").is_some_and(|value| {
+        !value.is_null()
+            && !value
+                .as_i64()
+                .is_some_and(|bitrate| i32::try_from(bitrate).is_ok())
+    }) || overrides
+        .get("video_max_batch_size_kb")
+        .is_some_and(|value| !value.is_null() && !value.as_u64().is_some_and(|size| size <= 64))
+        || overrides.get("key_repeat_delay").is_some_and(|value| {
+            !value.is_null() && !value.as_u64().is_some_and(|delay| delay <= i32::MAX as u64)
+        })
+    {
+        return Err(INVALID);
+    }
+    if overrides.get("minimum_fps_target").is_some_and(|value| {
+        !value.is_null()
+            && !value
+                .as_f64()
+                .is_some_and(|target| target.is_finite() && (0.0..=1000.0).contains(&target))
+    }) || overrides.get("key_repeat_frequency").is_some_and(|value| {
+        !value.is_null()
+            && !value
+                .as_f64()
+                .is_some_and(|frequency| frequency.is_finite() && frequency >= 0.0)
+    }) || overrides
+        .get("frame_limiter_fps_limit")
+        .is_some_and(|value| {
+            !value.is_null() && !value.as_f64().is_some_and(valid_paired_frame_limit)
+        })
+    {
+        return Err(INVALID);
+    }
+    if overrides
+        .get("frame_limiter_provider")
+        .is_some_and(|value| {
+            !value.is_null()
+                && !value
+                    .as_str()
+                    .is_some_and(valid_catalog_frame_limiter_provider)
+        })
+        || overrides
+            .get("frame_limiter_auto_virtual_framegen")
+            .is_some_and(|value| {
+                !value.is_null()
+                    && (!cfg!(windows)
+                        || !value.as_str().is_some_and(|mode| {
+                            matches!(mode, "enabled" | "vrr" | "legacy" | "disabled")
+                        }))
+            })
+        || overrides.get("rtss_frame_limit_type").is_some_and(|value| {
+            !value.is_null()
+                && (!cfg!(windows)
+                    || !value.as_str().is_some_and(|mode| {
+                        matches!(
+                            mode,
+                            "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
+                        )
+                    }))
+        })
+        || overrides
+            .get("frame_limiter_disable_vsync")
+            .is_some_and(|value| !value.is_null() && !cfg!(windows))
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn valid_paired_frame_limit(fps: f64) -> bool {
+    if !fps.is_finite() || !(0.0..=1000.0).contains(&fps) {
+        return false;
+    }
+    let millihertz = fps * 1000.0;
+    (millihertz - millihertz.round()).abs() <= 0.000_001
+}
+
+#[cfg(test)]
+mod paired_client_roundtrip_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn route() -> Route {
+        Route {
+            service: "amaterasu.pairing/1",
+            action: "update_client_config_overrides",
+            scope: Some("pairing.admin"),
+            requires_empty_body: false,
+        }
+    }
+
+    fn request(overrides: Value) -> Value {
+        json!({
+            "certificate_id":"a".repeat(64),
+            "expected_revision":7,
+            "config_overrides":overrides,
+        })
+    }
+
+    #[test]
+    fn full_provider_override_document_can_be_preserved_by_an_editor_save() {
+        let mut overrides = json!({
+            "fec_percentage":47,
+            "max_bitrate":-15000,
+            "minimum_fps_target":0.0,
+            "video_max_batch_size_kb":64,
+            "frame_limiter_fps_limit":59.875,
+            "frame_limiter_enable":false,
+            "frame_limiter_provider":"auto",
+            "stream_audio":false,
+            "audio_sink":"",
+            "virtual_sink":"",
+            "audio_sink_capture_only":false,
+            "nvenc_spatial_aq":false,
+            "back_button_timeout":-1,
+            "controller":false,
+            "gamepad":"auto",
+            "keyboard":true,
+            "mouse":false,
+            "native_pen_touch":false,
+            "high_resolution_scrolling":false,
+            "always_send_scancodes":false,
+            "key_rightalt_to_key_win":true,
+            "key_repeat_delay":0,
+            "key_repeat_frequency":24.9,
+        });
+        if cfg!(windows) {
+            overrides["frame_limiter_disable_vsync"] = json!(false);
+            overrides["frame_limiter_auto_virtual_framegen"] = json!("vrr");
+            overrides["rtss_frame_limit_type"] = json!("async");
+        }
+        assert!(validate(route(), request(overrides).as_object().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn extended_overrides_accept_null_reset_and_reject_malformed_values() {
+        for key in [
+            "max_bitrate",
+            "minimum_fps_target",
+            "video_max_batch_size_kb",
+            "frame_limiter_fps_limit",
+            "frame_limiter_enable",
+            "frame_limiter_provider",
+            "frame_limiter_disable_vsync",
+            "frame_limiter_auto_virtual_framegen",
+            "rtss_frame_limit_type",
+            "nvenc_spatial_aq",
+            "high_resolution_scrolling",
+            "always_send_scancodes",
+            "key_rightalt_to_key_win",
+            "key_repeat_delay",
+            "key_repeat_frequency",
+        ] {
+            let payload = request(json!({key: null}));
+            assert!(
+                validate(route(), payload.as_object().unwrap()).is_ok(),
+                "{key}"
+            );
+        }
+        for (key, value) in [
+            ("max_bitrate", json!(i32::MAX as u64 + 1)),
+            ("minimum_fps_target", json!(-0.1)),
+            ("video_max_batch_size_kb", json!(65)),
+            ("frame_limiter_fps_limit", json!(59.1234)),
+            ("frame_limiter_enable", json!(0)),
+            ("frame_limiter_provider", json!("unknown")),
+            ("frame_limiter_disable_vsync", json!("false")),
+            ("frame_limiter_auto_virtual_framegen", json!("true")),
+            ("rtss_frame_limit_type", json!("unknown")),
+            ("nvenc_spatial_aq", json!("false")),
+            ("high_resolution_scrolling", json!(1)),
+            ("always_send_scancodes", json!("false")),
+            ("key_rightalt_to_key_win", json!(0)),
+            ("key_repeat_delay", json!(i32::MAX as u64 + 1)),
+            ("key_repeat_frequency", json!(-0.1)),
+        ] {
+            let payload = request(json!({key: value}));
+            assert!(
+                validate(route(), payload.as_object().unwrap()).is_err(),
+                "{key}"
+            );
+        }
     }
 }
 
