@@ -381,6 +381,7 @@ fn enqueue(sender: &SyncSender<Packet>, health: &Mutex<Health>, packet: Packet) 
         Err(TrySendError::Full(_)) => {
             if let Ok(mut health) = health.lock() {
                 health.failure = Some("audio_queue_overflow");
+                health.recovering = false;
                 health.dropped_packets = health.dropped_packets.saturating_add(1);
             }
             false
@@ -560,6 +561,47 @@ mod tests {
         assert_eq!(worker.read().err(), Some("audio_queue_overflow"));
         drop(worker);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn recovered_packet_overflow_ends_recovery_and_releases_both_captures() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let initial = FakeCapture::new(format, [Ok(Some(packet(1_000, 0))), Err("device_lost")])
+            .with_drop_counter(drops.clone());
+        let (sender, packets) = mpsc::sync_channel(1);
+        let health = Mutex::new(Health::default());
+        let attempts = AtomicUsize::new(0);
+        run_capture_loop(
+            Box::new(initial),
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(
+                    FakeCapture::new(format, [Ok(Some(packet(0, 0)))])
+                        .with_drop_counter(drops.clone()),
+                ) as Box<dyn CaptureDevice>)
+            },
+            &sender,
+            &health,
+            &AtomicBool::new(false),
+            RecoveryPolicy {
+                expected_endpoint: "render.fixed".into(),
+                expected_format: format,
+                follow_console_default: false,
+                retry_delay: Duration::ZERO,
+            },
+        );
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        let captured = packets.try_recv().unwrap();
+        assert_eq!((captured.sequence, captured.timestamp_us), (0, 1_000));
+        assert!(packets.try_recv().is_err());
+        let health = health.lock().unwrap();
+        assert_eq!(health.failure, Some("audio_queue_overflow"));
+        assert!(!health.recovering);
+        assert_eq!(health.dropped_packets, 1);
+        assert_eq!(health.discontinuities, 0);
     }
 
     #[test]
