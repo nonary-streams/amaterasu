@@ -81,10 +81,13 @@ pub struct Snapshot {
 #[derive(Default)]
 pub struct SnapshotAssembler {
     current: Option<IncompleteSnapshot>,
+    connection_nonce: Option<String>,
 }
 
 #[derive(Default)]
 struct IncompleteSnapshot {
+    nonce: Option<String>,
+    request_id: Option<String>,
     games: Vec<Game>,
     ids: BTreeSet<String>,
     categories: Option<Vec<Category>>,
@@ -93,9 +96,25 @@ struct IncompleteSnapshot {
 }
 
 impl SnapshotAssembler {
+    pub fn for_connection(nonce: String) -> Self {
+        Self {
+            current: None,
+            connection_nonce: Some(nonce),
+        }
+    }
+
     /// Consumes one newline-delimited extension message. A snapshot is exposed
     /// only when both lookup lists and the declared game count are complete.
+    #[cfg(test)]
     pub fn receive_line(&mut self, line: &[u8]) -> Option<Result<Snapshot, &'static str>> {
+        self.receive_line_with_request(line)
+            .map(|(_, result)| result)
+    }
+
+    pub fn receive_line_with_request(
+        &mut self,
+        line: &[u8],
+    ) -> Option<(Option<String>, Result<Snapshot, &'static str>)> {
         if line.is_empty() || line.len() > MAX_LINE_BYTES {
             if let Some(current) = &mut self.current {
                 current.invalid = true;
@@ -116,13 +135,35 @@ impl SnapshotAssembler {
         };
         match kind {
             "snapshotStart" => {
-                self.current = Some(IncompleteSnapshot::default());
+                let nonce = message.get("nonce").and_then(serde_json::Value::as_str);
+                if self.connection_nonce.as_deref() != nonce {
+                    self.current = None;
+                    return None;
+                }
+                self.current = Some(IncompleteSnapshot {
+                    nonce: nonce.map(str::to_owned),
+                    request_id: message
+                        .get("requestId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    ..IncompleteSnapshot::default()
+                });
                 None
             }
-            "plugins" => self.receive_plugins(message.get("payload")),
-            "categories" => self.receive_categories(message.get("payload")),
-            "games" => self.receive_games(message.get("payload")),
-            "snapshotComplete" => self.finish(message.get("games")),
+            "plugins" => self
+                .receive_plugins(message.get("payload"))
+                .map(|result| (None, result)),
+            "categories" => self
+                .receive_categories(message.get("payload"))
+                .map(|result| (None, result)),
+            "games" => self
+                .receive_games(message.get("payload"))
+                .map(|result| (None, result)),
+            "snapshotComplete" => self.finish(
+                message.get("games"),
+                message.get("nonce"),
+                message.get("requestId"),
+            ),
             "status" | "commandResult" | "hello" => None,
             _ => {
                 if let Some(current) = &mut self.current {
@@ -232,23 +273,38 @@ impl SnapshotAssembler {
     fn finish(
         &mut self,
         declared_count: Option<&serde_json::Value>,
-    ) -> Option<Result<Snapshot, &'static str>> {
+        nonce: Option<&serde_json::Value>,
+        request_id: Option<&serde_json::Value>,
+    ) -> Option<(Option<String>, Result<Snapshot, &'static str>)> {
         let current = self.current.take()?;
+        let marker = current.request_id.clone();
+        if current.nonce.as_deref() != nonce.and_then(serde_json::Value::as_str) {
+            return Some((marker, Err("Playnite snapshot connection nonce changed")));
+        }
+        if current.request_id.as_deref() != request_id.and_then(serde_json::Value::as_str) {
+            return Some((marker, Err("Playnite snapshot request ID changed")));
+        }
         let Some(expected_count) = declared_count.and_then(serde_json::Value::as_u64) else {
-            return Some(Err("snapshot completion omitted a valid game count"));
+            return Some((
+                marker,
+                Err("snapshot completion omitted a valid game count"),
+            ));
         };
         if current.invalid
             || current.games.len() as u64 != expected_count
             || current.categories.is_none()
             || current.plugins.is_none()
         {
-            return Some(Err("Playnite snapshot was incomplete or malformed"));
+            return Some((marker, Err("Playnite snapshot was incomplete or malformed")));
         }
-        Some(Ok(Snapshot {
-            games: current.games,
-            categories: current.categories.unwrap_or_default(),
-            plugins: current.plugins.unwrap_or_default(),
-        }))
+        Some((
+            marker,
+            Ok(Snapshot {
+                games: current.games,
+                categories: current.categories.unwrap_or_default(),
+                plugins: current.plugins.unwrap_or_default(),
+            }),
+        ))
     }
 }
 
@@ -484,6 +540,77 @@ pub fn playnite_launch(game: &Game) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_nonce_rejects_old_complete_and_malformed_reconnect_frames() {
+        let mut assembler = SnapshotAssembler::for_connection("current".into());
+        for nonce in ["old", ""] {
+            let start = format!("{{\"type\":\"snapshotStart\",\"nonce\":\"{nonce}\"}}");
+            assert!(assembler.receive_line(start.as_bytes()).is_none());
+            assert!(
+                assembler
+                    .receive_line(br#"{"type":"plugins","payload":[]}"#)
+                    .is_none()
+            );
+            assert!(
+                assembler
+                    .receive_line(br#"{"type":"categories","payload":[]}"#)
+                    .is_none()
+            );
+            let complete =
+                format!("{{\"type\":\"snapshotComplete\",\"nonce\":\"{nonce}\",\"games\":0}}");
+            assert!(assembler.receive_line(complete.as_bytes()).is_none());
+        }
+        assert!(
+            assembler
+                .receive_line(br#"{"type":"snapshotStart","nonce":"current"}"#)
+                .is_none()
+        );
+        assert!(
+            assembler
+                .receive_line(br#"{"type":"plugins","payload":[]}"#)
+                .is_none()
+        );
+        assert!(
+            assembler
+                .receive_line(br#"{"type":"categories","payload":[]}"#)
+                .is_none()
+        );
+        assert!(
+            assembler
+                .receive_line(br#"{"type":"snapshotComplete","nonce":"old","games":0}"#)
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            assembler
+                .receive_line(br#"{"type":"snapshotComplete","nonce":"current","games":0}"#)
+                .is_none()
+        );
+        assert!(
+            assembler
+                .receive_line(br#"{"type":"snapshotStart","nonce":"current"}"#)
+                .is_none()
+        );
+        assert!(
+            assembler
+                .receive_line(br#"{"type":"plugins","payload":[]}"#)
+                .is_none()
+        );
+        assert!(
+            assembler
+                .receive_line(br#"{"type":"categories","payload":[]}"#)
+                .is_none()
+        );
+        assert!(
+            assembler
+                .receive_line(br#"{"type":"snapshotComplete","nonce":"current","games":0}"#)
+                .unwrap()
+                .unwrap()
+                .games
+                .is_empty()
+        );
+    }
 
     fn game(id: &str, categories: &[&str], plugin: &str, last_played: &str) -> Game {
         Game {

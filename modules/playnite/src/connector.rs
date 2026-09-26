@@ -22,6 +22,13 @@ const LAUNCH_START_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STATUS_LINE_BYTES: usize = 8 * 1024;
 
+#[cfg(windows)]
+fn fresh_connection_nonce() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| "Playnite connector nonce entropy unavailable")?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FullscreenStatusKind {
     GameStarted,
@@ -221,6 +228,7 @@ fn connect_role(
     role: &str,
     game_id: Option<&str>,
     mode: Option<&str>,
+    nonce: Option<&str>,
 ) -> Result<(Pipe, ProcessImage), String> {
     use std::thread;
 
@@ -266,6 +274,9 @@ fn connect_role(
     if let Some(mode) = mode {
         hello["mode"] = mode.into();
     }
+    if let Some(nonce) = nonce {
+        hello["nonce"] = nonce.into();
+    }
     let mut line = serde_json::to_vec(&hello).map_err(|_| "Playnite hello serialization failed")?;
     line.push(b'\n');
     data_pipe.write_all(&line)?;
@@ -278,7 +289,7 @@ pub fn request_snapshot(expected_processes: &[ProcessImage]) -> Result<Snapshot,
     sunshine_actor_channels()
         .ok_or("Playnite Sunshine connector is not running")?
         .0
-        .send(SunshineCommand::Snapshot {
+        .try_send(SunshineCommand::Snapshot {
             processes: expected_processes.to_vec(),
             reply,
         })
@@ -316,6 +327,7 @@ enum SunshineCommand {
         processes: Vec<ProcessImage>,
         line: Vec<u8>,
         command: String,
+        request_id: String,
         reply: Sender<Result<(), String>>,
     },
     Shutdown,
@@ -323,7 +335,7 @@ enum SunshineCommand {
 
 #[cfg(windows)]
 struct SunshineActor {
-    commands: Sender<SunshineCommand>,
+    commands: mpsc::SyncSender<SunshineCommand>,
     snapshots: SharedSnapshots,
     worker: thread::JoinHandle<()>,
 }
@@ -338,7 +350,7 @@ fn sunshine_actor_slot() -> &'static Mutex<Option<SunshineActor>> {
 }
 
 #[cfg(windows)]
-fn sunshine_actor_channels() -> Option<(Sender<SunshineCommand>, SharedSnapshots)> {
+fn sunshine_actor_channels() -> Option<(mpsc::SyncSender<SunshineCommand>, SharedSnapshots)> {
     let actor = sunshine_actor_slot().lock().ok()?;
     let actor = actor.as_ref()?;
     Some((actor.commands.clone(), Arc::clone(&actor.snapshots)))
@@ -349,7 +361,7 @@ pub(crate) fn start_sunshine_actor() {
     if let Ok(mut slot) = sunshine_actor_slot().lock()
         && slot.is_none()
     {
-        let (commands, requests) = mpsc::channel();
+        let (commands, requests) = mpsc::sync_channel(8);
         let (snapshots, events) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || run_sunshine_actor(requests, snapshots));
         *slot = Some(SunshineActor {
@@ -365,7 +377,7 @@ pub(crate) fn stop_sunshine_actor() {
     if let Ok(mut slot) = sunshine_actor_slot().lock()
         && let Some(actor) = slot.take()
     {
-        let _ = actor.commands.send(SunshineCommand::Shutdown);
+        let _ = actor.commands.try_send(SunshineCommand::Shutdown);
         let _ = actor.worker.join();
     }
 }
@@ -382,7 +394,7 @@ pub(crate) fn observe_sunshine_processes(
         };
         let (reply, observed) = mpsc::channel();
         if commands
-            .send(SunshineCommand::Observe {
+            .try_send(SunshineCommand::Observe {
                 processes: processes.to_vec(),
                 enabled,
                 settings_epoch,
@@ -423,15 +435,26 @@ struct SunshineState {
     settings_epoch: u64,
     pipe: Option<Pipe>,
     server_process: Option<ProcessImage>,
+    connection_nonce: Option<String>,
     assembler: SnapshotAssembler,
     line: Vec<u8>,
     received: usize,
     pending_snapshot: Option<PendingSnapshot>,
+    pending_command: Option<PendingCommand>,
 }
 
 #[cfg(windows)]
 struct PendingSnapshot {
     reply: Sender<Result<Snapshot, String>>,
+    deadline: Instant,
+    request_id: Option<String>,
+}
+
+#[cfg(windows)]
+struct PendingCommand {
+    reply: Sender<Result<(), String>>,
+    command: String,
+    request_id: String,
     deadline: Instant,
 }
 
@@ -444,20 +467,26 @@ impl SunshineState {
             settings_epoch: 0,
             pipe: None,
             server_process: None,
+            connection_nonce: None,
             assembler: SnapshotAssembler::default(),
             line: Vec::new(),
             received: 0,
             pending_snapshot: None,
+            pending_command: None,
         }
     }
 
     fn disconnect(&mut self, reason: &str) {
         self.pipe = None;
         self.server_process = None;
+        self.connection_nonce = None;
         self.assembler = SnapshotAssembler::default();
         self.line.clear();
         self.received = 0;
         if let Some(pending) = self.pending_snapshot.take() {
+            let _ = pending.reply.send(Err(reason.into()));
+        }
+        if let Some(pending) = self.pending_command.take() {
             let _ = pending.reply.send(Err(reason.into()));
         }
     }
@@ -466,9 +495,13 @@ impl SunshineState {
         if self.pipe.is_some() {
             return Ok(false);
         }
-        let (pipe, server_process) = connect_role(&self.processes, "sunshine", None, None)?;
+        let nonce = fresh_connection_nonce()?;
+        let (pipe, server_process) =
+            connect_role(&self.processes, "sunshine", None, None, Some(&nonce))?;
         self.server_process = Some(server_process);
         self.pipe = Some(pipe);
+        self.assembler = SnapshotAssembler::for_connection(nonce.clone());
+        self.connection_nonce = Some(nonce);
         Ok(true)
     }
 
@@ -490,6 +523,10 @@ impl SunshineState {
             return Err("Playnite Sunshine server identity changed".into());
         }
         Ok(())
+    }
+
+    fn assembler_nonce_matches(&self, nonce: Option<&str>) -> bool {
+        self.connection_nonce.as_deref() == nonce
     }
 
     fn handle(&mut self, command: SunshineCommand) {
@@ -515,10 +552,27 @@ impl SunshineState {
                 }
                 match self.connect() {
                     Ok(new_connection) => {
+                        let request_id = if new_connection {
+                            None
+                        } else {
+                            match fresh_connection_nonce() {
+                                Ok(id) => Some(id),
+                                Err(error) => {
+                                    let _ = reply.send(Err(error));
+                                    return;
+                                }
+                            }
+                        };
                         if !new_connection
                             && let Some(pipe) = &self.pipe
-                            && let Err(error) =
-                                pipe.write_all(&extension_command_line("snapshot", None).unwrap())
+                            && let Err(error) = pipe.write_all(
+                                &extension_command_line_with_request(
+                                    "snapshot",
+                                    None,
+                                    request_id.as_deref(),
+                                )
+                                .unwrap(),
+                            )
                         {
                             self.disconnect(&error);
                             let _ = reply.send(Err(error));
@@ -527,6 +581,7 @@ impl SunshineState {
                         let pending = PendingSnapshot {
                             reply,
                             deadline: Instant::now() + SNAPSHOT_TIMEOUT,
+                            request_id,
                         };
                         if let Some(previous) = self.pending_snapshot.replace(pending) {
                             let _ = previous
@@ -543,8 +598,13 @@ impl SunshineState {
                 processes,
                 line,
                 command,
+                request_id,
                 reply,
             } => {
+                if self.pending_command.is_some() {
+                    let _ = reply.send(Err("Playnite command already pending".into()));
+                    return;
+                }
                 if self.processes != processes || (!self.enabled && command != "stop") {
                     let _ = reply.send(Err("Playnite command instance changed".into()));
                     return;
@@ -556,8 +616,15 @@ impl SunshineState {
                 });
                 if result.is_err() {
                     self.disconnect("Playnite Sunshine command connection failed");
+                    let _ = reply.send(result);
+                } else {
+                    self.pending_command = Some(PendingCommand {
+                        reply,
+                        command,
+                        request_id,
+                        deadline: Instant::now() + CONNECT_TIMEOUT,
+                    });
                 }
-                let _ = reply.send(result);
             }
             SunshineCommand::Shutdown => self.disconnect("Playnite module stopped"),
         }
@@ -592,14 +659,34 @@ impl SunshineState {
                 if self.line.last() == Some(&b'\r') {
                     self.line.pop();
                 }
-                if let Some(result) = self.assembler.receive_line(&self.line) {
+                if let Some(result) = parse_command_result(&self.line)
+                    && let Some(pending) = self.pending_command.as_ref()
+                    && Some(pending.request_id.as_str()) == result.request_id.as_deref()
+                    && pending.command == result.command
+                    && self.assembler_nonce_matches(result.nonce.as_deref())
+                    && let Some(pending) = self.pending_command.take()
+                {
+                    let _ = pending.reply.send(if result.success {
+                        Ok(())
+                    } else {
+                        Err("Playnite extension rejected command".into())
+                    });
+                }
+                if let Some((request_id, result)) =
+                    self.assembler.receive_line_with_request(&self.line)
+                {
                     self.received = 0;
-                    let requested = self.pending_snapshot.take();
-                    if let Some(pending) = requested.as_ref() {
-                        let _ = pending.reply.send(result.clone().map_err(str::to_owned));
-                    }
-                    if self.enabled
-                        && requested.is_none()
+                    let matches_pending = self
+                        .pending_snapshot
+                        .as_ref()
+                        .is_some_and(|pending| pending.request_id == request_id);
+                    if matches_pending {
+                        if let Some(pending) = self.pending_snapshot.take() {
+                            let _ = pending.reply.send(result.map_err(str::to_owned));
+                        }
+                    } else if self.enabled
+                        && self.pending_snapshot.is_none()
+                        && request_id.is_none()
                         && let Ok(snapshot) = result
                     {
                         let _ = events.try_send(SnapshotEvent {
@@ -637,6 +724,13 @@ fn run_sunshine_actor(
             let _ = pending
                 .reply
                 .send(Err("Playnite extension snapshot timed out".into()));
+        }
+        if state
+            .pending_command
+            .as_ref()
+            .is_some_and(|pending| Instant::now() >= pending.deadline)
+        {
+            state.disconnect("Playnite extension command acknowledgement timed out");
         }
         match commands.recv_timeout(Duration::from_millis(10)) {
             Ok(SunshineCommand::Shutdown) => {
@@ -682,17 +776,18 @@ pub fn watch_game(
     let launch_deadline = Instant::now() + LAUNCH_START_TIMEOUT;
     let mut expected_processes = expected_processes.to_vec();
 
-    let (mut pipe, _) = match connect_role(&expected_processes, "launcher", Some(game_id), None) {
-        Ok(pipe) => pipe,
-        Err(_) => {
-            fail(if recovery {
-                super::launch::State::CleanupFailed
-            } else {
-                state_after_start_failure(false)
-            });
-            return;
-        }
-    };
+    let (mut pipe, _) =
+        match connect_role(&expected_processes, "launcher", Some(game_id), None, None) {
+            Ok(pipe) => pipe,
+            Err(_) => {
+                fail(if recovery {
+                    super::launch::State::CleanupFailed
+                } else {
+                    state_after_start_failure(false)
+                });
+                return;
+            }
+        };
     if recovery {
         let request = match stop_requests.try_recv() {
             Ok(request) => request,
@@ -712,13 +807,14 @@ pub fn watch_game(
             }
         };
         if validated_server_process(&pipe, &expected_processes).is_err() {
-            (pipe, _) = match connect_role(&expected_processes, "launcher", Some(game_id), None) {
-                Ok(pipe) => pipe,
-                Err(_) => {
-                    fail(super::launch::State::CleanupFailed);
-                    return;
-                }
-            };
+            (pipe, _) =
+                match connect_role(&expected_processes, "launcher", Some(game_id), None, None) {
+                    Ok(pipe) => pipe,
+                    Err(_) => {
+                        fail(super::launch::State::CleanupFailed);
+                        return;
+                    }
+                };
         }
         if send_command(&expected_processes, "stop", game_id).is_err() {
             fail(super::launch::State::CleanupFailed);
@@ -745,14 +841,19 @@ pub fn watch_game(
                     }
                 };
                 if validated_server_process(&pipe, &expected_processes).is_err() {
-                    (pipe, _) =
-                        match connect_role(&expected_processes, "launcher", Some(game_id), None) {
-                            Ok(pipe) => pipe,
-                            Err(_) => {
-                                fail(super::launch::State::CleanupFailed);
-                                return;
-                            }
-                        };
+                    (pipe, _) = match connect_role(
+                        &expected_processes,
+                        "launcher",
+                        Some(game_id),
+                        None,
+                        None,
+                    ) {
+                        Ok(pipe) => pipe,
+                        Err(_) => {
+                            fail(super::launch::State::CleanupFailed);
+                            return;
+                        }
+                    };
                 }
                 if send_command(&expected_processes, "stop", game_id).is_err() {
                     fail(super::launch::State::CleanupFailed);
@@ -808,6 +909,11 @@ pub fn watch_game(
                 if let Some(status) = parse_game_status(&line)
                     && status.game_id.eq_ignore_ascii_case(game_id)
                 {
+                    if let Some(state) = stop_signal_state(&status.name, stopping, recovery) {
+                        focus_retry.cancel();
+                        let _ = events.send(state);
+                        return;
+                    }
                     let was_started = started;
                     let state = apply_game_status(&status.name, &mut started, stopping);
                     if status.name == "gameStarted" && !stopping {
@@ -899,7 +1005,13 @@ fn watch_fullscreen_windows(
                 thread::sleep(Duration::from_millis(100));
                 continue;
             }
-            match connect_role(&expected_processes, "launcher", None, Some("fullscreen")) {
+            match connect_role(
+                &expected_processes,
+                "launcher",
+                None,
+                Some("fullscreen"),
+                None,
+            ) {
                 Ok((connected_pipe, server_process)) => {
                     extension_process = Some(server_process);
                     pipe = Some(connected_pipe);
@@ -975,13 +1087,15 @@ fn send_command(
     game_id: &str,
 ) -> Result<(), String> {
     let (reply, response) = mpsc::channel();
+    let request_id = fresh_connection_nonce()?;
     sunshine_actor_channels()
         .ok_or("Playnite Sunshine connector is not running")?
         .0
-        .send(SunshineCommand::Send {
+        .try_send(SunshineCommand::Send {
             processes: expected_processes.to_vec(),
-            line: extension_command_line(command, Some(game_id))?,
+            line: extension_command_line_with_request(command, Some(game_id), Some(&request_id))?,
             command: command.to_owned(),
+            request_id,
             reply,
         })
         .map_err(|_| "Playnite Sunshine connector stopped".to_owned())?;
@@ -990,11 +1104,44 @@ fn send_command(
         .map_err(|_| "Playnite extension command timed out".to_owned())?
 }
 
+struct CommandResult {
+    command: String,
+    request_id: Option<String>,
+    nonce: Option<String>,
+    success: bool,
+}
+
+fn parse_command_result(line: &[u8]) -> Option<CommandResult> {
+    let message: serde_json::Value = serde_json::from_slice(line).ok()?;
+    if message.get("type")?.as_str()? != "commandResult" {
+        return None;
+    }
+    Some(CommandResult {
+        command: message.get("command")?.as_str()?.to_owned(),
+        request_id: message.get("requestId")?.as_str().map(str::to_owned),
+        nonce: message.get("nonce")?.as_str().map(str::to_owned),
+        success: message.get("success")?.as_bool()?,
+    })
+}
+
 #[cfg(any(windows, test))]
+#[cfg(test)]
 fn extension_command_line(command: &str, game_id: Option<&str>) -> Result<Vec<u8>, String> {
+    extension_command_line_with_request(command, game_id, None)
+}
+
+#[cfg(any(windows, test))]
+fn extension_command_line_with_request(
+    command: &str,
+    game_id: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<Vec<u8>, String> {
     let mut message = serde_json::json!({"type":"command","command":command});
     if let Some(game_id) = game_id {
         message["id"] = game_id.into();
+    }
+    if let Some(request_id) = request_id {
+        message["requestId"] = request_id.into();
     }
     let mut line = serde_json::to_vec(&message)
         .map_err(|_| "Playnite command serialization failed".to_owned())?;
@@ -1091,6 +1238,10 @@ fn apply_game_status(
     }
 }
 
+fn stop_signal_state(name: &str, stopping: bool, recovery: bool) -> Option<super::launch::State> {
+    (name == "stopRequested" && stopping && !recovery).then_some(super::launch::State::Stopped)
+}
+
 fn state_after_start_failure(command_may_have_reached_extension: bool) -> super::launch::State {
     if command_may_have_reached_extension {
         super::launch::State::CleanupFailed
@@ -1157,26 +1308,36 @@ mod tests {
         state.processes = vec![process.clone()];
         state.enabled = true;
         state.settings_epoch = 7;
+        state.assembler =
+            crate::snapshot::SnapshotAssembler::for_connection("new-generation".into());
         let (events, received_events) = mpsc::sync_channel(1);
         let (reply, received_reply) = mpsc::channel();
         state.pending_snapshot = Some(PendingSnapshot {
             reply,
             deadline: std::time::Instant::now() + super::SNAPSHOT_TIMEOUT,
+            request_id: Some("requested".into()),
         });
         let snapshot = concat!(
-            "{\"type\":\"snapshotStart\"}\n",
+            "{\"type\":\"snapshotStart\",\"nonce\":\"new-generation\",\"requestId\":\"requested\"}\n",
             "{\"type\":\"status\",\"status\":{\"name\":\"gameStarted\"}}\n",
             "{\"type\":\"plugins\",\"payload\":[]}\n",
             "{\"type\":\"commandResult\",\"command\":\"set-cover\"}\n",
             "{\"type\":\"categories\",\"payload\":[]}\n",
             "{\"type\":\"games\",\"payload\":[] }\n",
-            "{\"type\":\"snapshotComplete\",\"games\":0}\n"
+            "{\"type\":\"snapshotComplete\",\"nonce\":\"new-generation\",\"requestId\":\"requested\",\"games\":0}\n"
         );
-        state.consume_bytes(snapshot.as_bytes(), &events).unwrap();
-        assert!(received_reply.try_recv().unwrap().unwrap().games.is_empty());
+        let unsolicited = snapshot.replace(",\"requestId\":\"requested\"", "");
+        state
+            .consume_bytes(unsolicited.as_bytes(), &events)
+            .unwrap();
+        assert!(received_reply.try_recv().is_err());
         assert!(received_events.try_recv().is_err());
 
         state.consume_bytes(snapshot.as_bytes(), &events).unwrap();
+        assert!(received_reply.try_recv().unwrap().unwrap().games.is_empty());
+        state
+            .consume_bytes(unsolicited.as_bytes(), &events)
+            .unwrap();
         let event = received_events.try_recv().unwrap();
         assert!(event.snapshot.games.is_empty());
         assert_eq!(event.processes, vec![process]);
@@ -1236,6 +1397,59 @@ mod tests {
             .unwrap();
         assert!(received.try_recv().is_err());
         assert_eq!(state.processes, vec![new]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_result_requires_current_nonce_request_and_command() {
+        use super::{PendingCommand, SunshineState};
+        use std::sync::mpsc;
+
+        let mut state = SunshineState::new();
+        state.connection_nonce = Some("current".into());
+        let (events, _) = mpsc::sync_channel(1);
+        let (reply, received) = mpsc::channel();
+        state.pending_command = Some(PendingCommand {
+            reply,
+            command: "launch".into(),
+            request_id: "request".into(),
+            deadline: std::time::Instant::now() + super::CONNECT_TIMEOUT,
+        });
+        for (nonce, request_id, command) in [
+            ("old", "request", "launch"),
+            ("current", "old", "launch"),
+            ("current", "request", "stop"),
+        ] {
+            let line = format!(
+                "{{\"type\":\"commandResult\",\"nonce\":\"{nonce}\",\"requestId\":\"{request_id}\",\"command\":\"{command}\",\"success\":true}}\n"
+            );
+            state.consume_bytes(line.as_bytes(), &events).unwrap();
+            assert!(received.try_recv().is_err());
+        }
+        state.consume_bytes(b"{\"type\":\"commandResult\",\"nonce\":\"current\",\"requestId\":\"request\",\"command\":\"launch\",\"success\":false}\n", &events).unwrap();
+        assert!(received.try_recv().unwrap().is_err());
+        assert!(state.pending_command.is_none());
+        let (reply, received) = mpsc::channel();
+        state.pending_command = Some(PendingCommand {
+            reply,
+            command: "stop".into(),
+            request_id: "next".into(),
+            deadline: std::time::Instant::now() + super::CONNECT_TIMEOUT,
+        });
+        state.consume_bytes(b"{\"type\":\"commandResult\",\"nonce\":\"current\",\"requestId\":\"next\",\"command\":\"stop\",\"success\":true}\n", &events).unwrap();
+        assert!(received.try_recv().unwrap().is_ok());
+    }
+
+    #[test]
+    fn stop_signal_ends_only_an_active_nonrecovery_stream_stop() {
+        use super::stop_signal_state;
+        assert_eq!(
+            stop_signal_state("stopRequested", true, false),
+            Some(super::super::launch::State::Stopped)
+        );
+        assert_eq!(stop_signal_state("stopRequested", false, false), None);
+        assert_eq!(stop_signal_state("stopRequested", true, true), None);
+        assert_eq!(stop_signal_state("gameStopped", true, false), None);
     }
 
     #[cfg(windows)]

@@ -79,16 +79,39 @@ eligibility from the current completed import, including when auto-sync is off;
 disabling the provider revokes it. Automatic selection policy changes revoke it
 when auto-sync is on. An in-flight import continues across operational settings
 changes but is canceled on provider disable, policy change, or process restart.
-The extension coalesces library changes with a three-second debounce. Its
-single shared outbox can retain queued snapshot records across a pipe reconnect
-in the same Playnite process, and snapshots carry no request ID or connection
-generation. A fully queued older snapshot can precede the new initial snapshot;
-the periodic request eventually reconciles the latest library state. Exact
-per-connection freshness requires an extension protocol marker or queue flush.
+The Amaterasu extension in `extension/` coalesces library changes with a
+three-second debounce. It captures complete Playnite records on the UI thread,
+then places an immutable snapshot batch in a bounded queue owned by one pipe
+connection. Each bracket contains the fresh nonce from that connection's
+authenticated hello, and requested brackets also echo a request ID. A queued
+batch from an old connection cannot acquire a new nonce. Missing, mismatched,
+partial, or stale brackets cannot update the catalog. The 30-second poll remains
+as recovery if a collection event is missed. Launch and stop results are bound
+to the current connection nonce and command request ID.
+
+Playnite's installed extension directory is `%AppData%\Playnite\Extensions`;
+portable installs use `Extensions` below the Playnite installation. To test a
+source checkout, copy `extension.yaml` and `AmaterasuPlaynite.psm1` from
+`extension/` into an `Amaterasu.Playnite.Connector` child directory there, then
+restart Playnite.
+The Amaterasu installer does not yet install or roll back this extension;
+that packaging work is tracked separately. Only the service-launched
+`worker-user-serve` process can claim the Sunshine role: the extension compares
+the kernel control/data client PID, live SCM service parent, executable path,
+and worker command line. It also requires the SCM image to reside in an
+administrator-protected location. This contract requires a packaged Windows/Playnite
+smoke test because CIM visibility, pipe ACLs, and UI dispatcher behavior depend
+on the actual service and user tokens. Playnite's
+[extension introduction](https://api.playnite.link/docs/tutorials/extensions/intro.html)
+states that PowerShell script support is planned for removal in version 11;
+that version needs a separately qualified extension implementation.
 
 The typed GUID launch route uses the bounded extension connection and ticket
 protocol. Snapshot, launch, and stop requests use the extension's typed
-`command` envelope; a successful pipe write alone does not confirm execution.
+`command` envelope; a command result with the current nonce and request ID
+confirms acceptance. Stop asks the launcher to end the stream; it does not kill
+the game. A recovered session still needs a matching `gameStopped` observation
+before cleanup can be called complete.
 Fullscreen entry is a separate Windows-only launch action, authorized
 only to `amaterasu.launch`; management can read or update the persisted
 `fullscreen_entry_enabled` setting. It defaults to false, is preserved by older
@@ -169,7 +192,4 @@ tries at most once per second. A supplied executable path must match exactly;
 the install directory is used only when no executable path is available. The
 timeout remains fixed for the active game even when status metadata changes,
 and retries end on timeout, successful-attempt budget, stop, or disconnect.
-Other platforms preserve settings but do not perform window focus. The
-reference `playnite_fullscreen_entry_enabled` and per-app
-`playnite-fullscreen` launch behavior remain pending because the current
-catalog launch contract cannot represent that host launcher action safely.
+Other platforms preserve settings but do not perform window focus.

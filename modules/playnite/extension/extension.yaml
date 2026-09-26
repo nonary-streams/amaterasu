@@ -1,0 +1,7 @@
+Id: Amaterasu.Playnite.Connector
+Name: Amaterasu Playnite Connector
+Author: Amaterasu
+Version: 0.1.0
+Module: AmaterasuPlaynite.psm1
+Type: Script
+Description: Provides authenticated local Playnite snapshots and game status to Amaterasu.
