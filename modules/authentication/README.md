@@ -156,6 +156,21 @@ principal. All required scopes must match.
 Removing a configured scope denies any session/token that still grants it,
 including otherwise valid requests for a smaller subset.
 
+When all 16 session slots are occupied, a login with a valid password makes
+room by revoking the session with the earliest absolute refresh expiry. If
+expiries match, the lexicographically smallest session digest is selected.
+Invalid credentials do not evict a session. The replacement and eviction take
+effect only after the revised session document is durably acknowledged; the
+evicted bearer and refresh token then fail verification and refresh. This keeps
+password login available when earlier sessions are no longer accessible to the
+user, including sessions whose token delivery was cancelled.
+
+Backend restart does not itself end a valid administrator session. The current
+browser client holds bearer and refresh tokens only in memory, so reloading or
+closing the page discards those secrets and requires another login, even with
+`remember_me`. A still-open page can continue using its tokens after a worker
+restart, subject to expiry, revocation, and policy checks.
+
 Token issuance returns `ok`, the one-time `bearer`, its `token_id`, `scopes`, and
 `expires_at`. The ID is the SHA-256 bearer digest and may be used for revocation;
 it is not a bearer. Lifetimes range from 1 second to 30 days. Expired or
@@ -210,7 +225,7 @@ Errors include `invalid_request`, `forbidden`, `unauthorized`, `rate_limited`,
 `clock_failure`. Unknown fields are rejected; request JSON is bounded to 4096
 serialized bytes. Error replies are `{"ok":false,"code":"..."}`.
 
-Offline password recovery, multiple human users, durable sessions, external identity
+Offline password recovery, multiple human users, external identity
 providers, MFA, audit trails, and password breach checks remain unimplemented.
 Offline state/host compromise is outside this in-process authority boundary.
 
