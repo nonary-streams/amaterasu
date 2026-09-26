@@ -14,7 +14,9 @@ pub struct Ready {
 }
 pub struct Observation {
     pub exists: bool,
+    pub occupied_by_other_lease: bool,
     pub specification_matches: bool,
+    pub lease_display_count: u32,
     pub pending_departure: bool,
     pub ready: Option<Ready>,
 }

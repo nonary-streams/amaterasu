@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -71,10 +71,26 @@ impl Journal {
         if file.metadata().map_err(|error| error.to_string())?.len() > 64 * 1024 * 1024 {
             return Err("virtual display journal is too large".into());
         }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        let complete = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |position| position + 1);
+        if complete < bytes.len() {
+            // A native effect follows sync_all, so an un-terminated tail was never
+            // a committed ownership transition. Preserve all earlier records.
+            file.set_len(complete as u64)
+                .map_err(|error| error.to_string())?;
+            file.sync_all().map_err(|error| error.to_string())?;
+        }
         let mut records = BTreeMap::new();
-        for line in BufReader::new(&file).lines() {
-            let line = line.map_err(|error| error.to_string())?;
-            let event: Event = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        for line in bytes[..complete]
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let event: Event = serde_json::from_slice(line).map_err(|error| error.to_string())?;
             match event {
                 Event::Upsert { record } => {
                     if record.specification.validate().is_err()
@@ -114,6 +130,9 @@ impl Journal {
             {
                 return Err("conflicting virtual display journal records".into());
             }
+        }
+        if records.len() > 8 {
+            return Err("too many virtual display journal records".into());
         }
         file.seek(SeekFrom::End(0))
             .map_err(|error| error.to_string())?;
@@ -221,6 +240,15 @@ mod tests {
         let mut journal = Journal::open(&path).unwrap();
         journal.upsert(record.clone()).unwrap();
         drop(journal);
+        let journal = Journal::open(&path).unwrap();
+        assert_eq!(journal.records().next().unwrap().lease, record.lease);
+        drop(journal);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"event\":\"upsert\"")
+            .unwrap();
         let mut journal = Journal::open(&path).unwrap();
         assert_eq!(journal.records().next().unwrap().lease, record.lease);
         journal
@@ -228,7 +256,7 @@ mod tests {
             .unwrap();
         drop(journal);
         assert_eq!(Journal::open(&path).unwrap().records().count(), 0);
-        fs::write(&path, b"{\"event\":\"upsert\"").unwrap();
+        fs::write(&path, b"{\"event\":\"upsert\"}\n").unwrap();
         assert!(Journal::open(&path).is_err());
         fs::remove_dir_all(root).unwrap();
     }

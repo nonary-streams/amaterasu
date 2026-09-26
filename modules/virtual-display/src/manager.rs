@@ -145,10 +145,16 @@ impl<D: Driver> Manager<D> {
                 Some(Err(_)) => continue,
                 None => None,
             };
-            if (old.exists && !old.specification_matches)
-                || next
-                    .as_ref()
-                    .is_some_and(|next| next.exists && !next.specification_matches)
+            if (!old.exists
+                && next.as_ref().is_none_or(|next| !next.exists)
+                && (old.occupied_by_other_lease
+                    || next
+                        .as_ref()
+                        .is_some_and(|next| next.occupied_by_other_lease)))
+                || (old.exists && (!old.specification_matches || old.lease_display_count != 1))
+                || next.as_ref().is_some_and(|next| {
+                    next.exists && (!next.specification_matches || next.lease_display_count != 1)
+                })
             {
                 monitor.state = "ownership_conflict";
                 monitor.error = Some("identity_conflict");
@@ -215,6 +221,7 @@ impl<D: Driver> Manager<D> {
                 };
                 if !observation.exists
                     || !observation.specification_matches
+                    || observation.lease_display_count != 1
                     || observation.pending_departure
                 {
                     continue;
@@ -519,7 +526,12 @@ fn maintain(driver: &mut impl Driver, monitor: &mut Monitor, now: Instant) {
         monitor.binding,
         &monitor.specification,
     ) {
-        Ok(observation) if observation.exists && !observation.specification_matches => {
+        Ok(observation)
+            if observation.occupied_by_other_lease
+                || (observation.exists
+                    && (!observation.specification_matches
+                        || observation.lease_display_count != 1)) =>
+        {
             monitor.ready = None;
             monitor.state = "ownership_conflict";
             monitor.error = Some("identity_conflict");
@@ -565,7 +577,12 @@ fn cleanup(driver: &mut impl Driver, monitor: &mut Monitor) -> bool {
         monitor.binding,
         &monitor.specification,
     ) {
-        Ok(observation) if observation.exists && !observation.specification_matches => {
+        Ok(observation)
+            if observation.occupied_by_other_lease
+                || (observation.exists
+                    && (!observation.specification_matches
+                        || observation.lease_display_count != 1)) =>
+        {
             monitor.state = "ownership_conflict";
             monitor.error = Some("identity_conflict");
             return false;

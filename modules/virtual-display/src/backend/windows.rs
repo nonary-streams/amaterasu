@@ -102,11 +102,13 @@ impl Driver for NativeDriver {
     ) -> Result<Observation, &'static str> {
         let state = self.exchange(protocol::QUERY_STATE, &[], protocol::STATE_BYTES)?;
         let exists = protocol::present(&state, lease, display)?;
+        let occupied_by_other_lease = protocol::occupied_by_other_lease(&state, lease, display)?;
         let specification_matches =
             !exists || protocol::matches_specification(&state, lease, display, specification)?;
         let lease_state =
             self.exchange(protocol::QUERY_LEASE, &protocol::lease_request(lease), 48)?;
         let pending_departure = protocol::pending_departure(&lease_state, lease)?;
+        let lease_display_count = protocol::lease_display_count(&lease_state, lease)?;
         let ready = if exists {
             match binding {
                 Some(binding) => monitor_identity(binding)?,
@@ -117,7 +119,9 @@ impl Driver for NativeDriver {
         };
         Ok(Observation {
             exists,
+            occupied_by_other_lease,
             specification_matches,
+            lease_display_count,
             pending_departure,
             ready,
         })

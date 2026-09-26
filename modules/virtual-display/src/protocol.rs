@@ -119,6 +119,14 @@ pub fn pending_departure(bytes: &[u8], lease: u64) -> Result<bool, &'static str>
     Ok(read_u32(bytes, 40) != 0)
 }
 
+pub fn lease_display_count(bytes: &[u8], lease: u64) -> Result<u32, &'static str> {
+    check(bytes, 48)?;
+    if read_u64(bytes, 16) != lease || read_u32(bytes, 24) > 16 {
+        return Err("invalid_driver_response");
+    }
+    Ok(read_u32(bytes, 24))
+}
+
 pub fn present(bytes: &[u8], lease: u64, display: u64) -> Result<bool, &'static str> {
     check(bytes, STATE_BYTES)?;
     let count = read_u32(bytes, 24) as usize;
@@ -137,6 +145,29 @@ pub fn present(bytes: &[u8], lease: u64, display: u64) -> Result<bool, &'static 
     Ok(matches
         .first()
         .is_some_and(|index| read_u64(bytes, 32 + 104 * index + 8) == lease))
+}
+
+pub fn occupied_by_other_lease(
+    bytes: &[u8],
+    lease: u64,
+    display: u64,
+) -> Result<bool, &'static str> {
+    check(bytes, STATE_BYTES)?;
+    let count = read_u32(bytes, 24) as usize;
+    if count > 16 || read_u32(bytes, 16) > 16 || read_u32(bytes, 20) > 16 {
+        return Err("invalid_driver_response");
+    }
+    let mut found = None;
+    for index in 0..count {
+        let offset = 32 + 104 * index;
+        if read_u32(bytes, offset) == 2 && read_u64(bytes, offset + 16) == display {
+            if found.is_some() {
+                return Err("invalid_driver_response");
+            }
+            found = Some(read_u64(bytes, offset + 8));
+        }
+    }
+    Ok(found.is_some_and(|found_lease| found_lease != lease))
 }
 
 pub fn matches_specification(
@@ -281,6 +312,8 @@ mod tests {
         put_u32(&mut state, 100, spec.refresh_millihz);
         state[104..111].copy_from_slice(b"Example");
         assert!(present(&state, 7, 8).unwrap());
+        assert!(occupied_by_other_lease(&state, 9, 8).unwrap());
+        assert!(!occupied_by_other_lease(&state, 7, 8).unwrap());
         assert!(matches_specification(&state, 7, 8, &spec).unwrap());
         state[104] = b'X';
         assert!(!matches_specification(&state, 7, 8, &spec).unwrap());
