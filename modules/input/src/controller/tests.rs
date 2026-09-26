@@ -26,6 +26,7 @@ struct FakeBackend {
     failed_pen_touch_events: Vec<(u32, PenTouchPhase)>,
     controller_input_supported: bool,
     effective_gamepad_profile: Option<&'static str>,
+    gamepad_unavailable_reason: Option<&'static str>,
     gamepad_profile: GamepadProfile,
     ds4_back_as_touchpad_click: bool,
     back_button_timeout_ms: i32,
@@ -62,6 +63,9 @@ impl Backend for FakeBackend {
     }
     fn effective_gamepad_profile(&self) -> Option<&'static str> {
         self.effective_gamepad_profile
+    }
+    fn gamepad_unavailable_reason(&self) -> Option<&str> {
+        self.gamepad_unavailable_reason
     }
     fn key_encoding(&self) -> &'static str {
         "test_only"
@@ -912,6 +916,100 @@ fn controller_capability_is_present_in_status_and_active_lease_responses() {
     assert_eq!(status["controller_input"], true);
     assert_eq!(status["effective_gamepad_profile"], "x360");
     assert_eq!(status["supported_profiles"][0], "auto");
+}
+
+#[test]
+fn active_gamepad_readback_tracks_recovery_without_changing_lease_identity() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            gamepad_unavailable_reason: Some("bus unavailable"),
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let operation = || {
+        let mut request = acquire_operation();
+        if let Operation::Acquire {
+            operation_id,
+            gamepad,
+            ..
+        } = &mut request
+        {
+            *operation_id = Some("reconnecting-gamepad".into());
+            *gamepad = Some(GamepadProfile::X360);
+        }
+        request
+    };
+    let acquired = controller.handle("owner", operation(), now, &mut || Ok(()));
+    let first_token = acquired["lease"].as_str().unwrap().to_owned();
+    assert_eq!(acquired["gamepad_profile"], "x360");
+    assert_eq!(acquired["controller_input"], false);
+    assert_eq!(acquired["effective_gamepad_profile"], Value::Null);
+    assert_eq!(acquired["gamepad_unavailable_reason"], "bus unavailable");
+
+    controller.backend.controller_input_supported = true;
+    controller.backend.effective_gamepad_profile = Some("x360");
+    controller.backend.gamepad_unavailable_reason = None;
+    let recovered = controller.handle("owner", operation(), now, &mut || Ok(()));
+    let lookup = controller.handle(
+        "owner",
+        Operation::Lookup {
+            operation_id: "reconnecting-gamepad".into(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    let status = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
+    for readback in [&recovered, &lookup] {
+        assert_eq!(readback["lease"], first_token);
+        assert_eq!(readback["gamepad_profile"], "x360");
+        assert_eq!(readback["controller_input"], true);
+        assert_eq!(readback["effective_gamepad_profile"], "x360");
+        assert_eq!(readback["gamepad_unavailable_reason"], Value::Null);
+    }
+    assert_eq!(status["effective_gamepad_profile"], "x360");
+    assert_eq!(status["lease"]["effective_gamepad_profile"], "x360");
+    assert_eq!(status["lease"]["gamepad_unavailable_reason"], Value::Null);
+
+    controller.backend.controller_input_supported = false;
+    controller.backend.effective_gamepad_profile = None;
+    controller.backend.gamepad_unavailable_reason = Some("bus lost");
+    let lost = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
+    assert_eq!(lost["controller_input"], false);
+    assert_eq!(lost["effective_gamepad_profile"], Value::Null);
+    assert_eq!(lost["lease"]["gamepad_unavailable_reason"], "bus lost");
+    let other = controller.handle("other", Operation::Status, now, &mut || Ok(()));
+    assert_eq!(other["lease"]["token"], Value::Null);
+    assert_eq!(other["lease"]["operation_id"], Value::Null);
+    let other_lookup = controller.handle(
+        "other",
+        Operation::Lookup {
+            operation_id: "reconnecting-gamepad".into(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(other_lookup["error"]["code"], "not_found");
+
+    assert_eq!(
+        controller.handle(
+            "owner",
+            Operation::Release {
+                lease: first_token.clone(),
+            },
+            now,
+            &mut || Ok(()),
+        )["released"],
+        true
+    );
+    controller.backend.controller_input_supported = true;
+    controller.backend.effective_gamepad_profile = Some("x360");
+    controller.backend.gamepad_unavailable_reason = None;
+    let reacquired = controller.handle("owner", acquire_operation(), now, &mut || Ok(()));
+    assert_ne!(reacquired["lease"], first_token);
+    assert_eq!(reacquired["effective_gamepad_profile"], "x360");
+    assert_eq!(reacquired["gamepad_profile"], "auto");
 }
 
 #[test]

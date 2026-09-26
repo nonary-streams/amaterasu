@@ -61,8 +61,6 @@ struct Lease {
     termination_reason: Option<&'static str>,
     key_encoding: Option<KeyEncoding>,
     gamepad_profile: GamepadProfile,
-    effective_gamepad_profile: Option<&'static str>,
-    gamepad_unavailable_reason: Option<String>,
 }
 
 struct TerminalAcquire {
@@ -618,14 +616,7 @@ impl<B: Backend> Controller<B> {
                 {
                     return Err(operation_conflict());
                 }
-                return Ok(active_lease(
-                    lease,
-                    now,
-                    self.backend.name(),
-                    self.backend.absolute_pointer(),
-                    self.backend.controller_input_supported(),
-                    self.backend.pen_touch_supported(),
-                ));
+                return Ok(active_lease(lease, now, &self.backend));
             }
             if let Some(terminal) = self
                 .terminal_acquires
@@ -753,19 +744,11 @@ impl<B: Backend> Controller<B> {
             key_encoding: None,
             gamepad_profile,
             ds4_back_as_touchpad_click,
-            effective_gamepad_profile: self.backend.effective_gamepad_profile(),
-            gamepad_unavailable_reason: self
-                .backend
-                .gamepad_unavailable_reason()
-                .map(str::to_owned),
         });
         Ok(active_lease(
             self.lease.as_ref().expect("new input lease"),
             now,
-            self.backend.name(),
-            self.backend.absolute_pointer(),
-            self.backend.controller_input_supported(),
-            self.backend.pen_touch_supported(),
+            &self.backend,
         ))
     }
 
@@ -774,14 +757,7 @@ impl<B: Backend> Controller<B> {
         if let Some(lease) = self.lease.as_ref().filter(|lease| {
             lease.owner == caller && lease.operation_id.as_deref() == Some(operation_id)
         }) {
-            return Ok(active_lease(
-                lease,
-                now,
-                self.backend.name(),
-                self.backend.absolute_pointer(),
-                self.backend.controller_input_supported(),
-                self.backend.pen_touch_supported(),
-            ));
+            return Ok(active_lease(lease, now, &self.backend));
         }
         if let Some(terminal) = self
             .terminal_acquires
@@ -1372,14 +1348,8 @@ impl<B: Backend> Controller<B> {
         Ok(())
     }
     fn status(&self, caller: &str, now: Instant) -> Value {
-        let effective_gamepad_profile = match self.lease.as_ref() {
-            Some(lease) => lease.effective_gamepad_profile,
-            None => self.backend.effective_gamepad_profile(),
-        };
-        let gamepad_unavailable_reason = match self.lease.as_ref() {
-            Some(lease) => lease.gamepad_unavailable_reason.as_deref(),
-            None => self.backend.gamepad_unavailable_reason(),
-        };
+        let effective_gamepad_profile = self.backend.effective_gamepad_profile();
+        let gamepad_unavailable_reason = self.backend.gamepad_unavailable_reason();
         let lease = self.lease.as_ref().map(|lease| {
             let owned = lease.owner == caller;
             json!({
@@ -1400,8 +1370,8 @@ impl<B: Backend> Controller<B> {
                 "gamepad_profile":lease.gamepad_profile.as_str(),
                 "ds4_back_as_touchpad_click":lease.requested_ds4_back_as_touchpad_click.unwrap_or(lease.ds4_back_as_touchpad_click),
                 "native_pen_touch":lease.native_pen_touch,
-                "effective_gamepad_profile":lease.effective_gamepad_profile,
-                "gamepad_unavailable_reason":lease.gamepad_unavailable_reason,
+                "effective_gamepad_profile":effective_gamepad_profile,
+                "gamepad_unavailable_reason":gamepad_unavailable_reason,
             })
         });
         json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"startup_cleanup_required":self.startup_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,"native_pen_touch":self.native_pen_touch,"pen_touch_supported":self.backend.pen_touch_supported(),"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
@@ -1423,14 +1393,7 @@ impl<B: Backend> Drop for Controller<B> {
     }
 }
 
-fn active_lease(
-    lease: &Lease,
-    now: Instant,
-    backend: &str,
-    absolute_pointer: bool,
-    controller_input: bool,
-    pen_touch_supported: bool,
-) -> Value {
+fn active_lease<B: Backend>(lease: &Lease, now: Instant, backend: &B) -> Value {
     json!({
         "ok": true,
         "state": "active",
@@ -1444,15 +1407,15 @@ fn active_lease(
         "key_repeat_delay": lease.requested_key_repeat_delay,
         "key_repeat_frequency": lease.requested_key_repeat_frequency,
         "expires_in_ms": lease.expires.saturating_duration_since(now).as_millis() as u64,
-        "backend": backend,
-        "absolute_pointer": absolute_pointer,
-        "controller_input": controller_input,
-        "pen_touch_supported": pen_touch_supported,
+        "backend": backend.name(),
+        "absolute_pointer": backend.absolute_pointer(),
+        "controller_input": backend.controller_input_supported(),
+        "pen_touch_supported": backend.pen_touch_supported(),
         "gamepad_profile": lease.gamepad_profile.as_str(),
         "ds4_back_as_touchpad_click": lease.ds4_back_as_touchpad_click,
         "native_pen_touch": lease.native_pen_touch,
-        "effective_gamepad_profile": lease.effective_gamepad_profile,
-        "gamepad_unavailable_reason": lease.gamepad_unavailable_reason,
+        "effective_gamepad_profile": backend.effective_gamepad_profile(),
+        "gamepad_unavailable_reason": backend.gamepad_unavailable_reason(),
         "cleanup_required": lease.cleanup_required,
     })
 }
