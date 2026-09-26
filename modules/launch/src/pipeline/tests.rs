@@ -1043,6 +1043,8 @@ fn display_preflight_treats_absent_and_null_as_sparse_and_rejects_bad_catalog_va
         json!(17),
         json!("unknown"),
         json!({"mixed":[{"requested_fps":22}]}),
+        json!({"mixed":[{}]}),
+        json!({"mixed":[{"requested_fps":"59.94","final_resolution":"1920x1080"}]}),
     ] {
         let mut harness = Harness::new();
         harness.catalog_config_overrides = Some(json!({"dd_mode_remapping":invalid}));

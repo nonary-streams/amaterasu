@@ -365,21 +365,7 @@ fn valid_display_overrides(
                 width.parse::<u32>().is_err() || height.parse::<u32>().is_err()
             })
         })
-        || manual_refresh_rate.is_some_and(|value| {
-            value.len() > 64
-                || (!value.trim().is_empty() && {
-                    let value = value.trim();
-                    value.split_once('.').map_or_else(
-                        || !value.bytes().all(|byte| byte.is_ascii_digit()),
-                        |(whole, fraction)| {
-                            whole.is_empty()
-                                || fraction.is_empty()
-                                || !whole.bytes().all(|byte| byte.is_ascii_digit())
-                                || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-                        },
-                    )
-                })
-        })
+        || manual_refresh_rate.is_some_and(|value| !valid_manual_refresh_rate(value))
     {
         return false;
     }
@@ -399,7 +385,7 @@ fn valid_display_overrides(
     {
         return false;
     }
-    groups.values().all(|group| {
+    groups.iter().all(|(kind, group)| {
         group.as_array().is_some_and(|entries| {
             entries.len() <= 128
                 && entries.iter().all(|entry| {
@@ -416,10 +402,124 @@ fn valid_display_overrides(
                                     text.len() <= 64 && !text.chars().any(char::is_control)
                                 })
                             })
+                            && valid_remapping_entry(kind, fields)
                     })
                 })
         })
     })
+}
+
+fn valid_remapping_entry(kind: &str, fields: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let field = |name| {
+        fields
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let final_resolution = field("final_resolution");
+    let final_refresh_rate = field("final_refresh_rate");
+    valid_remapping_resolution(field("requested_resolution"))
+        && valid_remapping_resolution(final_resolution)
+        && valid_remapping_rate(field("requested_fps"), false)
+        && valid_remapping_rate(final_refresh_rate, true)
+        && match kind {
+            "mixed" => !final_resolution.trim().is_empty() || !final_refresh_rate.trim().is_empty(),
+            "resolution_only" => !final_resolution.trim().is_empty(),
+            "refresh_rate_only" => !final_refresh_rate.trim().is_empty(),
+            _ => false,
+        }
+}
+
+fn valid_remapping_resolution(value: &str) -> bool {
+    let value = value.trim().replace('×', "x");
+    if value.is_empty() {
+        return true;
+    }
+    value.split_once('x').is_some_and(|(width, height)| {
+        !width.is_empty()
+            && !height.is_empty()
+            && width.bytes().all(|byte| byte.is_ascii_digit())
+            && height.bytes().all(|byte| byte.is_ascii_digit())
+            && width.parse::<u32>().is_ok()
+            && height.parse::<u32>().is_ok()
+    })
+}
+
+fn valid_remapping_rate(value: &str, allow_fraction: bool) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return true;
+    }
+    let Some((whole, fraction)) = value.split_once('.') else {
+        return value.bytes().all(|byte| byte.is_ascii_digit()) && value.parse::<u32>().is_ok();
+    };
+    if !allow_fraction
+        || whole.is_empty()
+        || fraction.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        return whole.parse::<u32>().is_ok();
+    }
+    format!("{whole}{fraction}").parse::<u32>().is_ok()
+        && u32::try_from(fraction.len())
+            .ok()
+            .and_then(|length| 10_u32.checked_pow(length))
+            .is_some()
+}
+
+fn valid_manual_refresh_rate(value: &str) -> bool {
+    if value.len() > 64 {
+        return false;
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return true;
+    }
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || (!fraction.is_empty() && !fraction.bytes().all(|byte| byte.is_ascii_digit()))
+        || (value.contains('.') && fraction.is_empty())
+    {
+        return false;
+    }
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let Ok(integer) = whole.parse::<u32>() else {
+        return false;
+    };
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        return true;
+    }
+    if fraction.len() > 31 {
+        return false;
+    }
+    let (Ok(numerator), Some(denominator)) = (
+        fraction.parse::<u128>(),
+        10_u128.checked_pow(fraction.len() as u32),
+    ) else {
+        return false;
+    };
+    let mut left = numerator;
+    let mut right = denominator;
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    let numerator = numerator / left;
+    let denominator = denominator / left;
+    u32::try_from(denominator).is_ok()
+        && u128::from(integer)
+            .checked_mul(denominator)
+            .and_then(|scaled| scaled.checked_add(numerator))
+            .is_some_and(|combined| u32::try_from(combined).is_ok())
 }
 
 fn valid_millihertz_value(value: f64) -> bool {
@@ -938,6 +1038,40 @@ pub fn parse_id(id: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn display_remapping_requires_resolver_usable_final_values_and_tokens() {
+        for rules in [
+            json!({"mixed":[{}]}),
+            json!({"resolution_only":[{"final_refresh_rate":"60"}]}),
+            json!({"refresh_rate_only":[{"final_resolution":"1920x1080"}]}),
+            json!({"mixed":[{"requested_fps":"59.94","final_resolution":"1920x1080"}]}),
+            json!({"mixed":[{"requested_resolution":"bad","final_resolution":"1920x1080"}]}),
+            json!({"mixed":[{"final_refresh_rate":"4294967296"}]}),
+        ] {
+            let overrides: ConfigOverrides =
+                serde_json::from_value(json!({"dd_mode_remapping":rules})).unwrap();
+            assert!(overrides.validate().is_err());
+        }
+        let valid: ConfigOverrides = serde_json::from_value(json!({
+            "dd_mode_remapping":{"mixed":[{"requested_fps":"60","final_resolution":"1920x1080","final_refresh_rate":"59.94"}]}
+        })).unwrap();
+        valid.validate().unwrap();
+    }
+
+    #[test]
+    fn manual_refresh_rate_requires_an_exact_representable_rational() {
+        for rate in ["0.0000000001", "4294967296", "59.1234567890", "1."] {
+            let overrides: ConfigOverrides =
+                serde_json::from_value(json!({"dd_manual_refresh_rate":rate})).unwrap();
+            assert!(overrides.validate().is_err(), "{rate}");
+        }
+        for rate in ["", "59.94", "60", "00060.000"] {
+            let overrides: ConfigOverrides =
+                serde_json::from_value(json!({"dd_manual_refresh_rate":rate})).unwrap();
+            overrides.validate().unwrap();
+        }
+    }
 
     #[test]
     fn stream_audio_override_preserves_absence_false_and_existing_fec() {
