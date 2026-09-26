@@ -307,6 +307,7 @@ namespace Amaterasu {
       back_button_timeout: number;
       gamepad: string;
       controller: boolean;
+      ds4_back_as_touchpad_click: boolean;
       native_pen_touch: boolean;
     };
   }

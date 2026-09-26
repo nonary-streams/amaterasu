@@ -612,7 +612,7 @@ namespace Amaterasu {
     selectableGamepadProfiles: readonly string[] = ["auto"],
     controllerEnabled: boolean = true,
     nativePenTouch: boolean = true,
-  ): InputPolicySettings["values"] {
+  ): Omit<InputPolicySettings["values"], "ds4_back_as_touchpad_click"> {
     if (
       typeof keyboard !== "boolean" ||
       typeof mouse !== "boolean" ||
@@ -647,6 +647,125 @@ namespace Amaterasu {
       controller: controllerEnabled,
       native_pen_touch: nativePenTouch,
     };
+  }
+
+  const recognizedInputGamepadProfiles = [
+    "auto", "x360", "vhf", "vhf_xbox", "vhf_xbox_one", "vhf_ds4", "vhf_ds5", "vhf_switch",
+    "ds4", "xone", "ds5", "switch",
+  ];
+
+  export function parseInputPolicySettingsReply(value: unknown): InputPolicySettings {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Input policy settings reply is invalid.");
+    const reply = value as Record<string, unknown>;
+    if (reply.ok !== true || reply.persisted !== true ||
+        typeof reply.applied !== "boolean" || typeof reply.cleanup_required !== "boolean" ||
+        !Number.isSafeInteger(reply.revision) || (reply.revision as number) < 0 ||
+        !reply.values || typeof reply.values !== "object" || Array.isArray(reply.values))
+      throw new Error("Input policy settings reply is invalid.");
+    const values = reply.values as Record<string, unknown>;
+    if (typeof values.ds4_back_as_touchpad_click !== "boolean")
+      throw new Error("Input policy settings reply omitted the DS4 back button policy.");
+    const parsed = {
+      ...parseInputPolicy(
+        values.keyboard as boolean,
+        values.mouse as boolean,
+        values.high_resolution_scrolling as boolean,
+        values.always_send_scancodes as boolean,
+        values.key_rightalt_to_key_win as boolean,
+        values.key_repeat_delay as number,
+        values.key_repeat_frequency as number,
+        values.back_button_timeout as number,
+        values.gamepad as string,
+        recognizedInputGamepadProfiles,
+        values.controller as boolean,
+        values.native_pen_touch as boolean,
+      ),
+      ds4_back_as_touchpad_click: values.ds4_back_as_touchpad_click,
+    };
+    if (!sameConfigurationValue(values, parsed))
+      throw new Error("Input policy settings reply contains unexpected values.");
+    return {
+      ok: true,
+      persisted: true,
+      applied: reply.applied as boolean,
+      cleanup_required: reply.cleanup_required as boolean,
+      revision: reply.revision as number,
+      values: parsed,
+    };
+  }
+
+  export async function saveInputPolicySettings(
+    api: Pick<Api, "post">,
+    current: InputPolicySettings,
+    values: InputPolicySettings["values"],
+  ): Promise<InputPolicySettings> {
+    if (!Number.isSafeInteger(current.revision) || current.revision < 0 ||
+        current.revision >= Number.MAX_SAFE_INTEGER)
+      throw new Error("Input policy settings revision is invalid.");
+    const confirms = (reply: InputPolicySettings): boolean =>
+      reply.revision === current.revision + 1 && sameConfigurationValue(reply.values, values);
+    try {
+      const updated = parseInputPolicySettingsReply(await api.post<unknown>("input/settings_update", {
+        ...values,
+        expected_revision: current.revision,
+      }));
+      if (!confirms(updated))
+        throw new Error("Input policy update could not be confirmed. Refresh and check the current values.");
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.code !== "cleanup_pending") throw error;
+    }
+    const saved = parseInputPolicySettingsReply(await api.post<unknown>("input/settings_get"));
+    if (!confirms(saved))
+      throw new Error("Input policy settings could not be confirmed after saving. Refresh and check the current values.");
+    return saved;
+  }
+
+  function parseInputRuntimeStatus(value: unknown): InputRuntimeStatus {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Input runtime status is invalid.");
+    const status = value as Record<string, unknown>;
+    if (status.ok !== true || typeof status.gamepad !== "string" ||
+        !Array.isArray(status.supported_profiles) ||
+        !status.supported_profiles.every((profile) => typeof profile === "string") ||
+        !Array.isArray(status.recognized_profiles) ||
+        !status.recognized_profiles.every((profile) => typeof profile === "string") ||
+        typeof status.controller_input !== "boolean" ||
+        typeof status.controller_enabled !== "boolean" ||
+        typeof status.controller_cleanup_required !== "boolean" ||
+        (status.lease !== null && (!status.lease || typeof status.lease !== "object" || Array.isArray(status.lease))) ||
+        (status.gamepad_unavailable_reason !== null && typeof status.gamepad_unavailable_reason !== "string"))
+      throw new Error("Input runtime status is invalid.");
+    return status as unknown as InputRuntimeStatus;
+  }
+
+  export class InputPolicyLoadGate {
+    private generation = 0;
+
+    invalidate(): void {
+      this.generation += 1;
+    }
+
+    async read(api: Pick<Api, "post">): Promise<{
+      settings: InputPolicySettings;
+      runtime: InputRuntimeStatus | null;
+    } | null> {
+      const generation = ++this.generation;
+      try {
+        const settings = parseInputPolicySettingsReply(await api.post<unknown>("input/settings_get"));
+        if (generation !== this.generation) return null;
+        let runtime: InputRuntimeStatus | null = null;
+        try {
+          runtime = parseInputRuntimeStatus(await api.post<unknown>("input/status"));
+        } catch {
+          // Configuration remains editable when dynamic runtime status is unavailable.
+        }
+        return generation === this.generation ? { settings, runtime } : null;
+      } catch (error) {
+        if (generation !== this.generation) return null;
+        throw error;
+      }
+    }
   }
 
   export interface GamepadProfileChoice {
@@ -689,7 +808,7 @@ namespace Amaterasu {
 
   export function inputGamepadStatusDescription(
     selectedProfile: string,
-    status: InputRuntimeStatus,
+    status: InputRuntimeStatus | null,
   ): string {
     if (!status || !Array.isArray(status.supported_profiles))
       return "Current gamepad backend status is unavailable.";
@@ -759,6 +878,20 @@ namespace Amaterasu {
     if (!settings.applied || settings.cleanup_required)
       return "The saved policy is active for new events, but cleanup of held native input is still pending.";
     return "The saved keyboard, mouse, and gamepad policy is active.";
+  }
+
+  export function inputPolicyRuntimeDescription(
+    settings: InputPolicySettings,
+    runtime: InputRuntimeStatus | null,
+  ): string {
+    if (runtime === null)
+      return "Saved input policy confirmed. Runtime status is unavailable; application is not confirmed.";
+    if (runtime.gamepad !== settings.values.gamepad ||
+        runtime.controller_enabled !== settings.values.controller)
+      return "Saved input policy confirmed, but runtime has not reported the selected gamepad and controller policy.";
+    if (runtime.controller_cleanup_required || settings.cleanup_required || !settings.applied)
+      return "Saved input policy confirmed; releasing held native input is still pending.";
+    return inputPolicyStatusDescription(settings);
   }
 
   function safeNvhttpBindFamily(value: string): "ipv4" | "ipv6" | null {
@@ -1477,6 +1610,7 @@ namespace Amaterasu {
     const playniteArea = el("div");
     const playniteLoads = new PlayniteSettingsLoadGate();
     const inputArea = el("div");
+    const inputLoads = new InputPolicyLoadGate();
     const historyArea = el("div");
     const historyLoads = new HistorySettingsLoadGate();
     const pairingArea = el("div");
@@ -2514,10 +2648,9 @@ namespace Amaterasu {
     async function loadInput(): Promise<void> {
       inputArea.replaceChildren(el("p", "muted", "Loading input policy…"));
       try {
-        const [settings, runtimeStatus] = await Promise.all([
-          context.api.post<InputPolicySettings>("input/settings_get"),
-          context.api.post<InputRuntimeStatus>("input/status"),
-        ]);
+        const loaded = await inputLoads.read(context.api);
+        if (loaded === null) return;
+        const { settings, runtime: runtimeStatus } = loaded;
         if (!context.content.isConnected) return;
         const form = el("form", "settings-form");
         const keyboard = input("input_keyboard", "", "checkbox");
@@ -2526,6 +2659,8 @@ namespace Amaterasu {
         mouse.checked = settings.values.mouse;
         const controller = input("input_controller", "", "checkbox");
         controller.checked = settings.values.controller;
+        const ds4BackAsTouchpadClick = input("input_ds4_back_as_touchpad_click", "", "checkbox");
+        ds4BackAsTouchpadClick.checked = settings.values.ds4_back_as_touchpad_click;
         const nativePenTouch = input("input_native_pen_touch", "", "checkbox");
         nativePenTouch.checked = settings.values.native_pen_touch;
         const highResolutionScrolling = input(
@@ -2576,8 +2711,8 @@ namespace Amaterasu {
         gamepadProfile.name = "input_gamepad_profile";
         const gamepadProfileChoices = inputGamepadProfileChoices(
           settings.values.gamepad,
-          runtimeStatus.supported_profiles,
-          runtimeStatus.recognized_profiles,
+          runtimeStatus?.supported_profiles ?? ["auto"],
+          runtimeStatus?.recognized_profiles ?? recognizedInputGamepadProfiles,
         );
         for (const choice of gamepadProfileChoices) {
           const option = el("option", "", choice.label);
@@ -2587,10 +2722,11 @@ namespace Amaterasu {
         gamepadProfile.value = settings.values.gamepad;
         const selectedGamepadUnavailable =
           settings.values.controller &&
-          (!runtimeStatus.supported_profiles.includes(settings.values.gamepad) ||
-            (runtimeStatus.lease !== null &&
-              runtimeStatus.gamepad === settings.values.gamepad &&
-              !runtimeStatus.controller_input));
+          (runtimeStatus !== null &&
+            (!runtimeStatus.supported_profiles.includes(settings.values.gamepad) ||
+              (runtimeStatus.lease !== null &&
+                runtimeStatus.gamepad === settings.values.gamepad &&
+                !runtimeStatus.controller_input)));
         const gamepadStatus = el(
           "p",
           selectedGamepadUnavailable ? "error" : "muted",
@@ -2598,8 +2734,9 @@ namespace Amaterasu {
         );
         const status = el(
           "p",
-          settings.applied ? "muted" : "error",
-          inputPolicyStatusDescription(settings),
+          settings.applied && runtimeStatus !== null && !runtimeStatus.controller_cleanup_required
+            ? "muted" : "error",
+          inputPolicyRuntimeDescription(settings, runtimeStatus),
         );
         const save = el("button", "button primary", "Save input policy");
         save.type = "submit";
@@ -2619,6 +2756,11 @@ namespace Amaterasu {
             "Controller input",
             controller,
             "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue.",
+          ),
+          field(
+            "DS4 Back as touchpad click",
+            ds4BackAsTouchpadClick,
+            "For the DS4 profile, maps Back to a touchpad click when that backend supports it. The preference stays saved if the selected backend cannot apply it.",
           ),
           field(
             "Native pen and touch policy",
@@ -2667,40 +2809,42 @@ namespace Amaterasu {
         form.addEventListener("submit", (event) => {
           event.preventDefault();
           void runAction(save, status, async () => {
+            inputLoads.invalidate();
+            let saveStarted = false;
             try {
-              const updated = await context.api.post<InputPolicySettings>(
-                "input/settings_update",
-                {
-                  ...parseInputPolicy(
-                    keyboard.checked,
-                    mouse.checked,
-                    highResolutionScrolling.checked,
-                    alwaysSendScancodes.checked,
-                    keyRightAltToKeyWin.checked,
-                    keyRepeatDelay.valueAsNumber,
-                    keyRepeatFrequency.valueAsNumber,
-                    backButtonTimeout.valueAsNumber,
-                    gamepadProfile.value,
-                    gamepadProfileChoices.map((choice) => choice.value),
-                    controller.checked,
-                    nativePenTouch.checked,
-                  ),
-                  expected_revision: settings.revision,
-                },
-              );
-              context.notify(
-                updated.applied
-                  ? "Input policy saved and applied."
-                  : "Input policy saved; native cleanup is pending.",
-              );
+              const values = {
+                ...parseInputPolicy(
+                  keyboard.checked,
+                  mouse.checked,
+                  highResolutionScrolling.checked,
+                  alwaysSendScancodes.checked,
+                  keyRightAltToKeyWin.checked,
+                  keyRepeatDelay.valueAsNumber,
+                  keyRepeatFrequency.valueAsNumber,
+                  backButtonTimeout.valueAsNumber,
+                  gamepadProfile.value,
+                  gamepadProfileChoices.map((choice) => choice.value),
+                  controller.checked,
+                  nativePenTouch.checked,
+                ),
+                ds4_back_as_touchpad_click: ds4BackAsTouchpadClick.checked,
+              };
+              saveStarted = true;
+              const saved = await saveInputPolicySettings(context.api, settings, values);
+              await loadInput();
+              context.notify(saved.applied && !saved.cleanup_required
+                ? "Input policy saved and confirmed. Runtime status is shown below."
+                : "Input policy saved and confirmed; releasing held native input is pending.");
             } catch (error) {
-              if (!(error instanceof ApiError) || error.code !== "cleanup_pending")
-                throw error;
-              context.notify(
-                "Input policy was saved, but releasing held native input is pending.",
-              );
+              if (saveStarted) {
+                await loadInput();
+                context.notify(error instanceof ApiError && error.code === "revision_conflict"
+                  ? "Input policy changed elsewhere. Review the latest values before saving again."
+                  : "Input policy save could not be confirmed. Review the latest values before saving again.");
+                return;
+              }
+              throw error;
             }
-            await loadInput();
           });
         });
         inputArea.replaceChildren(panel("Input policy", form));

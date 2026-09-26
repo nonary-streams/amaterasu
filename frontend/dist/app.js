@@ -2616,6 +2616,105 @@ var Amaterasu;
         };
     }
     Amaterasu.parseInputPolicy = parseInputPolicy;
+    const recognizedInputGamepadProfiles = [
+        "auto", "x360", "vhf", "vhf_xbox", "vhf_xbox_one", "vhf_ds4", "vhf_ds5", "vhf_switch",
+        "ds4", "xone", "ds5", "switch",
+    ];
+    function parseInputPolicySettingsReply(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Input policy settings reply is invalid.");
+        const reply = value;
+        if (reply.ok !== true || reply.persisted !== true ||
+            typeof reply.applied !== "boolean" || typeof reply.cleanup_required !== "boolean" ||
+            !Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
+            !reply.values || typeof reply.values !== "object" || Array.isArray(reply.values))
+            throw new Error("Input policy settings reply is invalid.");
+        const values = reply.values;
+        if (typeof values.ds4_back_as_touchpad_click !== "boolean")
+            throw new Error("Input policy settings reply omitted the DS4 back button policy.");
+        const parsed = {
+            ...parseInputPolicy(values.keyboard, values.mouse, values.high_resolution_scrolling, values.always_send_scancodes, values.key_rightalt_to_key_win, values.key_repeat_delay, values.key_repeat_frequency, values.back_button_timeout, values.gamepad, recognizedInputGamepadProfiles, values.controller, values.native_pen_touch),
+            ds4_back_as_touchpad_click: values.ds4_back_as_touchpad_click,
+        };
+        if (!sameConfigurationValue(values, parsed))
+            throw new Error("Input policy settings reply contains unexpected values.");
+        return {
+            ok: true,
+            persisted: true,
+            applied: reply.applied,
+            cleanup_required: reply.cleanup_required,
+            revision: reply.revision,
+            values: parsed,
+        };
+    }
+    Amaterasu.parseInputPolicySettingsReply = parseInputPolicySettingsReply;
+    async function saveInputPolicySettings(api, current, values) {
+        if (!Number.isSafeInteger(current.revision) || current.revision < 0 ||
+            current.revision >= Number.MAX_SAFE_INTEGER)
+            throw new Error("Input policy settings revision is invalid.");
+        const confirms = (reply) => reply.revision === current.revision + 1 && sameConfigurationValue(reply.values, values);
+        try {
+            const updated = parseInputPolicySettingsReply(await api.post("input/settings_update", {
+                ...values,
+                expected_revision: current.revision,
+            }));
+            if (!confirms(updated))
+                throw new Error("Input policy update could not be confirmed. Refresh and check the current values.");
+        }
+        catch (error) {
+            if (!(error instanceof Amaterasu.ApiError) || error.code !== "cleanup_pending")
+                throw error;
+        }
+        const saved = parseInputPolicySettingsReply(await api.post("input/settings_get"));
+        if (!confirms(saved))
+            throw new Error("Input policy settings could not be confirmed after saving. Refresh and check the current values.");
+        return saved;
+    }
+    Amaterasu.saveInputPolicySettings = saveInputPolicySettings;
+    function parseInputRuntimeStatus(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Input runtime status is invalid.");
+        const status = value;
+        if (status.ok !== true || typeof status.gamepad !== "string" ||
+            !Array.isArray(status.supported_profiles) ||
+            !status.supported_profiles.every((profile) => typeof profile === "string") ||
+            !Array.isArray(status.recognized_profiles) ||
+            !status.recognized_profiles.every((profile) => typeof profile === "string") ||
+            typeof status.controller_input !== "boolean" ||
+            typeof status.controller_enabled !== "boolean" ||
+            typeof status.controller_cleanup_required !== "boolean" ||
+            (status.lease !== null && (!status.lease || typeof status.lease !== "object" || Array.isArray(status.lease))) ||
+            (status.gamepad_unavailable_reason !== null && typeof status.gamepad_unavailable_reason !== "string"))
+            throw new Error("Input runtime status is invalid.");
+        return status;
+    }
+    class InputPolicyLoadGate {
+        generation = 0;
+        invalidate() {
+            this.generation += 1;
+        }
+        async read(api) {
+            const generation = ++this.generation;
+            try {
+                const settings = parseInputPolicySettingsReply(await api.post("input/settings_get"));
+                if (generation !== this.generation)
+                    return null;
+                let runtime = null;
+                try {
+                    runtime = parseInputRuntimeStatus(await api.post("input/status"));
+                }
+                catch {
+                }
+                return generation === this.generation ? { settings, runtime } : null;
+            }
+            catch (error) {
+                if (generation !== this.generation)
+                    return null;
+                throw error;
+            }
+        }
+    }
+    Amaterasu.InputPolicyLoadGate = InputPolicyLoadGate;
     function inputGamepadProfileChoices(selectedProfile, supportedProfiles, recognizedProfiles = supportedProfiles) {
         if (typeof selectedProfile !== "string" ||
             !Array.isArray(supportedProfiles) ||
@@ -2708,6 +2807,17 @@ var Amaterasu;
         return "The saved keyboard, mouse, and gamepad policy is active.";
     }
     Amaterasu.inputPolicyStatusDescription = inputPolicyStatusDescription;
+    function inputPolicyRuntimeDescription(settings, runtime) {
+        if (runtime === null)
+            return "Saved input policy confirmed. Runtime status is unavailable; application is not confirmed.";
+        if (runtime.gamepad !== settings.values.gamepad ||
+            runtime.controller_enabled !== settings.values.controller)
+            return "Saved input policy confirmed, but runtime has not reported the selected gamepad and controller policy.";
+        if (runtime.controller_cleanup_required || settings.cleanup_required || !settings.applied)
+            return "Saved input policy confirmed; releasing held native input is still pending.";
+        return inputPolicyStatusDescription(settings);
+    }
+    Amaterasu.inputPolicyRuntimeDescription = inputPolicyRuntimeDescription;
     function safeNvhttpBindFamily(value) {
         if (value === "")
             return null;
@@ -3355,6 +3465,7 @@ var Amaterasu;
         const playniteArea = Amaterasu.el("div");
         const playniteLoads = new PlayniteSettingsLoadGate();
         const inputArea = Amaterasu.el("div");
+        const inputLoads = new InputPolicyLoadGate();
         const historyArea = Amaterasu.el("div");
         const historyLoads = new HistorySettingsLoadGate();
         const pairingArea = Amaterasu.el("div");
@@ -4012,10 +4123,10 @@ var Amaterasu;
         async function loadInput() {
             inputArea.replaceChildren(Amaterasu.el("p", "muted", "Loading input policy…"));
             try {
-                const [settings, runtimeStatus] = await Promise.all([
-                    context.api.post("input/settings_get"),
-                    context.api.post("input/status"),
-                ]);
+                const loaded = await inputLoads.read(context.api);
+                if (loaded === null)
+                    return;
+                const { settings, runtime: runtimeStatus } = loaded;
                 if (!context.content.isConnected)
                     return;
                 const form = Amaterasu.el("form", "settings-form");
@@ -4025,6 +4136,8 @@ var Amaterasu;
                 mouse.checked = settings.values.mouse;
                 const controller = Amaterasu.input("input_controller", "", "checkbox");
                 controller.checked = settings.values.controller;
+                const ds4BackAsTouchpadClick = Amaterasu.input("input_ds4_back_as_touchpad_click", "", "checkbox");
+                ds4BackAsTouchpadClick.checked = settings.values.ds4_back_as_touchpad_click;
                 const nativePenTouch = Amaterasu.input("input_native_pen_touch", "", "checkbox");
                 nativePenTouch.checked = settings.values.native_pen_touch;
                 const highResolutionScrolling = Amaterasu.input("input_high_resolution_scrolling", "", "checkbox");
@@ -4049,7 +4162,7 @@ var Amaterasu;
                 backButtonTimeout.step = "1";
                 const gamepadProfile = Amaterasu.el("select");
                 gamepadProfile.name = "input_gamepad_profile";
-                const gamepadProfileChoices = inputGamepadProfileChoices(settings.values.gamepad, runtimeStatus.supported_profiles, runtimeStatus.recognized_profiles);
+                const gamepadProfileChoices = inputGamepadProfileChoices(settings.values.gamepad, runtimeStatus?.supported_profiles ?? ["auto"], runtimeStatus?.recognized_profiles ?? recognizedInputGamepadProfiles);
                 for (const choice of gamepadProfileChoices) {
                     const option = Amaterasu.el("option", "", choice.label);
                     option.value = choice.value;
@@ -4057,34 +4170,45 @@ var Amaterasu;
                 }
                 gamepadProfile.value = settings.values.gamepad;
                 const selectedGamepadUnavailable = settings.values.controller &&
-                    (!runtimeStatus.supported_profiles.includes(settings.values.gamepad) ||
-                        (runtimeStatus.lease !== null &&
-                            runtimeStatus.gamepad === settings.values.gamepad &&
-                            !runtimeStatus.controller_input));
+                    (runtimeStatus !== null &&
+                        (!runtimeStatus.supported_profiles.includes(settings.values.gamepad) ||
+                            (runtimeStatus.lease !== null &&
+                                runtimeStatus.gamepad === settings.values.gamepad &&
+                                !runtimeStatus.controller_input)));
                 const gamepadStatus = Amaterasu.el("p", selectedGamepadUnavailable ? "error" : "muted", inputGamepadStatusDescription(settings.values.gamepad, runtimeStatus));
-                const status = Amaterasu.el("p", settings.applied ? "muted" : "error", inputPolicyStatusDescription(settings));
+                const status = Amaterasu.el("p", settings.applied && runtimeStatus !== null && !runtimeStatus.controller_cleanup_required
+                    ? "muted" : "error", inputPolicyRuntimeDescription(settings, runtimeStatus));
                 const save = Amaterasu.el("button", "button primary", "Save input policy");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("Controller input", controller, "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue."), Amaterasu.field("Native pen and touch policy", nativePenTouch, "Windows-only global preference. Native pen/touch event transport and platform support are not implemented; saving this value does not activate pen or touch events."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux and Windows, when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other platforms do not inject gamepads."), Amaterasu.field("Gamepad profile", gamepadProfile, "Profiles listed by input status are supported by this backend. A saved platform-recognized profile outside that list remains visible and is labeled unavailable."), gamepadStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("Controller input", controller, "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue."), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick, "For the DS4 profile, maps Back to a touchpad click when that backend supports it. The preference stays saved if the selected backend cannot apply it."), Amaterasu.field("Native pen and touch policy", nativePenTouch, "Windows-only global preference. Native pen/touch event transport and platform support are not implemented; saving this value does not activate pen or touch events."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux and Windows, when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other platforms do not inject gamepads."), Amaterasu.field("Gamepad profile", gamepadProfile, "Profiles listed by input status are supported by this backend. A saved platform-recognized profile outside that list remains visible and is labeled unavailable."), gamepadStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
+                        inputLoads.invalidate();
+                        let saveStarted = false;
                         try {
-                            const updated = await context.api.post("input/settings_update", {
+                            const values = {
                                 ...parseInputPolicy(keyboard.checked, mouse.checked, highResolutionScrolling.checked, alwaysSendScancodes.checked, keyRightAltToKeyWin.checked, keyRepeatDelay.valueAsNumber, keyRepeatFrequency.valueAsNumber, backButtonTimeout.valueAsNumber, gamepadProfile.value, gamepadProfileChoices.map((choice) => choice.value), controller.checked, nativePenTouch.checked),
-                                expected_revision: settings.revision,
-                            });
-                            context.notify(updated.applied
-                                ? "Input policy saved and applied."
-                                : "Input policy saved; native cleanup is pending.");
+                                ds4_back_as_touchpad_click: ds4BackAsTouchpadClick.checked,
+                            };
+                            saveStarted = true;
+                            const saved = await saveInputPolicySettings(context.api, settings, values);
+                            await loadInput();
+                            context.notify(saved.applied && !saved.cleanup_required
+                                ? "Input policy saved and confirmed. Runtime status is shown below."
+                                : "Input policy saved and confirmed; releasing held native input is pending.");
                         }
                         catch (error) {
-                            if (!(error instanceof Amaterasu.ApiError) || error.code !== "cleanup_pending")
-                                throw error;
-                            context.notify("Input policy was saved, but releasing held native input is pending.");
+                            if (saveStarted) {
+                                await loadInput();
+                                context.notify(error instanceof Amaterasu.ApiError && error.code === "revision_conflict"
+                                    ? "Input policy changed elsewhere. Review the latest values before saving again."
+                                    : "Input policy save could not be confirmed. Review the latest values before saving again.");
+                                return;
+                            }
+                            throw error;
                         }
-                        await loadInput();
                     });
                 });
                 inputArea.replaceChildren(Amaterasu.panel("Input policy", form));

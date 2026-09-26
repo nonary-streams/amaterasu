@@ -935,6 +935,232 @@ test("Playnite save confirms the signed update and exact durable settings", asyn
   assert.deepEqual(calls, ["playnite/settings_update", "playnite/settings"]);
 });
 
+const inputSettingsValues = () => ({
+  keyboard: true, mouse: true, controller: true,
+  high_resolution_scrolling: true, always_send_scancodes: true,
+  key_rightalt_to_key_win: false, key_repeat_delay: 500,
+  key_repeat_frequency: 24.9, back_button_timeout: -1,
+  gamepad: "auto", ds4_back_as_touchpad_click: false, native_pen_touch: true,
+});
+
+test("input policy confirms complete signed update and durable GET at revision plus one", async () => {
+  const current = {
+    ok: true, persisted: true, applied: true, cleanup_required: false,
+    revision: 7, values: inputSettingsValues(),
+  };
+  const requested = { ...current.values, keyboard: false, key_repeat_delay: 0 };
+  const confirmed = { ...current, revision: 8, values: requested };
+  const routes = [];
+  const api = { async post(route, body) {
+    routes.push(route);
+    if (route === "input/settings_update")
+      assert.deepEqual(ordinary(body), { ...requested, expected_revision: 7 });
+    else assert.equal(route, "input/settings_get");
+    return confirmed;
+  } };
+  assert.deepEqual(ordinary(await context.Amaterasu.saveInputPolicySettings(api, current, requested)), confirmed);
+  assert.deepEqual(routes, ["input/settings_update", "input/settings_get"]);
+});
+
+test("input policy rejects changed unrelated values, malformed replies and concurrent readback", async () => {
+  const current = {
+    ok: true, persisted: true, applied: true, cleanup_required: false,
+    revision: 7, values: inputSettingsValues(),
+  };
+  const requested = { ...current.values, keyboard: false };
+  const confirmed = { ...current, revision: 8, values: requested };
+  for (const update of [
+    { ...confirmed, revision: 9 },
+    { ...confirmed, values: { ...requested, ds4_back_as_touchpad_click: true } },
+    { ...confirmed, values: { ...requested, unknown: true } },
+    { ...confirmed, ok: false },
+  ]) {
+    const routes = [];
+    await assert.rejects(context.Amaterasu.saveInputPolicySettings({ async post(route) {
+      routes.push(route);
+      return update;
+    } }, current, requested));
+    assert.deepEqual(routes, ["input/settings_update"]);
+  }
+  for (const readback of [
+    { ...confirmed, revision: 9 },
+    { ...confirmed, values: { ...requested, controller: false } },
+    { ...confirmed, values: { ...requested, ds4_back_as_touchpad_click: true } },
+  ]) {
+    await assert.rejects(context.Amaterasu.saveInputPolicySettings({ async post(route) {
+      return route === "input/settings_update" ? confirmed : readback;
+    } }, current, requested));
+  }
+});
+
+test("input cleanup_pending requires exact durable GET before reporting saved policy", async () => {
+  class ApiError extends Error { constructor(code) { super(code); this.code = code; } }
+  context.ApiError = ApiError;
+  const current = {
+    ok: true, persisted: true, applied: true, cleanup_required: false,
+    revision: 7, values: inputSettingsValues(),
+  };
+  const requested = { ...current.values, controller: false };
+  const pending = { ...current, revision: 8, applied: false,
+    cleanup_required: true, values: requested };
+  const api = (readback) => ({ async post(route) {
+    if (route === "input/settings_update") throw new ApiError("cleanup_pending");
+    assert.equal(route, "input/settings_get");
+    return readback;
+  } });
+  assert.deepEqual(ordinary(await context.Amaterasu.saveInputPolicySettings(
+    api(pending), current, requested)), pending);
+  assert.match(context.Amaterasu.inputPolicyRuntimeDescription(pending, {
+    gamepad: "auto", controller_enabled: false, controller_cleanup_required: true,
+  }), /pending/);
+  for (const readback of [
+    { ...pending, revision: 7 },
+    { ...pending, values: { ...requested, ds4_back_as_touchpad_click: true } },
+    { ...pending, persisted: false },
+  ]) {
+    await assert.rejects(context.Amaterasu.saveInputPolicySettings(
+      api(readback), current, requested));
+  }
+});
+
+test("input settings load discards old GET/status and permits status failure", async () => {
+  const gate = new context.Amaterasu.InputPolicyLoadGate();
+  const settings = { ok: true, persisted: true, applied: true, cleanup_required: false,
+    revision: 7, values: inputSettingsValues() };
+  let resolveOld;
+  const old = gate.read({ post: () => new Promise((resolve) => { resolveOld = resolve; }) });
+  const fresh = gate.read({ async post(route) {
+    if (route === "input/settings_get") return { ...settings, revision: 8 };
+    throw new Error("status unavailable");
+  } });
+  resolveOld(settings);
+  assert.equal(await old, null);
+  const current = await fresh;
+  assert.equal(current.settings.revision, 8);
+  assert.equal(current.runtime, null);
+  const malformed = await gate.read({ async post(route) {
+    return route === "input/settings_get" ? settings : { ok: true, supported_profiles: "auto" };
+  } });
+  assert.equal(malformed.runtime, null);
+  let resolveStatus;
+  const waiting = gate.read({ async post(route) {
+    if (route === "input/settings_get") return settings;
+    return new Promise((resolve) => { resolveStatus = resolve; });
+  } });
+  await new Promise(setImmediate);
+  gate.invalidate();
+  resolveStatus({ gamepad: "auto" });
+  assert.equal(await waiting, null);
+});
+
+test("input form confirms cleanup-pending save, then reloads after a revision conflict", async () => {
+  class Element {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.listeners = new Map();
+      this.isConnected = false;
+      this.value = "";
+    }
+    setConnected(value) {
+      this.isConnected = value;
+      for (const child of this.children) child?.setConnected?.(value);
+    }
+    append(...children) {
+      for (const child of children) {
+        if (child == null) continue;
+        this.children.push(child);
+        child?.setConnected?.(this.isConnected);
+      }
+    }
+    replaceChildren(...children) {
+      for (const child of this.children) child?.setConnected?.(false);
+      this.children = [];
+      this.append(...children);
+    }
+    addEventListener(name, callback) { this.listeners.set(name, callback); }
+    setAttribute() {}
+    reportValidity() { return true; }
+    setCustomValidity() {}
+    get options() { return this.children.filter((child) => child?.tagName === "option"); }
+    get valueAsNumber() { return Number(this.value); }
+    get textContent() {
+      return this.children.map((child) => typeof child === "string" ? child : child.textContent).join("");
+    }
+    set textContent(value) { this.replaceChildren(value); }
+    fire(name, event) { this.listeners.get(name)?.(event); }
+  }
+  const find = (node, predicate) => {
+    if (predicate(node)) return node;
+    for (const child of node.children ?? []) {
+      if (typeof child === "string") continue;
+      const result = find(child, predicate);
+      if (result) return result;
+    }
+    return null;
+  };
+  const dom = vm.createContext({
+    TextEncoder, URL, Error,
+    document: { createElement: (name) => new Element(name) },
+  });
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/settings.ts"]) {
+    vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
+      target: ts.ScriptTarget.ES2022,
+    }), dom);
+    vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+  }
+  class ApiError extends Error { constructor(code) { super(code); this.code = code; } }
+  dom.ApiError = ApiError;
+  const content = new Element("main");
+  content.setConnected(true);
+  const notices = [];
+  let stored = { ok: true, persisted: true, applied: true, cleanup_required: false,
+    revision: 7, values: inputSettingsValues() };
+  let updates = 0;
+  let secondSubmittedRevision;
+  dom.Amaterasu.renderSettings({
+    content,
+    notify: (message) => notices.push(message),
+    api: {
+      allows: (scope) => scope === "configuration.write",
+      async post(route, body) {
+        if (route === "input/settings_get") return stored;
+        if (route === "input/status") throw new Error("dynamic status unavailable");
+        if (route === "input/settings_update") {
+          updates += 1;
+          if (updates === 2) {
+            secondSubmittedRevision = body.expected_revision;
+            stored = { ...stored, revision: 9 };
+            throw new ApiError("revision_conflict");
+          }
+          stored = { ...stored, revision: 8, applied: false,
+            cleanup_required: true, values: { ...body } };
+          delete stored.values.expected_revision;
+          throw new ApiError("cleanup_pending");
+        }
+        throw new Error(`unavailable: ${route}`);
+      },
+    },
+  });
+  await new Promise(setImmediate);
+  const inputArea = content.children[8];
+  const oldForm = find(inputArea, (node) => node.tagName === "form");
+  assert.ok(oldForm);
+  assert.equal(find(oldForm, (node) => node.name === "input_ds4_back_as_touchpad_click").checked, false);
+  oldForm.fire("submit", { preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(oldForm.isConnected, false);
+  assert.match(inputArea.textContent, /Revision 8/);
+  assert.match(notices.at(-1), /saved and confirmed.*pending/);
+  assert.match(inputArea.textContent, /Runtime status is unavailable/);
+  const freshForm = find(inputArea, (node) => node.tagName === "form");
+  freshForm.fire("submit", { preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(secondSubmittedRevision, 8);
+  assert.match(inputArea.textContent, /Revision 9/);
+  assert.match(notices.at(-1), /changed elsewhere/);
+});
+
 test("Playnite save rejects mismatched replies, unrelated values and revision drift", async () => {
   const values = {
     enabled: true, auto_sync: true, sync_all_installed: false,
