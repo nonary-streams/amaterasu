@@ -263,6 +263,10 @@ fn run_capture_loop<F>(
     F: FnMut() -> AudioResult<Box<dyn CaptureDevice>>,
 {
     let mut continuity = Continuity::new();
+    // A capture that opens but fails before delivering PCM has not recovered.
+    // Keep the retry delay across those immediate losses to avoid spinning on
+    // an endpoint that accepts activation but cannot capture yet.
+    let mut recovery_without_packet = false;
     set_active_endpoint(health, capture.endpoint());
     while !stop.load(Ordering::Acquire) {
         match capture.read() {
@@ -274,6 +278,7 @@ fn run_capture_loop<F>(
                 if !enqueue(sender, health, packet) {
                     break;
                 }
+                recovery_without_packet = false;
             }
             Ok(None) => thread::park_timeout(POLL_INTERVAL),
             Err(error)
@@ -284,7 +289,8 @@ fn run_capture_loop<F>(
                 set_recovering(health, true);
                 continuity.begin_recovery();
                 drop(capture);
-                let mut retry_immediately = true;
+                let mut retry_immediately = !recovery_without_packet;
+                recovery_without_packet = true;
                 loop {
                     if stop.load(Ordering::Acquire) {
                         return;
@@ -633,6 +639,106 @@ mod tests {
         assert_ne!(recovered.flags & AUDIO_DISCONTINUITY, 0);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(!health.lock().unwrap().recovering);
+    }
+
+    #[test]
+    fn reopened_capture_that_loses_device_without_pcm_waits_before_reopening_again() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let initial = FakeCapture::new(format, [Err("device_lost")]);
+        let (sender, _packets) = mpsc::sync_channel(1);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let runner = thread::spawn({
+            let health = health.clone();
+            let stop = stop.clone();
+            let attempts = attempts.clone();
+            let drops = drops.clone();
+            move || {
+                run_capture_loop(
+                    Box::new(initial),
+                    move || {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok(Box::new(
+                            FakeCapture::new(format, [Err("device_lost")])
+                                .with_drop_counter(drops.clone()),
+                        ) as Box<dyn CaptureDevice>)
+                    },
+                    &sender,
+                    &health,
+                    &stop,
+                    RecoveryPolicy {
+                        expected_endpoint: "render.fixed".into(),
+                        expected_format: format,
+                        follow_console_default: false,
+                        retry_delay: Duration::from_secs(30),
+                    },
+                );
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while drops.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        // The next open would happen almost immediately without the backoff.
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(health.lock().unwrap().recovering);
+        stop.store(true, Ordering::Release);
+        runner.thread().unpark();
+        runner.join().unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn recovered_pcm_allows_next_device_loss_to_reopen_immediately() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let initial = FakeCapture::new(format, [Err("device_lost")]);
+        let (sender, packets) = mpsc::sync_channel(2);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runner = thread::spawn({
+            let health = health.clone();
+            let stop = stop.clone();
+            let attempts = attempts.clone();
+            move || {
+                run_capture_loop(
+                    Box::new(initial),
+                    move || {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        let events = if attempt == 0 {
+                            vec![Ok(Some(packet(1_000, 0))), Err("device_lost")]
+                        } else {
+                            vec![Ok(Some(packet(0, 0)))]
+                        };
+                        Ok(Box::new(FakeCapture::new(format, events)) as Box<dyn CaptureDevice>)
+                    },
+                    &sender,
+                    &health,
+                    &stop,
+                    RecoveryPolicy {
+                        expected_endpoint: "render.fixed".into(),
+                        expected_format: format,
+                        follow_console_default: false,
+                        retry_delay: Duration::from_secs(30),
+                    },
+                );
+            }
+        });
+
+        let first = packets.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = packets.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop.store(true, Ordering::Release);
+        runner.thread().unpark();
+        runner.join().unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!((first.sequence, second.sequence), (0, 1));
+        assert!(second.timestamp_us > first.timestamp_us);
+        assert_ne!(second.flags & AUDIO_DISCONTINUITY, 0);
     }
 
     #[test]
