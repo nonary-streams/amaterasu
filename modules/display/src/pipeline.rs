@@ -18,6 +18,11 @@ struct Incoming {
     context: Context,
     operation: Operation,
 }
+struct PrepareIntent {
+    expected_topology_revision: Option<String>,
+    operation_id: Option<String>,
+    topology_change: bool,
+}
 struct Pending {
     context: Context,
     state_request: u64,
@@ -135,9 +140,7 @@ impl<P: Platform> Pipeline<P> {
             mode_policies,
             ..
         } = &incoming.operation
-            && (mode_policy
-                .as_ref()
-                .is_some_and(|policy| policy.configuration_option.is_some())
+            && (mode_policy.is_some() && mode_policies.is_some()
                 || mode_policies.as_ref().is_some_and(|policies| {
                     policies
                         .iter()
@@ -148,8 +151,8 @@ impl<P: Platform> Pipeline<P> {
                 send,
                 incoming.context.request,
                 failure(
-                    "unsupported_configuration_option",
-                    "topology-changing configuration options require provider runtime support",
+                    "invalid_request",
+                    "configuration options require one selected mode_policy",
                 ),
             );
         }
@@ -407,6 +410,51 @@ impl<P: Platform> Pipeline<P> {
                         ),
                     );
                 }
+                let topology_option = mode_policy
+                    .as_ref()
+                    .and_then(|policy| policy.configuration_option);
+                let topology_change = matches!(
+                    topology_option,
+                    Some(
+                        DisplayConfigurationOption::EnsureActive
+                            | DisplayConfigurationOption::EnsurePrimary
+                            | DisplayConfigurationOption::EnsureOnlyDisplay
+                    )
+                );
+                if topology_change {
+                    let Some(expected) = expected_topology_revision.as_deref() else {
+                        return complete(
+                            send,
+                            context.request,
+                            failure(
+                                "invalid_request",
+                                "topology-changing configuration option requires expected_topology_revision",
+                            ),
+                        );
+                    };
+                    let snapshot = match self.platform.snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => return complete(send, context.request, error.payload()),
+                    };
+                    if snapshot.revision().as_ref().ok().map(String::as_str) != Some(expected) {
+                        return complete(
+                            send,
+                            context.request,
+                            failure(
+                                "topology_changed",
+                                "active display topology changed before configuration option",
+                            ),
+                        );
+                    }
+                    configuration = match compose_configuration(
+                        &configuration,
+                        &snapshot,
+                        mode_policy.as_ref().expect("topology policy exists"),
+                    ) {
+                        Ok(configuration) => configuration,
+                        Err(error) => return complete(send, context.request, error.payload()),
+                    };
+                }
                 let singular_policy = mode_policies.is_none();
                 let policies =
                     match collect_mode_policies(&configuration, mode_policy, mode_policies) {
@@ -438,8 +486,11 @@ impl<P: Platform> Pipeline<P> {
                     context,
                     revision,
                     configuration,
-                    expected_topology_revision,
-                    operation_id,
+                    PrepareIntent {
+                        expected_topology_revision,
+                        operation_id,
+                        topology_change,
+                    },
                     send,
                 )
             }
@@ -486,10 +537,14 @@ impl<P: Platform> Pipeline<P> {
         context: Context,
         revision: u64,
         configuration: Configuration,
-        expected_topology_revision: Option<String>,
-        operation_id: Option<String>,
+        intent: PrepareIntent,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        let PrepareIntent {
+            expected_topology_revision,
+            operation_id,
+            topology_change,
+        } = intent;
         if let Err(error) = configuration.validate() {
             return complete(send, context.request, error.payload());
         }
@@ -508,10 +563,13 @@ impl<P: Platform> Pipeline<P> {
                     ),
                 );
             }
-            if let Err(error) = snapshot
-                .configuration()
-                .and_then(|_| validate_active_ids(&configuration, &snapshot))
-            {
+            if let Err(error) = snapshot.configuration().and_then(|_| {
+                if topology_change {
+                    Ok(())
+                } else {
+                    validate_active_ids(&configuration, &snapshot)
+                }
+            }) {
                 return complete(send, context.request, error.payload());
             }
         }
@@ -657,6 +715,68 @@ fn read_only_apply<P: Platform>(
         ));
     }
     Ok(json!({"ok":true,"applied":false,"verified":true,"configuration_option":"verify_only"}))
+}
+fn compose_configuration(
+    requested: &Configuration,
+    snapshot: &Snapshot,
+    policy: &crate::model::ModePolicy,
+) -> DisplayResult<Configuration> {
+    requested.validate()?;
+    let active = snapshot.configuration()?;
+    let mut selected = requested
+        .displays
+        .iter()
+        .find(|display| display.id.eq_ignore_ascii_case(&policy.display_id))
+        .cloned()
+        .ok_or_else(|| {
+            DisplayError::new(
+                "invalid_request",
+                "selected display is absent from configuration",
+            )
+        })?;
+    let existing = active
+        .displays
+        .iter()
+        .position(|display| display.id.eq_ignore_ascii_case(&selected.id));
+    // The classic CCD request builder recreates every supplied native path.
+    // Only a single selected path or an intentionally selected-only topology
+    // can currently be changed without rewriting untouched paths.
+    let configuration = match policy.configuration_option {
+        Some(
+            DisplayConfigurationOption::EnsureActive | DisplayConfigurationOption::EnsurePrimary,
+        ) if existing.is_some() && active.displays.len() == 1 => {
+            selected.x = 0;
+            selected.y = 0;
+            Configuration {
+                displays: vec![selected],
+            }
+        }
+        Some(DisplayConfigurationOption::EnsureOnlyDisplay) if existing.is_some() => {
+            selected.x = 0;
+            selected.y = 0;
+            Configuration {
+                displays: vec![selected],
+            }
+        }
+        Some(
+            DisplayConfigurationOption::EnsureActive
+            | DisplayConfigurationOption::EnsurePrimary
+            | DisplayConfigurationOption::EnsureOnlyDisplay,
+        ) => {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "preserving untouched native routes or binding an inactive target requires a dedicated transition builder",
+            ));
+        }
+        _ => {
+            return Err(DisplayError::new(
+                "invalid_request",
+                "configuration option does not change topology",
+            ));
+        }
+    };
+    configuration.validate()?;
+    Ok(configuration)
 }
 fn validate_active_ids(configuration: &Configuration, snapshot: &Snapshot) -> DisplayResult<()> {
     let requested: BTreeSet<_> = configuration

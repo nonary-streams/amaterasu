@@ -128,8 +128,14 @@ A single `mode_policy` may include `configuration_option`. `disabled` returns
 without a state-service request or native effect. `verify_only` reads the
 coherent active topology and requires its selected display to be active;
 neither option resolves mode/HDR policy, creates a lease, or requires mutation
-startup permission. Mutating `ensure_*` options require a separate runtime
-implementation before clients may rely on them.
+startup permission. Mutating options require `expected_topology_revision` and
+use the durable Apply/restore journal. `ensure_only_display` accepts an active
+selected target, applies it at the origin, and disables all other active paths.
+`ensure_active` and `ensure_primary` currently accept only an already active
+sole target. Inactive targets and multi-monitor preservation for those options
+return `unsupported_topology` before journaling. The selected path uses the
+existing CCD Apply contract, including its requested 32bpp mode and preferred
+scaling; unchanged native path preservation remains unimplemented.
 
 `status` returns native support, startup mutation policy, `state` (`idle`, `leased`
 or `recovery_required`), `owned_by_caller`, and the lease and operation ID only to its owner. After a
