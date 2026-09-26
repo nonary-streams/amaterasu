@@ -1365,6 +1365,11 @@ def main():
             )
             assert status == 200 and updated_host_configuration["ok"], updated_host_configuration
             assert updated_host_configuration["revision"] == 1, updated_host_configuration
+            assert updated_host_configuration["logging"] == {
+                "saved_revision": 1,
+                "applied_revision": 1,
+                "status": "applied",
+            }, updated_host_configuration
             deadline = time.monotonic() + 20
             while True:
                 logging_status = console.request("amaterasu.diagnostics/1", {
@@ -1376,6 +1381,7 @@ def main():
                     break
                 assert time.monotonic() < deadline, logging_status
                 time.sleep(0.05)
+            assert logging_status["logging_configuration_revision"] == 1, logging_status
             assert console.request("amaterasu.diagnostics/1", {
                 "action": "record", "level": "info", "target": "integration",
                 "message": "filtered parity log record",
