@@ -195,10 +195,6 @@ impl SessionHistory {
         }
     }
 
-    pub(super) fn started(&self) -> bool {
-        self.started_at_unix.is_some()
-    }
-
     pub(super) fn queued_request(
         &self,
         owner: &str,

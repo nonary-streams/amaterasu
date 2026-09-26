@@ -25,6 +25,7 @@ struct Reservation {
     release_callers: Vec<u64>,
     release_requested: bool,
     release_requested_at: Option<u64>,
+    completed_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -100,6 +101,7 @@ impl HistoryActivities {
                 release_callers: Vec::new(),
                 release_requested: false,
                 release_requested_at: None,
+                completed_at: None,
             },
         );
     }
@@ -193,15 +195,23 @@ impl HistoryActivities {
         for (activity_id, entry) in &mut self.entries {
             let attached_active = records.values().any(|record| {
                 record.config.history_activity_id.as_deref() == Some(activity_id)
-                    && record.history.started()
+                    && (!record.state.terminal() || record.history.has_work())
             });
-            if !attached_active
-                && now.saturating_sub(entry.began_at) >= RESERVATION_MS
-                && matches!(entry.phase, Phase::Beginning(_) | Phase::Reserved)
-            {
-                if let Phase::Beginning(pending) = &mut entry.phase {
-                    let _ = pending.shutdown(send);
-                }
+            let attached = records
+                .values()
+                .any(|record| record.config.history_activity_id.as_deref() == Some(activity_id));
+            if attached && !attached_active {
+                entry.completed_at.get_or_insert(now);
+            }
+            let expired = if attached {
+                entry
+                    .completed_at
+                    .is_some_and(|completed| now.saturating_sub(completed) >= RESERVATION_MS)
+            } else {
+                now.saturating_sub(entry.began_at) >= RESERVATION_MS
+            };
+            if expired && matches!(entry.phase, Phase::Beginning(_) | Phase::Reserved) {
+                entry.release_requested = true;
                 for request in entry.callers.drain(..) {
                     rpc::complete(
                         send,
@@ -216,13 +226,33 @@ impl HistoryActivities {
                         super::error("history_activity_end_unconfirmed"),
                     );
                 }
-                entry.phase = Phase::Ending(activity_request(activity_id, false));
-                entry.retry_at = now;
+                let begin_settled = if let Phase::Beginning(pending) = &mut entry.phase {
+                    pending.shutdown(send)
+                } else {
+                    true
+                };
+                if begin_settled {
+                    entry.phase = Phase::Ending(activity_request(activity_id, false));
+                    entry.retry_at = now;
+                }
+                // Otherwise keep polling the original Begin until settlement.
+                // End must not overtake a late Begin.
             }
-            if !attached_active
-                && now.saturating_sub(entry.began_at) >= RESERVATION_MS * 2
-                && matches!(entry.phase, Phase::Ending(_))
-            {
+            let cleanup_expired = if attached {
+                entry
+                    .completed_at
+                    .is_some_and(|completed| now.saturating_sub(completed) >= RESERVATION_MS * 2)
+            } else {
+                now.saturating_sub(entry.began_at) >= RESERVATION_MS * 2
+            };
+            if !attached_active && cleanup_expired && matches!(entry.phase, Phase::Ending(_)) {
+                for request in entry.release_callers.drain(..) {
+                    rpc::complete(
+                        send,
+                        request,
+                        super::error("history_activity_end_unconfirmed"),
+                    );
+                }
                 entry.phase = Phase::CleanupExpired;
                 entry.terminal_at.get_or_insert(now);
                 continue;

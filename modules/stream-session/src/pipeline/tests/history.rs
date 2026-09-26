@@ -141,7 +141,7 @@ fn active_activity_outlives_pending_ttl_and_release_waits_for_history_end() {
         host.response_from(3, "amaterasu.rtsp", start(session))["state"],
         "active"
     );
-    host.now += 300_100;
+    host.now += 600_100;
     host.tick();
     assert!(host.broker.history_activities.contains(activity));
     assert_eq!(
@@ -274,6 +274,136 @@ fn pending_end_timeout_is_not_reported_as_confirmed_release() {
         "activity_id":activity,"rtsp_operation_id":activity})
         )["released"],
         false
+    );
+}
+
+#[test]
+fn unresolved_begin_is_settled_before_expiry_end() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    host.broker.history_pending_polls = usize::MAX;
+    host.broker.fail_cancel = true;
+    let activity = "rtsp-delayed-begin";
+    host.broker.enqueue(
+        1,
+        "amaterasu.nvhttp",
+        json!({"action":"reserve_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity}),
+    );
+    host.tick();
+    host.tick();
+    host.now += 300_001;
+    host.tick();
+    assert_eq!(host.broker.replies.remove(&1).unwrap()["reserved"], false);
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .any(|call| call.payload["action"] == "stream_activity_begin")
+    );
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.payload["action"] == "stream_activity_end")
+    );
+    host.broker.fail_cancel = false;
+    host.broker.history_pending_polls = 0;
+    host.idle();
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .any(|call| call.payload["action"] == "stream_activity_end")
+    );
+    assert!(host.broker.history_activities.is_empty());
+}
+
+#[test]
+fn completed_stream_without_explicit_release_frees_bounded_reservation_slot() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let activity = "rtsp-completed";
+    assert_eq!(
+        host.response_from(
+            1,
+            "amaterasu.nvhttp",
+            json!({"action":"reserve_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity})
+        )["reserved"],
+        true
+    );
+    let mut tagged = prepare();
+    tagged["history_activity_id"] = json!(activity);
+    tagged["rtsp_operation_id"] = json!(activity);
+    let session = host.response_from(2, "amaterasu.rtsp", tagged)["session"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        host.response_from(3, "amaterasu.rtsp", start(session))["state"],
+        "active"
+    );
+    host.idle();
+    assert_eq!(
+        host.response_from(
+            4,
+            "amaterasu.rtsp",
+            json!({"action":"stop","session":session})
+        )["state"],
+        "stopped"
+    );
+    host.idle();
+    host.now += 300_001;
+    host.tick();
+    host.idle();
+    assert!(
+        host.broker
+            .history_activity_ends
+            .iter()
+            .any(|call| call["session_id"] == activity)
+    );
+    host.now += 300_001;
+    host.tick();
+    assert!(
+        !host
+            .pipeline
+            .history_activities
+            .matches(activity, activity, host.now)
+    );
+}
+
+#[test]
+fn expired_end_does_not_strand_waiting_release_caller() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    let activity = "rtsp-expired-end";
+    assert_eq!(
+        host.response_from(
+            1,
+            "amaterasu.nvhttp",
+            json!({"action":"reserve_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity})
+        )["reserved"],
+        true
+    );
+    host.broker.history_pending_polls = usize::MAX;
+    host.broker.enqueue(
+        2,
+        "amaterasu.nvhttp",
+        json!({"action":"release_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity}),
+    );
+    host.tick();
+    host.now += 600_001;
+    host.tick();
+    assert_eq!(
+        host.broker.replies.remove(&2).unwrap()["code"],
+        "history_activity_end_unconfirmed"
     );
 }
 
