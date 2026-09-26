@@ -1136,6 +1136,82 @@ fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() 
 }
 
 #[test]
+fn preflight_keeps_target_and_sparse_limiter_policy_together_after_catalog_edit() {
+    let mut harness = Harness::new();
+    let mut original_policy = json!({"frame_limiter_enable":false});
+    if cfg!(windows) {
+        original_policy["rtss_frame_limit_type"] = json!("back edge sync");
+    }
+    harness.catalog_config_overrides = Some(original_policy.clone());
+    let mut pipeline = pipeline();
+    let operation_id = "frozen-target-and-policy";
+    let preflight = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        json!({"action":"preflight_export","operation_id":operation_id,"app_id":"app-0000000000000001"}),
+    );
+    assert_eq!(preflight["config_overrides"], original_policy);
+    assert!(preflight["executable_path"].is_string());
+
+    let mut launch = launch_export(operation_id);
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["frame_limiter_settings"] = frame_limiter_snapshot();
+    launch["frame_limiter_settings"]["settings"]["frame_limiter_enable"] = json!(false);
+    let mut client_overrides = json!({"frame_limiter_enable":null});
+    if cfg!(windows) {
+        launch["frame_limiter_settings"]["settings"]["rtss_frame_limit_type"] =
+            json!("back edge sync");
+        launch["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"] = json!(true);
+        client_overrides["rtss_frame_limit_type"] = Value::Null;
+    }
+    launch["client_frame_limiter_overrides"] = client_overrides.clone();
+
+    harness.catalog_playnite_game_id = Some("later-game".into());
+    harness.catalog_config_overrides = Some(json!({"frame_limiter_enable":true}));
+    let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone());
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    assert_eq!(started["launch"]["config_overrides"], original_policy);
+    assert_eq!(
+        started["launch"]["executable_path"],
+        preflight["executable_path"]
+    );
+    assert_eq!(
+        started["launch"]["frame_limiter_settings"],
+        launch["frame_limiter_settings"]
+    );
+    assert_eq!(
+        started["launch"]["client_frame_limiter_overrides"],
+        client_overrides
+    );
+    assert!(harness.provider_launches.is_empty());
+    assert_eq!(harness.processes.len(), 1);
+    assert_eq!(
+        harness
+            .commands
+            .iter()
+            .filter(|(service, _, _)| service == crate::workflow::CATALOG)
+            .count(),
+        1
+    );
+    let launch_id = started["launch"]["launch_id"].clone();
+    for readback in [
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch),
+        harness.request(
+            &mut pipeline,
+            "amaterasu.nvhttp",
+            json!({"action":"status","launch_id":launch_id}),
+        ),
+        harness.request(
+            &mut pipeline,
+            "amaterasu.nvhttp",
+            json!({"action":"lookup","operation_id":operation_id}),
+        ),
+    ] {
+        assert_eq!(readback, started);
+    }
+}
+
+#[test]
 fn display_export_is_bound_to_frozen_catalog_policy_and_retained_on_retry() {
     let mut harness = Harness::new();
     let display = json!({
