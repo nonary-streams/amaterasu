@@ -1,12 +1,22 @@
 """Cheap source-level contracts for the tracked Windows installer definition."""
 
+import hashlib
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCT = (ROOT / "installer" / "Product.wxs").read_text(encoding="utf-8")
 BUNDLE = (ROOT / "installer" / "Bundle.wxs").read_text(encoding="utf-8")
 BUILD = (ROOT / "installer" / "build-installer.ps1").read_text(encoding="utf-8")
+PLAYNITE_HASHES = {
+    "extension.yaml": "0E3507A22AC5C24F1E0573CAAFF52F572BC1AF9C1C18270905B2694EBFEBA72D",
+    "AmaterasuPlaynite.psm1": "264D97199DCC36E772E739DA9B2E4311A27C9350D9436AE2BB647D1572EE1715",
+}
 MIGRATION = (ROOT / "crates" / "package" / "src" / "migration.rs").read_text(encoding="utf-8")
 MIGRATION_TESTS = (
     ROOT / "crates" / "package" / "src" / "migration" / "tests.rs"
@@ -180,6 +190,145 @@ def test_build_is_tracked_and_uses_stable_harvest_guids():
     assert 'if ([string]::IsNullOrWhiteSpace($OutputDirectory))' in BUILD
 
 
+def test_playnite_extension_is_one_msi_owned_pair_under_program_files():
+    namespace = {"w": "http://schemas.microsoft.com/wix/2006/wi"}
+    product = ET.fromstring(PRODUCT)
+    program_files = product.find(".//w:Directory[@Id='ProgramFiles64Folder']", namespace)
+    install_folder = program_files.find("w:Directory[@Id='INSTALLFOLDER']", namespace)
+    assert install_folder.attrib["Name"] == "Amaterasu"
+    installed_files = product.find(".//w:DirectoryRef[@Id='INSTALLFOLDER']", namespace)
+    extension = installed_files.find("w:Directory[@Id='PLAYNITEEXTENSION']", namespace)
+    assert extension.attrib["Name"] == "playnite-extension"
+    components = extension.findall("w:Component", namespace)
+    assert len(components) == 1
+    component = components[0]
+    assert component.attrib["Id"] == "PlayniteExtensionFiles"
+    assert component.attrib["Guid"] == "*"
+    assert component.attrib["Win64"] == "yes"
+    files = component.findall("w:File", namespace)
+    assert {item.attrib["Name"] for item in files} == set(PLAYNITE_HASHES)
+    assert sum(item.attrib.get("KeyPath") == "yes" for item in files) == 1
+    for item in files:
+        assert item.attrib["Source"] == (
+            "$(var.StageDir)\\playnite-extension\\" + item.attrib["Name"]
+        )
+    feature = product.find(".//w:Feature[@Id='ProductFeature']", namespace)
+    assert len(feature.findall("w:ComponentRef[@Id='PlayniteExtensionFiles']", namespace)) == 1
+    assert product.find(".//w:MajorUpgrade", namespace).attrib["Schedule"] == "afterInstallInitialize"
+    host = installed_files.find("w:Component[@Id='HostExecutable']", namespace)
+    assert host.find("w:ServiceInstall", namespace) is not None
+    assert host.find("w:ServiceControl", namespace) is not None
+
+
+def _approved_playnite_source(name):
+    path = ROOT / "modules" / "playnite" / "extension" / name
+    if path.is_file():
+        return path.read_bytes()
+    return subprocess.check_output(
+        ["git", "show", f"main:modules/playnite/extension/{name}"], cwd=ROOT
+    )
+
+
+def _stage_playnite_fixture(source, stage):
+    # Invoke the real staging functions without running Cargo or WiX.
+    command = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:TEST_BUILD, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw 'installer build script has syntax errors' }
+foreach ($name in 'Get-ApprovedPlayniteExtension', 'Write-ApprovedPlayniteExtension') {
+    $function = $ast.Find({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }, $true)
+    if (-not $function) { throw "missing staging function $name" }
+    Invoke-Expression $function.Extent.Text
+}
+$approved = Get-ApprovedPlayniteExtension $env:TEST_SOURCE
+Write-ApprovedPlayniteExtension $approved $env:TEST_STAGE
+"""
+    environment = os.environ.copy()
+    environment.update(
+        TEST_BUILD=str(ROOT / "installer" / "build-installer.ps1"),
+        TEST_SOURCE=str(source),
+        TEST_STAGE=str(stage),
+    )
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+
+
+def test_playnite_staging_accepts_only_approved_sources_and_exact_crlf_bytes():
+    if not shutil.which("pwsh"):
+        return
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source = root / "source"
+        source.mkdir()
+        original = {}
+        for name, expected_hash in PLAYNITE_HASHES.items():
+            original[name] = _approved_playnite_source(name).replace(b"\r\n", b"\n")
+            (source / name).write_bytes(original[name])
+            assert b"\r" not in original[name]
+            assert (
+                hashlib.sha256(original[name].replace(b"\n", b"\r\n"))
+                .hexdigest()
+                .upper()
+                == expected_hash
+            )
+        (source / "unapproved.ps1").write_text("not shipped", encoding="utf-8")
+
+        stage = root / "stage"
+        result = _stage_playnite_fixture(source, stage)
+        assert result.returncode == 0, result.stderr
+        shipped = stage / "playnite-extension"
+        assert {path.name for path in shipped.iterdir()} == set(PLAYNITE_HASHES)
+        for name, expected_hash in PLAYNITE_HASHES.items():
+            assert (
+                hashlib.sha256((shipped / name).read_bytes()).hexdigest().upper()
+                == expected_hash
+            )
+
+        for name, content in original.items():
+            (source / name).write_bytes(content.replace(b"\n", b"\r\n"))
+        crlf_stage = root / "crlf-stage"
+        result = _stage_playnite_fixture(source, crlf_stage)
+        assert result.returncode == 0, result.stderr
+        for name, expected_hash in PLAYNITE_HASHES.items():
+            assert (
+                hashlib.sha256(
+                    (crlf_stage / "playnite-extension" / name).read_bytes()
+                )
+                .hexdigest()
+                .upper()
+                == expected_hash
+            )
+
+        (source / "extension.yaml").write_bytes(
+            original["extension.yaml"].replace(b"\n", b"\r\n", 1)
+        )
+        mixed_stage = root / "mixed-stage"
+        result = _stage_playnite_fixture(source, mixed_stage)
+        assert result.returncode != 0
+        assert not mixed_stage.exists()
+
+        (source / "extension.yaml").write_bytes(original["extension.yaml"] + b"# tampered\n")
+        rejected_stage = root / "tampered-stage"
+        result = _stage_playnite_fixture(source, rejected_stage)
+        assert result.returncode != 0
+        assert not rejected_stage.exists()
+
+        (source / "extension.yaml").unlink()
+        missing_stage = root / "missing-stage"
+        result = _stage_playnite_fixture(source, missing_stage)
+        assert result.returncode != 0
+        assert not missing_stage.exists()
+
+
 def test_bundle_owns_irreversible_legacy_retirement_after_coordinated_msi():
     assert 'Variable Name="AmaterasuDataRoot"' in BUNDLE
     assert 'bal:Overridable="yes"' in BUNDLE
@@ -232,6 +381,8 @@ if __name__ == "__main__":
     test_installer_never_uses_shell_cleanup_for_mutable_data()
     test_all_predecessor_families_are_discovered_and_critical_settings_fail_closed()
     test_build_is_tracked_and_uses_stable_harvest_guids()
+    test_playnite_extension_is_one_msi_owned_pair_under_program_files()
+    test_playnite_staging_accepts_only_approved_sources_and_exact_crlf_bytes()
     test_bundle_owns_irreversible_legacy_retirement_after_coordinated_msi()
     test_bundle_journal_cleanup_cannot_trigger_post_retirement_rollback()
     print("Installer source contracts passed.")

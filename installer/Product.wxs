@@ -60,6 +60,7 @@
       <ComponentRef Id="PairingImportTool" />
       <ComponentRef Id="AuthenticationImportTool" />
       <ComponentRef Id="ReleaseTool" />
+      <ComponentRef Id="PlayniteExtensionFiles" />
       <ComponentRef Id="DataDirectory" />
     </Feature>
 
@@ -262,6 +263,16 @@
 
   <Fragment>
     <DirectoryRef Id="INSTALLFOLDER">
+      <!-- MSI owns both immutable connector files as one component. Standard
+           component rollback and major-upgrade removal keep the pair together. -->
+      <Directory Id="PLAYNITEEXTENSION" Name="playnite-extension">
+        <Component Id="PlayniteExtensionFiles" Guid="*" Win64="yes">
+          <File Id="PlayniteExtensionManifest" Name="extension.yaml"
+                Source="$(var.StageDir)\playnite-extension\extension.yaml" KeyPath="yes" />
+          <File Id="PlayniteExtensionModule" Name="AmaterasuPlaynite.psm1"
+                Source="$(var.StageDir)\playnite-extension\AmaterasuPlaynite.psm1" />
+        </Component>
+      </Directory>
       <Directory Id="MIGRATIONTOOLS" Name="tools">
         <Component Id="MigrationTool" Guid="*" Win64="yes">
           <File Id="MigrationToolExe" Source="$(var.StageDir)\tools\amaterasu-migration.exe" KeyPath="yes" />

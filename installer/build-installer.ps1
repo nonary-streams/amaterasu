@@ -8,7 +8,50 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+function Get-ApprovedPlayniteExtension {
+    param([string]$SourceDirectory)
+
+    $expectedHashes = [ordered]@{
+        'extension.yaml' = '0E3507A22AC5C24F1E0573CAAFF52F572BC1AF9C1C18270905B2694EBFEBA72D'
+        'AmaterasuPlaynite.psm1' = '264D97199DCC36E772E739DA9B2E4311A27C9350D9436AE2BB647D1572EE1715'
+    }
+    $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $approved = [ordered]@{}
+    foreach ($name in $expectedHashes.Keys) {
+        $source = Join-Path $SourceDirectory $name
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Approved Playnite extension source is missing: $name"
+        }
+        $text = $utf8.GetString([System.IO.File]::ReadAllBytes($source))
+        $lfText = $text.Replace("`r`n", "`n")
+        if ($lfText.Contains("`r") -or
+            ($text.Contains("`r`n") -and $text.Replace("`r`n", '').Contains("`n"))) {
+            throw "Playnite extension source has mixed or invalid line endings: $name"
+        }
+        [byte[]]$bytes = $utf8.GetBytes($lfText.Replace("`n", "`r`n"))
+        $actualHash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes))
+        if ($actualHash -ne $expectedHashes[$name]) {
+            throw "Playnite extension source differs from the approved artifact: $name"
+        }
+        $approved[$name] = $bytes
+    }
+    return $approved
+}
+
+function Write-ApprovedPlayniteExtension {
+    param($ApprovedFiles, [string]$StageDirectory)
+
+    $destination = Join-Path $StageDirectory 'playnite-extension'
+    New-Item -ItemType Directory -Path $destination -Force | Out-Null
+    foreach ($name in $ApprovedFiles.Keys) {
+        $path = Join-Path $destination $name
+        [System.IO.File]::WriteAllBytes($path, [byte[]]$ApprovedFiles[$name])
+    }
+}
+
 $repository = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$playniteSource = Join-Path $repository 'modules\playnite\extension'
+$approvedPlayniteFiles = Get-ApprovedPlayniteExtension $playniteSource
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $repository 'target\installer'
 }
@@ -45,6 +88,7 @@ if (Test-Path $stage) {
     Remove-Item -LiteralPath $stage -Recurse -Force
 }
 New-Item -ItemType Directory -Path (Join-Path $stage 'tools') -Force | Out-Null
+Write-ApprovedPlayniteExtension $approvedPlayniteFiles $stage
 
 $releaseDirectory = Join-Path $repository 'target\release'
 $installerSigner = $env:AMATERASU_INSTALLER_SIGNING_KEY
