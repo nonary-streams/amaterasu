@@ -28,7 +28,7 @@ pub(crate) fn apply_pending_seed(seed: &Path, destination: &Path) -> PackageResu
     let sid = sid_string(token);
     // SAFETY: OpenProcessToken returned this owned token handle.
     unsafe { CloseHandle(token) };
-    merge_missing_tree(&seed, &destination, &sid?, false)?;
+    merge_missing_tree(&seed, &destination, &sid?, false, true)?;
     write_seed_owner(&marker, "S-1-5-18")
 }
 
@@ -39,10 +39,15 @@ fn merge_missing_tree(
     destination: &Path,
     sid: &str,
     namespace_tree: bool,
+    root_level: bool,
 ) -> PackageResult<()> {
     set_user_dacl(destination, sid)?;
     for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
+        // Each root owns its own live lock file; it is never imported state.
+        if root_level && entry.file_name() == "host.lock" {
+            continue;
+        }
         let source_path = entry.path();
         let source_metadata =
             fs::symlink_metadata(&source_path).map_err(|error| error.to_string())?;
@@ -58,7 +63,7 @@ fn merge_missing_tree(
                 create_real_directory(&destination_path)?;
             }
             let namespace_tree = namespace_tree || entry.file_name() == "namespaces";
-            merge_missing_tree(&source_path, &destination_path, sid, namespace_tree)?;
+            merge_missing_tree(&source_path, &destination_path, sid, namespace_tree, false)?;
         } else if source_metadata.is_file() {
             if destination_path
                 .try_exists()

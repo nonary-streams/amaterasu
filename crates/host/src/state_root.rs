@@ -673,6 +673,9 @@ mod tests {
             br#"{"format_version":1,"revision":1,"values":{"authentication/v1":{"credential":"imported"}}}"#,
         )
         .unwrap();
+        fs::write(seed.join("host.lock"), b"source-lock").unwrap();
+        fs::create_dir(seed.join("other")).unwrap();
+        fs::write(seed.join("other/host.lock"), b"nested-state").unwrap();
         fs::write(
             user.join("namespaces").join(namespace).join("state.json"),
             br#"{"format_version":1,"revision":2,"values":{"authentication/sessions/v1":{"sessions":[]}}}"#,
@@ -696,6 +699,11 @@ mod tests {
         assert_eq!(imported.revision, 3);
         assert!(imported.values.contains_key("authentication/v1"));
         assert!(imported.values.contains_key("authentication/sessions/v1"));
+        assert!(fs::read(user.join("host.lock")).unwrap().is_empty());
+        assert_eq!(
+            fs::read(user.join("other/host.lock")).unwrap(),
+            b"nested-state"
+        );
         validate_dacl(&namespace_path, &expected).unwrap();
         validate_dacl(&namespace_path.join("state.json"), &expected).unwrap();
         super::apply_pending_seed(&seed, &user).unwrap();
