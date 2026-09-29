@@ -29,8 +29,11 @@ target and a validated Playnite GUID; launch sends that ID to the Playnite exten
 and never turns it into an executable or URI. Bundle/URI `application` entries,
 detached launchers, and streaming startup remain unsupported. A catalog executable
 may be an absolute native path or a bare command resolved through `PATH`; relative
-paths containing a directory component are rejected. Lookup uses absolute `PATH`
-entries only, is capped at 128 entries and 16 KiB, and on Windows considers `.com`
+paths containing a directory component are rejected. Lookup preserves `PATH`
+order and resolves relative or empty entries against the expanded explicit app
+working directory, or the host's current directory when none is configured. It
+retains an absolute executable path before launch so later cwd changes cannot
+select another executable. Lookup is capped at 128 entries and 16 KiB, and on Windows considers `.com`
 and `.exe` for extensionless names. Implicit `.bat` and `.cmd` executables remain
 rejected. Executable and working-directory values support bounded `$()` references
 to configured launch environment values, then host environment values; an unset

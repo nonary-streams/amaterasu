@@ -713,6 +713,7 @@ fn optional_catalog_string(entry: &Value, key: &str) -> Result<Option<String>, &
 fn resolve_executable(
     configured_value: &str,
     environment: &BTreeMap<String, String>,
+    working_directory: Option<&str>,
 ) -> Result<String, &'static str> {
     let expanded = expand_environment_references(configured_value, environment)?;
     let executable = trim_path_quotes(&expanded);
@@ -725,7 +726,7 @@ fn resolve_executable(
     let resolved = if executable_path.is_absolute() {
         executable.to_owned()
     } else if is_bare_command(executable) {
-        find_path_executable(executable, environment)
+        find_path_executable(executable, environment, working_directory)
             .and_then(|path| path.to_str().map(str::to_owned))
             .ok_or("unsupported_launch_spec")?
     } else {
@@ -845,6 +846,7 @@ fn path_environment_value(configured_environment: &BTreeMap<String, String>) -> 
 fn find_path_executable(
     executable: &str,
     configured_environment: &BTreeMap<String, String>,
+    working_directory: Option<&str>,
 ) -> Option<PathBuf> {
     let search_path = path_environment_value(configured_environment)?;
     if search_path.len() > MAX_SEARCH_PATH_BYTES {
@@ -857,13 +859,18 @@ fn find_path_executable(
         return None;
     }
     let candidates = path_executable_names(executable);
+    let relative_directory = working_directory
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
 
     directories.into_iter().find_map(|directory| {
-        // Relative PATH entries include the current directory implicitly and
-        // can select a different executable when the service's cwd changes.
-        if !directory.is_absolute() {
-            return None;
-        }
+        // Resolve relative and empty entries once, before process execution,
+        // so later directory changes cannot select a different executable.
+        let directory = if directory.is_absolute() {
+            directory
+        } else {
+            relative_directory.as_ref()?.join(directory)
+        };
         candidates.iter().find_map(|name| {
             let candidate = directory.join(name);
             if is_executable_file(&candidate) {
@@ -997,12 +1004,13 @@ impl Executable {
                 let wait_all = wait_all.unwrap_or(DEFAULT_WAIT_ALL);
                 let exit_timeout_seconds =
                     exit_timeout_seconds.unwrap_or(DEFAULT_EXECUTABLE_EXIT_TIMEOUT_SECONDS);
-                let program = resolve_executable(&program, environment)?;
                 let working_directory = working_directory
                     .as_deref()
                     .map(|directory| resolve_working_directory(directory, environment))
                     .transpose()?
                     .flatten();
+                let program =
+                    resolve_executable(&program, environment, working_directory.as_deref())?;
                 if !valid_native_path(&program)
                     || !valid_arguments(&arguments)
                     || exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS
@@ -2883,7 +2891,7 @@ mod tests {
             "/safe/game folder;touch should-not-run"
         );
         assert_eq!(
-            resolve_executable("$(AMATERASU_MISSING_92831)", &environment),
+            resolve_executable("$(AMATERASU_MISSING_92831)", &environment, None),
             Err("unsupported_launch_spec")
         );
         assert_eq!(
@@ -2904,7 +2912,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_executable_lookup_uses_configured_absolute_path_and_rejects_relative_inputs() {
+    fn bare_executable_lookup_uses_configured_path_and_rejects_relative_programs() {
         let directory = unique_test_directory("amaterasu-launch-path-test");
         let executable_name = if cfg!(windows) {
             "amaterasu-path-probe.exe"
@@ -2921,26 +2929,88 @@ mod tests {
         let environment =
             BTreeMap::from([("PATH".to_owned(), directory.to_string_lossy().into_owned())]);
 
-        let resolved = resolve_executable(path_name, &environment).unwrap();
+        let resolved = resolve_executable(path_name, &environment, None).unwrap();
         assert_eq!(Path::new(&resolved), executable);
         assert_eq!(
             inferred_working_directory(&resolved).as_deref(),
             directory.to_str()
         );
         assert_eq!(
-            resolve_executable("subfolder/amaterasu-path-probe", &environment),
+            resolve_executable("subfolder/amaterasu-path-probe", &environment, None),
             Err("unsupported_launch_spec")
         );
-        let relative_path_environment = BTreeMap::from([("PATH".to_owned(), ".".to_owned())]);
-        assert_eq!(
-            resolve_executable(path_name, &relative_path_environment),
-            Err("unsupported_launch_spec")
-        );
-
         assert!(path_executable_names("untrusted")
             .iter()
             .all(|name| !matches!(name.to_str(), Some(value) if value.ends_with(".bat") || value.ends_with(".cmd"))));
 
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn relative_path_entries_use_expanded_application_directory_in_search_order() {
+        let directory = unique_test_directory("amaterasu-relative-launch-path");
+        let first = directory.join("first");
+        let second = directory.join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let executable_name = if cfg!(windows) { "probe.exe" } else { "probe" };
+        for target in [&first, &second] {
+            std::fs::copy(
+                std::env::current_exe().unwrap(),
+                target.join(executable_name),
+            )
+            .unwrap();
+        }
+        let search_path =
+            std::env::join_paths([Path::new("missing"), Path::new("second"), &first]).unwrap();
+        let environment = BTreeMap::from([
+            ("PATH".into(), search_path.to_str().unwrap().into()),
+            ("APP_DIRECTORY".into(), directory.to_str().unwrap().into()),
+            ("APP_EXECUTABLE".into(), executable_name.into()),
+        ]);
+        let launch = json!({
+            "kind":"executable",
+            "program":"$(APP_EXECUTABLE)",
+            "working_directory":"$(APP_DIRECTORY)",
+        });
+
+        let parsed = Executable::from_catalog_with_environment(&launch, &environment).unwrap();
+        assert_eq!(Path::new(&parsed.program), second.join(executable_name));
+        assert_eq!(parsed.working_directory.as_deref(), directory.to_str());
+        assert!(Path::new(&parsed.program).is_absolute());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn empty_path_entry_selects_executable_in_application_directory() {
+        let directory = unique_test_directory("amaterasu-empty-launch-path");
+        let executable_name = if cfg!(windows) { "probe.exe" } else { "probe" };
+        let executable = directory.join(executable_name);
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let environment = BTreeMap::from([("PATH".into(), String::new())]);
+
+        let resolved =
+            resolve_executable(executable_name, &environment, directory.to_str()).unwrap();
+        assert_eq!(Path::new(&resolved), executable);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn relative_path_without_application_directory_uses_host_directory_snapshot() {
+        let directory = unique_test_directory("amaterasu-host-relative-launch-path");
+        let host_directory = std::env::current_dir().unwrap();
+        let relative_name = directory.file_name().unwrap();
+        let relative_directory = host_directory.join(relative_name);
+        std::fs::create_dir(&relative_directory).unwrap();
+        let executable_name = if cfg!(windows) { "probe.exe" } else { "probe" };
+        let executable = relative_directory.join(executable_name);
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let environment = BTreeMap::from([("PATH".into(), relative_name.to_str().unwrap().into())]);
+
+        let resolved = resolve_executable(executable_name, &environment, None).unwrap();
+        assert_eq!(Path::new(&resolved), executable);
+        assert_eq!(std::env::current_dir().unwrap(), host_directory);
+        std::fs::remove_dir_all(relative_directory).unwrap();
         std::fs::remove_dir_all(directory).unwrap();
     }
 
