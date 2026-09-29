@@ -174,7 +174,7 @@ fn discover_source() -> Result<(PathBuf, PathBuf, LaunchKind), String> {
         if !flatpak_user_app_installed(&client) {
             return Err("lutris_flatpak_unavailable".to_owned());
         }
-        return select_source(None, None, Some(database), Some(client), true);
+        select_source(None, None, Some(database), Some(client), true)
     }
     #[cfg(not(target_os = "linux"))]
     Err("lutris_executable_unavailable".to_owned())

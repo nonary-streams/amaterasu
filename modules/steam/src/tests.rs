@@ -1036,7 +1036,7 @@ fn set_complete_test_snapshot(provider: &mut Provider, revision: u64, name: &str
 }
 
 #[test]
-fn force_sync_is_management_only_and_requires_ready_enabled_settings() {
+fn force_sync_is_management_only_and_follows_host_enablement_policy() {
     let mut host = Box::new(FakeHost::default());
     host.product_get_results
         .push_back(persisted_settings(false, 1));
@@ -1079,8 +1079,20 @@ fn force_sync_is_management_only_and_requires_ready_enabled_settings() {
             CONFIGURATION_TIMEOUT_MS,
         )
         .unwrap();
-    assert_eq!(host.completed[2].1["code"], "steam_disabled");
-    assert!(module.provider.scan.is_none());
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(host.completed[2].1["code"], "steam_disabled");
+        assert!(module.provider.scan.is_none());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Linux intentionally keeps Steam enabled when loading a disabled document.
+        assert!(module.configuration.settings().enabled);
+        assert!(module.provider.enabled);
+        assert_eq!(host.completed[2].1["accepted"], true);
+        assert_eq!(host.completed[2].1["force_sync_pending"], true);
+        assert!(module.provider.scan.is_some());
+    }
 }
 
 #[test]
