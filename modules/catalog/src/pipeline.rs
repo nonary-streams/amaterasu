@@ -18,6 +18,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MAX_QUEUED: usize = 32;
 const PAGE_BYTES: usize = 12_000;
 const MAX_SCAN: usize = 256;
+// A launch scan can cross public entries and their provider markers before
+// reaching the Lutris prefix. It remains bounded by both catalog populations.
+const MAX_LAUNCH_MARKER_SCAN: usize = MAX_ENTRIES * 2;
 const MANAGEMENT_PRINCIPAL: &str = "amaterasu.management";
 const PLAYNITE_IMPORTER: &str = "amaterasu.playnite";
 const STEAM_IMPORTER: &str = "amaterasu.steam";
@@ -75,7 +78,7 @@ struct LaunchMarkerScan {
     state_revision: u64,
     entry_id: String,
     fingerprint: String,
-    after: String,
+    after: Option<String>,
     scanned: usize,
     source_id: Option<String>,
     matched: bool,
@@ -2630,7 +2633,9 @@ impl Pipeline {
                     state_revision,
                     entry_id: entry_id.to_owned(),
                     fingerprint: provider_entry_fingerprint(LUTRIS_IMPORTER, &entry),
-                    after: format!("{}{}:", ENTRY_PREFIX, LUTRIS_IMPORTER),
+                    // State cursors name existing keys. Start at the beginning
+                    // and resume only from keys returned by this revision.
+                    after: None,
                     scanned: 0,
                     source_id: None,
                     matched: false,
@@ -2724,12 +2729,18 @@ impl Pipeline {
             let Some(key) = row["key"].as_str() else {
                 return complete(send, context.request_id, malformed());
             };
-            if key <= scan.after.as_str() {
+            if scan.after.as_deref().is_some_and(|after| key <= after) {
                 return complete(send, context.request_id, malformed());
             }
-            scan.after = key.to_owned();
+            scan.after = Some(key.to_owned());
             scan.scanned += 1;
+            if scan.scanned > MAX_LAUNCH_MARKER_SCAN {
+                return complete(send, context.request_id, malformed());
+            }
             if !key.starts_with(&prefix) {
+                if key < prefix.as_str() {
+                    continue;
+                }
                 past_prefix = true;
                 break;
             }
@@ -2758,14 +2769,18 @@ impl Pipeline {
         let more = match payload.get("next") {
             Some(Value::Null) => false,
             Some(Value::String(_)) if past_prefix => false,
-            Some(Value::String(next)) if next == &scan.after && !rows.is_empty() => true,
+            Some(Value::String(next))
+                if Some(next.as_str()) == scan.after.as_deref() && !rows.is_empty() =>
+            {
+                true
+            }
             _ => return complete(send, context.request_id, malformed()),
         };
         if more && rows.is_empty() {
             return complete(send, context.request_id, malformed());
         }
         if !past_prefix && more {
-            if scan.scanned >= MAX_ENTRIES {
+            if scan.scanned >= MAX_LAUNCH_MARKER_SCAN {
                 return complete(send, context.request_id, malformed());
             }
             return self.scan_launch_markers(context, scan, send);

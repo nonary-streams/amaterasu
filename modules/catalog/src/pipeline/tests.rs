@@ -17,6 +17,7 @@ struct Backend {
     legacy: Option<Value>,
     fail: bool,
     lose_commit_ack_once: bool,
+    collection_pages: usize,
 }
 impl Backend {
     fn handle(&mut self, request: Value) -> Value {
@@ -47,8 +48,14 @@ impl Backend {
                 json!({"ok":true,"revision":self.revision})
             }
             "collection_page" => {
+                self.collection_pages += 1;
                 if request["revision"] != self.revision {
                     return error("revision_conflict", "stale collection");
+                }
+                if let Some(after) = request["after"].as_str()
+                    && !self.entries.contains_key(after)
+                {
+                    return error("invalid_cursor", "collection cursor key is missing");
                 }
                 let after = request["after"].as_str().unwrap_or("");
                 let mut entries = Vec::new();
@@ -280,6 +287,43 @@ fn lutris_importer() -> Pipeline {
         BTreeMap::new(),
         BTreeMap::from([("amaterasu.lutris".into(), "amaterasu.management".into())]),
     )
+}
+
+#[test]
+fn manual_launch_resolution_resumes_only_from_existing_collection_keys() {
+    let mut backend = Backend::default();
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::from(["amaterasu.launch".into()]),
+        BTreeMap::from([("amaterasu.nvhttp".into(), "amaterasu.management".into())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    for revision in 0..130 {
+        let created = backend.run_for(
+            &mut pipeline,
+            json!({"action":"create", "expected_revision":revision, "entry":entry("Manual")}),
+            "amaterasu.management",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(created["ok"], true, "{created}");
+    }
+    for (action, initiator) in [
+        ("resolve_launch", "amaterasu.management"),
+        ("resolve_exported_launch", "amaterasu.nvhttp"),
+    ] {
+        let before = backend.collection_pages;
+        let resolved = backend.run_for(
+            &mut pipeline,
+            json!({"action":action, "id":"app-0000000000000001"}),
+            "amaterasu.launch",
+            initiator,
+            "amaterasu.management",
+        );
+        assert_eq!(resolved["ok"], true, "{resolved}");
+        assert!(resolved.get("provider_provenance").is_none());
+        assert!(backend.collection_pages - before >= 2);
+    }
 }
 
 #[test]
