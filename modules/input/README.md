@@ -442,9 +442,25 @@ Tests use fake backends for ownership, stale tokens, batch admission, chord
 release order, cancellation, partial failure, expiry, retained failed releases,
 retry and shutdown, including pen/touch identity, multiple contacts, duplicate
 events, device loss, and contact cleanup. Platform mapping tests inspect native
-event records without injecting input or creating a uinput device. **No test
-injects input or creates a uinput device on the developer desktop.** Native
-pen/touch delivery, Windows and Linux compositor behavior, and hardware device
+event records without injecting input or creating a uinput device. Default tests
+never inject input or create a uinput device on the developer desktop. The ignored
+`native_uinput_xbox_slot_reports_readback_and_teardown` test creates one real
+Xbox-like virtual controller, resolves its exact event node using `UI_GET_SYSNAME`,
+and obtains an exclusive evdev grab before sending any reports. It checks native
+button/axis frames, kernel key/axis state, a neutral report, and destruction of a
+slot with a held button. The controller is destroyed before its grab is released,
+including during panic unwinding. Native write failures end the test instead of
+replaying reports to an ungrabbed replacement. It creates no keyboard or pointer device and
+changes no permissions. Run it explicitly with:
+
+```sh
+cargo test -p amaterasu-input native_uinput_xbox_slot_reports_readback_and_teardown -- --ignored --nocapture
+```
+
+The test requires access to `/dev/uinput` and to the created controller's evdev
+node. A kernel readback pass establishes this bounded native device path; it does
+not establish service-account permissions, game visibility, or client delivery.
+Native pen/touch delivery, Windows and Linux compositor behavior, and hardware device
 loss remain qualification gates. GameStream ingress and its client-to-desktop
 coordinate transform remain pending in the protocol adapter.
 

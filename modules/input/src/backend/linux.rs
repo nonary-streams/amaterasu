@@ -13,6 +13,9 @@ use crate::model::{
 #[path = "linux_pen_touch.rs"]
 mod linux_pen_touch;
 use linux_pen_touch::LinuxPenTouch;
+#[cfg(test)]
+#[path = "linux_native_tests.rs"]
+mod native_tests;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, RawFd};
