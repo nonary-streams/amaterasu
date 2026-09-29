@@ -1,4 +1,28 @@
 use super::*;
+#[cfg(unix)]
+#[test]
+fn closed_loopback_connection_allows_immediate_transport_restart() {
+    use std::io::Read;
+    use std::net::{Shutdown, TcpStream};
+    use std::time::Duration;
+
+    let transport = Transport::bind("127.0.0.1:0".parse().unwrap(), false).unwrap();
+    let address = transport.local_addr().unwrap();
+    let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let (accepted, _) = transport.listeners[0].accept().unwrap();
+    accepted.shutdown(Shutdown::Write).unwrap();
+    let mut byte = [0];
+    assert_eq!(client.read(&mut byte).unwrap(), 0);
+    drop(client);
+    drop(accepted);
+    drop(transport);
+    let restarted = Transport::bind(address, false).unwrap();
+    assert_eq!(restarted.local_addr().unwrap(), address);
+    assert!(Transport::bind(address, false).is_err());
+}
 use amaterasu_gamestream::{
     crypto::{Direction, RtspOpener, RtspSealer},
     rtsp::serialize_response,

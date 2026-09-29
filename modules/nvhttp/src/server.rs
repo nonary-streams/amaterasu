@@ -368,6 +368,13 @@ fn bind_listener(address: SocketAddr, name: &str) -> Result<TcpListener, String>
     let domain = Domain::for_address(address);
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
         .map_err(|_| format!("{name} socket unavailable"))?;
+    // Unix keeps actively closed connections in TIME_WAIT after host shutdown.
+    // Address reuse permits restart after that listener closes; an existing
+    // live listener still owns its endpoint. Windows has different semantics.
+    #[cfg(unix)]
+    socket
+        .set_reuse_address(true)
+        .map_err(|_| format!("{name} address reuse configuration failed"))?;
     if address.is_ipv6() {
         socket
             .set_only_v6(true)
@@ -734,6 +741,32 @@ fn simple_reply(status: u16, message: &str) -> Reply {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn closed_loopback_connection_allows_immediate_listener_restart() {
+        use std::io::Read;
+        use std::net::{Shutdown, TcpStream};
+        use std::time::Duration;
+
+        let listener = super::bind_listener("127.0.0.1:0".parse().unwrap(), "test").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        // The server actively closes first, leaving its endpoint in TIME_WAIT.
+        accepted.shutdown(Shutdown::Write).unwrap();
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+        drop(client);
+        drop(accepted);
+        drop(listener);
+        let restarted = super::bind_listener(address, "restart").unwrap();
+        assert_eq!(restarted.local_addr().unwrap(), address);
+        assert!(super::bind_listener(address, "occupied").is_err());
+    }
+
     use super::*;
     use std::sync::Mutex;
 

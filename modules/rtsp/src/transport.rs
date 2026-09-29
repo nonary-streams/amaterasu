@@ -70,6 +70,12 @@ impl Transport {
                 Some(Protocol::TCP),
             )
             .map_err(|_| "tcp_bind_failed")?;
+            // Unix TIME_WAIT endpoints must not prevent host restart. This
+            // does not allow a second live listener to share the endpoint.
+            #[cfg(unix)]
+            socket
+                .set_reuse_address(true)
+                .map_err(|_| "tcp_configuration_failed")?;
             if address.is_ipv6() {
                 socket
                     .set_only_v6(true)
