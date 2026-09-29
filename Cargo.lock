@@ -198,6 +198,8 @@ dependencies = [
  "amaterasu-abi",
  "amaterasu-media",
  "amaterasu-module-sdk",
+ "cc",
+ "libloading",
  "serde",
  "serde_json",
  "windows",
