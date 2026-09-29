@@ -1418,6 +1418,55 @@ fn snapshots_contained_configured_state_symlink_targets_under_the_configured_ali
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn configured_state_alias_keeps_its_policy_when_target_has_an_application_filename() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    let state = br#"{"root":{}}"#;
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"file_state = credentials/state-alias.json\n",
+    );
+    write(&predecessor.join("private/apps.json"), state);
+    fs::create_dir_all(predecessor.join("credentials")).unwrap();
+    symlink(
+        "../private/apps.json",
+        predecessor.join("credentials/state-alias.json"),
+    )
+    .unwrap();
+    let sources = [source(LegacyProduct::Sunshine, &predecessor)];
+    let plan = analyze_legacy_configuration(&sources).unwrap();
+    assert!(plan.applications.is_empty());
+    assert!(plan.critical_items.iter().any(|item| {
+        item.product == LegacyProduct::Sunshine && item.item == "pairing_identity_state"
+    }));
+    assert!(preflight_legacy_configuration(&sources).is_err());
+
+    let destination = fixture.path().join("Amaterasu");
+    import_legacy_configuration_with_sensitive_sources(
+        &destination,
+        &sources,
+        &[ValidatedSensitiveSource {
+            product: LegacyProduct::Sunshine,
+            pairing: true,
+            authentication: false,
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(
+            destination
+                .join(LEGACY_IMPORT_DIRECTORY)
+                .join("sunshine/credentials/state-alias.json")
+        )
+        .unwrap(),
+        state,
+    );
+}
+
 #[test]
 fn plan_maps_safe_settings_and_exact_executable_applications() {
     let fixture = TemporaryDirectory::new();

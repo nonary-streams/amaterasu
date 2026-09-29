@@ -386,6 +386,7 @@
         "per_application",
         "per_client"
       ],
+      "notes": "The host int_f parser uses amd::av1_latency_from_view to accept named enum values; its integer storage does not make the external configuration an integer field.",
       "id": "global:amd_av1_latency_mode"
     },
     {

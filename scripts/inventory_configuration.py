@@ -672,6 +672,9 @@ def main() -> None:
     for key in sorted(global_keys):
         item = inventory.setdefault(("global", key), {"key": key, "scope": "global", "sources": []})
         type_overrides = {
+            # int_f stores the converted value, but this converter accepts named
+            # configuration tokens rather than integer input.
+            "amd_av1_latency_mode": "enum",
             "dd_mode_remapping": "array[display_mode_mapping]",
             "dd_snapshot_exclude_devices": "array[display_device_identifier]",
             "dd_vdd_static_monitor_count": "integer",
@@ -704,6 +707,8 @@ def main() -> None:
         item["override_scopes"] = override_scope
         if key == "flags":
             item["notes"] = "Parser compatibility flag map; it has no direct modern settings field or configuration guide heading."
+        if key == "amd_av1_latency_mode":
+            item["notes"] = "The host int_f parser uses amd::av1_latency_from_view to accept named enum values; its integer storage does not make the external configuration an integer field."
         if key in {"realtime_stats_history_retention_seconds", "realtime_stats_max_history_points", "realtime_stats_pause_when_hidden", "realtime_stats_show_active_sessions", "realtime_stats_show_host_stats", "realtime_stats_show_host_charts", "realtime_stats_show_session_history"}:
             item["notes"] = "Web-only preference consumed to avoid an unknown-option warning; it is not a native host policy field."
         item["sources"].sort(key=lambda source: (source["path"], source["line"], source["role"]))

@@ -159,6 +159,13 @@ struct CollectedConfigurationFiles {
     configured_authentication_files: BTreeSet<PathBuf>,
 }
 
+struct SourceFilePolicy {
+    is_default_primary_state_file: bool,
+    is_configured_state_file: bool,
+    is_auxiliary_state_file: bool,
+    is_configured_authentication_file: bool,
+}
+
 /// Non-secret evidence that a product-specific importer validated a sensitive
 /// predecessor pairing identity. Package migration does not parse identity
 /// keys itself: it only removes the corresponding preflight gates after the
@@ -255,14 +262,24 @@ pub fn analyze_legacy_configuration(sources: &[LegacyConfigSource]) -> PackageRe
         let collected = collect_configuration_files(&source.root)?
             .ok_or("a predecessor configuration source no longer contains supported files")?;
         for relative in &collected.files {
+            let logical_path = source.root.join(relative);
+            let physical_path = collected
+                .copy_sources
+                .get(relative)
+                .unwrap_or(&logical_path);
             analyze_source_file(
                 source.product,
-                &source.root.join(relative),
-                relative == Path::new("apollo_state.json")
-                    || relative == Path::new("sunshine_state.json"),
-                collected.configured_state_files.contains(relative),
-                collected.auxiliary_state_files.contains(relative),
-                collected.configured_authentication_files.contains(relative),
+                physical_path,
+                &logical_path,
+                SourceFilePolicy {
+                    is_default_primary_state_file: relative == Path::new("apollo_state.json")
+                        || relative == Path::new("sunshine_state.json"),
+                    is_configured_state_file: collected.configured_state_files.contains(relative),
+                    is_auxiliary_state_file: collected.auxiliary_state_files.contains(relative),
+                    is_configured_authentication_file: collected
+                        .configured_authentication_files
+                        .contains(relative),
+                },
                 &mut plan,
             )?;
         }
@@ -523,13 +540,19 @@ pub fn rollback_legacy_configuration(receipt: &MigrationReceipt) -> PackageResul
 fn analyze_source_file(
     product: LegacyProduct,
     path: &Path,
-    is_default_primary_state_file: bool,
-    is_configured_state_file: bool,
-    is_auxiliary_state_file: bool,
-    is_configured_authentication_file: bool,
+    logical_path: &Path,
+    policy: SourceFilePolicy,
     plan: &mut ImportPlan,
 ) -> PackageResult<()> {
-    let filename = path
+    let SourceFilePolicy {
+        is_default_primary_state_file,
+        is_configured_state_file,
+        is_auxiliary_state_file,
+        is_configured_authentication_file,
+    } = policy;
+    // Source aliases retain their configured policy identity while reads use
+    // the contained regular target selected by collection and snapshotting.
+    let filename = logical_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
@@ -557,7 +580,7 @@ fn analyze_source_file(
         return analyze_settings(product, path, plan);
     } else if is_state_document {
         return Ok(());
-    } else if path
+    } else if logical_path
         .components()
         .any(|component| component.as_os_str().eq_ignore_ascii_case("credentials"))
     {

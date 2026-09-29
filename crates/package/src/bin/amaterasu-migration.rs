@@ -1148,6 +1148,7 @@ fn validate_installer_paths(
     }
 }
 
+#[cfg(any(windows, test))]
 fn validate_installer_paths_against(
     install_folder: &std::path::Path,
     data_root: &std::path::Path,
@@ -1160,6 +1161,7 @@ fn validate_installer_paths_against(
     validate_contained_install_path(data_root, &program_data, "data root")
 }
 
+#[cfg(any(windows, test))]
 fn canonical_real_directory(path: &std::path::Path) -> Result<PathBuf, String> {
     let metadata = fs::symlink_metadata(path).map_err(|_| "installer root is unavailable")?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -1169,6 +1171,7 @@ fn canonical_real_directory(path: &std::path::Path) -> Result<PathBuf, String> {
         .map_err(|_| "installer root is unavailable".into())
 }
 
+#[cfg(any(windows, test))]
 fn validate_contained_install_path(
     candidate: &std::path::Path,
     root: &std::path::Path,
@@ -1203,6 +1206,7 @@ fn validate_contained_install_path(
     Ok(())
 }
 
+#[cfg(any(windows, test))]
 fn canonicalize_existing_prefix(path: &std::path::Path) -> Result<PathBuf, String> {
     let mut existing = path;
     let mut suffix = Vec::new();
@@ -1222,6 +1226,7 @@ fn canonicalize_existing_prefix(path: &std::path::Path) -> Result<PathBuf, Strin
     Ok(canonical)
 }
 
+#[cfg(any(windows, test))]
 fn lexical_normalize(path: &std::path::Path) -> Result<PathBuf, String> {
     use std::path::Component;
     let mut normalized = PathBuf::new();
