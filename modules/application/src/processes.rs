@@ -1,3 +1,4 @@
+use crate::command_paths::resolve_command_executable;
 use crate::commands::{DetachedCommandRequest, prepare_detached_requests};
 use crate::containment::{ContainedChild, DetachedChild};
 use crate::lifecycle::ApplicationLifecycle;
@@ -26,7 +27,15 @@ fn spawn_detached_commands_with(
 ) -> Vec<DetachedChild> {
     let mut children = Vec::new();
     for detached in &spec.detached {
-        let mut command = Command::new(&detached.executable);
+        let working_directory = detached.cwd.as_ref().or(spec.cwd.as_ref());
+        let Ok(executable) = resolve_command_executable(
+            &detached.executable,
+            &detached.environment,
+            working_directory.map(String::as_str),
+        ) else {
+            continue;
+        };
+        let mut command = Command::new(&executable);
         command
             .args(&detached.args)
             .env_clear()
@@ -34,9 +43,9 @@ fn spawn_detached_commands_with(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(cwd) = detached.cwd.as_ref().or(spec.cwd.as_ref()) {
+        if let Some(cwd) = working_directory {
             command.current_dir(cwd);
-        } else if let Some(cwd) = std::path::Path::new(&detached.executable)
+        } else if let Some(cwd) = executable
             .parent()
             .filter(|directory| !directory.as_os_str().is_empty())
         {
@@ -1199,7 +1208,10 @@ mod detached_elevation_tests {
             detached: policies
                 .iter()
                 .map(|policy| DetachedCommand {
-                    executable: "detached".into(),
+                    executable: std::env::current_exe()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
                     args: Vec::new(),
                     environment: BTreeMap::new(),
                     cwd: None,

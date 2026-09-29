@@ -1,5 +1,6 @@
 //! Incremental execution for trusted, configured application lifecycle commands.
 
+use crate::command_paths::resolve_command_executable;
 use crate::commands::parse_detached_commands;
 use crate::containment::ContainedChild;
 use serde::{Deserialize, Serialize};
@@ -347,97 +348,6 @@ fn preparation_environment_value(
     configured.or_else(|| std::env::var(name).ok())
 }
 
-fn resolve_preparation_executable(
-    executable: &str,
-    environment: &BTreeMap<String, String>,
-    application_working_directory: Option<&str>,
-) -> Result<std::path::PathBuf, std::io::Error> {
-    let executable_path = Path::new(executable);
-    if executable.contains("://") || executable_path.is_absolute() {
-        return Ok(executable_path.to_path_buf());
-    }
-
-    if executable_path.components().count() > 1 {
-        let base_directory = match application_working_directory {
-            Some(directory) => Path::new(directory).to_path_buf(),
-            None => std::env::current_dir()?,
-        };
-        return Ok(base_directory.join(executable_path));
-    }
-
-    let configured_path = environment
-        .iter()
-        .find(|(key, _)| {
-            #[cfg(windows)]
-            {
-                key.eq_ignore_ascii_case("PATH")
-            }
-            #[cfg(not(windows))]
-            {
-                key.as_str() == "PATH"
-            }
-        })
-        .map(|(_, value)| std::ffi::OsString::from(value));
-    let search_path = configured_path.clone().or_else(|| std::env::var_os("PATH"));
-    if let Some(search_path) = search_path
-        && let Some(resolved) = find_preparation_executable(
-            executable_path,
-            &search_path,
-            application_working_directory,
-        )
-    {
-        return Ok(resolved);
-    }
-
-    if configured_path.is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "raw preparation executable was not found on its configured PATH",
-        ));
-    }
-    Ok(executable_path.to_path_buf())
-}
-
-fn find_preparation_executable(
-    executable: &Path,
-    search_path: &std::ffi::OsStr,
-    application_working_directory: Option<&str>,
-) -> Option<std::path::PathBuf> {
-    let base_directory = application_working_directory
-        .map(Path::new)
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::current_dir().ok())?;
-    for directory in std::env::split_paths(search_path) {
-        let directory = if directory.is_absolute() {
-            directory
-        } else {
-            base_directory.join(directory)
-        };
-        #[cfg(windows)]
-        let candidates = {
-            if executable.extension().is_some() {
-                vec![executable.to_path_buf()]
-            } else {
-                vec![
-                    executable.to_path_buf(),
-                    executable.with_extension("exe"),
-                    executable.with_extension("com"),
-                ]
-            }
-        };
-        #[cfg(not(windows))]
-        let candidates = vec![executable.to_path_buf()];
-
-        for candidate in candidates {
-            let path = directory.join(candidate);
-            if path.is_file() {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
 fn preparation_working_directory(
     resolved_executable: &Path,
     application_working_directory: Option<&str>,
@@ -468,8 +378,7 @@ mod raw_preparation_path_tests {
             executable_directory.to_string_lossy().into_owned(),
         )]);
 
-        let resolved =
-            resolve_preparation_executable(&executable_name, &environment, None).unwrap();
+        let resolved = resolve_command_executable(&executable_name, &environment, None).unwrap();
         assert_eq!(resolved, current_executable);
         assert_eq!(
             preparation_working_directory(&resolved, None).as_deref(),
@@ -633,7 +542,7 @@ impl CommandTask {
                         "raw preparation command is empty",
                     )
                 })?;
-                let executable = resolve_preparation_executable(
+                let executable = resolve_command_executable(
                     &parsed.executable,
                     environment,
                     application_working_directory,

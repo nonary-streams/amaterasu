@@ -177,7 +177,10 @@ fn steam_install_tree_association_tracks_and_stops_only_the_new_game_process() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&install_directory).unwrap();
+    let executable = install_directory.join("amaterasu-steam-game-probe");
+    std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
     let mut request = launch("steam-tracked", "sleep");
+    request["executable"] = json!(executable);
     request["steam_id"] = json!("42");
     request["steam_install_dir"] = json!(install_directory);
     request["cwd"] = json!(install_directory);
@@ -917,6 +920,68 @@ fn typed_detached_commands_isolate_environment_and_cwd_from_primary_and_each_oth
         manager.handle("alice", changed)["code"],
         "operation_conflict"
     );
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn detached_commands_resolve_merged_path_and_keep_missing_targets_best_effort() {
+    let directory = test_directory("detached-effective-path");
+    let executable_directory = directory.join("bin");
+    std::fs::create_dir(&executable_directory).unwrap();
+    let executable_name = if cfg!(windows) {
+        "path-probe.exe"
+    } else {
+        "path-probe"
+    };
+    let executable = executable_directory.join(executable_name);
+    std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    let marker = directory.join("detached-record");
+    let original = detached_command_for_current_test_with_arguments(&[]);
+    let original_executable =
+        quote_raw_command_argument(std::env::current_exe().unwrap().to_str().unwrap());
+    let command = original.replacen(
+        &original_executable,
+        &quote_raw_command_argument(executable_name),
+        1,
+    );
+    let mut request = launch("detached-effective-path", "sleep");
+    request["cwd"] = json!(directory);
+    request["environment"]["PATH"] = json!("missing-launch-path");
+    request["detached"] = json!([
+        "amaterasu-missing-detached-probe-92831",
+        {
+            "command":command,
+            "environment":{
+                "PATH":"bin",
+                "AMATERASU_TEST_CHILD":"capture-env-cwd",
+                "AMATERASU_TEST_MARKER":marker,
+                "AMATERASU_TEST_VALUE":"selected-command-path",
+            },
+        },
+    ]);
+    let mut manager = ProcessManager::default();
+    let started = manager.handle("alice", request);
+    assert_eq!(started["process"]["state"], "running", "{started}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        manager.reap_exited().unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "configured-PATH detached target did not run"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap(),
+        format!(
+            "selected-command-path|{}",
+            directory.canonicalize().unwrap().display()
+        ),
+    );
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    manager.handle("alice", json!({"action":"terminate","process_id":id}));
+    wait_for_state(&mut manager, "alice", id, "cancelled");
     manager.shutdown().unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }

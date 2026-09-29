@@ -581,8 +581,15 @@ mod linux {
         #[test]
         fn only_new_install_tree_processes_and_their_descendants_are_associated() {
             let mut tracker = tracker();
+            let baseline_process = Process {
+                identity: Identity {
+                    pid: 10,
+                    start_ticks: 100,
+                },
+                ..synthetic_process(10, 1, "/games/title/game", 1000)
+            };
             let processes = [
-                synthetic_process(10, 1, "/games/title/game", 1000),
+                baseline_process,
                 synthetic_process(12, 1, "/games/title/bin/game", 1000),
                 synthetic_process(13, 12, "/usr/bin/child", 1000),
                 synthetic_process(14, 12, "/games/other/game", 1000),
@@ -591,7 +598,7 @@ mod linux {
             tracker.refresh_tracking(&processes);
             assert_eq!(
                 tracker.tracked.keys().copied().collect::<Vec<_>>(),
-                [12, 13]
+                [12, 13, 14]
             );
         }
 

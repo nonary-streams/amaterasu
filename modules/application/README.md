@@ -28,6 +28,14 @@ after `wait_all` is satisfied. A zero exit timeout skips graceful shutdown.
 Detached command strings use platform argv quoting, run best-effort before the
 primary executable, and are not attached to its process group or termination
 lifecycle. They inherit the app's explicit environment and working directory.
+Before spawning, bare targets resolve against the merged command environment's
+`PATH`, falling back to the host's `PATH` only when none is supplied. Relative
+or empty entries use the command's inherited or overridden cwd, or the host's
+current directory when no cwd is supplied. Without an explicit cwd, the resolved
+target's directory becomes its cwd. Lookup preserves entry order, skips
+non-executable Unix files, and is capped at 128 entries and 16 KiB. A lookup
+failure remains best-effort and does not prevent later commands or the primary
+application from starting. Child environment inheritance remains explicit.
 The typed form accepts `{"command":"...","environment":{"NAME":"value"},"cwd":"/absolute/path","stdout":"/absolute/out.log","stderr":"/absolute/err.log","elevated":false}`;
 `working_directory` is an alias for `cwd`. The per-command environment overlays
 the launch environment for that detached process only; its cwd overrides the
@@ -93,6 +101,10 @@ only when the catalog explicitly configures an application `working_directory`;
 otherwise each raw target's directory is inferred from its resolved path or
 `PATH`. This is separate from `cwd`, which may be inferred from the main
 executable when the catalog omits `working_directory`.
+Raw preparation uses the same bounded executable lookup as detached commands.
+Explicit relative target paths resolve against the configured preparation cwd
+or the current host directory. Both raw preparation and detached commands reject
+implicit `.bat`/`.cmd` targets; configure an interpreter explicitly instead.
 Raw preparation retains the existing 10-second default and 30-second maximum
 command timeout and null standard handles. Windows URL and associated-file
 launches are not resolved through shell associations. These bounded execution
