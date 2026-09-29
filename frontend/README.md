@@ -15,6 +15,21 @@ npm test
 npm run build
 ```
 
+Run the opt-in browser session qualifications separately:
+
+```sh
+node tests/browser-session-qualification.mjs
+node tests/browser-cookie-qualification.mjs
+```
+
+These tests use temporary browser profiles and ephemeral loopback listeners.
+They default to Chromium on Linux, Microsoft Edge on Windows, and Google Chrome
+on macOS. Set `AMATERASU_BROWSER` to another compatible browser executable when
+needed. The HTTPS test skips certificate verification in its isolated browser
+process for the local fixture. Its server is a controlled authentication fixture; these
+checks qualify browser cookie, reload, refresh, and peer-tab behavior, while the
+signed management host tests qualify the real authentication service.
+
 The deterministic output is exactly `dist/index.html`, `dist/app.js`, and
 `dist/styles.css`. Built assets are included for the native package builder;
 `node_modules` is not. Source files are small TypeScript namespace modules compiled
@@ -55,8 +70,8 @@ browser API calls.
   integer range. The Moonlight name and HTTP port panel uses a separate product
   settings route with its own revision. Accepted changes update live server
   information and listener ports; the HTTPS port is five below the HTTP port.
-  A separate Steam discovery toggle controls explicit local
-  library scans; synchronization with the application catalog remains unavailable.
+  Steam settings control bounded discovery and catalog synchronization, with
+  provider status and opaque artwork readback.
 - Session pagination, stop requests, and explicit finish-stop actions. No client
   connection or streaming state is fabricated.
 - Sessions shows signed history runtime status independently from recorded session
@@ -80,36 +95,33 @@ checked locally and the server authenticates every subsequent request.
 
 ## Browser security and accessibility
 
-Non-remembered administrator bearer tokens exist only in the API client's memory.
-Scoped API-token sign-in also stays memory-only and is never written to the
-remembered administrator-session record. With Remember this browser enabled, the
-raw administrator access and refresh token pair is stored together in one browser
-`localStorage` record. That record persists across page reloads and browser
-restarts, subject to the refresh token's server expiry. Same-origin scripts can
-read browser storage, so this is not HttpOnly protection. Native modules are
-trusted code; browser token storage is not a native-code sandbox. The backend
-persists token digests only, never the raw token values. Remembered administrator
-  sessions can survive a management-module restart while the refresh token remains
-  valid. Remember me requires Web Locks in a secure browser context so storage
-  updates and refreshes stay serialized across tabs. If Web Locks are unavailable,
-  sign in with Remember this browser unchecked.
+Same-origin HTTPS administrator login uses Secure, HttpOnly, SameSite=Strict
+cookies. Script receives session metadata rather than access or refresh tokens.
+Cookie requests use same-origin credentials and the required CSRF header;
+browser-origin checks and authorization scopes remain enforced by management.
+Web Locks serialize login, refresh, and sign-out across tabs. Local storage holds
+sign-out coordination markers, without cookie token secrets. Remember this
+browser selects the longer refresh lifetime and a persistent refresh cookie.
 
-Page departure clears in-memory credentials while preserving a valid remembered
-pair. Returning through the browser back/forward cache runs the same remembered
-session restore flow before showing the authenticated shell. If a refresh is
-ambiguous during suspension, it is not replayed. Sign-out clears in-memory
-credentials immediately, then removes the matching remembered pair under the
-same lock used for refresh and login. It sends a best-effort revocation using the
-refresh token. If the page is reloaded or closed before revocation completes, the
-server session remains valid until its absolute refresh expiry or
-trusted-administrator revocation. Signing out with an API token does not revoke
-that token.
+Plain HTTP and separately hosted API origins use bearer authentication instead.
+Non-remembered tokens stay in memory. Remembered bearer sessions store the raw
+access and refresh pair in one localStorage record, readable by same-origin
+scripts, and require Web Locks for safe coordination. Without Web Locks this
+fallback can sign in with Remember this browser unchecked. Scoped API-token
+sign-in stays memory-only and uses bearer transport even on HTTPS. The backend
+persists token digests. Native modules are trusted code; API grants and browser
+session handling do not sandbox native code.
 
-Remember me also selects the configured longer refresh lifetime. Without it, the
-browser keeps administrator session tokens in memory only.
+Page departure clears in-memory session state. Reload and back/forward-cache
+return restore an eligible cookie or remembered bearer session before showing
+the authenticated shell. An ambiguous refresh is not replayed. Cookie sign-out
+retains a local pending marker until server revocation is confirmed, and peer
+tabs observe sign-out through shared coordination. Bearer sign-out removes its
+remembered pair under the refresh lock and attempts server revocation. Signing
+out with an API token clears local use without revoking the token.
 
-Requests use POST JSON, Authorization Bearer, omitted cookies, no-store caching,
-and a 12-second browser timeout. An explicit unauthorized response may cause one
+Requests use POST JSON, no-store caching, and a 12-second browser timeout.
+Bearer requests omit cookies. An explicit unauthorized response may cause one
 retry after management verifies a rotated session; timeouts and transport failures
 never retry mutations. Ambiguous timeout messages instruct refresh/reconciliation.
 Server validation, Origin policy and scopes remain authoritative. All dynamic
@@ -123,12 +135,11 @@ actual API outcomes.
 
 ## Not implemented
 
-Pairing, screen/audio capture, streaming connections, gamepad controls, legacy
-client compatibility, application launching UX, Steam import/artwork, schema
-registration/migration UX, credential/token lifecycle administration, multi-user
-isolation, remote TLS setup, and installed-service setup remain unavailable.
-These are not represented as working controls. Native module and HTTP protocol
-limitations are documented by their respective READMEs.
+The console edits host, application, and paired-client settings, but does not
+initiate streaming sessions or qualify native capture and input delivery. Remote
+TLS provisioning and installed-service setup have no browser workflow.
+All management surfaces share one administrative namespace. Native module and
+HTTP protocol limitations are documented by their respective READMEs.
 
 Tests exercise literal argument handling, invalid form values, safe numeric
 editing, non-exact page counts, bearer transport/clearing, single-flight refresh,

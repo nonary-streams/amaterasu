@@ -6,7 +6,11 @@ import { join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import ts from "typescript";
 
-const edge = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
+const browser = process.env.AMATERASU_BROWSER ?? (process.platform === "win32"
+  ? "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+  : process.platform === "darwin"
+    ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    : "chromium");
 const certificate = readFileSync("../modules/pairing/tests/fixtures/host-cert.pem");
 const key = readFileSync("../modules/pairing/tests/fixtures/host-key.pem");
 const apiScript = ts.transpile(readFileSync("src/api.ts", "utf8"), {
@@ -181,7 +185,7 @@ const profile = resolve(mkdtempSync(join("tests", ".browser-cookie-profile-")));
 try {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   origin = `https://127.0.0.1:${server.address().port}`;
-  const { stdout, stderr } = await promisify(execFile)(edge, [
+  const { stdout, stderr } = await promisify(execFile)(browser, [
     "--headless=new", "--disable-gpu", "--no-first-run",
     "--no-default-browser-check", "--disable-extensions",
     // Only this isolated fixture uses the repository's untrusted test cert.
