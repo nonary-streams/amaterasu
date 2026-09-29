@@ -58,6 +58,49 @@ namespace Amaterasu {
     throw new Error(`${name} must be Inherit, Enabled, or Disabled.`);
   }
 
+  export function parseKeyRepeatDelayOverride(value: string): number | null {
+    const trimmed = value.trim();
+    if (trimmed === "") return null;
+    if (!/^[0-9]+$/.test(trimmed))
+      throw new Error("Key repeat delay must be a whole number from 0 to 2147483647 milliseconds, or blank to inherit.");
+    const delay = Number(trimmed);
+    if (!Number.isSafeInteger(delay) || delay > 0x7fff_ffff)
+      throw new Error("Key repeat delay must be a whole number from 0 to 2147483647 milliseconds, or blank to inherit.");
+    return delay;
+  }
+
+  export function parseKeyRepeatFrequencyOverride(value: string): number | null {
+    const trimmed = value.trim();
+    if (trimmed === "") return null;
+    if (!/^(?:[+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(?:[eE][+-]?[0-9]+)?$/.test(trimmed))
+      throw new Error("Key repeat frequency must be a finite nonnegative number, or blank to inherit.");
+    const frequency = Number(trimmed);
+    if (!Number.isFinite(frequency) || frequency < 0)
+      throw new Error("Key repeat frequency must be a finite nonnegative number, or blank to inherit.");
+    return frequency;
+  }
+
+  export function advancedInputOverrideFormValues(current?: AdvancedInputOverrides): Record<keyof AdvancedInputOverrides, string> {
+    return {
+      high_resolution_scrolling: current?.high_resolution_scrolling == null ? "" : String(current.high_resolution_scrolling),
+      always_send_scancodes: current?.always_send_scancodes == null ? "" : String(current.always_send_scancodes),
+      key_rightalt_to_key_win: current?.key_rightalt_to_key_win == null ? "" : String(current.key_rightalt_to_key_win),
+      key_repeat_delay: current?.key_repeat_delay == null ? "" : String(current.key_repeat_delay),
+      key_repeat_frequency: current?.key_repeat_frequency == null ? "" : String(current.key_repeat_frequency),
+    };
+  }
+
+  export function parseAdvancedInputOverrides(data: Pick<FormData, "get">): AdvancedInputOverrides {
+    const text = (name: keyof AdvancedInputOverrides) => String(data.get(name) ?? "");
+    return {
+      high_resolution_scrolling: parseInputBooleanOverride(text("high_resolution_scrolling"), "High-resolution scrolling"),
+      always_send_scancodes: parseInputBooleanOverride(text("always_send_scancodes"), "Always send scancodes"),
+      key_rightalt_to_key_win: parseInputBooleanOverride(text("key_rightalt_to_key_win"), "Right Alt as Windows key"),
+      key_repeat_delay: parseKeyRepeatDelayOverride(text("key_repeat_delay")),
+      key_repeat_frequency: parseKeyRepeatFrequencyOverride(text("key_repeat_frequency")),
+    };
+  }
+
   export function parseGamepadProfileOverride(
     value: string,
     recognizedProfiles: readonly string[],
@@ -327,6 +370,9 @@ namespace Amaterasu {
     const gamepad = parseGamepadProfileOverride(text("gamepad"), recognizedGamepadProfiles);
     const keyboard = parseInputBooleanOverride(text("keyboard"), "Keyboard input");
     const mouse = parseInputBooleanOverride(text("mouse"), "Mouse input");
+    const advancedInput = Object.fromEntries(
+      Object.entries(parseAdvancedInputOverrides(data)).filter(([, value]) => value !== null),
+    );
     const refreshRateOption = parseRefreshRateOptionOverride(
       String(data.get("dd_refresh_rate_option") ?? ""),
     );
@@ -346,6 +392,7 @@ namespace Amaterasu {
       gamepad === null &&
       keyboard === null &&
       mouse === null &&
+      Object.keys(advancedInput).length === 0 &&
       refreshRateOption === null &&
       prefer10BitSdr === null
         ? undefined
@@ -360,6 +407,7 @@ namespace Amaterasu {
             ...(gamepad === null ? {} : { gamepad }),
             ...(keyboard === null ? {} : { keyboard }),
             ...(mouse === null ? {} : { mouse }),
+            ...advancedInput,
             ...(refreshRateOption === null ? {} : { dd_refresh_rate_option: refreshRateOption }),
             ...(prefer10BitSdr === null ? {} : { prefer_10bit_sdr: prefer10BitSdr }),
           };
@@ -391,6 +439,7 @@ namespace Amaterasu {
         .map((tag) => tag.trim())
         .filter(Boolean),
       exclude_global_prep_cmd: data.has("exclude_global_prep_cmd"),
+      ...(kind === "executable" ? { elevated: data.has("elevated") } : {}),
       launch,
       ...(steamId === null ? {} : { steam_id: steamId }),
       ...(steamInstallDir === null ? {} : { steam_install_dir: steamInstallDir }),

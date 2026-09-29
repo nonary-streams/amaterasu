@@ -1113,6 +1113,16 @@ pub struct ApplicationConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_resolution_scrolling: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_send_scancodes: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_rightalt_to_key_win: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_repeat_delay: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_repeat_frequency: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_limiter_enable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_limiter_fps_limit: Option<f64>,
@@ -1159,6 +1169,15 @@ where
 
 impl ApplicationConfigOverrides {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .key_repeat_delay
+            .is_some_and(|delay| delay > i32::MAX as u32)
+            || self
+                .key_repeat_frequency
+                .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
+        {
+            return Err("invalid_catalog_response");
+        }
         if self.fec_percentage == Some(0) {
             return Err("invalid_catalog_response");
         }
@@ -1245,6 +1264,11 @@ impl ApplicationConfigOverrides {
             && self.gamepad.is_none()
             && self.keyboard.is_none()
             && self.mouse.is_none()
+            && self.high_resolution_scrolling.is_none()
+            && self.always_send_scancodes.is_none()
+            && self.key_rightalt_to_key_win.is_none()
+            && self.key_repeat_delay.is_none()
+            && self.key_repeat_frequency.is_none()
             && self.frame_limiter_enable.is_none()
             && self.frame_limiter_fps_limit.is_none()
             && self.frame_limiter_provider.is_none()
@@ -3085,5 +3109,56 @@ mod tests {
                 "unsupported_launch_spec"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod advanced_input_override_tests {
+    use super::ApplicationConfigOverrides;
+    use serde_json::json;
+
+    #[test]
+    fn application_projection_preserves_advanced_input_false_zero_and_inheritance() {
+        let selected = json!({
+            "high_resolution_scrolling":false,"always_send_scancodes":false,
+            "key_rightalt_to_key_win":true,"key_repeat_delay":0,"key_repeat_frequency":0.0,
+        });
+        let overrides: ApplicationConfigOverrides =
+            serde_json::from_value(selected.clone()).unwrap();
+        assert!(overrides.validate().is_ok());
+        assert!(!overrides.is_empty());
+        assert_eq!(serde_json::to_value(overrides).unwrap(), selected);
+        let inherited: ApplicationConfigOverrides = serde_json::from_value(json!({
+            "high_resolution_scrolling":null,"always_send_scancodes":null,
+            "key_rightalt_to_key_win":null,"key_repeat_delay":null,"key_repeat_frequency":null,
+        }))
+        .unwrap();
+        assert!(inherited.is_empty());
+        assert_eq!(serde_json::to_value(inherited).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn application_projection_rejects_invalid_advanced_input_policy() {
+        for (key, value) in [
+            ("high_resolution_scrolling", json!("false")),
+            ("always_send_scancodes", json!(1)),
+            ("key_rightalt_to_key_win", json!([])),
+            ("key_repeat_delay", json!(-1)),
+            ("key_repeat_delay", json!(0.5)),
+            ("key_repeat_delay", json!(2147483648_u64)),
+            ("key_repeat_frequency", json!(-0.1)),
+            ("key_repeat_frequency", json!("31.25")),
+        ] {
+            assert!(
+                serde_json::from_value::<ApplicationConfigOverrides>(json!({key:value}))
+                    .map(|overrides| overrides.validate().is_err())
+                    .unwrap_or(true)
+            );
+        }
+        let invalid = ApplicationConfigOverrides {
+            key_repeat_frequency: Some(f64::INFINITY),
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
     }
 }

@@ -885,6 +885,7 @@ namespace Amaterasu {
       const gamepad = inputGamepadOverrideSelect("gamepad", row.entry.config_overrides?.gamepad, runtimeStatus);
       const keyboard = audioOverrideSelect("keyboard", row.entry.config_overrides?.keyboard);
       const mouse = audioOverrideSelect("mouse", row.entry.config_overrides?.mouse);
+      const advancedInput = advancedInputOverrideControls(row.entry.config_overrides);
       const refreshRateOptionFields = catalogRefreshRateOptionFields(
         row.entry.config_overrides?.dd_refresh_rate_option,
       );
@@ -907,6 +908,7 @@ namespace Amaterasu {
         field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."),
         field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."),
         field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
+        ...advancedInput.fields,
       );
       const feedback = el("div");
       const save = el("button", "button primary", "Save streaming settings");
@@ -918,6 +920,7 @@ namespace Amaterasu {
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
           const config_overrides = {
+            ...advancedInput.read(),
             ...providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
             ...parseCatalogFrameLimiterOverrides(
               new FormData(form),
@@ -1105,6 +1108,8 @@ namespace Amaterasu {
     autoDetach.type = "checkbox";
     autoDetach.name = "auto_detach";
     autoDetach.checked = executableLaunch?.auto_detach ?? true;
+    const elevated = input("elevated", "", "checkbox");
+    elevated.checked = entry?.elevated ?? false;
     const waitAll = el("input");
     waitAll.type = "checkbox";
     waitAll.name = "wait_all";
@@ -1161,6 +1166,7 @@ namespace Amaterasu {
     const gamepad = inputGamepadOverrideSelect("gamepad", entry?.config_overrides?.gamepad, runtimeStatus);
     const keyboard = audioOverrideSelect("keyboard", entry?.config_overrides?.keyboard);
     const mouse = audioOverrideSelect("mouse", entry?.config_overrides?.mouse);
+    const advancedInput = advancedInputOverrideControls(entry?.config_overrides);
     const refreshRateOptionFields = catalogRefreshRateOptionFields(
       entry?.config_overrides?.dd_refresh_rate_option,
     );
@@ -1185,6 +1191,7 @@ namespace Amaterasu {
       "div",
       "form-grid",
       field("Auto detach", autoDetach, "Retain a quick successful launcher."),
+      field("Run with administrator privileges", elevated, "Windows uses an available elevated user token. Other platforms keep the host's normal launch identity."),
       field("Wait for all processes", waitAll, "Keep the app active while its process group is running."),
       field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."),
       field("Detached commands", detached, "One ordered command per line; up to 16."),
@@ -1207,6 +1214,7 @@ namespace Amaterasu {
     const fullscreen = field("Exit timeout (seconds)", fullscreenTimeout, "Graceful Playnite Fullscreen close window, from 0 to 300 seconds.");
     const showKind = () => {
       executable.hidden = kind.value !== "executable";
+      elevated.disabled = kind.value !== "executable";
       const isFullscreen = kind.value === "playnite_fullscreen";
       fullscreen.hidden = !isFullscreen;
       pathField.hidden = isFullscreen;
@@ -1246,6 +1254,7 @@ namespace Amaterasu {
       field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."),
       field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."),
       field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
+      ...advancedInput.fields,
       steamIdField,
       steamInstallDirField,
       fullscreen,

@@ -61,6 +61,51 @@ var Amaterasu;
         throw new Error(`${name} must be Inherit, Enabled, or Disabled.`);
     }
     Amaterasu.parseInputBooleanOverride = parseInputBooleanOverride;
+    function parseKeyRepeatDelayOverride(value) {
+        const trimmed = value.trim();
+        if (trimmed === "")
+            return null;
+        if (!/^[0-9]+$/.test(trimmed))
+            throw new Error("Key repeat delay must be a whole number from 0 to 2147483647 milliseconds, or blank to inherit.");
+        const delay = Number(trimmed);
+        if (!Number.isSafeInteger(delay) || delay > 0x7fff_ffff)
+            throw new Error("Key repeat delay must be a whole number from 0 to 2147483647 milliseconds, or blank to inherit.");
+        return delay;
+    }
+    Amaterasu.parseKeyRepeatDelayOverride = parseKeyRepeatDelayOverride;
+    function parseKeyRepeatFrequencyOverride(value) {
+        const trimmed = value.trim();
+        if (trimmed === "")
+            return null;
+        if (!/^(?:[+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(?:[eE][+-]?[0-9]+)?$/.test(trimmed))
+            throw new Error("Key repeat frequency must be a finite nonnegative number, or blank to inherit.");
+        const frequency = Number(trimmed);
+        if (!Number.isFinite(frequency) || frequency < 0)
+            throw new Error("Key repeat frequency must be a finite nonnegative number, or blank to inherit.");
+        return frequency;
+    }
+    Amaterasu.parseKeyRepeatFrequencyOverride = parseKeyRepeatFrequencyOverride;
+    function advancedInputOverrideFormValues(current) {
+        return {
+            high_resolution_scrolling: current?.high_resolution_scrolling == null ? "" : String(current.high_resolution_scrolling),
+            always_send_scancodes: current?.always_send_scancodes == null ? "" : String(current.always_send_scancodes),
+            key_rightalt_to_key_win: current?.key_rightalt_to_key_win == null ? "" : String(current.key_rightalt_to_key_win),
+            key_repeat_delay: current?.key_repeat_delay == null ? "" : String(current.key_repeat_delay),
+            key_repeat_frequency: current?.key_repeat_frequency == null ? "" : String(current.key_repeat_frequency),
+        };
+    }
+    Amaterasu.advancedInputOverrideFormValues = advancedInputOverrideFormValues;
+    function parseAdvancedInputOverrides(data) {
+        const text = (name) => String(data.get(name) ?? "");
+        return {
+            high_resolution_scrolling: parseInputBooleanOverride(text("high_resolution_scrolling"), "High-resolution scrolling"),
+            always_send_scancodes: parseInputBooleanOverride(text("always_send_scancodes"), "Always send scancodes"),
+            key_rightalt_to_key_win: parseInputBooleanOverride(text("key_rightalt_to_key_win"), "Right Alt as Windows key"),
+            key_repeat_delay: parseKeyRepeatDelayOverride(text("key_repeat_delay")),
+            key_repeat_frequency: parseKeyRepeatFrequencyOverride(text("key_repeat_frequency")),
+        };
+    }
+    Amaterasu.parseAdvancedInputOverrides = parseAdvancedInputOverrides;
     function parseGamepadProfileOverride(value, recognizedProfiles) {
         if (value === "")
             return null;
@@ -303,6 +348,7 @@ var Amaterasu;
         const gamepad = parseGamepadProfileOverride(text("gamepad"), recognizedGamepadProfiles);
         const keyboard = parseInputBooleanOverride(text("keyboard"), "Keyboard input");
         const mouse = parseInputBooleanOverride(text("mouse"), "Mouse input");
+        const advancedInput = Object.fromEntries(Object.entries(parseAdvancedInputOverrides(data)).filter(([, value]) => value !== null));
         const refreshRateOption = parseRefreshRateOptionOverride(String(data.get("dd_refresh_rate_option") ?? ""));
         const prefer10BitSdr = parsePrefer10BitSdrOverride(String(data.get("prefer_10bit_sdr") ?? ""));
         const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
@@ -317,6 +363,7 @@ var Amaterasu;
             gamepad === null &&
             keyboard === null &&
             mouse === null &&
+            Object.keys(advancedInput).length === 0 &&
             refreshRateOption === null &&
             prefer10BitSdr === null
             ? undefined
@@ -331,6 +378,7 @@ var Amaterasu;
                 ...(gamepad === null ? {} : { gamepad }),
                 ...(keyboard === null ? {} : { keyboard }),
                 ...(mouse === null ? {} : { mouse }),
+                ...advancedInput,
                 ...(refreshRateOption === null ? {} : { dd_refresh_rate_option: refreshRateOption }),
                 ...(prefer10BitSdr === null ? {} : { prefer_10bit_sdr: prefer10BitSdr }),
             };
@@ -362,6 +410,7 @@ var Amaterasu;
                 .map((tag) => tag.trim())
                 .filter(Boolean),
             exclude_global_prep_cmd: data.has("exclude_global_prep_cmd"),
+            ...(kind === "executable" ? { elevated: data.has("elevated") } : {}),
             launch,
             ...(steamId === null ? {} : { steam_id: steamId }),
             ...(steamInstallDir === null ? {} : { steam_install_dir: steamInstallDir }),
@@ -1624,6 +1673,47 @@ var Amaterasu;
     Amaterasu.pager = pager;
 })(Amaterasu || (Amaterasu = {}));
 (function (Amaterasu) {
+    function advancedInputOverrideControls(current) {
+        const values = Amaterasu.advancedInputOverrideFormValues(current);
+        const controls = new Map();
+        const fields = [];
+        for (const [name, label] of [
+            ["high_resolution_scrolling", "High-resolution scrolling"],
+            ["always_send_scancodes", "Always send scancodes"],
+            ["key_rightalt_to_key_win", "Right Alt as Windows key"],
+        ]) {
+            const select = Amaterasu.el("select");
+            select.name = name;
+            for (const [value, text] of [["", "Inherit"], ["true", "Enabled"], ["false", "Disabled"]]) {
+                const option = Amaterasu.el("option", "", text);
+                option.value = value ?? "";
+                select.append(option);
+            }
+            select.value = values[name];
+            controls.set(name, select);
+            fields.push(Amaterasu.field(label, select, "Inherit the next scope, or set an explicit input preference."));
+        }
+        for (const [name, label, help] of [
+            ["key_repeat_delay", "Key repeat delay (milliseconds)", "Blank inherits. Zero disables key repeat; maximum 2147483647."],
+            ["key_repeat_frequency", "Key repeat frequency (Hz)", "Blank inherits. Use a finite nonnegative value; zero selects the 24.9 Hz default."],
+        ]) {
+            const control = Amaterasu.input(name, values[name], "number");
+            control.min = "0";
+            control.step = name === "key_repeat_delay" ? "1" : "any";
+            if (name === "key_repeat_delay")
+                control.max = String(0x7fff_ffff);
+            control.placeholder = "Inherit";
+            controls.set(name, control);
+            fields.push(Amaterasu.field(label, control, help));
+        }
+        return {
+            fields,
+            read: () => Amaterasu.parseAdvancedInputOverrides({
+                get: (name) => controls.get(name)?.value ?? null,
+            }),
+        };
+    }
+    Amaterasu.advancedInputOverrideControls = advancedInputOverrideControls;
     function confirmAction(title, description, label) {
         return new Promise((resolve) => {
             const dialog = Amaterasu.el("dialog", "confirmation");
@@ -2222,8 +2312,9 @@ var Amaterasu;
             const gamepad = inputGamepadOverrideSelect("gamepad", row.entry.config_overrides?.gamepad, runtimeStatus);
             const keyboard = audioOverrideSelect("keyboard", row.entry.config_overrides?.keyboard);
             const mouse = audioOverrideSelect("mouse", row.entry.config_overrides?.mouse);
+            const advancedInput = Amaterasu.advancedInputOverrideControls(row.entry.config_overrides);
             const refreshRateOptionFields = catalogRefreshRateOptionFields(row.entry.config_overrides?.dd_refresh_rate_option);
-            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."));
+            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields);
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
             save.type = "submit";
@@ -2235,6 +2326,7 @@ var Amaterasu;
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
                     const config_overrides = {
+                        ...advancedInput.read(),
                         ...Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
                         ...parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row.entry.config_overrides),
                         dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
@@ -2352,6 +2444,8 @@ var Amaterasu;
         autoDetach.type = "checkbox";
         autoDetach.name = "auto_detach";
         autoDetach.checked = executableLaunch?.auto_detach ?? true;
+        const elevated = Amaterasu.input("elevated", "", "checkbox");
+        elevated.checked = entry?.elevated ?? false;
         const waitAll = Amaterasu.el("input");
         waitAll.type = "checkbox";
         waitAll.name = "wait_all";
@@ -2383,6 +2477,7 @@ var Amaterasu;
         const gamepad = inputGamepadOverrideSelect("gamepad", entry?.config_overrides?.gamepad, runtimeStatus);
         const keyboard = audioOverrideSelect("keyboard", entry?.config_overrides?.keyboard);
         const mouse = audioOverrideSelect("mouse", entry?.config_overrides?.mouse);
+        const advancedInput = Amaterasu.advancedInputOverrideControls(entry?.config_overrides);
         const refreshRateOptionFields = catalogRefreshRateOptionFields(entry?.config_overrides?.dd_refresh_rate_option);
         const prefer10BitSdr = audioOverrideSelect("prefer_10bit_sdr", catalogPrefer10BitSdrOverrideValue(entry?.config_overrides?.prefer_10bit_sdr) ?? undefined);
         const steamId = Amaterasu.input("steam_id", entry?.steam_id ?? "");
@@ -2394,7 +2489,7 @@ var Amaterasu;
         fullscreenTimeout.max = "300";
         fullscreenTimeout.step = "1";
         fullscreenTimeout.required = true;
-        const processPolicy = Amaterasu.el("div", "form-grid", Amaterasu.field("Auto detach", autoDetach, "Retain a quick successful launcher."), Amaterasu.field("Wait for all processes", waitAll, "Keep the app active while its process group is running."), Amaterasu.field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."), Amaterasu.field("Detached commands", detached, "One ordered command per line; up to 16."));
+        const processPolicy = Amaterasu.el("div", "form-grid", Amaterasu.field("Auto detach", autoDetach, "Retain a quick successful launcher."), Amaterasu.field("Run with administrator privileges", elevated, "Windows uses an available elevated user token. Other platforms keep the host's normal launch identity."), Amaterasu.field("Wait for all processes", waitAll, "Keep the app active while its process group is running."), Amaterasu.field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."), Amaterasu.field("Detached commands", detached, "One ordered command per line; up to 16."));
         const executable = Amaterasu.el("div", "form-grid", Amaterasu.field("Arguments", argumentsField, 'A JSON array of literal arguments. Example: ["--fullscreen"]'), Amaterasu.field("Working directory", directory, "Optional absolute path."), processPolicy, preparation);
         const pathField = Amaterasu.field("Absolute application path", path);
         const steamIdField = Amaterasu.field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
@@ -2402,6 +2497,7 @@ var Amaterasu;
         const fullscreen = Amaterasu.field("Exit timeout (seconds)", fullscreenTimeout, "Graceful Playnite Fullscreen close window, from 0 to 300 seconds.");
         const showKind = () => {
             executable.hidden = kind.value !== "executable";
+            elevated.disabled = kind.value !== "executable";
             const isFullscreen = kind.value === "playnite_fullscreen";
             fullscreen.hidden = !isFullscreen;
             pathField.hidden = isFullscreen;
@@ -2414,7 +2510,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields, steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }
@@ -4502,6 +4598,7 @@ var Amaterasu;
                     mouse.setAttribute("aria-label", `Mouse input override for ${client.name}`);
                     const nativePenTouch = sparseInputOverrideSelect("native_pen_touch", client.config_overrides?.native_pen_touch);
                     nativePenTouch.setAttribute("aria-label", `Native pen/touch preference override for ${client.name}`);
+                    const advancedInput = Amaterasu.advancedInputOverrideControls(client.config_overrides);
                     const streamAudio = Amaterasu.el("select");
                     streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
                     const audioChoices = [
@@ -4578,6 +4675,7 @@ var Amaterasu;
                         let saveStarted = false;
                         try {
                             const values = {
+                                ...advancedInput.read(),
                                 ...parseClientFecOverride(fec.value),
                                 back_button_timeout: Amaterasu.parseBackButtonTimeoutOverride(backButtonTimeout.value),
                                 stream_audio: Amaterasu.parseStreamAudioOverride(streamAudio.value),
@@ -4610,10 +4708,10 @@ var Amaterasu;
                     if (unsupported.length > 0)
                         status.textContent = `Save unavailable: this client has stored overrides this editor cannot preserve (${unsupported.join(", ")}).`;
                     const identity = Amaterasu.el("div", "", Amaterasu.el("strong", "", client.name), Amaterasu.el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`));
-                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, Amaterasu.el("div", "", save, status)];
+                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, Amaterasu.el("div", "form-grid", ...advancedInput.fields), Amaterasu.el("div", "", save, status)];
                 });
-                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", ""], rows);
-                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save confirms the stored pairing revision; applying client input preferences during active streams is not yet implemented."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
+                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "Keyboard and scrolling preferences", ""], rows);
+                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save confirms the stored pairing revision. Input preferences apply when the next stream acquires its input lease."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
             }
             catch (error) {
                 if (context.content.isConnected)

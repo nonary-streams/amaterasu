@@ -44,6 +44,13 @@ namespace Amaterasu {
   export type CatalogFrameLimiterProvider = string;
   export type CatalogAutoVirtualFramegenMode = "enabled" | "vrr" | "legacy" | "disabled";
   export type CatalogRtssFrameLimitType = string;
+  export interface AdvancedInputOverrides {
+    high_resolution_scrolling?: boolean | null;
+    always_send_scancodes?: boolean | null;
+    key_rightalt_to_key_win?: boolean | null;
+    key_repeat_delay?: number | null;
+    key_repeat_frequency?: number | null;
+  }
   export interface Entry {
     name: string;
     description: string;
@@ -55,7 +62,8 @@ namespace Amaterasu {
     steam_id?: string;
     steam_install_dir?: string;
     exclude_global_prep_cmd?: boolean;
-    config_overrides?: {
+    elevated?: boolean;
+    config_overrides?: AdvancedInputOverrides & {
       fec_percentage?: number;
       stream_audio?: boolean;
       audio_sink?: string;
@@ -273,7 +281,7 @@ namespace Amaterasu {
     client_id: string;
     name: string;
     paired_at: number;
-    config_overrides?: {
+    config_overrides?: AdvancedInputOverrides & {
       fec_percentage?: number;
       stream_audio?: boolean;
       audio_sink?: string;

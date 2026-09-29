@@ -2001,6 +2001,8 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
           updates += 1;
           if (updates === 2) {
             secondSubmittedRevision = body.expected_revision;
+            for (const key of ["high_resolution_scrolling", "always_send_scancodes", "key_rightalt_to_key_win", "key_repeat_delay", "key_repeat_frequency"])
+              assert.equal(Object.hasOwn(body.config_overrides, key), false);
             stored = { ...stored, revision: 9, clients: [
               { ...stored.clients[0], config_overrides: {
                 ...stored.clients[0].config_overrides, future_policy: true,
@@ -2012,6 +2014,11 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
           assert.equal(body.config_overrides.max_bitrate, 15000);
           assert.equal(body.config_overrides.frame_limiter_enable, false);
           assert.equal(body.config_overrides.native_pen_touch, true);
+          assert.equal(body.config_overrides.high_resolution_scrolling, false);
+          assert.equal(body.config_overrides.always_send_scancodes, false);
+          assert.equal(body.config_overrides.key_rightalt_to_key_win, true);
+          assert.equal(body.config_overrides.key_repeat_delay, 0);
+          assert.equal(body.config_overrides.key_repeat_frequency, 0);
           stored = { ...stored, revision: 8, clients: [
             { ...stored.clients[0], config_overrides: body.config_overrides }, stored.clients[1],
           ] };
@@ -2029,12 +2036,19 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   assert.ok(save);
   fec.value = "35";
   find(pairingArea, (node) => node.name === "native_pen_touch").value = "true";
+  for (const [key, value] of Object.entries({high_resolution_scrolling: "false", always_send_scancodes: "false", key_rightalt_to_key_win: "true", key_repeat_delay: "0", key_repeat_frequency: "0"}))
+    find(pairingArea, (node) => node.name === key).value = value;
   save.fire("click");
   await new Promise(setImmediate);
   assert.equal(updates, 1);
   assert.match(pairingArea.textContent, /Revision 8/);
   assert.match(notices.at(-1), /Stored overrides confirmed.*Active stream application is not confirmed/);
   const freshSave = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
+  for (const [key, value] of Object.entries({high_resolution_scrolling: "false", always_send_scancodes: "false", key_rightalt_to_key_win: "true", key_repeat_delay: "0", key_repeat_frequency: "0"})) {
+    const control = find(pairingArea, (node) => node.name === key);
+    assert.equal(control.value, value);
+    control.value = "";
+  }
   freshSave.fire("click");
   await new Promise(setImmediate);
   assert.equal(secondSubmittedRevision, 8);

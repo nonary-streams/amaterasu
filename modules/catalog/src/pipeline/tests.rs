@@ -3849,6 +3849,46 @@ fn native_pen_touch_override_is_sparse_strict_and_round_trips_through_catalog() 
 }
 
 #[test]
+fn advanced_input_overrides_preserve_sparse_values_after_catalog_reload_and_clear() {
+    let mut backend = Backend::default();
+    let mut pipeline = Pipeline::default();
+    let explicit = json!({
+        "high_resolution_scrolling": false,
+        "always_send_scancodes": false,
+        "key_rightalt_to_key_win": true,
+        "key_repeat_delay": 0,
+        "key_repeat_frequency": 0.0,
+    });
+    let mut catalog_entry = entry("Scoped input");
+    catalog_entry["config_overrides"] = explicit.clone();
+    let created = backend.run(
+        &mut pipeline,
+        json!({
+            "action":"create", "expected_revision":0, "entry":catalog_entry,
+        }),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    let id = created["id"].as_str().unwrap();
+    let reloaded = backend.run(&mut Pipeline::default(), json!({"action":"get", "id":id}));
+    assert_eq!(reloaded["entry"]["config_overrides"], explicit);
+    let mut inherited = reloaded["entry"].clone();
+    inherited["config_overrides"] = json!({
+        "high_resolution_scrolling": null, "always_send_scancodes": null,
+        "key_rightalt_to_key_win": null, "key_repeat_delay": null, "key_repeat_frequency": null,
+    });
+    let cleared = backend.run(
+        &mut pipeline,
+        json!({
+            "action":"update", "id":id, "expected_revision":created["revision"], "entry":inherited,
+        }),
+    );
+    assert_eq!(cleared["ok"], true, "{cleared}");
+    let reloaded = backend.run(&mut Pipeline::default(), json!({"action":"get", "id":id}));
+    assert!(reloaded["entry"].get("config_overrides").is_none());
+    assert!(backend.entries[id].get("config_overrides").is_none());
+}
+
+#[test]
 fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() {
     let mut backend = Backend::default();
     let mut pipeline = steam_importer();

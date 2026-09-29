@@ -2653,6 +2653,7 @@ namespace Amaterasu {
           mouse.setAttribute("aria-label", `Mouse input override for ${client.name}`);
           const nativePenTouch = sparseInputOverrideSelect("native_pen_touch", client.config_overrides?.native_pen_touch);
           nativePenTouch.setAttribute("aria-label", `Native pen/touch preference override for ${client.name}`);
+          const advancedInput = advancedInputOverrideControls(client.config_overrides);
           const streamAudio = el("select");
           streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
           const audioChoices: Array<[string, string]> = [
@@ -2731,6 +2732,7 @@ namespace Amaterasu {
               let saveStarted = false;
               try {
                 const values = {
+                  ...advancedInput.read(),
                   ...parseClientFecOverride(fec.value),
                   back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeout.value),
                   stream_audio: parseStreamAudioOverride(streamAudio.value),
@@ -2772,13 +2774,13 @@ namespace Amaterasu {
             el("strong", "", client.name),
             el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
           );
-          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, el("div", "", save, status)];
+          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, el("div", "form-grid", ...advancedInput.fields), el("div", "", save, status)];
         });
-        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", ""], rows);
+        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "Keyboard and scrolling preferences", ""], rows);
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
-            el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save confirms the stored pairing revision; applying client input preferences during active streams is not yet implemented."),
+            el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save confirms the stored pairing revision. Input preferences apply when the next stream acquires its input lease."),
             tableView,
             el("div", "actions", badge(`Revision ${settings.revision}`)),
           ),

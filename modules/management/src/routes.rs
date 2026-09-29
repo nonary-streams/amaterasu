@@ -609,6 +609,56 @@ mod tests {
     }
 
     #[test]
+    fn scoped_advanced_input_routes_preserve_inheritance_false_and_zero() {
+        for path in [
+            "/v1/catalog/update_provider_overrides",
+            "/v1/pairing/update_client_config_overrides",
+        ] {
+            let route = resolve(path).unwrap();
+            let request = if path.contains("catalog") {
+                serde_json::json!({"id":"app-0000000000000001", "expected_revision":7})
+            } else {
+                serde_json::json!({"certificate_id":"a".repeat(64), "expected_revision":7})
+            };
+            for overrides in [
+                serde_json::json!({}),
+                serde_json::json!({
+                    "high_resolution_scrolling":false,"always_send_scancodes":false,
+                    "key_rightalt_to_key_win":true,"key_repeat_delay":0,"key_repeat_frequency":0.0,
+                }),
+                serde_json::json!({
+                    "high_resolution_scrolling":null,"always_send_scancodes":null,
+                    "key_rightalt_to_key_win":null,"key_repeat_delay":null,"key_repeat_frequency":null,
+                }),
+            ] {
+                let mut body = request.clone();
+                body["config_overrides"] = overrides.clone();
+                assert_eq!(
+                    payload(route, &serde_json::to_vec(&body).unwrap()).unwrap()["config_overrides"],
+                    overrides
+                );
+            }
+            for (key, value) in [
+                ("high_resolution_scrolling", serde_json::json!("false")),
+                ("always_send_scancodes", serde_json::json!(1)),
+                ("key_rightalt_to_key_win", serde_json::json!([])),
+                ("key_repeat_delay", serde_json::json!(-1)),
+                ("key_repeat_delay", serde_json::json!(0.5)),
+                ("key_repeat_delay", serde_json::json!(2147483648_u64)),
+                ("key_repeat_frequency", serde_json::json!(-0.1)),
+                ("key_repeat_frequency", serde_json::json!("24.9")),
+            ] {
+                let mut body = request.clone();
+                body["config_overrides"] = serde_json::json!({key:value});
+                assert!(
+                    payload(route, &serde_json::to_vec(&body).unwrap()).is_err(),
+                    "{body}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn display_write_payloads_reject_nested_authority_and_unknown_mode_fields() {
         for action in ["status", "enumerate", "apply", "restore", "recover"] {
             let route = resolve(&format!("/v1/display/{action}")).unwrap();

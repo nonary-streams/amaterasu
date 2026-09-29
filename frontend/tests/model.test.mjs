@@ -14,6 +14,61 @@ vm.runInContext(
 const model = context.Amaterasu;
 const ordinary = (value) => JSON.parse(JSON.stringify(value));
 
+test("advanced scoped input editor preserves false and zero, and clears inherited values", () => {
+  const saved = { high_resolution_scrolling: false, always_send_scancodes: false,
+    key_rightalt_to_key_win: true, key_repeat_delay: 0, key_repeat_frequency: 0 };
+  const form = new FormData();
+  form.set("name", "Input app");
+  form.set("kind", "executable");
+  form.set("path", "/opt/example");
+  const values = model.advancedInputOverrideFormValues(saved);
+  for (const [key, value] of Object.entries(values)) form.set(key, value);
+  assert.deepEqual(ordinary(model.parseAdvancedInputOverrides(form)), saved);
+  assert.deepEqual(ordinary(model.entryFromForm(form).config_overrides), saved);
+  const cleared = model.advancedInputOverrideFormValues({
+    high_resolution_scrolling: null, always_send_scancodes: null,
+    key_rightalt_to_key_win: null, key_repeat_delay: null, key_repeat_frequency: null });
+  for (const [key, value] of Object.entries(cleared)) form.set(key, value);
+  assert.deepEqual(ordinary(model.parseAdvancedInputOverrides(form)), {
+    high_resolution_scrolling: null, always_send_scancodes: null,
+    key_rightalt_to_key_win: null, key_repeat_delay: null, key_repeat_frequency: null });
+  assert.equal(Object.hasOwn(model.entryFromForm(form), "config_overrides"), false);
+  assert.deepEqual(ordinary(model.advancedInputOverrideFormValues()), ordinary(cleared));
+});
+
+test("advanced scoped input editor rejects invalid repeat values and boolean coercion", () => {
+  for (const [key, value] of [
+    ["high_resolution_scrolling", "0"], ["always_send_scancodes", "yes"],
+    ["key_rightalt_to_key_win", "FALSE"], ["key_repeat_delay", "-1"],
+    ["key_repeat_delay", "0.5"], ["key_repeat_delay", "2147483648"],
+    ["key_repeat_frequency", "-0.1"], ["key_repeat_frequency", "Infinity"],
+    ["key_repeat_frequency", "NaN"], ["key_repeat_frequency", "0x10"],
+  ]) {
+    const form = new FormData();
+    form.set(key, value);
+    assert.throws(() => model.parseAdvancedInputOverrides(form), undefined, `${key}: ${value}`);
+  }
+  assert.equal(model.parseKeyRepeatDelayOverride("2147483647"), 2147483647);
+  assert.equal(model.parseKeyRepeatFrequencyOverride("31.25"), 31.25);
+});
+
+test("elevated executable editor persists both choices and removes elevation from other launch kinds", () => {
+  const form = new FormData();
+  form.set("name", "Elevated app");
+  form.set("kind", "executable");
+  form.set("path", "/opt/example");
+  assert.equal(model.entryFromForm(form).elevated, false);
+  form.set("elevated", "on");
+  assert.equal(model.entryFromForm(form).elevated, true);
+  form.delete("elevated");
+  assert.equal(model.entryFromForm(form).elevated, false);
+  form.set("elevated", "on");
+  for (const kind of ["application", "playnite_fullscreen"]) {
+    form.set("kind", kind);
+    assert.equal(Object.hasOwn(model.entryFromForm(form), "elevated"), false);
+  }
+});
+
 test("executable arguments stay literal and application metadata is not executed", () => {
   const form = new FormData();
   form.set("name", "  Example  ");

@@ -137,6 +137,16 @@ pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_resolution_scrolling: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_send_scancodes: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_rightalt_to_key_win: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_repeat_delay: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_repeat_frequency: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amd_av1_latency_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvenc_spatial_aq: Option<bool>,
@@ -191,6 +201,18 @@ where
 
 impl ConfigOverrides {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .key_repeat_delay
+            .is_some_and(|delay| delay > i32::MAX as u32)
+        {
+            return Err("key_repeat_delay must be between 0 and 2147483647 milliseconds");
+        }
+        if self
+            .key_repeat_frequency
+            .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
+        {
+            return Err("key_repeat_frequency must be finite and nonnegative");
+        }
         if self
             .fec_percentage
             .is_some_and(|percentage| percentage == 0)
@@ -319,6 +341,11 @@ impl ConfigOverrides {
             && self.gamepad.is_none()
             && self.keyboard.is_none()
             && self.mouse.is_none()
+            && self.high_resolution_scrolling.is_none()
+            && self.always_send_scancodes.is_none()
+            && self.key_rightalt_to_key_win.is_none()
+            && self.key_repeat_delay.is_none()
+            && self.key_repeat_frequency.is_none()
             && self.amd_av1_latency_mode.is_none()
             && self.nvenc_spatial_aq.is_none()
             && self.prefer_10bit_sdr.is_none()
@@ -1646,6 +1673,49 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn advanced_input_overrides_validate_types_and_repeat_boundaries() {
+        let inherited: ConfigOverrides = serde_json::from_value(json!({
+            "high_resolution_scrolling":null, "always_send_scancodes":null,
+            "key_rightalt_to_key_win":null, "key_repeat_delay":null, "key_repeat_frequency":null,
+        }))
+        .unwrap();
+        assert!(inherited.is_empty());
+        assert_eq!(serde_json::to_value(inherited).unwrap(), json!({}));
+        for value in [
+            json!({"key_repeat_delay":0}),
+            json!({"key_repeat_delay":i32::MAX}),
+            json!({"key_repeat_frequency":0}),
+            json!({"key_repeat_frequency":24.9}),
+        ] {
+            let overrides: ConfigOverrides = serde_json::from_value(value).unwrap();
+            assert!(overrides.validate().is_ok());
+            assert!(!overrides.is_empty());
+        }
+        for (key, value) in [
+            ("high_resolution_scrolling", json!("false")),
+            ("always_send_scancodes", json!(1)),
+            ("key_rightalt_to_key_win", json!([])),
+            ("key_repeat_delay", json!(-1)),
+            ("key_repeat_delay", json!(0.5)),
+            ("key_repeat_delay", json!(i32::MAX as u64 + 1)),
+            ("key_repeat_frequency", json!(-0.1)),
+            ("key_repeat_frequency", json!("24.9")),
+        ] {
+            let value = json!({key:value});
+            assert!(
+                serde_json::from_value::<ConfigOverrides>(value)
+                    .map(|overrides| overrides.validate().is_err())
+                    .unwrap_or(true)
+            );
+        }
+        let overrides = ConfigOverrides {
+            key_repeat_frequency: Some(f64::INFINITY),
+            ..Default::default()
+        };
+        assert!(overrides.validate().is_err());
     }
 
     #[test]

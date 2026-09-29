@@ -973,6 +973,11 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
             "keyboard",
             "mouse",
             "native_pen_touch",
+            "high_resolution_scrolling",
+            "always_send_scancodes",
+            "key_rightalt_to_key_win",
+            "key_repeat_delay",
+            "key_repeat_frequency",
             "frame_limiter_enable",
             "frame_limiter_fps_limit",
             "frame_limiter_provider",
@@ -1150,13 +1155,31 @@ fn optional_back_button_timeout(overrides: &Object) -> Result<(), &'static str> 
 }
 
 fn optional_input_overrides(overrides: &Object) -> Result<(), &'static str> {
-    for key in ["controller", "keyboard", "mouse", "native_pen_touch"] {
+    for key in [
+        "controller",
+        "keyboard",
+        "mouse",
+        "native_pen_touch",
+        "high_resolution_scrolling",
+        "always_send_scancodes",
+        "key_rightalt_to_key_win",
+    ] {
         if overrides
             .get(key)
             .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
         {
             return Err(INVALID);
         }
+    }
+    if overrides.get("key_repeat_delay").is_some_and(|value| {
+        !value.is_null() && !value.as_u64().is_some_and(|delay| delay <= i32::MAX as u64)
+    }) || overrides.get("key_repeat_frequency").is_some_and(|value| {
+        !value.is_null()
+            && !value
+                .as_f64()
+                .is_some_and(|frequency| frequency.is_finite() && frequency >= 0.0)
+    }) {
+        return Err(INVALID);
     }
     if overrides.get("gamepad").is_some_and(|value| {
         !value.is_null()

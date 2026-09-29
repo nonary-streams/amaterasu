@@ -157,6 +157,49 @@ namespace Amaterasu {
   }
 }
 namespace Amaterasu {
+  export function advancedInputOverrideControls(current?: AdvancedInputOverrides): {
+    fields: HTMLElement[];
+    read: () => AdvancedInputOverrides;
+  } {
+    const values = advancedInputOverrideFormValues(current);
+    const controls = new Map<keyof AdvancedInputOverrides, HTMLInputElement | HTMLSelectElement>();
+    const fields: HTMLElement[] = [];
+    for (const [name, label] of [
+      ["high_resolution_scrolling", "High-resolution scrolling"],
+      ["always_send_scancodes", "Always send scancodes"],
+      ["key_rightalt_to_key_win", "Right Alt as Windows key"],
+    ] as const) {
+      const select = el("select");
+      select.name = name;
+      for (const [value, text] of [["", "Inherit"], ["true", "Enabled"], ["false", "Disabled"]]) {
+        const option = el("option", "", text);
+        option.value = value ?? "";
+        select.append(option);
+      }
+      select.value = values[name];
+      controls.set(name, select);
+      fields.push(field(label, select, "Inherit the next scope, or set an explicit input preference."));
+    }
+    for (const [name, label, help] of [
+      ["key_repeat_delay", "Key repeat delay (milliseconds)", "Blank inherits. Zero disables key repeat; maximum 2147483647."],
+      ["key_repeat_frequency", "Key repeat frequency (Hz)", "Blank inherits. Use a finite nonnegative value; zero selects the 24.9 Hz default."],
+    ] as const) {
+      const control = input(name, values[name], "number");
+      control.min = "0";
+      control.step = name === "key_repeat_delay" ? "1" : "any";
+      if (name === "key_repeat_delay") control.max = String(0x7fff_ffff);
+      control.placeholder = "Inherit";
+      controls.set(name, control);
+      fields.push(field(label, control, help));
+    }
+    return {
+      fields,
+      read: () => parseAdvancedInputOverrides({
+        get: (name: string) => controls.get(name as keyof AdvancedInputOverrides)?.value ?? null,
+      }),
+    };
+  }
+
   export function confirmAction(
     title: string,
     description: string,
