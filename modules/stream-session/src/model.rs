@@ -1,3 +1,4 @@
+use amaterasu_module_sdk::EncoderSelection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -733,7 +734,7 @@ pub struct StartConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<u32>,
     pub output: String,
-    pub encoder: u32,
+    pub encoder: EncoderSelection,
     pub configuration: VideoConfiguration,
     pub audio_endpoint: String,
     #[serde(default)]
@@ -768,6 +769,7 @@ impl StartConfig {
     }
 
     pub fn validate(&self, stream_audio: bool) -> Result<(), &'static str> {
+        self.encoder.validate()?;
         if self.continuous_audio == Some(true) && !stream_audio {
             return Err("continuous_audio_requires_stream_audio");
         }

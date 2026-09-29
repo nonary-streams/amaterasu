@@ -125,3 +125,11 @@ Orderly ticket close must precede replacement for confirmed cleanup. Synchronous
 module unload can release sockets and settle bounded broker work, but cannot drive
 asynchronous provider teardown after ticking stops. Provider unload/process exit
 is the backstop for active resources; native grants do not sandbox trusted code.
+
+Encoder selection preserves legacy unsigned startup ordinals and accepts a full
+stable encoder identity or the exact `"auto"`/`"software"` backend selectors.
+The selection passes unchanged to video, which resolves non-identity selectors
+once before capture allocation. Missing software support fails explicitly; fixture
+control success does not qualify real capture, encode, or client playback. See
+[video selection policy](../video/README.md) for bounds and automatic-selection
+limits.

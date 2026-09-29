@@ -8,7 +8,7 @@ fn config() -> StreamingConfig {
         capture: CaptureConfig {
             capture_provider: CaptureProvider::Dxgi,
             output: "display-one".into(),
-            encoder: 0,
+            encoder: amaterasu_module_sdk::EncoderSelection::Index(0),
             audio_endpoint: "default".into(),
         },
         profile: StreamProfile {

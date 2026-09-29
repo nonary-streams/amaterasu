@@ -3347,7 +3347,7 @@ mod tests {
                 capture: crate::launch::CaptureConfig {
                     capture_provider: crate::launch::CaptureProvider::Dxgi,
                     output: output.into(),
-                    encoder: 0,
+                    encoder: amaterasu_module_sdk::EncoderSelection::Index(0),
                     audio_endpoint: audio_endpoint.into(),
                 },
                 profile: crate::launch::StreamProfile {

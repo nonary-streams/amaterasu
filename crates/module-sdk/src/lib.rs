@@ -4,6 +4,9 @@ mod native;
 pub use native::NativeBinding;
 
 pub use amaterasu_abi as abi;
+pub use amaterasu_contracts::encoder::{
+    EncoderBackend, EncoderIdentity, EncoderSelection, SOFTWARE_ENCODER_ID,
+};
 pub use amaterasu_contracts::{Command, Response, RuntimeHostContext};
 
 pub type ModuleResult<T> = Result<T, String>;

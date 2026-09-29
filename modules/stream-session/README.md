@@ -202,3 +202,11 @@ normalize to an effective 64; 16, 32, and 64 select the software per-frame send
 allowance. Eligible batches attempt Windows UDP segmentation or Linux UDP GSO;
 unsupported sockets fall back to individual datagrams. Live NIC and Linux
 qualification remain outstanding.
+
+Encoder selection preserves legacy unsigned startup ordinals and accepts a full
+stable encoder identity or the exact `"auto"`/`"software"` backend selectors.
+The selection passes unchanged to video, which resolves non-identity selectors
+once before capture allocation. Missing software support fails explicitly; fixture
+control success does not qualify real capture, encode, or client playback. See
+[video selection policy](../video/README.md) for bounds and automatic-selection
+limits.

@@ -1,4 +1,5 @@
 //! Version 1 control-plane messages. These types are independent of the bootstrap ABI.
+pub mod encoder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};

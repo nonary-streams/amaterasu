@@ -3,6 +3,7 @@
 //! The wire layer authenticates the TLS peer and parses Moonlight fields. This
 //! controller owns the resulting application and RTSP operations until the
 //! successful HTTP reply has been re-authorized and completely written.
+use amaterasu_module_sdk::EncoderSelection;
 mod call;
 mod record;
 mod workflow;
@@ -387,13 +388,16 @@ impl StreamingConfig {
 pub struct CaptureConfig {
     pub capture_provider: CaptureProvider,
     pub output: String,
-    pub encoder: u32,
+    pub encoder: EncoderSelection,
     pub audio_endpoint: String,
 }
 
 impl CaptureConfig {
     fn validate(&self) -> Result<(), &'static str> {
-        if !valid_label(&self.output, 512) || !valid_label(&self.audio_endpoint, 4096) {
+        if self.encoder.validate().is_err()
+            || !valid_label(&self.output, 512)
+            || !valid_label(&self.audio_endpoint, 4096)
+        {
             return Err("invalid_streaming_capture");
         }
         Ok(())

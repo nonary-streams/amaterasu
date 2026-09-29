@@ -2,6 +2,7 @@ use amaterasu_gamestream::{
     rtsp::negotiation::UdpDiscovery,
     sdp::{Announce, ColorMode, ControlProtocol},
 };
+use amaterasu_module_sdk::EncoderSelection;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -282,7 +283,7 @@ pub struct Capture {
     #[serde(default)]
     pub constant_rate: bool,
     pub output: String,
-    pub encoder: u32,
+    pub encoder: EncoderSelection,
     pub audio_endpoint: String,
     #[serde(default)]
     pub host_audio_enabled: bool,
@@ -680,6 +681,7 @@ impl Open {
     }
 
     fn validate_capture(&self) -> Result<(), &'static str> {
+        self.capture.encoder.validate()?;
         if self
             .device_name
             .as_deref()

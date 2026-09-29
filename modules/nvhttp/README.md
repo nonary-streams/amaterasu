@@ -576,3 +576,11 @@ session, and media composition through real paired HTTPS. It is the integration
 gate for launch XML, encrypted RTSP negotiation, UDP discovery, ownership, and
 cleanup behavior; the startup advertisement remains a configuration declaration
 rather than a replacement for that probe.
+
+Encoder selection preserves legacy unsigned startup ordinals and accepts a full
+stable encoder identity or the exact `"auto"`/`"software"` backend selectors.
+The selection passes unchanged to video, which resolves non-identity selectors
+once before capture allocation. Missing software support fails explicitly; fixture
+control success does not qualify real capture, encode, or client playback. See
+[video selection policy](../video/README.md) for bounds and automatic-selection
+limits.
