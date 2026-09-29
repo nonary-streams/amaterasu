@@ -12,9 +12,11 @@ use super::{
     ABS_TILT_Y, ABS_X, ABS_Y, BTN_STYLUS, BTN_STYLUS2, BTN_TOOL_PEN, BTN_TOOL_RUBBER, BTN_TOUCH,
     Device, EV_ABS, EV_KEY, InputError, InputResult, MAX_TOUCH_SLOTS,
 };
+#[cfg(test)]
+use crate::model::PEN_POINTER_ID;
 use crate::model::{
-    Event, PEN_BUTTON_PRIMARY, PEN_BUTTON_SECONDARY, PEN_BUTTON_TERTIARY, PEN_POINTER_ID, PenTool,
-    PenTouchDevice, PenTouchPhase, pen_tilt_axes,
+    Event, PEN_BUTTON_PRIMARY, PEN_BUTTON_SECONDARY, PEN_BUTTON_TERTIARY, PenTool, PenTouchDevice,
+    PenTouchPhase, pen_tilt_axes,
 };
 use std::collections::BTreeMap;
 
@@ -1051,6 +1053,7 @@ mod tests {
         Device {
             file: std::fs::OpenOptions::new().write(true).open(path).unwrap(),
             created: false,
+            fake: None,
         }
     }
 
@@ -1288,6 +1291,7 @@ mod tests {
                 .open("/dev/null")
                 .unwrap(),
             created: false,
+            fake: None,
         });
         pen_touch.inject(unavailable_path, &first_down).unwrap();
         assert!(pen_touch.tracker.touches.contains_key(&11));
@@ -1310,6 +1314,7 @@ mod tests {
                 .open("/dev/null")
                 .unwrap(),
             created: false,
+            fake: None,
         });
         assert!(super::super::Backend::pen_touch_supported(&backend));
         let pen_down = event(
@@ -1350,6 +1355,7 @@ mod tests {
                 .open("/dev/full")
                 .unwrap(),
             created: false,
+            fake: None,
         });
         let down = event(
             PEN_POINTER_ID,
@@ -1423,6 +1429,7 @@ mod tests {
                 .open("/dev/null")
                 .unwrap(),
             created: false,
+            fake: None,
         });
         let touch_down = event(42, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 40);
         pen_touch.inject("\0", &touch_down).unwrap();
@@ -1462,6 +1469,7 @@ mod tests {
                 .open("/dev/null")
                 .unwrap(),
             created: false,
+            fake: None,
         });
         pen_touch.inject("\0", &down).unwrap();
         assert!(pen_touch.tracker.pen.as_ref().unwrap().contact.down_written);
@@ -1891,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn move_after_failed_down_starts_touch_and_reserved_contacts_do_not_hold_tip() {
+    fn move_after_failed_down_starts_touch_and_uncertain_contacts_keep_shared_tip() {
         let mut tracker = ContactTracker::default();
         let mut writer = FakeWriter {
             fail_next: true,
@@ -1920,7 +1928,9 @@ mod tests {
             &event(7, PenTouchDevice::Touch, PenTouchPhase::Up, 11, 21),
         )
         .unwrap();
-        assert_eq!(event_at(&writer.frames[4].1, EV_KEY, BTN_TOUCH), Some(0));
+        // The second failed write may have installed a tracking ID. Its
+        // uncertain native contact keeps the shared tip until it is reconciled.
+        assert_eq!(event_at(&writer.frames[4].1, EV_KEY, BTN_TOUCH), None);
 
         let second_move = event(8, PenTouchDevice::Touch, PenTouchPhase::Move, 31, 41);
         emit(&mut tracker, &mut writer, &second_move).unwrap();

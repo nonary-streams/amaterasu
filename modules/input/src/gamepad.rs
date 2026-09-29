@@ -220,6 +220,7 @@ pub(crate) trait GamepadDevice {
     }
 
     /// Returns whether the active native report needs to be projected again.
+    #[cfg(windows)]
     fn set_ds4_back_as_touchpad_click(&mut self, _enabled: bool) -> bool {
         false
     }
@@ -382,6 +383,7 @@ impl<Device: GamepadDevice> GamepadSlot<Device> {
         self.back_deadline = None;
     }
 
+    #[cfg(windows)]
     fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
         // The next tick must project the new mapping even if the client keeps
         // holding Back and sends no further controller snapshot.
@@ -496,6 +498,7 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
         self.devices.iter().all(Option::is_none)
     }
 
+    #[cfg(windows)]
     pub(crate) fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
         for slot in self.devices.iter_mut().flatten() {
             slot.set_ds4_back_as_touchpad_click(enabled);
@@ -504,6 +507,7 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
 
     /// A shared native connection was lost. Each slot keeps its client state
     /// and timers, but must resend its effective state to a replacement device.
+    #[cfg(windows)]
     pub(crate) fn invalidate_devices(&mut self, mut invalidate: impl FnMut(&mut Device)) {
         for slot in self.devices.iter_mut().flatten() {
             invalidate(&mut slot.device);

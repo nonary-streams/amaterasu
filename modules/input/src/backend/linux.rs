@@ -10,6 +10,7 @@ use crate::model::{
     Axis, Button, Event, InputError, InputResult, Key, KeyState, PenTouchDevice,
     effective_virtual_key,
 };
+#[path = "linux_pen_touch.rs"]
 mod linux_pen_touch;
 use linux_pen_touch::LinuxPenTouch;
 use std::collections::HashMap;
@@ -133,7 +134,7 @@ impl Device {
                 REL_HWHEEL_HI_RES,
                 REL_WHEEL_HI_RES,
             ] {
-                set_bit(fd, UI_SET_RELBIT, code)?;
+                set_bit(fd, UI_SET_RELBIT, u32::from(code))?;
             }
         }
         let name: &[u8] = if keyboard {
@@ -656,7 +657,13 @@ impl Backend for LinuxBackend {
                     std::time::Instant::now(),
                     |slot| UinputGamepad::create(path, slot),
                 )
-                .map_err(|error| InputError::new("controller_unavailable", error.message));
+                .map_err(|error| {
+                    if error.code == "release_failed" {
+                        error
+                    } else {
+                        InputError::new("controller_unavailable", error.message)
+                    }
+                });
         }
         if let Event::Key { key, state } = event {
             if self.keyboard_retired {
@@ -705,20 +712,12 @@ impl Backend for LinuxBackend {
                 Key::MoonlightVk { code, .. } => Some(*code),
                 _ => None,
             };
-            if let (
-                Some(identity),
-                Key::MoonlightVk {
-                    code, normalized, ..
-                },
-            ) = (identity, key)
+            if let Some(identity) = identity
                 && *state == KeyState::Down
             {
                 // Retain the plan before the write; a failed write can have an
                 // uncertain outcome and a later cleanup must use this mapping.
-                self.held_virtual_keycodes.insert(
-                    identity,
-                    code_for_virtual_key(*code, *normalized, self.key_rightalt_to_key_win)?,
-                );
+                self.held_virtual_keycodes.insert(identity, code);
             }
             let result = keyboard.emit(&[(
                 EV_KEY,
@@ -1508,7 +1507,7 @@ mod tests {
 
         assert_eq!(
             backend.validate(&event).unwrap_err().code,
-            "unsupported_event"
+            "controller_unavailable"
         );
         assert!(!backend.controller_input_supported());
     }
@@ -1543,7 +1542,7 @@ mod tests {
 
     #[test]
     fn high_resolution_scroll_maps_raw_units_and_compatible_detents_per_axis() {
-        let mut vertical = 0;
+        let vertical = 0;
         let (hi_res, legacy, vertical) = scroll_unit_frame(Axis::Vertical, 60, vertical);
         assert_eq!(hi_res, (REL_WHEEL_HI_RES, 60));
         assert_eq!(legacy, None);

@@ -937,13 +937,16 @@ fn active_gamepad_readback_tracks_recovery_without_changing_lease_identity() {
         } = &mut request
         {
             *operation_id = Some("reconnecting-gamepad".into());
-            *gamepad = Some(GamepadProfile::X360);
+            *gamepad = Some(selected_supported_profile());
         }
         request
     };
     let acquired = controller.handle("owner", operation(), now, &mut || Ok(()));
     let first_token = acquired["lease"].as_str().unwrap().to_owned();
-    assert_eq!(acquired["gamepad_profile"], "x360");
+    assert_eq!(
+        acquired["gamepad_profile"],
+        selected_supported_profile().as_str()
+    );
     assert_eq!(acquired["controller_input"], false);
     assert_eq!(acquired["effective_gamepad_profile"], Value::Null);
     assert_eq!(acquired["gamepad_unavailable_reason"], "bus unavailable");
@@ -963,7 +966,10 @@ fn active_gamepad_readback_tracks_recovery_without_changing_lease_identity() {
     let status = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
     for readback in [&recovered, &lookup] {
         assert_eq!(readback["lease"], first_token);
-        assert_eq!(readback["gamepad_profile"], "x360");
+        assert_eq!(
+            readback["gamepad_profile"],
+            selected_supported_profile().as_str()
+        );
         assert_eq!(readback["controller_input"], true);
         assert_eq!(readback["effective_gamepad_profile"], "x360");
         assert_eq!(readback["gamepad_unavailable_reason"], Value::Null);

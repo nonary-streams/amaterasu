@@ -1278,7 +1278,7 @@ fn resolved_existing_relative_path(root: &Path, relative: &Path) -> PackageResul
     #[cfg(not(windows))]
     {
         let _ = root;
-        return Ok(relative.to_path_buf());
+        Ok(relative.to_path_buf())
     }
     #[cfg(windows)]
     {
