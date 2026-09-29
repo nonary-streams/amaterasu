@@ -270,6 +270,7 @@ mod tests {
         let settings = FrameLimiterSettings {
             frame_limiter_enable: Some(false),
             frame_limiter_fps_limit: Some(0.0),
+            #[cfg(windows)]
             frame_limiter_disable_vsync: Some(false),
             ..FrameLimiterSettings::default()
         };
@@ -278,7 +279,10 @@ mod tests {
         let persisted = serde_json::to_value(&settings).unwrap();
         assert_eq!(persisted["frame_limiter_enable"], false);
         assert_eq!(persisted["frame_limiter_fps_limit"], 0.0);
+        #[cfg(windows)]
         assert_eq!(persisted["frame_limiter_disable_vsync"], false);
+        #[cfg(not(windows))]
+        assert!(persisted["frame_limiter_disable_vsync"].is_null());
         let effective = settings.effective();
         assert!(!effective.frame_limiter_enable);
         assert_eq!(effective.frame_limiter_fps_limit_millihz, 0);
