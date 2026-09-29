@@ -25,6 +25,42 @@ ORIGIN = "http://127.0.0.1:3000"
 PASSWORD = "test-password-for-local-api-only"
 PAIRING_FIXTURES = Path(__file__).resolve().parents[1] / "modules" / "pairing" / "tests" / "fixtures"
 
+CLIENT_INPUT_OVERRIDES = {
+    "high_resolution_scrolling": False,
+    "always_send_scancodes": False,
+    "key_rightalt_to_key_win": True,
+    "key_repeat_delay": 0,
+    "key_repeat_frequency": 0.0,
+}
+APPLICATION_INPUT_OVERRIDES = {
+    "high_resolution_scrolling": True,
+    "always_send_scancodes": True,
+    "key_rightalt_to_key_win": False,
+    "key_repeat_delay": 275,
+    "key_repeat_frequency": 31.25,
+}
+INVALID_INPUT_OVERRIDES = (
+    {"controller": "false"}, {"keyboard": "false"}, {"mouse": 1},
+    {"gamepad": "unknown-profile"}, {"high_resolution_scrolling": "false"},
+    {"always_send_scancodes": 1}, {"key_rightalt_to_key_win": "true"},
+    {"key_repeat_delay": -1}, {"key_repeat_delay": 0.5},
+    {"key_repeat_delay": 2147483648}, {"key_repeat_frequency": -0.1},
+    {"key_repeat_frequency": "31.25"},
+)
+
+
+def assert_input_overrides(overrides, expected):
+    for key, value in expected.items():
+        actual = overrides.get(key)
+        assert actual == value, (key, actual, value)
+        if isinstance(value, bool):
+            assert actual is value, (key, actual, value)
+        elif isinstance(value, (int, float)):
+            assert isinstance(actual, (int, float)) and not isinstance(actual, bool), (
+                key, actual, value
+            )
+
+
 def solid_portrait_png():
     def chunk(name, data):
         payload = name + data
@@ -308,7 +344,7 @@ def test_auth_and_crud(console, api):
         {
             "certificate_id": first_client["certificate_id"],
             "expected_revision": paired_clients["revision"],
-            "config_overrides": {"fec_percentage": 47, "stream_audio": True, "audio_sink": "client-endpoint", "virtual_sink": "client-virtual-endpoint", "audio_sink_capture_only": False, "back_button_timeout": -1, "controller": False, "gamepad": "auto", "keyboard": False, "mouse": True},
+            "config_overrides": {"fec_percentage": 47, "stream_audio": True, "audio_sink": "client-endpoint", "virtual_sink": "client-virtual-endpoint", "audio_sink_capture_only": False, "back_button_timeout": -1, "controller": False, "gamepad": "auto", "keyboard": False, "mouse": True, **CLIENT_INPUT_OVERRIDES},
         },
         administrator,
     )
@@ -330,12 +366,13 @@ def test_auth_and_crud(console, api):
     assert first_after_update.get("config_overrides", {}).get("audio_sink_capture_only") is False, first_after_update
     assert first_after_update.get("config_overrides", {}).get("back_button_timeout") == -1, first_after_update
     assert {key: first_after_update["config_overrides"][key] for key in ("controller", "gamepad", "keyboard", "mouse")} == {"controller": False, "gamepad": "auto", "keyboard": False, "mouse": True}, first_after_update
+    assert_input_overrides(first_after_update["config_overrides"], CLIENT_INPUT_OVERRIDES)
     assert second_after_update.get("config_overrides", {}).get("fec_percentage") is None, second_after_update
     assert second_after_update.get("config_overrides", {}).get("audio_sink_capture_only") is None, second_after_update
     assert second_after_update.get("config_overrides", {}).get("virtual_sink") is None, second_after_update
     assert second_after_update.get("config_overrides", {}).get("back_button_timeout") is None, second_after_update
     assert all(key not in second_after_update.get("config_overrides", {}) for key in ("controller", "gamepad", "keyboard", "mouse")), second_after_update
-    for invalid_input in ({"controller": "false"}, {"keyboard": "false"}, {"mouse": 1}, {"gamepad": "unknown-profile"}):
+    for invalid_input in INVALID_INPUT_OVERRIDES:
         status, rejected_input, _ = api.post(
             "/v1/pairing/update_client_config_overrides",
             {
@@ -392,6 +429,7 @@ def test_auth_and_crud(console, api):
     assert persisted_client.get("config_overrides", {}).get("audio_sink_capture_only") is False, persisted_client
     assert persisted_client.get("config_overrides", {}).get("back_button_timeout") == -1, persisted_client
     assert {key: persisted_client["config_overrides"][key] for key in ("controller", "gamepad", "keyboard", "mouse")} == {"controller": False, "gamepad": "auto", "keyboard": False, "mouse": True}, persisted_client
+    assert_input_overrides(persisted_client["config_overrides"], CLIENT_INPUT_OVERRIDES)
     status, auth_settings, _ = api.post("/v1/auth/settings", token=administrator)
     assert status == 200 and auth_settings["ok"], auth_settings
     assert auth_settings["values"] == {
@@ -439,7 +477,7 @@ def test_auth_and_crud(console, api):
         "steam_id": "730",
         "steam_install_dir": steam_install_dir,
         "exclude_global_prep_cmd": True,
-        "config_overrides": {"fec_percentage": 37, "stream_audio": False, "audio_sink": "", "virtual_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250, "controller": True, "gamepad": "auto", "keyboard": True, "mouse": False},
+        "config_overrides": {"fec_percentage": 37, "stream_audio": False, "audio_sink": "", "virtual_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250, "controller": True, "gamepad": "auto", "keyboard": True, "mouse": False, **APPLICATION_INPUT_OVERRIDES},
         "launch": {
             "kind": "executable",
             "program": game_path,
@@ -474,7 +512,7 @@ def test_auth_and_crud(console, api):
             administrator,
         )
         assert status == 400 and not rejected_timeout["ok"], rejected_timeout
-    for invalid_input in ({"controller": "false"}, {"keyboard": "false"}, {"mouse": 1}, {"gamepad": "unknown-profile"}):
+    for invalid_input in INVALID_INPUT_OVERRIDES:
         status, rejected_input, _ = api.post(
             "/v1/catalog/create",
             {
@@ -512,7 +550,7 @@ def test_auth_and_crud(console, api):
     updated_entry = {
         **entry,
         "name": "Renamed",
-        "config_overrides": {"fec_percentage": 43, "stream_audio": False, "audio_sink": "", "virtual_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250, "controller": True, "gamepad": "auto", "keyboard": True, "mouse": False},
+        "config_overrides": {"fec_percentage": 43, "stream_audio": False, "audio_sink": "", "virtual_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250, "controller": True, "gamepad": "auto", "keyboard": True, "mouse": False, **APPLICATION_INPUT_OVERRIDES},
         "launch": {**entry["launch"], "auto_detach": True, "wait_all": False},
     }
     status, renamed, _ = api.post("/v1/catalog/update", {"id": created["id"], "entry": updated_entry, "expected_revision": created["revision"]}, administrator)
@@ -1461,6 +1499,7 @@ def main():
             assert persisted_client.get("config_overrides", {}).get("audio_sink_capture_only") is False, persisted_client
             assert persisted_client.get("config_overrides", {}).get("back_button_timeout") == -1, persisted_client
             assert {key: persisted_client["config_overrides"][key] for key in ("controller", "gamepad", "keyboard", "mouse")} == {"controller": False, "gamepad": "auto", "keyboard": False, "mouse": True}, persisted_client
+            assert_input_overrides(persisted_client["config_overrides"], CLIENT_INPUT_OVERRIDES)
             status, lutris_settings, _ = api.post("/v1/lutris/settings", token=relogged["bearer"])
             assert status == 200 and lutris_settings["values"] == lutris_values, lutris_settings
             assert lutris_settings["revision"] == lutris_revision, lutris_settings

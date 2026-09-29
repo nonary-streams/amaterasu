@@ -23,6 +23,15 @@ from cryptography.x509.oid import NameOID
 
 from test_component_updates import CARGO, ComponentHarness, run
 from test_host_service import Console
+from test_management_api import (
+    APPLICATION_INPUT_OVERRIDES,
+    CLIENT_INPUT_OVERRIDES,
+    ORIGIN,
+    PASSWORD,
+    Api,
+    available_moonlight_port_pair,
+    assert_input_overrides,
+)
 from test_nvhttp import FIXTURES, get, pair, successful, tls_context, wait_for
 from test_rtsp import PeerDiscovery, RtspClient, announcement
 from test_stream_session import (
@@ -35,6 +44,7 @@ from test_stream_session import (
 )
 
 SOURCE = "test.stream-source/1"
+INPUT_PROBE = "test.input-probe/1"
 
 
 def launch_query(key, app_id="1", key_id=17):
@@ -90,7 +100,7 @@ def media_complete(console, baseline):
     )
 
 
-def create_application(console, marker, revision, lifetime):
+def create_application(console, marker, revision, lifetime, config_overrides=None):
     code = (
         f"from pathlib import Path; import os,time; "
         f"Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep({lifetime!r})"
@@ -102,10 +112,18 @@ def create_application(console, marker, revision, lifetime):
             "expected_revision": revision,
             "entry": {
                 "name": "Controlled streaming process",
+                **(
+                    {"config_overrides": config_overrides}
+                    if config_overrides is not None
+                    else {}
+                ),
                 "launch": {
                     "kind": "executable",
                     "program": sys.executable,
                     "arguments": ["-c", code],
+                    # These controlled roots exercise ordinary attached-process
+                    # exit and teardown, rather than the short-root detach rule.
+                    "auto_detach": False,
                 },
             },
         },
@@ -113,6 +131,67 @@ def create_application(console, marker, revision, lifetime):
     expected_id = f"app-{revision + 1:016x}"
     assert created["ok"] and created["id"] == expected_id, created
     return str(revision + 1)
+
+
+def update_client_input_overrides(console, certificate_id, overrides):
+    clients = console.request("amaterasu.pairing/1", {"action": "list_clients"})
+    updated = console.request(
+        "amaterasu.pairing/1",
+        {
+            "action": "update_client_config_overrides",
+            "certificate_id": certificate_id,
+            "expected_revision": clients["revision"],
+            "config_overrides": overrides,
+        },
+    )
+    assert updated["ok"], updated
+    clients = console.request("amaterasu.pairing/1", {"action": "list_clients"})
+    client = next(
+        row for row in clients["clients"] if row["certificate_id"] == certificate_id
+    )
+    assert_input_overrides(client.get("config_overrides", {}), overrides)
+    assert all(
+        key not in client.get("config_overrides", {})
+        for key, value in overrides.items()
+        if value is None
+    )
+
+
+def update_application_input_overrides(console, app_id, overrides):
+    app = console.request("amaterasu.catalog/1", {"action": "get", "id": app_id})
+    updated = console.request(
+        "amaterasu.catalog/1",
+        {
+            "action": "update",
+            "id": app["id"],
+            "expected_revision": app["revision"],
+            "entry": {**app["entry"], "config_overrides": overrides},
+        },
+    )
+    assert updated["ok"], updated
+    app = console.request("amaterasu.catalog/1", {"action": "get", "id": app_id})
+    assert_input_overrides(app["entry"].get("config_overrides", {}), overrides)
+    assert all(
+        key not in app["entry"].get("config_overrides", {})
+        for key, value in overrides.items()
+        if value is None
+    )
+
+
+def assert_persisted_input_overrides(console, certificate_id):
+    app = console.request(
+        "amaterasu.catalog/1", {"action": "get", "id": "app-0000000000000001"}
+    )
+    assert_input_overrides(app["entry"]["config_overrides"], APPLICATION_INPUT_OVERRIDES)
+    clients = console.request("amaterasu.pairing/1", {"action": "list_clients"})
+    client = next(
+        row for row in clients["clients"] if row["certificate_id"] == certificate_id
+    )
+    assert_input_overrides(client["config_overrides"], CLIENT_INPUT_OVERRIDES)
+    other = next(
+        row for row in clients["clients"] if row["certificate_id"] != certificate_id
+    )
+    assert all(key not in other.get("config_overrides", {}) for key in CLIENT_INPUT_OVERRIDES)
 
 
 def require_launch_denied(base, query, context=None, expected=401):
@@ -206,11 +285,14 @@ def exercise_stream(
     stop_mode,
     certificate_id,
     key_id,
+    expected_input=None,
 ):
     marker.unlink(missing_ok=True)
     baseline = console.request(SOURCE, {"action": "status"})
     key = secrets.token_bytes(16)
     query = launch_query(key, key_id=key_id)
+    # Payload identity cannot replace the authenticated certificate's policy.
+    query["uniqueid"] = "other-launch-owner"
     opened = successful(get(https, "/launch", query, context))
     url = opened.findtext("sessionUrl0")
     assert url and url.startswith("rtspenc://"), url
@@ -257,6 +339,14 @@ def exercise_stream(
         )
         try:
             association.finish(console, baseline)
+            if expected_input is not None:
+                wait_until(
+                    lambda: console.request(INPUT_PROBE, {"action": "status"}).get("active"),
+                    "stream did not acquire its synthetic input lease",
+                )
+                input_state = console.request(INPUT_PROBE, {"action": "status"})
+                assert input_state["fixture"], input_state
+                assert_input_overrides(input_state["requested_policy"], expected_input)
             wait_until(
                 lambda: media_complete(console, baseline),
                 "stream did not produce media and an IDR request",
@@ -280,6 +370,11 @@ def exercise_stream(
                 lambda: capture_idle(console, baseline, opened_delta=1),
                 "stream cleanup did not close each capture provider exactly once",
             )
+            if expected_input is not None:
+                wait_until(
+                    lambda: not console.request(INPUT_PROBE, {"action": "status"})["active"],
+                    "stream cleanup left its synthetic input lease active",
+                )
             verify_video(collect(video, ("127.0.0.1", ports["video"])), key, expected_video)
             verify_audio(collect(audio, ("127.0.0.1", ports["audio"])), key, key_id)
         finally:
@@ -296,11 +391,24 @@ def main():
         path = harness.root / "bootstrap.json"
         bootstrap = json.loads(path.read_text())
         settings = bootstrap["policy"]["settings"]
+        # Pairing uses an explicit fixture identity through its legacy importer.
+        settings["amaterasu.pairing"]["host_configuration"] = False
+        settings["amaterasu.management"] = {
+            "enabled": True,
+            "bind": "127.0.0.1:0",
+            "allowed_origins": [ORIGIN],
+        }
         settings["amaterasu.catalog"]["export_principals"] = {
             "amaterasu.nvhttp": "amaterasu.console"
         }
+        # The settings API uses a Moonlight base port with derived listeners.
+        # Choose a currently free loopback set instead of any installed host's
+        # default ports, keeping that real protocol layout across restart.
+        base_port = available_moonlight_port_pair()
         settings["amaterasu.nvhttp"] = {
-            "enabled": True, "http_bind": "127.0.0.1:0", "https_bind": "127.0.0.1:0",
+            "enabled": True,
+            "http_bind": f"127.0.0.1:{base_port}",
+            "https_bind": f"127.0.0.1:{base_port - 5}",
             "streaming": {
                 "capture": {
                     "capture_provider": "dxgi", "output": "synthetic-display",
@@ -319,13 +427,15 @@ def main():
         }
         settings["amaterasu.rtsp"] = {
             "enabled": True,
-            "bind": "127.0.0.1:0",
+            "bind": f"127.0.0.1:{base_port + 21}",
             "allowed_principals": ["amaterasu.nvhttp"],
         }
         settings["amaterasu.stream-session"] = {
             "enabled": True,
+            "enable_input": True,
             "allowed_principals": ["amaterasu.rtsp"],
         }
+        settings["amaterasu.input-probe"] = {"enabled": True}
         settings["amaterasu.audio-encode"] = {"enabled": True}
         for component in ("media-transport", "control-transport"):
             settings[f"amaterasu.{component}"] = {
@@ -354,32 +464,95 @@ def main():
                 lambda value: value.get("tls_ready"),
             )
             http, https = "http://" + state["http_address"], "https://" + state["https_address"]
+            # This explicit fixture uses encrypted video on loopback. Its
+            # durable LAN policy must agree with that client transport choice.
+            api = Api(console)
+            setup = console.request(
+                "amaterasu.authentication/1",
+                {"action": "setup", "username": "administrator", "password": PASSWORD},
+            )
+            assert setup["ok"], setup
+            status, logged_in, _ = api.post(
+                "/v1/auth/login",
+                {"username": "administrator", "password": PASSWORD},
+                origin=ORIGIN,
+            )
+            assert status == 200 and logged_in["ok"], logged_in
+            administrator = logged_in["bearer"]
+            status, host_settings, _ = api.post("/v1/nvhttp/settings", token=administrator)
+            assert status == 200 and host_settings["ok"], host_settings
+            status, encrypted, _ = api.post(
+                "/v1/nvhttp/settings_update",
+                {
+                    "hostname": host_settings["hostname"],
+                    "port": host_settings["port"],
+                    "expected_revision": host_settings["revision"],
+                    "lan_encryption_mode": 2,
+                },
+                administrator,
+            )
+            assert status == 200 and encrypted["ok"], encrypted
+            assert encrypted["lan_encryption_mode"] == 2, encrypted
             certificate_id = pair(console, http)
             context = tls_context()
             other = other_paired_context(console, directory)
             marker = directory / "application.pid"
             short_marker = directory / "short-application.pid"
-            create_application(console, marker, 0, 60)
+            create_application(console, marker, 0, 60, APPLICATION_INPUT_OVERRIDES)
             short_app = create_application(console, short_marker, 1, 3)
+            update_client_input_overrides(console, certificate_id, CLIENT_INPUT_OVERRIDES)
+            # Restart the signed host before observing the launch-time policy.
+            console.eof()
+            console.close()
+            console = Console(harness)
+            state = wait_for(
+                console, "amaterasu.nvhttp/1", {"action": "status"},
+                lambda value: value.get("tls_ready"),
+            )
+            http = "http://" + state["http_address"]
+            https = "https://" + state["https_address"]
+            api = Api(console)
+            status, persisted_host, _ = api.post("/v1/nvhttp/settings", token=administrator)
+            assert status == 200 and persisted_host["lan_encryption_mode"] == 2, persisted_host
+            assert_persisted_input_overrides(console, certificate_id)
             exercise_rejected_launches(console, http, https, context, marker)
             exercise_natural_exit(console, https, context, short_marker, short_app, 17)
             # key_id is an IV salt, not session identity. Fresh AES keys may
             # legitimately reuse it, so every session deliberately uses 17.
             for mode in ("teardown", "cancel", "revoke"):
+                if mode == "teardown":
+                    expected_input = CLIENT_INPUT_OVERRIDES
+                elif mode == "cancel":
+                    update_client_input_overrides(
+                        console, certificate_id,
+                        {key: None for key in CLIENT_INPUT_OVERRIDES},
+                    )
+                    expected_input = APPLICATION_INPUT_OVERRIDES
+                else:
+                    update_application_input_overrides(
+                        console, "app-0000000000000001",
+                        {key: None for key in APPLICATION_INPUT_OVERRIDES},
+                    )
+                    expected_input = {key: None for key in APPLICATION_INPUT_OVERRIDES}
                 exercise_stream(
                     console, https, context, other, marker, oracle, directory,
-                    mode, certificate_id, 17,
+                    mode, certificate_id, 17, expected_input,
                 )
             marker.unlink(missing_ok=True)
             require_launch_denied(https, launch_query(secrets.token_bytes(16)), context)
             assert not marker.exists(), "revoked certificate launched an application"
             console.eof()
+        except Exception:
+            print("".join(console.errors), file=sys.stderr)
+            raise
         finally:
             console.close()
     print(
         "Passed: paired HTTPS exported application launch, owned retry/cancel, "
         "encrypted RTSP and discovered UDP media, TEARDOWN and "
         "certificate-revocation cleanup of capture and controlled child. "
+        "Scoped input lease requests preserve certificate-bound client/application "
+        "precedence, false/zero, null inheritance, and restart persistence. "
         "Hardware and full client parity remain unqualified."
     )
 
