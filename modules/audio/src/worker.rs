@@ -1,7 +1,7 @@
 //! Worker-owned COM capture feeds a bounded queue; no COM interface is Send.
 use crate::{
+    continuity::Continuity,
     model::{AudioResult, Endpoint, Format, Health, Packet},
-    packet::Continuity,
     platform,
 };
 use amaterasu_media::AUDIO_DISCONTINUITY;

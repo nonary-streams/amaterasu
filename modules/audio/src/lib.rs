@@ -1,4 +1,5 @@
 //! Caller-owned Windows WASAPI loopback audio and borrowed native PCM frames.
+mod continuity;
 mod controller;
 mod model;
 mod native;

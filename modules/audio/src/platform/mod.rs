@@ -6,6 +6,13 @@ pub use windows::{Capture, enumerate, route_restore_pending};
 pub use windows::{shutdown, startup};
 
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    not(windows),
+    expect(
+        dead_code,
+        reason = "device recovery options are consumed by the Windows capture backend"
+    )
+)]
 pub struct RecoveryConfig {
     pub endpoint: String,
     pub follow_console_default: bool,
@@ -15,10 +22,12 @@ pub struct RecoveryConfig {
     pub explicit_route: bool,
 }
 
+#[cfg(any(windows, test))]
 pub(super) fn should_resolve_console_default(requested: &str, uses_virtual_sink: bool) -> bool {
     !uses_virtual_sink && (requested.is_empty() || requested == "default")
 }
 
+#[cfg(any(windows, test))]
 pub(super) fn should_follow_console_default(
     requested: &str,
     uses_virtual_sink: bool,
