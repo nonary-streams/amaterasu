@@ -25,14 +25,7 @@ pub(super) fn validate(config: &mut RuntimeConfig, state_root: &Path) -> Package
     if !present.iter().all(|present| *present) {
         return Err("management TLS settings must be configured together".into());
     }
-    let bind = settings["tls_bind"]
-        .as_str()
-        .ok_or("management TLS bind must be a loopback socket address")?
-        .parse::<std::net::SocketAddr>()
-        .map_err(|_| "management TLS bind must be a loopback socket address")?;
-    if !bind.ip().is_loopback() || bind.port() == 0 {
-        return Err("management TLS bind must be loopback".into());
-    }
+    validate_bind(&settings["tls_bind"])?;
     let certificate = setting_path(settings, "tls_certificate_path", state_root, "cert")?;
     let key = setting_path(settings, "tls_private_key_path", state_root, "key")?;
     if same_path(&certificate, &key) {
@@ -50,6 +43,18 @@ pub(super) fn validate(config: &mut RuntimeConfig, state_root: &Path) -> Package
         "tls_private_key_path".into(),
         serde_json::json!(super::path_to_unicode_string(&key)?),
     );
+    Ok(())
+}
+
+fn validate_bind(value: &serde_json::Value) -> PackageResult<()> {
+    let bind = value
+        .as_str()
+        .ok_or("management TLS bind must be a socket address")?
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| "management TLS bind must be a socket address")?;
+    if bind.port() == 0 {
+        return Err("management TLS bind must use a nonzero port".into());
+    }
     Ok(())
 }
 
@@ -234,6 +239,30 @@ fn same_path(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn trusted_tls_bind_accepts_explicit_remote_and_wildcard_selection_without_opening_sockets() {
+        for bind in [
+            "127.0.0.1:47990",
+            "[::1]:47990",
+            "0.0.0.0:47990",
+            "[::]:47990",
+            "192.168.0.1:47990",
+            "203.0.113.1:47990",
+        ] {
+            validate_bind(&json!(bind)).unwrap();
+        }
+        for bind in [
+            json!("127.0.0.1:0"),
+            json!("0.0.0.0:0"),
+            json!("localhost:47990"),
+            json!("relative"),
+            json!(true),
+            serde_json::Value::Null,
+        ] {
+            assert!(validate_bind(&bind).is_err());
+        }
+    }
 
     fn configured(cert: &str, key: &str) -> RuntimeConfig {
         let mut config = RuntimeConfig::default();

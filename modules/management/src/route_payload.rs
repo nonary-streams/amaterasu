@@ -15,6 +15,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
     }
     match route.service {
         "amaterasu.authentication/1" => authentication(route.action, object),
+        "amaterasu.management/1" => management_settings(route.action, object),
         "amaterasu.host-configuration/1" => host_configuration(route.action, object),
         "amaterasu.catalog/1" => catalog(route.action, object),
         "amaterasu.pairing/1" => pairing(route.action, object),
@@ -54,6 +55,66 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn management_settings(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "product_get" => fields(object, &[], &[]),
+        "product_update" => {
+            fields(object, &["expected_revision"], &["origin_web_ui_allowed"])?;
+            if object
+                .get("expected_revision")
+                .and_then(Value::as_u64)
+                .is_none()
+                || object.get("origin_web_ui_allowed").is_some_and(|value| {
+                    !value.is_null() && !matches!(value.as_str(), Some("pc" | "lan" | "wan"))
+                })
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        _ => Err(INVALID),
+    }
+}
+
+#[cfg(test)]
+mod management_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn management_policy_routes_require_exact_scopes_and_bounded_fields() {
+        let get = crate::routes::resolve("/v1/management_settings/get").unwrap();
+        assert_eq!(get.service, "amaterasu.management/1");
+        assert_eq!(get.scope, Some("configuration.read"));
+        assert!(validate(get, json!({}).as_object().unwrap()).is_ok());
+        assert!(validate(get, json!({"owner":"other"}).as_object().unwrap()).is_err());
+        let update = crate::routes::resolve("/v1/management_settings/update").unwrap();
+        assert_eq!(update.scope, Some("configuration.write"));
+        for selection in [json!("pc"), json!("lan"), json!("wan"), Value::Null] {
+            assert!(
+                validate(
+                    update,
+                    json!({"expected_revision":0,"origin_web_ui_allowed":selection})
+                        .as_object()
+                        .unwrap()
+                )
+                .is_ok()
+            );
+        }
+        assert!(validate(update, json!({"expected_revision":0}).as_object().unwrap()).is_ok());
+        for payload in [
+            json!({}),
+            json!({"expected_revision":-1}),
+            json!({"expected_revision":1.5}),
+            json!({"expected_revision":0,"origin_web_ui_allowed":"WAN"}),
+            json!({"expected_revision":0,"origin_web_ui_allowed":false}),
+            json!({"expected_revision":0,"origin_web_ui_allowed":"wan","caller":"other"}),
+        ] {
+            assert!(validate(update, payload.as_object().unwrap()).is_err());
+        }
     }
 }
 

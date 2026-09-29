@@ -2517,6 +2517,117 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function managementTier(value) {
+        return value === "pc" || value === "lan" || value === "wan";
+    }
+    function parseManagementPolicyReply(value) {
+        if (value === null || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Management access policy reply is invalid.");
+        const reply = value;
+        if (reply.ok !== true || typeof reply.revision !== "number" ||
+            !Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
+            reply.values === null || typeof reply.values !== "object" || Array.isArray(reply.values))
+            throw new Error("Management access policy reply is invalid.");
+        const values = reply.values;
+        const selection = values.origin_web_ui_allowed;
+        if ((selection !== null && !managementTier(selection)) ||
+            !managementTier(reply.origin_web_ui_allowed) ||
+            reply.origin_web_ui_allowed !== (selection ?? "lan"))
+            throw new Error("Management access policy was not confirmed by the host.");
+        return { ok: true, revision: reply.revision,
+            values: { origin_web_ui_allowed: selection },
+            origin_web_ui_allowed: reply.origin_web_ui_allowed };
+    }
+    Amaterasu.parseManagementPolicyReply = parseManagementPolicyReply;
+    async function saveManagementPolicy(api, current, selection) {
+        if (selection !== null && !managementTier(selection))
+            throw new Error("Choose a valid management access policy.");
+        if (!Number.isSafeInteger(current.revision) || current.revision < 0 ||
+            current.revision >= Number.MAX_SAFE_INTEGER)
+            throw new Error("Management access policy revision cannot be updated.");
+        const update = await api.post("management_settings/update", {
+            expected_revision: current.revision, origin_web_ui_allowed: selection,
+        });
+        if (update && typeof update === "object" &&
+            update.code === "revision_conflict")
+            throw new Error("Management access policy changed in another editor. Refresh and try again.");
+        const confirmed = parseManagementPolicyReply(update);
+        if (confirmed.revision !== current.revision + 1 ||
+            confirmed.values.origin_web_ui_allowed !== selection)
+            throw new Error("Management access policy update could not be confirmed. Refresh and check the current value.");
+        const saved = parseManagementPolicyReply(await api.post("management_settings/get"));
+        if (saved.revision !== confirmed.revision || saved.values.origin_web_ui_allowed !== selection)
+            throw new Error("Management access policy could not be confirmed after saving. Refresh and check the current value.");
+        return saved;
+    }
+    Amaterasu.saveManagementPolicy = saveManagementPolicy;
+    function renderManagementPolicy(context) {
+        const area = Amaterasu.el("div");
+        let generation = 0;
+        context.content.append(area);
+        async function load() {
+            const request = ++generation;
+            area.replaceChildren(Amaterasu.el("p", "muted", "Loading management access policy…"));
+            try {
+                const current = parseManagementPolicyReply(await context.api.post("management_settings/get"));
+                if (!context.content.isConnected || request !== generation)
+                    return;
+                const selection = Amaterasu.el("select");
+                selection.name = "origin_web_ui_allowed";
+                for (const [value, label] of [
+                    ["", "Default (this PC and LAN)"],
+                    ["pc", "This PC"],
+                    ["lan", "This PC and LAN"],
+                    ["wan", "All networks"],
+                ]) {
+                    const option = Amaterasu.el("option", "", label);
+                    option.value = value ?? "";
+                    selection.append(option);
+                }
+                selection.value = current.values.origin_web_ui_allowed ?? "";
+                const form = Amaterasu.el("form", "settings-form");
+                const status = Amaterasu.el("div");
+                const save = Amaterasu.el("button", "button primary", "Save management access");
+                save.type = "submit";
+                save.disabled = !context.api.allows("configuration.write");
+                selection.disabled = save.disabled;
+                form.append(Amaterasu.field("Allow management access from", selection, "Remote access uses the host's configured HTTPS listener. Administrator sign-in is still required. Choosing this PC can disconnect a remote browser."), save, status);
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    if (save.disabled || !context.api.allows("configuration.write"))
+                        return;
+                    ++generation;
+                    selection.disabled = true;
+                    void Amaterasu.runAction(save, status, async () => {
+                        const value = selection.value;
+                        if (value !== "" && !managementTier(value))
+                            throw new Error("Choose a valid management access policy.");
+                        try {
+                            await saveManagementPolicy(context.api, current, value === "" ? null : value);
+                            context.notify("Management access policy saved.");
+                            await load();
+                        }
+                        catch (error) {
+                            await load();
+                            if (context.content.isConnected)
+                                area.append(Amaterasu.errorPanel(error));
+                            throw error;
+                        }
+                    }).finally(() => { selection.disabled = !context.api.allows("configuration.write"); });
+                });
+                area.replaceChildren(Amaterasu.panel("Management access", Amaterasu.button("Refresh policy", load), form));
+            }
+            catch (error) {
+                if (context.content.isConnected && request === generation)
+                    area.replaceChildren(Amaterasu.errorPanel(error, load));
+            }
+        }
+        void load();
+    }
+    Amaterasu.renderManagementPolicy = renderManagementPolicy;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     const maxConfiguredAuthTtlSeconds = 0x7fff_ffff;
     const maxInputKeyRepeatDelayMs = 0x7fff_ffff;
     const minInputBackButtonTimeoutMs = -0x8000_0000;
@@ -4119,6 +4230,7 @@ var Amaterasu;
             void loadHistorySettings();
             void loadPairing();
         })), area, authArea, hostLoggingArea, hostArea, steamArea, lutrisArea, playniteArea, inputArea, historyArea, pairingArea);
+        Amaterasu.renderManagementPolicy(context);
         async function loadAuth() {
             authArea.replaceChildren(Amaterasu.el("p", "muted", "Loading authentication lifetimes…"));
             try {

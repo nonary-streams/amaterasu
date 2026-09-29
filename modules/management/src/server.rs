@@ -1,12 +1,13 @@
 //! Tick-owned, nonblocking network connections and asynchronous service delegation.
 use crate::assets::Assets;
 use crate::http::{BrowserAuth, RequestTarget};
+use crate::peer_policy::{self, PeerTier};
 use crate::{AUTH_SERVICE, http};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use rustls::{ServerConfig, ServerConnection};
 use serde_json::{Value, json};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +23,7 @@ pub struct Server {
     connections: Vec<Connection>,
     next_operation: u64,
     assets: Option<Assets>,
+    maximum_peer: Option<PeerTier>,
 }
 
 impl Server {
@@ -58,6 +60,7 @@ impl Server {
             connections: Vec::new(),
             next_operation: 1,
             assets,
+            maximum_peer: None,
         })
     }
 
@@ -72,6 +75,10 @@ impl Server {
     pub fn tick(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
         self.accept()?;
         for connection in &mut self.connections {
+            if !peer_policy::permits(self.maximum_peer, connection.peer, connection.tls.is_some()) {
+                connection.expire(runtime);
+                continue;
+            }
             connection.tick(
                 runtime,
                 &self.address,
@@ -85,12 +92,22 @@ impl Server {
         Ok(())
     }
 
+    pub(crate) fn set_peer_policy(&mut self, maximum: Option<PeerTier>) {
+        self.maximum_peer = maximum;
+    }
+
     fn accept(&mut self) -> ModuleResult<()> {
-        Self::accept_from(&self.listener, None, &mut self.connections)?;
+        Self::accept_from(
+            &self.listener,
+            None,
+            self.maximum_peer,
+            &mut self.connections,
+        )?;
         if let Some(listener) = &self.tls_listener {
             Self::accept_from(
                 listener,
                 self.tls_configuration.as_ref(),
+                self.maximum_peer,
                 &mut self.connections,
             )?;
         }
@@ -100,6 +117,7 @@ impl Server {
     fn accept_from(
         listener: &TcpListener,
         configuration: Option<&Arc<ServerConfig>>,
+        maximum_peer: Option<PeerTier>,
         connections: &mut Vec<Connection>,
     ) -> ModuleResult<()> {
         for _ in 0..4 {
@@ -107,7 +125,9 @@ impl Server {
                 break;
             }
             match listener.accept() {
-                Ok((stream, peer)) if peer.ip().is_loopback() => {
+                Ok((stream, peer))
+                    if peer_policy::permits(maximum_peer, peer.ip(), configuration.is_some()) =>
+                {
                     if stream.set_nonblocking(true).is_ok() {
                         let tls = configuration
                             .map(|config| ServerConnection::new(config.clone()))
@@ -120,6 +140,7 @@ impl Server {
                             deadline: Instant::now() + CONNECTION_TIMEOUT,
                             stage: Stage::Reading(Vec::new()),
                             origin: None,
+                            peer: peer.ip(),
                         });
                     }
                 }
@@ -140,6 +161,7 @@ struct Connection {
     deadline: Instant,
     origin: Option<String>,
     stage: Stage,
+    peer: IpAddr,
 }
 
 enum Stage {
@@ -413,6 +435,10 @@ impl Connection {
             return Ok(());
         }
         if matches!(request.target, RequestTarget::OperationalHealth) {
+            if peer_policy::classify(self.peer) != PeerTier::Pc {
+                self.fail(403, "peer_denied");
+                return Ok(());
+            }
             if let Some(request_id) = self.submit(
                 runtime,
                 crate::SERVICE,
@@ -672,6 +698,52 @@ fn service_status(payload: &Value, login: bool, operational_health: bool) -> u16
 mod tests {
     use super::*;
 
+    #[test]
+    fn real_loopback_ingress_stays_closed_until_policy_load_and_uses_transport_rules() {
+        let tls = crate::tls::configuration(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/browser-cert.pem"
+            ),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/browser-key.pem"
+            ),
+        )
+        .unwrap();
+        let mut server = Server::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            None,
+            Some("127.0.0.1:0".parse().unwrap()),
+            Some(tls),
+        )
+        .unwrap();
+        let _closed_http = TcpStream::connect(server.address()).unwrap();
+        let _closed_tls = TcpStream::connect(server.tls_address().unwrap()).unwrap();
+        server.accept().unwrap();
+        assert!(server.connections.is_empty());
+        server.set_peer_policy(Some(PeerTier::Pc));
+        let _http = TcpStream::connect(server.address()).unwrap();
+        let _tls = TcpStream::connect(server.tls_address().unwrap()).unwrap();
+        server.accept().unwrap();
+        assert_eq!(server.connections.len(), 2);
+        assert!(
+            server
+                .connections
+                .iter()
+                .all(|connection| connection.peer == "127.0.0.1".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(
+            server
+                .connections
+                .iter()
+                .filter(|connection| connection.tls.is_some())
+                .count(),
+            1
+        );
+    }
+
     fn browser_reply(action: BrowserAuth, payload: Value) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -682,6 +754,7 @@ mod tests {
             deadline: Instant::now() + CONNECTION_TIMEOUT,
             origin: None,
             stage: Stage::Closed,
+            peer: "127.0.0.1".parse().unwrap(),
         };
         connection.respond_browser_auth(action, payload);
         let Stage::Writing { bytes, .. } = connection.stage else {
@@ -757,6 +830,7 @@ mod tests {
             deadline: Instant::now() + CONNECTION_TIMEOUT,
             origin: None,
             stage: Stage::Closed,
+            peer: "127.0.0.1".parse().unwrap(),
         };
         connection.write_response(b"response".to_vec(), 0);
         assert!(matches!(connection.stage, Stage::Writing { offset: 0, .. }));

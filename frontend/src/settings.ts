@@ -1860,6 +1860,7 @@ namespace Amaterasu {
       historyArea,
       pairingArea,
     );
+    renderManagementPolicy(context);
     async function loadAuth(): Promise<void> {
       authArea.replaceChildren(el("p", "muted", "Loading authentication lifetimes…"));
       try {

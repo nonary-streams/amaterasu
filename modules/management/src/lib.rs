@@ -1,6 +1,8 @@
 //! Development loopback HTTP management lives in this independently loaded module.
 mod assets;
 mod http;
+mod peer_policy;
+mod product_settings;
 mod route_payload;
 mod routes;
 mod server;
@@ -34,6 +36,7 @@ struct ManagementModule {
     runtime: RuntimeClient,
     server: Option<Server>,
     operational_health: Option<OperationalHealth>,
+    product_settings: product_settings::ProductSettings,
 }
 
 const CATALOG_SERVICE: &str = "amaterasu.catalog/1";
@@ -89,18 +92,23 @@ impl ManagedModule for ManagementModule {
             runtime,
             server,
             operational_health: None,
+            product_settings: product_settings::ProductSettings::default(),
         })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        self.product_settings
+            .tick(Instant::now(), &mut |command| self.runtime.send(command))?;
         self.advance_operational_health()?;
         if let Some(server) = &mut self.server {
+            server.set_peer_policy(self.product_settings.maximum_peer());
             server.tick(&self.runtime)?;
         }
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
                 id,
+                caller,
                 service,
                 payload,
                 remaining_ms,
@@ -115,6 +123,19 @@ impl ManagedModule for ManagementModule {
                 }
                 if payload == json!({"action":"operational_health"}) {
                     return self.begin_operational_health(id, remaining_ms);
+                }
+                if payload
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|action| matches!(action, "product_get" | "product_update"))
+                {
+                    return self.product_settings.receive(
+                        &caller,
+                        id,
+                        remaining_ms,
+                        payload,
+                        &mut |command| self.runtime.send(command),
+                    );
                 }
                 let payload = if payload == json!({"action":"status"}) {
                     json!({"ok":true,"enabled":self.server.is_some(),"bound_address":self.server.as_ref().map(Server::address),"tls_address":self.server.as_ref().and_then(Server::tls_address)})
@@ -303,12 +324,6 @@ fn validate_settings(settings: &Settings) -> ModuleResult<()> {
     {
         return Err("management bind must be explicitly loopback".into());
     }
-    if settings
-        .tls_bind
-        .is_some_and(|address| !address.ip().is_loopback())
-    {
-        return Err("management TLS bind must be explicitly loopback".into());
-    }
     if settings.tls_bind.is_some() != settings.tls_certificate_path.is_some()
         || settings.tls_bind.is_some() != settings.tls_private_key_path.is_some()
     {
@@ -341,13 +356,22 @@ mod tests {
         for settings in [
             json!({"bind":"0.0.0.0:1234"}),
             json!({"bind":"[::]:1234"}),
-            json!({"tls_bind":"0.0.0.0:1234","tls_certificate_path":"C:/cert.pem","tls_private_key_path":"C:/key.pem"}),
             json!({"tls_bind":"127.0.0.1:1234"}),
             json!({"tls_certificate_path":"C:/cert.pem","tls_private_key_path":"C:/key.pem"}),
             json!({"allowed_origins":["*"]}),
             json!({"allowed_origins":["https://host/path"]}),
         ] {
             assert!(validate_settings(&serde_json::from_value(settings).unwrap()).is_err());
+        }
+        // TLS bind is a trusted startup setting; peer access is checked independently.
+        for bind in [
+            "0.0.0.0:1234",
+            "[::]:1234",
+            "192.168.0.1:1234",
+            "203.0.113.1:1234",
+        ] {
+            let settings = serde_json::from_value(json!({"tls_bind":bind,"tls_certificate_path":"/cert.pem","tls_private_key_path":"/key.pem"})).unwrap();
+            validate_settings(&settings).unwrap();
         }
     }
 }

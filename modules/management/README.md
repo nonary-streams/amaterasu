@@ -1,4 +1,4 @@
-# Loopback management module
+# Management module
 
 `amaterasu-management` is a native cdylib/rlib providing `amaterasu.management/1`.
 The generic host does not implement HTTP or product routing. This module uses
@@ -17,21 +17,44 @@ The listener is disabled by default. Development bootstrap settings for principa
 ephemeral port. The trusted console can request
 `amaterasu.management/1` with `{"action":"status"}` to obtain
 `{"ok":true,"enabled":true,"bound_address":"127.0.0.1:PORT"}`. Disabled status
-returns a null address. Startup rejects wildcard/nonloopback binds and invalid
-settings. At most 16 exact HTTP(S) origins without paths are accepted; empty means
-all browser Origin headers are denied. `Host` must exactly match the bound numeric
+returns a null address. Startup rejects wildcard/nonloopback plaintext binds and invalid
+settings. At most 16 exact HTTP(S) origins without paths are accepted; the bound
+transport's exact origin is always permitted. `Host` must exactly match the bound numeric
 address and port, including IPv6 brackets. DNS names such as `localhost` are
 intentionally rejected to prevent DNS rebinding.
 
 An opt-in browser HTTPS listener uses three signed bootstrap settings together:
-`tls_bind` (loopback socket address), `tls_certificate_path` (absolute PEM chain),
+`tls_bind` (explicit socket address), `tls_certificate_path` (absolute PEM chain),
 and `tls_private_key_path` (absolute PEM key). The TLS files are bounded at load
 time and rustls checks that the key matches the leaf certificate. The trusted
 console status includes `tls_address` when bound. A deployment must provision a
-separate browser-valid leaf with loopback IP SANs, serverAuth EKU, a browser-trusted
+separate browser-valid leaf with the selected listener IP SANs, serverAuth EKU, a browser-trusted
 issuer, and private-key file access restricted to the host account and admins.
 Replace certificate and key atomically and restart management to rotate them.
 The Moonlight pairing identity and its certificate are not browser TLS material.
+The installed host additionally requires nonzero TLS ports and content-addressed
+files under its private `management-tls` state directory, selected through the
+worker-state-root token. File digest, ownership, permissions, containment and
+reparse checks remain mandatory. Generated development certificates retain
+loopback SANs; selecting a remote bind alone does not qualify remote TLS identity.
+
+`origin_web_ui_allowed` selects the maximum source tier for HTTPS ingress:
+`pc` permits IPv4 127/8 and IPv6 ::1, `lan` additionally permits RFC1918,
+100.64/10, 169.254/16, fc00::/7 and exactly fe80::/64, and `wan` permits the
+remaining addresses. IPv4-mapped IPv6 peers are classified as IPv4. Plain HTTP
+and `/healthz` remain PC-only. This policy uses the actual socket peer; forwarded
+headers, browser Origin, cookies and credentials cannot change its source tier.
+
+The Settings page reads `/v1/management_settings/get` and writes
+`/v1/management_settings/update` with `expected_revision` and an optional
+`origin_web_ui_allowed`. Omission retains the selection; null resets to the
+source default `lan`. The management module owns a separate version-1 product
+document in configuration's caller-scoped namespace, leaving its generic user
+schema intact. Writes require the immutable management runtime principal after
+HTTP scope verification. Confirmed CAS values apply to new and existing
+connections and survive restart. Ingress stays closed until the durable document
+loads, and during ambiguous writes or unresolved child-result cleanup. Narrowing
+access can disconnect a browser whose peer no longer qualifies.
 
 ## Authentication and routes
 
@@ -80,6 +103,8 @@ Plaintext requests cannot use browser cookie routes or cookie authentication.
 | `/v1/catalog/` | create, update, delete | `catalog.write` |
 | `/v1/configuration/` | get | `configuration.read` |
 | `/v1/configuration/` | register, update, migrate | `configuration.write` |
+| `/v1/management_settings/` | get | `configuration.read` |
+| `/v1/management_settings/` | update | `configuration.write` |
 | `/v1/host-configuration/` | get | `configuration.read` |
 | `/v1/host-configuration/` | update | `configuration.write` |
 | `/v1/session/` | list, snapshot | `session.read` |
@@ -252,16 +277,15 @@ Origin is denied. Only explicit OPTIONS preflight for a known route, POST and th
 `authorization`/`content-type` headers is accepted. Allowed origins receive exact
 CORS headers, never a wildcard or credential-cookie permission. Strict JSON,
 explicit Bearer headers, Origin checks and numeric Host validation protect the
-browser boundary; ordinary nonbrowser clients may omit Origin. This API does not
-set or consume authentication cookies.
+browser boundary; ordinary nonbrowser clients may omit Origin. HTTPS browser
+cookie routes retain their separate same-origin CSRF checks.
 
 ## Remaining release gates
 
-This is explicitly loopback **development HTTP**, not a remote HTTPS service.
-TLS/certificate management, remote bind policy, installed service hardening,
-legacy Sunshine/Vibeshine HTTP compatibility, real-client pairing qualification, stream establishment,
-per-user isolation, frontend UI, audit records, token-management HTTP workflows,
-and production load/abuse testing remain unimplemented. Scoped launch authority
+Plain HTTP remains a loopback development surface. Actual remote HTTPS
+certificate identity, installed service/platform behavior, legacy
+Sunshine/Vibeshine HTTP compatibility, real-client pairing and production
+load/abuse qualification remain release gates. Scoped launch authority
 can execute trusted native applications and is intentionally powerful.
 
 Run `cargo test -p amaterasu-management` and `python3 scripts/test_management_api.py`.
@@ -269,6 +293,10 @@ The latter starts a real signed package under `amaterasu serve`, binds an epheme
 loopback port, performs actual auth and catalog CRUD, and checks more than 512 internal calls plus scoped token
 persistence/revocation, session invalidation, browser protections and framing.
 A sandbox must permit loopback listening for that integration test.
+`python3 scripts/test_management_origin_policy.py` exercises a real signed host
+and browser TLS identity on loopback: scoped policy CAS, null/omitted updates,
+Host/Origin checks, generic schema isolation and restart persistence. Pure unit
+tests cover every remote CIDR boundary without opening remote listeners.
 
 Verified static frontend bundles are optional; see [web bundles](../../docs/web-bundles.md).
 GET assets bypass API authentication and expose only signed public frontend bytes.
