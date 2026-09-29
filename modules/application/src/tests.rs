@@ -925,6 +925,107 @@ fn typed_detached_commands_isolate_environment_and_cwd_from_primary_and_each_oth
 }
 
 #[test]
+fn detached_directory_selection_preserves_legacy_inheritance_and_independent_targets() {
+    let directory = test_directory("detached-directory-policy");
+    let primary_directory = directory.join("primary");
+    let helper_directory = directory.join("helper");
+    let configured_directory = directory.join("configured");
+    let child_directory = directory.join("child");
+    for selected in [
+        &primary_directory,
+        &helper_directory,
+        &configured_directory,
+        &child_directory,
+    ] {
+        std::fs::create_dir(selected).unwrap();
+    }
+    let test_executable = std::env::current_exe().unwrap();
+    let executable_name = test_executable.file_name().unwrap();
+    let primary_executable = primary_directory.join(executable_name);
+    let helper_executable = helper_directory.join(executable_name);
+    std::fs::copy(&test_executable, &primary_executable).unwrap();
+    std::fs::copy(&test_executable, &helper_executable).unwrap();
+    let command = detached_command_for_current_test_with_arguments(&[]).replacen(
+        &quote_raw_command_argument(test_executable.to_str().unwrap()),
+        &quote_raw_command_argument(helper_executable.to_str().unwrap()),
+        1,
+    );
+
+    for (name, policy, child_override, expected_directory) in [
+        ("legacy", None, None, &primary_directory),
+        ("inferred", Some(Value::Null), None, &helper_directory),
+        (
+            "configured",
+            Some(json!(configured_directory)),
+            None,
+            &configured_directory,
+        ),
+        (
+            "child",
+            Some(json!(configured_directory)),
+            Some(&child_directory),
+            &child_directory,
+        ),
+    ] {
+        let marker = directory.join(format!("{name}-marker"));
+        let mut request = launch(&format!("detached-directory-{name}"), "exit");
+        request["executable"] = json!(primary_executable);
+        request["cwd"] = json!(primary_directory);
+        if let Some(policy) = policy {
+            request["detached_cwd"] = policy;
+        }
+        let mut detached = json!({
+            "command":command,
+            "environment":{
+                "AMATERASU_TEST_CHILD":"capture-env-cwd",
+                "AMATERASU_TEST_VALUE":name,
+                "AMATERASU_TEST_MARKER":marker,
+            },
+        });
+        if let Some(child_override) = child_override {
+            detached["cwd"] = json!(child_override);
+        }
+        request["detached"] = json!([detached]);
+
+        let mut manager = ProcessManager::default();
+        let started = manager.handle("alice", request.clone());
+        assert_eq!(started["ok"], true, "{started}");
+        let process_id = started["process"]["process_id"].as_u64().unwrap();
+        assert_eq!(
+            wait_for_exit(&mut manager, process_id)["process"]["success"],
+            true
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{name} child did not write its directory"
+            );
+            manager.reap_exited().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            format!(
+                "{name}|{}",
+                expected_directory.canonicalize().unwrap().display()
+            )
+        );
+        request["detached_cwd"] = if request["detached_cwd"].is_null() {
+            json!(configured_directory)
+        } else {
+            Value::Null
+        };
+        assert_eq!(
+            manager.handle("alice", request)["code"],
+            "operation_conflict"
+        );
+        manager.shutdown().unwrap();
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn detached_commands_resolve_merged_path_and_keep_missing_targets_best_effort() {
     let directory = test_directory("detached-effective-path");
     let executable_directory = directory.join("bin");

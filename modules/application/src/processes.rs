@@ -27,11 +27,14 @@ fn spawn_detached_commands_with(
 ) -> Vec<DetachedChild> {
     let mut children = Vec::new();
     for detached in &spec.detached {
-        let working_directory = detached.cwd.as_ref().or(spec.cwd.as_ref());
+        let working_directory = detached
+            .cwd
+            .as_deref()
+            .or_else(|| spec.detached_cwd.configured_directory(spec.cwd.as_deref()));
         let Ok(executable) = resolve_command_executable(
             &detached.executable,
             &detached.environment,
-            working_directory.map(String::as_str),
+            working_directory,
         ) else {
             continue;
         };
@@ -791,6 +794,7 @@ impl ProcessManager {
                 environment,
                 cwd,
                 preparation_cwd,
+                detached_cwd,
                 elevated,
                 auto_detach,
                 wait_all,
@@ -828,6 +832,7 @@ impl ProcessManager {
                     environment,
                     cwd,
                     preparation_cwd,
+                    detached_cwd,
                     elevated,
                     auto_detach,
                     wait_all,
@@ -1199,6 +1204,7 @@ mod detached_elevation_tests {
             environment: BTreeMap::new(),
             cwd: None,
             preparation_cwd: None,
+            detached_cwd: crate::protocol::DetachedWorkingDirectory::default(),
             elevated,
             auto_detach: false,
             wait_all: true,

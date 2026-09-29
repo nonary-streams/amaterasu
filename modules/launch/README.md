@@ -84,6 +84,10 @@ configured catalog `working_directory` as the preparation cwd. A cwd inferred
 from the main executable is not treated as an explicit app directory, so raw
 commands without one infer their own target directory from the resolved
 executable or `PATH`.
+Executable launches also forward this explicit directory separately for detached
+commands. When no app directory is configured, the application provider infers
+each detached target's own directory, even when the main executable has an
+inferred cwd. Typed per-command cwd overrides retain precedence.
 
 Typed `playnite_fullscreen` catalog targets carry only a bounded exit timeout
 (default 10 seconds, maximum 300); they contain no request-controlled path or

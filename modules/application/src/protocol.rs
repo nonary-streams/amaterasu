@@ -18,6 +18,8 @@ pub(crate) enum Action {
         #[serde(default)]
         preparation_cwd: Option<String>,
         #[serde(default)]
+        detached_cwd: DetachedWorkingDirectory,
+        #[serde(default)]
         elevated: bool,
         #[serde(default = "default_auto_detach")]
         auto_detach: bool,
@@ -116,6 +118,47 @@ fn default_exit_timeout_seconds() -> u64 {
 
 pub(crate) const MAX_EXIT_TIMEOUT_SECONDS: u64 = 300;
 
+/// Omission preserves direct callers' inherited directory. An explicit null
+/// lets catalog launches infer each detached command's own executable directory.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DetachedWorkingDirectory {
+    #[default]
+    InheritApplication,
+    InferExecutable,
+    Explicit(String),
+}
+
+impl<'de> Deserialize<'de> for DetachedWorkingDirectory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match Option::<String>::deserialize(deserializer)? {
+            Some(directory) => Self::Explicit(directory),
+            None => Self::InferExecutable,
+        })
+    }
+}
+
+impl DetachedWorkingDirectory {
+    pub fn configured_directory<'a>(&'a self, application: Option<&'a str>) -> Option<&'a str> {
+        match self {
+            Self::InheritApplication => application,
+            Self::InferExecutable => None,
+            Self::Explicit(directory) => Some(directory),
+        }
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        if let Self::Explicit(directory) = self
+            && !valid_path(directory)
+        {
+            return Err("detached cwd must be an absolute path");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct LaunchSpec {
     pub executable: String,
@@ -123,6 +166,7 @@ pub(crate) struct LaunchSpec {
     pub environment: BTreeMap<String, String>,
     pub cwd: Option<String>,
     pub preparation_cwd: Option<String>,
+    pub detached_cwd: DetachedWorkingDirectory,
     pub elevated: bool,
     pub auto_detach: bool,
     pub wait_all: bool,
@@ -144,6 +188,7 @@ impl LaunchSpec {
         if self.exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
             return Err("exit timeout exceeds bounds");
         }
+        self.detached_cwd.validate()?;
         if self
             .steam_id
             .as_deref()
@@ -301,6 +346,7 @@ mod tests {
             environment: BTreeMap::new(),
             cwd: None,
             preparation_cwd: None,
+            detached_cwd: DetachedWorkingDirectory::default(),
             elevated: false,
             auto_detach: true,
             wait_all: false,
@@ -309,6 +355,43 @@ mod tests {
             steam_install_dir: install_directory.map(str::to_owned),
             detached: Vec::new(),
             preparation: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detached_directory_has_distinct_omitted_null_and_explicit_forms() {
+        let directory = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        for (selection, expected) in [
+            (None, DetachedWorkingDirectory::InheritApplication),
+            (
+                Some(serde_json::Value::Null),
+                DetachedWorkingDirectory::InferExecutable,
+            ),
+            (
+                Some(serde_json::json!(directory)),
+                DetachedWorkingDirectory::Explicit(directory.clone()),
+            ),
+        ] {
+            let mut request = serde_json::json!({
+                "action":"launch","operation_id":"directory-policy",
+                "executable":std::env::current_exe().unwrap(),
+            });
+            if let Some(selection) = selection {
+                request["detached_cwd"] = selection;
+            }
+            let Action::Launch { detached_cwd, .. } = serde_json::from_value(request).unwrap()
+            else {
+                panic!("launch action expected");
+            };
+            assert_eq!(detached_cwd, expected);
+        }
+        for directory in ["", "relative", "\0invalid"] {
+            let mut selected = spec(None, None);
+            selected.detached_cwd = DetachedWorkingDirectory::Explicit(directory.into());
+            assert!(selected.validate("invalid-directory").is_err());
         }
     }
 

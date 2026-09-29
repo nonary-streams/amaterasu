@@ -28,6 +28,13 @@ after `wait_all` is satisfied. A zero exit timeout skips graceful shutdown.
 Detached command strings use platform argv quoting, run best-effort before the
 primary executable, and are not attached to its process group or termination
 lifecycle. They inherit the app's explicit environment and working directory.
+The optional launch field `detached_cwd` separates that policy from the primary
+process cwd: omission retains inherited cwd for existing direct callers, null
+infers each detached target's directory, and an absolute path selects a common
+directory. A typed child's `cwd` takes precedence. Catalog launches forward the
+explicit app directory or null, preserving independent target directories when
+the main process cwd was inferred. Directory policy changes conflict with an
+existing operation ID rather than starting additional detached processes.
 Before spawning, bare targets resolve against the merged command environment's
 `PATH`, falling back to the host's `PATH` only when none is supplied. Relative
 or empty entries use the command's inherited or overridden cwd, or the host's

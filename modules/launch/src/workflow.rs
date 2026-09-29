@@ -130,7 +130,7 @@ impl Workflow {
                 };
                 (
                     APPLICATION,
-                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"preparation_cwd":executable.preparation_working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"steam_id":executable.steam_id,"steam_install_dir":executable.steam_install_dir,"elevated":executable.elevated,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
+                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"preparation_cwd":executable.preparation_working_directory,"detached_cwd":executable.preparation_working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"steam_id":executable.steam_id,"steam_install_dir":executable.steam_install_dir,"elevated":executable.elevated,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
                 )
             }
             Step::StartPlaynite => match record.target.as_ref() {
@@ -295,6 +295,46 @@ mod tests {
     use super::*;
     use crate::records::{GlobalPreparation, Records};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn executable_spawn_keeps_explicit_app_directory_separate_from_inferred_directory() {
+        let mut records = Records::new().unwrap();
+        let (launch_id, _) = records
+            .start(
+                "alice",
+                "alice",
+                "directory-policy".into(),
+                "app-0000000000000001".into(),
+                CatalogSelection::Initiator,
+                GlobalPreparation::default(),
+            )
+            .unwrap();
+        let program = std::env::current_exe().unwrap();
+        let directory = std::env::current_dir().unwrap();
+        for explicit_directory in [None, Some(directory.clone())] {
+            let record = records.values.get_mut(&launch_id).unwrap();
+            record.target = Some(
+                LaunchTarget::from_catalog_entry_with_environment(
+                    &json!({"launch":{
+                        "kind":"executable","program":program,
+                        "working_directory":explicit_directory,
+                    }}),
+                    &[],
+                    &BTreeMap::new(),
+                )
+                .unwrap(),
+            );
+            let mut workflow = Workflow::launch(launch_id, 1, 30_000);
+            workflow.step = Step::Spawn;
+            let (service, payload) = workflow.command(record, &BTreeMap::new()).unwrap();
+            assert_eq!(service, APPLICATION);
+            assert_eq!(payload["detached_cwd"], json!(explicit_directory));
+            let expected_main = explicit_directory
+                .as_deref()
+                .unwrap_or_else(|| program.parent().unwrap());
+            assert_eq!(payload["cwd"], json!(expected_main));
+        }
+    }
 
     #[test]
     fn ambiguous_playnite_start_looks_up_its_operation_and_stop_deadline_is_bounded() {
