@@ -873,6 +873,62 @@ mod tests {
     }
 
     #[test]
+    fn nvhttp_encryption_updates_preserve_nullable_modes_and_reject_coercion() {
+        let route = resolve("/v1/nvhttp/settings_update").unwrap();
+        assert_eq!(route.service, "amaterasu.nvhttp/1");
+        assert_eq!(route.scope, Some("configuration.write"));
+        let base = serde_json::json!({
+            "hostname": "Living Room",
+            "port": 47989,
+            "expected_revision": 7,
+        });
+        let omitted = payload(route, &serde_json::to_vec(&base).unwrap()).unwrap();
+        assert!(omitted.get("lan_encryption_mode").is_none());
+        assert!(omitted.get("wan_encryption_mode").is_none());
+
+        for field in ["lan_encryption_mode", "wan_encryption_mode"] {
+            for mode in [
+                serde_json::Value::Null,
+                serde_json::json!(0),
+                serde_json::json!(1),
+                serde_json::json!(2),
+            ] {
+                let mut request = base.clone();
+                request[field] = mode.clone();
+                let parsed = payload(route, &serde_json::to_vec(&request).unwrap()).unwrap();
+                assert_eq!(parsed[field], mode);
+                assert_eq!(parsed["expected_revision"], 7);
+                assert_eq!(parsed["action"], "settings_update");
+            }
+            for invalid in [
+                serde_json::json!(-1),
+                serde_json::json!(3),
+                serde_json::json!(1.0),
+                serde_json::json!(1.5),
+                serde_json::json!("2"),
+                serde_json::json!(false),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ] {
+                let mut request = base.clone();
+                request[field] = invalid;
+                assert!(
+                    payload(route, &serde_json::to_vec(&request).unwrap()).is_err(),
+                    "accepted invalid {field}: {}",
+                    request[field]
+                );
+            }
+        }
+
+        let mut independent_modes = base;
+        independent_modes["lan_encryption_mode"] = serde_json::json!(2);
+        independent_modes["wan_encryption_mode"] = serde_json::json!(0);
+        let parsed = payload(route, &serde_json::to_vec(&independent_modes).unwrap()).unwrap();
+        assert_eq!(parsed["lan_encryption_mode"], 2);
+        assert_eq!(parsed["wan_encryption_mode"], 0);
+    }
+
+    #[test]
     fn nvhttp_settings_routes_pin_domain_and_reject_unexpected_fields() {
         let get = resolve("/v1/nvhttp/settings").unwrap();
         assert_eq!(get.service, "amaterasu.nvhttp/1");

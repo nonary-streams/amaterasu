@@ -1527,6 +1527,8 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "nvenc_spatial_aq",
                     "ping_timeout_ms",
                     "global_preparation",
+                    "lan_encryption_mode",
+                    "wan_encryption_mode",
                 ],
             )?;
             let hostname = text(object, "hostname")?;
@@ -1642,6 +1644,13 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             }
             optional_nullable_boolean(object, "wgc_pacing_smoothing")?;
             optional_nullable_boolean(object, "nvenc_spatial_aq")?;
+            for field in ["lan_encryption_mode", "wan_encryption_mode"] {
+                if object.get(field).is_some_and(|value| {
+                    !value.is_null() && !value.as_u64().is_some_and(|mode| mode <= 2)
+                }) {
+                    return Err(INVALID);
+                }
+            }
             if object.get("ping_timeout_ms").is_some_and(|value| {
                 !value.is_null()
                     && !value
