@@ -1,5 +1,28 @@
 # Configuration parity execution workflow
 
+## Current session override: native agents, Ultra
+
+On 2026-09-29 the user requested execution in one session at Ultra reasoning
+and clarified that delegation must use this session's native agents API rather
+than separate `codex exec` processes. This overrides the CLI launcher and model
+tiers below. Keep six logical feature assignments, their build-enabled worktrees,
+independent target directories, review evidence, and continuous landing policy.
+
+The native API permits three child threads and counts completed threads against
+that limit. Reuse those threads for successive feature assignments; synchronize
+only an idle, clean destination worktree before changing assignments. Do not
+launch external Codex sessions to bypass this limit. The current Linux host has
+16 logical processors and approximately 62 GiB RAM; each build uses two Cargo
+jobs. Host-global device and service checks remain serialized.
+
+The session's worktrees are
+`/home/chasep/sources/worktrees/amaterasu-20260929-ultra-feature-N_large`, with
+matching build directories under `/home/chasep/sources/builds` and manifests in
+`/home/chasep/sources/worktrees/.large-manifests`. Evidence and ready handoffs are
+under `amaterasu-config-runs/20260929-ultra-native/team-N`. Main remains the sole
+landing destination. Preserve the historical workflow below as context rather
+than restarting its old CLI sessions.
+
 ## Active policy: six coordinators, three workers each
 
 The user's clarification on 2026-09-25 requires MULTIPLE coordinators. Preserve
