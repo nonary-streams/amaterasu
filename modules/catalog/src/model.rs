@@ -95,6 +95,12 @@ impl ArtworkReference {
 #[serde(deny_unknown_fields)]
 pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_tune: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<amaterasu_module_sdk::EncoderBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec_percentage: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bitrate: Option<i32>,
@@ -201,6 +207,11 @@ where
 
 impl ConfigOverrides {
     pub fn validate(&self) -> Result<(), &'static str> {
+        amaterasu_module_sdk::validate_software_options(
+            self.sw_preset.as_deref(),
+            self.sw_tune.as_deref(),
+        )
+        .map_err(|_| "software encoder options are invalid")?;
         if self
             .key_repeat_delay
             .is_some_and(|delay| delay > i32::MAX as u32)
@@ -320,7 +331,10 @@ impl ConfigOverrides {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fec_percentage.is_none()
+        self.sw_preset.is_none()
+            && self.sw_tune.is_none()
+            && self.encoder.is_none()
+            && self.fec_percentage.is_none()
             && self.max_bitrate.is_none()
             && self.minimum_fps_target.is_none()
             && self.video_max_batch_size_kb.is_none()
@@ -2064,6 +2078,43 @@ mod tests {
                 validate_steam_install_directory(directory).is_err(),
                 "accepted Steam install directory {directory:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod software_encoder_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn software_fields_are_sparse_exact_and_bounded() {
+        let absent: ConfigOverrides =
+            serde_json::from_value(json!({"sw_preset":null,"sw_tune":null,"encoder":null}))
+                .unwrap();
+        assert!(absent.is_empty());
+        let selected: ConfigOverrides = serde_json::from_value(
+            json!({"sw_preset":"","sw_tune":"film,zerolatency","encoder":"software"}),
+        )
+        .unwrap();
+        assert!(selected.validate().is_ok());
+        assert!(!selected.is_empty());
+        assert_eq!(
+            serde_json::to_value(selected).unwrap(),
+            json!({"sw_preset":"","sw_tune":"film,zerolatency","encoder":"software"})
+        );
+        for invalid in [
+            json!({"sw_preset":false}),
+            json!({"encoder":"nvenc"}),
+            json!({"encoder":""}),
+        ] {
+            assert!(serde_json::from_value::<ConfigOverrides>(invalid).is_err());
+        }
+        for invalid in [
+            json!({"sw_preset":"x".repeat(129)}),
+            json!({"sw_tune":"film\n"}),
+        ] {
+            let options: ConfigOverrides = serde_json::from_value(invalid).unwrap();
+            assert!(options.validate().is_err());
         }
     }
 }

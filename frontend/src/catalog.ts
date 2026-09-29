@@ -886,6 +886,7 @@ namespace Amaterasu {
       const keyboard = audioOverrideSelect("keyboard", row.entry.config_overrides?.keyboard);
       const mouse = audioOverrideSelect("mouse", row.entry.config_overrides?.mouse);
       const advancedInput = advancedInputOverrideControls(row.entry.config_overrides);
+      const softwareEncoder = softwareEncoderOverrideControls(row.entry.config_overrides);
       const refreshRateOptionFields = catalogRefreshRateOptionFields(
         row.entry.config_overrides?.dd_refresh_rate_option,
       );
@@ -909,6 +910,7 @@ namespace Amaterasu {
         field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."),
         field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
         ...advancedInput.fields,
+        ...softwareEncoder.fields,
       );
       const feedback = el("div");
       const save = el("button", "button primary", "Save streaming settings");
@@ -921,6 +923,7 @@ namespace Amaterasu {
         void runAction(save, feedback, async () => {
           const config_overrides = {
             ...advancedInput.read(),
+            ...softwareEncoder.read(),
             ...providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
             ...parseCatalogFrameLimiterOverrides(
               new FormData(form),
@@ -1167,6 +1170,7 @@ namespace Amaterasu {
     const keyboard = audioOverrideSelect("keyboard", entry?.config_overrides?.keyboard);
     const mouse = audioOverrideSelect("mouse", entry?.config_overrides?.mouse);
     const advancedInput = advancedInputOverrideControls(entry?.config_overrides);
+    const softwareEncoder = softwareEncoderOverrideControls(entry?.config_overrides);
     const refreshRateOptionFields = catalogRefreshRateOptionFields(
       entry?.config_overrides?.dd_refresh_rate_option,
     );
@@ -1255,6 +1259,7 @@ namespace Amaterasu {
       field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."),
       field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
       ...advancedInput.fields,
+      ...softwareEncoder.fields,
       steamIdField,
       steamInstallDirField,
       fullscreen,

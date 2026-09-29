@@ -482,6 +482,10 @@ pub struct Open {
     pub minimum_fps_target: f64,
     #[serde(default = "default_wgc_pacing_smoothing")]
     pub wgc_pacing_smoothing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_tune: Option<String>,
     #[serde(default)]
     pub capture_sink_without_routing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -682,6 +686,10 @@ impl Open {
 
     fn validate_capture(&self) -> Result<(), &'static str> {
         self.capture.encoder.validate()?;
+        amaterasu_module_sdk::validate_software_options(
+            self.sw_preset.as_deref(),
+            self.sw_tune.as_deref(),
+        )?;
         if self
             .device_name
             .as_deref()
@@ -858,6 +866,12 @@ impl Open {
                 },
             },
         });
+        if let Some(preset) = &self.sw_preset {
+            payload["configuration"]["configuration"]["sw_preset"] = serde_json::json!(preset);
+        }
+        if let Some(tune) = &self.sw_tune {
+            payload["configuration"]["configuration"]["sw_tune"] = serde_json::json!(tune);
+        }
         if let Some(continuous_audio) = self.continuous_audio {
             payload["configuration"]["continuous_audio"] = serde_json::json!(continuous_audio);
         }
@@ -2735,5 +2749,26 @@ mod tests {
         );
         let announce = parse_announce(zero_reference.as_bytes()).unwrap();
         assert!(zero_reference_profile.matches(&announce));
+    }
+    #[test]
+    fn software_options_and_backend_reach_stream_start_exactly() {
+        let mut request = open();
+        request.capture.encoder =
+            EncoderSelection::Backend(amaterasu_module_sdk::EncoderBackend::Software);
+        request.sw_preset = Some("slow".into());
+        request.sw_tune = Some(String::new());
+        assert!(request.validate(false).is_ok());
+        let started = request.arm(51);
+        assert_eq!(started["configuration"]["encoder"], "software");
+        assert_eq!(
+            started["configuration"]["configuration"]["sw_preset"],
+            "slow"
+        );
+        assert_eq!(started["configuration"]["configuration"]["sw_tune"], "");
+        request.sw_tune = Some("film\n".into());
+        assert_eq!(
+            request.validate_capture(),
+            Err("invalid_software_encoder_options")
+        );
     }
 }

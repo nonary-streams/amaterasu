@@ -584,3 +584,40 @@ once before capture allocation. Missing software support fails explicitly; fixtu
 control success does not qualify real capture, encode, or client playback. See
 [video selection policy](../video/README.md) for bounds and automatic-selection
 limits.
+
+## Software encoder policy
+
+Product document v19 persists nullable `sw_preset`, `sw_tune`, and `encoder`.
+An omitted update preserves the current value; null resets tuning to the effective
+`superfast`/`zerolatency` defaults and backend selection to the trusted startup
+selector. Empty tuning is an explicit raw string, preserved across CAS writes,
+readback, restart, and admission. Preset/tune syntax allows at most 128/256 UTF-8
+bytes respectively and no control characters; the actual x264 consumer validates
+codec names at Open. Backend labels are exactly `auto` and `software`.
+
+Sparse application and certificate-authorized client overrides use the same
+syntax. Every field resolves independently, client before application before
+global. Null inherits the lower scope. NVHTTP freezes global/client values at
+admission and application values at preflight, rejects changed application
+readback, and verifies the RTSP encoder/tuning snapshot before completing launch.
+RTSP copies this into stream-session and video; real video resolves ordinals and
+backend labels once into a stable identity before capture allocation.
+
+Signed host, application and client editors distinguish inheritance from an
+explicit empty string. Host settings expose configured and effective tuning;
+`media/encoders` reports the genuine current runtime availability. Disabled
+software builds and missing headers/libraries cannot select a software encoder.
+See [encoder distribution requirements](../encode/README.md#software-x264-selection-and-distribution).
+Auto prefers registered hardware then available x264, with no hardware probing
+or fallback after failed hardware Open. Unsupported reference vendor labels are
+rejected. Windows software packaging, hardware qualification and live playback
+remain gates; `global:sw_preset`/`global:sw_tune` stay pending.
+
+`python scripts/test_software_encoder_policy.py` builds and loads the signed
+platform package in an isolated temporary host. It checks authenticated global,
+application and certificate-bound persistence, CAS conflicts, exact raw and empty
+strings, null reset/inheritance, process restart, forbidden scopes, forged
+authority fields and genuine disabled-feature codec availability. It opens only
+a loopback management listener. It does not qualify public stream projection,
+capture or playback; native software encode and independent decode have separate
+opt-in tests in `amaterasu-encode`.

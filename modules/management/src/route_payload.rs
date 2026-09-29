@@ -1019,11 +1019,15 @@ fn valid_steam_install_dir(path: &str) -> bool {
 
 fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
     let overrides = value.as_object().ok_or(INVALID)?;
+    optional_software_encoder_options(overrides)?;
     fields(
         overrides,
         &[],
         &[
             "fec_percentage",
+            "sw_preset",
+            "sw_tune",
+            "encoder",
             "stream_audio",
             "audio_sink",
             "virtual_sink",
@@ -1577,6 +1581,9 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "output_name",
                     "stream_audio",
                     "capture",
+                    "sw_preset",
+                    "sw_tune",
+                    "encoder",
                     "video_max_batch_size_kb",
                     "max_bitrate",
                     "minimum_fps_target",
@@ -1703,6 +1710,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             }) {
                 return Err(INVALID);
             }
+            optional_software_encoder_options(object)?;
             optional_nullable_boolean(object, "wgc_pacing_smoothing")?;
             optional_nullable_boolean(object, "nvenc_spatial_aq")?;
             for field in ["lan_encryption_mode", "wan_encryption_mode"] {
@@ -2544,6 +2552,9 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                 &[],
                 &[
                     "fec_percentage",
+                    "sw_preset",
+                    "sw_tune",
+                    "encoder",
                     "max_bitrate",
                     "minimum_fps_target",
                     "video_max_batch_size_kb",
@@ -2585,6 +2596,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
             {
                 return Err(INVALID);
             }
+            optional_software_encoder_options(config_overrides)?;
             optional_audio_sink(config_overrides)?;
             optional_virtual_sink(config_overrides)?;
             optional_audio_sink_capture_only(config_overrides)?;
@@ -2595,6 +2607,28 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
         }
         _ => Err(INVALID),
     }
+}
+
+fn optional_software_encoder_options(object: &Object) -> Result<(), &'static str> {
+    for (key, limit) in [("sw_preset", 128), ("sw_tune", 256)] {
+        if object.get(key).is_some_and(|value| {
+            !value.is_null()
+                && !value
+                    .as_str()
+                    .is_some_and(|text| text.len() <= limit && !text.chars().any(char::is_control))
+        }) {
+            return Err(INVALID);
+        }
+    }
+    if object.get("encoder").is_some_and(|value| {
+        !value.is_null()
+            && !value
+                .as_str()
+                .is_some_and(|text| matches!(text, "auto" | "software"))
+    }) {
+        return Err(INVALID);
+    }
+    Ok(())
 }
 
 fn optional_paired_client_extended_overrides(overrides: &Object) -> Result<(), &'static str> {
@@ -3485,5 +3519,53 @@ mod catalog_tests {
         });
         assert!(validate(route("update"), update.as_object().unwrap()).is_ok());
         assert!(validate(route("delete"), update.as_object().unwrap()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod software_encoder_tests {
+    use super::*;
+    use crate::routes::{payload, resolve};
+    use serde_json::json;
+    #[test]
+    fn signed_software_settings_and_scopes_retain_exact_null_empty_and_combined_tunes() {
+        for fields in [
+            json!({"sw_preset":null,"sw_tune":null,"encoder":null}),
+            json!({"sw_preset":"","sw_tune":"film,zerolatency","encoder":"software"}),
+        ] {
+            assert!(catalog_config_overrides(&fields).is_ok());
+            let route = resolve("/v1/nvhttp/settings_update").unwrap();
+            let mut request = json!({"hostname":"Host","port":47989,"expected_revision":4});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let forwarded = payload(route, request.to_string().as_bytes()).unwrap();
+            for key in ["sw_preset", "sw_tune", "encoder"] {
+                assert_eq!(forwarded[key], fields[key]);
+            }
+            let paired = resolve("/v1/pairing/update_client_config_overrides").unwrap();
+            let request = json!({"certificate_id":"a".repeat(64),"expected_revision":4,"config_overrides":fields});
+            assert!(payload(paired, request.to_string().as_bytes()).is_ok());
+        }
+        for fields in [
+            json!({"sw_preset":false}),
+            json!({"sw_tune":"x".repeat(257)}),
+            json!({"encoder":"nvenc"}),
+        ] {
+            assert!(catalog_config_overrides(&fields).is_err());
+            let mut request = json!({"hostname":"Host","port":47989,"expected_revision":4});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            assert!(
+                payload(
+                    resolve("/v1/nvhttp/settings_update").unwrap(),
+                    request.to_string().as_bytes()
+                )
+                .is_err()
+            );
+        }
     }
 }

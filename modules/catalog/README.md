@@ -458,3 +458,11 @@ The provider uses this row only when Playnite is enabled, on Windows, and
 the generated row with `provider_entry_managed`. The action and reserved row
 are independent of Playnite library snapshots, so incomplete scans cannot
 create or remove them. Snapshot cleanup explicitly excludes this source ID.
+
+Sparse software encoder overrides support exact `sw_preset`/`sw_tune` strings
+(up to 128/256 UTF-8 bytes, no controls) and `encoder: "auto" | "software"`.
+Null/absence inherit; empty tuning strings remain explicit. The actual x264
+backend validates codec vocabulary when opening software. NVHTTP resolves each
+field client before application before global and freezes the launch snapshot.
+See [software policy](../nvhttp/README.md#software-encoder-policy) for runtime
+availability, source differences and remaining qualification gates.

@@ -133,3 +133,9 @@ once before capture allocation. Missing software support fails explicitly; fixtu
 control success does not qualify real capture, encode, or client playback. See
 [video selection policy](../video/README.md) for bounds and automatic-selection
 limits.
+
+Software tuning remains exact through the launch snapshot: nullable `sw_preset`
+and `sw_tune` inherit defaults, while explicit empty strings are retained. The
+backend policy supports `auto` and `software` and real codec availability remains
+a separate requirement. [NVHTTP policy](../nvhttp/README.md#software-encoder-policy)
+documents persistence, scope precedence and platform qualification limits.

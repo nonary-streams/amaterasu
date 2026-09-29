@@ -7,7 +7,9 @@ use crate::{
     },
     settings::{self, AddressFamily, Settings},
 };
-use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{
+    Command, EncoderBackend, ModuleResult, Response, RuntimeClient, SoftwareEncoderOptions,
+};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -35,7 +37,8 @@ const ENCRYPTION_MODE_SETTINGS_VERSION: u64 = 17;
 const DISPLAY_POLICY_SETTINGS_VERSION: u64 = 18;
 const DEFAULT_LAN_ENCRYPTION_MODE: u8 = 0;
 const DEFAULT_WAN_ENCRYPTION_MODE: u8 = 1;
-const SETTINGS_VERSION: u64 = DISPLAY_POLICY_SETTINGS_VERSION;
+const SOFTWARE_ENCODER_SETTINGS_VERSION: u64 = 19;
+const SETTINGS_VERSION: u64 = SOFTWARE_ENCODER_SETTINGS_VERSION;
 const DISPLAY_POLICY_KEYS: [&str; 8] = [
     "dd_mode_remapping",
     "dd_resolution_option",
@@ -75,6 +78,7 @@ pub(crate) enum AdminAction {
         max_bitrate: FieldUpdate<i32>,
         minimum_fps_target: FieldUpdate<f64>,
         wgc_pacing_smoothing: FieldUpdate<bool>,
+        software_encoder: SoftwareEncoderUpdate,
         ping_timeout_ms: FieldUpdate<i32>,
         global_preparation: FieldUpdate<Vec<PreparationStep>>,
         legacy_global_preparation: FieldUpdate<Vec<LegacyPreparationStep>>,
@@ -84,6 +88,26 @@ pub(crate) enum AdminAction {
         expected_revision: u64,
         require_listener_apply: bool,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SoftwareEncoderUpdate {
+    pub(crate) sw_preset: FieldUpdate<String>,
+    pub(crate) sw_tune: FieldUpdate<String>,
+    pub(crate) encoder: FieldUpdate<EncoderBackend>,
+}
+
+fn apply_software_encoder_update(
+    update: SoftwareEncoderUpdate,
+    current: &SoftwareEncoderOptions,
+) -> Result<SoftwareEncoderOptions, &'static str> {
+    let options = SoftwareEncoderOptions {
+        sw_preset: apply_field_update(update.sw_preset, current.sw_preset.clone()),
+        sw_tune: apply_field_update(update.sw_tune, current.sw_tune.clone()),
+        encoder: apply_field_update(update.encoder, current.encoder),
+    };
+    options.validate()?;
+    Ok(options)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -393,6 +417,7 @@ struct UpdatePurpose {
     max_bitrate: Option<i32>,
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
+    software_encoder: SoftwareEncoderOptions,
     ping_timeout_ms: Option<i32>,
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
@@ -439,6 +464,7 @@ struct ProductDocument {
     max_bitrate: Option<i32>,
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
+    software_encoder: SoftwareEncoderOptions,
     ping_timeout_ms: Option<i32>,
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
@@ -461,6 +487,7 @@ struct ProductStreamingSettings {
     max_bitrate: Option<i32>,
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
+    software_encoder: SoftwareEncoderOptions,
     ping_timeout_ms: Option<i32>,
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
@@ -516,6 +543,7 @@ pub struct ProductSettings {
     configured_max_bitrate: Option<i32>,
     configured_minimum_fps_target: Option<f64>,
     configured_wgc_pacing_smoothing: Option<bool>,
+    configured_software_encoder: SoftwareEncoderOptions,
     configured_ping_timeout_ms: Option<i32>,
     configured_global_preparation: Vec<PreparationStep>,
     configured_legacy_global_preparation: Vec<LegacyPreparationStep>,
@@ -622,6 +650,7 @@ impl ProductSettings {
             configured_max_bitrate: None,
             configured_minimum_fps_target: None,
             configured_wgc_pacing_smoothing: None,
+            configured_software_encoder: SoftwareEncoderOptions::default(),
             configured_ping_timeout_ms: None,
             configured_global_preparation: Vec::new(),
             configured_legacy_global_preparation: Vec::new(),
@@ -741,6 +770,10 @@ impl ProductSettings {
     pub fn effective_minimum_fps_target(&self) -> f64 {
         self.configured_minimum_fps_target
             .unwrap_or(DEFAULT_MINIMUM_FPS_TARGET)
+    }
+
+    pub fn software_encoder_options(&self) -> &SoftwareEncoderOptions {
+        &self.configured_software_encoder
     }
 
     pub fn configured_wgc_pacing_smoothing(&self) -> Option<bool> {
@@ -1258,6 +1291,7 @@ impl ProductSettings {
                 max_bitrate,
                 minimum_fps_target,
                 wgc_pacing_smoothing,
+                software_encoder,
                 ping_timeout_ms,
                 global_preparation,
                 legacy_global_preparation,
@@ -1395,6 +1429,19 @@ impl ProductSettings {
                 };
                 let wgc_pacing_smoothing =
                     apply_field_update(wgc_pacing_smoothing, self.configured_wgc_pacing_smoothing);
+                let software_encoder = match apply_software_encoder_update(
+                    software_encoder,
+                    &self.configured_software_encoder,
+                ) {
+                    Ok(options) => options,
+                    Err(code) => {
+                        self.queue_completion(
+                            request.request,
+                            failure(code, "software encoder options are invalid"),
+                        );
+                        return;
+                    }
+                };
                 let ping_timeout_ms = match apply_ping_timeout_update(
                     ping_timeout_ms,
                     self.configured_ping_timeout_ms,
@@ -1573,6 +1620,7 @@ impl ProductSettings {
                             max_bitrate,
                             minimum_fps_target,
                             wgc_pacing_smoothing,
+                            software_encoder: software_encoder.clone(),
                             ping_timeout_ms,
                             global_preparation: global_preparation.clone(),
                             legacy_global_preparation: legacy_global_preparation.clone(),
@@ -1600,6 +1648,7 @@ impl ProductSettings {
                         max_bitrate,
                         minimum_fps_target,
                         wgc_pacing_smoothing,
+                        software_encoder,
                         ping_timeout_ms,
                         global_preparation,
                         legacy_global_preparation,
@@ -1730,6 +1779,7 @@ impl ProductSettings {
                     max_bitrate,
                     minimum_fps_target,
                     wgc_pacing_smoothing,
+                    software_encoder,
                     ping_timeout_ms,
                     global_preparation,
                     legacy_global_preparation,
@@ -1758,6 +1808,7 @@ impl ProductSettings {
                             max_bitrate,
                             minimum_fps_target,
                             wgc_pacing_smoothing,
+                            software_encoder: &software_encoder,
                             ping_timeout_ms,
                             global_preparation: &global_preparation,
                             legacy_global_preparation: &legacy_global_preparation,
@@ -2077,6 +2128,7 @@ impl ProductSettings {
         self.configured_max_bitrate = document.max_bitrate;
         self.configured_minimum_fps_target = document.minimum_fps_target;
         self.configured_wgc_pacing_smoothing = document.wgc_pacing_smoothing;
+        self.configured_software_encoder = document.software_encoder;
         self.configured_ping_timeout_ms = document.ping_timeout_ms;
         self.configured_global_preparation = document.global_preparation;
         self.configured_legacy_global_preparation = document.legacy_global_preparation;
@@ -2141,6 +2193,11 @@ impl ProductSettings {
                 "effective_minimum_fps_target":self.effective_minimum_fps_target(),
                 "configured_wgc_pacing_smoothing":self.configured_wgc_pacing_smoothing(),
                 "effective_wgc_pacing_smoothing":self.effective_wgc_pacing_smoothing(),
+                "configured_sw_preset":self.configured_software_encoder.sw_preset,
+                "configured_sw_tune":self.configured_software_encoder.sw_tune,
+                "configured_encoder":self.configured_software_encoder.encoder,
+                "effective_sw_preset":self.configured_software_encoder.effective_preset(),
+                "effective_sw_tune":self.configured_software_encoder.effective_tune(),
                 "configured_ping_timeout_ms":self.configured_ping_timeout_ms(),
             }),
             json!({
@@ -2233,6 +2290,9 @@ fn product_update_payload(
         "max_bitrate":streaming.max_bitrate,
         "minimum_fps_target":streaming.minimum_fps_target,
         "wgc_pacing_smoothing":streaming.wgc_pacing_smoothing,
+        "sw_preset":streaming.software_encoder.sw_preset,
+        "sw_tune":streaming.software_encoder.sw_tune,
+        "encoder":streaming.software_encoder.encoder,
         "ping_timeout_ms":streaming.ping_timeout_ms,
         "global_preparation":streaming.global_preparation,
         "legacy_global_preparation":streaming.legacy_global_preparation,
@@ -2356,6 +2416,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             max_bitrate: None,
             minimum_fps_target: None,
             wgc_pacing_smoothing: None,
+            software_encoder: SoftwareEncoderOptions::default(),
             ping_timeout_ms: None,
             global_preparation: Vec::new(),
             legacy_global_preparation: Vec::new(),
@@ -2390,6 +2451,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | GLOBAL_PREPARATION_SETTINGS_VERSION
             | GLOBAL_RAW_PREPARATION_SETTINGS_VERSION
             | DISPLAY_POLICY_SETTINGS_VERSION
+            | SOFTWARE_ENCODER_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -2415,11 +2477,16 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         GLOBAL_PREPARATION_SETTINGS_VERSION => 17,
         GLOBAL_RAW_PREPARATION_SETTINGS_VERSION => 32,
         DISPLAY_POLICY_SETTINGS_VERSION => 40,
+        SOFTWARE_ENCODER_SETTINGS_VERSION => 43,
         _ => unreachable!(),
     };
     let matches_expected_value_count = values.len() == expected_value_count
         || (version == GLOBAL_RAW_PREPARATION_SETTINGS_VERSION && values.len() == 31);
-    if !matches_expected_value_count
+    if (version >= SOFTWARE_ENCODER_SETTINGS_VERSION
+        && ["sw_preset", "sw_tune", "encoder"]
+            .iter()
+            .any(|key| !values.contains_key(*key)))
+        || !matches_expected_value_count
         || !values.contains_key("hostname")
         || (version >= PORT_SETTINGS_VERSION && !values.contains_key("port"))
         || (version >= NETWORK_SETTINGS_VERSION
@@ -2604,6 +2671,15 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         None
     };
+    let software_encoder: SoftwareEncoderOptions = if version >= SOFTWARE_ENCODER_SETTINGS_VERSION {
+        let options: SoftwareEncoderOptions = serde_json::from_value(json!({"sw_preset":values["sw_preset"],"sw_tune":values["sw_tune"],"encoder":values["encoder"]})).map_err(|_| invalid_state("persisted software encoder options are invalid"))?;
+        options
+            .validate()
+            .map_err(|_| invalid_state("persisted software encoder options are invalid"))?;
+        options
+    } else {
+        SoftwareEncoderOptions::default()
+    };
     let ping_timeout_ms = if version >= PING_TIMEOUT_SETTINGS_VERSION {
         match values.get("ping_timeout_ms") {
             Some(Value::Null) => None,
@@ -2732,6 +2808,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         max_bitrate,
         minimum_fps_target,
         wgc_pacing_smoothing,
+        software_encoder,
         ping_timeout_ms,
         global_preparation,
         legacy_global_preparation,
@@ -2759,6 +2836,7 @@ struct UpdateExpectation<'a> {
     max_bitrate: Option<i32>,
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
+    software_encoder: &'a SoftwareEncoderOptions,
     ping_timeout_ms: Option<i32>,
     global_preparation: &'a [PreparationStep],
     legacy_global_preparation: &'a [LegacyPreparationStep],
@@ -2776,7 +2854,7 @@ fn update_result(
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
-        return Err(invalid_state("product_update did not confirm v18 settings"));
+        return Err(invalid_state("product_update did not confirm v19 settings"));
     }
     let document = parse_document(payload)?;
     if document.hostname.as_deref() != Some(expected.hostname)
@@ -2795,6 +2873,7 @@ fn update_result(
         || document.max_bitrate != expected.max_bitrate
         || document.minimum_fps_target != expected.minimum_fps_target
         || document.wgc_pacing_smoothing != expected.wgc_pacing_smoothing
+        || &document.software_encoder != expected.software_encoder
         || document.ping_timeout_ms != expected.ping_timeout_ms
         || document.global_preparation != expected.global_preparation
         || document.legacy_global_preparation != expected.legacy_global_preparation
@@ -3169,6 +3248,9 @@ mod tests {
         for key in DISPLAY_POLICY_KEYS {
             values.entry(key.to_owned()).or_insert(Value::Null);
         }
+        for key in ["sw_preset", "sw_tune", "encoder"] {
+            values.entry(key.to_owned()).or_insert(Value::Null);
+        }
         payload
     }
 
@@ -3193,6 +3275,7 @@ mod tests {
             max_bitrate: FieldUpdate::Omitted,
             minimum_fps_target: FieldUpdate::Omitted,
             wgc_pacing_smoothing: FieldUpdate::Omitted,
+            software_encoder: SoftwareEncoderUpdate::default(),
             ping_timeout_ms: FieldUpdate::Omitted,
             global_preparation: FieldUpdate::Omitted,
             legacy_global_preparation: FieldUpdate::Omitted,
@@ -3244,11 +3327,12 @@ mod tests {
             .unwrap();
         product.start_next();
         let pending = product.pending.take().unwrap();
-        assert_eq!(pending.payload["version"], 18);
+        assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["expected_revision"], 7);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 40);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 43);
         let write = pending.payload["values"].clone();
-        let response = json!({"ok":true,"found":true,"version":18,"revision":8,"values":write});
+        let response =
+            json!({"ok":true,"found":true,"version":SETTINGS_VERSION,"revision":8,"values":write});
         product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
         assert_eq!(product.display_policy_snapshot().unwrap().0, 8);
         assert_eq!(
@@ -3967,6 +4051,7 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
+                software_encoder: SoftwareEncoderOptions::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -3993,6 +4078,7 @@ mod tests {
                 5_000,
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
+                    software_encoder: SoftwareEncoderUpdate::default(),
                     hostname: "Host".into(),
                     port: settings::DEFAULT_PORT,
                     address_family: FieldUpdate::Omitted,
@@ -4153,6 +4239,7 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
+                software_encoder: SoftwareEncoderOptions::default(),
                 ping_timeout_ms: reset,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -4192,6 +4279,7 @@ mod tests {
                     5_000,
                     AdminAction::Update {
                         display_policy: DisplayPolicyUpdate::default(),
+                        software_encoder: SoftwareEncoderUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -4295,6 +4383,7 @@ mod tests {
                 5_000,
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
+                    software_encoder: SoftwareEncoderUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -4368,6 +4457,7 @@ mod tests {
                 5_000,
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
+                    software_encoder: SoftwareEncoderUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -4440,6 +4530,7 @@ mod tests {
                     5_000,
                     AdminAction::Update {
                         display_policy: DisplayPolicyUpdate::default(),
+                        software_encoder: SoftwareEncoderUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -4523,6 +4614,7 @@ mod tests {
                     5_000,
                     AdminAction::Update {
                         display_policy: DisplayPolicyUpdate::default(),
+                        software_encoder: SoftwareEncoderUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -4713,6 +4805,7 @@ mod tests {
         let expected_display_policy = empty_display_policy();
         let expected = UpdateExpectation {
             display_policy: &expected_display_policy,
+            software_encoder: &SoftwareEncoderOptions::default(),
             revision: 3,
             hostname: "New Host",
             target: &target,
@@ -4896,6 +4989,7 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
+                software_encoder: SoftwareEncoderOptions::default(),
                 ping_timeout_ms: None,
                 global_preparation: product.global_preparation().to_vec(),
                 legacy_global_preparation: product.legacy_global_preparation().to_vec(),
@@ -4905,7 +4999,7 @@ mod tests {
             },
         );
         assert_eq!(update["version"], SETTINGS_VERSION);
-        assert_eq!(update["values"].as_object().unwrap().len(), 40);
+        assert_eq!(update["values"].as_object().unwrap().len(), 43);
         assert_eq!(update["values"]["nvenc_spatial_aq"], false);
         assert_eq!(
             update["values"]["global_preparation"]
@@ -4956,6 +5050,7 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
+                software_encoder: SoftwareEncoderOptions::default(),
                 ping_timeout_ms: None,
                 global_preparation: vec![structured.clone()],
                 legacy_global_preparation: vec![raw.clone()],
@@ -5018,6 +5113,9 @@ mod tests {
 
         let mut old_v17 = reply.clone();
         old_v17["version"] = json!(GLOBAL_RAW_PREPARATION_SETTINGS_VERSION);
+        for key in ["sw_preset", "sw_tune", "encoder"] {
+            old_v17["values"].as_object_mut().unwrap().remove(key);
+        }
         for key in DISPLAY_POLICY_KEYS {
             old_v17["values"].as_object_mut().unwrap().remove(key);
         }
@@ -5079,6 +5177,7 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
+                software_encoder: SoftwareEncoderOptions::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -5118,6 +5217,7 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
+                software_encoder: SoftwareEncoderOptions::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -5142,6 +5242,7 @@ mod tests {
                 5_000,
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
+                    software_encoder: SoftwareEncoderUpdate::default(),
                     hostname: "Host".into(),
                     port: settings::DEFAULT_PORT,
                     address_family: FieldUpdate::Omitted,
@@ -5338,6 +5439,8 @@ mod tests {
                 json!({
                     "effective_minimum_fps_target":20.0,
                     "configured_wgc_pacing_smoothing":null,
+                    "configured_sw_preset":null,"configured_sw_tune":null,"configured_encoder":null,
+                    "effective_sw_preset":"superfast","effective_sw_tune":"zerolatency",
                     "effective_wgc_pacing_smoothing":true,
                     "configured_ping_timeout_ms":null,
                 }),
@@ -5446,6 +5549,7 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
+                software_encoder: SoftwareEncoderOptions::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -5517,6 +5621,7 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
+                software_encoder: SoftwareEncoderOptions::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -5701,6 +5806,7 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
+                software_encoder: SoftwareEncoderOptions::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -5802,6 +5908,7 @@ mod tests {
                     5_000,
                     AdminAction::Update {
                         display_policy: DisplayPolicyUpdate::default(),
+                        software_encoder: SoftwareEncoderUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -5942,6 +6049,7 @@ mod tests {
                     5_000,
                     AdminAction::Update {
                         display_policy: DisplayPolicyUpdate::default(),
+                        software_encoder: SoftwareEncoderUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -6054,6 +6162,7 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
+                software_encoder: SoftwareEncoderOptions::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -6094,6 +6203,7 @@ mod tests {
                 max_bitrate: Some(15_000),
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: Some(false),
+                software_encoder: SoftwareEncoderOptions::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -6167,6 +6277,7 @@ mod tests {
                     5_000,
                     AdminAction::Update {
                         display_policy: DisplayPolicyUpdate::default(),
+                        software_encoder: SoftwareEncoderUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -6244,6 +6355,7 @@ mod tests {
                 5_000,
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
+                    software_encoder: SoftwareEncoderUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -6292,6 +6404,7 @@ mod tests {
                 5_000,
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
+                    software_encoder: SoftwareEncoderUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -6343,6 +6456,7 @@ mod tests {
                 5_000,
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
+                    software_encoder: SoftwareEncoderUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -6389,5 +6503,83 @@ mod tests {
             product.completions.front().unwrap().payload["configured_capture"],
             "wgcc"
         );
+    }
+    #[test]
+    fn software_v19_cas_restart_reset_empty_and_readback_are_exact() {
+        let mut legacy = display_v18_document(7);
+        legacy["version"] = json!(DISPLAY_POLICY_SETTINGS_VERSION);
+        for key in ["sw_preset", "sw_tune", "encoder"] {
+            legacy["values"].as_object_mut().unwrap().remove(key);
+        }
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(parse_document(&legacy).unwrap());
+        assert_eq!(
+            product.software_encoder_options().effective_preset(),
+            "superfast"
+        );
+        assert_eq!(
+            product.software_encoder_options().effective_tune(),
+            "zerolatency"
+        );
+        let mut action = display_update_action(DisplayPolicyUpdate::default(), 7);
+        let AdminAction::Update {
+            software_encoder, ..
+        } = &mut action
+        else {
+            unreachable!()
+        };
+        *software_encoder = SoftwareEncoderUpdate {
+            sw_preset: FieldUpdate::Value("slow".into()),
+            sw_tune: FieldUpdate::Value(String::new()),
+            encoder: FieldUpdate::Value(EncoderBackend::Software),
+        };
+        product.enqueue(51, 5000, action).unwrap();
+        product.start_next();
+        let pending = product.pending.take().unwrap();
+        assert_eq!(pending.payload["version"], 19);
+        assert_eq!(pending.payload["expected_revision"], 7);
+        assert_eq!(pending.payload["values"]["sw_tune"], "");
+        let saved = json!({"ok":true,"found":true,"version":19,"revision":8,"values":pending.payload["values"]});
+        product.finish_call(pending.purpose, CallOutcome::Payload(saved.clone()));
+        assert_eq!(product.revision(), Some(8));
+        let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        restarted.apply_document(parse_document(&saved).unwrap());
+        assert_eq!(
+            restarted.software_encoder_options(),
+            product.software_encoder_options()
+        );
+        let mut action = display_update_action(DisplayPolicyUpdate::default(), 8);
+        let AdminAction::Update {
+            software_encoder, ..
+        } = &mut action
+        else {
+            unreachable!()
+        };
+        software_encoder.sw_preset = FieldUpdate::Null;
+        software_encoder.encoder = FieldUpdate::Null;
+        restarted.enqueue(52, 5000, action).unwrap();
+        restarted.start_next();
+        let pending = restarted.pending.take().unwrap();
+        assert!(pending.payload["values"]["sw_preset"].is_null());
+        assert_eq!(pending.payload["values"]["sw_tune"], "");
+        assert!(pending.payload["values"]["encoder"].is_null());
+        let mut forged = json!({"ok":true,"found":true,"version":19,"revision":9,"values":pending.payload["values"]});
+        forged["values"]["sw_tune"] = json!("zerolatency");
+        restarted.finish_call(pending.purpose, CallOutcome::Payload(forged));
+        assert_eq!(restarted.revision(), None);
+        assert!(!restarted.loaded());
+        assert_eq!(
+            restarted.software_encoder_options().sw_tune.as_deref(),
+            Some("")
+        );
+        for (field, value) in [
+            ("sw_preset", json!(false)),
+            ("sw_tune", json!("x".repeat(257))),
+            ("encoder", json!("nvenc")),
+        ] {
+            let mut invalid = saved.clone();
+            invalid["values"][field] = value;
+            assert!(parse_document(&invalid).is_err());
+        }
     }
 }

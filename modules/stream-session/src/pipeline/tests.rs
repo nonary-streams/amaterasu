@@ -1063,3 +1063,43 @@ fn unload_releases_bindings_without_claiming_asynchronous_provider_cleanup() {
     );
     assert_eq!(host.broker.live_components(), 0);
 }
+
+#[test]
+fn software_configuration_reaches_real_video_control_contract_without_normalization() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut started = start(id);
+    started["configuration"]["encoder"] = json!("software");
+    started["configuration"]["configuration"]["sw_preset"] = json!("slow");
+    started["configuration"]["configuration"]["sw_tune"] = json!("");
+    assert_eq!(host.response(2, started)["state"], "active");
+    let open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .unwrap();
+    assert_eq!(open.payload["encoder"], "software");
+    assert_eq!(open.payload["configuration"]["sw_preset"], "slow");
+    assert_eq!(open.payload["configuration"]["sw_tune"], "");
+}
+
+#[test]
+fn malformed_software_configuration_never_opens_video() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut started = start(id);
+    started["configuration"]["configuration"]["sw_preset"] = json!("x".repeat(129));
+    assert_eq!(
+        host.response(2, started)["code"],
+        "invalid_start_configuration"
+    );
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::Video.service()
+                && call.payload["action"] == "open")
+    );
+}

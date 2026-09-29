@@ -211,6 +211,12 @@ pub struct Client {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfigOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_tune: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<amaterasu_module_sdk::EncoderBackend>,
     /// Physical presentation mode; the streamed viewport and cadence are separate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_mode: Option<String>,
@@ -286,6 +292,11 @@ pub struct ClientConfigOverrides {
 
 impl ClientConfigOverrides {
     pub fn validate(&self) -> Result<(), &'static str> {
+        amaterasu_module_sdk::validate_software_options(
+            self.sw_preset.as_deref(),
+            self.sw_tune.as_deref(),
+        )
+        .map_err(|_| "invalid_config_overrides")?;
         if self
             .display_mode
             .as_deref()
@@ -404,7 +415,10 @@ impl ClientConfigOverrides {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.display_mode.is_none()
+        self.sw_preset.is_none()
+            && self.sw_tune.is_none()
+            && self.encoder.is_none()
+            && self.display_mode.is_none()
             && self.fec_percentage.is_none()
             && self.max_bitrate.is_none()
             && self.minimum_fps_target.is_none()
@@ -1537,6 +1551,43 @@ mod tests {
                 Err("invalid_config_overrides"),
                 "{mode}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod software_encoder_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn software_fields_are_sparse_exact_and_bounded() {
+        let absent: ClientConfigOverrides =
+            serde_json::from_value(json!({"sw_preset":null,"sw_tune":null,"encoder":null}))
+                .unwrap();
+        assert!(absent.is_empty());
+        let selected: ClientConfigOverrides = serde_json::from_value(
+            json!({"sw_preset":"","sw_tune":"film,zerolatency","encoder":"software"}),
+        )
+        .unwrap();
+        assert!(selected.validate().is_ok());
+        assert!(!selected.is_empty());
+        assert_eq!(
+            serde_json::to_value(selected).unwrap(),
+            json!({"sw_preset":"","sw_tune":"film,zerolatency","encoder":"software"})
+        );
+        for invalid in [
+            json!({"sw_preset":false}),
+            json!({"encoder":"nvenc"}),
+            json!({"encoder":""}),
+        ] {
+            assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
+        }
+        for invalid in [
+            json!({"sw_preset":"x".repeat(129)}),
+            json!({"sw_tune":"film\n"}),
+        ] {
+            let options: ClientConfigOverrides = serde_json::from_value(invalid).unwrap();
+            assert!(options.validate().is_err());
         }
     }
 }

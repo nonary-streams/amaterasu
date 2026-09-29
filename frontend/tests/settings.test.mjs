@@ -1987,6 +1987,8 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   content.setConnected(true);
   const notices = [];
   let stored = pairedClients();
+  stored.clients[0].config_overrides.sw_preset = "";
+  stored.clients[0].config_overrides.encoder = "software";
   let updates = 0;
   let secondSubmittedRevision;
   dom.Amaterasu.renderSettings({
@@ -2019,6 +2021,9 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
           assert.equal(body.config_overrides.key_rightalt_to_key_win, true);
           assert.equal(body.config_overrides.key_repeat_delay, 0);
           assert.equal(body.config_overrides.key_repeat_frequency, 0);
+          assert.equal(body.config_overrides.sw_preset, "");
+          assert.equal(body.config_overrides.sw_tune, "  film,zerolatency  ");
+          assert.equal(body.config_overrides.encoder, "software");
           stored = { ...stored, revision: 8, clients: [
             { ...stored.clients[0], config_overrides: body.config_overrides }, stored.clients[1],
           ] };
@@ -2034,6 +2039,21 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   const save = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
   assert.ok(fec);
   assert.ok(save);
+  assert.match(pairingArea.textContent, /Input and software encoding preferences/);
+  const presetMode = find(pairingArea, (node) => node.name === "sw_preset_mode");
+  const presetValue = find(pairingArea, (node) => node.name === "sw_preset_value");
+  assert.equal(presetMode.value, "value");
+  assert.equal(presetValue.value, "");
+  assert.equal(presetValue.disabled, false);
+  const tuneMode = find(pairingArea, (node) => node.name === "sw_tune_mode");
+  const tuneValue = find(pairingArea, (node) => node.name === "sw_tune_value");
+  assert.equal(tuneMode.value, "inherit");
+  assert.equal(tuneValue.disabled, true);
+  tuneMode.value = "value";
+  tuneMode.fire("change");
+  assert.equal(tuneValue.disabled, false);
+  tuneValue.value = "  film,zerolatency  ";
+  assert.equal(find(pairingArea, (node) => node.name === "encoder_backend").value, "software");
   fec.value = "35";
   find(pairingArea, (node) => node.name === "native_pen_touch").value = "true";
   for (const [key, value] of Object.entries({high_resolution_scrolling: "false", always_send_scancodes: "false", key_rightalt_to_key_win: "true", key_repeat_delay: "0", key_repeat_frequency: "0"}))
@@ -2043,6 +2063,9 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   assert.equal(updates, 1);
   assert.match(pairingArea.textContent, /Revision 8/);
   assert.match(notices.at(-1), /Stored overrides confirmed.*Active stream application is not confirmed/);
+  assert.equal(find(pairingArea, (node) => node.name === "sw_preset_mode").value, "value");
+  assert.equal(find(pairingArea, (node) => node.name === "sw_preset_value").value, "");
+  assert.equal(find(pairingArea, (node) => node.name === "sw_tune_value").value, "  film,zerolatency  ");
   const freshSave = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
   for (const [key, value] of Object.entries({high_resolution_scrolling: "false", always_send_scancodes: "false", key_rightalt_to_key_win: "true", key_repeat_delay: "0", key_repeat_frequency: "0"})) {
     const control = find(pairingArea, (node) => node.name === key);
@@ -2803,4 +2826,30 @@ test("Steam settings show provider loading, disabled and scan states honestly", 
   assert.match(describe({ ...base, complete: true }), /last scan complete/);
   assert.match(describe(base), /no complete scan/);
   assert.match(describe(base), /4 games · 1 warning/);
+});
+
+test("software availability requires an actual software encoder identity and distinguishes disabled artifacts", () => {
+  const read = context.Amaterasu.parseSoftwareEncoderAvailability;
+  assert.match(read({ok:true,enabled:true,encoders:[],software_encoder:{available:false,reason:"x264_feature_disabled"}}),/feature disabled/);
+  assert.match(read({ok:true,enabled:true,encoders:[],software_encoder:{available:false,reason:"x264_runtime_unavailable"}}),/runtime library is unavailable/);
+  assert.throws(()=>read({ok:true,enabled:true,encoders:[],software_encoder:{available:true}}));
+  assert.match(read({ok:true,enabled:true,encoders:[{hardware:false,identity:{clsid:"amaterasu.software.x264"}}],software_encoder:{available:true}}),/available in the current codec runtime/);
+  assert.match(read({ok:true,enabled:false,software_encoder:{available:false}}),/provider is disabled/);
+});
+
+test("paired software overrides retain exact empty strings through canonicalization and reject unknown backends", () => {
+  const client = {certificate_id:"a".repeat(64),client_id:"client",name:"Client",paired_at:1,config_overrides:{sw_preset:"",sw_tune:"film,zerolatency",encoder:"software"}};
+  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(client)),[]);
+  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields({...client,config_overrides:{sw_tune:"x".repeat(257),encoder:"nvenc"}})),["sw_tune","encoder"]);
+});
+
+test("host software save confirms exact empty/null tuning and rejects stale codec readback", async () => {
+  const current={...nvhttpHostSettings(),configured_sw_preset:null,configured_sw_tune:"film",configured_encoder:null};
+  const values={...nvhttpHostUpdate(),sw_preset:"slow",sw_tune:"",encoder:"software"};
+  const updated={...nvhttpUpdatedHost(),configured_sw_preset:"slow",configured_sw_tune:"",configured_encoder:"software"};
+  const calls=[];
+  const saved=await context.Amaterasu.saveNvhttpHostSettings({async post(route,body={}) {calls.push([route,ordinary(body)]);return updated;}},current,values);
+  assert.equal(saved.configured_sw_tune,"");assert.equal(calls[0][1].expected_revision,8);
+  await assert.rejects(context.Amaterasu.saveNvhttpHostSettings({async post(){return {...updated,configured_sw_tune:null};}},current,values),/could not be confirmed/);
+  await assert.rejects(context.Amaterasu.saveNvhttpHostSettings({async post(route){return route==="nvhttp/settings_update" ? updated : {...updated,revision:10};}},current,values),/could not be confirmed/);
 });

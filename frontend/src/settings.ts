@@ -324,6 +324,38 @@ namespace Amaterasu {
     }
   }
 
+  export function parseSoftwareEncoderAvailability(value: unknown): string {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Invalid codec availability reply.");
+    const reply = value as Record<string, unknown>;
+    const software = reply.software_encoder;
+    if (reply.ok !== true || typeof reply.enabled !== "boolean" || !software ||
+        typeof software !== "object" || Array.isArray(software) ||
+        typeof (software as Record<string, unknown>).available !== "boolean")
+      throw new Error("Invalid codec availability reply.");
+    const availability = software as Record<string, unknown>;
+    if (!reply.enabled) return "The codec provider is disabled. Software x264 cannot be selected.";
+    if (availability.available) {
+      const isSoftwareIdentity = (entry: unknown): boolean => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+        const descriptor = entry as Record<string, unknown>;
+        const identity = descriptor.identity;
+        return descriptor.hardware === false && identity !== null &&
+          typeof identity === "object" && !Array.isArray(identity) &&
+          (identity as Record<string, unknown>).clsid === "amaterasu.software.x264";
+      };
+      if (!Array.isArray(reply.encoders) || !reply.encoders.some(isSoftwareIdentity))
+        throw new Error("Software availability lacks an actual encoder identity.");
+      return "Software x264 is available in the current codec runtime. Capture and client playback still require platform qualification.";
+    }
+    const reasons: Record<string, string> = {
+      x264_feature_disabled: "This build has the software-x264 feature disabled.",
+      x264_headers_unavailable: "This build lacked compatible x264 development headers.",
+      x264_runtime_unavailable: "A compatible x264 runtime library is unavailable.",
+    };
+    return `Software x264 is unavailable. ${reasons[String(availability.reason)] ?? "The codec provider did not report a qualified software backend."}`;
+  }
+
   export function parseNvhttpSettingsReply(value: unknown): NvhttpSettings {
     if (value === null || typeof value !== "object" || Array.isArray(value))
       throw new Error("Moonlight host settings reply is invalid.");
@@ -380,6 +412,8 @@ namespace Amaterasu {
       configured_wgc_pacing_smoothing: values.wgc_pacing_smoothing,
       configured_global_preparation: normalizedPreparationSteps(values.global_preparation),
     });
+    for (const key of ["sw_preset", "sw_tune", "encoder"])
+      if (Object.prototype.hasOwnProperty.call(values, key)) expected[`configured_${key}`] = values[key];
     const confirms = (reply: NvhttpSettings): boolean =>
       reply.revision === current.revision + 1 &&
       Object.entries(expected).every(([key, value]) =>
@@ -915,7 +949,7 @@ namespace Amaterasu {
   }
 
   const forwardablePairingOverrideFields = [
-    "fec_percentage", "stream_audio", "audio_sink", "virtual_sink",
+    "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "encoder",
     "audio_sink_capture_only", "back_button_timeout", "controller", "gamepad",
     "keyboard", "mouse", "native_pen_touch",
     "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
@@ -943,6 +977,11 @@ namespace Amaterasu {
     if (field === "audio_sink" || field === "virtual_sink")
       return typeof value === "string" && new TextEncoder().encode(value).length <= 4096 &&
         !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+    if (field === "sw_preset" || field === "sw_tune")
+      return typeof value === "string" &&
+        new TextEncoder().encode(value).length <= (field === "sw_preset" ? 128 : 256) &&
+        !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+    if (field === "encoder") return value === "auto" || value === "software";
     if (field === "gamepad")
       return typeof value === "string" && recognizedInputGamepadProfiles.includes(value);
     if (field === "frame_limiter_provider")
@@ -2655,6 +2694,7 @@ namespace Amaterasu {
           const nativePenTouch = sparseInputOverrideSelect("native_pen_touch", client.config_overrides?.native_pen_touch);
           nativePenTouch.setAttribute("aria-label", `Native pen/touch preference override for ${client.name}`);
           const advancedInput = advancedInputOverrideControls(client.config_overrides);
+          const softwareEncoder = softwareEncoderOverrideControls(client.config_overrides);
           const streamAudio = el("select");
           streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
           const audioChoices: Array<[string, string]> = [
@@ -2734,6 +2774,7 @@ namespace Amaterasu {
               try {
                 const values = {
                   ...advancedInput.read(),
+                  ...softwareEncoder.read(),
                   ...parseClientFecOverride(fec.value),
                   back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeout.value),
                   stream_audio: parseStreamAudioOverride(streamAudio.value),
@@ -2775,9 +2816,9 @@ namespace Amaterasu {
             el("strong", "", client.name),
             el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
           );
-          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, el("div", "form-grid", ...advancedInput.fields), el("div", "", save, status)];
+          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields), el("div", "", save, status)];
         });
-        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "Keyboard and scrolling preferences", ""], rows);
+        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "Input and software encoding preferences", ""], rows);
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
@@ -3324,11 +3365,29 @@ namespace Amaterasu {
         pingTimeout.max = "2147483647";
         pingTimeout.step = "1";
         pingTimeout.placeholder = "Default (10000)";
+        const softwareEncoder = softwareEncoderOverrideControls({
+          sw_preset: settings.configured_sw_preset,
+          sw_tune: settings.configured_sw_tune,
+          encoder: settings.configured_encoder,
+        }, true);
+        const softwareAvailability = el("p", "muted", "Software x264 availability has not been checked.");
+        if (context.api.allows("media.read")) {
+          try {
+            const availability = parseSoftwareEncoderAvailability(await context.api.post<unknown>("media/encoders"));
+            if (!context.content.isConnected || !hostLoads.isCurrent(generation)) return;
+            softwareAvailability.textContent = availability;
+          } catch {
+            softwareAvailability.textContent = "Software x264 availability could not be checked. Explicit software launch requires a real available backend.";
+          }
+        }
         const status = el("div");
         const save = el("button", "button primary", "Save host settings");
         save.type = "submit";
         save.disabled = !context.api.allows("configuration.write");
         form.append(
+          ...softwareEncoder.fields,
+          softwareAvailability,
+          el("p", "muted", `Effective software tuning: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}.`),
           field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."),
           field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."),
           field(
@@ -3431,6 +3490,7 @@ namespace Amaterasu {
               audio_sink_capture_only: audioSinkCaptureOnly.checked,
               external_ip: parseExternalIp(externalIp.value),
               wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),
+              ...softwareEncoder.read(),
               global_preparation: parsePreparationSteps(globalPreparation.value),
             };
             hostLoads.invalidate();

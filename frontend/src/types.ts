@@ -63,7 +63,7 @@ namespace Amaterasu {
     steam_install_dir?: string;
     exclude_global_prep_cmd?: boolean;
     elevated?: boolean;
-    config_overrides?: AdvancedInputOverrides & {
+    config_overrides?: AdvancedInputOverrides & SoftwareEncoderOverrides & {
       fec_percentage?: number;
       stream_audio?: boolean;
       audio_sink?: string;
@@ -84,6 +84,11 @@ namespace Amaterasu {
       dd_refresh_rate_option?: RefreshRateOption | null;
       prefer_10bit_sdr?: boolean | null;
     };
+  }
+  export interface SoftwareEncoderOverrides {
+    sw_preset?: string | null;
+    sw_tune?: string | null;
+    encoder?: "auto" | "software" | null;
   }
   export type RefreshRateOption = "auto" | "disabled" | "manual" | "prefer_highest";
   export interface CatalogRow {
@@ -142,6 +147,11 @@ namespace Amaterasu {
     configured_external_ip: string | null;
     effective_audio_sink: string;
     configured_wgc_pacing_smoothing: boolean | null;
+    configured_sw_preset: string | null;
+    configured_sw_tune: string | null;
+    configured_encoder: "auto" | "software" | null;
+    effective_sw_preset: string;
+    effective_sw_tune: string;
     effective_wgc_pacing_smoothing: boolean;
     configured_global_preparation: PreparationStep[];
     stream_audio: boolean;
@@ -281,7 +291,7 @@ namespace Amaterasu {
     client_id: string;
     name: string;
     paired_at: number;
-    config_overrides?: AdvancedInputOverrides & {
+    config_overrides?: AdvancedInputOverrides & SoftwareEncoderOverrides & {
       fec_percentage?: number;
       stream_audio?: boolean;
       audio_sink?: string;

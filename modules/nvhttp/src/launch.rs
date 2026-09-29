@@ -3,7 +3,7 @@
 //! The wire layer authenticates the TLS peer and parses Moonlight fields. This
 //! controller owns the resulting application and RTSP operations until the
 //! successful HTTP reply has been re-authorized and completely written.
-use amaterasu_module_sdk::EncoderSelection;
+use amaterasu_module_sdk::{EncoderSelection, SoftwareEncoderOptions};
 mod call;
 mod record;
 mod workflow;
@@ -146,6 +146,7 @@ pub struct PeerIdentity {
     client_frame_limiter_settings: FrameLimiterSettings,
     client_display_overrides: Value,
     client_display_mode: Option<PhysicalDisplayMode>,
+    client_software_encoder: SoftwareEncoderOptions,
 }
 
 impl PeerIdentity {
@@ -183,6 +184,7 @@ impl PeerIdentity {
             client_frame_limiter_settings: FrameLimiterSettings::default(),
             client_display_overrides: json!({}),
             client_display_mode: None,
+            client_software_encoder: SoftwareEncoderOptions::default(),
         })
     }
 
@@ -193,6 +195,14 @@ impl PeerIdentity {
         config_overrides: ClientConfigOverrides,
     ) -> Result<Self, &'static str> {
         let client_display_overrides = config_overrides.display_overrides();
+        let client_software_encoder = SoftwareEncoderOptions {
+            sw_preset: config_overrides.sw_preset.clone(),
+            sw_tune: config_overrides.sw_tune.clone(),
+            encoder: config_overrides.encoder,
+        };
+        client_software_encoder
+            .validate()
+            .map_err(|_| "invalid_paired_identity")?;
         let client_display_mode = match config_overrides.display_mode.as_deref() {
             Some(mode) => Some(PhysicalDisplayMode::parse(mode).ok_or("invalid_paired_identity")?),
             None => None,
@@ -283,6 +293,7 @@ impl PeerIdentity {
         self.client_frame_limiter_settings = client_frame_limiter_settings;
         self.client_display_overrides = client_display_overrides;
         self.client_display_mode = client_display_mode;
+        self.client_software_encoder = client_software_encoder;
         Ok(self)
     }
 
@@ -516,6 +527,7 @@ pub struct Controller {
     global_max_bitrate_kbps: Option<u32>,
     global_minimum_fps_target: f64,
     global_wgc_pacing_smoothing: bool,
+    software_encoder: SoftwareEncoderOptions,
     device_name: String,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
@@ -551,6 +563,7 @@ impl Controller {
             global_max_bitrate_kbps: None,
             global_minimum_fps_target: 20.0,
             global_wgc_pacing_smoothing: true,
+            software_encoder: SoftwareEncoderOptions::default(),
             device_name: "Amaterasu".into(),
             records: BTreeMap::new(),
             job: None,
@@ -632,6 +645,10 @@ impl Controller {
         self.global_minimum_fps_target = target;
     }
 
+    pub fn set_software_encoder_options(&mut self, options: SoftwareEncoderOptions) {
+        self.software_encoder = options;
+    }
+
     pub fn set_global_wgc_pacing_smoothing(&mut self, enabled: bool) {
         self.global_wgc_pacing_smoothing = enabled;
     }
@@ -692,6 +709,7 @@ impl Controller {
         let global_max_bitrate_kbps = self.global_max_bitrate_kbps;
         let global_minimum_fps_target = self.global_minimum_fps_target;
         let global_wgc_pacing_smoothing = self.global_wgc_pacing_smoothing;
+        let startup_encoder = config.capture.encoder.clone();
         let capture_output = self
             .configured_output_name
             .as_deref()
@@ -774,6 +792,11 @@ impl Controller {
             now + INITIAL_DEADLINE,
         );
         record.global_display_revision = self.global_display_revision;
+        record.global_software_encoder = self.software_encoder.clone();
+        record.effective_software_encoder = self
+            .software_encoder
+            .with_overrides(&record.peer.client_software_encoder);
+        record.selected_encoder = startup_encoder;
         record.global_display_policy = self.global_display_policy.clone();
         self.records.insert(id, record);
         None

@@ -402,16 +402,30 @@ eligible batches and falls back to ordinary datagrams when the socket or
 platform does not support it. Driver, NIC, and live Linux behavior still need
 qualification before this setting can be marked complete.
 
-`global:sw_preset` and `global:sw_tune` remain pending. Vibeshine defaults
-them to `superfast` and `zerolatency` and passes their strings to x264/x265
-through FFmpeg; its parser accepts strings beyond the web editor's listed
-choices. Amaterasu's encoder module currently enumerates Windows hardware
-H.264 MFTs and has no software encoder consumer on any platform. Carrying
-these values through settings alone would not affect output. A software
-encoder must preserve the current NV12 input, Annex B output, timestamps,
-forced IDR, and drain contracts. Exact preset/tune behavior requires an x264
-backend and a deliberate dependency and distribution choice before the
-settings can be presented as functional.
+`global:sw_preset` and `global:sw_tune` remain pending full platform
+qualification. The optional genuine system-x264 H.264 backend now consumes exact
+strings with defaults `superfast`/`zerolatency`; it preserves NV12, Annex B,
+forced IDR, timestamps, bounded retries and drain. Product document v19 stores
+nullable tuning strings and an additive nullable `auto`/`software` backend policy.
+Older documents retain defaults and the trusted startup encoder selection.
+Signed host, application and certificate-bound client editors preserve null versus
+empty and resolve each field client before application before global. Admission
+freezes the result through RTSP, stream-session and video. Real video resolves a
+legacy ordinal/backend once into a stable identity before capture allocation;
+synthetic fixture control does not qualify production capabilities.
+
+The pinned parser and scoped override allowlist accept raw preset/tune strings,
+including empty and combined tunes. Amaterasu preserves bounded raw
+strings and delegates vocabulary validation to x264 at software Open. Hardware
+MFTs preserve those fields without applying them. Backend selection supports only
+`auto`/`software`; reference vendor aliases are rejected. Auto prefers registered
+hardware, then genuine available x264, without source-equivalent probing or
+retrying failed hardware Open. The signed editor reads actual codec enumeration
+and reports disabled-feature, missing-header and missing-runtime states. Default
+builds still omit x264; distribution requires an explicit licensing/packaging
+choice. Native Linux encode and independent FFmpeg decode are qualified; Windows
+build/runtime packaging, capture, performance and live client playback remain
+gates. These IDs must not be marked verified from signed synthetic streams.
 
 The `ping_timeout` setting now has a signed editor and nullable product
 document v13 value. Its 10,000 ms default and 0..2,147,483,647 ms range are

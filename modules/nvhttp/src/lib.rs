@@ -17,7 +17,7 @@ use network_settings::NetworkSettings;
 use preparation::LegacyPreparationStep;
 use product_settings::{
     AdminAction, DisplayPolicyUpdate, EncryptionModeUpdate, FieldUpdate, FrameLimiterUpdate,
-    NetworkTarget, ProductSettings,
+    NetworkTarget, ProductSettings, SoftwareEncoderUpdate,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
@@ -131,6 +131,12 @@ enum Operation {
         minimum_fps_target: FieldUpdate<f64>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         wgc_pacing_smoothing: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        sw_preset: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        sw_tune: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        encoder: FieldUpdate<amaterasu_module_sdk::EncoderBackend>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         ping_timeout_ms: FieldUpdate<i32>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
@@ -304,6 +310,9 @@ impl ManagedModule for NvhttpModule {
             );
             router.set_global_ping_timeout_ms(self.product_settings.effective_ping_timeout_ms());
             router.set_capture_mode(self.product_settings.configured_capture());
+            router.set_software_encoder_options(
+                self.product_settings.software_encoder_options().clone(),
+            );
             router.set_global_video_max_batch_size_kb(
                 self.product_settings.effective_video_max_batch_size_kb(),
             );
@@ -574,6 +583,9 @@ impl NvhttpModule {
                                 max_bitrate,
                                 minimum_fps_target,
                                 wgc_pacing_smoothing,
+                                sw_preset,
+                                sw_tune,
+                                encoder,
                                 ping_timeout_ms,
                                 global_preparation,
                                 legacy_global_preparation,
@@ -634,6 +646,11 @@ impl NvhttpModule {
                                     max_bitrate,
                                     minimum_fps_target,
                                     wgc_pacing_smoothing,
+                                    software_encoder: SoftwareEncoderUpdate {
+                                        sw_preset,
+                                        sw_tune,
+                                        encoder,
+                                    },
                                     ping_timeout_ms,
                                     global_preparation,
                                     legacy_global_preparation,

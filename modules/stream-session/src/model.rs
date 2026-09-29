@@ -668,6 +668,10 @@ pub enum CaptureProvider {
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VideoConfiguration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_tune: Option<String>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -874,6 +878,11 @@ impl VideoConfiguration {
             && (1..=120).contains(&self.fps)
             && (100_000..=100_000_000).contains(&self.bitrate)
             && self.max_reference_frames <= 1
+            && amaterasu_module_sdk::validate_software_options(
+                self.sw_preset.as_deref(),
+                self.sw_tune.as_deref(),
+            )
+            .is_ok()
     }
 }
 

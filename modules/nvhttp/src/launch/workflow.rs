@@ -243,7 +243,7 @@ impl Controller {
                     "capture_provider":record.capture_provider,
                     "constant_rate":record.constant_rate,
                     "output":record.capture_output,
-                    "encoder":config.capture.encoder,
+                    "encoder":record.selected_encoder,
                     "audio_endpoint":record.audio_endpoint,
                     "host_audio_enabled":record.request.host_audio_enabled,
                 });
@@ -298,6 +298,8 @@ impl Controller {
                         "max_bitrate_kbps": record.effective_max_bitrate_kbps,
                         "minimum_fps_target": record.effective_minimum_fps_target,
                         "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
+                        "sw_preset":record.effective_software_encoder.effective_preset(),
+                        "sw_tune":record.effective_software_encoder.effective_tune(),
                         "frame_limiter_settings": record.executable_path.as_ref().and(record.frame_limiter_snapshot.as_ref()),
                         "frame_limiter_executable_path": record.executable_path,
                         "display_policy_snapshot": record.display_policy_snapshot,
@@ -1357,6 +1359,17 @@ fn project_application_policy(
     application_overrides: &ApplicationConfigOverrides,
     profile: &mut super::StreamProfile,
 ) -> Result<(), &'static str> {
+    record.effective_software_encoder = record
+        .global_software_encoder
+        .with_overrides(&amaterasu_module_sdk::SoftwareEncoderOptions {
+            sw_preset: application_overrides.sw_preset.clone(),
+            sw_tune: application_overrides.sw_tune.clone(),
+            encoder: application_overrides.encoder,
+        })
+        .with_overrides(&record.peer.client_software_encoder);
+    if let Some(backend) = record.effective_software_encoder.encoder {
+        record.selected_encoder = amaterasu_module_sdk::EncoderSelection::Backend(backend);
+    }
     record.scoped_ds4_back_as_touchpad_click = application_overrides.ds4_back_as_touchpad_click;
     let application_fec_percentage = application_overrides.fec_percentage;
     record.application_fec_percentage = application_fec_percentage;
@@ -1535,6 +1548,9 @@ pub(super) struct ApplicationConfigOverrides {
     max_bitrate: Option<i32>,
     minimum_fps_target: Option<f64>,
     video_max_batch_size_kb: Option<u8>,
+    sw_preset: Option<String>,
+    sw_tune: Option<String>,
+    encoder: Option<amaterasu_module_sdk::EncoderBackend>,
     dd_mode_remapping: Option<Value>,
     dd_resolution_option: Option<String>,
     dd_manual_resolution: Option<String>,
@@ -1710,6 +1726,11 @@ pub(super) fn parse_application_config_overrides(
             serde_json::from_value(value.clone()).map_err(|_| "invalid_application_response")?
         }
     };
+    amaterasu_module_sdk::validate_software_options(
+        config_overrides.sw_preset.as_deref(),
+        config_overrides.sw_tune.as_deref(),
+    )
+    .map_err(|_| "invalid_application_response")?;
     if config_overrides.fec_percentage == Some(0)
         || config_overrides
             .dd_mode_remapping
@@ -1844,6 +1865,9 @@ fn rtsp_response<'a>(
     if record
         .rtsp_ticket
         .is_some_and(|expected| expected != ticket)
+        || payload["encoder"] != json!(record.selected_encoder)
+        || payload["sw_preset"] != record.effective_software_encoder.effective_preset()
+        || payload["sw_tune"] != record.effective_software_encoder.effective_tune()
         || payload.get("failure").is_none()
         || payload.get("cleanup_error").is_none()
         || payload.get("frame_limiter_settings")

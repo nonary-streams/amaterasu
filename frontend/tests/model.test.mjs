@@ -466,3 +466,19 @@ test("page counts never claim an exact total while continuation exists", () => {
   assert.equal(model.countLabel(0, { after: "continue-search" }), "0+");
   assert.equal(model.countLabel(12, null), "12");
 });
+
+test("software override editor preserves null versus empty, raw strings, and application serialization", () => {
+  const form = new FormData();
+  form.set("name","Software app");form.set("kind","executable");form.set("path","/opt/example");
+  assert.deepEqual(ordinary(model.parseSoftwareEncoderOverrides(form)), {sw_preset:null,sw_tune:null,encoder:null});
+  form.set("sw_preset_mode","value");form.set("sw_preset_value","");
+  form.set("sw_tune_mode","value");form.set("sw_tune_value","film,zerolatency");
+  form.set("encoder_backend","software");
+  assert.deepEqual(ordinary(model.entryFromForm(form).config_overrides), {sw_preset:"",sw_tune:"film,zerolatency",encoder:"software"});
+  form.set("sw_preset_value","  slow  ");
+  assert.equal(model.parseSoftwareEncoderOverrides(form).sw_preset,"  slow  ");
+  for (const [key,value] of [["sw_preset_value","é".repeat(65)],["sw_tune_value","x".repeat(257)],["sw_tune_value","film\n"],["encoder_backend","nvenc"]]) {
+    const invalid = new FormData();invalid.set("sw_preset_mode","value");invalid.set("sw_tune_mode","value");invalid.set(key,value);
+    assert.throws(()=>model.parseSoftwareEncoderOverrides(invalid));
+  }
+});

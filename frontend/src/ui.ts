@@ -200,6 +200,62 @@ namespace Amaterasu {
     };
   }
 
+  export function softwareEncoderOverrideControls(
+    current?: SoftwareEncoderOverrides,
+    global = false,
+  ): {
+    fields: HTMLElement[];
+    read: () => SoftwareEncoderOverrides;
+  } {
+    const controls = new Map<string, HTMLInputElement | HTMLSelectElement>();
+    const fields: HTMLElement[] = [];
+    for (const [key, label, fallback] of [
+      ["sw_preset", "Software H.264 preset", "superfast"],
+      ["sw_tune", "Software H.264 tune", "zerolatency"],
+    ] as const) {
+      const mode = el("select");
+      mode.name = `${key}_mode`;
+      const inherited = el("option", "", global ? `Default (${fallback})` : "Inherit");
+      inherited.value = "inherit";
+      const specified = el("option", "", "Exact string (including empty)");
+      specified.value = "value";
+      mode.append(inherited, specified);
+      const stored = current?.[key];
+      mode.value = stored == null ? "inherit" : "value";
+      const value = input(`${key}_value`, stored ?? "");
+      value.disabled = mode.value === "inherit";
+      mode.addEventListener("change", () => {
+        value.disabled = mode.value === "inherit";
+      });
+      controls.set(mode.name, mode);
+      controls.set(value.name, value);
+      fields.push(
+        field(label, mode, "Inherit the lower scope, or retain an exact software tuning string."),
+        field(`${label} exact value`, value, "Applied by the x264 software backend. Exact strings are validated by the installed codec at launch; hardware encoders preserve these fields without applying them."),
+      );
+    }
+    const backend = el("select");
+    backend.name = "encoder_backend";
+    for (const [value, label] of [
+      ["", global ? "Trusted startup selection" : "Inherit"],
+      ["auto", "Automatic (registered hardware, then available x264)"],
+      ["software", "Software x264 (requires available backend)"],
+    ] as const) {
+      const option = el("option", "", label);
+      option.value = value;
+      backend.append(option);
+    }
+    backend.value = current?.encoder ?? "";
+    controls.set(backend.name, backend);
+    fields.push(field("Encoder backend", backend, "Explicit software selection fails when x264 is unavailable. Automatic selection does not probe hardware or retry a failed hardware open."));
+    return {
+      fields,
+      read: () => parseSoftwareEncoderOverrides({
+        get: (name: string) => controls.get(name)?.value ?? null,
+      }),
+    };
+  }
+
   export function confirmAction(
     title: string,
     description: string,

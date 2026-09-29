@@ -222,6 +222,13 @@ impl Router {
         self.launches.set_global_minimum_fps_target(target);
     }
 
+    pub fn set_software_encoder_options(
+        &mut self,
+        options: amaterasu_module_sdk::SoftwareEncoderOptions,
+    ) {
+        self.launches.set_software_encoder_options(options);
+    }
+
     pub fn set_global_wgc_pacing_smoothing(&mut self, enabled: bool) {
         self.launches.set_global_wgc_pacing_smoothing(enabled);
     }
@@ -575,6 +582,9 @@ fn response_code(response: &ModuleResult<Response>) -> &str {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ClientConfigOverrides {
+    pub(super) sw_preset: Option<String>,
+    pub(super) sw_tune: Option<String>,
+    pub(super) encoder: Option<amaterasu_module_sdk::EncoderBackend>,
     pub(super) display_mode: Option<String>,
     pub(super) fec_percentage: Option<u8>,
     pub(super) max_bitrate: Option<i32>,

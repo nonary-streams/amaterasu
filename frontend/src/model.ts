@@ -16,6 +16,27 @@ namespace Amaterasu {
     return value === "manual";
   }
 
+  export function parseSoftwareEncoderOverrides(data: Pick<FormData, "get">): SoftwareEncoderOverrides {
+    const raw = (name: string): string => String(data.get(name) ?? "");
+    const option = (key: string, limit: number): string | null => {
+      const mode = raw(`${key}_mode`) || "inherit";
+      if (mode === "inherit") return null;
+      const value = raw(`${key}_value`);
+      if (mode !== "value" || new TextEncoder().encode(value).length > limit ||
+          /[\u0000-\u001f\u007f-\u009f]/u.test(value))
+        throw new Error(`${key} must contain at most ${limit} UTF-8 bytes without control characters.`);
+      return value;
+    };
+    const backend = raw("encoder_backend");
+    if (!["", "auto", "software"].includes(backend))
+      throw new Error("Encoder backend must inherit the startup selection, auto, or software.");
+    return {
+      sw_preset: option("sw_preset", 128),
+      sw_tune: option("sw_tune", 256),
+      encoder: backend === "" ? null : backend as "auto" | "software",
+    };
+  }
+
   export function parseArguments(value: string): string[] {
     const parsed: unknown = JSON.parse(value || "[]");
     if (
@@ -371,7 +392,10 @@ namespace Amaterasu {
     const keyboard = parseInputBooleanOverride(text("keyboard"), "Keyboard input");
     const mouse = parseInputBooleanOverride(text("mouse"), "Mouse input");
     const advancedInput = Object.fromEntries(
-      Object.entries(parseAdvancedInputOverrides(data)).filter(([, value]) => value !== null),
+      Object.entries({
+        ...parseAdvancedInputOverrides(data),
+        ...parseSoftwareEncoderOverrides(data),
+      }).filter(([, value]) => value !== null),
     );
     const refreshRateOption = parseRefreshRateOptionOverride(
       String(data.get("dd_refresh_rate_option") ?? ""),

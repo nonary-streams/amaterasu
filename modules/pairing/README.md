@@ -292,3 +292,11 @@ The installer process boundary is the sibling executable
 `amaterasu-pairing-import.exe`: `validate --source SOURCE` performs no writes,
 and `seed --source DATA_ROOT/legacy-imports/PRODUCT --state STATE_ROOT` commits
 only validated data. Its output contains only fixed status words.
+
+Sparse software encoder overrides support exact `sw_preset`/`sw_tune` strings
+(up to 128/256 UTF-8 bytes, no controls) and `encoder: "auto" | "software"`.
+Null/absence inherit; empty tuning strings remain explicit. The actual x264
+backend validates codec vocabulary when opening software. NVHTTP resolves each
+field client before application before global and freezes the launch snapshot.
+See [software policy](../nvhttp/README.md#software-encoder-policy) for runtime
+availability, source differences and remaining qualification gates.

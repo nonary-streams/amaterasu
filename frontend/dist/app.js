@@ -18,6 +18,28 @@ var Amaterasu;
         return value === "manual";
     }
     Amaterasu.usesManualRefreshRateCompanion = usesManualRefreshRateCompanion;
+    function parseSoftwareEncoderOverrides(data) {
+        const raw = (name) => String(data.get(name) ?? "");
+        const option = (key, limit) => {
+            const mode = raw(`${key}_mode`) || "inherit";
+            if (mode === "inherit")
+                return null;
+            const value = raw(`${key}_value`);
+            if (mode !== "value" || new TextEncoder().encode(value).length > limit ||
+                /[\u0000-\u001f\u007f-\u009f]/u.test(value))
+                throw new Error(`${key} must contain at most ${limit} UTF-8 bytes without control characters.`);
+            return value;
+        };
+        const backend = raw("encoder_backend");
+        if (!["", "auto", "software"].includes(backend))
+            throw new Error("Encoder backend must inherit the startup selection, auto, or software.");
+        return {
+            sw_preset: option("sw_preset", 128),
+            sw_tune: option("sw_tune", 256),
+            encoder: backend === "" ? null : backend,
+        };
+    }
+    Amaterasu.parseSoftwareEncoderOverrides = parseSoftwareEncoderOverrides;
     function parseArguments(value) {
         const parsed = JSON.parse(value || "[]");
         if (!Array.isArray(parsed) ||
@@ -348,7 +370,10 @@ var Amaterasu;
         const gamepad = parseGamepadProfileOverride(text("gamepad"), recognizedGamepadProfiles);
         const keyboard = parseInputBooleanOverride(text("keyboard"), "Keyboard input");
         const mouse = parseInputBooleanOverride(text("mouse"), "Mouse input");
-        const advancedInput = Object.fromEntries(Object.entries(parseAdvancedInputOverrides(data)).filter(([, value]) => value !== null));
+        const advancedInput = Object.fromEntries(Object.entries({
+            ...parseAdvancedInputOverrides(data),
+            ...parseSoftwareEncoderOverrides(data),
+        }).filter(([, value]) => value !== null));
         const refreshRateOption = parseRefreshRateOptionOverride(String(data.get("dd_refresh_rate_option") ?? ""));
         const prefer10BitSdr = parsePrefer10BitSdrOverride(String(data.get("prefer_10bit_sdr") ?? ""));
         const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
@@ -1714,6 +1739,53 @@ var Amaterasu;
         };
     }
     Amaterasu.advancedInputOverrideControls = advancedInputOverrideControls;
+    function softwareEncoderOverrideControls(current, global = false) {
+        const controls = new Map();
+        const fields = [];
+        for (const [key, label, fallback] of [
+            ["sw_preset", "Software H.264 preset", "superfast"],
+            ["sw_tune", "Software H.264 tune", "zerolatency"],
+        ]) {
+            const mode = Amaterasu.el("select");
+            mode.name = `${key}_mode`;
+            const inherited = Amaterasu.el("option", "", global ? `Default (${fallback})` : "Inherit");
+            inherited.value = "inherit";
+            const specified = Amaterasu.el("option", "", "Exact string (including empty)");
+            specified.value = "value";
+            mode.append(inherited, specified);
+            const stored = current?.[key];
+            mode.value = stored == null ? "inherit" : "value";
+            const value = Amaterasu.input(`${key}_value`, stored ?? "");
+            value.disabled = mode.value === "inherit";
+            mode.addEventListener("change", () => {
+                value.disabled = mode.value === "inherit";
+            });
+            controls.set(mode.name, mode);
+            controls.set(value.name, value);
+            fields.push(Amaterasu.field(label, mode, "Inherit the lower scope, or retain an exact software tuning string."), Amaterasu.field(`${label} exact value`, value, "Applied by the x264 software backend. Exact strings are validated by the installed codec at launch; hardware encoders preserve these fields without applying them."));
+        }
+        const backend = Amaterasu.el("select");
+        backend.name = "encoder_backend";
+        for (const [value, label] of [
+            ["", global ? "Trusted startup selection" : "Inherit"],
+            ["auto", "Automatic (registered hardware, then available x264)"],
+            ["software", "Software x264 (requires available backend)"],
+        ]) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = value;
+            backend.append(option);
+        }
+        backend.value = current?.encoder ?? "";
+        controls.set(backend.name, backend);
+        fields.push(Amaterasu.field("Encoder backend", backend, "Explicit software selection fails when x264 is unavailable. Automatic selection does not probe hardware or retry a failed hardware open."));
+        return {
+            fields,
+            read: () => Amaterasu.parseSoftwareEncoderOverrides({
+                get: (name) => controls.get(name)?.value ?? null,
+            }),
+        };
+    }
+    Amaterasu.softwareEncoderOverrideControls = softwareEncoderOverrideControls;
     function confirmAction(title, description, label) {
         return new Promise((resolve) => {
             const dialog = Amaterasu.el("dialog", "confirmation");
@@ -2313,8 +2385,9 @@ var Amaterasu;
             const keyboard = audioOverrideSelect("keyboard", row.entry.config_overrides?.keyboard);
             const mouse = audioOverrideSelect("mouse", row.entry.config_overrides?.mouse);
             const advancedInput = Amaterasu.advancedInputOverrideControls(row.entry.config_overrides);
+            const softwareEncoder = Amaterasu.softwareEncoderOverrideControls(row.entry.config_overrides);
             const refreshRateOptionFields = catalogRefreshRateOptionFields(row.entry.config_overrides?.dd_refresh_rate_option);
-            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields);
+            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields, ...softwareEncoder.fields);
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
             save.type = "submit";
@@ -2327,6 +2400,7 @@ var Amaterasu;
                 void Amaterasu.runAction(save, feedback, async () => {
                     const config_overrides = {
                         ...advancedInput.read(),
+                        ...softwareEncoder.read(),
                         ...Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
                         ...parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row.entry.config_overrides),
                         dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
@@ -2478,6 +2552,7 @@ var Amaterasu;
         const keyboard = audioOverrideSelect("keyboard", entry?.config_overrides?.keyboard);
         const mouse = audioOverrideSelect("mouse", entry?.config_overrides?.mouse);
         const advancedInput = Amaterasu.advancedInputOverrideControls(entry?.config_overrides);
+        const softwareEncoder = Amaterasu.softwareEncoderOverrideControls(entry?.config_overrides);
         const refreshRateOptionFields = catalogRefreshRateOptionFields(entry?.config_overrides?.dd_refresh_rate_option);
         const prefer10BitSdr = audioOverrideSelect("prefer_10bit_sdr", catalogPrefer10BitSdrOverrideValue(entry?.config_overrides?.prefer_10bit_sdr) ?? undefined);
         const steamId = Amaterasu.input("steam_id", entry?.steam_id ?? "");
@@ -2510,7 +2585,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields, steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields, ...softwareEncoder.fields, steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }
@@ -2898,6 +2973,40 @@ var Amaterasu;
         }
     }
     Amaterasu.RegisteredConfigurationLoadGate = RegisteredConfigurationLoadGate;
+    function parseSoftwareEncoderAvailability(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Invalid codec availability reply.");
+        const reply = value;
+        const software = reply.software_encoder;
+        if (reply.ok !== true || typeof reply.enabled !== "boolean" || !software ||
+            typeof software !== "object" || Array.isArray(software) ||
+            typeof software.available !== "boolean")
+            throw new Error("Invalid codec availability reply.");
+        const availability = software;
+        if (!reply.enabled)
+            return "The codec provider is disabled. Software x264 cannot be selected.";
+        if (availability.available) {
+            const isSoftwareIdentity = (entry) => {
+                if (!entry || typeof entry !== "object" || Array.isArray(entry))
+                    return false;
+                const descriptor = entry;
+                const identity = descriptor.identity;
+                return descriptor.hardware === false && identity !== null &&
+                    typeof identity === "object" && !Array.isArray(identity) &&
+                    identity.clsid === "amaterasu.software.x264";
+            };
+            if (!Array.isArray(reply.encoders) || !reply.encoders.some(isSoftwareIdentity))
+                throw new Error("Software availability lacks an actual encoder identity.");
+            return "Software x264 is available in the current codec runtime. Capture and client playback still require platform qualification.";
+        }
+        const reasons = {
+            x264_feature_disabled: "This build has the software-x264 feature disabled.",
+            x264_headers_unavailable: "This build lacked compatible x264 development headers.",
+            x264_runtime_unavailable: "A compatible x264 runtime library is unavailable.",
+        };
+        return `Software x264 is unavailable. ${reasons[String(availability.reason)] ?? "The codec provider did not report a qualified software backend."}`;
+    }
+    Amaterasu.parseSoftwareEncoderAvailability = parseSoftwareEncoderAvailability;
     function parseNvhttpSettingsReply(value) {
         if (value === null || typeof value !== "object" || Array.isArray(value))
             throw new Error("Moonlight host settings reply is invalid.");
@@ -2951,6 +3060,9 @@ var Amaterasu;
             configured_wgc_pacing_smoothing: values.wgc_pacing_smoothing,
             configured_global_preparation: normalizedPreparationSteps(values.global_preparation),
         });
+        for (const key of ["sw_preset", "sw_tune", "encoder"])
+            if (Object.prototype.hasOwnProperty.call(values, key))
+                expected[`configured_${key}`] = values[key];
         const confirms = (reply) => reply.revision === current.revision + 1 &&
             Object.entries(expected).every(([key, value]) => sameConfigurationValue(reply[key], value));
         const updated = parseNvhttpSettingsReply(await api.post("nvhttp/settings_update", {
@@ -3386,7 +3498,7 @@ var Amaterasu;
     }
     Amaterasu.parseClientFecOverride = parseClientFecOverride;
     const forwardablePairingOverrideFields = [
-        "fec_percentage", "stream_audio", "audio_sink", "virtual_sink",
+        "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "encoder",
         "audio_sink_capture_only", "back_button_timeout", "controller", "gamepad",
         "keyboard", "mouse", "native_pen_touch",
         "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
@@ -3415,6 +3527,12 @@ var Amaterasu;
         if (field === "audio_sink" || field === "virtual_sink")
             return typeof value === "string" && new TextEncoder().encode(value).length <= 4096 &&
                 !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+        if (field === "sw_preset" || field === "sw_tune")
+            return typeof value === "string" &&
+                new TextEncoder().encode(value).length <= (field === "sw_preset" ? 128 : 256) &&
+                !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+        if (field === "encoder")
+            return value === "auto" || value === "software";
         if (field === "gamepad")
             return typeof value === "string" && recognizedInputGamepadProfiles.includes(value);
         if (field === "frame_limiter_provider")
@@ -4711,6 +4829,7 @@ var Amaterasu;
                     const nativePenTouch = sparseInputOverrideSelect("native_pen_touch", client.config_overrides?.native_pen_touch);
                     nativePenTouch.setAttribute("aria-label", `Native pen/touch preference override for ${client.name}`);
                     const advancedInput = Amaterasu.advancedInputOverrideControls(client.config_overrides);
+                    const softwareEncoder = Amaterasu.softwareEncoderOverrideControls(client.config_overrides);
                     const streamAudio = Amaterasu.el("select");
                     streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
                     const audioChoices = [
@@ -4788,6 +4907,7 @@ var Amaterasu;
                         try {
                             const values = {
                                 ...advancedInput.read(),
+                                ...softwareEncoder.read(),
                                 ...parseClientFecOverride(fec.value),
                                 back_button_timeout: Amaterasu.parseBackButtonTimeoutOverride(backButtonTimeout.value),
                                 stream_audio: Amaterasu.parseStreamAudioOverride(streamAudio.value),
@@ -4820,9 +4940,9 @@ var Amaterasu;
                     if (unsupported.length > 0)
                         status.textContent = `Save unavailable: this client has stored overrides this editor cannot preserve (${unsupported.join(", ")}).`;
                     const identity = Amaterasu.el("div", "", Amaterasu.el("strong", "", client.name), Amaterasu.el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`));
-                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, Amaterasu.el("div", "form-grid", ...advancedInput.fields), Amaterasu.el("div", "", save, status)];
+                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, Amaterasu.el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields), Amaterasu.el("div", "", save, status)];
                 });
-                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "Keyboard and scrolling preferences", ""], rows);
+                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "Input and software encoding preferences", ""], rows);
                 pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save confirms the stored pairing revision. Input preferences apply when the next stream acquires its input lease."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
             }
             catch (error) {
@@ -5196,11 +5316,28 @@ var Amaterasu;
                 pingTimeout.max = "2147483647";
                 pingTimeout.step = "1";
                 pingTimeout.placeholder = "Default (10000)";
+                const softwareEncoder = Amaterasu.softwareEncoderOverrideControls({
+                    sw_preset: settings.configured_sw_preset,
+                    sw_tune: settings.configured_sw_tune,
+                    encoder: settings.configured_encoder,
+                }, true);
+                const softwareAvailability = Amaterasu.el("p", "muted", "Software x264 availability has not been checked.");
+                if (context.api.allows("media.read")) {
+                    try {
+                        const availability = parseSoftwareEncoderAvailability(await context.api.post("media/encoders"));
+                        if (!context.content.isConnected || !hostLoads.isCurrent(generation))
+                            return;
+                        softwareAvailability.textContent = availability;
+                    }
+                    catch {
+                        softwareAvailability.textContent = "Software x264 availability could not be checked. Explicit software launch requires a real available backend.";
+                    }
+                }
                 const status = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation, Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), ...(settings.rtsp_listener_error ? [Amaterasu.el("p", "error", settings.rtsp_listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(...softwareEncoder.fields, softwareAvailability, Amaterasu.el("p", "muted", `Effective software tuning: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}.`), Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation, Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), ...(settings.rtsp_listener_error ? [Amaterasu.el("p", "error", settings.rtsp_listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     if (!form.reportValidity())
@@ -5223,6 +5360,7 @@ var Amaterasu;
                             audio_sink_capture_only: audioSinkCaptureOnly.checked,
                             external_ip: parseExternalIp(externalIp.value),
                             wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),
+                            ...softwareEncoder.read(),
                             global_preparation: Amaterasu.parsePreparationSteps(globalPreparation.value),
                         };
                         hostLoads.invalidate();
