@@ -2,9 +2,13 @@ use crate::settings::ProductSettings;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(any(windows, test))]
 pub const MAX_GAMES: usize = 50_000;
+#[cfg(any(windows, test))]
 pub const MAX_CATEGORIES: usize = 4_096;
+#[cfg(any(windows, test))]
 pub const MAX_PLUGINS: usize = 4_096;
+#[cfg(any(windows, test))]
 pub const MAX_LINE_BYTES: usize = 1_048_576;
 pub const SOURCE_RECENT: u32 = 1 << 0;
 pub const SOURCE_CATEGORY: u32 = 1 << 1;
@@ -79,12 +83,14 @@ pub struct Snapshot {
 }
 
 #[derive(Default)]
+#[cfg(any(windows, test))]
 pub struct SnapshotAssembler {
     current: Option<IncompleteSnapshot>,
     connection_nonce: Option<String>,
 }
 
 #[derive(Default)]
+#[cfg(any(windows, test))]
 struct IncompleteSnapshot {
     nonce: Option<String>,
     request_id: Option<String>,
@@ -95,6 +101,7 @@ struct IncompleteSnapshot {
     invalid: bool,
 }
 
+#[cfg(any(windows, test))]
 impl SnapshotAssembler {
     pub fn for_connection(nonce: String) -> Self {
         Self {

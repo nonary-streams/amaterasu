@@ -6,21 +6,41 @@
 //! protect against a compromised Playnite process on the same host.
 
 use crate::discovery::ProcessImage;
-use crate::focus::{FocusPolicy, FocusRetry, FocusTarget};
-use crate::launch::{StopRequest, installation_roots, refresh_processes_for_install};
-use crate::snapshot::{Snapshot, SnapshotAssembler, valid_playnite_id};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use crate::focus::FocusPolicy;
+#[cfg(windows)]
+use crate::focus::FocusRetry;
+#[cfg(any(windows, test))]
+use crate::focus::FocusTarget;
+use crate::launch::StopRequest;
+#[cfg(windows)]
+use crate::launch::{installation_roots, refresh_processes_for_install};
+use crate::snapshot::Snapshot;
+#[cfg(windows)]
+use crate::snapshot::SnapshotAssembler;
+#[cfg(any(windows, test))]
+use crate::snapshot::valid_playnite_id;
+#[cfg(windows)]
+use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{Receiver, Sender};
 #[cfg(windows)]
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
+#[cfg(windows)]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
+#[cfg(windows)]
 const CONTROL_PIPE: &str = r"\\.\pipe\Sunshine.PlayniteExtension";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 pub(crate) const OBSERVE_TIMEOUT: Duration = CONNECT_TIMEOUT;
+#[cfg(windows)]
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
 const LAUNCH_START_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(windows)]
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(any(windows, test))]
 const MAX_STATUS_LINE_BYTES: usize = 8 * 1024;
 
 #[cfg(windows)]
@@ -31,6 +51,13 @@ fn fresh_connection_nonce() -> Result<String, String> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(any(windows, test)),
+    expect(
+        dead_code,
+        reason = "native status events are produced only by the Windows Playnite connector"
+    )
+)]
 pub(crate) enum FullscreenStatusKind {
     GameStarted,
     GameStopped,
@@ -46,6 +73,13 @@ pub(crate) struct FullscreenStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(any(windows, test)),
+    expect(
+        dead_code,
+        reason = "native status events are produced only by the Windows Playnite connector"
+    )
+)]
 pub(crate) enum FullscreenWatchEvent {
     Status {
         status: FullscreenStatus,
@@ -58,6 +92,13 @@ pub(crate) enum FullscreenWatchEvent {
 
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) enum FullscreenWatchCommand {
+    #[cfg_attr(
+        not(windows),
+        expect(
+            dead_code,
+            reason = "process updates are consumed by the Windows Playnite watcher"
+        )
+    )]
     UpdateProcesses(Vec<ProcessImage>),
     Cancel,
 }
@@ -1148,6 +1189,7 @@ fn send_command(
         .map_err(|_| "Playnite extension command timed out".to_owned())?
 }
 
+#[cfg(windows)]
 struct CommandResult {
     command: String,
     request_id: Option<String>,
@@ -1155,6 +1197,7 @@ struct CommandResult {
     success: bool,
 }
 
+#[cfg(windows)]
 fn parse_command_result(line: &[u8]) -> Option<CommandResult> {
     let message: serde_json::Value = serde_json::from_slice(line).ok()?;
     if message.get("type")?.as_str()? != "commandResult" {
@@ -1194,12 +1237,14 @@ fn extension_command_line_with_request(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(windows, test))]
 struct GameStatus {
     name: String,
     game_id: String,
     focus_target: FocusTarget,
 }
 
+#[cfg(any(windows, test))]
 fn parse_fullscreen_status(line: &[u8]) -> Option<FullscreenStatus> {
     let message: serde_json::Value = serde_json::from_slice(line).ok()?;
     if message["type"] != "status"
@@ -1242,6 +1287,7 @@ fn parse_fullscreen_status(line: &[u8]) -> Option<FullscreenStatus> {
     })
 }
 
+#[cfg(any(windows, test))]
 fn parse_game_status(line: &[u8]) -> Option<GameStatus> {
     let message: serde_json::Value = serde_json::from_slice(line).ok()?;
     if message["type"] != "status" {
@@ -1267,6 +1313,7 @@ fn parse_game_status(line: &[u8]) -> Option<GameStatus> {
     })
 }
 
+#[cfg(any(windows, test))]
 fn apply_game_status(
     name: &str,
     started: &mut bool,
@@ -1282,10 +1329,12 @@ fn apply_game_status(
     }
 }
 
+#[cfg(any(windows, test))]
 fn stop_signal_state(name: &str, stopping: bool, recovery: bool) -> Option<super::launch::State> {
     (name == "stopRequested" && stopping && !recovery).then_some(super::launch::State::Stopped)
 }
 
+#[cfg(any(windows, test))]
 fn state_after_start_failure(command_may_have_reached_extension: bool) -> super::launch::State {
     if command_may_have_reached_extension {
         super::launch::State::CleanupFailed

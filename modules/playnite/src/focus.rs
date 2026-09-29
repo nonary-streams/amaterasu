@@ -67,6 +67,7 @@ impl FocusTarget {
         target
     }
 
+    #[cfg(any(windows, test))]
     fn merge_nonempty(&mut self, update: Self) {
         if update.install_directory.is_some() {
             self.install_directory = update.install_directory;
@@ -80,6 +81,7 @@ impl FocusTarget {
         }
     }
 
+    #[cfg(any(windows, test))]
     fn matches_process_identity(&self, process_id: u32, creation_time: u64) -> bool {
         match (self.process_id, self.process_creation_time) {
             (Some(expected_id), Some(expected_time)) => {
@@ -153,6 +155,7 @@ impl FocusRetry {
         self.started_at = Some(now);
     }
 
+    #[cfg(any(windows, test))]
     pub fn observe_target(&mut self, update: FocusTarget) {
         if self.policy.active {
             self.target.merge_nonempty(update);
@@ -361,6 +364,7 @@ mod windows_focus {
     }
 }
 
+#[cfg(any(windows, test))]
 fn matches_image_path(image_path: &str, target: &FocusTarget) -> bool {
     let image_path = normalize_windows_path(image_path);
     if let Some(executable) = target.executable.as_deref() {
@@ -377,6 +381,7 @@ fn matches_image_path(image_path: &str, target: &FocusTarget) -> bool {
         })
 }
 
+#[cfg(any(windows, test))]
 fn normalize_windows_path(path: &str) -> String {
     path.replace('/', "\\")
         .trim_start_matches(r"\\?\")

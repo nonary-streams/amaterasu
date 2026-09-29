@@ -79,8 +79,10 @@ pub(crate) struct OwnedLeaseStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProviderError {
     Unavailable(&'static str),
+    #[cfg(any(windows, test))]
     ReadFailed(&'static str),
     /// The provider rejected the expected state before starting any writes.
+    #[cfg(any(windows, test))]
     PreconditionFailed(&'static str),
     VerifyFailed(&'static str),
 }
@@ -88,10 +90,9 @@ pub(crate) enum ProviderError {
 impl ProviderError {
     pub(crate) fn diagnostic(&self) -> &'static str {
         match self {
-            Self::Unavailable(code)
-            | Self::ReadFailed(code)
-            | Self::PreconditionFailed(code)
-            | Self::VerifyFailed(code) => code,
+            Self::Unavailable(code) | Self::VerifyFailed(code) => code,
+            #[cfg(any(windows, test))]
+            Self::ReadFailed(code) | Self::PreconditionFailed(code) => code,
         }
     }
 }
@@ -278,6 +279,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
                 .write_profile_verified(profile, before.profile, desired_profile)
         {
             return match error {
+                #[cfg(any(windows, test))]
                 ProviderError::PreconditionFailed(code) => {
                     self.discard_unmutated_pending_apply(record, code)
                 }
@@ -741,6 +743,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
         }
     }
 
+    #[cfg(any(windows, test))]
     fn discard_unmutated_pending_apply(
         &mut self,
         lease: LeaseRecord,
@@ -1521,6 +1524,7 @@ mod tests {
         })
     }
 
+    #[cfg(windows)]
     fn runtime_apply_request() -> serde_json::Value {
         serde_json::json!({
             "action": "apply",

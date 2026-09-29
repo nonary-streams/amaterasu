@@ -3,6 +3,7 @@ mod backend;
 mod controller;
 mod model;
 mod native;
+#[cfg(any(windows, test))]
 mod staging;
 mod worker;
 

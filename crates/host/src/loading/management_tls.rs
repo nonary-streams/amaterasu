@@ -118,6 +118,7 @@ pub(crate) fn validate_file_name(name: &str, role: &str) -> PackageResult<()> {
     Ok(())
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn active_file_names(config: &RuntimeConfig) -> PackageResult<Option<[String; 2]>> {
     let Some(settings) = config.settings.get(MANAGEMENT_COMPONENT) else {
         return Ok(None);

@@ -1070,7 +1070,7 @@ mod tests {
     fn fullscreen_process(process_id: u32) -> ProcessImage {
         ProcessImage {
             process_id,
-            path: r"C:\Playnite\Playnite.FullscreenApp.exe".into(),
+            path: "C:/Playnite/Playnite.FullscreenApp.exe".into(),
             creation_time: u64::from(process_id),
         }
     }
@@ -1078,7 +1078,7 @@ mod tests {
     fn launch_process(process_id: u32) -> ProcessImage {
         ProcessImage {
             process_id,
-            path: r"C:\Playnite\Playnite.DesktopApp.exe".into(),
+            path: "C:/Playnite/Playnite.DesktopApp.exe".into(),
             creation_time: u64::from(process_id),
         }
     }
@@ -1086,7 +1086,7 @@ mod tests {
     fn extension_process(process_id: u32, creation_time: u64) -> ProcessImage {
         ProcessImage {
             process_id,
-            path: r"C:\Playnite\Playnite.DesktopApp.exe".into(),
+            path: "C:/Playnite/Playnite.DesktopApp.exe".into(),
             creation_time,
         }
     }
@@ -1224,7 +1224,7 @@ mod tests {
                 Some(installation()),
                 &[ProcessImage {
                     process_id: 99,
-                    path: r"D:\Other\Playnite.DesktopApp.exe".into(),
+                    path: "D:/Other/Playnite.DesktopApp.exe".into(),
                     creation_time: 99,
                 }],
                 FocusPolicy::disabled(),
@@ -1340,7 +1340,7 @@ mod tests {
         let ticket = started["ticket"].as_str().unwrap().to_owned();
         let launcher = [ProcessImage {
             process_id: 77,
-            path: r"C:\Playnite\Playnite.DesktopApp.exe".into(),
+            path: "C:/Playnite/Playnite.DesktopApp.exe".into(),
             creation_time: 77,
         }];
         sessions.advance(now + START_TIMEOUT, &launcher);
@@ -1500,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn status_before_discovery_still_stops_the_ticket_owned_fullscreen_process() {
+    fn status_before_discovery_tracks_the_ticket_owned_fullscreen_process_during_stop() {
         let now = Instant::now();
         let mut sessions = FullscreenSessions::default();
         let ticket = sessions.start_with(
@@ -1552,6 +1552,8 @@ mod tests {
             sessions.by_ticket[&ticket].fullscreen_process,
             Some(discovered_fullscreen.clone())
         );
+        #[cfg(not(windows))]
+        assert_eq!(sessions.status(&ticket)["state"], "cleanup_failed");
         sessions.advance_with_scanner(
             now + Duration::from_secs(5),
             &[extension],
@@ -1560,7 +1562,14 @@ mod tests {
             |_| true,
             |_| panic!("stopped tickets cannot relaunch"),
         );
+        #[cfg(windows)]
         assert_eq!(sessions.status(&ticket)["state"], "stopped");
+        #[cfg(not(windows))]
+        {
+            // The unsupported close backend must retain ownership after a failed request.
+            assert_eq!(sessions.status(&ticket)["state"], "cleanup_failed");
+            assert_eq!(sessions.active_count(), 1);
+        }
     }
 
     #[test]
@@ -2341,7 +2350,7 @@ mod tests {
         );
         let reused_fullscreen = ProcessImage {
             process_id: 80,
-            path: r"C:\Playnite\Playnite.FullscreenApp.exe".into(),
+            path: "C:/Playnite/Playnite.FullscreenApp.exe".into(),
             creation_time: 800,
         };
         sessions.advance_with(
@@ -2496,12 +2505,12 @@ mod tests {
         session.fullscreen_process = None;
         session.launch_baseline = vec![ProcessImage {
             process_id: 95,
-            path: r"C:\Playnite\Playnite.FullscreenApp.exe".into(),
+            path: "C:/Playnite/Playnite.FullscreenApp.exe".into(),
             creation_time: 95,
         }];
         let reused_candidate = ProcessImage {
             process_id: 95,
-            path: r"C:\Playnite\Playnite.FullscreenApp.exe".into(),
+            path: "C:/Playnite/Playnite.FullscreenApp.exe".into(),
             creation_time: 950,
         };
         reused_pid.advance_with_scanner(

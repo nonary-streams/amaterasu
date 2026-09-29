@@ -1043,19 +1043,19 @@ mod tests {
             assert_eq!(serde_json::to_value(override_value).unwrap(), one_override);
         }
 
-        let mut override_json = json!({
+        let override_json = json!({
             "frame_limiter_fps_limit":0.0,
             "frame_limiter_enable":false,
             "frame_limiter_provider":"auto"
         });
         #[cfg(windows)]
-        {
+        let override_json = {
+            let mut override_json = override_json;
             override_json["frame_limiter_disable_vsync"] = json!(false);
             override_json["frame_limiter_auto_virtual_framegen"] = json!("enabled");
             override_json["rtss_frame_limit_type"] = json!("async");
-        }
-        #[cfg(target_os = "linux")]
-        {}
+            override_json
+        };
 
         let selected: ClientConfigOverrides =
             serde_json::from_value(override_json.clone()).unwrap();

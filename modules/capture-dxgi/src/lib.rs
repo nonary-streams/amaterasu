@@ -5,6 +5,7 @@ mod controller;
 mod cursor;
 mod model;
 mod native;
+#[cfg(any(windows, test))]
 mod staging;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};

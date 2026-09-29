@@ -12,6 +12,7 @@ pub struct Installation {
 }
 
 impl Installation {
+    #[cfg(any(windows, test))]
     fn from_associated_executable(path: &Path) -> Option<Self> {
         let path_text = path.to_string_lossy();
         if path_text.len() > 32_768
@@ -279,17 +280,19 @@ impl Installation {
         self.processes_with_exact_image(&self.fullscreen_executable.to_string_lossy())
     }
 
+    #[cfg(windows)]
     fn expected_fullscreen_path(&self) -> &Path {
         &self.fullscreen_executable
     }
 
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
+        // Forward separators keep synthetic installation paths parseable on every test host.
         Self {
-            launch_executable: PathBuf::from(r"C:\Playnite\Playnite.DesktopApp.exe"),
+            launch_executable: PathBuf::from("C:/Playnite/Playnite.DesktopApp.exe"),
             launch_with_fullscreen_argument: true,
-            fullscreen_executable: PathBuf::from(r"C:\Playnite\Playnite.FullscreenApp.exe"),
-            install_directory: PathBuf::from(r"C:\Playnite"),
+            fullscreen_executable: PathBuf::from("C:/Playnite/Playnite.FullscreenApp.exe"),
+            install_directory: PathBuf::from("C:/Playnite"),
         }
     }
 }
@@ -320,12 +323,15 @@ fn normalized_path(path: &str) -> String {
 
 // Win32 ERROR_NO_MORE_FILES. It is the only failed Toolhelp call that proves
 // the process snapshot ended normally rather than being incomplete.
+#[cfg(any(windows, test))]
 const TOOLHELP_ERROR_NO_MORE_FILES: u32 = 18;
 
+#[cfg(any(windows, test))]
 fn process_enumeration_step_is_complete(found_entry: bool, last_error: u32) -> bool {
     found_entry || last_error == TOOLHELP_ERROR_NO_MORE_FILES
 }
 
+#[cfg(any(windows, test))]
 fn close_target_matches(
     expected_path: &str,
     expected_process_id: u32,
@@ -639,18 +645,18 @@ mod tests {
 
     #[test]
     fn running_playnite_processes_must_match_the_associated_installation() {
-        let directory = PathBuf::from(r"C:\Users\player\AppData\Local\Playnite");
+        let directory = PathBuf::from("C:/Users/player/AppData/Local/Playnite");
         assert!(same_installation(
             &directory,
-            &PathBuf::from(r"C:\Users\player\AppData\Local\Playnite\Playnite.DesktopApp.exe")
+            &PathBuf::from("C:/Users/player/AppData/Local/Playnite/Playnite.DesktopApp.exe")
         ));
         assert!(!same_installation(
             &directory,
-            &PathBuf::from(r"D:\Other\Playnite\Playnite.DesktopApp.exe")
+            &PathBuf::from("D:/Other/Playnite/Playnite.DesktopApp.exe")
         ));
         assert!(!same_installation(
             &directory,
-            &PathBuf::from(r"C:\Users\player\AppData\Local\Playnite\cmd.exe")
+            &PathBuf::from("C:/Users/player/AppData/Local/Playnite/cmd.exe")
         ));
     }
 
@@ -660,18 +666,18 @@ mod tests {
         assert!(installation.matches_running_processes(&[]));
         assert!(installation.matches_running_processes(&[ProcessImage {
             process_id: 12,
-            path: r"C:\Playnite\Playnite.DesktopApp.exe".into(),
+            path: "C:/Playnite/Playnite.DesktopApp.exe".into(),
             creation_time: 12,
         }]));
         assert!(!installation.matches_running_processes(&[
             ProcessImage {
                 process_id: 12,
-                path: r"C:\Playnite\Playnite.DesktopApp.exe".into(),
+                path: "C:/Playnite/Playnite.DesktopApp.exe".into(),
                 creation_time: 12,
             },
             ProcessImage {
                 process_id: 13,
-                path: r"D:\Playnite\Playnite.FullscreenApp.exe".into(),
+                path: "D:/Playnite/Playnite.FullscreenApp.exe".into(),
                 creation_time: 13,
             }
         ]));
@@ -679,7 +685,7 @@ mod tests {
             installation
                 .fullscreen_processes(&[ProcessImage {
                     process_id: 13,
-                    path: r"D:\Playnite\Playnite.FullscreenApp.exe".into(),
+                    path: "D:/Playnite/Playnite.FullscreenApp.exe".into(),
                     creation_time: 13,
                 }])
                 .len(),
