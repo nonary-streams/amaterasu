@@ -40,7 +40,7 @@ fn disabled_default_never_allocates_or_records_input() {
             "ok": true, "fixture": true, "enabled": false, "active": false,
             "acquired": 0, "renewed": 0, "released": 0, "expired": 0,
             "events": [], "events_truncated": false,
-            "held_keys": 0, "held_buttons": 0,
+            "held_keys": 0, "held_buttons": 0, "requested_policy": null,
         })
     );
 }
@@ -250,4 +250,71 @@ fn validation_is_atomic_and_recording_is_bounded() {
     let metrics = controller.metrics(now);
     assert_eq!(metrics["events"].as_array().unwrap().len(), 256);
     assert_eq!(metrics["events_truncated"], true);
+}
+
+#[test]
+fn scoped_policy_is_observable_and_bound_to_the_acquisition_operation() {
+    let now = Instant::now();
+    let mut controller = Controller::new(true);
+    let request = json!({"action":"acquire", "operation_id":"scoped-policy", "ttl_ms":1000,
+        "high_resolution_scrolling":false, "always_send_scancodes":false,
+        "key_rightalt_to_key_win":true, "key_repeat_delay":0, "key_repeat_frequency":0.0});
+    let acquired = controller.handle("owner", operation(request.clone()), now);
+    assert_eq!(acquired["ok"], true);
+    let snapshot = controller.metrics(now)["requested_policy"].clone();
+    for key in [
+        "high_resolution_scrolling",
+        "always_send_scancodes",
+        "key_rightalt_to_key_win",
+        "key_repeat_delay",
+        "key_repeat_frequency",
+    ] {
+        assert_eq!(snapshot[key], request[key]);
+    }
+    assert!(snapshot["keyboard"].is_null());
+    let retry = controller.handle("owner", operation(request.clone()), now);
+    assert_eq!(lease(&retry), lease(&acquired));
+    let mut changed = request;
+    changed["key_repeat_delay"] = json!(null);
+    assert_eq!(
+        error_code(&controller.handle("owner", operation(changed), now)),
+        Some("operation_conflict")
+    );
+    let mut invalid = json!({"action":"acquire", "key_repeat_frequency":-0.1});
+    assert_eq!(
+        error_code(&controller.handle("other", operation(invalid.clone()), now)),
+        Some("invalid_request")
+    );
+    invalid["key_repeat_frequency"] = json!(null);
+    invalid["key_repeat_delay"] = json!(2147483648_u64);
+    assert_eq!(
+        error_code(&controller.handle("other", operation(invalid), now)),
+        Some("invalid_request")
+    );
+}
+
+#[test]
+fn invalid_gamepad_profiles_never_allocate_or_replace_the_observed_policy() {
+    let now = Instant::now();
+    let mut controller = Controller::new(true);
+    for profile in ["unknown-profile".to_owned(), "x".repeat(20_000)] {
+        let rejected = controller.handle(
+            "owner",
+            operation(json!({"action":"acquire", "gamepad":profile})),
+            now,
+        );
+        assert_eq!(error_code(&rejected), Some("invalid_request"));
+        assert_eq!(controller.metrics(now)["acquired"], 0);
+        assert!(controller.metrics(now)["requested_policy"].is_null());
+    }
+    let acquired = controller.handle(
+        "owner",
+        operation(json!({"action":"acquire", "gamepad":"auto"})),
+        now,
+    );
+    assert_eq!(acquired["ok"], true);
+    assert_eq!(
+        controller.metrics(now)["requested_policy"]["gamepad"],
+        "auto"
+    );
 }

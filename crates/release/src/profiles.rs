@@ -661,6 +661,38 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
     ],
 };
 
+// The signed synthetic composition uses the real management authority and API.
+// Its source and input dependencies are fixtures; the call grants remain the
+// same as the platform component's grants.
+const MANAGEMENT_PROBE: ComponentDefinition = ComponentDefinition {
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.authentication",
+        "amaterasu.state",
+        "amaterasu.catalog",
+        "amaterasu.configuration",
+        "amaterasu.session",
+        "amaterasu.application",
+        "amaterasu.input-probe",
+        "amaterasu.steam",
+        "amaterasu.playnite",
+        "amaterasu.lutris",
+        "amaterasu.diagnostics",
+        "amaterasu.host-configuration",
+        "amaterasu.pairing",
+        "amaterasu.display",
+        "amaterasu.launch",
+        "amaterasu.stream-source",
+        "amaterasu.audio-encode",
+        "amaterasu.nvhttp",
+        "amaterasu.rtsp",
+        "amaterasu.media-transport",
+        "amaterasu.control-transport",
+        "amaterasu.session-history",
+    ],
+    ..MANAGEMENT
+};
+
 impl PackageProfile {
     pub fn components(self) -> &'static [ComponentDefinition] {
         match self {
@@ -683,11 +715,15 @@ impl PackageProfile {
                 CONFIGURATION,
                 CATALOG,
                 APPLICATION,
+                HOST_CONFIGURATION,
+                DIAGNOSTICS,
                 STEAM,
                 PLAYNITE,
                 LUTRIS,
                 LAUNCH,
                 DISPLAY,
+                AUTHENTICATION,
+                MANAGEMENT_PROBE,
                 PAIRING,
                 NVHTTP,
                 SESSION,

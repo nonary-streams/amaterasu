@@ -18,6 +18,30 @@ pub enum Operation {
         operation_id: Option<String>,
         #[serde(default)]
         ttl_ms: Option<u64>,
+        #[serde(default)]
+        back_button_timeout: Option<i32>,
+        #[serde(default)]
+        controller: Option<bool>,
+        #[serde(default)]
+        gamepad: Option<String>,
+        #[serde(default)]
+        ds4_back_as_touchpad_click: Option<bool>,
+        #[serde(default)]
+        native_pen_touch: Option<bool>,
+        #[serde(default)]
+        keyboard: Option<bool>,
+        #[serde(default)]
+        mouse: Option<bool>,
+        #[serde(default)]
+        high_resolution_scrolling: Option<bool>,
+        #[serde(default)]
+        always_send_scancodes: Option<bool>,
+        #[serde(default)]
+        key_rightalt_to_key_win: Option<bool>,
+        #[serde(default)]
+        key_repeat_delay: Option<u32>,
+        #[serde(default)]
+        key_repeat_frequency: Option<f64>,
     },
     Lookup {
         operation_id: String,
@@ -34,6 +58,80 @@ pub enum Operation {
     Release {
         lease: String,
     },
+}
+
+/// Requested lease policy recorded by this synthetic provider. This is evidence
+/// of contract transport only; no operating-system behavior is emulated.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RequestedPolicy {
+    pub back_button_timeout: Option<i32>,
+    pub controller: Option<bool>,
+    pub gamepad: Option<String>,
+    pub ds4_back_as_touchpad_click: Option<bool>,
+    pub native_pen_touch: Option<bool>,
+    pub keyboard: Option<bool>,
+    pub mouse: Option<bool>,
+    pub high_resolution_scrolling: Option<bool>,
+    pub always_send_scancodes: Option<bool>,
+    pub key_rightalt_to_key_win: Option<bool>,
+    pub key_repeat_delay: Option<u32>,
+    pub key_repeat_frequency: Option<f64>,
+}
+
+impl RequestedPolicy {
+    pub fn validate(&self) -> FixtureResult<()> {
+        if self
+            .gamepad
+            .as_deref()
+            .is_some_and(|profile| !valid_gamepad_profile(profile))
+        {
+            return Err(FixtureError::new(
+                "invalid_request",
+                "invalid synthetic input gamepad profile",
+            ));
+        }
+        if self
+            .key_repeat_delay
+            .is_some_and(|delay| delay > i32::MAX as u32)
+            || self
+                .key_repeat_frequency
+                .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
+        {
+            return Err(FixtureError::new(
+                "invalid_request",
+                "invalid synthetic input repeat policy",
+            ));
+        }
+        Ok(())
+    }
+}
+
+// Match the input contract's target-specific recognized choices. This fixture
+// records the choice without asserting native availability for any profile.
+fn valid_gamepad_profile(profile: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            profile,
+            "auto"
+                | "x360"
+                | "vhf"
+                | "vhf_xbox"
+                | "vhf_xbox_one"
+                | "vhf_ds4"
+                | "vhf_ds5"
+                | "vhf_switch"
+                | "ds4"
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(profile, "auto" | "xone" | "ds4" | "ds5" | "switch")
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        profile == "auto"
+    }
 }
 
 impl Operation {

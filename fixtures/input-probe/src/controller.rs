@@ -1,6 +1,6 @@
 use crate::model::{
-    Event, FixtureError, FixtureResult, HeldInput, MAX_BATCH_EVENTS, Operation, lease_duration,
-    validate_operation_id,
+    Event, FixtureError, FixtureResult, HeldInput, MAX_BATCH_EVENTS, Operation, RequestedPolicy,
+    lease_duration, validate_operation_id,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -17,6 +17,7 @@ struct Lease {
     token: String,
     operation_id: Option<String>,
     acquire_ttl_ms: u64,
+    requested_policy: RequestedPolicy,
     expires: Instant,
     held: Vec<HeldInput>,
 }
@@ -46,6 +47,7 @@ impl TerminalReason {
 
 struct OperationRecord {
     requested_ttl_ms: u64,
+    requested_policy: RequestedPolicy,
     state: RecordState,
 }
 
@@ -85,7 +87,38 @@ impl Controller {
             Operation::Acquire {
                 operation_id,
                 ttl_ms,
-            } => self.acquire(owner, operation_id, ttl_ms, now),
+                back_button_timeout,
+                controller,
+                gamepad,
+                ds4_back_as_touchpad_click,
+                native_pen_touch,
+                keyboard,
+                mouse,
+                high_resolution_scrolling,
+                always_send_scancodes,
+                key_rightalt_to_key_win,
+                key_repeat_delay,
+                key_repeat_frequency,
+            } => self.acquire(
+                owner,
+                operation_id,
+                ttl_ms,
+                RequestedPolicy {
+                    back_button_timeout,
+                    controller,
+                    gamepad,
+                    ds4_back_as_touchpad_click,
+                    native_pen_touch,
+                    keyboard,
+                    mouse,
+                    high_resolution_scrolling,
+                    always_send_scancodes,
+                    key_rightalt_to_key_win,
+                    key_repeat_delay,
+                    key_repeat_frequency,
+                },
+                now,
+            ),
             Operation::Lookup { operation_id } => self.lookup(owner, &operation_id, now),
             Operation::Renew { lease, ttl_ms } => self.renew(owner, &lease, ttl_ms, now),
             Operation::Batch { lease, events } => self.batch(owner, &lease, events),
@@ -122,6 +155,7 @@ impl Controller {
             "events_truncated": self.events_truncated,
             "held_keys": held_keys,
             "held_buttons": held_buttons,
+            "requested_policy": self.lease.as_ref().map(|lease| &lease.requested_policy),
         })
     }
 
@@ -150,8 +184,10 @@ impl Controller {
         owner: &str,
         operation_id: Option<String>,
         ttl_ms: Option<u64>,
+        requested_policy: RequestedPolicy,
         now: Instant,
     ) -> FixtureResult<Value> {
+        requested_policy.validate()?;
         if !self.enabled {
             return Err(FixtureError::new(
                 "injection_disabled",
@@ -163,10 +199,12 @@ impl Controller {
             validate_operation_id(operation_id)?;
             let key = (owner.to_owned(), operation_id.to_owned());
             if let Some(record) = self.operations.get(&key) {
-                if record.requested_ttl_ms != duration {
+                if record.requested_ttl_ms != duration
+                    || record.requested_policy != requested_policy
+                {
                     return Err(FixtureError::new(
                         "operation_conflict",
-                        "operation_id was already used with a different lease duration",
+                        "operation_id was already used with a different lease duration or input policy",
                     ));
                 }
                 return self.operation_response(owner, operation_id, now);
@@ -197,6 +235,7 @@ impl Controller {
             token: token.clone(),
             operation_id: operation_id.clone(),
             acquire_ttl_ms: duration,
+            requested_policy: requested_policy.clone(),
             expires: now + Duration::from_millis(duration),
             held: Vec::new(),
         });
@@ -205,6 +244,7 @@ impl Controller {
                 (owner.to_owned(), operation_id.clone()),
                 OperationRecord {
                     requested_ttl_ms: duration,
+                    requested_policy,
                     state: RecordState::Active,
                 },
             );

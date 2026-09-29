@@ -61,6 +61,46 @@ fn management_loads_after_its_nvhttp_settings_provider() {
 }
 
 #[test]
+fn stream_probe_uses_real_management_authority_with_synthetic_dependencies() {
+    let components = PackageProfile::StreamProbe.components();
+    let management = components
+        .iter()
+        .find(|component| component.id == MANAGEMENT.id)
+        .unwrap();
+    assert_eq!(management.library, MANAGEMENT.library);
+    assert_eq!(management.calls, MANAGEMENT.calls);
+    assert_eq!(
+        serde_json::to_value(management.grants()).unwrap(),
+        serde_json::to_value(MANAGEMENT.grants()).unwrap()
+    );
+    for dependency in [
+        AUTHENTICATION.id,
+        HOST_CONFIGURATION.id,
+        DIAGNOSTICS.id,
+        INPUT_PROBE.id,
+        STREAM_SOURCE.id,
+        NVHTTP.id,
+    ] {
+        assert!(management.dependencies.contains(&dependency));
+        assert!(
+            components
+                .iter()
+                .any(|component| component.id == dependency)
+        );
+    }
+    for dependency in [
+        INPUT.id,
+        VIDEO.id,
+        AUDIO.id,
+        CAPTURE_DXGI.id,
+        CAPTURE_WGC.id,
+        ENCODE.id,
+    ] {
+        assert!(!management.dependencies.contains(&dependency));
+    }
+}
+
+#[test]
 fn signed_platform_grants_preserve_display_and_launch_parent_authority() {
     let policy = installer_policy("__WEB__", BTreeMap::new());
     let display = "amaterasu.display/1";
@@ -406,7 +446,7 @@ fn platform_registers_host_configuration_with_runtime_and_state_dependencies() {
     );
     let stream_probe = PackageProfile::StreamProbe.components();
     assert!(
-        !stream_probe
+        stream_probe
             .iter()
             .any(|component| component.id == HOST_CONFIGURATION.id)
     );
