@@ -161,3 +161,16 @@ Trusted per-session discovery and launch for machine services and cross-user
 import remain open.
 Behavior was checked against the pinned Vibeshine Lutris policy and database
 contract; source code was not copied or translated.
+
+`python scripts/test_lutris_launch_workflow.py` qualifies the signed Linux
+provider-to-launch composition using a temporary current-user database and
+controlled native client. Its explicit child environment leaves the desktop's
+HOME, XDG data and PATH unchanged; its only listener is ephemeral loopback
+management HTTP. It checks the imported canonical executable and URI argv,
+durable disable rejection before and after restart, launch retry identity,
+owned stop and exclusive app-lease reacquisition. Retained pidfds verify client
+exit and clean up an injected assertion abort while an unrelated child survives.
+Removing the imported client rejects launch even if a verified system fallback
+keeps provider availability true; the fixture freezes automatic scans so that
+fallback cannot replace its imported target. Actual Lutris/Wine/Flatpak game
+delivery, desktop integration and cross-user service discovery remain unqualified.

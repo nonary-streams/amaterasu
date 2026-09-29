@@ -18,11 +18,11 @@ from test_platform_modules import PlatformHarness
 
 
 class Console:
-    def __init__(self, harness: PlatformHarness):
+    def __init__(self, harness: PlatformHarness, *, environment: dict[str, str] | None = None):
         self.process = subprocess.Popen(
             [str(harness.host), "serve", str(harness.root)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1,
+            text=True, bufsize=1, env=environment,
         )
         self.replies = queue.Queue()
         self.errors = []
