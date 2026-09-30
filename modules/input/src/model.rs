@@ -46,6 +46,12 @@ pub enum Operation {
         #[serde(default)]
         ds4_back_as_touchpad_click: Option<bool>,
         #[serde(default)]
+        motion_as_ds4: Option<bool>,
+        #[serde(default)]
+        touchpad_as_ds4: Option<bool>,
+        #[serde(default)]
+        ds5_inputtino_randomize_mac: Option<bool>,
+        #[serde(default)]
         native_pen_touch: Option<bool>,
         #[serde(default)]
         keyboard: Option<bool>,
@@ -175,6 +181,37 @@ pub enum PenTouchPhase {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ControllerMotionType {
+    Accel,
+    Gyro,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerBatteryState {
+    Unknown,
+    NotPresent,
+    Charging,
+    Discharging,
+    NotCharging,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerTouchPhase {
+    Hover,
+    Down,
+    Up,
+    Move,
+    Cancel,
+    ButtonOnly,
+    HoverLeave,
+    CancelAll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PenTool {
     Unknown,
     Pen,
@@ -273,6 +310,34 @@ pub enum Event {
         right_x: i16,
         right_y: i16,
     },
+    ControllerArrival {
+        number: u16,
+        controller_type: u8,
+        capabilities: u32,
+        supported_buttons: u32,
+    },
+    ControllerTouch {
+        number: u16,
+        touchpad_index: u8,
+        pointer_id: u32,
+        phase: ControllerTouchPhase,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    },
+    ControllerMotion {
+        number: u16,
+        motion_type: ControllerMotionType,
+        x: f32,
+        y: f32,
+        z: f32,
+    },
+    ControllerBattery {
+        number: u16,
+        state: ControllerBatteryState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        percentage: Option<u8>,
+    },
 }
 impl Event {
     pub fn enabled_by(&self, policy: DevicePolicy) -> bool {
@@ -286,7 +351,11 @@ impl Event {
             Self::PenTouch { .. } => true,
             // Route controller records through the backend capability check;
             // unsupported native backends reject the batch before it is applied.
-            Self::Controller { .. } => true,
+            Self::Controller { .. }
+            | Self::ControllerArrival { .. }
+            | Self::ControllerTouch { .. }
+            | Self::ControllerMotion { .. }
+            | Self::ControllerBattery { .. } => true,
         }
     }
 
@@ -328,6 +397,45 @@ impl Event {
             Self::Controller { number, .. } if *number >= 16 => Err(InputError::new(
                 "invalid_event",
                 "controller number must be in the range 0..16",
+            )),
+            Self::ControllerArrival { number, .. }
+            | Self::ControllerTouch { number, .. }
+            | Self::ControllerMotion { number, .. }
+            | Self::ControllerBattery { number, .. }
+                if *number >= 16 =>
+            {
+                Err(InputError::new(
+                    "invalid_event",
+                    "controller number must be in the range 0..16",
+                ))
+            }
+            Self::ControllerTouch { touchpad_index, .. } if *touchpad_index > 1 => Err(
+                InputError::new("invalid_event", "controller touchpad index must be 0 or 1"),
+            ),
+            Self::ControllerTouch { x, y, pressure, .. }
+                if [*x, *y, *pressure]
+                    .into_iter()
+                    .any(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) =>
+            {
+                Err(InputError::new(
+                    "invalid_event",
+                    "controller touch coordinates and pressure must be finite and normalized to 0..1",
+                ))
+            }
+            Self::ControllerMotion { x, y, z, .. }
+                if [*x, *y, *z].into_iter().any(|value| !value.is_finite()) =>
+            {
+                Err(InputError::new(
+                    "invalid_event",
+                    "controller motion components must be finite",
+                ))
+            }
+            Self::ControllerBattery {
+                percentage: Some(percentage),
+                ..
+            } if *percentage > 100 => Err(InputError::new(
+                "invalid_event",
+                "controller battery percentage must be in the range 0..100",
             )),
             Self::PenTouch { .. } => validate_pen_touch(self),
             _ => Ok(()),
@@ -705,6 +813,8 @@ mod tests {
             "always_send_scancodes":false,
             "key_rightalt_to_key_win":true,
             "ds4_back_as_touchpad_click":false,
+            "motion_as_ds4":true,
+            "touchpad_as_ds4":true,
             "native_pen_touch":false,
             "key_repeat_delay":0,
             "key_repeat_frequency":0.0
@@ -911,6 +1021,81 @@ mod tests {
         .unwrap();
 
         assert_eq!(event.validate().unwrap_err().code, "invalid_event");
+    }
+
+    #[test]
+    fn controller_auxiliary_events_preserve_arrival_touch_motion_and_battery_fields() {
+        let arrival = json!({
+            "kind":"controller_arrival",
+            "number":2,
+            "controller_type":3,
+            "capabilities":0x1234,
+            "supported_buttons":0x89abcdefu32,
+        });
+        let arrival_event: Event = serde_json::from_value(arrival.clone()).unwrap();
+        arrival_event.validate().unwrap();
+        assert_eq!(serde_json::to_value(arrival_event).unwrap(), arrival);
+
+        let touch = json!({
+            "kind":"controller_touch",
+            "number":2,
+            "touchpad_index":1,
+            "pointer_id":27,
+            "phase":"down",
+            "x":0.25,
+            "y":0.75,
+            "pressure":0.5,
+        });
+        let touch_event: Event = serde_json::from_value(touch.clone()).unwrap();
+        touch_event.validate().unwrap();
+        assert_eq!(serde_json::to_value(touch_event).unwrap(), touch);
+
+        let motion = json!({
+            "kind":"controller_motion",
+            "number":2,
+            "motion_type":"gyro",
+            "x":-1.25,
+            "y":0.0,
+            "z":9.80665,
+        });
+        let motion_event: Event = serde_json::from_value(motion.clone()).unwrap();
+        motion_event.validate().unwrap();
+        let round_tripped: Event =
+            serde_json::from_value(serde_json::to_value(&motion_event).unwrap()).unwrap();
+        assert_eq!(round_tripped, motion_event);
+
+        let battery = json!({
+            "kind":"controller_battery",
+            "number":2,
+            "state":"charging"
+        });
+        let battery_event: Event = serde_json::from_value(battery.clone()).unwrap();
+        battery_event.validate().unwrap();
+        assert_eq!(serde_json::to_value(battery_event).unwrap(), battery);
+    }
+
+    #[test]
+    fn controller_auxiliary_events_reject_invalid_numbers_coordinates_and_samples() {
+        for event in [
+            json!({
+                "kind":"controller_arrival", "number":16, "controller_type":0,
+                "capabilities":0, "supported_buttons":0
+            }),
+            json!({
+                "kind":"controller_touch", "number":0, "touchpad_index":2,
+                "pointer_id":1, "phase":"down", "x":0.5, "y":0.5, "pressure":1.0
+            }),
+            json!({
+                "kind":"controller_touch", "number":0, "touchpad_index":0,
+                "pointer_id":1, "phase":"down", "x":1.5, "y":0.5, "pressure":1.0
+            }),
+            json!({
+                "kind":"controller_battery", "number":0, "state":"full", "percentage":101
+            }),
+        ] {
+            let event: Event = serde_json::from_value(event).unwrap();
+            assert_eq!(event.validate().unwrap_err().code, "invalid_event");
+        }
     }
 
     #[test]

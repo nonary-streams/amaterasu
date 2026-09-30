@@ -81,7 +81,7 @@ fn absent_product_document_uses_enabled_bootstrap_defaults() {
     assert_eq!(policy, InputPolicy::default());
     assert_eq!(
         policy.values(),
-        json!({"keyboard":true,"mouse":true,"controller":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true,"native_pen_touch":true,"keybindings":[16,160,17,162,18,164]})
+        json!({"keyboard":true,"mouse":true,"controller":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true,"motion_as_ds4":true,"touchpad_as_ds4":true,"proton_dualsense_compatibility":true,"ds5_inputtino_randomize_mac":true,"native_pen_touch":true,"keybindings":[16,160,17,162,18,164]})
     );
     assert_eq!(revision, 0);
 }
@@ -360,7 +360,7 @@ fn product_v3_reads_scancode_policy_and_defaults_a_missing_field_on() {
 #[test]
 fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
     for document in [
-        json!({"ok":true,"found":true,"version":12,"revision":1,"values":{"keyboard":true,"mouse":true}}),
+        json!({"ok":true,"found":true,"version":15,"revision":1,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":9,"revision":1,"values":{"keyboard":true,"mouse":true,"native_pen_touch":false}}),
         json!({"ok":true,"found":true,"version":10,"revision":1,"values":{"keyboard":true,"mouse":true,"native_pen_touch":"false"}}),
         json!({"ok":true,"found":true,"version":10,"revision":1,"values":{"keyboard":true,"mouse":true,"unexpected":true}}),
@@ -390,7 +390,7 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
 }
 
 #[test]
-fn update_requires_current_revision_and_sends_whole_v11_document() {
+fn update_requires_current_revision_and_sends_whole_v14_document() {
     let mut settings = ProductSettings::new();
     settings.ready = true;
     settings.revision = 4;
@@ -451,23 +451,53 @@ fn update_requires_current_revision_and_sends_whole_v11_document() {
         &json!({
             "action":"product_update",
             "expected_revision":4,
-            "version":11,
-            "values":{"keyboard":false,"mouse":false,"controller":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true,"native_pen_touch":true,"keybindings":[16,160,17,162,18,164]},
+            "version":14,
+            "values":{"keyboard":false,"mouse":false,"controller":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true,"motion_as_ds4":true,"touchpad_as_ds4":true,"proton_dualsense_compatibility":true,"ds5_inputtino_randomize_mac":true,"native_pen_touch":true,"keybindings":[16,160,17,162,18,164]},
         })
     );
 }
 
 #[test]
-fn v11_update_serializes_an_explicitly_disabled_native_pen_touch_setting() {
+fn v14_update_serializes_controller_proton_and_random_mac_preferences() {
     let policy = InputPolicy {
-        native_pen_touch: false,
+        motion_as_ds4: false,
+        touchpad_as_ds4: false,
+        ds5_inputtino_randomize_mac: false,
         ..InputPolicy::default()
     };
 
     let payload = policy.update_payload(12);
 
-    assert_eq!(payload["version"], 11);
-    assert_eq!(payload["values"]["native_pen_touch"], false);
+    assert_eq!(payload["version"], 14);
+    assert_eq!(payload["values"]["motion_as_ds4"], false);
+    assert_eq!(payload["values"]["touchpad_as_ds4"], false);
+    assert_eq!(payload["values"]["proton_dualsense_compatibility"], true);
+    assert_eq!(payload["values"]["ds5_inputtino_randomize_mac"], false);
+}
+
+#[test]
+fn v12_documents_migrate_proton_compatibility_to_its_enabled_default() {
+    let old = json!({
+        "ok":true,
+        "found":true,
+        "version":12,
+        "revision":9,
+        "values":InputPolicy::default().values(),
+    });
+    let mut values = old["values"].as_object().unwrap().clone();
+    values.remove("proton_dualsense_compatibility");
+    values.remove("ds5_inputtino_randomize_mac");
+    let (policy, revision) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":12,
+        "revision":9,
+        "values":values,
+    }))
+    .unwrap();
+    assert_eq!(revision, 9);
+    assert!(policy.proton_dualsense_compatibility);
+    assert!(policy.ds5_inputtino_randomize_mac);
 }
 
 #[test]
@@ -503,10 +533,10 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     let Call::Submit { payload, .. } = &settings.pending.as_ref().unwrap().call else {
         panic!("legacy settings update was not submitted");
     };
-    assert_eq!(payload["version"], 11);
+    assert_eq!(payload["version"], 14);
     assert_eq!(
         payload["values"],
-        json!({"keyboard":false,"mouse":true,"controller":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0,"back_button_timeout":-1,"gamepad":selected_supported_profile().as_str(),"ds4_back_as_touchpad_click":false,"native_pen_touch":false,"keybindings":[16,160,17,162,18,164]})
+        json!({"keyboard":false,"mouse":true,"controller":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0,"back_button_timeout":-1,"gamepad":selected_supported_profile().as_str(),"ds4_back_as_touchpad_click":false,"motion_as_ds4":true,"touchpad_as_ds4":true,"proton_dualsense_compatibility":true,"ds5_inputtino_randomize_mac":true,"native_pen_touch":false,"keybindings":[16,160,17,162,18,164]})
     );
     assert!(
         !settings
@@ -613,6 +643,10 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
         back_button_timeout: 1_250,
         gamepad: selected_supported_profile(),
         ds4_back_as_touchpad_click: false,
+        motion_as_ds4: true,
+        touchpad_as_ds4: true,
+        proton_dualsense_compatibility: true,
+        ds5_inputtino_randomize_mac: true,
         native_pen_touch: false,
         keybindings: KeyBindings::default(),
     };
@@ -830,6 +864,9 @@ fn native_release_failure_reports_saved_policy_as_pending() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -924,7 +961,7 @@ fn legacy_documents_keep_saved_values_and_default_only_the_new_keybindings() {
         assert_eq!(policy.keybindings, KeyBindings::default());
         assert_eq!(revision, 19);
         let updated = policy.update_payload(revision);
-        assert_eq!(updated["version"], 11);
+        assert_eq!(updated["version"], 14);
         assert_eq!(updated["values"]["keyboard"], false);
         assert_eq!(updated["values"]["mouse"], false);
         assert_eq!(
@@ -1002,7 +1039,7 @@ fn keybinding_write_uses_cas_and_verified_readback_before_applying_or_completing
     let mut script = Script::new([
         Response::Accepted { id: 51 },
         Response::Result {
-            payload: json!({"ok":true,"found":true,"version":11,
+            payload: json!({"ok":true,"found":true,"version":14,
             "revision":8,"values":desired.values()}),
         },
         Response::Ok,
@@ -1027,7 +1064,7 @@ fn keybinding_write_uses_cas_and_verified_readback_before_applying_or_completing
         panic!("missing write");
     };
     assert_eq!(write["expected_revision"], 7);
-    assert_eq!(write["version"], 11);
+    assert_eq!(write["version"], 14);
     assert_eq!(write["values"]["keybindings"], json!([]));
     let Command::Complete {
         request: 71,
@@ -1050,7 +1087,7 @@ fn keybinding_write_uses_cas_and_verified_readback_before_applying_or_completing
     let mut load = Script::new([
         Response::Accepted { id: 61 },
         Response::Result {
-            payload: json!({"ok":true,"found":true,"version":11,
+            payload: json!({"ok":true,"found":true,"version":14,
             "revision":8,"values":settings.policy.values()}),
         },
         Response::Ok,
@@ -1091,7 +1128,7 @@ fn reordered_keybinding_readback_is_reconciled_and_never_reported_as_the_attempt
                 desired: desired.clone(),
             },
             ChildOutcome::Payload(
-                json!({"ok":true,"found":true,"version":11,"revision":8,"values":actual.values()}),
+                json!({"ok":true,"found":true,"version":14,"revision":8,"values":actual.values()}),
             ),
         )
         .unwrap();
@@ -1111,7 +1148,7 @@ fn reordered_keybinding_readback_is_reconciled_and_never_reported_as_the_attempt
                 desired,
             },
             ChildOutcome::Payload(
-                json!({"ok":true,"found":true,"version":11,"revision":8,"values":actual.values()}),
+                json!({"ok":true,"found":true,"version":14,"revision":8,"values":actual.values()}),
             ),
         )
         .unwrap();

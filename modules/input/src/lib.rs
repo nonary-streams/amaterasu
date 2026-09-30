@@ -76,6 +76,14 @@ enum SettingsOperation {
         #[serde(default)]
         ds4_back_as_touchpad_click: Option<bool>,
         #[serde(default)]
+        motion_as_ds4: Option<bool>,
+        #[serde(default)]
+        touchpad_as_ds4: Option<bool>,
+        #[serde(default)]
+        proton_dualsense_compatibility: Option<bool>,
+        #[serde(default)]
+        ds5_inputtino_randomize_mac: Option<bool>,
+        #[serde(default)]
         native_pen_touch: Option<bool>,
         expected_revision: u64,
     },
@@ -207,7 +215,7 @@ impl InputModule {
         if let Some(action) = request.payload.get("action").and_then(Value::as_str)
             && matches!(action, "settings_get" | "settings_update")
         {
-            if request.caller != "amaterasu.management" {
+            if !authorized_settings_operation(&request.caller, action) {
                 return self.complete(
                     request.id,
                     InputError::new(
@@ -239,6 +247,10 @@ impl InputModule {
                     back_button_timeout,
                     gamepad,
                     ds4_back_as_touchpad_click,
+                    motion_as_ds4,
+                    touchpad_as_ds4,
+                    proton_dualsense_compatibility,
+                    ds5_inputtino_randomize_mac,
                     native_pen_touch,
                     expected_revision,
                 }) => {
@@ -262,6 +274,10 @@ impl InputModule {
                         back_button_timeout,
                         gamepad,
                         ds4_back_as_touchpad_click,
+                        motion_as_ds4,
+                        touchpad_as_ds4,
+                        proton_dualsense_compatibility,
+                        ds5_inputtino_randomize_mac,
                         native_pen_touch,
                     });
                     match self.product_settings.begin_update(
@@ -369,6 +385,10 @@ fn is_read_only_input(payload: &Value) -> bool {
     )
 }
 
+fn authorized_settings_operation(caller: &str, action: &str) -> bool {
+    caller == "amaterasu.management" || (caller == "amaterasu.nvhttp" && action == "settings_get")
+}
+
 fn should_defer_settings_request(
     product_settings: &ProductSettings,
     service: &str,
@@ -408,6 +428,26 @@ mod tests {
             &settings,
             SERVICE,
             &json!({"action":"status"}),
+        ));
+    }
+
+    #[test]
+    fn nvhttp_can_only_read_global_input_settings_for_launch_resolution() {
+        assert!(authorized_settings_operation(
+            "amaterasu.nvhttp",
+            "settings_get"
+        ));
+        assert!(!authorized_settings_operation(
+            "amaterasu.nvhttp",
+            "settings_update"
+        ));
+        assert!(!authorized_settings_operation(
+            "untrusted.caller",
+            "settings_get"
+        ));
+        assert!(authorized_settings_operation(
+            "amaterasu.management",
+            "settings_update"
         ));
     }
 
@@ -471,6 +511,8 @@ mod tests {
             "high_resolution_scrolling":false,
             "always_send_scancodes":false,
             "key_rightalt_to_key_win":false,
+            "proton_dualsense_compatibility":false,
+            "ds5_inputtino_randomize_mac":false,
             "key_repeat_delay":250,
             "key_repeat_frequency":30.5,
             "back_button_timeout":-1,
@@ -486,6 +528,8 @@ mod tests {
                 high_resolution_scrolling: Some(false),
                 always_send_scancodes: Some(false),
                 key_rightalt_to_key_win: Some(false),
+                proton_dualsense_compatibility: Some(false),
+                ds5_inputtino_randomize_mac: Some(false),
                 key_repeat_delay: Some(250),
                 key_repeat_frequency: Some(30.5),
                 back_button_timeout: Some(-1),

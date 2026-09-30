@@ -51,6 +51,9 @@ pub trait Backend {
     fn set_back_button_timeout(&mut self, _timeout_ms: i32) {}
     fn set_gamepad_profile(&mut self, _profile: GamepadProfile) {}
     fn set_ds4_back_as_touchpad_click(&mut self, _enabled: bool) {}
+    fn set_motion_as_ds4(&mut self, _enabled: bool) {}
+    fn set_touchpad_as_ds4(&mut self, _enabled: bool) {}
+    fn set_ds5_inputtino_randomize_mac(&mut self, _enabled: bool) {}
     /// Releases and removes owned virtual controller slots without stopping
     /// keyboard or pointer injection for the current lease.
     fn disable_controller_input(&mut self) -> InputResult<()> {

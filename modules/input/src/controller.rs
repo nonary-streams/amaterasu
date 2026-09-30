@@ -1,9 +1,9 @@
 use crate::backend::Backend;
 use crate::gamepad_profile::GamepadProfile;
 use crate::model::{
-    DevicePolicy, Event, InputError, InputResult, KeyEncoding, KeyState, MAX_EVENTS,
-    MAX_PEN_TOUCH_CONTACTS, MAX_PRESSED, Operation, PenTouchDevice, PenTouchPhase, Pressed,
-    is_temporary_modifier, lease_duration, repeat_modifiers, validate_operation_id,
+    ControllerTouchPhase, DevicePolicy, Event, InputError, InputResult, KeyEncoding, KeyState,
+    MAX_EVENTS, MAX_PEN_TOUCH_CONTACTS, MAX_PRESSED, Operation, PenTouchDevice, PenTouchPhase,
+    Pressed, is_temporary_modifier, lease_duration, repeat_modifiers, validate_operation_id,
 };
 use amaterasu_input_policy::KeyBindings;
 use serde_json::{Value, json};
@@ -20,6 +20,17 @@ const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
 const DEFAULT_KEY_REPEAT_FREQUENCY_HZ: f64 = 24.9;
 const DEFAULT_BACK_BUTTON_TIMEOUT_MS: i32 = -1;
 
+fn is_controller_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Controller { .. }
+            | Event::ControllerArrival { .. }
+            | Event::ControllerTouch { .. }
+            | Event::ControllerMotion { .. }
+            | Event::ControllerBattery { .. }
+    )
+}
+
 struct AcquireRequest {
     operation_id: Option<String>,
     ttl_ms: Option<u64>,
@@ -27,6 +38,9 @@ struct AcquireRequest {
     controller: Option<bool>,
     gamepad: Option<GamepadProfile>,
     ds4_back_as_touchpad_click: Option<bool>,
+    motion_as_ds4: Option<bool>,
+    touchpad_as_ds4: Option<bool>,
+    ds5_inputtino_randomize_mac: Option<bool>,
     native_pen_touch: Option<bool>,
     keyboard: Option<bool>,
     mouse: Option<bool>,
@@ -50,6 +64,12 @@ struct Lease {
     requested_gamepad: Option<GamepadProfile>,
     requested_ds4_back_as_touchpad_click: Option<bool>,
     ds4_back_as_touchpad_click: bool,
+    requested_motion_as_ds4: Option<bool>,
+    motion_as_ds4: bool,
+    requested_touchpad_as_ds4: Option<bool>,
+    touchpad_as_ds4: bool,
+    requested_ds5_inputtino_randomize_mac: Option<bool>,
+    ds5_inputtino_randomize_mac: bool,
     requested_native_pen_touch: Option<bool>,
     native_pen_touch: bool,
     requested_keyboard: Option<bool>,
@@ -74,6 +94,9 @@ struct TerminalAcquire {
     requested_controller: Option<bool>,
     requested_gamepad: Option<GamepadProfile>,
     requested_ds4_back_as_touchpad_click: Option<bool>,
+    requested_motion_as_ds4: Option<bool>,
+    requested_touchpad_as_ds4: Option<bool>,
+    requested_ds5_inputtino_randomize_mac: Option<bool>,
     requested_native_pen_touch: Option<bool>,
     native_pen_touch: bool,
     requested_keyboard: Option<bool>,
@@ -100,6 +123,42 @@ struct ActivePenTouch {
     pointer_id: u32,
     last_event: Event,
     last_move: Option<Event>,
+}
+
+struct ActiveControllerTouch {
+    number: u16,
+    touchpad_index: u8,
+    pointer_id: u32,
+    last_event: Event,
+}
+
+impl ActiveControllerTouch {
+    fn new(event: &Event) -> Self {
+        let Event::ControllerTouch {
+            number,
+            touchpad_index,
+            pointer_id,
+            ..
+        } = event
+        else {
+            unreachable!("controller touch contacts are created from controller touch events")
+        };
+        Self {
+            number: *number,
+            touchpad_index: *touchpad_index,
+            pointer_id: *pointer_id,
+            last_event: event.clone(),
+        }
+    }
+
+    fn cancel_event(&self) -> Event {
+        let mut event = self.last_event.clone();
+        let Event::ControllerTouch { phase, .. } = &mut event else {
+            unreachable!("controller touch contacts retain controller touch events")
+        };
+        *phase = ControllerTouchPhase::Cancel;
+        event
+    }
 }
 
 impl ActivePenTouch {
@@ -141,6 +200,9 @@ pub struct Controller<B: Backend> {
     back_button_timeout_ms: i32,
     gamepad_profile: GamepadProfile,
     ds4_back_as_touchpad_click: bool,
+    motion_as_ds4: bool,
+    touchpad_as_ds4: bool,
+    ds5_inputtino_randomize_mac: bool,
     native_pen_touch: bool,
     controller_enabled: bool,
     controller_cleanup_pending: bool,
@@ -153,12 +215,14 @@ pub struct Controller<B: Backend> {
     pressed: Vec<Pressed>,
     // Pen and touch contacts have independent pointer identities and cancel paths.
     pen_touch_contacts: Vec<ActivePenTouch>,
+    controller_touch_contacts: Vec<ActiveControllerTouch>,
     retry_at: Instant,
     terminal_acquires: VecDeque<TerminalAcquire>,
 }
 impl<B: Backend> Controller<B> {
     pub fn new(mut backend: B, enabled: bool) -> Self {
         backend.set_keybindings(&KeyBindings::default());
+        backend.set_ds5_inputtino_randomize_mac(true);
         Self {
             backend,
             enabled,
@@ -172,6 +236,9 @@ impl<B: Backend> Controller<B> {
             back_button_timeout_ms: DEFAULT_BACK_BUTTON_TIMEOUT_MS,
             gamepad_profile: GamepadProfile::Auto,
             ds4_back_as_touchpad_click: true,
+            motion_as_ds4: true,
+            touchpad_as_ds4: true,
+            ds5_inputtino_randomize_mac: true,
             native_pen_touch: true,
             controller_enabled: true,
             controller_cleanup_pending: false,
@@ -182,6 +249,7 @@ impl<B: Backend> Controller<B> {
             lease: None,
             pressed: Vec::new(),
             pen_touch_contacts: Vec::new(),
+            controller_touch_contacts: Vec::new(),
             retry_at: Instant::now(),
             terminal_acquires: VecDeque::new(),
         }
@@ -203,6 +271,9 @@ impl<B: Backend> Controller<B> {
                 controller,
                 gamepad,
                 ds4_back_as_touchpad_click,
+                motion_as_ds4,
+                touchpad_as_ds4,
+                ds5_inputtino_randomize_mac,
                 native_pen_touch,
                 keyboard,
                 mouse,
@@ -221,6 +292,9 @@ impl<B: Backend> Controller<B> {
                     controller,
                     gamepad,
                     ds4_back_as_touchpad_click,
+                    motion_as_ds4,
+                    touchpad_as_ds4,
+                    ds5_inputtino_randomize_mac,
                     native_pen_touch,
                     keyboard,
                     mouse,
@@ -460,6 +534,66 @@ impl<B: Backend> Controller<B> {
         }
     }
 
+    pub fn motion_as_ds4(&self) -> bool {
+        self.motion_as_ds4
+    }
+
+    pub fn set_motion_as_ds4(&mut self, enabled: bool) {
+        let previous = self.effective_motion_as_ds4();
+        self.motion_as_ds4 = enabled;
+        let effective = self.effective_motion_as_ds4();
+        if previous != effective {
+            self.backend.set_motion_as_ds4(effective);
+        }
+    }
+
+    fn effective_motion_as_ds4(&self) -> bool {
+        self.lease
+            .as_ref()
+            .map(|lease| lease.motion_as_ds4)
+            .unwrap_or(self.motion_as_ds4)
+    }
+
+    pub fn touchpad_as_ds4(&self) -> bool {
+        self.touchpad_as_ds4
+    }
+
+    pub fn set_touchpad_as_ds4(&mut self, enabled: bool) {
+        let previous = self.effective_touchpad_as_ds4();
+        self.touchpad_as_ds4 = enabled;
+        let effective = self.effective_touchpad_as_ds4();
+        if previous != effective {
+            self.backend.set_touchpad_as_ds4(effective);
+        }
+    }
+
+    fn effective_touchpad_as_ds4(&self) -> bool {
+        self.lease
+            .as_ref()
+            .map(|lease| lease.touchpad_as_ds4)
+            .unwrap_or(self.touchpad_as_ds4)
+    }
+
+    pub fn ds5_inputtino_randomize_mac(&self) -> bool {
+        self.ds5_inputtino_randomize_mac
+    }
+
+    pub fn set_ds5_inputtino_randomize_mac(&mut self, enabled: bool) {
+        let previous = self.effective_ds5_inputtino_randomize_mac();
+        self.ds5_inputtino_randomize_mac = enabled;
+        let effective = self.effective_ds5_inputtino_randomize_mac();
+        if previous != effective {
+            self.backend.set_ds5_inputtino_randomize_mac(effective);
+        }
+    }
+
+    fn effective_ds5_inputtino_randomize_mac(&self) -> bool {
+        self.lease
+            .as_ref()
+            .map(|lease| lease.ds5_inputtino_randomize_mac)
+            .unwrap_or(self.ds5_inputtino_randomize_mac)
+    }
+
     pub fn native_pen_touch(&self) -> bool {
         self.native_pen_touch
     }
@@ -605,6 +739,9 @@ impl<B: Backend> Controller<B> {
             controller: requested_controller,
             gamepad: requested_gamepad,
             ds4_back_as_touchpad_click: requested_ds4_back_as_touchpad_click,
+            motion_as_ds4: requested_motion_as_ds4,
+            touchpad_as_ds4: requested_touchpad_as_ds4,
+            ds5_inputtino_randomize_mac: requested_ds5_inputtino_randomize_mac,
             native_pen_touch: requested_native_pen_touch,
             keyboard: requested_keyboard,
             mouse: requested_mouse,
@@ -635,6 +772,10 @@ impl<B: Backend> Controller<B> {
                     || lease.requested_gamepad != requested_gamepad
                     || lease.requested_ds4_back_as_touchpad_click
                         != requested_ds4_back_as_touchpad_click
+                    || lease.requested_motion_as_ds4 != requested_motion_as_ds4
+                    || lease.requested_touchpad_as_ds4 != requested_touchpad_as_ds4
+                    || lease.requested_ds5_inputtino_randomize_mac
+                        != requested_ds5_inputtino_randomize_mac
                     || lease.requested_native_pen_touch != requested_native_pen_touch
                     || lease.requested_keyboard != requested_keyboard
                     || lease.requested_mouse != requested_mouse
@@ -661,6 +802,10 @@ impl<B: Backend> Controller<B> {
                     || terminal.requested_gamepad != requested_gamepad
                     || terminal.requested_ds4_back_as_touchpad_click
                         != requested_ds4_back_as_touchpad_click
+                    || terminal.requested_motion_as_ds4 != requested_motion_as_ds4
+                    || terminal.requested_touchpad_as_ds4 != requested_touchpad_as_ds4
+                    || terminal.requested_ds5_inputtino_randomize_mac
+                        != requested_ds5_inputtino_randomize_mac
                     || terminal.requested_native_pen_touch != requested_native_pen_touch
                     || terminal.requested_keyboard != requested_keyboard
                     || terminal.requested_mouse != requested_mouse
@@ -719,6 +864,10 @@ impl<B: Backend> Controller<B> {
         let gamepad_profile = requested_gamepad.unwrap_or(self.gamepad_profile);
         let ds4_back_as_touchpad_click =
             requested_ds4_back_as_touchpad_click.unwrap_or(self.ds4_back_as_touchpad_click);
+        let motion_as_ds4 = requested_motion_as_ds4.unwrap_or(self.motion_as_ds4);
+        let touchpad_as_ds4 = requested_touchpad_as_ds4.unwrap_or(self.touchpad_as_ds4);
+        let ds5_inputtino_randomize_mac =
+            requested_ds5_inputtino_randomize_mac.unwrap_or(self.ds5_inputtino_randomize_mac);
         let native_pen_touch = requested_native_pen_touch.unwrap_or(self.native_pen_touch);
         let high_resolution_scrolling =
             requested_high_resolution_scrolling.unwrap_or(self.high_resolution_scrolling);
@@ -733,6 +882,10 @@ impl<B: Backend> Controller<B> {
         self.backend.set_gamepad_profile(gamepad_profile);
         self.backend
             .set_ds4_back_as_touchpad_click(ds4_back_as_touchpad_click);
+        self.backend.set_motion_as_ds4(motion_as_ds4);
+        self.backend.set_touchpad_as_ds4(touchpad_as_ds4);
+        self.backend
+            .set_ds5_inputtino_randomize_mac(ds5_inputtino_randomize_mac);
         self.backend
             .set_always_send_scancodes(always_send_scancodes);
         self.backend
@@ -747,6 +900,10 @@ impl<B: Backend> Controller<B> {
             self.backend.set_gamepad_profile(self.gamepad_profile);
             self.backend
                 .set_ds4_back_as_touchpad_click(self.ds4_back_as_touchpad_click);
+            self.backend.set_motion_as_ds4(self.motion_as_ds4);
+            self.backend.set_touchpad_as_ds4(self.touchpad_as_ds4);
+            self.backend
+                .set_ds5_inputtino_randomize_mac(self.ds5_inputtino_randomize_mac);
             self.backend
                 .set_always_send_scancodes(self.always_send_scancodes);
             self.backend
@@ -767,6 +924,12 @@ impl<B: Backend> Controller<B> {
             requested_gamepad,
             requested_ds4_back_as_touchpad_click,
             requested_native_pen_touch,
+            requested_motion_as_ds4,
+            motion_as_ds4,
+            requested_touchpad_as_ds4,
+            touchpad_as_ds4,
+            requested_ds5_inputtino_randomize_mac,
+            ds5_inputtino_randomize_mac,
             native_pen_touch,
             requested_keyboard,
             requested_mouse,
@@ -882,9 +1045,7 @@ impl<B: Backend> Controller<B> {
                 }
             });
             if let Err(error) = result {
-                if matches!(event, Event::Controller { .. })
-                    && error.code == "controller_unavailable"
-                {
+                if is_controller_event(event) && error.code == "controller_unavailable" {
                     // Keep the active lease and let its owner decide whether to
                     // drop this gamepad packet. The backend retains any virtual
                     // device whose neutral release or destroy still needs retry.
@@ -916,6 +1077,11 @@ impl<B: Backend> Controller<B> {
             .iter()
             .map(|contact| (contact.device, contact.pointer_id))
             .collect::<Vec<_>>();
+        let mut controller_touch_contacts = self
+            .controller_touch_contacts
+            .iter()
+            .map(|contact| (contact.number, contact.touchpad_index, contact.pointer_id))
+            .collect::<Vec<_>>();
         let mut key_encoding = self.lease.as_ref().and_then(|lease| lease.key_encoding);
         for event in events {
             event.validate()?;
@@ -929,6 +1095,60 @@ impl<B: Backend> Controller<B> {
                 ));
             }
             self.backend.validate(event)?;
+            if let Event::ControllerTouch {
+                number,
+                touchpad_index,
+                pointer_id,
+                phase,
+                ..
+            } = event
+            {
+                let identity = (*number, *touchpad_index, *pointer_id);
+                let held_index = controller_touch_contacts
+                    .iter()
+                    .position(|held| *held == identity);
+                match phase {
+                    ControllerTouchPhase::Down => {
+                        if held_index.is_some() {
+                            return Err(InputError::new(
+                                "invalid_sequence",
+                                "controller touch down duplicates a pointer already owned by this lease",
+                            ));
+                        }
+                        if controller_touch_contacts.len() >= MAX_PEN_TOUCH_CONTACTS {
+                            return Err(InputError::new(
+                                "resource_exhausted",
+                                "at most 16 controller touch contacts may be held",
+                            ));
+                        }
+                        controller_touch_contacts.push(identity);
+                    }
+                    ControllerTouchPhase::Move if held_index.is_none() => {
+                        return Err(InputError::new(
+                            "invalid_sequence",
+                            "controller touch move requires a pointer held by this lease",
+                        ));
+                    }
+                    ControllerTouchPhase::Up | ControllerTouchPhase::Cancel => {
+                        let Some(held_index) = held_index else {
+                            return Err(InputError::new(
+                                "invalid_sequence",
+                                "controller touch terminal event requires a pointer held by this lease",
+                            ));
+                        };
+                        controller_touch_contacts.remove(held_index);
+                    }
+                    ControllerTouchPhase::Move
+                    | ControllerTouchPhase::Hover
+                    | ControllerTouchPhase::ButtonOnly
+                    | ControllerTouchPhase::HoverLeave => {}
+                    ControllerTouchPhase::CancelAll => {
+                        controller_touch_contacts.retain(|(held_number, held_touchpad, _)| {
+                            held_number != number || held_touchpad != touchpad_index
+                        })
+                    }
+                }
+            }
             if let Event::PenTouch {
                 pointer_id,
                 device,
@@ -1127,6 +1347,67 @@ impl<B: Backend> Controller<B> {
             }
             return Ok(());
         }
+        if let Event::ControllerTouch {
+            number,
+            touchpad_index,
+            pointer_id,
+            phase,
+            ..
+        } = event
+        {
+            let identity = (*number, *touchpad_index, *pointer_id);
+            let contact_index = self.controller_touch_contacts.iter().position(|contact| {
+                (contact.number, contact.touchpad_index, contact.pointer_id) == identity
+            });
+            match phase {
+                ControllerTouchPhase::Down => {
+                    if contact_index.is_some() {
+                        return Err(InputError::new(
+                            "invalid_sequence",
+                            "controller touch down duplicates a pointer already owned by this lease",
+                        ));
+                    }
+                    self.controller_touch_contacts
+                        .push(ActiveControllerTouch::new(event));
+                }
+                ControllerTouchPhase::Move => {
+                    let Some(index) = contact_index else {
+                        return Err(InputError::new(
+                            "invalid_sequence",
+                            "controller touch move requires a pointer held by this lease",
+                        ));
+                    };
+                    self.controller_touch_contacts[index].last_event = event.clone();
+                }
+                ControllerTouchPhase::Up | ControllerTouchPhase::Cancel => {
+                    let Some(index) = contact_index else {
+                        return Err(InputError::new(
+                            "invalid_sequence",
+                            "controller touch terminal event requires a pointer held by this lease",
+                        ));
+                    };
+                    self.controller_touch_contacts[index].last_event = event.clone();
+                }
+                ControllerTouchPhase::Hover
+                | ControllerTouchPhase::ButtonOnly
+                | ControllerTouchPhase::HoverLeave
+                | ControllerTouchPhase::CancelAll => {}
+            }
+            self.backend.inject(event)?;
+            if matches!(
+                phase,
+                ControllerTouchPhase::Up | ControllerTouchPhase::Cancel
+            ) {
+                self.controller_touch_contacts.retain(|contact| {
+                    (contact.number, contact.touchpad_index, contact.pointer_id) != identity
+                });
+            } else if matches!(phase, ControllerTouchPhase::CancelAll) {
+                self.controller_touch_contacts.retain(|contact| {
+                    contact.number != *number || contact.touchpad_index != *touchpad_index
+                });
+            }
+            return Ok(());
+        }
         if let Event::Key { key, .. } = event
             && let Some(lease) = &mut self.lease
         {
@@ -1179,7 +1460,11 @@ impl<B: Backend> Controller<B> {
         event.enabled_by(policy)
             && match event {
                 Event::PenTouch { .. } => self.effective_native_pen_touch(),
-                Event::Controller { .. } => {
+                Event::Controller { .. }
+                | Event::ControllerArrival { .. }
+                | Event::ControllerTouch { .. }
+                | Event::ControllerMotion { .. }
+                | Event::ControllerBattery { .. } => {
                     self.effective_controller_enabled() && !self.controller_cleanup_pending
                 }
                 _ => true,
@@ -1308,6 +1593,20 @@ impl<B: Backend> Controller<B> {
         failure
     }
 
+    fn cancel_controller_touch_contacts(&mut self) -> Option<InputError> {
+        let mut failure = None;
+        for index in (0..self.controller_touch_contacts.len()).rev() {
+            let cancel_event = self.controller_touch_contacts[index].cancel_event();
+            match self.backend.inject(&cancel_event) {
+                Ok(()) => {
+                    self.controller_touch_contacts.remove(index);
+                }
+                Err(error) => failure = Some(error),
+            }
+        }
+        failure
+    }
+
     fn finish_lease(&mut self, now: Instant, reason: &'static str) -> InputResult<()> {
         self.repeating_key = None;
         if let Some(lease) = &mut self.lease {
@@ -1325,6 +1624,9 @@ impl<B: Backend> Controller<B> {
             }
         }
         if let Some(error) = self.cancel_pen_touch_contacts() {
+            failure = Some(error);
+        }
+        if let Some(error) = self.cancel_controller_touch_contacts() {
             failure = Some(error);
         }
         if let Some(error) = failure {
@@ -1349,6 +1651,10 @@ impl<B: Backend> Controller<B> {
         self.backend.set_gamepad_profile(self.gamepad_profile);
         self.backend
             .set_ds4_back_as_touchpad_click(self.ds4_back_as_touchpad_click);
+        self.backend.set_motion_as_ds4(self.motion_as_ds4);
+        self.backend.set_touchpad_as_ds4(self.touchpad_as_ds4);
+        self.backend
+            .set_ds5_inputtino_randomize_mac(self.ds5_inputtino_randomize_mac);
         self.backend
             .set_always_send_scancodes(self.always_send_scancodes);
         self.backend
@@ -1369,6 +1675,9 @@ impl<B: Backend> Controller<B> {
                 requested_controller: lease.requested_controller,
                 requested_gamepad: lease.requested_gamepad,
                 requested_ds4_back_as_touchpad_click: lease.requested_ds4_back_as_touchpad_click,
+                requested_motion_as_ds4: lease.requested_motion_as_ds4,
+                requested_touchpad_as_ds4: lease.requested_touchpad_as_ds4,
+                requested_ds5_inputtino_randomize_mac: lease.requested_ds5_inputtino_randomize_mac,
                 requested_native_pen_touch: lease.requested_native_pen_touch,
                 native_pen_touch: lease.native_pen_touch,
                 requested_keyboard: lease.requested_keyboard,
@@ -1410,12 +1719,15 @@ impl<B: Backend> Controller<B> {
                 "key_repeat_frequency":lease.requested_key_repeat_frequency.unwrap_or(self.key_repeat_frequency_hz),
                 "gamepad_profile":lease.gamepad_profile.as_str(),
                 "ds4_back_as_touchpad_click":lease.requested_ds4_back_as_touchpad_click.unwrap_or(lease.ds4_back_as_touchpad_click),
+                "motion_as_ds4":lease.requested_motion_as_ds4.unwrap_or(lease.motion_as_ds4),
+                "touchpad_as_ds4":lease.requested_touchpad_as_ds4.unwrap_or(lease.touchpad_as_ds4),
+                "ds5_inputtino_randomize_mac":lease.requested_ds5_inputtino_randomize_mac.unwrap_or(lease.ds5_inputtino_randomize_mac),
                 "native_pen_touch":lease.native_pen_touch,
                 "effective_gamepad_profile":effective_gamepad_profile,
                 "gamepad_unavailable_reason":gamepad_unavailable_reason,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"startup_cleanup_required":self.startup_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"keybindings":self.keybindings,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,"native_pen_touch":self.native_pen_touch,"pen_touch_supported":self.backend.pen_touch_supported(),"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"startup_cleanup_required":self.startup_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"keybindings":self.keybindings,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,"motion_as_ds4":self.motion_as_ds4,"touchpad_as_ds4":self.touchpad_as_ds4,"ds5_inputtino_randomize_mac":self.ds5_inputtino_randomize_mac,"native_pen_touch":self.native_pen_touch,"pen_touch_supported":self.backend.pen_touch_supported(),"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();
@@ -1455,6 +1767,9 @@ fn active_lease<B: Backend>(lease: &Lease, now: Instant, backend: &B) -> Value {
         "pen_touch_supported": backend.pen_touch_supported(),
         "gamepad_profile": lease.gamepad_profile.as_str(),
         "ds4_back_as_touchpad_click": lease.ds4_back_as_touchpad_click,
+        "motion_as_ds4": lease.motion_as_ds4,
+        "touchpad_as_ds4": lease.touchpad_as_ds4,
+        "ds5_inputtino_randomize_mac": lease.ds5_inputtino_randomize_mac,
         "native_pen_touch": lease.native_pen_touch,
         "effective_gamepad_profile": backend.effective_gamepad_profile(),
         "gamepad_unavailable_reason": backend.gamepad_unavailable_reason(),
@@ -1544,6 +1859,7 @@ fn terminal_acquire(operation: &TerminalAcquire) -> Value {
         "operation_id": operation.operation_id,
         "lease": Value::Null,
         "reason": operation.reason,
+        "ds5_inputtino_randomize_mac": operation.requested_ds5_inputtino_randomize_mac,
         "native_pen_touch": operation.native_pen_touch,
         "keybindings": operation.requested_keybindings,
     })

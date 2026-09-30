@@ -8,7 +8,7 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const PRODUCT_SETTINGS_VERSION: u32 = 11;
+pub const PRODUCT_SETTINGS_VERSION: u32 = 14;
 const CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
 const DEFAULT_KEY_REPEAT_FREQUENCY_HZ: f64 = 24.9;
@@ -42,6 +42,14 @@ pub struct InputPolicy {
     #[serde(default = "default_enabled")]
     pub ds4_back_as_touchpad_click: bool,
     #[serde(default = "default_enabled")]
+    pub motion_as_ds4: bool,
+    #[serde(default = "default_enabled")]
+    pub touchpad_as_ds4: bool,
+    #[serde(default = "default_enabled")]
+    pub proton_dualsense_compatibility: bool,
+    #[serde(default = "default_enabled")]
+    pub ds5_inputtino_randomize_mac: bool,
+    #[serde(default = "default_enabled")]
     pub native_pen_touch: bool,
 }
 
@@ -59,6 +67,10 @@ pub struct InputPolicyUpdate {
     pub back_button_timeout: Option<i32>,
     pub gamepad: Option<GamepadProfile>,
     pub ds4_back_as_touchpad_click: Option<bool>,
+    pub motion_as_ds4: Option<bool>,
+    pub touchpad_as_ds4: Option<bool>,
+    pub proton_dualsense_compatibility: Option<bool>,
+    pub ds5_inputtino_randomize_mac: Option<bool>,
     pub native_pen_touch: Option<bool>,
 }
 
@@ -88,6 +100,10 @@ impl InputPolicy {
             "back_button_timeout":self.back_button_timeout,
             "gamepad":self.gamepad.as_str(),
             "ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,
+            "motion_as_ds4":self.motion_as_ds4,
+            "touchpad_as_ds4":self.touchpad_as_ds4,
+            "proton_dualsense_compatibility":self.proton_dualsense_compatibility,
+            "ds5_inputtino_randomize_mac":self.ds5_inputtino_randomize_mac,
             "native_pen_touch":self.native_pen_touch,
         })
     }
@@ -139,6 +155,10 @@ impl Default for InputPolicy {
             back_button_timeout: default_back_button_timeout(),
             gamepad: GamepadProfile::Auto,
             ds4_back_as_touchpad_click: true,
+            motion_as_ds4: true,
+            touchpad_as_ds4: true,
+            proton_dualsense_compatibility: true,
+            ds5_inputtino_randomize_mac: true,
             native_pen_touch: true,
         }
     }
@@ -247,6 +267,16 @@ impl ProductSettings {
             ds4_back_as_touchpad_click: update
                 .ds4_back_as_touchpad_click
                 .unwrap_or(self.policy.ds4_back_as_touchpad_click),
+            motion_as_ds4: update.motion_as_ds4.unwrap_or(self.policy.motion_as_ds4),
+            touchpad_as_ds4: update
+                .touchpad_as_ds4
+                .unwrap_or(self.policy.touchpad_as_ds4),
+            proton_dualsense_compatibility: update
+                .proton_dualsense_compatibility
+                .unwrap_or(self.policy.proton_dualsense_compatibility),
+            ds5_inputtino_randomize_mac: update
+                .ds5_inputtino_randomize_mac
+                .unwrap_or(self.policy.ds5_inputtino_randomize_mac),
             native_pen_touch: update
                 .native_pen_touch
                 .unwrap_or(self.policy.native_pen_touch),
@@ -511,6 +541,10 @@ impl ProductSettings {
                         controller.set_gamepad_profile(policy.gamepad);
                         controller
                             .set_ds4_back_as_touchpad_click(policy.ds4_back_as_touchpad_click);
+                        controller.set_motion_as_ds4(policy.motion_as_ds4);
+                        controller.set_touchpad_as_ds4(policy.touchpad_as_ds4);
+                        controller
+                            .set_ds5_inputtino_randomize_mac(policy.ds5_inputtino_randomize_mac);
                         controller.set_native_pen_touch(policy.native_pen_touch);
                         let _ = controller
                             .set_controller_enabled(policy.controller, std::time::Instant::now());
@@ -589,6 +623,10 @@ impl ProductSettings {
                         controller.set_gamepad_profile(actual.gamepad);
                         controller
                             .set_ds4_back_as_touchpad_click(actual.ds4_back_as_touchpad_click);
+                        controller.set_motion_as_ds4(actual.motion_as_ds4);
+                        controller.set_touchpad_as_ds4(actual.touchpad_as_ds4);
+                        controller
+                            .set_ds5_inputtino_randomize_mac(actual.ds5_inputtino_randomize_mac);
                         controller.set_native_pen_touch(actual.native_pen_touch);
                         let now = std::time::Instant::now();
                         let controller_cleanup = controller
@@ -638,6 +676,9 @@ impl ProductSettings {
         controller.set_back_button_timeout_ms(policy.back_button_timeout);
         controller.set_gamepad_profile(policy.gamepad);
         controller.set_ds4_back_as_touchpad_click(policy.ds4_back_as_touchpad_click);
+        controller.set_motion_as_ds4(policy.motion_as_ds4);
+        controller.set_touchpad_as_ds4(policy.touchpad_as_ds4);
+        controller.set_ds5_inputtino_randomize_mac(policy.ds5_inputtino_randomize_mac);
         controller.set_native_pen_touch(policy.native_pen_touch);
         let now = std::time::Instant::now();
         let controller_cleanup = controller
@@ -679,6 +720,9 @@ impl ProductSettings {
             && controller.back_button_timeout_ms() == self.policy.back_button_timeout
             && controller.gamepad_profile() == self.policy.gamepad
             && controller.ds4_back_as_touchpad_click() == self.policy.ds4_back_as_touchpad_click
+            && controller.motion_as_ds4() == self.policy.motion_as_ds4
+            && controller.touchpad_as_ds4() == self.policy.touchpad_as_ds4
+            && controller.ds5_inputtino_randomize_mac() == self.policy.ds5_inputtino_randomize_mac
             && controller.native_pen_touch() == self.policy.native_pen_touch
             && !cleanup_required;
         settings_response_with_state(
@@ -752,7 +796,7 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
         {
             Ok((InputPolicy::default(), 0))
         }
-        Some(true) if matches!(payload["version"].as_u64(), Some(1..=11)) => {
+        Some(true) if matches!(payload["version"].as_u64(), Some(1..=14)) => {
             let values = payload["values"].as_object().ok_or("values not object")?;
             let version = payload["version"].as_u64().unwrap_or_default();
             let has_unknown_key = values.keys().any(|key| match version {
@@ -863,6 +907,63 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
                         | "ds4_back_as_touchpad_click"
                         | "native_pen_touch"
                         | "keybindings"
+                ),
+                12 => !matches!(
+                    key.as_str(),
+                    "keyboard"
+                        | "mouse"
+                        | "controller"
+                        | "high_resolution_scrolling"
+                        | "always_send_scancodes"
+                        | "key_rightalt_to_key_win"
+                        | "key_repeat_delay"
+                        | "key_repeat_frequency"
+                        | "back_button_timeout"
+                        | "gamepad"
+                        | "ds4_back_as_touchpad_click"
+                        | "native_pen_touch"
+                        | "keybindings"
+                        | "motion_as_ds4"
+                        | "touchpad_as_ds4"
+                ),
+                13 => !matches!(
+                    key.as_str(),
+                    "keyboard"
+                        | "mouse"
+                        | "controller"
+                        | "high_resolution_scrolling"
+                        | "always_send_scancodes"
+                        | "key_rightalt_to_key_win"
+                        | "key_repeat_delay"
+                        | "key_repeat_frequency"
+                        | "back_button_timeout"
+                        | "gamepad"
+                        | "ds4_back_as_touchpad_click"
+                        | "native_pen_touch"
+                        | "keybindings"
+                        | "motion_as_ds4"
+                        | "touchpad_as_ds4"
+                        | "proton_dualsense_compatibility"
+                ),
+                14 => !matches!(
+                    key.as_str(),
+                    "keyboard"
+                        | "mouse"
+                        | "controller"
+                        | "high_resolution_scrolling"
+                        | "always_send_scancodes"
+                        | "key_rightalt_to_key_win"
+                        | "key_repeat_delay"
+                        | "key_repeat_frequency"
+                        | "back_button_timeout"
+                        | "gamepad"
+                        | "ds4_back_as_touchpad_click"
+                        | "native_pen_touch"
+                        | "keybindings"
+                        | "motion_as_ds4"
+                        | "touchpad_as_ds4"
+                        | "proton_dualsense_compatibility"
+                        | "ds5_inputtino_randomize_mac"
                 ),
                 _ => true,
             });

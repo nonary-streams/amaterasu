@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::{
-    Axis, Button, DevicePolicy, Key, PEN_BUTTON_MASK, PEN_POINTER_ID, PenTool, PenTouchDevice,
-    PenTouchPhase,
+    Axis, Button, ControllerTouchPhase, DevicePolicy, Event as InputEvent, Key, PEN_BUTTON_MASK,
+    PEN_POINTER_ID, PenTool, PenTouchDevice, PenTouchPhase,
 };
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -29,6 +29,9 @@ struct FakeBackend {
     gamepad_unavailable_reason: Option<&'static str>,
     gamepad_profile: GamepadProfile,
     ds4_back_as_touchpad_click: bool,
+    motion_as_ds4: bool,
+    touchpad_as_ds4: bool,
+    ds5_inputtino_randomize_mac: bool,
     back_button_timeout_ms: i32,
     always_send_scancodes: bool,
     key_rightalt_to_key_win: bool,
@@ -153,6 +156,17 @@ impl Backend for FakeBackend {
     fn set_back_button_timeout(&mut self, timeout_ms: i32) {
         self.back_button_timeout_ms = timeout_ms;
     }
+
+    fn set_motion_as_ds4(&mut self, enabled: bool) {
+        self.motion_as_ds4 = enabled;
+    }
+
+    fn set_touchpad_as_ds4(&mut self, enabled: bool) {
+        self.touchpad_as_ds4 = enabled;
+    }
+    fn set_ds5_inputtino_randomize_mac(&mut self, enabled: bool) {
+        self.ds5_inputtino_randomize_mac = enabled;
+    }
     fn set_always_send_scancodes(&mut self, enabled: bool) {
         self.always_send_scancodes = enabled;
     }
@@ -261,6 +275,9 @@ fn acquire_operation() -> Operation {
         controller: None,
         gamepad: None,
         ds4_back_as_touchpad_click: None,
+        motion_as_ds4: None,
+        touchpad_as_ds4: None,
+        ds5_inputtino_randomize_mac: None,
         native_pen_touch: None,
         keyboard: None,
         mouse: None,
@@ -389,6 +406,9 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -426,6 +446,9 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -444,7 +467,7 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
 }
 
 #[test]
-fn scoped_ds4_back_mapping_survives_global_updates_and_restores_after_release() {
+fn scoped_controller_auto_selection_survives_global_updates_and_restores_after_release() {
     let mut controller = Controller::new(FakeBackend::default(), true);
     let now = Instant::now();
     let acquired = controller.handle(
@@ -456,6 +479,9 @@ fn scoped_ds4_back_mapping_survives_global_updates_and_restores_after_release() 
             controller: None,
             gamepad: Some(GamepadProfile::Auto),
             ds4_back_as_touchpad_click: Some(false),
+            motion_as_ds4: Some(false),
+            touchpad_as_ds4: Some(false),
+            ds5_inputtino_randomize_mac: Some(false),
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -471,14 +497,32 @@ fn scoped_ds4_back_mapping_survives_global_updates_and_restores_after_release() 
     );
     assert_eq!(acquired["ok"], true);
     assert_eq!(acquired["ds4_back_as_touchpad_click"], false);
+    assert_eq!(acquired["motion_as_ds4"], false);
+    assert_eq!(acquired["touchpad_as_ds4"], false);
+    assert_eq!(acquired["ds5_inputtino_randomize_mac"], false);
     let lease = controller.lease.as_ref().unwrap();
     assert_eq!(lease.requested_ds4_back_as_touchpad_click, Some(false));
     assert!(!lease.ds4_back_as_touchpad_click);
+    assert!(!lease.motion_as_ds4);
+    assert!(!lease.touchpad_as_ds4);
+    assert!(!lease.ds5_inputtino_randomize_mac);
     assert!(!controller.backend.ds4_back_as_touchpad_click);
+    assert!(!controller.backend.motion_as_ds4);
+    assert!(!controller.backend.touchpad_as_ds4);
+    assert!(!controller.backend.ds5_inputtino_randomize_mac);
 
     controller.set_ds4_back_as_touchpad_click(false);
     controller.set_ds4_back_as_touchpad_click(true);
+    controller.set_motion_as_ds4(false);
+    controller.set_motion_as_ds4(true);
+    controller.set_touchpad_as_ds4(false);
+    controller.set_touchpad_as_ds4(true);
+    controller.set_ds5_inputtino_randomize_mac(false);
+    controller.set_ds5_inputtino_randomize_mac(true);
     assert!(!controller.backend.ds4_back_as_touchpad_click);
+    assert!(!controller.backend.motion_as_ds4);
+    assert!(!controller.backend.touchpad_as_ds4);
+    assert!(!controller.backend.ds5_inputtino_randomize_mac);
 
     controller.handle(
         "owner",
@@ -489,6 +533,45 @@ fn scoped_ds4_back_mapping_survives_global_updates_and_restores_after_release() 
         &mut || Ok(()),
     );
     assert!(controller.backend.ds4_back_as_touchpad_click);
+    assert!(controller.backend.motion_as_ds4);
+    assert!(controller.backend.touchpad_as_ds4);
+    assert!(controller.backend.ds5_inputtino_randomize_mac);
+}
+
+#[test]
+fn controller_touch_release_cancels_contacts_owned_by_the_lease() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let now = Instant::now();
+    let lease = acquire(&mut controller, now);
+    let down = InputEvent::ControllerTouch {
+        number: 0,
+        touchpad_index: 1,
+        pointer_id: 42,
+        phase: ControllerTouchPhase::Down,
+        x: 0.25,
+        y: 0.75,
+        pressure: 0.5,
+    };
+    assert_eq!(
+        batch(&mut controller, &lease, vec![down.clone()])["ok"],
+        true
+    );
+
+    let release = controller.handle("owner", Operation::Release { lease }, now, &mut || Ok(()));
+    assert_eq!(release["released"], true);
+    assert!(controller.controller_touch_contacts.is_empty());
+    assert_eq!(
+        controller.backend.trace.borrow().last(),
+        Some(&InputEvent::ControllerTouch {
+            number: 0,
+            touchpad_index: 1,
+            pointer_id: 42,
+            phase: ControllerTouchPhase::Cancel,
+            x: 0.25,
+            y: 0.75,
+            pressure: 0.5,
+        })
+    );
 }
 
 #[test]
@@ -502,6 +585,9 @@ fn unscoped_ds4_back_mapping_is_snapshotted_from_the_v9_default() {
         controller: None,
         gamepad: None,
         ds4_back_as_touchpad_click,
+        motion_as_ds4: None,
+        touchpad_as_ds4: None,
+        ds5_inputtino_randomize_mac: None,
         keyboard: None,
         mouse: None,
         native_pen_touch: None,
@@ -557,6 +643,9 @@ fn native_pen_touch_resolution_is_snapshotted_and_retry_identity_is_optional_val
         controller: None,
         gamepad: None,
         ds4_back_as_touchpad_click: None,
+        motion_as_ds4: None,
+        touchpad_as_ds4: None,
+        ds5_inputtino_randomize_mac: None,
         native_pen_touch,
         keyboard: None,
         mouse: None,
@@ -677,6 +766,9 @@ fn acquire_retry_with_a_different_ds4_back_mapping_conflicts() {
         controller: None,
         gamepad: None,
         ds4_back_as_touchpad_click: Some(enabled),
+        motion_as_ds4: None,
+        touchpad_as_ds4: None,
+        ds5_inputtino_randomize_mac: None,
         native_pen_touch: None,
         keyboard: None,
         mouse: None,
@@ -709,6 +801,9 @@ fn acquire_retry_distinguishes_zero_key_repeat_delay_from_unspecified() {
         controller: None,
         gamepad: None,
         ds4_back_as_touchpad_click: None,
+        motion_as_ds4: None,
+        touchpad_as_ds4: None,
+        ds5_inputtino_randomize_mac: None,
         native_pen_touch: None,
         keyboard: None,
         mouse: None,
@@ -762,6 +857,9 @@ fn acquired_key_repeat_frequency_controls_cadence_and_retry_identity() {
         controller: None,
         gamepad: None,
         ds4_back_as_touchpad_click: None,
+        motion_as_ds4: None,
+        touchpad_as_ds4: None,
+        ds5_inputtino_randomize_mac: None,
         native_pen_touch: None,
         keyboard: None,
         mouse: None,
@@ -844,6 +942,9 @@ fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -867,6 +968,9 @@ fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -903,6 +1007,9 @@ fn controller_capability_is_present_in_status_and_active_lease_responses() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -1056,6 +1163,9 @@ fn active_lease_keeps_the_profile_selected_at_acquire_time() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -1130,6 +1240,9 @@ fn scoped_input_policy_overrides_host_defaults_then_restores_them_on_release() {
             controller: Some(true),
             gamepad: Some(GamepadProfile::Auto),
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: Some(true),
             mouse: Some(false),
@@ -1217,6 +1330,9 @@ fn scoped_input_policy_overrides_host_defaults_then_restores_them_on_release() {
             controller: Some(true),
             gamepad: Some(global_gamepad),
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: Some(true),
             mouse: None,
@@ -1272,6 +1388,9 @@ fn scoped_keyboard_and_scroll_overrides_hold_through_cleanup_and_restore_default
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -1382,6 +1501,9 @@ fn scoped_keyboard_and_scroll_overrides_hold_through_cleanup_and_restore_default
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -1955,6 +2077,9 @@ fn failed_releases_remain_tracked_block_new_leases_and_retry() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -2097,6 +2222,9 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -2122,6 +2250,9 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -2166,6 +2297,9 @@ fn lost_error_replies_preserve_the_existing_lease_and_pressed_keys() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -2216,6 +2350,9 @@ fn lost_success_replies_release_new_acquisition_and_batch_state() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -2271,6 +2408,9 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
         controller: None,
         gamepad: None,
         ds4_back_as_touchpad_click: None,
+        motion_as_ds4: None,
+        touchpad_as_ds4: None,
+        ds5_inputtino_randomize_mac: None,
         native_pen_touch: None,
         keyboard: None,
         mouse: None,
@@ -2324,6 +2464,9 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -3055,6 +3198,9 @@ fn lease_repeat_overrides_survive_global_policy_updates() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: None,
             keyboard: None,
             mouse: None,
@@ -3595,6 +3741,9 @@ fn pen_touch_policy_suppresses_global_disable_but_honors_scoped_lease_override()
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
             native_pen_touch: Some(true),
             keyboard: None,
             mouse: None,
