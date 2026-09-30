@@ -317,41 +317,74 @@ fn disabled_and_verify_only_policies_do_not_acquire_or_restore_a_topology_lease(
 }
 
 #[test]
-fn inactive_intent_and_unsupported_driver_never_mutate_display_state() {
-    for (case, mut request) in [
-        (
-            "activation-false",
-            prepare_with_intent(
-                "inactive-gate",
-                intent(
-                    "session-inactive-gate",
-                    VirtualDisplayMode::Shared,
-                    VirtualDisplayLayout::Exclusive,
-                ),
-            ),
-        ),
-        (
-            "disabled-mode",
-            prepare_with_intent(
-                "inactive-mode",
-                intent(
-                    "session-inactive-mode",
-                    VirtualDisplayMode::Disabled,
-                    VirtualDisplayLayout::Extended,
-                ),
-            ),
-        ),
-    ] {
-        if case == "activation-false" {
-            request["virtual_display_intent"]["dd_activate_virtual_display"] = json!(false);
-        }
-        let mut host = Harness::new();
-        let prepared = host.response(1, request);
-        assert_eq!(prepared["state"], "prepared");
-        assert_eq!(prepared["virtual_display_ready"], false);
-        assert!(actions(&host, "amaterasu.virtual-display/1").is_empty());
-        assert!(actions(&host, "amaterasu.display/1").is_empty());
-    }
+fn explicit_mode_activates_with_auto_activation_disabled() {
+    let mut requested = intent(
+        "session-explicit-mode",
+        VirtualDisplayMode::Shared,
+        VirtualDisplayLayout::Exclusive,
+    );
+    requested["dd_activate_virtual_display"] = json!(false);
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare_with_intent("explicit-mode", requested));
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["virtual_display_ready"], true);
+    assert_eq!(prepared["display_applied"], true);
+    assert_eq!(
+        actions(&host, "amaterasu.virtual-display/1"),
+        ["create", "status"]
+    );
+    assert_eq!(
+        actions(&host, "amaterasu.display/1"),
+        ["snapshot", "status", "apply", "status"]
+    );
+}
+
+#[test]
+fn disabled_mode_without_auto_activation_never_mutates_display_state() {
+    let mut disabled = intent(
+        "session-disabled-mode",
+        VirtualDisplayMode::Disabled,
+        VirtualDisplayLayout::Extended,
+    );
+    disabled["dd_activate_virtual_display"] = json!(false);
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare_with_intent("disabled-mode", disabled));
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["virtual_display_ready"], false);
+    assert!(actions(&host, "amaterasu.virtual-display/1").is_empty());
+    assert!(actions(&host, "amaterasu.display/1").is_empty());
+}
+
+#[test]
+fn automatic_activation_creates_display_with_disabled_mode() {
+    let mut automatic = intent(
+        "session-auto-activate",
+        VirtualDisplayMode::Disabled,
+        VirtualDisplayLayout::Exclusive,
+    );
+    automatic["request_virtual_display"] = json!(true);
+    automatic["dd_activate_virtual_display"] = json!(false);
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare_with_intent("auto-activation", automatic));
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["virtual_display_ready"], true);
+    assert_eq!(prepared["display_applied"], true);
+}
+
+#[test]
+fn pre_resolved_physical_selection_never_mutates_display_state() {
+    let mut physical = intent(
+        "session-physical-selection",
+        VirtualDisplayMode::PerClient,
+        VirtualDisplayLayout::Extended,
+    );
+    physical["request_virtual_display"] = json!(false);
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare_with_intent("physical-selection", physical));
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["virtual_display_ready"], false);
+    assert!(actions(&host, "amaterasu.virtual-display/1").is_empty());
+    assert!(actions(&host, "amaterasu.display/1").is_empty());
 
     let mut unsupported = intent(
         "session-unsupported-driver",
