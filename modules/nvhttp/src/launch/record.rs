@@ -42,6 +42,7 @@ pub enum Stage {
     EnumerateDisplay,
     ConfirmDisplay,
     LaunchApplication,
+    AwaitApplicationReady,
     PrepareDisplayAdmission,
     OpenRtsp,
     AwaitingDelivery,

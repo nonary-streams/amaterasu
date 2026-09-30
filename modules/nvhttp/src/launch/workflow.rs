@@ -1,6 +1,6 @@
 use super::{
-    AudioSinkCaptureOnlyOverrides, CLEANUP_POLL_INTERVAL, Controller,
-    MAX_APPLICATION_CLEANUP_BUDGET_MS, Send, app_id,
+    AudioSinkCaptureOnlyOverrides, CLEANUP_POLL_INTERVAL, Controller, INITIAL_DEADLINE,
+    MAX_APPLICATION_CLEANUP_BUDGET_MS, MONITOR_INTERVAL, Send, app_id,
     call::{Call, Outcome},
     capture_sink_without_routing, key_hex, private_error,
     record::{Record, Stage, State},
@@ -16,7 +16,7 @@ use amaterasu_contracts::virtual_display::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const LAUNCH_SERVICE: &str = "amaterasu.launch/1";
 const RTSP_SERVICE: &str = "amaterasu.rtsp/1";
@@ -32,6 +32,7 @@ pub enum Phase {
     ConfirmDisplay,
     LaunchApplication,
     LookupApplication,
+    AwaitApplication,
     PrepareDisplayAdmission,
     OpenRtsp,
     LookupRtsp,
@@ -80,8 +81,11 @@ impl Controller {
         }
         let phase = next_phase(&record);
         let call = self.make_call(&mut record, phase);
-        let deadline = if matches!(phase, Phase::MonitorApplication | Phase::MonitorRtsp) {
-            now + std::time::Duration::from_secs(5)
+        let deadline = if matches!(
+            phase,
+            Phase::AwaitApplication | Phase::MonitorApplication | Phase::MonitorRtsp
+        ) {
+            now + Duration::from_secs(5)
         } else {
             record.deadline
         };
@@ -122,6 +126,7 @@ impl Controller {
                         record.rtsp_cleanup_blocked = true;
                     }
                     Phase::LaunchApplication
+                    | Phase::AwaitApplication
                     | Phase::PrepareDisplayAdmission
                     | Phase::StopApplication
                     | Phase::LookupApplication => {
@@ -205,10 +210,16 @@ impl Controller {
                         "frame_limiter_settings": record.frame_limiter_snapshot,
                         "client_frame_limiter_overrides":
                             client_frame_limiter_overrides(record),
+                        "return_on_admission": true,
                     }),
                     30_000,
                 )
             }
+            Phase::AwaitApplication => (
+                LAUNCH_SERVICE,
+                json!({"action":"status","launch_id":record.application_launch}),
+                5_000,
+            ),
             Phase::LookupApplication => (
                 LAUNCH_SERVICE,
                 json!({
@@ -570,55 +581,24 @@ impl Controller {
             },
             Phase::LaunchApplication | Phase::LookupApplication => {
                 match application_response(record, &payload) {
+                    Ok((launch_id, "starting", true)) if record.state == State::Starting => {
+                        record.application_launch = Some(launch_id);
+                        if let Err(code) = validate_application_launch_snapshot(record, &payload) {
+                            fail_record(record, code, now);
+                            self.finish_or_retain(job.record, now, replies);
+                            return;
+                        }
+                        record.stage = Stage::AwaitApplicationReady;
+                        record.next_monitor = now + MONITOR_INTERVAL;
+                    }
                     Ok((launch_id, "active", true)) if record.state == State::Starting => {
                         record.application_launch = Some(launch_id);
-                        match application_config_overrides(&payload) {
-                            Ok(application_overrides) => {
-                                if record.application_preflight_overrides.as_ref()
-                                    != Some(&application_overrides)
-                                {
-                                    fail_record(record, "application_policy_mismatch", now);
-                                    self.finish_or_retain(job.record, now, replies);
-                                    return;
-                                }
-                                if payload["launch"]["catalog_revision"].as_u64()
-                                    != record.application_catalog_revision
-                                {
-                                    fail_record(record, "application_revision_mismatch", now);
-                                    self.finish_or_retain(job.record, now, replies);
-                                    return;
-                                }
-                                if payload["launch"].get("application_display_overrides")
-                                    != record.application_display_overrides.as_ref()
-                                {
-                                    fail_record(record, "application_display_policy_mismatch", now);
-                                    self.finish_or_retain(job.record, now, replies);
-                                    return;
-                                }
-                                record.application_frame_limiter_settings =
-                                    application_overrides.frame_limiter_settings();
-                                if record.frame_limiter_snapshot.as_ref()
-                                    != payload["launch"].get("frame_limiter_settings")
-                                {
-                                    fail_record(record, "application_snapshot_mismatch", now);
-                                    self.finish_or_retain(job.record, now, replies);
-                                    return;
-                                }
-                                if record.executable_path.as_deref()
-                                    != payload["launch"]["executable_path"].as_str()
-                                {
-                                    fail_record(record, "application_target_mismatch", now);
-                                    self.finish_or_retain(job.record, now, replies);
-                                    return;
-                                }
-                                if record.rtsp_ticket.is_some() {
-                                    complete_launch(record, now, replies);
-                                } else {
-                                    record.stage = Stage::OpenRtsp;
-                                }
-                            }
-                            Err(code) => fail_record(record, code, now),
+                        if let Err(code) = validate_application_launch_snapshot(record, &payload) {
+                            fail_record(record, code, now);
+                            self.finish_or_retain(job.record, now, replies);
+                            return;
                         }
+                        advance_after_application_ready(record, now, replies);
                     }
                     Ok((launch_id, "active", _)) => {
                         record.application_launch = Some(launch_id);
@@ -639,6 +619,31 @@ impl Controller {
                     Err(code) => fail_record(record, code, now),
                 }
             }
+            Phase::AwaitApplication => match application_response(record, &payload) {
+                Ok((launch_id, "starting", true)) if record.state == State::Starting => {
+                    record.application_launch = Some(launch_id);
+                    if let Err(code) = validate_application_launch_snapshot(record, &payload) {
+                        fail_record(record, code, now);
+                        self.finish_or_retain(job.record, now, replies);
+                        return;
+                    }
+                    record.next_monitor = now + MONITOR_INTERVAL;
+                }
+                Ok((launch_id, "active", true)) if record.state == State::Starting => {
+                    record.application_launch = Some(launch_id);
+                    if let Err(code) = validate_application_launch_snapshot(record, &payload) {
+                        fail_record(record, code, now);
+                        self.finish_or_retain(job.record, now, replies);
+                        return;
+                    }
+                    advance_after_application_ready(record, now, replies);
+                }
+                Ok((launch_id, _, _)) => {
+                    record.application_launch = Some(launch_id);
+                    record.request_cleanup(Some("application_launch_unhealthy"), now);
+                }
+                Err(code) => fail_record(record, code, now),
+            },
             Phase::PrepareDisplayAdmission => match display_admission_response(record, &payload) {
                 Ok(token) if record.state == State::Starting => {
                     record.display_admission_token = Some(token);
@@ -773,6 +778,10 @@ impl Controller {
                 record.application_requested = false;
                 fail_record(record, "application_launch_rejected", now);
             }
+            Phase::AwaitApplication => {
+                record.application_reconcile = Some(Phase::LookupApplication);
+                record.next_monitor = now;
+            }
             Phase::PrepareDisplayAdmission => {
                 fail_record(record, "display_admission_unavailable", now);
             }
@@ -817,6 +826,11 @@ impl Controller {
                 record.application_cleanup_blocked = false;
                 record.application_reconcile = Some(Phase::LookupApplication);
             }
+            Phase::AwaitApplication => {
+                record.stage = Stage::AwaitApplicationReady;
+                record.application_reconcile = Some(Phase::LookupApplication);
+                record.next_monitor = now;
+            }
             Phase::PrepareDisplayAdmission => {
                 record.request_cleanup(Some("display_admission_unavailable"), now);
             }
@@ -844,7 +858,10 @@ impl Controller {
                 record.request_cleanup(Some("lifecycle_status_unavailable"), now);
             }
         }
-        if record.state == State::Starting && now >= record.deadline {
+        if record.state == State::Starting
+            && record.stage != Stage::AwaitApplicationReady
+            && now >= record.deadline
+        {
             record.request_cleanup(Some("launch_deadline_exceeded"), now);
         }
         self.finish_or_retain(job.record, now, replies);
@@ -898,6 +915,7 @@ impl Phase {
             Self::ConfirmDisplay => "confirm-display",
             Self::LaunchApplication => "launch",
             Self::LookupApplication => "find-launch",
+            Self::AwaitApplication => "await-application-ready",
             Self::PrepareDisplayAdmission => "prepare-display-admission",
             Self::OpenRtsp => "open-rtsp",
             Self::LookupRtsp => "find-rtsp",
@@ -930,6 +948,7 @@ fn needs_work(record: &Record, now: Instant) -> bool {
             | Stage::PrepareDisplayAdmission
             | Stage::OpenRtsp
     ) || (record.stage == Stage::Live && now >= record.next_monitor)
+        || (record.stage == Stage::AwaitApplicationReady && now >= record.next_monitor)
         || matches!(
             record.stage,
             Stage::Cleanup | Stage::VerifyRtspCleanup | Stage::ReleaseHistory
@@ -952,6 +971,7 @@ fn next_phase(record: &Record) -> Phase {
         Stage::EnumerateDisplay => Phase::EnumerateDisplay,
         Stage::ConfirmDisplay => Phase::ConfirmDisplay,
         Stage::LaunchApplication => Phase::LaunchApplication,
+        Stage::AwaitApplicationReady => Phase::AwaitApplication,
         Stage::PrepareDisplayAdmission => Phase::PrepareDisplayAdmission,
         Stage::OpenRtsp => Phase::OpenRtsp,
         Stage::Live if record.monitor_application_next => Phase::MonitorApplication,
@@ -1850,6 +1870,45 @@ fn application_response<'a>(
         })
         .ok_or("invalid_application_response")?;
     Ok((id, state, launch["cleanup_error"].is_null()))
+}
+
+fn validate_application_launch_snapshot(
+    record: &mut Record,
+    payload: &Value,
+) -> Result<(), &'static str> {
+    let application_overrides = application_config_overrides(payload)?;
+    if record.application_preflight_overrides.as_ref() != Some(&application_overrides) {
+        return Err("application_policy_mismatch");
+    }
+    if payload["launch"]["catalog_revision"].as_u64() != record.application_catalog_revision {
+        return Err("application_revision_mismatch");
+    }
+    if payload["launch"].get("application_display_overrides")
+        != record.application_display_overrides.as_ref()
+    {
+        return Err("application_display_policy_mismatch");
+    }
+    record.application_frame_limiter_settings = application_overrides.frame_limiter_settings();
+    if record.frame_limiter_snapshot.as_ref() != payload["launch"].get("frame_limiter_settings") {
+        return Err("application_snapshot_mismatch");
+    }
+    if record.executable_path.as_deref() != payload["launch"]["executable_path"].as_str() {
+        return Err("application_target_mismatch");
+    }
+    Ok(())
+}
+
+fn advance_after_application_ready(
+    record: &mut Record,
+    now: Instant,
+    replies: &mut Vec<(u64, Reply)>,
+) {
+    record.deadline = now + INITIAL_DEADLINE;
+    if record.rtsp_ticket.is_some() {
+        complete_launch(record, now, replies);
+    } else {
+        record.stage = Stage::OpenRtsp;
+    }
 }
 
 #[derive(Clone, Default, Deserialize, PartialEq)]
