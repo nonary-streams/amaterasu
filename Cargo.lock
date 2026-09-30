@@ -129,6 +129,7 @@ dependencies = [
 name = "amaterasu-catalog"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-input-policy",
  "amaterasu-module-sdk",
  "serde",
  "serde_json",
@@ -276,6 +277,7 @@ dependencies = [
 name = "amaterasu-launch"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-input-policy",
  "amaterasu-module-sdk",
  "getrandom 0.3.4",
  "serde",
@@ -298,6 +300,7 @@ dependencies = [
 name = "amaterasu-management"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-input-policy",
  "amaterasu-module-sdk",
  "amaterasu-package",
  "httparse",
@@ -354,6 +357,7 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-gamestream",
  "amaterasu-identity",
+ "amaterasu-input-policy",
  "amaterasu-module-sdk",
  "getrandom 0.3.4",
  "httparse",
@@ -386,6 +390,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "amaterasu-identity",
+ "amaterasu-input-policy",
  "amaterasu-module-sdk",
  "amaterasu-storage",
  "getrandom 0.3.4",
@@ -430,6 +435,7 @@ name = "amaterasu-rtsp"
 version = "0.1.0"
 dependencies = [
  "amaterasu-gamestream",
+ "amaterasu-input-policy",
  "amaterasu-module-sdk",
  "getrandom 0.3.4",
  "serde",
@@ -503,6 +509,7 @@ name = "amaterasu-stream-session"
 version = "0.1.0"
 dependencies = [
  "amaterasu-gamestream",
+ "amaterasu-input-policy",
  "amaterasu-media",
  "amaterasu-module-sdk",
  "getrandom 0.3.4",

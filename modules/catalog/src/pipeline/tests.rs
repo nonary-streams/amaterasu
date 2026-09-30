@@ -5285,3 +5285,74 @@ fn retained_manually_edited_entry_loses_marker_but_survives_later_cleanup() {
             .contains_key("~provider.entry:steam:steam:10")
     );
 }
+
+#[test]
+fn keybindings_catalog_updates_preserve_lists_durability_and_revision_authority() {
+    for selected in [json!([]), json!([0, 255, 65, 66, 65, 67])] {
+        let mut backend = Backend::default();
+        let mut pipeline = Pipeline::default();
+        let mut catalog_entry = entry("Ordered keyboard mappings");
+        catalog_entry["config_overrides"] = json!({"keybindings":selected});
+        let created = backend.run(
+            &mut pipeline,
+            json!({
+                "action":"create","expected_revision":0,"entry":catalog_entry,
+            }),
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        let id = created["id"].as_str().unwrap();
+        let stored = backend.entries[id].clone();
+        let reloaded = backend.run(&mut Pipeline::default(), json!({"action":"get","id":id}));
+        assert_eq!(
+            reloaded["entry"]["config_overrides"]["keybindings"],
+            selected
+        );
+        assert_eq!(stored["config_overrides"]["keybindings"], selected);
+
+        let mut inherited = stored.clone();
+        inherited["config_overrides"] = json!({"keybindings":null});
+        let stale = backend.run(
+            &mut pipeline,
+            json!({
+                "action":"update","id":id,"expected_revision":0,"entry":inherited,
+            }),
+        );
+        assert_eq!(stale["ok"], false);
+        assert_eq!(backend.revision, 1);
+        assert_eq!(backend.entries[id], stored);
+        let cleared = backend.run(
+            &mut pipeline,
+            json!({
+                "action":"update","id":id,"expected_revision":1,"entry":inherited,
+            }),
+        );
+        assert_eq!(cleared["ok"], true, "{cleared}");
+        let reloaded = backend.run(&mut Pipeline::default(), json!({"action":"get","id":id}));
+        assert!(reloaded["entry"].get("config_overrides").is_none());
+        assert!(backend.entries[id].get("config_overrides").is_none());
+    }
+
+    for invalid in [
+        json!([65]),
+        json!([0, 256]),
+        json!([-1, 0]),
+        json!([65.0, 66]),
+        json!([true, 66]),
+        json!(["65", 66]),
+        json!({}),
+        json!(vec![0_u8; 514]),
+    ] {
+        let mut backend = Backend::default();
+        let mut catalog_entry = entry("Rejected keyboard mappings");
+        catalog_entry["config_overrides"] = json!({"keybindings":invalid});
+        let rejected = backend.run(
+            &mut Pipeline::default(),
+            json!({
+                "action":"create","expected_revision":0,"entry":catalog_entry,
+            }),
+        );
+        assert_eq!(rejected["ok"], false, "{invalid}: {rejected}");
+        assert_eq!(backend.revision, 0);
+        assert!(backend.entries.is_empty());
+    }
+}

@@ -968,3 +968,57 @@ fn second_session_input_busy_never_adopts_or_releases_the_first_lease() {
     );
     assert!(host.broker.input_lease.is_none());
 }
+
+#[test]
+fn input_acquire_preserves_the_selected_whole_keybindings_list_and_global_inheritance() {
+    for selected in [
+        None,
+        Some(json!(null)),
+        Some(json!([])),
+        Some(json!([0, 255, 65, 66, 65, 67])),
+    ] {
+        let mut host = Harness::new();
+        enable_input(&mut host);
+        let id = host.response(1, prepare())["session"].as_u64().unwrap();
+        let mut start_request = start(id);
+        if let Some(selected) = &selected {
+            start_request["configuration"]["keybindings"] = selected.clone();
+        }
+        assert_eq!(host.response(2, start_request)["state"], "active");
+        let acquire = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| call.service == "amaterasu.input/1" && call.payload["action"] == "acquire")
+            .expect("input lease acquisition");
+        assert_eq!(
+            acquire.payload["keybindings"],
+            selected.unwrap_or(Value::Null)
+        );
+    }
+}
+
+#[test]
+fn malformed_keybindings_start_cannot_acquire_an_input_lease() {
+    for invalid in [
+        json!([65]),
+        json!([0, 256]),
+        json!([-1, 0]),
+        json!([65.0, 66]),
+        json!([true, 66]),
+        json!(["65", 66]),
+        json!({}),
+        json!(vec![0_u8; 514]),
+    ] {
+        let mut host = Harness::new();
+        enable_input(&mut host);
+        let id = host.response(1, prepare())["session"].as_u64().unwrap();
+        let mut start_request = start(id);
+        start_request["configuration"]["keybindings"] = invalid.clone();
+        let reply = host.response(2, start_request);
+        assert_ne!(reply["state"], "active", "{invalid}: {reply}");
+        assert!(host.broker.calls.iter().all(|call| {
+            call.service != "amaterasu.input/1" || call.payload["action"] != "acquire"
+        }));
+    }
+}

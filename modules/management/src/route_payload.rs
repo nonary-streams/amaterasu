@@ -632,6 +632,7 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
                     "high_resolution_scrolling",
                     "always_send_scancodes",
                     "key_rightalt_to_key_win",
+                    "keybindings",
                     "key_repeat_delay",
                     "key_repeat_frequency",
                     "back_button_timeout",
@@ -652,6 +653,10 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
                 || object
                     .get("key_rightalt_to_key_win")
                     .is_some_and(|value| value.as_bool().is_none())
+                || object.get("keybindings").is_some_and(|value| {
+                    serde_json::from_value::<amaterasu_input_policy::KeyBindings>(value.clone())
+                        .is_err()
+                })
                 || object
                     .get("key_repeat_delay")
                     .is_some_and(|value| value.as_u64().is_none_or(|delay| delay > i32::MAX as u64))
@@ -1041,6 +1046,7 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
             "high_resolution_scrolling",
             "always_send_scancodes",
             "key_rightalt_to_key_win",
+            "keybindings",
             "key_repeat_delay",
             "key_repeat_frequency",
             "frame_limiter_enable",
@@ -1220,6 +1226,12 @@ fn optional_back_button_timeout(overrides: &Object) -> Result<(), &'static str> 
 }
 
 fn optional_input_overrides(overrides: &Object) -> Result<(), &'static str> {
+    if overrides.get("keybindings").is_some_and(|value| {
+        !value.is_null()
+            && serde_json::from_value::<amaterasu_input_policy::KeyBindings>(value.clone()).is_err()
+    }) {
+        return Err(INVALID);
+    }
     for key in [
         "controller",
         "keyboard",
@@ -2578,6 +2590,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                     "high_resolution_scrolling",
                     "always_send_scancodes",
                     "key_rightalt_to_key_win",
+                    "keybindings",
                     "key_repeat_delay",
                     "key_repeat_frequency",
                 ],
@@ -2796,6 +2809,7 @@ mod paired_client_roundtrip_tests {
             "high_resolution_scrolling",
             "always_send_scancodes",
             "key_rightalt_to_key_win",
+            "keybindings",
             "key_repeat_delay",
             "key_repeat_frequency",
         ] {

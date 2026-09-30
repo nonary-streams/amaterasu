@@ -3895,3 +3895,65 @@ fn missing_provider_status_after_module_restart_reacquires_extension_and_stops_b
     }));
     assert!(harness.sessions[0].lease.is_none());
 }
+
+#[test]
+fn keybindings_preflight_freezes_whole_lists_without_changing_export_authority() {
+    for (index, selected) in [json!([]), json!([0, 255, 65, 66, 65, 67])]
+        .into_iter()
+        .enumerate()
+    {
+        let mut harness = Harness::new();
+        harness.catalog_config_overrides = Some(json!({"keybindings":selected}));
+        let mut pipeline = pipeline();
+        let operation_id = format!("keybindings-admitted-{index}");
+        let preflight_request = json!({
+            "action":"preflight_export","operation_id":operation_id,"app_id":"app-0000000000000001",
+        });
+        let preflight =
+            harness.request(&mut pipeline, "amaterasu.nvhttp", preflight_request.clone());
+        assert_eq!(preflight["ok"], true, "{preflight}");
+        assert_eq!(preflight["config_overrides"]["keybindings"], selected);
+        assert!(harness.sessions.is_empty());
+        assert!(harness.processes.is_empty());
+        let mut launch = launch_export(&operation_id);
+        launch["preflight_token"] = preflight["preflight_token"].clone();
+        launch["frame_limiter_settings"] = frame_limiter_snapshot();
+        let denied = harness.request(&mut pipeline, "other-service", launch.clone());
+        assert_eq!(denied["code"], "preflight_not_found");
+        assert!(harness.sessions.is_empty());
+        assert!(harness.processes.is_empty());
+        harness.catalog_config_overrides = Some(json!({"keybindings":[90,91]}));
+        let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch);
+        assert_eq!(started["launch"]["state"], "active", "{started}");
+        assert_eq!(
+            started["launch"]["config_overrides"]["keybindings"],
+            selected
+        );
+    }
+}
+
+#[test]
+fn malformed_keybindings_catalog_policy_is_rejected_before_preflight_side_effects() {
+    for invalid in [
+        json!([65]),
+        json!([0, 256]),
+        json!([-1, 0]),
+        json!([65.0, 66]),
+        json!([true, 66]),
+        json!(["65", 66]),
+        json!({}),
+        json!(vec![0_u8; 514]),
+    ] {
+        let mut harness = Harness::new();
+        harness.catalog_config_overrides = Some(json!({"keybindings":invalid}));
+        let rejected = harness.request(&mut pipeline(), "amaterasu.nvhttp", json!({
+            "action":"preflight_export","operation_id":"invalid-keybindings","app_id":"app-0000000000000001",
+        }));
+        assert_eq!(
+            rejected["code"], "invalid_catalog_response",
+            "{invalid}: {rejected}"
+        );
+        assert!(harness.sessions.is_empty());
+        assert!(harness.processes.is_empty());
+    }
+}

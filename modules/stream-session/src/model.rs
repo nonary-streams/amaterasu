@@ -727,6 +727,8 @@ pub struct StartConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_rightalt_to_key_win: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keybindings: Option<amaterasu_input_policy::KeyBindings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_repeat_delay: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_repeat_frequency: Option<f64>,
@@ -1086,6 +1088,43 @@ mod tests {
             request["minimum_fps_target"] = json!(invalid);
             let parsed: StartConfig = serde_json::from_value(request).unwrap();
             assert_eq!(parsed.validate(true), Err("invalid_minimum_fps_target"));
+        }
+    }
+
+    #[test]
+    fn ordered_keybindings_start_accepts_sparse_lists_and_rejects_malformed_packets() {
+        for selected in [
+            None,
+            Some(json!(null)),
+            Some(json!([])),
+            Some(json!([0, 255, 65, 66, 65, 67])),
+        ] {
+            let mut value = start_json();
+            if let Some(selected) = &selected {
+                value["keybindings"] = selected.clone();
+            }
+            let request: StartConfig = serde_json::from_value(value).unwrap();
+            assert!(request.validate(true).is_ok());
+            assert_eq!(
+                serde_json::to_value(&request.keybindings).unwrap(),
+                selected.unwrap_or(Value::Null)
+            );
+        }
+        for invalid in [
+            json!([65]),
+            json!([0, 256]),
+            json!([-1, 0]),
+            json!([65.0, 66]),
+            json!(["65", 66]),
+            json!({}),
+            json!(vec![0_u8; 514]),
+        ] {
+            let mut value = start_json();
+            value["keybindings"] = invalid.clone();
+            assert!(
+                serde_json::from_value::<StartConfig>(value).is_err(),
+                "{invalid}"
+            );
         }
     }
 

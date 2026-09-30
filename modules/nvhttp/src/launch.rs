@@ -141,6 +141,7 @@ pub struct PeerIdentity {
     client_high_resolution_scrolling: Option<bool>,
     client_always_send_scancodes: Option<bool>,
     client_key_rightalt_to_key_win: Option<bool>,
+    client_keybindings: Option<amaterasu_input_policy::KeyBindings>,
     client_key_repeat_delay: Option<u32>,
     client_key_repeat_frequency: Option<f64>,
     client_frame_limiter_settings: FrameLimiterSettings,
@@ -179,6 +180,7 @@ impl PeerIdentity {
             client_high_resolution_scrolling: None,
             client_always_send_scancodes: None,
             client_key_rightalt_to_key_win: None,
+            client_keybindings: None,
             client_key_repeat_delay: None,
             client_key_repeat_frequency: None,
             client_frame_limiter_settings: FrameLimiterSettings::default(),
@@ -225,6 +227,7 @@ impl PeerIdentity {
             high_resolution_scrolling,
             always_send_scancodes,
             key_rightalt_to_key_win,
+            keybindings,
             key_repeat_delay,
             key_repeat_frequency,
             frame_limiter_enable,
@@ -288,6 +291,7 @@ impl PeerIdentity {
         self.client_high_resolution_scrolling = high_resolution_scrolling;
         self.client_always_send_scancodes = always_send_scancodes;
         self.client_key_rightalt_to_key_win = key_rightalt_to_key_win;
+        self.client_keybindings = keybindings;
         self.client_key_repeat_delay = key_repeat_delay;
         self.client_key_repeat_frequency = key_repeat_frequency;
         self.client_frame_limiter_settings = client_frame_limiter_settings;

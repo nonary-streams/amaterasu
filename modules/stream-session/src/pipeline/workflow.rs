@@ -211,6 +211,7 @@ impl Job {
                     "high_resolution_scrolling":start.high_resolution_scrolling,
                     "always_send_scancodes":start.always_send_scancodes,
                     "key_rightalt_to_key_win":start.key_rightalt_to_key_win,
+                    "keybindings":start.keybindings,
                     "key_repeat_delay":start.key_repeat_delay,
                     "key_repeat_frequency":start.key_repeat_frequency});
                 if let Some(back_as_touchpad_click) = start.ds4_back_as_touchpad_click {

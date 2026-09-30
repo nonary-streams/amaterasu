@@ -619,6 +619,89 @@ mod tests {
     }
 
     #[test]
+    fn keybindings_routes_preserve_order_empty_and_null_without_accepting_authority_fields() {
+        for path in [
+            "/v1/catalog/update_provider_overrides",
+            "/v1/pairing/update_client_config_overrides",
+        ] {
+            let route = resolve(path).unwrap();
+            let request = if path.contains("catalog") {
+                serde_json::json!({"id":"app-0000000000000001","expected_revision":7})
+            } else {
+                serde_json::json!({"certificate_id":"a".repeat(64),"expected_revision":7})
+            };
+            for selected in [
+                serde_json::json!(null),
+                serde_json::json!([]),
+                serde_json::json!([0, 255, 65, 66, 65, 67]),
+                serde_json::json!(vec![0_u8; 512]),
+            ] {
+                let mut body = request.clone();
+                body["config_overrides"] = serde_json::json!({"keybindings":selected});
+                assert_eq!(
+                    payload(route, &serde_json::to_vec(&body).unwrap()).unwrap()["config_overrides"]
+                        ["keybindings"],
+                    selected
+                );
+                for authority in ["caller", "owner", "client_id", "certificate_id"] {
+                    let mut forged = body.clone();
+                    forged["config_overrides"][authority] = serde_json::json!("forged");
+                    assert!(
+                        payload(route, &serde_json::to_vec(&forged).unwrap()).is_err(),
+                        "{forged}"
+                    );
+                }
+            }
+            for invalid in [
+                serde_json::json!([65]),
+                serde_json::json!([-1, 0]),
+                serde_json::json!([0, 256]),
+                serde_json::json!([65.0, 66]),
+                serde_json::json!([true, 66]),
+                serde_json::json!(["65", 66]),
+                serde_json::json!({}),
+                serde_json::json!(vec![0_u8; 514]),
+            ] {
+                let mut body = request.clone();
+                body["config_overrides"] = serde_json::json!({"keybindings":invalid});
+                assert!(
+                    payload(route, &serde_json::to_vec(&body).unwrap()).is_err(),
+                    "{body}"
+                );
+            }
+        }
+        let global = resolve("/v1/input/settings_update").unwrap();
+        for selected in [
+            serde_json::json!([]),
+            serde_json::json!([0, 255, 65, 66, 65, 67]),
+            serde_json::json!(vec![0_u8; 512]),
+        ] {
+            let body = serde_json::json!({"keyboard":true,"mouse":true,"expected_revision":0,"keybindings":selected});
+            assert_eq!(
+                payload(global, &serde_json::to_vec(&body).unwrap()).unwrap()["keybindings"],
+                selected
+            );
+        }
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!([65]),
+            serde_json::json!([-1, 0]),
+            serde_json::json!([0, 256]),
+            serde_json::json!([65.0, 66]),
+            serde_json::json!([true, 66]),
+            serde_json::json!(["65", 66]),
+            serde_json::json!({}),
+            serde_json::json!(vec![0_u8; 514]),
+        ] {
+            let body = serde_json::json!({"keyboard":true,"mouse":true,"expected_revision":0,"keybindings":invalid});
+            assert!(
+                payload(global, &serde_json::to_vec(&body).unwrap()).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
     fn scoped_advanced_input_routes_preserve_inheritance_false_and_zero() {
         for path in [
             "/v1/catalog/update_provider_overrides",

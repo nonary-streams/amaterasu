@@ -292,6 +292,7 @@ impl Controller {
                         "high_resolution_scrolling": record.scoped_high_resolution_scrolling,
                         "always_send_scancodes": record.scoped_always_send_scancodes,
                         "key_rightalt_to_key_win": record.scoped_key_rightalt_to_key_win,
+                        "keybindings": record.scoped_keybindings,
                         "key_repeat_delay": record.scoped_key_repeat_delay,
                         "key_repeat_frequency": record.scoped_key_repeat_frequency,
                         "ping_timeout_ms": record.global_ping_timeout_ms,
@@ -1472,6 +1473,11 @@ fn project_application_policy(
         .peer
         .client_key_rightalt_to_key_win
         .or(application_overrides.key_rightalt_to_key_win);
+    record.scoped_keybindings = record
+        .peer
+        .client_keybindings
+        .clone()
+        .or(application_overrides.keybindings.clone());
     record.scoped_key_repeat_delay = record
         .peer
         .client_key_repeat_delay
@@ -1579,6 +1585,7 @@ pub(super) struct ApplicationConfigOverrides {
     high_resolution_scrolling: Option<bool>,
     always_send_scancodes: Option<bool>,
     key_rightalt_to_key_win: Option<bool>,
+    keybindings: Option<amaterasu_input_policy::KeyBindings>,
     key_repeat_delay: Option<u32>,
     key_repeat_frequency: Option<f64>,
 }

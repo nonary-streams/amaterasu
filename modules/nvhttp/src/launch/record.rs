@@ -109,6 +109,8 @@ pub struct Record {
     pub scoped_high_resolution_scrolling: Option<bool>,
     pub scoped_always_send_scancodes: Option<bool>,
     pub scoped_key_rightalt_to_key_win: Option<bool>,
+    /// The entire selected ordered list; absence is resolved by input at acquire.
+    pub scoped_keybindings: Option<amaterasu_input_policy::KeyBindings>,
     pub scoped_key_repeat_delay: Option<u32>,
     pub scoped_key_repeat_frequency: Option<f64>,
     pub global_ping_timeout_ms: u32,
@@ -248,6 +250,7 @@ impl Record {
             scoped_high_resolution_scrolling: None,
             scoped_always_send_scancodes: None,
             scoped_key_rightalt_to_key_win: None,
+            scoped_keybindings: None,
             scoped_key_repeat_delay: None,
             scoped_key_repeat_frequency: None,
             global_ping_timeout_ms,

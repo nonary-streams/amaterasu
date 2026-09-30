@@ -285,6 +285,8 @@ pub struct ClientConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_rightalt_to_key_win: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keybindings: Option<amaterasu_input_policy::KeyBindings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_repeat_delay: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_repeat_frequency: Option<f64>,
@@ -451,6 +453,7 @@ impl ClientConfigOverrides {
             && self.high_resolution_scrolling.is_none()
             && self.always_send_scancodes.is_none()
             && self.key_rightalt_to_key_win.is_none()
+            && self.keybindings.is_none()
             && self.key_repeat_delay.is_none()
             && self.key_repeat_frequency.is_none()
     }
@@ -1589,5 +1592,55 @@ mod software_encoder_tests {
             let options: ClientConfigOverrides = serde_json::from_value(invalid).unwrap();
             assert!(options.validate().is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod keybindings_override_tests {
+    use super::ClientConfigOverrides;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn ordered_keybindings_are_sparse_and_explicit_empty_replaces_inheritance() {
+        for inherited in [json!({}), json!({"keybindings":null})] {
+            let overrides: ClientConfigOverrides = serde_json::from_value(inherited).unwrap();
+            assert!(overrides.keybindings.is_none());
+            assert!(overrides.is_empty());
+            assert_eq!(serde_json::to_value(overrides).unwrap(), json!({}));
+        }
+        for list in [
+            json!([]),
+            json!([0, 255, 65, 66, 65, 67]),
+            json!(vec![0_u8; 512]),
+        ] {
+            let value = json!({"keybindings":list});
+            let overrides: ClientConfigOverrides = serde_json::from_value(value.clone()).unwrap();
+            assert!(overrides.validate().is_ok());
+            assert!(!overrides.is_empty());
+            assert_eq!(serde_json::to_value(overrides).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn malformed_keybindings_reject_exact_types_byte_bounds_and_pair_count() {
+        for invalid in [
+            json!([65]),
+            json!([-1, 0]),
+            json!([0, 256]),
+            json!([65.0, 66]),
+            json!([true, 66]),
+            json!(["65", 66]),
+            json!([[65, 66]]),
+            json!({"65":66}),
+            json!("65,66"),
+            json!(vec![0_u8; 514]),
+        ] {
+            assert!(
+                serde_json::from_value::<ClientConfigOverrides>(json!({"keybindings":invalid}))
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(serde_json::from_value::<ClientConfigOverrides>(Value::Null).is_err());
     }
 }

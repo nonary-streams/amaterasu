@@ -611,6 +611,7 @@ pub(super) struct ClientConfigOverrides {
     pub(super) high_resolution_scrolling: Option<bool>,
     pub(super) always_send_scancodes: Option<bool>,
     pub(super) key_rightalt_to_key_win: Option<bool>,
+    pub(super) keybindings: Option<amaterasu_input_policy::KeyBindings>,
     pub(super) key_repeat_delay: Option<u32>,
     pub(super) key_repeat_frequency: Option<f64>,
     pub(super) frame_limiter_enable: Option<bool>,

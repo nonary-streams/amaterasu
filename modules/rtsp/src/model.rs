@@ -513,6 +513,8 @@ pub struct Open {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_rightalt_to_key_win: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keybindings: Option<amaterasu_input_policy::KeyBindings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_repeat_delay: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_repeat_frequency: Option<f64>,
@@ -854,6 +856,7 @@ impl Open {
                 "high_resolution_scrolling": self.high_resolution_scrolling,
                 "always_send_scancodes": self.always_send_scancodes,
                 "key_rightalt_to_key_win": self.key_rightalt_to_key_win,
+                "keybindings": self.keybindings,
                 "key_repeat_delay": self.key_repeat_delay,
                 "key_repeat_frequency": self.key_repeat_frequency,
                 "device_name": self.device_name,
@@ -2488,6 +2491,40 @@ mod tests {
             selected_timeout.arm(42)["configuration"]["back_button_timeout"],
             -1
         );
+    }
+
+    #[test]
+    fn ordered_keybindings_open_snapshot_preserves_null_empty_and_duplicates_in_arm() {
+        for selected in [
+            None,
+            Some(json!(null)),
+            Some(json!([])),
+            Some(json!([0, 255, 65, 66, 65, 67])),
+        ] {
+            let mut value = open_json();
+            if let Some(selected) = &selected {
+                value["keybindings"] = selected.clone();
+            }
+            let request: Open = serde_json::from_value(value).unwrap();
+            assert!(request.validate(false).is_ok());
+            assert_eq!(
+                request.arm(51)["configuration"]["keybindings"],
+                selected.unwrap_or(Value::Null)
+            );
+        }
+        for invalid in [
+            json!([65]),
+            json!([0, 256]),
+            json!([-1, 0]),
+            json!([65.0, 66]),
+            json!(["65", 66]),
+            json!({}),
+            json!(vec![0_u8; 514]),
+        ] {
+            let mut value = open_json();
+            value["keybindings"] = invalid.clone();
+            assert!(serde_json::from_value::<Open>(value).is_err(), "{invalid}");
+        }
     }
 
     #[test]

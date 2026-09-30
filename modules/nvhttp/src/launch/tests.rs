@@ -3790,3 +3790,140 @@ fn malformed_software_application_options_fail_before_rtsp_and_launch() {
         assert!(!broker.actions().iter().any(|(service,action)|(*service=="amaterasu.rtsp/1"&&*action=="open")||(*service=="amaterasu.launch/1"&&*action=="launch_export")));
     }
 }
+
+fn peer_with_keybindings(marker: u8, keybindings: Option<Value>) -> PeerIdentity {
+    let certificate = vec![marker; 32];
+    let overrides: ClientConfigOverrides =
+        serde_json::from_value(json!({"keybindings":keybindings})).unwrap();
+    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            format!("client-{marker}"),
+            fingerprint(&certificate),
+            overrides,
+        )
+        .unwrap()
+}
+
+#[test]
+fn admitted_keybindings_select_the_client_whole_list_then_application_then_global() {
+    let application = json!([65, 66, 70, 71]);
+    let client = json!([65, 67, 65, 68, 0, 255]);
+    for (marker, client, application, expected) in [
+        (71, Some(client.clone()), Some(application.clone()), client),
+        (72, Some(json!([])), Some(application.clone()), json!([])),
+        (
+            73,
+            Some(Value::Null),
+            Some(application.clone()),
+            application.clone(),
+        ),
+        (74, None, Some(application.clone()), application),
+        (75, None, Some(json!([])), json!([])),
+        (76, None, Some(Value::Null), Value::Null),
+        (77, None, None, Value::Null),
+    ] {
+        let now = Instant::now();
+        let mut broker = Broker {
+            application_input_overrides: application
+                .map(|selected| json!({"keybindings":selected})),
+            ..Broker::default()
+        };
+        let mut controller = Controller::new(Some(config())).unwrap();
+        assert!(
+            controller
+                .launch(
+                    10,
+                    request(marker),
+                    peer_with_keybindings(marker, client),
+                    now
+                )
+                .is_none()
+        );
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200);
+        let opened = opened_rtsp_payload(&broker);
+        assert_eq!(opened["keybindings"], expected);
+        assert_eq!(
+            opened["display_policy_snapshot"]["certificate_id"],
+            fingerprint(&[marker; 32])
+        );
+    }
+}
+
+#[test]
+fn invalid_keybindings_fail_before_launch_export_and_rtsp_open() {
+    for invalid in [
+        json!([65]),
+        json!([0, 256]),
+        json!([-1, 0]),
+        json!([65.0, 66]),
+        json!([true, 66]),
+        json!(["65", 66]),
+        json!({}),
+        json!(vec![0_u8; 514]),
+    ] {
+        assert!(
+            serde_json::from_value::<ClientConfigOverrides>(json!({"keybindings":invalid}))
+                .is_err()
+        );
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker {
+            application_input_overrides: Some(json!({"keybindings":invalid})),
+            ..Broker::default()
+        };
+        assert!(controller.launch(10, request(78), peer(78), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_ne!(reply.status, 200, "{invalid}");
+        assert!(
+            !broker
+                .actions()
+                .contains(&("amaterasu.launch/1", "launch_export"))
+        );
+        assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+    }
+}
+
+#[test]
+fn keybindings_do_not_make_a_mismatched_certificate_an_authorized_client() {
+    let certificate = vec![79; 32];
+    let peer = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate).unwrap();
+    let overrides = serde_json::from_value(json!({"keybindings":[65,66]})).unwrap();
+    assert_eq!(
+        peer.with_paired_identity("client-79".into(), "00".repeat(32), overrides)
+            .err(),
+        Some("invalid_paired_identity")
+    );
+}
+
+#[test]
+fn changed_application_keybindings_after_preflight_cannot_open_rtsp() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({"keybindings":[65,66]})),
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(80), peer(80), now).is_none());
+    for _ in 0..8 {
+        controller.poll(now, &mut |command| broker.send(command));
+        if controller
+            .records
+            .values()
+            .any(|record| record.stage == Stage::LaunchApplication)
+        {
+            break;
+        }
+    }
+    assert!(
+        controller
+            .records
+            .values()
+            .any(|record| record.stage == Stage::LaunchApplication)
+    );
+    broker.application_input_overrides = Some(json!({"keybindings":[]}));
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_ne!(reply.status, 200);
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+}
