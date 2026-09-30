@@ -10,16 +10,39 @@ use std::sync::{Arc, Mutex};
 
 const METRICS: &str = "test.stream-source/1";
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Settings {
     desktop_geometry: bool,
+    enable_video: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            desktop_geometry: false,
+            enable_video: true,
+        }
+    }
+}
+
+impl Settings {
+    fn source_kinds(&self) -> Vec<Kind> {
+        if self.enable_video {
+            vec![Kind::Video, Kind::Audio]
+        } else {
+            vec![Kind::Audio]
+        }
+    }
 }
 
 struct StreamSource {
     runtime: RuntimeClient,
     state: native::Shared,
-    _factories: [Box<native::Factory>; 2],
+    // Native factory contexts point into their boxes and must keep stable
+    // addresses when this collection or the owning module moves.
+    #[allow(clippy::vec_box)]
+    _factories: Vec<Box<native::Factory>>,
 }
 
 impl ManagedModule for StreamSource {
@@ -30,9 +53,12 @@ impl ManagedModule for StreamSource {
         let settings: Settings = serde_json::from_value(payload)
             .map_err(|error| format!("invalid stream source settings: {error}"))?;
         let state = Arc::new(Mutex::new(Controller::new(settings.desktop_geometry)));
-        let factories =
-            [Kind::Video, Kind::Audio].map(|kind| native::Factory::new(state.clone(), kind));
-        for (kind, factory) in [Kind::Video, Kind::Audio].into_iter().zip(&factories) {
+        let kinds = settings.source_kinds();
+        let factories: Vec<_> = kinds
+            .iter()
+            .map(|kind| native::Factory::new(state.clone(), *kind))
+            .collect();
+        for (kind, factory) in kinds.into_iter().zip(&factories) {
             runtime.require_success(Command::Register {
                 service: kind.service().into(),
             })?;
@@ -103,3 +129,27 @@ impl Drop for StreamSource {
 }
 
 amaterasu_module_sdk::export_module!(StreamSource);
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn existing_startup_settings_register_both_source_interfaces() {
+        for value in [json!({}), json!({"desktop_geometry": true})] {
+            let settings: Settings = serde_json::from_value(value).unwrap();
+            let kinds = settings.source_kinds();
+            assert_eq!(kinds.len(), 2);
+            assert!(kinds[0] == Kind::Video && kinds[1] == Kind::Audio);
+        }
+    }
+
+    #[test]
+    fn explicit_audio_only_startup_has_no_video_registration() {
+        let settings: Settings = serde_json::from_value(json!({"enable_video": false})).unwrap();
+        let kinds = settings.source_kinds();
+        assert_eq!(kinds.len(), 1);
+        assert!(kinds[0] == Kind::Audio);
+        assert!(serde_json::from_value::<Settings>(json!({"enable_video": "false"})).is_err());
+    }
+}

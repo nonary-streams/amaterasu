@@ -13,6 +13,8 @@ pub enum PackageProfile {
     Platform,
     MediaProbe,
     StreamProbe,
+    /// Test-only controlled NV12 capture with the real video and encoder modules.
+    SoftwareProbe,
 }
 
 #[derive(Clone, Copy)]
@@ -507,6 +509,33 @@ const STREAM_SOURCE: ComponentDefinition = ComponentDefinition {
     native_uses: &[],
     dependencies: &[RUNTIME_ID],
 };
+
+// These substitutions belong only to the explicit software qualification package.
+// The fixture aliases the existing capture ABI without claiming desktop capture.
+const CAPTURE_SOURCE: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.capture-source",
+    library: "amaterasu_capture_source",
+    provides: &["amaterasu.capture-dxgi/1", "test.capture-source/1"],
+    calls: &[],
+    publishes: &[],
+    native_provides: &["amaterasu.capture-dxgi/1"],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
+};
+
+const SOFTWARE_AUDIO_SOURCE: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.software-probe-audio",
+    provides: &["amaterasu.audio/1", "test.stream-source/1"],
+    native_provides: &["amaterasu.audio/1"],
+    ..STREAM_SOURCE
+};
+
+const SOFTWARE_VIDEO: ComponentDefinition = ComponentDefinition {
+    calls: &["amaterasu.capture-dxgi/1", "amaterasu.encode/1"],
+    native_uses: &["amaterasu.capture-dxgi/1", "amaterasu.encode/1"],
+    dependencies: &[RUNTIME_ID, "amaterasu.capture-source", "amaterasu.encode"],
+    ..VIDEO
+};
 const RTSP: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.rtsp",
     library: "amaterasu_rtsp",
@@ -547,6 +576,24 @@ const STREAM_SESSION_PROBE: ComponentDefinition = ComponentDefinition {
         "amaterasu.state",
         "amaterasu.session-history",
         "amaterasu.stream-source",
+        "amaterasu.audio-encode",
+        "amaterasu.media-transport",
+        "amaterasu.control-transport",
+        "amaterasu.frame-limiter",
+    ],
+    ..STREAM_SESSION
+};
+
+const STREAM_SESSION_SOFTWARE_PROBE: ComponentDefinition = ComponentDefinition {
+    dependencies: &[
+        "amaterasu.input-probe",
+        RUNTIME_ID,
+        "amaterasu.session",
+        "amaterasu.display",
+        "amaterasu.state",
+        "amaterasu.session-history",
+        "amaterasu.video",
+        "amaterasu.software-probe-audio",
         "amaterasu.audio-encode",
         "amaterasu.media-transport",
         "amaterasu.control-transport",
@@ -693,6 +740,38 @@ const MANAGEMENT_PROBE: ComponentDefinition = ComponentDefinition {
     ..MANAGEMENT
 };
 
+const MANAGEMENT_SOFTWARE_PROBE: ComponentDefinition = ComponentDefinition {
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.authentication",
+        "amaterasu.state",
+        "amaterasu.catalog",
+        "amaterasu.configuration",
+        "amaterasu.session",
+        "amaterasu.application",
+        "amaterasu.input-probe",
+        "amaterasu.steam",
+        "amaterasu.playnite",
+        "amaterasu.lutris",
+        "amaterasu.diagnostics",
+        "amaterasu.host-configuration",
+        "amaterasu.pairing",
+        "amaterasu.display",
+        "amaterasu.launch",
+        "amaterasu.capture-source",
+        "amaterasu.software-probe-audio",
+        "amaterasu.audio-encode",
+        "amaterasu.encode",
+        "amaterasu.video",
+        "amaterasu.nvhttp",
+        "amaterasu.rtsp",
+        "amaterasu.media-transport",
+        "amaterasu.control-transport",
+        "amaterasu.session-history",
+    ],
+    ..MANAGEMENT
+};
+
 impl PackageProfile {
     pub fn components(self) -> &'static [ComponentDefinition] {
         match self {
@@ -735,6 +814,37 @@ impl PackageProfile {
                 CONTROL_TRANSPORT,
                 FRAME_LIMITER,
                 STREAM_SESSION_PROBE,
+                RTSP,
+            ],
+            Self::SoftwareProbe => &[
+                RUNTIME,
+                STATE,
+                CONFIGURATION,
+                CATALOG,
+                APPLICATION,
+                HOST_CONFIGURATION,
+                DIAGNOSTICS,
+                STEAM,
+                PLAYNITE,
+                LUTRIS,
+                LAUNCH,
+                DISPLAY,
+                AUTHENTICATION,
+                MANAGEMENT_SOFTWARE_PROBE,
+                PAIRING,
+                NVHTTP,
+                SESSION,
+                SESSION_HISTORY,
+                CAPTURE_SOURCE,
+                SOFTWARE_AUDIO_SOURCE,
+                INPUT_PROBE,
+                AUDIO_ENCODE,
+                ENCODE,
+                SOFTWARE_VIDEO,
+                MEDIA_TRANSPORT,
+                CONTROL_TRANSPORT,
+                FRAME_LIMITER,
+                STREAM_SESSION_SOFTWARE_PROBE,
                 RTSP,
             ],
             Self::Platform => &[
@@ -797,6 +907,7 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
     for component in PackageProfile::Example
         .components()
         .iter()
+        .chain(PackageProfile::SoftwareProbe.components())
         .chain(PackageProfile::Platform.components())
         .chain(PackageProfile::MediaProbe.components())
         .chain(PackageProfile::StreamProbe.components())

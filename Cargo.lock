@@ -112,6 +112,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-capture-source"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-media",
+ "amaterasu-module-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-capture-wgc"
 version = "0.1.0"
 dependencies = [

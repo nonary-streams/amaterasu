@@ -86,3 +86,9 @@ default. These coordinates deliberately differ from the encoded 16×16 mode.
 The test-only metrics action `invalidate_geometry` then makes native video reads
 fail, exercising session failure and held-input cleanup. This simulates the
 production geometry watchdog; it does not enumerate or change desktop monitors.
+
+Startup `{"enable_video":false}` registers only the audio control/native services
+and metrics. Video counters remain zero, allowing the explicit software probe to
+load the real video pipeline beside this controlled PCM source. The default is
+`true`, preserving both source interfaces for existing stream probes. This option
+does not add a capture or encoder capability to the fixture.

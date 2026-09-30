@@ -9,6 +9,7 @@ fn every_profile_contains_unique_providers_and_all_dependencies() {
         PackageProfile::Platform,
         PackageProfile::MediaProbe,
         PackageProfile::StreamProbe,
+        PackageProfile::SoftwareProbe,
     ] {
         let components = profile.components();
         let ids: BTreeSet<_> = components.iter().map(|component| component.id).collect();
@@ -42,6 +43,89 @@ fn every_profile_contains_unique_providers_and_all_dependencies() {
             );
         }
     }
+}
+
+#[test]
+fn software_probe_uses_one_real_video_encoder_with_controlled_capture_and_audio() {
+    let components = PackageProfile::SoftwareProbe.components();
+    let component = |id| {
+        components
+            .iter()
+            .find(|component| component.id == id)
+            .unwrap()
+    };
+    assert_eq!(component(VIDEO.id).library, VIDEO.library);
+    assert_eq!(component(ENCODE.id).library, ENCODE.library);
+    assert_eq!(
+        component(CAPTURE_SOURCE.id).library,
+        "amaterasu_capture_source"
+    );
+    assert_eq!(
+        component(SOFTWARE_AUDIO_SOURCE.id).library,
+        STREAM_SOURCE.library
+    );
+    assert_eq!(
+        SOFTWARE_AUDIO_SOURCE.provides,
+        &["amaterasu.audio/1", "test.stream-source/1"]
+    );
+    assert_eq!(
+        SOFTWARE_AUDIO_SOURCE.native_provides,
+        &["amaterasu.audio/1"]
+    );
+    assert!(SOFTWARE_VIDEO.dependencies.contains(&CAPTURE_SOURCE.id));
+    assert!(
+        STREAM_SESSION_SOFTWARE_PROBE
+            .dependencies
+            .contains(&VIDEO.id)
+    );
+    assert!(
+        STREAM_SESSION_SOFTWARE_PROBE
+            .dependencies
+            .contains(&SOFTWARE_AUDIO_SOURCE.id)
+    );
+    for production_capture in [CAPTURE_DXGI.id, CAPTURE_WGC.id, AUDIO.id, INPUT.id] {
+        assert!(
+            !components
+                .iter()
+                .any(|component| component.id == production_capture)
+        );
+    }
+    let platform = PackageProfile::Platform.components();
+    assert!(
+        platform
+            .iter()
+            .any(|component| component.id == CAPTURE_DXGI.id)
+    );
+    assert!(
+        !platform
+            .iter()
+            .any(|component| component.id == CAPTURE_SOURCE.id)
+    );
+}
+
+#[test]
+fn software_probe_does_not_narrow_existing_development_native_grants() {
+    let directory = std::env::temp_dir().join(format!(
+        "amaterasu-software-probe-profile-{}",
+        std::process::id()
+    ));
+    let policy = development_policy(&directory).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+    assert_eq!(
+        policy.principals[VIDEO.id].native_use,
+        VIDEO.grants().native_use
+    );
+    assert_eq!(
+        policy.principals[STREAM_SOURCE.id].native_provide,
+        STREAM_SOURCE.grants().native_provide
+    );
+    assert_eq!(
+        policy.principals[CAPTURE_SOURCE.id].native_provide,
+        CAPTURE_SOURCE.grants().native_provide
+    );
+    let installer = installer_policy("web", BTreeMap::new());
+    assert!(!installer.principals.contains_key(CAPTURE_SOURCE.id));
+    assert!(!installer.principals.contains_key(SOFTWARE_AUDIO_SOURCE.id));
 }
 
 #[test]

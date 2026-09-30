@@ -21,13 +21,19 @@ fn run() -> PackageResult<()> {
         [command, root, artifacts, output, sequence]
             if matches!(
                 command.as_str(),
-                "pack" | "pack-platform" | "pack-media-probe" | "pack-stream-probe"
+                "pack"
+                    | "pack-platform"
+                    | "pack-media-probe"
+                    | "pack-stream-probe"
+                    | "pack-software-probe"
             ) =>
         {
             let sequence = sequence
                 .parse()
                 .map_err(|_| "sequence must be an unsigned integer")?;
-            let profile = if command == "pack-stream-probe" {
+            let profile = if command == "pack-software-probe" {
+                profiles::PackageProfile::SoftwareProbe
+            } else if command == "pack-stream-probe" {
                 profiles::PackageProfile::StreamProbe
             } else if command == "pack-media-probe" {
                 profiles::PackageProfile::MediaProbe
@@ -140,5 +146,5 @@ fn verify(root: &str, source: &str) -> PackageResult<()> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT"
+    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-software-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT"
 }

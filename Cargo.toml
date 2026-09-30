@@ -17,6 +17,7 @@ members = [
     "fixtures/echo",
     "fixtures/media-probe",
     "fixtures/stream-source",
+    "fixtures/capture-source",
     "fixtures/input-probe",
     "modules/state",
     "modules/session",
