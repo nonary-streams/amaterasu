@@ -40,6 +40,8 @@ namespace Amaterasu {
   interface CatalogApplicationDisplaySettings {
     "display-output"?: string;
     "virtual-screen"?: boolean;
+    "virtual-display-mode"?: string;
+    "virtual-display-layout"?: string;
   }
 
   type CatalogEntryWithDisplaySettings = Entry & CatalogApplicationDisplaySettings;
@@ -47,6 +49,8 @@ namespace Amaterasu {
   export function catalogApplicationDisplayFormValues(entry: Entry | undefined): {
     display_output: string;
     virtual_screen: "" | "true" | "false";
+    virtual_display_mode: "" | "disabled" | "per_client" | "shared";
+    virtual_display_layout: "" | "exclusive" | "extended" | "extended_primary" | "extended_isolated" | "extended_primary_isolated";
   } {
     const settings = entry as CatalogEntryWithDisplaySettings | undefined;
     const displayOutput = settings?.["display-output"];
@@ -58,11 +62,23 @@ namespace Amaterasu {
     const virtualScreen = settings?.["virtual-screen"];
     if (virtualScreen !== undefined && virtualScreen !== null && typeof virtualScreen !== "boolean")
       throw new Error("Existing virtual screen setting must be a boolean.");
+    const virtualDisplayMode = settings?.["virtual-display-mode"];
+    if (virtualDisplayMode !== undefined && virtualDisplayMode !== null &&
+        (typeof virtualDisplayMode !== "string" ||
+          !["disabled", "per_client", "shared"].includes(virtualDisplayMode)))
+      throw new Error("Existing virtual display mode must be disabled, per_client, or shared.");
+    const virtualDisplayLayout = settings?.["virtual-display-layout"];
+    if (virtualDisplayLayout !== undefined && virtualDisplayLayout !== null &&
+        (typeof virtualDisplayLayout !== "string" ||
+          !["exclusive", "extended", "extended_primary", "extended_isolated", "extended_primary_isolated"].includes(virtualDisplayLayout)))
+      throw new Error("Existing virtual display layout must be a supported layout token.");
     return {
       display_output: displayOutput ?? "",
       virtual_screen: virtualScreen === undefined || virtualScreen === null
         ? ""
         : virtualScreen ? "true" : "false",
+      virtual_display_mode: (virtualDisplayMode ?? "") as "" | "disabled" | "per_client" | "shared",
+      virtual_display_layout: (virtualDisplayLayout ?? "") as "" | "exclusive" | "extended" | "extended_primary" | "extended_isolated" | "extended_primary_isolated",
     };
   }
 
@@ -76,9 +92,19 @@ namespace Amaterasu {
     const virtualScreen = String(data.get("virtual_screen") ?? "");
     if (virtualScreen !== "" && virtualScreen !== "true" && virtualScreen !== "false")
       throw new Error("Virtual screen must inherit the host setting or be true or false.");
+    const virtualDisplayMode = String(data.get("virtual_display_mode") ?? "");
+    if (virtualDisplayMode !== "" &&
+        !["disabled", "per_client", "shared"].includes(virtualDisplayMode))
+      throw new Error("Virtual display mode must inherit or be disabled, per_client, or shared.");
+    const virtualDisplayLayout = String(data.get("virtual_display_layout") ?? "");
+    if (virtualDisplayLayout !== "" &&
+        !["exclusive", "extended", "extended_primary", "extended_isolated", "extended_primary_isolated"].includes(virtualDisplayLayout))
+      throw new Error("Virtual display layout must inherit or use a supported layout token.");
     return {
       ...(displayOutput ? { "display-output": displayOutput } : {}),
       ...(virtualScreen === "" ? {} : { "virtual-screen": virtualScreen === "true" }),
+      ...(virtualDisplayMode === "" ? {} : { "virtual-display-mode": virtualDisplayMode }),
+      ...(virtualDisplayLayout === "" ? {} : { "virtual-display-layout": virtualDisplayLayout }),
     };
   }
 
@@ -1500,6 +1526,34 @@ namespace Amaterasu {
       virtualScreen.append(option);
     }
     virtualScreen.value = appDisplayValues.virtual_screen;
+    const virtualDisplayMode = el("select");
+    virtualDisplayMode.name = "virtual_display_mode";
+    for (const [value, label] of [
+      ["", "Inherit"],
+      ["disabled", "Disabled"],
+      ["per_client", "Per client"],
+      ["shared", "Shared"],
+    ] as const) {
+      const option = el("option", "", label);
+      option.value = value;
+      virtualDisplayMode.append(option);
+    }
+    virtualDisplayMode.value = appDisplayValues.virtual_display_mode;
+    const virtualDisplayLayout = el("select");
+    virtualDisplayLayout.name = "virtual_display_layout";
+    for (const [value, label] of [
+      ["", "Inherit"],
+      ["exclusive", "Exclusive"],
+      ["extended", "Extended"],
+      ["extended_primary", "Extended primary"],
+      ["extended_isolated", "Extended isolated"],
+      ["extended_primary_isolated", "Extended primary isolated"],
+    ] as const) {
+      const option = el("option", "", label);
+      option.value = value;
+      virtualDisplayLayout.append(option);
+    }
+    virtualDisplayLayout.value = appDisplayValues.virtual_display_layout;
     const outputValues = applicationOutputFormValues(entry?.output);
     const outputMode = el("select");
     outputMode.name = "output_mode";
@@ -1700,6 +1754,16 @@ namespace Amaterasu {
         "Virtual screen request",
         virtualScreen,
         "Inherit the host setting or explicitly request or avoid a virtual screen.",
+      ),
+      field(
+        "Virtual display mode",
+        virtualDisplayMode,
+        "Inherit the host mode or explicitly disable, use per-client, or share a virtual display.",
+      ),
+      field(
+        "Virtual display layout",
+        virtualDisplayLayout,
+        "Inherit the host layout or select how virtual displays are arranged.",
       ),
       field("Command output", outputMode, "Use default discards command output without saving an output value."),
       outputFile,

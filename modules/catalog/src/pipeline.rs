@@ -2967,6 +2967,8 @@ fn playnite_fullscreen_entry(config_overrides: ConfigOverrides) -> Entry {
         output: None,
         display_output: None,
         virtual_screen: None,
+        virtual_display_mode: None,
+        virtual_display_layout: None,
         config_overrides,
         exclude_global_prep_cmd: false,
         prep_cmd: Vec::new(),

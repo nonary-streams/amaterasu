@@ -257,6 +257,10 @@ pub struct ApplicationDisplaySettings {
     pub display_output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_screen: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_display_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_display_layout: Option<String>,
 }
 
 impl ApplicationDisplaySettings {
@@ -277,17 +281,32 @@ impl ApplicationDisplaySettings {
             Some(Value::Bool(value)) => Some(*value),
             Some(_) => return Err("invalid_catalog_response"),
         };
+        let virtual_display_mode =
+            match catalog_entry_field(entry, "virtual-display-mode", "virtual_display_mode")? {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) => Some(value.clone()),
+                Some(_) => return Err("invalid_catalog_response"),
+            };
+        let virtual_display_layout =
+            match catalog_entry_field(entry, "virtual-display-layout", "virtual_display_layout")? {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) => Some(value.clone()),
+                Some(_) => return Err("invalid_catalog_response"),
+            };
         let settings = Self {
             display_output,
             virtual_screen,
+            virtual_display_mode,
+            virtual_display_layout,
         };
         settings
             .validate()
             .map_err(|_| "invalid_catalog_response")?;
-        Ok(
-            (settings.display_output.is_some() || settings.virtual_screen.is_some())
-                .then_some(settings),
-        )
+        Ok((settings.display_output.is_some()
+            || settings.virtual_screen.is_some()
+            || settings.virtual_display_mode.is_some()
+            || settings.virtual_display_layout.is_some())
+        .then_some(settings))
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -295,6 +314,26 @@ impl ApplicationDisplaySettings {
             .display_output
             .as_deref()
             .is_some_and(|output| output.len() > 1_024 || output.chars().any(char::is_control))
+        {
+            return Err("invalid_application_display_settings");
+        }
+        if self
+            .virtual_display_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "disabled" | "per_client" | "shared"))
+            || self
+                .virtual_display_layout
+                .as_deref()
+                .is_some_and(|layout| {
+                    !matches!(
+                        layout,
+                        "exclusive"
+                            | "extended"
+                            | "extended_primary"
+                            | "extended_isolated"
+                            | "extended_primary_isolated"
+                    )
+                })
         {
             return Err("invalid_application_display_settings");
         }
@@ -2194,18 +2233,24 @@ mod tests {
         assert_eq!(
             ApplicationDisplaySettings::from_catalog_entry(&json!({
                 "display-output":null,
-                "virtual-screen":null
+                "virtual-screen":null,
+                "virtual-display-mode":null,
+                "virtual-display-layout":null
             })),
             Ok(None)
         );
         assert_eq!(
             ApplicationDisplaySettings::from_catalog_entry(&json!({
                 "display_output":"DISPLAY-1",
-                "virtual_screen":false
+                "virtual_screen":false,
+                "virtual-display-mode":"disabled",
+                "virtual_display_layout":"extended_primary_isolated"
             })),
             Ok(Some(ApplicationDisplaySettings {
                 display_output: Some("DISPLAY-1".into()),
                 virtual_screen: Some(false),
+                virtual_display_mode: Some("disabled".into()),
+                virtual_display_layout: Some("extended_primary_isolated".into()),
             }))
         );
         assert!(
@@ -2221,16 +2266,49 @@ mod tests {
             }))
             .is_err()
         );
+        for invalid_entry in [
+            json!({"virtual-display-mode":true}),
+            json!({"virtual-display-mode":"inherit"}),
+            json!({"virtual-display-layout":"extended_primary_isolated_extra"}),
+            json!({"virtual-display-mode":"shared", "virtual_display_mode":"disabled"}),
+        ] {
+            assert!(ApplicationDisplaySettings::from_catalog_entry(&invalid_entry).is_err());
+        }
 
         let explicit_false = ApplicationDisplaySettings {
             display_output: Some("DISPLAY-1".into()),
             virtual_screen: Some(false),
+            virtual_display_mode: Some("disabled".into()),
+            virtual_display_layout: Some("extended_primary".into()),
         };
         explicit_false.validate().unwrap();
         assert_eq!(
             serde_json::to_value(&explicit_false).unwrap(),
-            json!({"display_output":"DISPLAY-1", "virtual_screen":false})
+            json!({
+                "display_output":"DISPLAY-1",
+                "virtual_screen":false,
+                "virtual_display_mode":"disabled",
+                "virtual_display_layout":"extended_primary"
+            })
         );
+        let all_layouts = [
+            "exclusive",
+            "extended",
+            "extended_primary",
+            "extended_isolated",
+            "extended_primary_isolated",
+        ];
+        for layout in all_layouts {
+            let settings = ApplicationDisplaySettings {
+                virtual_display_layout: Some(layout.into()),
+                ..ApplicationDisplaySettings::default()
+            };
+            settings.validate().unwrap();
+            assert_eq!(
+                serde_json::to_value(settings).unwrap(),
+                json!({"virtual_display_layout":layout})
+            );
+        }
 
         let omitted: Operation = serde_json::from_value(json!({
             "action":"launch_export",
@@ -2254,7 +2332,9 @@ mod tests {
             "app_id":"app-0000000000000001",
             "application_display_settings": {
                 "display_output":"DISPLAY-1",
-                "virtual_screen":false
+                "virtual_screen":false,
+                "virtual_display_mode":"disabled",
+                "virtual_display_layout":"extended_primary"
             }
         }))
         .unwrap();
@@ -2274,7 +2354,9 @@ mod tests {
             "app_id":"app-0000000000000001",
             "application_display_settings": {
                 "display_output":null,
-                "virtual_screen":null
+                "virtual_screen":null,
+                "virtual_display_mode":null,
+                "virtual_display_layout":null
             }
         }))
         .unwrap();
@@ -2292,6 +2374,8 @@ mod tests {
         for invalid_settings in [
             json!({"display_output":true}),
             json!({"virtual_screen":"false"}),
+            json!({"virtual_display_mode":true}),
+            json!({"virtual_display_layout":[]}),
             json!({"unknown":false}),
         ] {
             assert!(
@@ -2315,6 +2399,23 @@ mod tests {
             .unwrap();
             assert_eq!(invalid.validate(), Err("invalid_request"));
         }
+        for invalid_value in [
+            ("virtual_display_mode", "inherit"),
+            ("virtual_display_mode", "DISABLED"),
+            ("virtual_display_layout", "auto"),
+            ("virtual_display_layout", "extended_primary_isolated_extra"),
+        ] {
+            let invalid: Operation = serde_json::from_value(json!({
+                "action":"launch_export",
+                "operation_id":"display-bad-enum",
+                "app_id":"app-0000000000000001",
+                "application_display_settings":{
+                    (invalid_value.0):invalid_value.1
+                }
+            }))
+            .unwrap();
+            assert_eq!(invalid.validate(), Err("invalid_request"));
+        }
 
         let admitted: Operation = serde_json::from_value(json!({
             "action":"prepare_display_admission",
@@ -2323,7 +2424,11 @@ mod tests {
             "global_overrides":{},
             "catalog_revision":1,
             "application_display_overrides":{},
-            "application_display_settings":{"virtual_screen":false},
+            "application_display_settings":{
+                "virtual_screen":false,
+                "virtual_display_mode":"per_client",
+                "virtual_display_layout":"extended_isolated"
+            },
             "certificate_id":"a".repeat(64),
             "client_display_overrides":{},
             "rtsp_operation_id":"display-rtsp",
@@ -2339,7 +2444,7 @@ mod tests {
             "global_overrides":{},
             "catalog_revision":1,
             "application_display_overrides":{},
-            "application_display_settings":{"display_output":"x".repeat(1_025)},
+            "application_display_settings":{"virtual_display_mode":"unexpected"},
             "certificate_id":"a".repeat(64),
             "client_display_overrides":{},
             "rtsp_operation_id":"display-rtsp",

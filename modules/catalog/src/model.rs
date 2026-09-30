@@ -43,6 +43,24 @@ pub struct Entry {
         alias = "virtual_screen"
     )]
     pub virtual_screen: Option<bool>,
+    /// Optional app-specific virtual display mode. Absence inherits the host
+    /// policy; `disabled` is an explicit per-application override.
+    #[serde(
+        default,
+        rename = "virtual-display-mode",
+        skip_serializing_if = "Option::is_none",
+        alias = "virtual_display_mode"
+    )]
+    pub virtual_display_mode: Option<String>,
+    /// Optional app-specific virtual display layout. Absence inherits the
+    /// host policy.
+    #[serde(
+        default,
+        rename = "virtual-display-layout",
+        skip_serializing_if = "Option::is_none",
+        alias = "virtual_display_layout"
+    )]
+    pub virtual_display_layout: Option<String>,
     #[serde(default, skip_serializing_if = "ConfigOverrides::is_empty")]
     pub config_overrides: ConfigOverrides,
     #[serde(
@@ -1111,6 +1129,29 @@ impl Entry {
             .is_some_and(|output| !bounded_text(output, 1_024))
         {
             return Err("display_output exceeds 1024 bytes or contains control characters");
+        }
+        if self
+            .virtual_display_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "disabled" | "per_client" | "shared"))
+        {
+            return Err("virtual_display_mode must be disabled, per_client, or shared");
+        }
+        if self
+            .virtual_display_layout
+            .as_deref()
+            .is_some_and(|layout| {
+                !matches!(
+                    layout,
+                    "exclusive"
+                        | "extended"
+                        | "extended_primary"
+                        | "extended_isolated"
+                        | "extended_primary_isolated"
+                )
+            })
+        {
+            return Err("invalid virtual_display_layout");
         }
         self.config_overrides.validate()?;
         validate_raw_preparation(&self.prep_cmd)?;

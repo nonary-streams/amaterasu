@@ -63,6 +63,8 @@ struct Harness {
     catalog_output: Option<Value>,
     catalog_display_output: Option<Value>,
     catalog_virtual_screen: Option<Value>,
+    catalog_virtual_display_mode: Option<Value>,
+    catalog_virtual_display_layout: Option<Value>,
     catalog_exclude_global_prep_cmd: Option<bool>,
     catalog_config_overrides: Option<Value>,
     catalog_working_directory: Option<String>,
@@ -131,6 +133,8 @@ impl Harness {
             catalog_output: None,
             catalog_display_output: None,
             catalog_virtual_screen: None,
+            catalog_virtual_display_mode: None,
+            catalog_virtual_display_layout: None,
             catalog_exclude_global_prep_cmd: None,
             catalog_config_overrides: None,
             catalog_working_directory: None,
@@ -649,6 +653,12 @@ impl Harness {
                         }
                         if let Some(virtual_screen) = &self.catalog_virtual_screen {
                             reply["entry"]["virtual-screen"] = virtual_screen.clone();
+                        }
+                        if let Some(mode) = &self.catalog_virtual_display_mode {
+                            reply["entry"]["virtual-display-mode"] = mode.clone();
+                        }
+                        if let Some(layout) = &self.catalog_virtual_display_layout {
+                            reply["entry"]["virtual-display-layout"] = layout.clone();
                         }
                         if let Some(exclude) = self.catalog_exclude_global_prep_cmd {
                             reply["entry"]["exclude_global_prep_cmd"] = json!(exclude);
@@ -1408,6 +1418,8 @@ fn per_application_display_settings_are_frozen_and_admission_bound() {
     let mut harness = Harness::new();
     harness.catalog_display_output = Some(json!("DISPLAY-1"));
     harness.catalog_virtual_screen = Some(json!(false));
+    harness.catalog_virtual_display_mode = Some(json!("disabled"));
+    harness.catalog_virtual_display_layout = Some(json!("extended_primary_isolated"));
     let mut pipeline = pipeline();
     let preflight = harness.request(
         &mut pipeline,
@@ -1418,7 +1430,12 @@ fn per_application_display_settings_are_frozen_and_admission_bound() {
             "app_id":"app-0000000000000001"
         }),
     );
-    let settings = json!({"display_output":"DISPLAY-1","virtual_screen":false});
+    let settings = json!({
+        "display_output":"DISPLAY-1",
+        "virtual_screen":false,
+        "virtual_display_mode":"disabled",
+        "virtual_display_layout":"extended_primary_isolated"
+    });
     assert_eq!(preflight["application_display_settings"], settings);
 
     let mut launch = launch_export("app-display-settings");
@@ -1430,6 +1447,20 @@ fn per_application_display_settings_are_frozen_and_admission_bound() {
     mismatch["display_admission_token"] = json!("00".repeat(32));
     assert_eq!(
         harness.request(&mut pipeline, "amaterasu.nvhttp", mismatch)["code"],
+        "application_display_settings_mismatch"
+    );
+    let mut mode_mismatch = launch.clone();
+    mode_mismatch["application_display_settings"]["virtual_display_mode"] = json!("shared");
+    mode_mismatch["display_admission_token"] = json!("00".repeat(32));
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", mode_mismatch)["code"],
+        "application_display_settings_mismatch"
+    );
+    let mut layout_mismatch = launch.clone();
+    layout_mismatch["application_display_settings"]["virtual_display_layout"] = json!("extended");
+    layout_mismatch["display_admission_token"] = json!("00".repeat(32));
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", layout_mismatch)["code"],
         "application_display_settings_mismatch"
     );
     assert_eq!(
@@ -1460,6 +1491,20 @@ fn per_application_display_settings_are_frozen_and_admission_bound() {
     prepare_mismatch["application_display_settings"]["virtual_screen"] = json!(true);
     assert_eq!(
         harness.request(&mut pipeline, "amaterasu.nvhttp", prepare_mismatch)["code"],
+        "display_admission_denied"
+    );
+    let mut mode_prepare_mismatch = prepare.clone();
+    mode_prepare_mismatch["application_display_settings"]["virtual_display_mode"] =
+        json!("per_client");
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", mode_prepare_mismatch)["code"],
+        "display_admission_denied"
+    );
+    let mut layout_prepare_mismatch = prepare.clone();
+    layout_prepare_mismatch["application_display_settings"]["virtual_display_layout"] =
+        json!("exclusive");
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", layout_prepare_mismatch)["code"],
         "display_admission_denied"
     );
     let admission = harness.request(&mut pipeline, "amaterasu.nvhttp", prepare.clone());

@@ -123,6 +123,77 @@ fn app_display_fields_are_sparse_typed_and_bounded_separately_from_command_outpu
     assert!(normalized.get("virtual-screen").is_none());
 }
 
+#[test]
+fn virtual_display_mode_and_layout_are_sparse_and_accept_only_pinned_tokens() {
+    let legacy = entry("Legacy virtual display settings");
+    let serialized = serde_json::to_value(&legacy).unwrap();
+    assert!(serialized.get("virtual-display-mode").is_none());
+    assert!(serialized.get("virtual-display-layout").is_none());
+
+    for mode in ["disabled", "per_client", "shared"] {
+        let mut value = serialized.clone();
+        value["virtual-display-mode"] = json!(mode);
+        let configured: Entry = serde_json::from_value(value).unwrap();
+        configured.validate().unwrap();
+        assert_eq!(configured.virtual_display_mode.as_deref(), Some(mode));
+        assert_eq!(
+            serde_json::to_value(configured).unwrap()["virtual-display-mode"],
+            mode
+        );
+    }
+
+    for layout in [
+        "exclusive",
+        "extended",
+        "extended_primary",
+        "extended_isolated",
+        "extended_primary_isolated",
+    ] {
+        let mut value = serialized.clone();
+        value["virtual_display_layout"] = json!(layout);
+        let configured: Entry = serde_json::from_value(value).unwrap();
+        configured.validate().unwrap();
+        assert_eq!(configured.virtual_display_layout.as_deref(), Some(layout));
+        let normalized = serde_json::to_value(configured).unwrap();
+        assert_eq!(normalized["virtual-display-layout"], layout);
+        assert!(normalized.get("virtual_display_layout").is_none());
+    }
+
+    let mut null_overrides = serialized.clone();
+    null_overrides["virtual-display-mode"] = Value::Null;
+    null_overrides["virtual-display-layout"] = Value::Null;
+    let null_overrides: Entry = serde_json::from_value(null_overrides).unwrap();
+    null_overrides.validate().unwrap();
+    assert_eq!(null_overrides.virtual_display_mode, None);
+    assert_eq!(null_overrides.virtual_display_layout, None);
+    let normalized = serde_json::to_value(null_overrides).unwrap();
+    assert!(normalized.get("virtual-display-mode").is_none());
+    assert!(normalized.get("virtual-display-layout").is_none());
+
+    for (field, value) in [
+        ("virtual-display-mode", json!("inherit")),
+        ("virtual-display-mode", json!("DISABLED")),
+        ("virtual-display-layout", json!("auto")),
+    ] {
+        let mut invalid = serialized.clone();
+        invalid[field] = value;
+        let invalid: Entry = serde_json::from_value(invalid).unwrap();
+        assert!(invalid.validate().is_err());
+    }
+    for (field, value) in [
+        ("virtual-display-mode", json!(true)),
+        ("virtual-display-layout", json!([])),
+    ] {
+        let mut invalid = serialized.clone();
+        invalid[field] = value;
+        assert!(serde_json::from_value::<Entry>(invalid).is_err());
+    }
+
+    let mut invalid_struct = legacy;
+    invalid_struct.virtual_display_mode = Some("x".repeat(1_025));
+    assert!(invalid_struct.validate().is_err());
+}
+
 fn entry(name: &str) -> Entry {
     serde_json::from_value(json!({
         "name": name,

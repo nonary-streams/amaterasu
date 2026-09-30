@@ -140,13 +140,19 @@ test("application display settings preserve inheritance, explicit false, bounds,
   const empty = model.catalogApplicationDisplayFormValues({});
   assert.equal(empty.display_output, "");
   assert.equal(empty.virtual_screen, "");
+  assert.equal(empty.virtual_display_mode, "");
+  assert.equal(empty.virtual_display_layout, "");
   const falseValue = model.catalogApplicationDisplayFormValues({
     "display-output": "Virtual-1",
     "virtual-screen": false,
+    "virtual-display-mode": "disabled",
+    "virtual-display-layout": "extended_primary_isolated",
     output: "command.log",
   });
   assert.equal(falseValue.display_output, "Virtual-1");
   assert.equal(falseValue.virtual_screen, "false");
+  assert.equal(falseValue.virtual_display_mode, "disabled");
+  assert.equal(falseValue.virtual_display_layout, "extended_primary_isolated");
 
   const inherited = JSON.parse(JSON.stringify(model.parseCatalogApplicationDisplaySettings(new FormData())));
   assert.deepEqual(inherited, {});
@@ -158,20 +164,58 @@ test("application display settings preserve inheritance, explicit false, bounds,
   fields.set("output_value", "logs/game.log");
   fields.set("display_output", "  DISPLAY-1  ");
   fields.set("virtual_screen", "false");
+  fields.set("virtual_display_mode", "disabled");
+  fields.set("virtual_display_layout", "extended_primary_isolated");
   const saved = model.entryFromForm(fields);
   Object.assign(saved, model.parseCatalogApplicationDisplaySettings(fields));
   assert.equal(saved.output, "logs/game.log");
   assert.equal(saved["display-output"], "DISPLAY-1");
   assert.equal(saved["virtual-screen"], false);
+  assert.equal(saved["virtual-display-mode"], "disabled");
+  assert.equal(saved["virtual-display-layout"], "extended_primary_isolated");
   assert.deepEqual(JSON.parse(JSON.stringify({
     "display-output": saved["display-output"],
     "virtual-screen": saved["virtual-screen"],
-  })), { "display-output": "DISPLAY-1", "virtual-screen": false });
+    "virtual-display-mode": saved["virtual-display-mode"],
+    "virtual-display-layout": saved["virtual-display-layout"],
+  })), {
+    "display-output": "DISPLAY-1",
+    "virtual-screen": false,
+    "virtual-display-mode": "disabled",
+    "virtual-display-layout": "extended_primary_isolated",
+  });
   fields.set("virtual_screen", "true");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(model.parseCatalogApplicationDisplaySettings(fields))),
+    {
+      "display-output": "DISPLAY-1",
+      "virtual-screen": true,
+      "virtual-display-mode": "disabled",
+      "virtual-display-layout": "extended_primary_isolated",
+    },
+  );
+  fields.set("virtual_display_mode", "per_client");
+  fields.set("virtual_display_layout", "extended");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(model.parseCatalogApplicationDisplaySettings(fields))),
+    {
+      "display-output": "DISPLAY-1",
+      "virtual-screen": true,
+      "virtual-display-mode": "per_client",
+      "virtual-display-layout": "extended",
+    },
+  );
+  fields.set("virtual_display_mode", "");
+  fields.set("virtual_display_layout", "");
   assert.deepEqual(
     JSON.parse(JSON.stringify(model.parseCatalogApplicationDisplaySettings(fields))),
     { "display-output": "DISPLAY-1", "virtual-screen": true },
   );
+  fields.set("virtual_display_mode", "inherit");
+  assert.throws(() => model.parseCatalogApplicationDisplaySettings(fields), /Virtual display mode/);
+  fields.set("virtual_display_mode", "");
+  fields.set("virtual_display_layout", "auto");
+  assert.throws(() => model.parseCatalogApplicationDisplaySettings(fields), /Virtual display layout/);
   fields.set("virtual_screen", "no");
   assert.throws(() => model.parseCatalogApplicationDisplaySettings(fields), /Virtual screen/);
 
@@ -184,6 +228,9 @@ test("application display settings preserve inheritance, explicit false, bounds,
     { "display-output": true },
     { "display-output": "x".repeat(1_025) },
     { "virtual-screen": "false" },
+    { "virtual-display-mode": true },
+    { "virtual-display-mode": "inherit" },
+    { "virtual-display-layout": "extended_primary_isolated_extra" },
   ]) {
     assert.throws(() => model.catalogApplicationDisplayFormValues(entry), /Existing/);
   }

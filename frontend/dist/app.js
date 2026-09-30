@@ -4131,11 +4131,23 @@ var Amaterasu;
         const virtualScreen = settings?.["virtual-screen"];
         if (virtualScreen !== undefined && virtualScreen !== null && typeof virtualScreen !== "boolean")
             throw new Error("Existing virtual screen setting must be a boolean.");
+        const virtualDisplayMode = settings?.["virtual-display-mode"];
+        if (virtualDisplayMode !== undefined && virtualDisplayMode !== null &&
+            (typeof virtualDisplayMode !== "string" ||
+                !["disabled", "per_client", "shared"].includes(virtualDisplayMode)))
+            throw new Error("Existing virtual display mode must be disabled, per_client, or shared.");
+        const virtualDisplayLayout = settings?.["virtual-display-layout"];
+        if (virtualDisplayLayout !== undefined && virtualDisplayLayout !== null &&
+            (typeof virtualDisplayLayout !== "string" ||
+                !["exclusive", "extended", "extended_primary", "extended_isolated", "extended_primary_isolated"].includes(virtualDisplayLayout)))
+            throw new Error("Existing virtual display layout must be a supported layout token.");
         return {
             display_output: displayOutput ?? "",
             virtual_screen: virtualScreen === undefined || virtualScreen === null
                 ? ""
                 : virtualScreen ? "true" : "false",
+            virtual_display_mode: (virtualDisplayMode ?? ""),
+            virtual_display_layout: (virtualDisplayLayout ?? ""),
         };
     }
     Amaterasu.catalogApplicationDisplayFormValues = catalogApplicationDisplayFormValues;
@@ -4147,9 +4159,19 @@ var Amaterasu;
         const virtualScreen = String(data.get("virtual_screen") ?? "");
         if (virtualScreen !== "" && virtualScreen !== "true" && virtualScreen !== "false")
             throw new Error("Virtual screen must inherit the host setting or be true or false.");
+        const virtualDisplayMode = String(data.get("virtual_display_mode") ?? "");
+        if (virtualDisplayMode !== "" &&
+            !["disabled", "per_client", "shared"].includes(virtualDisplayMode))
+            throw new Error("Virtual display mode must inherit or be disabled, per_client, or shared.");
+        const virtualDisplayLayout = String(data.get("virtual_display_layout") ?? "");
+        if (virtualDisplayLayout !== "" &&
+            !["exclusive", "extended", "extended_primary", "extended_isolated", "extended_primary_isolated"].includes(virtualDisplayLayout))
+            throw new Error("Virtual display layout must inherit or use a supported layout token.");
         return {
             ...(displayOutput ? { "display-output": displayOutput } : {}),
             ...(virtualScreen === "" ? {} : { "virtual-screen": virtualScreen === "true" }),
+            ...(virtualDisplayMode === "" ? {} : { "virtual-display-mode": virtualDisplayMode }),
+            ...(virtualDisplayLayout === "" ? {} : { "virtual-display-layout": virtualDisplayLayout }),
         };
     }
     Amaterasu.parseCatalogApplicationDisplaySettings = parseCatalogApplicationDisplaySettings;
@@ -5019,6 +5041,34 @@ var Amaterasu;
             virtualScreen.append(option);
         }
         virtualScreen.value = appDisplayValues.virtual_screen;
+        const virtualDisplayMode = Amaterasu.el("select");
+        virtualDisplayMode.name = "virtual_display_mode";
+        for (const [value, label] of [
+            ["", "Inherit"],
+            ["disabled", "Disabled"],
+            ["per_client", "Per client"],
+            ["shared", "Shared"],
+        ]) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = value;
+            virtualDisplayMode.append(option);
+        }
+        virtualDisplayMode.value = appDisplayValues.virtual_display_mode;
+        const virtualDisplayLayout = Amaterasu.el("select");
+        virtualDisplayLayout.name = "virtual_display_layout";
+        for (const [value, label] of [
+            ["", "Inherit"],
+            ["exclusive", "Exclusive"],
+            ["extended", "Extended"],
+            ["extended_primary", "Extended primary"],
+            ["extended_isolated", "Extended isolated"],
+            ["extended_primary_isolated", "Extended primary isolated"],
+        ]) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = value;
+            virtualDisplayLayout.append(option);
+        }
+        virtualDisplayLayout.value = appDisplayValues.virtual_display_layout;
         const outputValues = Amaterasu.applicationOutputFormValues(entry?.output);
         const outputMode = Amaterasu.el("select");
         outputMode.name = "output_mode";
@@ -5143,7 +5193,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null/empty to inherit the next scope; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettingsFields, steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null/empty to inherit the next scope; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettingsFields, steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }
