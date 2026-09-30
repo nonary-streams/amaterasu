@@ -19,6 +19,9 @@ use linux_pen_touch::LinuxPenTouch;
 #[path = "linux_ds4.rs"]
 mod linux_ds4;
 use linux_ds4::Ds4Gamepad;
+#[path = "linux_ds5.rs"]
+mod linux_ds5;
+use linux_ds5::Ds5Gamepad;
 #[cfg(test)]
 #[path = "linux_native_tests.rs"]
 mod native_tests;
@@ -454,6 +457,7 @@ impl GamepadDevice for UinputGamepad {
 enum LinuxGamepad {
     Xone(UinputGamepad),
     Ds4(Ds4Gamepad),
+    Ds5(Ds5Gamepad),
 }
 
 impl LinuxGamepad {
@@ -462,13 +466,15 @@ impl LinuxGamepad {
         slot: u8,
         profile: GamepadProfile,
         back_as_touchpad_click: bool,
+        ds5_randomize_mac: bool,
     ) -> InputResult<Self> {
         match profile {
             GamepadProfile::Auto | GamepadProfile::Xone => {
                 Ok(Self::Xone(UinputGamepad::create(path, slot)?))
             }
             GamepadProfile::Ds4 => Ok(Self::Ds4(Ds4Gamepad::create(slot, back_as_touchpad_click)?)),
-            GamepadProfile::Ds5 | GamepadProfile::Switch => Err(unavailable_profile(profile)),
+            GamepadProfile::Ds5 => Ok(Self::Ds5(Ds5Gamepad::create(slot, ds5_randomize_mac)?)),
+            GamepadProfile::Switch => Err(unavailable_profile(profile)),
         }
     }
 }
@@ -478,6 +484,7 @@ impl GamepadDevice for LinuxGamepad {
         match self {
             Self::Xone(device) => device.update(state),
             Self::Ds4(device) => device.update(state),
+            Self::Ds5(device) => device.update(state),
         }
     }
 
@@ -485,6 +492,7 @@ impl GamepadDevice for LinuxGamepad {
         match self {
             Self::Xone(device) => device.set_motion(motion_type, values),
             Self::Ds4(device) => device.set_motion(motion_type, values),
+            Self::Ds5(device) => device.set_motion(motion_type, values),
         }
     }
 
@@ -492,6 +500,7 @@ impl GamepadDevice for LinuxGamepad {
         match self {
             Self::Xone(device) => device.set_touch(touch),
             Self::Ds4(device) => device.set_touch(touch),
+            Self::Ds5(device) => device.set_touch(touch),
         }
     }
 
@@ -503,6 +512,7 @@ impl GamepadDevice for LinuxGamepad {
         match self {
             Self::Xone(device) => device.set_battery(state, percentage),
             Self::Ds4(device) => device.set_battery(state, percentage),
+            Self::Ds5(device) => device.set_battery(state, percentage),
         }
     }
 
@@ -510,6 +520,7 @@ impl GamepadDevice for LinuxGamepad {
         match self {
             Self::Xone(device) => device.recover_after_update_failure(error),
             Self::Ds4(device) => device.recover_after_update_failure(error),
+            Self::Ds5(device) => device.recover_after_update_failure(error),
         }
     }
 
@@ -517,6 +528,7 @@ impl GamepadDevice for LinuxGamepad {
         match self {
             Self::Xone(device) => device.set_ds4_back_as_touchpad_click(enabled),
             Self::Ds4(device) => device.set_ds4_back_as_touchpad_click(enabled),
+            Self::Ds5(_) => false,
         }
     }
 
@@ -524,6 +536,7 @@ impl GamepadDevice for LinuxGamepad {
         match self {
             Self::Xone(device) => device.release(),
             Self::Ds4(device) => device.release(),
+            Self::Ds5(device) => device.release(),
         }
     }
 }
@@ -552,6 +565,13 @@ pub struct LinuxBackend {
     gamepads: GamepadSlots<LinuxGamepad>,
     gamepad_probe: Option<Device>,
     ds4_probe: Option<Ds4Gamepad>,
+    ds5_probe: Option<Ds5Gamepad>,
+    xone_available: bool,
+    ds4_available: bool,
+    ds5_available: bool,
+    xone_unavailable_reason: Option<String>,
+    ds4_unavailable_reason: Option<String>,
+    ds5_unavailable_reason: Option<String>,
     controller_routes: [Option<GamepadProfile>; 16],
     pen_touch: LinuxPenTouch,
     controller_input_supported: bool,
@@ -562,6 +582,7 @@ pub struct LinuxBackend {
     ds4_back_as_touchpad_click: bool,
     motion_as_ds4: bool,
     touchpad_as_ds4: bool,
+    ds5_inputtino_randomize_mac: bool,
 }
 impl LinuxBackend {
     pub fn new(path: String) -> Self {
@@ -581,6 +602,13 @@ impl LinuxBackend {
             gamepads: GamepadSlots::new(),
             gamepad_probe: None,
             ds4_probe: None,
+            ds5_probe: None,
+            xone_available: false,
+            ds4_available: false,
+            ds5_available: false,
+            xone_unavailable_reason: None,
+            ds4_unavailable_reason: None,
+            ds5_unavailable_reason: None,
             controller_routes: [None; 16],
             pen_touch: LinuxPenTouch::new(),
             controller_input_supported: false,
@@ -591,6 +619,7 @@ impl LinuxBackend {
             ds4_back_as_touchpad_click: true,
             motion_as_ds4: true,
             touchpad_as_ds4: true,
+            ds5_inputtino_randomize_mac: true,
         }
     }
 
@@ -612,7 +641,56 @@ impl LinuxBackend {
     }
 
     fn profile_available_for_lease(&self, profile: GamepadProfile) -> bool {
-        self.controller_input_supported && self.effective_profile == Some(profile.as_str())
+        match profile {
+            GamepadProfile::Auto => false,
+            GamepadProfile::Xone => self.xone_available,
+            GamepadProfile::Ds4 => self.ds4_available,
+            GamepadProfile::Ds5 => self.ds5_available,
+            GamepadProfile::Switch => false,
+        }
+    }
+
+    fn profile_unavailable_error(&self, profile: GamepadProfile) -> InputError {
+        let reason = match profile {
+            GamepadProfile::Xone => self.xone_unavailable_reason.as_ref(),
+            GamepadProfile::Ds4 => self.ds4_unavailable_reason.as_ref(),
+            GamepadProfile::Ds5 => self.ds5_unavailable_reason.as_ref(),
+            GamepadProfile::Auto | GamepadProfile::Switch => None,
+        };
+        reason.map_or_else(
+            || unavailable_profile(profile),
+            |message| InputError::new("controller_unavailable", message.clone()),
+        )
+    }
+
+    fn refresh_controller_status(&mut self) {
+        self.controller_input_supported = match self.profile {
+            GamepadProfile::Auto => self.xone_available || self.ds5_available,
+            GamepadProfile::Xone => self.xone_available,
+            GamepadProfile::Ds4 => self.ds4_available,
+            GamepadProfile::Ds5 => self.ds5_available,
+            GamepadProfile::Switch => false,
+        };
+        self.effective_profile = match self.profile {
+            GamepadProfile::Auto => Some("auto"),
+            profile if self.profile_available_for_lease(profile) => Some(profile.as_str()),
+            _ => None,
+        };
+        self.controller_unavailable_reason = if self.controller_input_supported {
+            None
+        } else {
+            match self.profile {
+                GamepadProfile::Auto => self
+                    .ds5_unavailable_reason
+                    .clone()
+                    .or_else(|| self.xone_unavailable_reason.clone())
+                    .or_else(|| Some("Linux Auto has no available Xone or DS5 backend".into())),
+                GamepadProfile::Xone => self.xone_unavailable_reason.clone(),
+                GamepadProfile::Ds4 => self.ds4_unavailable_reason.clone(),
+                GamepadProfile::Ds5 => self.ds5_unavailable_reason.clone(),
+                GamepadProfile::Switch => Some(unavailable_profile(GamepadProfile::Switch).message),
+            }
+        };
     }
 
     fn require_profile_for_controller(&self, number: u16) -> InputResult<GamepadProfile> {
@@ -620,7 +698,7 @@ impl LinuxBackend {
         if self.profile_available_for_lease(profile) {
             Ok(profile)
         } else {
-            Err(unavailable_profile(profile))
+            Err(self.profile_unavailable_error(profile))
         }
     }
 
@@ -641,13 +719,20 @@ impl LinuxBackend {
         let profile = self.route_profile_for_arrival(controller_type, capabilities);
         self.controller_routes[route_index] = Some(profile);
         if !self.profile_available_for_lease(profile) {
-            return Err(unavailable_profile(profile));
+            return Err(self.profile_unavailable_error(profile));
         }
 
         let back_as_touchpad_click = self.ds4_back_as_touchpad_click;
+        let ds5_randomize_mac = self.ds5_inputtino_randomize_mac;
         let path = &self.path;
         self.gamepads.ensure(number, |slot| {
-            LinuxGamepad::create(path, slot, profile, back_as_touchpad_click)
+            LinuxGamepad::create(
+                path,
+                slot,
+                profile,
+                back_as_touchpad_click,
+                ds5_randomize_mac,
+            )
         })
     }
 }
@@ -681,15 +766,11 @@ impl Backend for LinuxBackend {
     fn effective_gamepad_profile(&self) -> Option<&'static str> {
         self.effective_profile
     }
+    fn supported_gamepad_profiles(&self) -> &'static [&'static str] {
+        &["auto", "xone", "ds4", "ds5"]
+    }
     fn gamepad_unavailable_reason(&self) -> Option<&str> {
-        self.controller_unavailable_reason
-            .as_deref()
-            .or(match self.profile {
-                GamepadProfile::Auto | GamepadProfile::Xone => None,
-                GamepadProfile::Ds4 => None,
-                GamepadProfile::Ds5 => Some("Linux gamepad profile 'ds5' is recognized but not implemented by this backend"),
-                GamepadProfile::Switch => Some("Linux gamepad profile 'switch' is recognized but not implemented by this backend"),
-            })
+        self.controller_unavailable_reason.as_deref()
     }
     fn key_encoding(&self) -> &'static str {
         "linux_evdev"
@@ -752,6 +833,7 @@ impl Backend for LinuxBackend {
             || !self.gamepads.is_empty()
             || self.gamepad_probe.is_some()
             || self.ds4_probe.is_some()
+            || self.ds5_probe.is_some()
             || !self.pen_touch.is_idle()
             || self.keyboard_retired
             || self.pointer_retired
@@ -774,35 +856,56 @@ impl Backend for LinuxBackend {
         self.controller_input_supported = false;
         self.effective_profile = None;
         self.controller_unavailable_reason = None;
+        self.xone_available = false;
+        self.ds4_available = false;
+        self.ds5_available = false;
+        self.xone_unavailable_reason = None;
+        self.ds4_unavailable_reason = None;
+        self.ds5_unavailable_reason = None;
         self.controller_routes = [None; 16];
-        if profile_uses_uinput_backend(self.profile) {
+
+        if matches!(self.profile, GamepadProfile::Auto | GamepadProfile::Xone) {
             match Device::create_gamepad(&self.path, 0) {
                 Ok(mut probe) => match probe.destroy() {
-                    Ok(()) => {
-                        self.controller_input_supported = true;
-                        self.effective_profile = Some("xone");
-                    }
+                    Ok(()) => self.xone_available = true,
                     Err(error) => {
-                        self.controller_unavailable_reason = Some(format!(
-                            "Linux uinput gamepad probe device could not be destroyed: {}",
+                        self.xone_unavailable_reason = Some(format!(
+                            "Linux uinput Xone probe device could not be destroyed: {}",
                             error.message
                         ));
                         self.gamepad_probe = Some(probe);
                     }
                 },
                 Err(error) => {
-                    self.controller_unavailable_reason = Some(error.message);
+                    self.xone_unavailable_reason = Some(error.message);
                 }
             }
-        } else if self.profile == GamepadProfile::Ds4 {
+        }
+
+        if matches!(self.profile, GamepadProfile::Auto | GamepadProfile::Ds5) {
+            match Ds5Gamepad::create(0, self.ds5_inputtino_randomize_mac) {
+                Ok(mut probe) => match probe.release() {
+                    Ok(()) => self.ds5_available = true,
+                    Err(error) => {
+                        self.ds5_unavailable_reason = Some(format!(
+                            "Linux UHID DS5 probe could not be destroyed: {}",
+                            error.message
+                        ));
+                        self.ds5_probe = Some(probe);
+                    }
+                },
+                Err(error) => {
+                    self.ds5_unavailable_reason = Some(error.message);
+                }
+            }
+        }
+
+        if self.profile == GamepadProfile::Ds4 {
             match Ds4Gamepad::create(0, self.ds4_back_as_touchpad_click) {
                 Ok(mut probe) => match probe.release() {
-                    Ok(()) => {
-                        self.controller_input_supported = true;
-                        self.effective_profile = Some("ds4");
-                    }
+                    Ok(()) => self.ds4_available = true,
                     Err(error) => {
-                        self.controller_unavailable_reason = Some(format!(
+                        self.ds4_unavailable_reason = Some(format!(
                             "Linux UHID DS4 probe could not be destroyed: {}",
                             error.message
                         ));
@@ -810,10 +913,13 @@ impl Backend for LinuxBackend {
                     }
                 },
                 Err(error) => {
-                    self.controller_unavailable_reason = Some(error.message);
+                    self.ds4_unavailable_reason = Some(error.message);
                 }
             }
-        } else {
+        }
+
+        self.refresh_controller_status();
+        if self.profile == GamepadProfile::Switch {
             self.controller_unavailable_reason = Some(unavailable_profile(self.profile).message);
         }
         Ok(())
@@ -848,10 +954,17 @@ impl Backend for LinuxBackend {
                 ControllerMotionType::Gyro => GamepadMotionType::Gyro,
             };
             let back_as_touchpad_click = self.ds4_back_as_touchpad_click;
+            let ds5_randomize_mac = self.ds5_inputtino_randomize_mac;
             let path = &self.path;
             let gamepads = &mut self.gamepads;
             gamepads.ensure(*number, |slot| {
-                LinuxGamepad::create(path, slot, profile, back_as_touchpad_click)
+                LinuxGamepad::create(
+                    path,
+                    slot,
+                    profile,
+                    back_as_touchpad_click,
+                    ds5_randomize_mac,
+                )
             })?;
             return gamepads.set_motion(*number, motion_type, [*x, *y, *z]);
         }
@@ -877,10 +990,17 @@ impl Backend for LinuxBackend {
                 ControllerTouchPhase::CancelAll => GamepadTouchPhase::CancelAll,
             };
             let back_as_touchpad_click = self.ds4_back_as_touchpad_click;
+            let ds5_randomize_mac = self.ds5_inputtino_randomize_mac;
             let path = &self.path;
             let gamepads = &mut self.gamepads;
             gamepads.ensure(*number, |slot| {
-                LinuxGamepad::create(path, slot, profile, back_as_touchpad_click)
+                LinuxGamepad::create(
+                    path,
+                    slot,
+                    profile,
+                    back_as_touchpad_click,
+                    ds5_randomize_mac,
+                )
             })?;
             return gamepads.set_touch(
                 *number,
@@ -910,10 +1030,17 @@ impl Backend for LinuxBackend {
                 ControllerBatteryState::Full => GamepadBatteryState::Full,
             };
             let back_as_touchpad_click = self.ds4_back_as_touchpad_click;
+            let ds5_randomize_mac = self.ds5_inputtino_randomize_mac;
             let path = &self.path;
             let gamepads = &mut self.gamepads;
             gamepads.ensure(*number, |slot| {
-                LinuxGamepad::create(path, slot, profile, back_as_touchpad_click)
+                LinuxGamepad::create(
+                    path,
+                    slot,
+                    profile,
+                    back_as_touchpad_click,
+                    ds5_randomize_mac,
+                )
             })?;
             return gamepads.set_battery(*number, state, *percentage);
         }
@@ -935,6 +1062,9 @@ impl Backend for LinuxBackend {
                 }
             }
             let profile = self.profile_for_controller(*number);
+            if active_mask & (1 << *number) != 0 && !self.profile_available_for_lease(profile) {
+                return Err(self.profile_unavailable_error(profile));
+            }
             let state = ControllerSnapshot {
                 buttons: *buttons,
                 left_trigger: *left_trigger,
@@ -945,6 +1075,7 @@ impl Backend for LinuxBackend {
                 right_y: *right_y,
             };
             let back_as_touchpad_click = self.ds4_back_as_touchpad_click;
+            let ds5_randomize_mac = self.ds5_inputtino_randomize_mac;
             let (path, gamepads) = (&self.path, &mut self.gamepads);
             return gamepads
                 .apply(
@@ -953,7 +1084,15 @@ impl Backend for LinuxBackend {
                     state,
                     self.back_button_timeout_ms,
                     std::time::Instant::now(),
-                    |slot| LinuxGamepad::create(path, slot, profile, back_as_touchpad_click),
+                    |slot| {
+                        LinuxGamepad::create(
+                            path,
+                            slot,
+                            profile,
+                            back_as_touchpad_click,
+                            ds5_randomize_mac,
+                        )
+                    },
                 )
                 .map_err(|error| {
                     if error.code == "release_failed" {
@@ -1109,8 +1248,8 @@ impl Backend for LinuxBackend {
     fn stop(&mut self) -> InputResult<()> {
         let pen_touch_result = self.pen_touch.stop();
         let gamepad_result = self.gamepads.stop();
-        // Keep each descriptor after a failed UI_DEV_DESTROY so a later lease
-        // cleanup can retry the same device without reopening /dev/uinput.
+        // Keep each failed probe detach owned so cleanup can retry that same
+        // descriptor instead of silently leaking it.
         let probe_result =
             release_owned_device(&mut self.gamepad_probe, false, |_| Ok(()), Device::destroy);
         let ds4_probe_result = self
@@ -1121,11 +1260,18 @@ impl Backend for LinuxBackend {
         if ds4_probe_result.is_ok() {
             self.ds4_probe = None;
         }
+        let ds5_probe_result = self
+            .ds5_probe
+            .as_mut()
+            .map(Ds5Gamepad::release)
+            .unwrap_or(Ok(()));
+        if ds5_probe_result.is_ok() {
+            self.ds5_probe = None;
+        }
+        // A failed native destroy leaves the exact descriptor owned by this
+        // lease for a later stop call to retry.
         let input_result =
             release_input_pair(&mut self.keyboard, &mut self.pointer, Device::destroy);
-        // A failed destroy leaves the descriptor owned by this lease. Keep its
-        // recovery and event state until that exact descriptor is destroyed;
-        // another stop can then retry without losing the failed-write marker.
         if self.keyboard.is_none() {
             self.held_virtual_keycodes.clear();
             self.keyboard_recovery_required = false;
@@ -1140,7 +1286,25 @@ impl Backend for LinuxBackend {
         self.controller_input_supported = false;
         self.effective_profile = None;
         self.controller_unavailable_reason = None;
-        if self.gamepads.is_empty() && self.ds4_probe.is_none() {
+        self.xone_available = false;
+        self.ds4_available = false;
+        self.ds5_available = false;
+        if ds4_probe_result.is_ok() {
+            self.ds4_unavailable_reason = None;
+        }
+        if ds5_probe_result.is_err() {
+            self.ds5_unavailable_reason = ds5_probe_result
+                .as_ref()
+                .err()
+                .map(|error| error.message.clone());
+        } else {
+            self.ds5_unavailable_reason = None;
+        }
+        if self.gamepads.is_empty()
+            && self.ds4_probe.is_none()
+            && self.ds5_probe.is_none()
+            && self.gamepad_probe.is_none()
+        {
             self.controller_routes = [None; 16];
         }
         for result in [
@@ -1148,6 +1312,7 @@ impl Backend for LinuxBackend {
             gamepad_result,
             probe_result,
             ds4_probe_result,
+            ds5_probe_result,
             input_result,
         ] {
             result?;
@@ -1164,28 +1329,32 @@ impl Backend for LinuxBackend {
     }
 
     fn advance(&mut self, now: std::time::Instant) -> InputResult<()> {
-        // A failed probe teardown keeps the original descriptor owned by this
-        // lease. Retry that detach before advertising controller input; no
-        // second gamepad may be allocated while the probe still exists.
+        // A failed probe teardown keeps the original device owned until the
+        // retry succeeds; only then is that profile reported available.
         if let Some(probe) = self.gamepad_probe.as_mut()
             && probe.destroy().is_ok()
         {
             self.gamepad_probe = None;
-            self.controller_input_supported = true;
-            self.effective_profile = Some("xone");
-            self.controller_unavailable_reason = None;
+            self.xone_available = true;
+            self.xone_unavailable_reason = None;
         }
         if let Some(probe) = self.ds4_probe.as_mut()
             && probe.release().is_ok()
         {
             self.ds4_probe = None;
-            self.controller_input_supported = true;
-            self.effective_profile = Some("ds4");
-            self.controller_unavailable_reason = None;
+            self.ds4_available = true;
+            self.ds4_unavailable_reason = None;
         }
-        // Timer-driven controller writes are retried by GamepadSlots while
-        // their effective state remains dirty. A transient write failure must
-        // not tear down the keyboard, pointer, or stream lease before retry.
+        if let Some(probe) = self.ds5_probe.as_mut()
+            && probe.release().is_ok()
+        {
+            self.ds5_probe = None;
+            self.ds5_available = true;
+            self.ds5_unavailable_reason = None;
+        }
+        self.refresh_controller_status();
+        // Timer-driven controller reports are retried while their current
+        // state stays dirty, without tearing down unrelated input devices.
         let _ = self.gamepads.advance(now);
         Ok(())
     }
@@ -1214,6 +1383,10 @@ impl Backend for LinuxBackend {
         self.touchpad_as_ds4 = enabled;
     }
 
+    fn set_ds5_inputtino_randomize_mac(&mut self, enabled: bool) {
+        self.ds5_inputtino_randomize_mac = enabled;
+    }
+
     fn disable_controller_input(&mut self) -> InputResult<()> {
         let result = self.gamepads.stop();
         if result.is_ok() {
@@ -1237,6 +1410,7 @@ fn retire_uncertain_input_device(
     Ok(())
 }
 
+#[cfg(test)]
 fn profile_uses_uinput_backend(profile: GamepadProfile) -> bool {
     matches!(profile, GamepadProfile::Auto | GamepadProfile::Xone)
 }
@@ -1304,7 +1478,7 @@ mod profile_tests {
     }
 
     #[test]
-    fn xone_uses_uinput_while_ds4_uses_the_native_hid_profile() {
+    fn xone_uses_uinput_while_sony_profiles_use_native_hid() {
         assert!(profile_uses_uinput_backend(GamepadProfile::Auto));
         assert!(profile_uses_uinput_backend(GamepadProfile::Xone));
         assert!(!profile_uses_uinput_backend(GamepadProfile::Ds4));
@@ -1474,9 +1648,113 @@ mod profile_tests {
     }
 
     #[test]
-    fn arrival_profile_change_detaches_xone_before_reporting_ds5_unavailable() {
+    fn explicit_ds5_probe_and_slot_route_publish_reports_and_release_cleanly() {
+        let _input_guard = FakeInputGuard;
+        let _input_adapter = FakeInputGuard::install();
+        let (uhid_guard, uhid_adapter) = linux_ds5::FakeUhidGuard::install();
+        let mut backend = LinuxBackend::new("/dev/uinput".into());
+        backend.set_gamepad_profile(GamepadProfile::Ds5);
+        backend.set_ds5_inputtino_randomize_mac(false);
+        backend.start().unwrap();
+        assert!(backend.controller_input_supported());
+        assert_eq!(backend.effective_gamepad_profile(), Some("ds5"));
+        assert!(backend.gamepad_unavailable_reason().is_none());
+
+        backend
+            .inject(&Event::ControllerArrival {
+                number: 2,
+                controller_type: CONTROLLER_TYPE_PLAYSTATION,
+                capabilities: CONTROLLER_CAP_TOUCHPAD
+                    | CONTROLLER_CAP_ACCELEROMETER
+                    | CONTROLLER_CAP_GYROSCOPE,
+                supported_buttons: u32::MAX,
+            })
+            .unwrap();
+        backend
+            .inject(&Event::ControllerTouch {
+                number: 2,
+                touchpad_index: 0,
+                pointer_id: 0,
+                phase: ControllerTouchPhase::Down,
+                x: 0.5,
+                y: 0.25,
+                pressure: 1.0,
+            })
+            .unwrap();
+        backend
+            .inject(&Event::ControllerMotion {
+                number: 2,
+                motion_type: ControllerMotionType::Accel,
+                x: 0.0,
+                y: 9.80665,
+                z: 0.0,
+            })
+            .unwrap();
+        backend
+            .inject(&Event::ControllerMotion {
+                number: 2,
+                motion_type: ControllerMotionType::Gyro,
+                x: 0.0,
+                y: 0.0,
+                z: 90.0,
+            })
+            .unwrap();
+        backend
+            .inject(&Event::ControllerBattery {
+                number: 2,
+                state: ControllerBatteryState::Discharging,
+                percentage: Some(69),
+            })
+            .unwrap();
+        backend
+            .inject(&Event::Controller {
+                number: 2,
+                active_mask: 1 << 2,
+                buttons: (1 << 12) | (1 << 13) | (1 << 8),
+                left_trigger: 10,
+                right_trigger: 20,
+                left_x: i16::MIN,
+                left_y: i16::MAX,
+                right_x: 0,
+                right_y: 0,
+            })
+            .unwrap();
+
+        let adapter = uhid_adapter.borrow();
+        assert_eq!(adapter.created.len(), 2);
+        assert_eq!(adapter.created[1].0, 2);
+        assert_eq!(&adapter.created[1].1[132..149], b"02:00:00:00:00:02");
+        let active_id = adapter.reports.last().unwrap().0;
+        assert!(
+            adapter.reports.iter().any(|(id, report)| {
+                *id == active_id && report[1..7] == [0, 0, 128, 128, 10, 20]
+            })
+        );
+        assert!(adapter.reports.iter().any(|(id, report)| {
+            *id == active_id && report[16..22] == [0, 0, 0, 0, 0xa0, 0x05]
+        }));
+        assert!(
+            adapter
+                .reports
+                .iter()
+                .any(|(id, report)| { *id == active_id && report[22..28] == [0, 0, 0, 32, 0, 0] })
+        );
+        assert!(adapter.reports.iter().any(|(id, report)| {
+            *id == active_id && report[33..37] == [1, 0xc0, 0xe3, 0x10] && report[53] == 0x06
+        }));
+        drop(adapter);
+
+        backend.stop().unwrap();
+        assert!(uhid_adapter.borrow().destroyed.contains(&1));
+        assert!(uhid_adapter.borrow().destroyed.contains(&2));
+        drop(uhid_guard);
+    }
+
+    #[test]
+    fn arrival_profile_change_detaches_xone_before_selecting_ds5() {
         let _input_guard = FakeInputGuard;
         let input_adapter = FakeInputGuard::install();
+        let (_uhid_guard, uhid_adapter) = linux_ds5::FakeUhidGuard::install();
         let mut backend = LinuxBackend::new("/dev/uinput".into());
         backend.start().unwrap();
 
@@ -1491,39 +1769,82 @@ mod profile_tests {
         assert_eq!(backend.controller_routes[0], Some(GamepadProfile::Xone));
         assert_eq!(input_adapter.borrow().next_id, 4);
 
-        let error = backend
+        backend
             .inject(&Event::ControllerArrival {
                 number: 0,
                 controller_type: CONTROLLER_TYPE_PLAYSTATION,
                 capabilities: CONTROLLER_CAP_TOUCHPAD,
                 supported_buttons: u32::MAX,
             })
-            .unwrap_err();
-        assert_eq!(error.code, "controller_unavailable");
+            .unwrap();
         assert_eq!(backend.controller_routes[0], Some(GamepadProfile::Ds5));
         assert!(input_adapter.borrow().destroys.contains(&4));
         assert_eq!(input_adapter.borrow().next_id, 4);
+        assert_eq!(uhid_adapter.borrow().created.len(), 2);
 
         backend.stop().unwrap();
+        assert!(uhid_adapter.borrow().destroyed.contains(&2));
     }
 
     #[test]
-    fn auto_playstation_arrival_reports_ds5_unavailable_without_xone_fallback() {
+    fn auto_playstation_arrival_uses_ds5_and_reports_auto_as_effective_profile() {
         let _input_guard = FakeInputGuard;
         let input_adapter = FakeInputGuard::install();
+        let (_uhid_guard, uhid_adapter) = linux_ds5::FakeUhidGuard::install();
         let mut backend = LinuxBackend::new("/dev/uinput".into());
         backend.start().unwrap();
-        let error = backend
+        assert!(backend.controller_input_supported());
+        assert_eq!(backend.effective_gamepad_profile(), Some("auto"));
+        backend
             .inject(&Event::ControllerArrival {
                 number: 0,
                 controller_type: CONTROLLER_TYPE_PLAYSTATION,
                 capabilities: CONTROLLER_CAP_TOUCHPAD,
                 supported_buttons: u32::MAX,
             })
+            .unwrap();
+        assert_eq!(backend.controller_routes[0], Some(GamepadProfile::Ds5));
+        backend
+            .inject(&Event::Controller {
+                number: 0,
+                active_mask: 1,
+                buttons: 0,
+                left_trigger: 0,
+                right_trigger: 0,
+                left_x: 0,
+                left_y: 0,
+                right_x: 0,
+                right_y: 0,
+            })
+            .unwrap();
+        assert_eq!(input_adapter.borrow().next_id, 3);
+        assert_eq!(uhid_adapter.borrow().created.len(), 2);
+        backend.stop().unwrap();
+        assert!(uhid_adapter.borrow().destroyed.contains(&2));
+    }
+
+    #[test]
+    fn auto_nintendo_arrival_is_unavailable_without_falling_back_to_xone_or_ds5() {
+        let _input_guard = FakeInputGuard;
+        let input_adapter = FakeInputGuard::install();
+        let (_uhid_guard, _uhid_adapter) = linux_ds5::FakeUhidGuard::install();
+        let mut backend = LinuxBackend::new("/dev/uinput".into());
+        backend.start().unwrap();
+        assert!(backend.controller_input_supported());
+        assert_eq!(backend.effective_gamepad_profile(), Some("auto"));
+
+        let error = backend
+            .inject(&Event::ControllerArrival {
+                number: 0,
+                controller_type: CONTROLLER_TYPE_NINTENDO,
+                capabilities: 0,
+                supported_buttons: u32::MAX,
+            })
             .unwrap_err();
         assert_eq!(error.code, "controller_unavailable");
-        assert!(error.message.contains("ds5"));
-        assert_eq!(backend.controller_routes[0], Some(GamepadProfile::Ds5));
+        assert!(error.message.contains("switch"));
+        assert_eq!(backend.controller_routes[0], Some(GamepadProfile::Switch));
+        assert_eq!(input_adapter.borrow().next_id, 3);
 
         let error = backend
             .inject(&Event::Controller {
@@ -1539,6 +1860,30 @@ mod profile_tests {
             })
             .unwrap_err();
         assert_eq!(error.code, "controller_unavailable");
+        assert!(error.message.contains("switch"));
+        assert_eq!(input_adapter.borrow().next_id, 3);
+        backend.stop().unwrap();
+    }
+
+    #[test]
+    fn auto_playstation_does_not_fall_back_when_ds5_probe_is_unavailable() {
+        let _input_guard = FakeInputGuard;
+        let input_adapter = FakeInputGuard::install();
+        let mut backend = LinuxBackend::new("/dev/uinput".into());
+        backend.start().unwrap();
+        assert!(backend.controller_input_supported());
+        assert_eq!(backend.effective_gamepad_profile(), Some("auto"));
+        let error = backend
+            .inject(&Event::ControllerArrival {
+                number: 0,
+                controller_type: CONTROLLER_TYPE_PLAYSTATION,
+                capabilities: CONTROLLER_CAP_TOUCHPAD,
+                supported_buttons: u32::MAX,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "controller_unavailable");
+        assert!(error.message.contains("DS5"));
+        assert_eq!(backend.controller_routes[0], Some(GamepadProfile::Ds5));
         assert_eq!(input_adapter.borrow().next_id, 3);
         backend.stop().unwrap();
     }
@@ -1959,7 +2304,7 @@ mod tests {
         let _guard = FakeAdapterGuard;
         let mut backend = LinuxBackend::new("/missing/uinput".into());
         backend.start().unwrap();
-        assert_eq!(backend.effective_gamepad_profile(), Some("xone"));
+        assert_eq!(backend.effective_gamepad_profile(), Some("auto"));
         backend.inject(&gamepad_event(1, 1 << 12)).unwrap();
         assert_eq!(adapter.borrow().writes, [4]);
 
@@ -1997,7 +2342,7 @@ mod tests {
 
         backend.start().unwrap();
         assert!(!backend.controller_input_supported());
-        assert_eq!(backend.effective_gamepad_profile(), None);
+        assert_eq!(backend.effective_gamepad_profile(), Some("auto"));
         assert_eq!(adapter.borrow().next_id, 3);
         assert_eq!(adapter.borrow().destroys, [3]);
         assert_eq!(
@@ -2014,7 +2359,7 @@ mod tests {
 
         backend.advance(std::time::Instant::now()).unwrap();
         assert!(backend.controller_input_supported());
-        assert_eq!(backend.effective_gamepad_profile(), Some("xone"));
+        assert_eq!(backend.effective_gamepad_profile(), Some("auto"));
         assert!(backend.gamepad_unavailable_reason().is_none());
         assert_eq!(adapter.borrow().next_id, 3);
         assert_eq!(adapter.borrow().destroys, [3, 3, 3]);

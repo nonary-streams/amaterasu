@@ -129,12 +129,16 @@ unmapped raw keys are rejected during batch validation.
 With `gamepad:"auto"`, Windows probes a real ViGEmClient/ViGEmBus connection
 and selects `x360` only after that connection succeeds. Linux probes the
 configured native target and reports its effective profile only after creation
-and destruction succeed. Explicit `x360`, Windows `ds4`, Linux `xone`, and Linux
-`ds4` select their corresponding platform probes; other recognized explicit
-profiles return `controller_input:false` with a status reason, leave keyboard
-and mouse usable, and never fall back to `auto`.
+and destruction succeed. Explicit `x360`, Windows `ds4`, and Linux `xone`,
+`ds4`, and `ds5` select their corresponding platform probes; other recognized
+explicit profiles return `controller_input:false` with a status reason, leave
+keyboard and mouse usable, and never fall back to `auto`.
 Status reports the requested `gamepad`, `supported_profiles`, and the effective
-profile as `effective_gamepad_profile` (null until a real backend is available).
+profile as `effective_gamepad_profile`. Linux Auto reports `auto` as its
+configured selector, not as one controller's selected route; `controller_input`
+reports whether at least one native Auto route passed its probe. Other profiles
+report null when their probe fails. `supported_profiles` lists implemented
+profiles, not a promise that a host can open the required device node or driver.
 An active lease retains the requested and effective profiles from acquisition.
 
 Linux creates per-lease uinput gamepads when its startup probe succeeds. It maps
@@ -177,12 +181,36 @@ lightbar feedback to the client, so valid DS4 output requests are consumed but
 not delivered. Synthetic descriptor, report, feature-query, and lifecycle tests
 cover this path; no physical-controller or game-delivery result is claimed.
 
-For `auto`, Linux chooses `xone` for Xbox arrivals. PlayStation arrivals choose
-`ds5`, Nintendo arrivals choose `switch`, and unknown devices with enabled
-motion or touchpad preference and matching capabilities also choose `ds5`.
-Those profiles remain unavailable in this increment, so their controller events
-are rejected with `controller_unavailable` instead of being sent through the
-Xbox-like device. Unknown arrivals without those capabilities use `xone`.
+Linux `ds5` creates a USB-identity DualSense over `/dev/uhid` (Sony VID/PID
+054c:0ce6, version 0x8111). It publishes the USB report descriptor, answers
+calibration, pairing, firmware, and supported control feature requests, and
+sends 64-byte input reports at 100 Hz after UHID starts. Reports include buttons,
+d-pad, triggers, sticks, battery state, two touch contacts, accelerometer
+samples in m/s², and gyroscope samples in degrees per second. Touch coordinates
+are normalized by the protocol and projected onto the DualSense 1920×1080
+surface; normalized touch pressure above 0.5 marks a contact active. By default
+each virtual device gets a random local-unicast
+identity that remains stable across device recovery. Disabling
+`ds5_inputtino_randomize_mac` uses `02:00:00:00:00:<slot>` for compatibility.
+Failed input writes stop the event worker, destroy the potentially inconsistent
+device, and recreate the same slot and identity before the next report. Failed
+destruction retains the UHID descriptor for cleanup retry. The protocol has no
+client-feedback route, so valid rumble, lightbar, and adaptive-trigger output
+reports are recognized and consumed but are not delivered to the client.
+Synthetic USB descriptor, feature-query, identity, input-report, recovery, and
+release tests cover this path. They do not establish hardware or game delivery.
+
+For Linux `auto`, Xbox arrivals use `xone`; PlayStation arrivals use `ds5`;
+Nintendo arrivals select `switch`; and unknown devices with enabled motion or
+touchpad preferences and matching capabilities use `ds5`. Unknown arrivals
+without those capabilities use `xone`. Auto probes the xone and DS5 backends
+independently, reports the configured selector as `effective_gamepad_profile:
+"auto"`, and accepts controller input when at least one route is available.
+Each arrival keeps its selected route: if that profile cannot be created, the
+event returns `controller_unavailable` and does not fall back to another
+profile. Nintendo's `switch` route is selected correctly but remains unavailable
+pending its native implementation. `controller_input` reports aggregate Auto
+viability; it does not promise that every controller route is available.
 
 Windows uses ViGEm's Xbox 360 profile when a
 compatible ViGEmBus driver is installed and a vetted `ViGEmClient.dll` is
@@ -208,12 +236,12 @@ certificate-bound client policy before application policy and freezes the choice
 for launch. Signed host restart and synthetic input-probe tests qualify that
 projection. Windows DS4 touchpad-click and game delivery remain unqualified.
 Windows does not select another profile when ViGEm is missing. Linux provides
-its Xbox-like uinput backend under `xone` and a native UHID implementation for
-explicit `ds4`; it does not use Inputtino. DS5, Switch, VHF profiles, and VHF/UMDF
-device creation remain unimplemented. Linux UHID runtime behavior has not been
-exercised with a physical controller or game, and Windows virtual-device
-delivery has not been qualified against an installed ViGEmBus driver, so
-platform-qualified controller parity remains pending.
+its Xbox-like uinput backend under `xone` and native UHID implementations for
+`ds4` and `ds5`; it does not link or call Inputtino. The Nintendo Switch profile,
+VHF profiles, and VHF/UMDF device creation remain unimplemented. Linux UHID
+runtime behavior has not been exercised with a physical controller or game, and
+Windows virtual-device delivery has not been qualified against an installed
+ViGEmBus driver, so platform-qualified controller parity remains pending.
 
 If an active ViGEm target rejects a report, input detaches that target before
 creating a replacement and submitting the current state. A failed detach keeps
@@ -481,8 +509,8 @@ to open the configured uinput device. No permissions/udev rules are changed by
 this module. Device creation does not acknowledge compositor readiness; udev and
 libinput discovery are asynchronous, and delivery during device activation needs
 native acceptance testing. Seat selection, captured-monitor coordinate mapping,
-Wayland absolute-pointer integration, DS4/DS5/Switch reports, VHF/UMDF
-and Inputtino integrations, rumble/LED feedback, and crash-surviving Windows
+Wayland absolute-pointer integration, Switch reports, VHF/UMDF and Inputtino
+integrations, rumble/LED feedback, and crash-surviving Windows
 keyboard/mouse cleanup remain unimplemented.
 
 The pen/touch event coordinates and contact dimensions arriving at this module
