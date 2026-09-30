@@ -458,6 +458,9 @@ pub struct Open {
     /// frozen policy source and authenticated operation binding.
     #[serde(default)]
     pub display_request: Option<serde_json::Value>,
+    /// Sparse per-application display selection frozen by Launch preflight.
+    #[serde(default)]
+    pub application_display_settings: Option<serde_json::Value>,
     /// Resolved stream-time virtual-display policy, signed by Launch.
     #[serde(default)]
     pub virtual_display_intent: Option<VirtualDisplayIntent>,
@@ -557,15 +560,19 @@ impl Open {
         use sha2::{Digest, Sha256};
         let bytes = if let Some(intent) = &self.virtual_display_intent {
             serde_json::to_vec(intent).ok()?
+        } else if let Some(request) = &self.display_request {
+            serde_json::to_vec(request).ok()?
         } else {
-            serde_json::to_vec(self.display_request.as_ref()?).ok()?
+            serde_json::to_vec(self.application_display_settings.as_ref()?).ok()?
         };
         let digest = Sha256::digest(bytes);
         Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
     pub fn display_admission_required(&self) -> bool {
-        self.display_request.is_some() || self.virtual_display_intent.is_some()
+        self.display_request.is_some()
+            || self.virtual_display_intent.is_some()
+            || self.application_display_settings.is_some()
     }
 
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
@@ -613,6 +620,13 @@ impl Open {
         {
             return Err("display_request_unattested");
         }
+        if self
+            .application_display_settings
+            .as_ref()
+            .is_some_and(|settings| !valid_application_display_settings(settings))
+        {
+            return Err("display_request_unattested");
+        }
         if self.display_admission_required() {
             let (Some(token), Some(operation), Some(snapshot)) = (
                 self.display_admission_token.as_deref(),
@@ -638,6 +652,7 @@ impl Open {
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
                 || !valid_name(operation)
                 || snapshot.get("virtual_display_intent") != expected_intent.as_ref()
+                || !application_display_settings_match_snapshot(self, snapshot)
             {
                 return Err("display_request_unattested");
             }
@@ -1168,6 +1183,57 @@ fn valid_display_request(request: &serde_json::Value) -> bool {
     true
 }
 
+fn valid_application_display_settings(value: &serde_json::Value) -> bool {
+    let Some(fields) = value.as_object() else {
+        return false;
+    };
+    fields.len() <= 4
+        && fields.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "display_output"
+                    | "virtual_screen"
+                    | "virtual_display_mode"
+                    | "virtual_display_layout"
+            )
+        })
+        && value.get("display_output").is_none_or(|output| {
+            output.as_str().is_some_and(|output| {
+                output.len() <= 1_024 && !output.chars().any(char::is_control)
+            })
+        })
+        && value
+            .get("virtual_screen")
+            .is_none_or(serde_json::Value::is_boolean)
+        && value
+            .get("virtual_display_mode")
+            .is_none_or(|mode| matches!(mode.as_str(), Some("disabled" | "per_client" | "shared")))
+        && value.get("virtual_display_layout").is_none_or(|layout| {
+            matches!(
+                layout.as_str(),
+                Some(
+                    "exclusive"
+                        | "extended"
+                        | "extended_primary"
+                        | "extended_isolated"
+                        | "extended_primary_isolated"
+                )
+            )
+        })
+}
+
+fn application_display_settings_match_snapshot(open: &Open, snapshot: &serde_json::Value) -> bool {
+    match (
+        open.application_display_settings.as_ref(),
+        snapshot.get("application_display_settings"),
+    ) {
+        (Some(expected), Some(actual)) => expected == actual,
+        (Some(_), None) => false,
+        (None, Some(actual)) => actual.is_null(),
+        (None, None) => true,
+    }
+}
+
 fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
     let Some(fields) = snapshot.as_object() else {
         return false;
@@ -1185,13 +1251,21 @@ fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
         return false;
     };
     let has_intent = fields.contains_key("virtual_display_intent");
-    let base_field_count = fields.len().saturating_sub(usize::from(has_intent));
+    let has_application_settings = fields.contains_key("application_display_settings");
+    let base_field_count = fields
+        .len()
+        .saturating_sub(usize::from(has_intent))
+        .saturating_sub(usize::from(has_application_settings));
     let intent_is_valid = snapshot.get("virtual_display_intent").is_none_or(|value| {
         serde_json::from_value::<VirtualDisplayIntent>(value.clone())
             .is_ok_and(|intent| intent.validate().is_ok())
     });
+    let application_settings_are_valid = snapshot
+        .get("application_display_settings")
+        .is_none_or(|value| value.is_null() || valid_application_display_settings(value));
     if !matches!(base_field_count, 5 | 7)
         || !intent_is_valid
+        || !application_settings_are_valid
         || fields.keys().any(|key| {
             !matches!(
                 key.as_str(),
@@ -1202,6 +1276,7 @@ fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
                     | "application_overrides"
                     | "client_overrides"
                     | "effective_overrides"
+                    | "application_display_settings"
                     | "virtual_display_intent"
             )
         })
@@ -1456,6 +1531,7 @@ mod tests {
     use super::*;
     use amaterasu_gamestream::sdp::parse_announce;
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
 
     const PRIMARY_ANNOUNCE: &str =
         include_str!("../../../crates/gamestream/src/sdp/fixtures/moonlight-h264.sdp");
@@ -1480,6 +1556,70 @@ mod tests {
 
     fn open() -> Open {
         serde_json::from_value(open_json()).unwrap()
+    }
+
+    #[test]
+    fn per_application_settings_require_and_match_signed_admission() {
+        let settings = json!({
+            "display_output":"DP-1",
+            "virtual_screen":false,
+            "virtual_display_mode":"disabled",
+            "virtual_display_layout":"extended_primary"
+        });
+        let mut input = open_json();
+        input["app_id"] = json!("game");
+        input["catalog_revision"] = json!(7);
+        input["application_operation_id"] = json!("launch-one");
+        input["display_admission_token"] = json!("ab".repeat(32));
+        input["application_display_settings"] = settings.clone();
+        input["display_policy_snapshot"] = json!({
+            "global_revision":1,
+            "global_overrides":{},
+            "catalog_revision":7,
+            "certificate_id":"cd".repeat(32),
+            "application_overrides":{},
+            "application_display_settings":settings,
+            "client_overrides":{},
+            "effective_overrides":{}
+        });
+
+        let accepted: Open = serde_json::from_value(input.clone()).unwrap();
+        accepted.validate(false).unwrap();
+        assert!(accepted.display_admission_required());
+        let expected_hash =
+            Sha256::digest(serde_json::to_vec(&accepted.application_display_settings).unwrap());
+        assert_eq!(
+            accepted.display_request_sha256().unwrap(),
+            expected_hash
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+
+        let mut mismatched = input.clone();
+        mismatched["display_policy_snapshot"]["application_display_settings"]["virtual_screen"] =
+            json!(true);
+        assert_eq!(
+            serde_json::from_value::<Open>(mismatched)
+                .unwrap()
+                .validate(false),
+            Err("display_request_unattested")
+        );
+        for invalid in [
+            json!({"virtual_screen":"false"}),
+            json!({"virtual_display_mode":"automatic"}),
+            json!({"virtual_display_layout":"portrait"}),
+            json!({"unexpected":true}),
+        ] {
+            let mut malformed = input.clone();
+            malformed["application_display_settings"] = invalid;
+            assert_eq!(
+                serde_json::from_value::<Open>(malformed)
+                    .unwrap()
+                    .validate(false),
+                Err("display_request_unattested")
+            );
+        }
     }
 
     #[test]

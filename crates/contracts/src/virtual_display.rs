@@ -157,6 +157,11 @@ pub struct VirtualDisplayIntent {
     pub dd_use_sunshine_virtual_display_driver: bool,
     pub virtual_display_mode: VirtualDisplayMode,
     pub virtual_display_layout: VirtualDisplayLayout,
+    /// Optional frozen result of launch/display precedence. `None` is the
+    /// legacy interpretation; `Some(false)` preserves an explicit physical
+    /// selection even when the inherited mode requests a virtual display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_virtual_display: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_policy: Option<VirtualDisplayModePolicy>,
 }
@@ -191,11 +196,13 @@ impl VirtualDisplayIntent {
         Ok(())
     }
 
-    /// True only when both the global activation gate and selected mode allow
-    /// the stream to create a monitor and mutate topology.
+    /// Return the pre-resolved request when available. Older wire values use
+    /// the source-compatible mode/auto-activation fallback.
     pub fn active(&self) -> bool {
-        self.dd_activate_virtual_display
-            && self.virtual_display_mode != VirtualDisplayMode::Disabled
+        self.request_virtual_display.unwrap_or_else(|| {
+            self.dd_activate_virtual_display
+                || self.virtual_display_mode != VirtualDisplayMode::Disabled
+        })
     }
 }
 
@@ -375,6 +382,7 @@ mod tests {
             dd_use_sunshine_virtual_display_driver: true,
             virtual_display_mode: VirtualDisplayMode::PerClient,
             virtual_display_layout: VirtualDisplayLayout::Exclusive,
+            request_virtual_display: None,
             display_policy: None,
         }
     }
@@ -389,7 +397,10 @@ mod tests {
             value["virtual_display_mode"] = json!(mode);
             let parsed: VirtualDisplayIntent = serde_json::from_value(value).unwrap();
             assert_eq!(parsed.validate(), Ok(()));
-            assert_eq!(parsed.active(), mode != "disabled");
+            assert_eq!(
+                parsed.active(),
+                mode != "disabled" || parsed.dd_activate_virtual_display
+            );
         }
         for layout in [
             "exclusive",
@@ -430,14 +441,41 @@ mod tests {
     }
 
     #[test]
-    fn activation_false_and_disabled_mode_both_bypass_runtime_mutation() {
-        let mut disabled_by_gate = intent();
-        disabled_by_gate.dd_activate_virtual_display = false;
-        assert!(!disabled_by_gate.active());
+    fn legacy_explicit_modes_activate_and_flag_is_an_additional_auto_route() {
+        let mut per_client_without_auto_activation = intent();
+        per_client_without_auto_activation.dd_activate_virtual_display = false;
+        assert!(per_client_without_auto_activation.active());
 
-        let mut disabled_by_mode = intent();
-        disabled_by_mode.virtual_display_mode = VirtualDisplayMode::Disabled;
-        assert!(!disabled_by_mode.active());
+        let mut shared_without_auto_activation = intent();
+        shared_without_auto_activation.dd_activate_virtual_display = false;
+        shared_without_auto_activation.virtual_display_mode = VirtualDisplayMode::Shared;
+        assert!(shared_without_auto_activation.active());
+
+        let mut disabled_without_auto_activation = intent();
+        disabled_without_auto_activation.dd_activate_virtual_display = false;
+        disabled_without_auto_activation.virtual_display_mode = VirtualDisplayMode::Disabled;
+        assert!(!disabled_without_auto_activation.active());
+
+        let mut auto_activation_with_disabled_mode = intent();
+        auto_activation_with_disabled_mode.virtual_display_mode = VirtualDisplayMode::Disabled;
+        assert!(auto_activation_with_disabled_mode.active());
+    }
+
+    #[test]
+    fn frozen_request_preserves_physical_and_virtual_selection() {
+        let mut explicit_physical = intent();
+        explicit_physical.request_virtual_display = Some(false);
+        assert!(!explicit_physical.active());
+
+        let mut explicit_virtual = intent();
+        explicit_virtual.virtual_display_mode = VirtualDisplayMode::Disabled;
+        explicit_virtual.dd_activate_virtual_display = false;
+        explicit_virtual.request_virtual_display = Some(true);
+        assert!(explicit_virtual.active());
+
+        let mut encoded = serde_json::to_value(&explicit_physical).unwrap();
+        encoded["request_virtual_display"] = json!("false");
+        assert!(serde_json::from_value::<VirtualDisplayIntent>(encoded).is_err());
     }
 
     #[test]

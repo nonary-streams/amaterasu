@@ -331,6 +331,77 @@ fn paired_physical_mode_freezes_independently_of_stream_cadence_and_retry() {
 }
 
 #[test]
+fn virtual_display_intent_is_frozen_and_admission_bound_before_rtsp_open() {
+    let now = Instant::now();
+    let settings = json!({
+        "virtual_screen": false,
+        "virtual_display_mode": "shared",
+        "virtual_display_layout": "extended"
+    });
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_display_policy(
+        7,
+        json!({
+            "virtual_display_mode":"disabled",
+            "dd_activate_virtual_display":false
+        }),
+    );
+    let mut broker = Broker {
+        application_display_settings: Some(settings.clone()),
+        ..Broker::default()
+    };
+
+    assert!(controller.launch(10, request(33), peer(33), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200, "{}", String::from_utf8_lossy(&reply.body));
+
+    let open = opened_rtsp_payload(&broker);
+    let intent = &open["virtual_display_intent"];
+    assert_eq!(intent["virtual_display_mode"], "shared");
+    assert_eq!(intent["virtual_display_layout"], "extended");
+    assert_eq!(intent["dd_activate_virtual_display"], false);
+    assert_eq!(intent["request_virtual_display"], true);
+    assert_eq!(open["application_display_settings"], settings);
+    assert_eq!(open["display_policy_snapshot"]["virtual_display_intent"], *intent);
+    assert_eq!(
+        open["display_policy_snapshot"]["application_display_settings"],
+        settings
+    );
+    assert_eq!(open["display_admission_token"], "ab".repeat(32));
+
+    let admission = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request { service, payload, .. }
+                if service == "amaterasu.launch/1"
+                    && payload["action"] == "prepare_display_admission" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .expect("signed display admission");
+    assert_eq!(admission["virtual_display_intent"], *intent);
+    assert_eq!(admission["application_display_settings"], settings);
+
+    let export = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request { service, payload, .. }
+                if service == "amaterasu.launch/1" && payload["action"] == "launch_export" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .expect("launch export");
+    assert_eq!(export["virtual_display_intent"], *intent);
+    assert_eq!(export["application_display_settings"], settings);
+}
+
+#[test]
 fn malformed_paired_physical_mode_rejects_before_launch_and_absent_inherits_stream() {
     for malformed in [
         "",
@@ -1164,6 +1235,7 @@ struct Broker {
     application_audio_sink_capture_only: Option<bool>,
     application_back_button_timeout: Option<i32>,
     application_input_overrides: Option<Value>,
+    application_display_settings: Option<Value>,
     application_snapshot: Option<Value>,
     application_executable_path: Option<String>,
     application_catalog_revision: u64,
@@ -1243,6 +1315,7 @@ impl Default for Broker {
             application_audio_sink_capture_only: None,
             application_back_button_timeout: None,
             application_input_overrides: None,
+            application_display_settings: None,
             application_snapshot: None,
             application_executable_path: None,
             application_catalog_revision: 1,
@@ -1501,18 +1574,26 @@ impl Broker {
                 let mut effective = payload["global_overrides"].as_object().unwrap().clone();
                 effective.extend(payload["application_display_overrides"].as_object().unwrap().clone());
                 effective.extend(payload["client_display_overrides"].as_object().unwrap().clone());
+                let mut snapshot = json!({
+                    "catalog_revision":payload["catalog_revision"],
+                    "global_revision":payload["global_revision"],
+                    "global_overrides":payload["global_overrides"],
+                    "certificate_id":payload["certificate_id"],
+                    "application_overrides":payload["application_display_overrides"],
+                    "application_display_settings":payload["application_display_settings"],
+                    "client_overrides":payload["client_display_overrides"],
+                    "effective_overrides":effective,
+                });
+                if let Some(intent) = payload
+                    .get("virtual_display_intent")
+                    .filter(|intent| !intent.is_null())
+                {
+                    snapshot["virtual_display_intent"] = intent.clone();
+                }
                 return json!({
                     "ok":true,
                     "display_admission_token":"ab".repeat(32),
-                    "display_policy_snapshot":{
-                        "catalog_revision":payload["catalog_revision"],
-                        "global_revision":payload["global_revision"],
-                        "global_overrides":payload["global_overrides"],
-                        "certificate_id":payload["certificate_id"],
-                        "application_overrides":payload["application_display_overrides"],
-                        "client_overrides":payload["client_display_overrides"],
-                        "effective_overrides":effective,
-                    },
+                    "display_policy_snapshot":snapshot,
                     "application_operation_id":payload["application_operation_id"],
                     "rtsp_operation_id":payload["rtsp_operation_id"],
                     "request_sha256":if self.forge_display_admission_hash { json!("00".repeat(32)) } else { payload["request_sha256"].clone() },
@@ -1535,6 +1616,7 @@ impl Broker {
                     "cleanup_budget_ms":self.application_cleanup_budget,
                     "config_overrides":launch["launch"]["config_overrides"].as_object()
                         .map(|overrides| json!(overrides)).unwrap_or_else(|| json!({})),
+                    "application_display_settings":self.application_display_settings,
                     "executable_path":self.application_executable_path,
                 });
             }

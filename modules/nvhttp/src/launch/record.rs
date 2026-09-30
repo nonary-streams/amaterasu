@@ -5,6 +5,7 @@ use super::{
 use crate::frame_limiter::FrameLimiterSettings;
 use crate::launch::{DEFAULT_CLEANUP_BUDGET, MONITOR_INTERVAL, STREAM_CLEANUP_MARGIN_MS};
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
+use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
 use serde_json::Value;
 use std::{
     collections::VecDeque,
@@ -79,9 +80,13 @@ pub struct Record {
     pub application_preflight_overrides: Option<ApplicationConfigOverrides>,
     /// Sparse application display fields frozen at preflight for launch readback.
     pub application_display_overrides: Option<Value>,
+    /// Typed catalog display selection, kept separate from dd_* overrides.
+    pub application_display_settings: Option<Value>,
     pub global_display_revision: Option<u64>,
     pub global_display_policy: Value,
     pub display_policy_snapshot: Option<Value>,
+    /// Resolved virtual-display lease intent frozen before Launch admission.
+    pub virtual_display_intent: Option<VirtualDisplayIntent>,
     pub display_topology_revision: Option<String>,
     pub display_snapshot_configuration: Option<Value>,
     pub verified_display_id: Option<String>,
@@ -242,9 +247,11 @@ impl Record {
             application_frame_limiter_settings: FrameLimiterSettings::default(),
             application_preflight_overrides: None,
             application_display_overrides: None,
+            application_display_settings: None,
             global_display_revision: None,
             global_display_policy: serde_json::json!({}),
             display_policy_snapshot: None,
+            virtual_display_intent: None,
             display_topology_revision: None,
             display_snapshot_configuration: None,
             verified_display_id: None,

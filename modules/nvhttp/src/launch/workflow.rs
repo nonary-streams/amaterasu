@@ -8,7 +8,12 @@ use super::{
 };
 use crate::frame_limiter::FrameLimiterSettings;
 use crate::wire::Reply;
-use serde::Deserialize;
+use amaterasu_contracts::virtual_display::{
+    VirtualDisplayConfigurationOption, VirtualDisplayHdrOption, VirtualDisplayIntent,
+    VirtualDisplayLayout, VirtualDisplayMode, VirtualDisplayModePolicy,
+    VirtualDisplayRefreshRateOption, VirtualDisplayResolutionOption, VirtualDisplayResolverContext,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::time::Instant;
@@ -195,6 +200,8 @@ impl Controller {
                         "preflight_token": record.application_preflight_token,
                         "display_admission_token": record.display_admission_token,
                         "application_display_overrides": record.application_display_overrides,
+                        "application_display_settings": record.application_display_settings,
+                        "virtual_display_intent": record.virtual_display_intent,
                         "frame_limiter_settings": record.frame_limiter_snapshot,
                         "client_frame_limiter_overrides":
                             client_frame_limiter_overrides(record),
@@ -215,11 +222,8 @@ impl Controller {
                     .display_policy_snapshot
                     .as_ref()
                     .expect("frozen display policy");
-                let request = record
-                    .display_request
-                    .as_ref()
-                    .expect("complete display request");
-                let request_sha256 = request_sha256(request).expect("serialized display request");
+                let request_sha256 = display_admission_request_sha256(record)
+                    .expect("serialized display admission request");
                 (
                     LAUNCH_SERVICE,
                     json!({
@@ -229,10 +233,12 @@ impl Controller {
                         "global_overrides":snapshot["global_overrides"],
                         "catalog_revision":snapshot["catalog_revision"],
                         "application_display_overrides":snapshot["application_overrides"],
+                        "application_display_settings":record.application_display_settings,
                         "certificate_id":snapshot["certificate_id"],
                         "client_display_overrides":snapshot["client_overrides"],
                         "rtsp_operation_id":record.rtsp_operation,
                         "request_sha256":request_sha256,
+                        "virtual_display_intent":record.virtual_display_intent,
                     }),
                     5_000,
                 )
@@ -315,6 +321,9 @@ impl Controller {
                         "frame_limiter_executable_path": record.executable_path,
                         "display_policy_snapshot": record.display_policy_snapshot,
                         "display_request": record.display_request,
+                        "application_display_settings": record.application_display_settings,
+                        "virtual_display_intent": record.virtual_display_intent,
+                        "display_admission_token": record.display_admission_token,
                         "capture": capture,
                         "profile": profile,
                     }),
@@ -370,11 +379,10 @@ impl Controller {
                 .expect("RTSP open payload")
                 .remove("display_request");
         }
-        if matches!(phase, Phase::OpenRtsp) && record.display_request.is_some() {
-            payload["display_admission_token"] = json!(record.display_admission_token);
-        }
         if matches!(phase, Phase::OpenRtsp)
             && (record.display_request.is_some()
+                || record.virtual_display_intent.is_some()
+                || record.application_display_settings.is_some()
                 || (record.executable_path.is_some() && record.frame_limiter_snapshot.is_some()))
         {
             payload["application_operation_id"] = json!(record.application_operation);
@@ -427,6 +435,7 @@ impl Controller {
                     token,
                     catalog_revision,
                     overrides: application_overrides,
+                    application_display_settings,
                     executable_path,
                     cleanup_budget_ms,
                 }) if record.state == State::Starting => {
@@ -447,6 +456,15 @@ impl Controller {
                     record.application_display_overrides = Some(application_display_overrides(
                         payload.get("config_overrides"),
                     ));
+                    record.application_display_settings = application_display_settings;
+                    record.virtual_display_intent = match virtual_display_intent(record) {
+                        Ok(intent) => intent,
+                        Err(code) => {
+                            fail_record(record, code, now);
+                            self.finish_or_retain(job.record, now, replies);
+                            return;
+                        }
+                    };
                     record.display_policy_snapshot = Some(display_policy_snapshot(record));
                     record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
                     let frozen_overrides = record
@@ -467,23 +485,37 @@ impl Controller {
                         self.finish_or_retain(job.record, now, replies);
                         return;
                     }
-                    match record
-                        .display_policy_snapshot
+                    if record
+                        .virtual_display_intent
                         .as_ref()
-                        .and_then(|snapshot| {
-                            snapshot["effective_overrides"]["dd_configuration_option"].as_str()
-                        }) {
-                        Some(
-                            "verify_only"
-                            | "ensure_active"
-                            | "ensure_primary"
-                            | "ensure_only_display",
-                        ) => match capture_source(record) {
-                            Ok(_) => record.stage = Stage::SnapshotDisplay,
-                            Err(code) => fail_record(record, code, now),
-                        },
-                        None | Some("disabled") => record.stage = Stage::LaunchApplication,
-                        Some(_) => fail_record(record, "display_mutation_unavailable", now),
+                        .is_some_and(VirtualDisplayIntent::active)
+                    {
+                        record.stage = Stage::PrepareDisplayAdmission;
+                    } else {
+                        match record
+                            .display_policy_snapshot
+                            .as_ref()
+                            .and_then(|snapshot| {
+                                snapshot["effective_overrides"]["dd_configuration_option"].as_str()
+                            }) {
+                            Some(
+                                "verify_only"
+                                | "ensure_active"
+                                | "ensure_primary"
+                                | "ensure_only_display",
+                            ) => match capture_source(record) {
+                                Ok(_) => record.stage = Stage::SnapshotDisplay,
+                                Err(code) => fail_record(record, code, now),
+                            },
+                            None | Some("disabled") => {
+                                record.stage = if record.application_display_settings.is_some() {
+                                    Stage::PrepareDisplayAdmission
+                                } else {
+                                    Stage::LaunchApplication
+                                }
+                            }
+                            Some(_) => fail_record(record, "display_mutation_unavailable", now),
+                        }
                     }
                 }
                 Ok(_) => fail_record(record, "application_preflight_unavailable", now),
@@ -522,7 +554,9 @@ impl Controller {
                     match build_display_request(record) {
                         Ok(request) => {
                             record.display_request = request;
-                            record.stage = if record.display_request.is_some() {
+                            record.stage = if record.display_request.is_some()
+                                || record.application_display_settings.is_some()
+                            {
                                 Stage::PrepareDisplayAdmission
                             } else {
                                 Stage::LaunchApplication
@@ -577,7 +611,7 @@ impl Controller {
                                     self.finish_or_retain(job.record, now, replies);
                                     return;
                                 }
-                                if record.display_request.is_some() {
+                                if record.rtsp_ticket.is_some() {
                                     complete_launch(record, now, replies);
                                 } else {
                                     record.stage = Stage::OpenRtsp;
@@ -617,7 +651,9 @@ impl Controller {
                 Ok((ticket, url, "ready", true)) if record.state == State::Starting => {
                     record.rtsp_ticket = Some(ticket);
                     record.rtsp_url = Some(url.to_owned());
-                    if record.display_request.is_some() && record.application_launch.is_none() {
+                    if record.display_admission_token.is_some()
+                        && record.application_launch.is_none()
+                    {
                         record.stage = Stage::LaunchApplication;
                     } else {
                         complete_launch(record, now, replies);
@@ -1212,12 +1248,32 @@ fn request_sha256(request: &Value) -> Result<String, &'static str> {
         .collect())
 }
 
-fn display_admission_response(record: &Record, payload: &Value) -> Result<String, &'static str> {
-    let request = record
-        .display_request
+fn display_admission_request_sha256(record: &Record) -> Result<String, &'static str> {
+    if let Some(intent) = &record.virtual_display_intent {
+        let bytes = serde_json::to_vec(intent).map_err(|_| "display_request_unavailable")?;
+        return Ok(hash_sha256(&bytes));
+    }
+    if let Some(request) = &record.display_request {
+        return request_sha256(request);
+    }
+    let settings = record
+        .application_display_settings
         .as_ref()
-        .ok_or("display_admission_unavailable")?;
-    let hash = request_sha256(request)?;
+        .ok_or("display_request_unavailable")?;
+    let bytes = serde_json::to_vec(settings).map_err(|_| "display_request_unavailable")?;
+    Ok(hash_sha256(&bytes))
+}
+
+fn hash_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn display_admission_response(record: &Record, payload: &Value) -> Result<String, &'static str> {
+    let hash =
+        display_admission_request_sha256(record).map_err(|_| "display_admission_unavailable")?;
     let token = payload["display_admission_token"]
         .as_str()
         .filter(|token| {
@@ -1295,7 +1351,139 @@ fn capture_source_for(
 
 #[cfg(test)]
 mod capture_source_tests {
-    use super::capture_source_for;
+    use super::{
+        capture_source_for, parse_application_display_settings, resolve_virtual_display_mode,
+        resolve_virtual_display_request,
+    };
+    use amaterasu_contracts::virtual_display::VirtualDisplayMode;
+    use serde_json::json;
+
+    #[test]
+    fn virtual_display_mode_precedence_preserves_explicit_disabled() {
+        assert_eq!(
+            resolve_virtual_display_mode(
+                None,
+                Some("disabled"),
+                None,
+                Some("shared"),
+                "per_client"
+            ),
+            Ok(VirtualDisplayMode::Disabled)
+        );
+        assert_eq!(
+            resolve_virtual_display_mode(
+                Some("disabled"),
+                Some("per_client"),
+                None,
+                Some("shared"),
+                "per_client"
+            ),
+            Ok(VirtualDisplayMode::Disabled)
+        );
+        assert_eq!(
+            resolve_virtual_display_mode(
+                Some("shared"),
+                Some("disabled"),
+                None,
+                Some("per_client"),
+                "disabled"
+            ),
+            Ok(VirtualDisplayMode::Shared)
+        );
+        assert_eq!(
+            resolve_virtual_display_mode(None, None, None, None, "per_client"),
+            Ok(VirtualDisplayMode::PerClient)
+        );
+    }
+
+    #[test]
+    fn virtual_display_request_matches_mode_auto_route_and_app_override_precedence() {
+        assert!(resolve_virtual_display_request(
+            VirtualDisplayMode::PerClient,
+            false,
+            false,
+            None,
+            true,
+        ));
+        assert!(resolve_virtual_display_request(
+            VirtualDisplayMode::Shared,
+            false,
+            false,
+            None,
+            true,
+        ));
+        assert!(!resolve_virtual_display_request(
+            VirtualDisplayMode::Disabled,
+            false,
+            false,
+            None,
+            true,
+        ));
+        assert!(resolve_virtual_display_request(
+            VirtualDisplayMode::Disabled,
+            true,
+            false,
+            None,
+            true,
+        ));
+        assert!(resolve_virtual_display_request(
+            VirtualDisplayMode::Disabled,
+            false,
+            true,
+            None,
+            true,
+        ));
+        assert!(!resolve_virtual_display_request(
+            VirtualDisplayMode::Shared,
+            true,
+            true,
+            Some("DISPLAY1"),
+            true,
+        ));
+        assert!(!resolve_virtual_display_request(
+            VirtualDisplayMode::PerClient,
+            false,
+            true,
+            Some(""),
+            true,
+        ));
+        assert!(resolve_virtual_display_request(
+            VirtualDisplayMode::Disabled,
+            false,
+            false,
+            Some("SUNSHINE:VIRTUAL_DISPLAY"),
+            true,
+        ));
+    }
+
+    #[test]
+    fn application_display_settings_are_strict_sparse_and_preserve_false() {
+        assert_eq!(parse_application_display_settings(None).unwrap(), None);
+        assert_eq!(
+            parse_application_display_settings(Some(&json!({
+                "display_output":"DP-1",
+                "virtual_screen":false,
+                "virtual_display_mode":"disabled",
+                "virtual_display_layout":"extended_primary"
+            })))
+            .unwrap(),
+            Some(json!({
+                "display_output":"DP-1",
+                "virtual_screen":false,
+                "virtual_display_mode":"disabled",
+                "virtual_display_layout":"extended_primary"
+            }))
+        );
+        for invalid in [
+            json!({"unexpected":true}),
+            json!({"virtual_screen":"false"}),
+            json!({"virtual_display_mode":"automatic"}),
+            json!({"virtual_display_layout":"sideways"}),
+            json!({"display_output":"monitor\nname"}),
+        ] {
+            assert!(parse_application_display_settings(Some(&invalid)).is_err());
+        }
+    }
 
     #[test]
     fn x11_source_uses_validated_connector_name_without_exposing_xid() {
@@ -1909,15 +2097,362 @@ fn display_policy_snapshot(record: &Record) -> Value {
             .clone(),
     );
     effective.extend(client.as_object().expect("client overrides object").clone());
-    json!({
+    let mut snapshot = json!({
         "catalog_revision":record.application_catalog_revision,
         "global_revision":record.global_display_revision,
         "global_overrides":record.global_display_policy,
         "certificate_id":record.peer.certificate_id,
         "application_overrides":application,
+        "application_display_settings":record.application_display_settings,
         "client_overrides":client,
         "effective_overrides":effective,
-    })
+    });
+    if let Some(intent) = &record.virtual_display_intent {
+        snapshot["virtual_display_intent"] = json!(intent);
+    }
+    snapshot
+}
+
+fn virtual_display_intent(record: &Record) -> Result<Option<VirtualDisplayIntent>, &'static str> {
+    let global = record
+        .global_display_policy
+        .as_object()
+        .ok_or("display_policy_unavailable")?;
+    let application = record
+        .application_display_overrides
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or("display_policy_unavailable")?;
+    let client = application_display_overrides(Some(&record.peer.client_display_overrides));
+    let client = client.as_object().ok_or("display_policy_unavailable")?;
+    let mut effective = global.clone();
+    effective.extend(application.clone());
+    effective.extend(client.clone());
+
+    let settings = match record.application_display_settings.as_ref() {
+        Some(value) => Some(
+            serde_json::from_value::<ApplicationDisplaySettings>(value.clone())
+                .map_err(|_| "invalid_application_display_settings")?,
+        ),
+        None => None,
+    };
+    let default_mode = implicit_virtual_display_mode(record);
+    let mode = resolve_virtual_display_mode(
+        client.get("virtual_display_mode").and_then(Value::as_str),
+        settings
+            .as_ref()
+            .and_then(|settings| settings.virtual_display_mode.as_deref()),
+        application
+            .get("virtual_display_mode")
+            .and_then(Value::as_str),
+        global.get("virtual_display_mode").and_then(Value::as_str),
+        default_mode,
+    )?;
+    let layout = client
+        .get("virtual_display_layout")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            settings
+                .as_ref()
+                .and_then(|settings| settings.virtual_display_layout.as_deref())
+        })
+        .or_else(|| {
+            effective
+                .get("virtual_display_layout")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("exclusive");
+    let layout = parse_virtual_display_layout(layout)?;
+
+    let app_output = settings
+        .as_ref()
+        .and_then(|settings| settings.display_output.as_deref());
+    let driver_enabled = effective
+        .get("dd_use_sunshine_virtual_display_driver")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let activate_virtual_display = effective
+        .get("dd_activate_virtual_display")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let app_requests_virtual = settings
+        .as_ref()
+        .and_then(|settings| settings.virtual_screen)
+        .unwrap_or(false);
+    let request_virtual_display = resolve_virtual_display_request(
+        mode,
+        activate_virtual_display,
+        app_requests_virtual,
+        app_output,
+        driver_enabled,
+    );
+    if !request_virtual_display {
+        return Ok(None);
+    }
+
+    let policy = virtual_display_mode_policy(record, &effective)?;
+    let width = record.request.width;
+    let height = record.request.height;
+    let refresh_millihz = record
+        .request
+        .fps
+        .checked_mul(1_000)
+        .ok_or("invalid_virtual_display_intent")?;
+    let scale = effective
+        .get("dd_virtual_display_scale")
+        .and_then(Value::as_i64)
+        .and_then(|scale| i32::try_from(scale).ok())
+        .unwrap_or(0);
+    let identity_material = if mode == VirtualDisplayMode::Shared {
+        json!([
+            "shared",
+            "Amaterasu",
+            width,
+            height,
+            refresh_millihz,
+            scale,
+            activate_virtual_display,
+            driver_enabled,
+            mode,
+            layout,
+            policy
+        ])
+    } else {
+        let owner = record
+            .peer
+            .client_id
+            .as_deref()
+            .or(record.peer.certificate_id.as_deref())
+            .ok_or("virtual_display_identity_unavailable")?;
+        json!([
+            "client",
+            owner,
+            "Amaterasu",
+            width,
+            height,
+            refresh_millihz,
+            scale,
+            activate_virtual_display,
+            driver_enabled,
+            mode,
+            layout,
+            policy
+        ])
+    };
+    let encoded_identity =
+        serde_json::to_vec(&identity_material).map_err(|_| "invalid_virtual_display_intent")?;
+    let identity = deterministic_display_identity(&encoded_identity);
+    let intent = VirtualDisplayIntent {
+        identity,
+        reference_id: record.rtsp_operation.clone(),
+        name: "Amaterasu".into(),
+        width,
+        height,
+        refresh_millihz,
+        dd_virtual_display_scale: scale,
+        dd_activate_virtual_display: activate_virtual_display,
+        dd_use_sunshine_virtual_display_driver: driver_enabled,
+        virtual_display_mode: mode,
+        virtual_display_layout: layout,
+        request_virtual_display: Some(true),
+        display_policy: Some(policy),
+    };
+    intent
+        .validate()
+        .map_err(|_| "invalid_virtual_display_intent")?;
+    Ok(Some(intent))
+}
+
+fn parse_virtual_display_mode(value: &str) -> Result<VirtualDisplayMode, &'static str> {
+    match value {
+        "disabled" => Ok(VirtualDisplayMode::Disabled),
+        "per_client" => Ok(VirtualDisplayMode::PerClient),
+        "shared" => Ok(VirtualDisplayMode::Shared),
+        _ => Err("invalid_virtual_display_mode"),
+    }
+}
+
+fn resolve_virtual_display_mode(
+    client: Option<&str>,
+    application_setting: Option<&str>,
+    application_override: Option<&str>,
+    global: Option<&str>,
+    default: &str,
+) -> Result<VirtualDisplayMode, &'static str> {
+    parse_virtual_display_mode(
+        client
+            .or(application_setting)
+            .or(application_override)
+            .or(global)
+            .unwrap_or(default),
+    )
+}
+
+fn implicit_virtual_display_mode(record: &Record) -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        let private_outputs_are_configured = record
+            .global_display_policy
+            .get("virtual_display_outputs")
+            .and_then(Value::as_array)
+            .is_some_and(|outputs| !outputs.is_empty());
+        if private_outputs_are_configured {
+            "per_client"
+        } else {
+            "disabled"
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "per_client"
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        "disabled"
+    }
+}
+
+fn resolve_virtual_display_request(
+    mode: VirtualDisplayMode,
+    activate_virtual_display: bool,
+    app_requests_virtual: bool,
+    app_output: Option<&str>,
+    sunshine_driver_enabled: bool,
+) -> bool {
+    let selected_output = app_output.map(str::trim);
+    let explicit_virtual_output = selected_output.is_some_and(|output| {
+        output.eq_ignore_ascii_case("sunshine:virtual_display")
+            || (!sunshine_driver_enabled
+                && output.eq_ignore_ascii_case("sunshine:sudovda_virtual_display"))
+    });
+    if explicit_virtual_output {
+        return true;
+    }
+    if selected_output.is_some() {
+        return false;
+    }
+    mode != VirtualDisplayMode::Disabled || activate_virtual_display || app_requests_virtual
+}
+
+fn parse_virtual_display_layout(value: &str) -> Result<VirtualDisplayLayout, &'static str> {
+    match value {
+        "exclusive" => Ok(VirtualDisplayLayout::Exclusive),
+        "extended" => Ok(VirtualDisplayLayout::Extended),
+        "extended_primary" => Ok(VirtualDisplayLayout::ExtendedPrimary),
+        "extended_isolated" => Ok(VirtualDisplayLayout::ExtendedIsolated),
+        "extended_primary_isolated" => Ok(VirtualDisplayLayout::ExtendedPrimaryIsolated),
+        _ => Err("invalid_virtual_display_layout"),
+    }
+}
+
+fn virtual_display_mode_policy(
+    record: &Record,
+    effective: &serde_json::Map<String, Value>,
+) -> Result<VirtualDisplayModePolicy, &'static str> {
+    let option = effective
+        .get("dd_configuration_option")
+        .and_then(Value::as_str)
+        .unwrap_or("verify_only");
+    let configuration_option = match option {
+        "disabled" => VirtualDisplayConfigurationOption::Disabled,
+        "verify_only" => VirtualDisplayConfigurationOption::VerifyOnly,
+        "ensure_active" => VirtualDisplayConfigurationOption::EnsureActive,
+        "ensure_primary" => VirtualDisplayConfigurationOption::EnsurePrimary,
+        "ensure_only_display" => VirtualDisplayConfigurationOption::EnsureOnlyDisplay,
+        _ => return Err("invalid_virtual_display_policy"),
+    };
+    let resolution = effective
+        .get("dd_resolution_option")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let resolution_option = match resolution {
+        "auto" => VirtualDisplayResolutionOption::Auto,
+        "disabled" => VirtualDisplayResolutionOption::Disabled,
+        "manual" => VirtualDisplayResolutionOption::Manual,
+        _ => return Err("invalid_virtual_display_policy"),
+    };
+    let refresh = effective
+        .get("dd_refresh_rate_option")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let refresh_rate_option = match refresh {
+        "auto" => VirtualDisplayRefreshRateOption::Auto,
+        "disabled" => VirtualDisplayRefreshRateOption::Disabled,
+        "manual" => VirtualDisplayRefreshRateOption::Manual,
+        "prefer_highest" => VirtualDisplayRefreshRateOption::PreferHighest,
+        _ => return Err("invalid_virtual_display_policy"),
+    };
+    let hdr = effective
+        .get("dd_hdr_option")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let hdr_option = match hdr {
+        "auto" => VirtualDisplayHdrOption::Auto,
+        "disabled" => VirtualDisplayHdrOption::Disabled,
+        _ => return Err("invalid_virtual_display_policy"),
+    };
+    let remapping = effective
+        .get("dd_mode_remapping")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| "invalid_virtual_display_policy")?
+        .unwrap_or_default();
+    let policy = VirtualDisplayModePolicy {
+        configuration_option: Some(configuration_option),
+        remapping,
+        context: VirtualDisplayResolverContext {
+            resolution_is_automatic: resolution == "auto",
+            refresh_rate_is_automatic: matches!(refresh, "auto" | "prefer_highest"),
+            client_display_mode_override: record.peer.client_display_mode.is_some(),
+            optimize_game_settings: false,
+        },
+        resolution_option: Some(resolution_option),
+        manual_resolution: effective
+            .get("dd_manual_resolution")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        refresh_rate_option: Some(refresh_rate_option),
+        manual_refresh_rate: effective
+            .get("dd_manual_refresh_rate")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        hdr_option: Some(hdr_option),
+        // The NVHTTP wire contract rejects hdrMode=1 today, so false is an
+        // explicit fact rather than an inference from missing SDP data.
+        effective_client_hdr_request: Some(false),
+    };
+    policy
+        .validate()
+        .map_err(|_| "invalid_virtual_display_policy")?;
+    Ok(policy)
+}
+
+fn deterministic_display_identity(material: &[u8]) -> String {
+    let digest = Sha256::digest(material);
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
 }
 
 fn resolved_adapter_setting(record: &Record, name: &str) -> Option<String> {
@@ -1941,6 +2476,7 @@ struct ApplicationPreflight {
     token: String,
     catalog_revision: u64,
     overrides: ApplicationConfigOverrides,
+    application_display_settings: Option<Value>,
     executable_path: Option<String>,
     cleanup_budget_ms: u64,
 }
@@ -1963,6 +2499,9 @@ fn application_preflight_response(
         .ok_or("invalid_application_preflight_response")?;
     let overrides = parse_application_config_overrides(payload.get("config_overrides"))
         .map_err(|_| "invalid_application_preflight_response")?;
+    let application_display_settings =
+        parse_application_display_settings(payload.get("application_display_settings"))
+            .map_err(|_| "invalid_application_preflight_response")?;
     let cleanup_budget_ms = application_cleanup_budget_ms(&payload["cleanup_budget_ms"])
         .ok_or("invalid_application_preflight_response")?;
     let executable_path = payload["executable_path"].as_str().map(str::to_owned);
@@ -1979,9 +2518,60 @@ fn application_preflight_response(
         token: token.to_owned(),
         catalog_revision,
         overrides,
+        application_display_settings,
         executable_path,
         cleanup_budget_ms,
     })
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct ApplicationDisplaySettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    virtual_screen: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    virtual_display_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    virtual_display_layout: Option<String>,
+}
+
+fn parse_application_display_settings(
+    value: Option<&Value>,
+) -> Result<Option<Value>, &'static str> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let settings: ApplicationDisplaySettings = serde_json::from_value(value.clone())
+        .map_err(|_| "invalid_application_display_settings")?;
+    if settings
+        .display_output
+        .as_deref()
+        .is_some_and(|output| output.len() > 1_024 || output.chars().any(char::is_control))
+        || settings
+            .virtual_display_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "disabled" | "per_client" | "shared"))
+        || settings
+            .virtual_display_layout
+            .as_deref()
+            .is_some_and(|layout| {
+                !matches!(
+                    layout,
+                    "exclusive"
+                        | "extended"
+                        | "extended_primary"
+                        | "extended_isolated"
+                        | "extended_primary_isolated"
+                )
+            })
+    {
+        return Err("invalid_application_display_settings");
+    }
+    serde_json::to_value(settings)
+        .map(Some)
+        .map_err(|_| "invalid_application_display_settings")
 }
 
 pub(super) fn parse_application_config_overrides(
