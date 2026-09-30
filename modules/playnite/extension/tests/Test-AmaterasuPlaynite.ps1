@@ -155,6 +155,8 @@ public sealed class BlockedPlayniteWriteStream : Stream {
     $new = New-MockConnection ('b' * 32) $cache
     try {
         $api.Database.Games[0].IsRunning = $true
+        $api.Database.Games[0].InstallDirectory = $extensionDirectory
+        $api.Database.Games[0].GameActions = @([pscustomobject]@{ IsPlayAction = $true; Path = $ModulePath })
         foreach ($connection in @($old, $new)) {
             $connection.Role = 'launcher'
             $connection.Mode = 'fullscreen'
@@ -172,10 +174,12 @@ public sealed class BlockedPlayniteWriteStream : Stream {
         $api.Database.Games[0].IsRunning = $true
         $api.Database.Games += [pscustomobject]@{ Id='60000000-0000-0000-0000-000000000002'; IsRunning=$true; InstallDirectory='C:\Games\Other'; GameActions=@() }
         & $extension { param($connection) Replay-RunningGame $connection } $new
-        $ambiguous = [string[]]($new.Queue.Take())
-        Assert-Equal $ambiguous.Count 2 'ambiguous running games were not both reported'
-        Assert-True (($ambiguous[0] | ConvertFrom-Json).status.id -cne ($ambiguous[1] | ConvertFrom-Json).status.id) 'ambiguous games collapsed into one status'
+        Assert-Equal $new.Queue.Count 0 'ambiguous running games emitted a fullscreen status'
         $api.Database.Games = @($api.Database.Games[0])
+        $api.Database.Games[0].Id = 'not-a-guid'
+        & $extension { param($connection) Replay-RunningGame $connection } $new
+        Assert-Equal $new.Queue.Count 0 'malformed running game emitted a fullscreen status'
+        $api.Database.Games[0].Id = '60000000-0000-0000-0000-000000000001'
         $api.Database.Games[0].IsRunning = $false
         $requestId = 'c' * 32
         $oldFrame = @(& $extension { param($connection, $id) New-SnapshotFrame $connection $id } $old $requestId)
@@ -354,18 +358,25 @@ public sealed class BlockedPlayniteWriteStream : Stream {
     $shutdownGame.InstallDirectory = $extensionDirectory
     $shutdownGame.GameActions = @([pscustomobject]@{ IsPlayAction = $true; Path = $ModulePath })
     $shutdownGame.IsRunning = $true
-    $shutdownApi.Database.Games += [pscustomobject]@{
+    $activeShutdownLines = @(& $extension { param($api) Get-FullscreenShutdownLines $api $api.MainView.UIDispatcher } $shutdownApi)
+    Assert-Equal $activeShutdownLines.Count 1 'single active game shutdown handoff line count'
+    Assert-Equal ($activeShutdownLines[0] | ConvertFrom-Json).status.name 'gameStarted' 'single active game shutdown handoff status'
+    Assert-Equal ($activeShutdownLines[0] | ConvertFrom-Json).status.id $shutdownGame.Id 'single active game shutdown handoff ID'
+
+    $ambiguousShutdownApi = New-MockApi $true
+    $ambiguousShutdownGame = $ambiguousShutdownApi.Database.Games[0]
+    $ambiguousShutdownGame.InstallDirectory = $extensionDirectory
+    $ambiguousShutdownGame.GameActions = @([pscustomobject]@{ IsPlayAction = $true; Path = $ModulePath })
+    $ambiguousShutdownGame.IsRunning = $true
+    $ambiguousShutdownApi.Database.Games += [pscustomobject]@{
         Id = '60000000-0000-0000-0000-000000000002'
         InstallDirectory = $extensionDirectory
         GameActions = @([pscustomobject]@{ IsPlayAction = $true; Path = $ModulePath })
         IsRunning = $true
     }
-    $activeShutdownLines = @(& $extension { param($api) Get-FullscreenShutdownLines $api $api.MainView.UIDispatcher } $shutdownApi)
-    Assert-Equal $activeShutdownLines.Count 2 'active game shutdown handoff line count'
-    Assert-Equal ($activeShutdownLines[0] | ConvertFrom-Json).status.name 'gameStarted' 'active game shutdown handoff status'
-    Assert-Equal ($activeShutdownLines[0] | ConvertFrom-Json).status.id $shutdownGame.Id 'active game shutdown handoff ID'
-    Assert-Equal ($activeShutdownLines[1] | ConvertFrom-Json).status.name 'gameStarted' 'second active game shutdown handoff status'
-    Assert-True (($activeShutdownLines[0] | ConvertFrom-Json).status.id -cne ($activeShutdownLines[1] | ConvertFrom-Json).status.id) 'distinct active games collapsed during shutdown handoff'
+    Assert-True ($null -eq (& $extension { param($api) Get-FullscreenShutdownLines $api $api.MainView.UIDispatcher } $ambiguousShutdownApi)) 'multiple running games emitted a shutdown status'
+    Assert-Equal (@(& $extension { param($items,$api) Request-FullscreenShutdown $items $api $api.MainView.UIDispatcher } $connections $ambiguousShutdownApi).Count) 0 'ambiguous shutdown woke fullscreen writers'
+    Assert-True (-not $fullscreen.ShutdownRequested.IsSet) 'ambiguous shutdown requested a status write'
 
     $idleShutdownApi = New-MockApi $true
     $idleShutdownLines = @(& $extension { param($api) Get-FullscreenShutdownLines $api $api.MainView.UIDispatcher } $idleShutdownApi)
@@ -377,6 +388,17 @@ public sealed class BlockedPlayniteWriteStream : Stream {
     $incompleteShutdownApi = New-MockApi $true
     $incompleteShutdownApi.Database.Games[0].IsRunning = $true
     Assert-True ($null -eq (& $extension { param($api) Get-FullscreenShutdownLines $api $api.MainView.UIDispatcher } $incompleteShutdownApi)) 'incomplete active-game data emitted a shutdown status'
+    $rootInstallShutdownApi = New-MockApi $true
+    $rootInstallShutdownApi.Database.Games[0].InstallDirectory = [System.IO.Path]::GetPathRoot($extensionDirectory)
+    $rootInstallShutdownApi.Database.Games[0].GameActions = @([pscustomobject]@{ IsPlayAction = $true; Path = $ModulePath })
+    $rootInstallShutdownApi.Database.Games[0].IsRunning = $true
+    Assert-True ($null -eq (& $extension { param($api) Get-FullscreenShutdownLines $api $api.MainView.UIDispatcher } $rootInstallShutdownApi)) 'filesystem-root install directory emitted a shutdown status'
+    $invalidIdShutdownApi = New-MockApi $true
+    $invalidIdShutdownApi.Database.Games[0].Id = 'not-a-guid'
+    $invalidIdShutdownApi.Database.Games[0].InstallDirectory = $extensionDirectory
+    $invalidIdShutdownApi.Database.Games[0].GameActions = @([pscustomobject]@{ IsPlayAction = $true; Path = $ModulePath })
+    $invalidIdShutdownApi.Database.Games[0].IsRunning = $true
+    Assert-True ($null -eq (& $extension { param($api) Get-FullscreenShutdownLines $api $api.MainView.UIDispatcher } $invalidIdShutdownApi)) 'malformed game ID emitted a shutdown status'
 
     $writer = [System.IO.StringWriter]::new()
     $writerWorker = [PowerShell]::Create()
@@ -387,10 +409,9 @@ public sealed class BlockedPlayniteWriteStream : Stream {
         [void]$writerWorker.EndInvoke($writerHandle)
         Assert-True $fullscreen.ShutdownWritten.IsSet 'shutdown did not wait for writer confirmation'
         $shutdownLines = @($writer.ToString().Trim().Split("`n") | Where-Object { $_ })
-        Assert-Equal $shutdownLines.Count 2 'fullscreen shutdown handoff line count'
+        Assert-Equal $shutdownLines.Count 1 'fullscreen shutdown handoff line count'
         Assert-Equal ($shutdownLines[0] | ConvertFrom-Json).status.name 'gameStarted' 'fullscreen shutdown did not preserve the active game'
         Assert-Equal ($shutdownLines[0] | ConvertFrom-Json).status.id $shutdownGame.Id 'fullscreen shutdown changed the active game ID'
-        Assert-Equal ($shutdownLines[1] | ConvertFrom-Json).status.name 'gameStarted' 'fullscreen shutdown omitted the second active game'
         Assert-Equal $fullscreen.Queue.Count 1 'shutdown did not bypass queued frames'
         Assert-True (-not $desktop.ShutdownRequested.IsSet) 'desktop launcher received fullscreen shutdown'
         Assert-True (-not $sunshine.ShutdownRequested.IsSet) 'sunshine received fullscreen shutdown'

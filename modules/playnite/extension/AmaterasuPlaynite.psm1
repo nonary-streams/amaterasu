@@ -291,30 +291,66 @@ function Send-Status([string]$Name, $Game) {
     }
 }
 
+function New-GameStartedStatusLine($Game) {
+    if (-not $Game) { return $null }
+    $parsedGameId = [Guid]::Empty
+    if (-not [Guid]::TryParse([string]$Game.Id, [ref]$parsedGameId) -or $parsedGameId -eq [Guid]::Empty) { return $null }
+
+    $installDirectory = [string]$Game.InstallDirectory
+    if (-not $installDirectory -or -not [System.IO.Path]::IsPathRooted($installDirectory) -or
+        $installDirectory -match '(^|[\\/])\.\.?([\\/]|$)' -or
+        -not (Test-Path -LiteralPath $installDirectory -PathType Container)) { return $null }
+
+    $executable = Get-GameExecutable $Game
+    if (-not $executable -or -not [System.IO.Path]::IsPathRooted($executable)) { return $null }
+    try {
+        $root = [System.IO.Path]::GetPathRoot($installDirectory)
+        if (-not $root -or $root -eq '\' -or $root -match '^[A-Za-z]:$') { return $null }
+        $installDirectory = [System.IO.Path]::GetFullPath($installDirectory)
+        $executable = [System.IO.Path]::GetFullPath($executable)
+        $rootWithoutTrailingSeparator = $root.TrimEnd([char[]]@('\', '/'))
+        $installWithoutTrailingSeparator = $installDirectory.TrimEnd([char[]]@('\', '/'))
+        if ([string]::Equals($rootWithoutTrailingSeparator, $installWithoutTrailingSeparator, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        $installPrefix = $installDirectory.TrimEnd([char[]]@('\', '/')) + '\'
+    } catch { return $null }
+    if (-not $executable.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+
+    return (Convert-FrameLine @{ type='status'; status=@{ name='gameStarted'; id=$parsedGameId.ToString('D'); installDir=$installDirectory; exe=$executable } })
+}
+
+function Get-FullscreenRunningGameSnapshot($Api) {
+    try {
+        # Two running games prove ambiguity; cap the UI-thread query at that point.
+        $running = @($Api.Database.Games | Where-Object { $_.IsRunning } | Select-Object -First 2)
+    } catch {
+        return @{ kind='query_failed'; line=$null }
+    }
+    if ($running.Count -eq 0) { return @{ kind='empty'; line=$null } }
+    if ($running.Count -ne 1) { return @{ kind='ambiguous'; line=$null } }
+    $line = New-GameStartedStatusLine $running[0]
+    if (-not $line) { return @{ kind='invalid'; line=$null } }
+    return @{ kind='active'; line=$line }
+}
+
 function Replay-RunningGame($Connection) {
     if ($Connection.Role -ne 'launcher') { return }
     if ($Connection.Mode -ne 'fullscreen' -and -not $Connection.GameId) { return }
     try {
         $api = $Connection.Api
-        $id = if ($Connection.Mode -eq 'fullscreen') { [Guid]::Empty } else { [Guid]::Parse($Connection.GameId) }
-        $queued = $Connection.Dispatcher.Invoke([Func[object]]{
-            $running = if ($Connection.Mode -eq 'fullscreen') {
-                # Two distinct games are enough for the watcher to reject an
-                # ambiguous return. Queue both in one frame on the UI thread,
-                # ordered with OnGameStarted and OnGameStopped callbacks.
-                @($api.Database.Games | Where-Object { $_.IsRunning } | Select-Object -First 2)
-            } else {
-                $game = $api.Database.Games.Get($id)
-                if ($game -and $game.IsRunning) { @($game) } else { @() }
+        $snapshot = $Connection.Dispatcher.Invoke([Func[object]]{
+            if ($Connection.Mode -eq 'fullscreen') {
+                return (Get-FullscreenRunningGameSnapshot $api)
             }
-            $lines = [System.Collections.Generic.List[string]]::new()
-            foreach ($game in $running) {
-                $lines.Add((Convert-FrameLine @{ type='status'; status=@{ name='gameStarted'; id=[string]$game.Id; installDir=[string]$game.InstallDirectory; exe=(Get-GameExecutable $game) } }))
-            }
-            if ($lines.Count -eq 0) { return $true }
-            return (Add-Frame $Connection $lines.ToArray())
+            $id = [Guid]::Parse($Connection.GameId)
+            $game = $api.Database.Games.Get($id)
+            if (-not $game -or -not $game.IsRunning) { return @{ kind='empty'; line=$null } }
+            $line = New-GameStartedStatusLine $game
+            if (-not $line) { return @{ kind='invalid'; line=$null } }
+            return @{ kind='active'; line=$line }
         })
-        if (-not $queued) { throw 'running-game replay queue full' }
+        if ($snapshot.kind -eq 'query_failed') { throw 'running-game query failed' }
+        if ($snapshot.kind -ne 'active') { return }
+        if (-not (Add-Frame $Connection @([string]$snapshot.line))) { throw 'running-game replay queue full' }
     } catch { $Connection.Stream.Dispose() }
 }
 
@@ -377,36 +413,16 @@ function Get-FullscreenShutdownLines($Api, $Dispatcher) {
     if (-not $Api -or -not $Dispatcher) { return $null }
     try {
         $api = $Api
-        $runningGames = @($Dispatcher.Invoke([Func[object]]{
-            @($api.Database.Games | Where-Object { $_.IsRunning } | Select-Object -First 2)
-        }))
+        $snapshot = $Dispatcher.Invoke([Func[object]]{ Get-FullscreenRunningGameSnapshot $api })
     } catch {
         # A failed query cannot prove this was a user exit. Leave the watcher
         # without a shutdown status instead of closing a live game's session.
         return $null
     }
-
-    try {
-        $lines = [System.Collections.Generic.List[string]]::new()
-        foreach ($game in $runningGames) {
-            if (-not $game) { continue }
-            $gameId = [string]$game.Id
-            $installDirectory = [string]$game.InstallDirectory
-            $executable = Get-GameExecutable $game
-            if (-not $gameId -or -not $installDirectory -or -not $executable) {
-                # Do not send a partial handoff. The consumer needs all three
-                # fields to watch this game and safely restore Fullscreen.
-                return $null
-            }
-            $lines.Add((Convert-FrameLine @{ type='status'; status=@{ name='gameStarted'; id=$gameId; installDir=$installDirectory; exe=$executable } }))
-        }
-
-        if ($lines.Count -eq 0) {
-            $lines.Add((Convert-FrameLine @{ type='status'; status=@{ name='playniteExiting' } }))
-        }
-        return $lines.ToArray()
-    } catch {
-        return $null
+    switch ($snapshot.kind) {
+        'empty' { return (Convert-FrameLine @{ type='status'; status=@{ name='playniteExiting' } }) }
+        'active' { return [string]$snapshot.line }
+        default { return $null }
     }
 }
 
