@@ -21,6 +21,11 @@ sections enabled. Poll intervals are 250 to 60,000 ms, retention is 30 to
 intentionally in memory; persisted stream history is owned by
 `amaterasu.session-history/1`.
 
+The management response includes at most 32 evenly spaced samples from the
+retained window. This keeps the response within the management API body limit
+while allowing retention and maximum-sample settings to control the time span
+shown by the charts.
+
 Linux sampling reads `/proc/stat` for CPU utilization, `/proc/meminfo` for
 memory use, and aggregates non-loopback counters from `/proc/net/dev` for
 network rates. CPU temperature is read only from recognized CPU thermal or

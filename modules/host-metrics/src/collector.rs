@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_STREAM_ACTIVITIES: usize = 128;
+const MAX_RESPONSE_SAMPLES: usize = 32;
 const MIN_DASHBOARD_LEASE: Duration = Duration::from_secs(5);
 
 pub struct Collector {
@@ -60,7 +61,7 @@ impl Collector {
             latest
                 .map(|sample| sample.host.clone())
                 .unwrap_or_else(HostSnapshot::unavailable),
-            self.samples.iter().rev().take(32).rev().cloned().collect(),
+            self.response_samples(),
         )
     }
 
@@ -114,6 +115,21 @@ impl Collector {
         }
         self.dashboard_expires.is_some_and(|expires| now < expires)
             || !self.stream_activities.is_empty()
+    }
+
+    fn response_samples(&self) -> Vec<Sample> {
+        let count = self.samples.len();
+        if count <= MAX_RESPONSE_SAMPLES {
+            return self.samples.iter().cloned().collect();
+        }
+
+        let last_index = count - 1;
+        (0..MAX_RESPONSE_SAMPLES)
+            .map(|point| {
+                let index = point * last_index / (MAX_RESPONSE_SAMPLES - 1);
+                self.samples[index].clone()
+            })
+            .collect()
     }
 
     fn prune(&mut self) {
@@ -181,19 +197,28 @@ mod tests {
         let settings = Settings {
             pause_when_hidden: false,
             poll_interval_ms: 250,
-            max_history_points: 30,
+            max_history_points: 40,
             ..Settings::default()
         };
         let mut collector = Collector::new(settings);
-        for index in 0..35 {
+        for index in 0..50 {
             collector.tick(now + Duration::from_millis(250 * index));
         }
-        assert_eq!(collector.samples.len(), 30);
+        assert_eq!(collector.samples.len(), 40);
         assert!(
             collector
                 .samples
                 .iter()
                 .all(|sample| sample.recorded_at_unix_ms > 0)
+        );
+        let (_, _, _, response_samples) = collector.read(now + Duration::from_secs(9));
+        assert_eq!(response_samples.len(), MAX_RESPONSE_SAMPLES);
+        assert_eq!(response_samples.first(), collector.samples.front());
+        assert_eq!(response_samples.last(), collector.samples.back());
+        assert!(
+            response_samples.windows(2).all(|samples| {
+                samples[0].recorded_at_unix_ms <= samples[1].recorded_at_unix_ms
+            })
         );
     }
 
