@@ -1,6 +1,44 @@
 # Configuration parity execution workflow
 
-## Current session override: native agents, Ultra
+## Current session override: native Luna agents
+
+On 2026-09-30 the user requested resuming the remaining work with Luna agents
+at Medium through Max reasoning according to task complexity. This supersedes
+all older model and effort assignments below. Use the native agents API with
+six feature coordinators and up to twelve active workers in total; workers do
+not delegate. Coordinators choose Luna Medium, High, or Max for bounded tasks,
+review, and complex lifecycle or native ABI work respectively.
+
+The resumed clean baseline is `e49857173dda77ce358ab4a05766f2604765bdd8`.
+Fresh build-enabled team trees are
+`/tmp/amaterasu-20260930-luna/feature-N_large`, with isolated targets at
+`/tmp/amaterasu-20260930-luna/build-N_large/cargo-target`, two Cargo jobs per
+build, and `manifest-N.json` recording their base and directories. Child trees
+also use `_large` names with distinct build directories. This temporary layout
+avoids filling the source filesystem; preserve the earlier worktrees and their
+interrupted changes. New team handoffs live alongside these trees in `team-N`.
+Main remains the sole landing destination with one writer.
+
+The resumed teams have landed public network policy qualification, paired-client
+DS4 Back-button precedence, real Auto-to-x264 public streaming qualification, and
+profile-preserving cold-browser remembered-session qualification. The PipeWire
+follow-on adds scoped management/editor selection and a signed MediaProbe
+no-picker provider-load gate. The preserved launch cleanup, portable
+portal/PipeWire provider, and scoped software `min_threads` increments are landed. Coordinate actual
+NVHTTP launch overlaps between input, lifecycle, capture and encoder owners.
+Keep local implementation, signed consumer tests, and hardware/platform gates
+separate; coverage stays pending until the complete reference behavior passes.
+
+The resume discovered zero-length tracked files, two empty loose Git objects,
+and an empty old team index. The exact reachable blob was restored only after
+its Git hash matched a surviving checkout; the other empty object was
+unreachable and quarantined. Committed main files were restored and the empty
+index rebuilt without changing its worktree. Evidence and copies of interrupted
+files are at `/tmp/amaterasu-20260930-luna/recovery-evidence`. A full Git object
+check found no corrupt or missing reachable objects after recovery. This is
+repository recovery evidence, not filesystem-health qualification.
+
+## Historical session override: native agents, Ultra
 
 On 2026-09-29 the user requested execution in one session at Ultra reasoning
 and clarified that delegation must use this session's native agents API rather
@@ -26,7 +64,7 @@ under `amaterasu-config-runs/20260929-ultra-native/team-N`. Main remains the sol
 landing destination. Preserve the historical workflow below as context rather
 than restarting its old CLI sessions.
 
-## Active policy: six coordinators, three workers each
+## Historical policy: six coordinators, three workers each
 
 The user's clarification on 2026-09-25 requires MULTIPLE coordinators. Preserve
 six autonomous feature coordinators, each with up to three implementation/review
@@ -67,6 +105,11 @@ separately so real progress remains visible without overstating completion.
 
 ## Build-enabled teams and workers
 
+For the current native-Luna run, use the `/tmp` worktrees and manifests in the
+opening override. Do not run the PowerShell CLI launchers or apply their pinned
+Sol model tiers. The launcher descriptions and earlier Windows paths below are
+historical; isolated targets, local validation and ownership rules still apply.
+
 The user approved build-enabled worktrees. Team and child worktrees use _large
 directory names and manifest-recorded isolated build directories. The
 Worktree provisioner creates them. Each child gets its own checkout and
@@ -74,8 +117,8 @@ CARGO_TARGET_DIR=<manifest BuildDirectory>/cargo-target, with CARGO_BUILD_JOBS=2
 Children must not inherit their coordinator's target directory for compilation.
 Use Cargo's common download cache; never share mutable target directories.
 
-The current machine has 24 logical processors and about 64 GB RAM. The check
-helper allows six simultaneous validation jobs (two Cargo jobs each); further
+The historical Windows runner had 24 logical processors and about 64 GB RAM. Its check
+helper allowed six simultaneous validation jobs (two Cargo jobs each); further
 checks wait automatically. This limits build contention while all teams continue
 implementation. There is no single global build queue serviced by a model.
 Host-global device/port/service tests remain explicitly serialized.
@@ -195,9 +238,9 @@ header with an exact same-origin check, and
 a Web Locks guard for refresh and remembered-session restoration. Plain HTTP
 and separate-origin development retain explicit bearer authorization. Controlled
 Linux Chromium tests qualify reload, refresh and peer sign-out; signed host tests
-separately exercise the real authentication service. Interactive installed-host
-browser/restart qualification and the web fallback difference keep both IDs
-pending.
+separately exercise the real authentication service. Signed normal-user Linux Chromium now qualifies host restart and a cold browser
+process restart with remembered-cookie restoration. Installed service/CA trust,
+other-platform browsers and the web fallback difference keep both IDs pending.
 
 Session-history settings now use the central `amaterasu.configuration/1`
 revision for signed compare-and-swap updates. Startup migrates older SQLite

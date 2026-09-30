@@ -177,8 +177,11 @@ provide touch coordinates, motion, rumble, or controller feedback.
 `ds4_back_as_touchpad_click` defaults to enabled and adds the Back button to the
 DS4 touchpad-click control while preserving its Share mapping. Client touchpad
 and miscellaneous-button clicks also map to that DS4 control. The durable setting
-and sparse acquire override are accepted by the input module; management UI and
-NVHTTP scope resolution await their owning lanes. Windows does not select another
+and sparse acquire override are accepted by the input module. Signed management
+and paired-client editors persist explicit false and inheritance; NVHTTP resolves
+certificate-bound client policy before application policy and freezes the choice
+for launch. Signed host restart and synthetic input-probe tests qualify that
+projection. Native DS4 touchpad-click and game delivery remain unqualified. Windows does not select another
 profile when ViGEm is missing. Linux exposes the Xbox-like uinput backend under
 the pinned `xone` choice; it does not use Inputtino. DS5, Switch, VHF profiles,
 VHF/UMDF device creation, and Inputtino integration remain unimplemented. Linux runtime behavior
