@@ -785,17 +785,25 @@ fn stream_probe_replaces_platform_sources_without_widening_native_interfaces() {
                 .calls
                 .iter()
                 .filter(|service| {
-                    !["amaterasu.session-history/1", "amaterasu.frame-limiter/1"].contains(service)
+                    ![
+                        "amaterasu.session-history/1",
+                        "amaterasu.frame-limiter/1",
+                        "amaterasu.host-metrics/1",
+                    ]
+                    .contains(service)
                 })
                 .all(|service| rtsp.calls.contains(service))
         );
-        // History and frame limiter are internal to stream-session; RTSP has no direct grant.
+        // History, host telemetry and frame limiting are internal to
+        // stream-session; RTSP has no direct grant.
         assert!(
             STREAM_SESSION
                 .calls
                 .contains(&"amaterasu.session-history/1")
         );
+        assert!(STREAM_SESSION.calls.contains(&"amaterasu.host-metrics/1"));
         assert!(!rtsp.calls.contains(&"amaterasu.session-history/1"));
+        assert!(!rtsp.calls.contains(&"amaterasu.host-metrics/1"));
         assert!(rtsp.native_uses.is_empty());
     }
 }
