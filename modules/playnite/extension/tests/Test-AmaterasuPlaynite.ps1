@@ -31,6 +31,10 @@ class MockDispatcher {
     [object] Invoke([Func[object]] $action) { return $action.Invoke() }
 }
 
+class FailingDispatcher {
+    [object] Invoke([Func[object]] $action) { throw 'dispatcher unavailable' }
+}
+
 function New-MockApi([bool]$OnUiThread) {
     $categoryId = '50000000-0000-0000-0000-000000000001'
     return [pscustomobject]@{
@@ -344,17 +348,49 @@ public sealed class BlockedPlayniteWriteStream : Stream {
     Assert-True $connections.TryAdd('desktop', $desktop) 'desktop shutdown setup failed'
     Assert-True $connections.TryAdd('sunshine', $sunshine) 'sunshine shutdown setup failed'
     Assert-True (& $extension { param($connection) Add-Frame $connection @('queued-before-shutdown') } $fullscreen) 'shutdown queue setup failed'
+
+    $shutdownApi = New-MockApi $true
+    $shutdownGame = $shutdownApi.Database.Games[0]
+    $shutdownGame.InstallDirectory = $extensionDirectory
+    $shutdownGame.GameActions = @([pscustomobject]@{ IsPlayAction = $true; Path = $ModulePath })
+    $shutdownGame.IsRunning = $true
+    $shutdownApi.Database.Games += [pscustomobject]@{
+        Id = '60000000-0000-0000-0000-000000000002'
+        InstallDirectory = $extensionDirectory
+        GameActions = @([pscustomobject]@{ IsPlayAction = $true; Path = $ModulePath })
+        IsRunning = $true
+    }
+    $activeShutdownLines = @(& $extension { param($api) Get-FullscreenShutdownLines $api $api.MainView.UIDispatcher } $shutdownApi)
+    Assert-Equal $activeShutdownLines.Count 2 'active game shutdown handoff line count'
+    Assert-Equal ($activeShutdownLines[0] | ConvertFrom-Json).status.name 'gameStarted' 'active game shutdown handoff status'
+    Assert-Equal ($activeShutdownLines[0] | ConvertFrom-Json).status.id $shutdownGame.Id 'active game shutdown handoff ID'
+    Assert-Equal ($activeShutdownLines[1] | ConvertFrom-Json).status.name 'gameStarted' 'second active game shutdown handoff status'
+    Assert-True (($activeShutdownLines[0] | ConvertFrom-Json).status.id -cne ($activeShutdownLines[1] | ConvertFrom-Json).status.id) 'distinct active games collapsed during shutdown handoff'
+
+    $idleShutdownApi = New-MockApi $true
+    $idleShutdownLines = @(& $extension { param($api) Get-FullscreenShutdownLines $api $api.MainView.UIDispatcher } $idleShutdownApi)
+    Assert-Equal $idleShutdownLines.Count 1 'idle shutdown line count'
+    Assert-Equal ($idleShutdownLines[0] | ConvertFrom-Json).status.name 'playniteExiting' 'idle shutdown status'
+    $unknownShutdownApi = New-MockApi $true
+    $unknownShutdownApi.MainView.UIDispatcher = [FailingDispatcher]::new()
+    Assert-True ($null -eq (& $extension { param($api) Get-FullscreenShutdownLines $api $api.MainView.UIDispatcher } $unknownShutdownApi)) 'failed running-game query emitted a shutdown status'
+    $incompleteShutdownApi = New-MockApi $true
+    $incompleteShutdownApi.Database.Games[0].IsRunning = $true
+    Assert-True ($null -eq (& $extension { param($api) Get-FullscreenShutdownLines $api $api.MainView.UIDispatcher } $incompleteShutdownApi)) 'incomplete active-game data emitted a shutdown status'
+
     $writer = [System.IO.StringWriter]::new()
     $writerWorker = [PowerShell]::Create()
     try {
         [void]$writerWorker.AddScript('param($path,$connection,$writer) Import-Module -Name $path -Force; [void]$connection.ShutdownRequested.Wait(2000); $module = Get-Module AmaterasuPlaynite; & $module { param($c,$w) Write-FullscreenShutdown $c $w } $connection $writer').AddArgument($ModulePath).AddArgument($fullscreen).AddArgument($writer)
         $writerHandle = $writerWorker.BeginInvoke()
-        & $extension { param($items) $script:Connections = $items; $script:Stop = [System.Threading.CancellationTokenSource]::new(); $script:Subscriptions = @(); $script:Background = $null; OnApplicationStopped } $connections
+        & $extension { param($items,$api) $script:Connections = $items; $script:PlayniteApi = $api; $script:Stop = [System.Threading.CancellationTokenSource]::new(); $script:Subscriptions = @(); $script:Background = $null; OnApplicationStopped } $connections $shutdownApi
         [void]$writerWorker.EndInvoke($writerHandle)
         Assert-True $fullscreen.ShutdownWritten.IsSet 'shutdown did not wait for writer confirmation'
         $shutdownLines = @($writer.ToString().Trim().Split("`n") | Where-Object { $_ })
-        Assert-Equal $shutdownLines.Count 1 'fullscreen shutdown emitted multiple statuses'
-        Assert-Equal ($shutdownLines[0] | ConvertFrom-Json).status.name 'playniteExiting' 'fullscreen shutdown status missing'
+        Assert-Equal $shutdownLines.Count 2 'fullscreen shutdown handoff line count'
+        Assert-Equal ($shutdownLines[0] | ConvertFrom-Json).status.name 'gameStarted' 'fullscreen shutdown did not preserve the active game'
+        Assert-Equal ($shutdownLines[0] | ConvertFrom-Json).status.id $shutdownGame.Id 'fullscreen shutdown changed the active game ID'
+        Assert-Equal ($shutdownLines[1] | ConvertFrom-Json).status.name 'gameStarted' 'fullscreen shutdown omitted the second active game'
         Assert-Equal $fullscreen.Queue.Count 1 'shutdown did not bypass queued frames'
         Assert-True (-not $desktop.ShutdownRequested.IsSet) 'desktop launcher received fullscreen shutdown'
         Assert-True (-not $sunshine.ShutdownRequested.IsSet) 'sunshine received fullscreen shutdown'
@@ -370,13 +406,24 @@ public sealed class BlockedPlayniteWriteStream : Stream {
     $deadConnections = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
     Assert-True $deadConnections.TryAdd('dead', $dead) 'dead writer setup failed'
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
-    & $extension { param($items) $script:Connections = $items; $script:Stop = [System.Threading.CancellationTokenSource]::new(); $script:Subscriptions = @(); $script:Background = $null; OnApplicationStopped } $deadConnections
+    & $extension { param($items,$api) $script:Connections = $items; $script:PlayniteApi = $api; $script:Stop = [System.Threading.CancellationTokenSource]::new(); $script:Subscriptions = @(); $script:Background = $null; OnApplicationStopped } $deadConnections $idleShutdownApi
     $timer.Stop()
     Assert-True ($timer.ElapsedMilliseconds -lt 1500) 'dead writer blocked Playnite shutdown'
     Assert-True $dead.ShutdownRequested.IsSet 'dead writer did not receive shutdown request'
     Assert-True (-not $dead.ShutdownWritten.IsSet) 'dead writer falsely confirmed a write'
     Assert-True (-not $dead.Stream.CanRead) 'dead writer pipe was not closed'
     $dead.Queue.Dispose()
+
+    $unknown = New-MockConnection ('4' * 32) $cache
+    $unknown.Role = 'launcher'; $unknown.Mode = 'fullscreen'; $unknown.Stream = [System.IO.MemoryStream]::new()
+    $unknown.ShutdownRequested = [System.Threading.ManualResetEventSlim]::new($false)
+    $unknown.ShutdownWritten = [System.Threading.ManualResetEventSlim]::new($false)
+    $unknownConnections = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+    Assert-True $unknownConnections.TryAdd('unknown', $unknown) 'unknown shutdown setup failed'
+    & $extension { param($items,$api) $script:Connections = $items; $script:PlayniteApi = $api; $script:Stop = [System.Threading.CancellationTokenSource]::new(); $script:Subscriptions = @(); $script:Background = $null; OnApplicationStopped } $unknownConnections $unknownShutdownApi
+    Assert-True (-not $unknown.ShutdownRequested.IsSet) 'failed running-game query was reported as a deliberate exit'
+    Assert-True (-not $unknown.Stream.CanRead) 'unknown shutdown left the pipe open'
+    $unknown.Queue.Dispose()
 
     Write-Host 'PASS Playnite extension mock protocol, identity, bounds, and packaging checks'
 } finally {

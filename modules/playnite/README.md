@@ -161,12 +161,16 @@ cannot establish that its process is gone; the ticket remains Playing until
 manual stop. The pinned extension
 normally omits `gameStopped` for games started after a generic launcher
 connection; exact-image process observation is the fallback. On shutdown the
-extension asks each authenticated Fullscreen connection's sole writer to flush
-one `playniteExiting` record before closing pipes, with a 500 ms total wait.
-Writer confirmation means a local pipe flush, not receipt by the watcher;
-abrupt termination or a blocked pipe can still lose the record. When received,
-it suppresses auto-return for an intentional Playnite exit. The ticket becomes
-Stopped only after a complete exact FullscreenApp scan
+extension checks the running-game list on Playnite's UI thread. It asks each
+authenticated Fullscreen connection's sole writer to flush up to two
+`gameStarted` records when games are still running, preserving the active-game
+watchdog if Playnite is configured to exit on launch. It sends
+`playniteExiting` only after a successful query confirms no game is running; a
+failed query or incomplete game record sends no shutdown status. The writer has
+a 500 ms total wait, and confirmation means a local pipe flush, not receipt by
+the watcher. Abrupt termination or a blocked pipe can still lose the record. A
+received `playniteExiting` suppresses auto-return for an intentional Playnite
+exit. The ticket becomes Stopped only after a complete exact FullscreenApp scan
 finds no process for that installation. An unknown scan or any remaining
 same-install fullscreen UI keeps the ticket active, even when the ordinary
 discovery snapshot is empty. This also applies to tickets already in

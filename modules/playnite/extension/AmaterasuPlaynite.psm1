@@ -10,6 +10,7 @@ $script:SnapshotCache = [System.Collections.Concurrent.ConcurrentDictionary[stri
 $script:Stop = [System.Threading.CancellationTokenSource]::new()
 $script:Background = $null
 $script:Subscriptions = @()
+$script:PlayniteApi = $null
 
 function Get-SnapshotGeneration($Signals) {
     if (-not $Signals) { return 0L }
@@ -366,16 +367,57 @@ function Invoke-ExtensionCommand($Connection, $Message) {
 
 function Write-FullscreenShutdown($Connection, $Writer) {
     if (-not $Connection.ShutdownRequested.IsSet -or $Connection.ShutdownWritten.IsSet) { return $false }
-    $Writer.WriteLine((Convert-FrameLine @{ type='status'; status=@{ name='playniteExiting' } }))
+    foreach ($line in [string[]]$Connection.ShutdownLines) { $Writer.WriteLine($line) }
     $Writer.Flush()
     $Connection.ShutdownWritten.Set()
     return $true
 }
 
-function Request-FullscreenShutdown($Connections) {
+function Get-FullscreenShutdownLines($Api, $Dispatcher) {
+    if (-not $Api -or -not $Dispatcher) { return $null }
+    try {
+        $api = $Api
+        $runningGames = @($Dispatcher.Invoke([Func[object]]{
+            @($api.Database.Games | Where-Object { $_.IsRunning } | Select-Object -First 2)
+        }))
+    } catch {
+        # A failed query cannot prove this was a user exit. Leave the watcher
+        # without a shutdown status instead of closing a live game's session.
+        return $null
+    }
+
+    try {
+        $lines = [System.Collections.Generic.List[string]]::new()
+        foreach ($game in $runningGames) {
+            if (-not $game) { continue }
+            $gameId = [string]$game.Id
+            $installDirectory = [string]$game.InstallDirectory
+            $executable = Get-GameExecutable $game
+            if (-not $gameId -or -not $installDirectory -or -not $executable) {
+                # Do not send a partial handoff. The consumer needs all three
+                # fields to watch this game and safely restore Fullscreen.
+                return $null
+            }
+            $lines.Add((Convert-FrameLine @{ type='status'; status=@{ name='gameStarted'; id=$gameId; installDir=$installDirectory; exe=$executable } }))
+        }
+
+        if ($lines.Count -eq 0) {
+            $lines.Add((Convert-FrameLine @{ type='status'; status=@{ name='playniteExiting' } }))
+        }
+        return $lines.ToArray()
+    } catch {
+        return $null
+    }
+}
+
+function Request-FullscreenShutdown($Connections, $Api, $Dispatcher) {
+    $lines = Get-FullscreenShutdownLines $Api $Dispatcher
+    if ($null -eq $lines -or $lines.Count -eq 0) { return @() }
+
     $pending = [System.Collections.Generic.List[object]]::new()
     foreach ($connection in $Connections.Values) {
         if ($connection.Role -eq 'launcher' -and $connection.Mode -eq 'fullscreen' -and $connection.ShutdownRequested -and $connection.ShutdownWritten) {
+            $connection.ShutdownLines = $lines
             $connection.ShutdownRequested.Set()
             $pending.Add($connection)
         }
@@ -500,6 +542,7 @@ function Start-PipeServer($Api, $Dispatcher, $Connections, $Stop, $Signals, $Cac
 }
 
 function OnApplicationStarted() {
+    $script:PlayniteApi = $PlayniteApi
     if ($script:Background) { return }
     try { $script:SnapshotCache['payload'] = Capture-SnapshotPayload $PlayniteApi $script:Signals } catch { $discard = $null; [void]$script:SnapshotCache.TryRemove('payload', [ref]$discard) }
     $script:Stop = [System.Threading.CancellationTokenSource]::new()
@@ -528,10 +571,13 @@ function OnLibraryUpdated() {
 }
 
 function OnApplicationStopped() {
-    $pending = @(Request-FullscreenShutdown $script:Connections)
+    $api = $script:PlayniteApi
+    $dispatcher = if ($api) { $api.MainView.UIDispatcher } else { $null }
+    $pending = @(Request-FullscreenShutdown $script:Connections $api $dispatcher)
     Await-FullscreenShutdown $pending 500
     $script:Stop.Cancel()
     foreach ($connection in $script:Connections.Values) { $connection.Stream.Dispose() }
+    $script:PlayniteApi = $null
     foreach ($subscription in $script:Subscriptions) { Unregister-Event -SubscriptionId $subscription.SubscriptionId -ErrorAction SilentlyContinue }
     if ($script:Background) {
         $script:Background.Worker.Dispose()
