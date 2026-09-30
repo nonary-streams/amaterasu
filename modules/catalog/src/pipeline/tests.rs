@@ -1427,6 +1427,55 @@ fn import_playnite_entry(
     )
 }
 
+fn import_playnite_entry_value(
+    backend: &mut Backend,
+    pipeline: &mut Pipeline,
+    sync_id: &str,
+    source_revision: u64,
+    expected_revision: u64,
+    source_id: &str,
+    entry: Value,
+) -> Value {
+    let begin = backend.run_for(
+        pipeline,
+        snapshot_begin(sync_id, source_revision),
+        "amaterasu.playnite",
+        "management",
+        "amaterasu.management",
+    );
+    assert_eq!(begin["ok"], true, "{begin}");
+    let generation = begin["generation"].as_u64().unwrap();
+    let batch = backend.run_for(
+        pipeline,
+        snapshot_batch(
+            sync_id,
+            generation,
+            source_revision,
+            0,
+            expected_revision,
+            vec![(source_id, entry)],
+        ),
+        "amaterasu.playnite",
+        "management",
+        "amaterasu.management",
+    );
+    assert_eq!(batch["ok"], true, "{batch}");
+    backend.run_for(
+        pipeline,
+        snapshot_finish(
+            sync_id,
+            generation,
+            source_revision,
+            batch["revision"].as_u64().unwrap(),
+            1,
+            true,
+        ),
+        "amaterasu.playnite",
+        "management",
+        "amaterasu.management",
+    )
+}
+
 fn import_playnite_entries(
     backend: &mut Backend,
     pipeline: &mut Pipeline,
@@ -4580,6 +4629,116 @@ fn provider_prefer_10bit_sdr_override_survives_playnite_refresh() {
         );
         expected_revision = refreshed["revision"].as_u64().unwrap();
     }
+}
+
+#[test]
+fn playnite_category_tags_persist_refresh_and_project_without_overwriting_user_tags() {
+    let mut backend = Backend::default();
+    let source_id = "playnite:category-tags";
+    let id = "app-0000000000000001";
+    let marker_key = "~provider.entry:amaterasu.playnite:playnite:category-tags";
+    let mut pipeline = playnite_importer();
+    let initial = import_playnite_entry_value(
+        &mut backend,
+        &mut pipeline,
+        "playnite-category-tags-1",
+        1,
+        0,
+        source_id,
+        json!({
+            "name":"Category game",
+            "description":"",
+            "tags":["Adventure", "RPG"],
+            "launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}
+        }),
+    );
+    assert_eq!(initial["ok"], true, "{initial}");
+    assert_eq!(backend.entries[id]["tags"], json!(["Adventure", "RPG"]));
+    assert_eq!(
+        backend.entries[marker_key]["fingerprint"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    let projected = backend.run(
+        &mut Pipeline::default(),
+        json!({"action":"search","query":"Adventure","limit":32}),
+    );
+    assert_eq!(projected["entries"][0]["id"], id);
+    assert_eq!(
+        projected["entries"][0]["entry"]["tags"],
+        json!(["Adventure", "RPG"])
+    );
+
+    let mut expected_revision = initial["revision"].as_u64().unwrap();
+    let updated = backend.run_for(
+        &mut pipeline,
+        update_provider_config_overrides(id, expected_revision, json!({"fec_percentage":37})),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(updated["ok"], true, "{updated}");
+    expected_revision = updated["revision"].as_u64().unwrap();
+
+    let refreshed = import_playnite_entry_value(
+        &mut backend,
+        &mut pipeline,
+        "playnite-category-tags-2",
+        2,
+        expected_revision,
+        source_id,
+        json!({
+            "name":"Category game",
+            "description":"",
+            "tags":["RPG", "Tactics"],
+            "launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}
+        }),
+    );
+    assert_eq!(refreshed["ok"], true, "{refreshed}");
+    assert_eq!(backend.entries[id]["tags"], json!(["RPG", "Tactics"]));
+    assert_eq!(
+        backend.entries[id]["config_overrides"]["fec_percentage"],
+        37
+    );
+    assert_eq!(
+        backend.entries[marker_key]["config_overrides"]["fec_percentage"],
+        37
+    );
+
+    // Model a catalog row edited outside the provider API. Normal catalog
+    // updates reject Playnite launch identity, while the provider pipeline
+    // still must preserve and detach an already user-modified row.
+    backend.entries.get_mut(id).unwrap()["tags"] = json!(["My custom tag"]);
+    backend.revision += 1;
+    let expected_revision = refreshed["revision"].as_u64().unwrap() + 1;
+    backend.metadata["revision"] = json!(expected_revision);
+
+    let mut pipeline = playnite_importer();
+    let after_user_edit = import_playnite_entry_value(
+        &mut backend,
+        &mut pipeline,
+        "playnite-category-tags-3",
+        3,
+        expected_revision,
+        source_id,
+        json!({
+            "name":"Provider title changed",
+            "description":"",
+            "tags":["RPG", "Roguelike"],
+            "launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}
+        }),
+    );
+    assert_eq!(after_user_edit["ok"], true, "{after_user_edit}");
+    assert_eq!(backend.entries[id]["name"], "Category game");
+    assert_eq!(backend.entries[id]["tags"], json!(["My custom tag"]));
+    assert_eq!(
+        backend.entries[id]["config_overrides"]["fec_percentage"],
+        37
+    );
+    assert_eq!(backend.entries[marker_key]["detached"], true);
 }
 
 #[test]

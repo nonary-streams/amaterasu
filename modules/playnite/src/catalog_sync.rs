@@ -1279,9 +1279,20 @@ fn provider_entry_with_flags(game: &Game, source_flags: u32) -> Option<Value> {
         return None;
     }
     let launch = playnite_launch(game)?;
+    let tags = game
+        .categories
+        .iter()
+        .filter(|category| {
+            !category.trim().is_empty()
+                && category.len() <= 64
+                && !category.chars().any(char::is_control)
+        })
+        .take(16)
+        .cloned()
+        .collect::<Vec<_>>();
     Some(json!({
         "source_id":game.id.to_ascii_lowercase(),
-        "entry":{"name":game.name,"description":"","tags":[],"launch":launch},
+        "entry":{"name":game.name,"description":"","tags":tags,"launch":launch},
         "source_flags":source_flags
     }))
 }
@@ -2551,6 +2562,32 @@ mod tests {
         assert_eq!(
             provider_entry(&game).unwrap()["entry"]["launch"]["kind"],
             "playnite"
+        );
+    }
+
+    #[test]
+    fn provider_categories_become_bounded_catalog_tags() {
+        let mut game = game("a1b2c3d4-1234-5678-9abc-0123456789ab", "Game", "");
+        game.categories = vec![
+            "RPG".into(),
+            "Adventure".into(),
+            " ".into(),
+            "x".repeat(65),
+            "Strategy".into(),
+        ];
+
+        assert_eq!(
+            provider_entry(&game).unwrap()["entry"]["tags"],
+            serde_json::json!(["RPG", "Adventure", "Strategy"])
+        );
+
+        game.categories = (0..20).map(|index| format!("Category {index}")).collect();
+        assert_eq!(
+            provider_entry(&game).unwrap()["entry"]["tags"]
+                .as_array()
+                .unwrap()
+                .len(),
+            16
         );
     }
 }
