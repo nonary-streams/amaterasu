@@ -1,4 +1,8 @@
 namespace Amaterasu {
+  function managementPolicyTextMessage(value: string): TextValue {
+    return typeof Amaterasu.localizedMessage === "function" ? Amaterasu.localizedMessage(value) : value;
+  }
+
   export type ManagementPeerTier = "pc" | "lan" | "wan";
   export interface ManagementPolicyReply {
     ok: true;
@@ -97,7 +101,7 @@ namespace Amaterasu {
             if (value !== "" && !managementTier(value)) throw new Error("Choose a valid management access policy.");
             try {
               await saveManagementPolicy(context.api, current, value === "" ? null : value);
-              context.notify("Management access policy saved.");
+              context.notify(managementPolicyTextMessage("Management access policy saved."));
               await load();
             } catch (error) {
               await load();

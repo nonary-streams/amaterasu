@@ -1,4 +1,42 @@
 namespace Amaterasu {
+  function catalogTextLiteral(value: string): TextValue {
+    return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
+  }
+
+  function catalogTextMessage(value: string): TextValue {
+    return typeof Amaterasu.localizedMessage === "function" ? Amaterasu.localizedMessage(value) : value;
+  }
+
+  function catalogLocalizedAttribute(
+    target: Element,
+    attribute: "aria-label" | "title" | "placeholder",
+    source: string,
+  ): void {
+    if (typeof Amaterasu.setLocalizedAttribute === "function") {
+      Amaterasu.setLocalizedAttribute(target, attribute, source);
+    } else {
+      target.setAttribute(attribute, source);
+    }
+  }
+
+  function catalogLocalizedAttributeTemplate(
+    target: Element,
+    attribute: "aria-label" | "title" | "placeholder",
+    source: string,
+    values: Readonly<Record<string, TextValue>>,
+  ): void {
+    if (typeof Amaterasu.setLocalizedAttributeTemplate === "function") {
+      Amaterasu.setLocalizedAttributeTemplate(target, attribute, source, values);
+      return;
+    }
+    let rendered = source;
+    for (const [name, value] of Object.entries(values)) {
+      const literal = typeof value === "string" ? value : value.value;
+      rendered = rendered.replaceAll(`{${name}}`, () => literal);
+    }
+    target.setAttribute(attribute, rendered);
+  }
+
   interface SteamArtworkChunk {
     ok: boolean;
     app_id: number;
@@ -378,12 +416,12 @@ namespace Amaterasu {
     inherit.value = "";
     select.append(inherit);
     for (const value of values) {
-      const option = el("option", "", value);
+      const option = el("option", "", catalogTextLiteral(value));
       option.value = value;
       select.append(option);
     }
     if (savedValueToken !== undefined) {
-      const saved = el("option", "", `Keep saved value: ${current} (unsupported on this host)`);
+      const saved = el("option", "", catalogTextLiteral(`Keep saved value: ${current} (unsupported on this host)`));
       saved.value = savedValueToken;
       select.append(saved);
     }
@@ -426,12 +464,12 @@ namespace Amaterasu {
     inherit.value = "";
     select.append(inherit);
     for (const value of values) {
-      const option = el("option", "", value);
+      const option = el("option", "", catalogTextLiteral(value));
       option.value = value;
       select.append(option);
     }
     if (current != null && !values.includes(current)) {
-      const saved = el("option", "", `Saved value: ${current}`);
+      const saved = el("option", "", catalogTextLiteral(`Saved value: ${current}`));
       saved.value = current;
       select.append(saved);
     }
@@ -465,7 +503,8 @@ namespace Amaterasu {
     hint: string,
   ): HTMLElement {
     if (control instanceof HTMLSelectElement) return field(label, control, hint);
-    control.querySelector("select")?.setAttribute("aria-label", label);
+    const select = control.querySelector("select");
+    if (select) catalogLocalizedAttribute(select, "aria-label", label);
     return el(
       "div",
       "field",
@@ -840,7 +879,7 @@ namespace Amaterasu {
       status.supported_profiles,
       status.recognized_profiles,
     )) {
-      const option = el("option", "", choice.label);
+      const option = el("option", "", catalogTextLiteral(choice.label));
       option.value = choice.value;
       select.append(option);
     }
@@ -899,7 +938,7 @@ namespace Amaterasu {
     mode.value = current === undefined ? "inherit" : current === "" ? "automatic" : "specific";
     const selector = input("virtual_sink_selector", current ?? "");
     selector.maxLength = 4096;
-    selector.placeholder = "Exact ID or device name";
+    catalogLocalizedAttribute(selector, "placeholder", "Exact ID or device name");
     const update = () => { selector.disabled = mode.value !== "specific"; };
     mode.addEventListener("change", update);
     update();
@@ -917,8 +956,8 @@ namespace Amaterasu {
     const { content, api, notify } = context;
     const search = input("search");
     search.type = "search";
-    search.placeholder = "Search names, descriptions, tags";
-    search.setAttribute("aria-label", "Search catalog");
+    catalogLocalizedAttribute(search, "placeholder", "Search names, descriptions, tags");
+    catalogLocalizedAttribute(search, "aria-label", "Search catalog");
     const searchForm = el("form", "search-form", search);
     const searchButton = el("button", "button secondary", "Search");
     searchButton.type = "submit";
@@ -967,8 +1006,8 @@ namespace Amaterasu {
           el(
             "div",
             "section-meta",
-            el("span", "", `${reply.entries.length} applications on this page`),
-            badge(`Revision ${revision}`),
+            el("span", "", catalogTextLiteral(`${reply.entries.length} applications on this page`)),
+            badge(catalogTextLiteral(`Revision ${revision}`)),
           ),
           reply.entries.length
             ? grid
@@ -997,7 +1036,7 @@ namespace Amaterasu {
                   void load();
                 }
               : null,
-            `Page ${page + 1}`,
+            catalogTextLiteral(`Page ${page + 1}`),
           ),
         );
       } catch (error) {
@@ -1026,7 +1065,7 @@ namespace Amaterasu {
       const providerLaunch = row.entry.launch.kind === "playnite";
       const edit = button("Edit", () => showEditor(row, capabilities));
       edit.disabled = !api.allows("catalog.write") || providerLaunch;
-      if (providerLaunch) edit.title = "Playnite launch targets are managed by the provider.";
+      if (providerLaunch) catalogLocalizedAttribute(edit, "title", "Playnite launch targets are managed by the provider.");
       const actions = [edit];
       if (providerLaunch) {
         const configure = button(
@@ -1042,8 +1081,8 @@ namespace Amaterasu {
         async () => {
           if (
             !(await confirmAction(
-              `Delete ${row.entry.name}?`,
-              "This removes its catalog entry. It does not remove files or stop a running application.",
+              catalogTextLiteral(`Delete ${row.entry.name}?`),
+              catalogTextLiteral("This removes its catalog entry. It does not remove files or stop a running application."),
               "Delete entry",
             ))
           )
@@ -1053,7 +1092,7 @@ namespace Amaterasu {
               id: row.id,
               expected_revision: revision,
             });
-            notify("Application removed from the catalog.");
+            notify(catalogTextMessage("Application removed from the catalog."));
             reset();
           });
         },
@@ -1064,7 +1103,7 @@ namespace Amaterasu {
       const art = el(
         "div",
         "app-art",
-        el("span", "", row.entry.name.slice(0, 2).toUpperCase()),
+        el("span", "", catalogTextLiteral(row.entry.name.slice(0, 2).toUpperCase())),
         badge(
           row.entry.launch.kind === "executable"
             ? "Executable"
@@ -1081,14 +1120,14 @@ namespace Amaterasu {
         el(
           "div",
           "app-details",
-          el("h2", "", row.entry.name),
+          el("h2", "", catalogTextLiteral(row.entry.name)),
           el(
             "p",
             "muted description",
-            row.entry.description || "No description added.",
+            row.entry.description ? catalogTextLiteral(row.entry.description) : "No description added.",
           ),
-          el("div", "tags", ...(row.entry.tags ?? []).map((tag) => badge(tag))),
-          el("p", "path", launchPath(row.entry)),
+          el("div", "tags", ...(row.entry.tags ?? []).map((tag) => badge(catalogTextLiteral(tag)))),
+          el("p", "path", catalogTextLiteral(launchPath(row.entry))),
           el("div", "card-footer", ...actions),
         ),
       );
@@ -1140,7 +1179,15 @@ namespace Amaterasu {
       fec.max = "255";
       fec.step = "1";
       fec.placeholder = "Inherit";
-      fec.setAttribute("aria-label", `FEC percentage override for ${row.entry.name}`);
+      catalogLocalizedAttributeTemplate(
+        fec,
+        "aria-label",
+        "{field} override for {client}",
+        {
+          field: catalogTextMessage("FEC percentage"),
+          client: catalogTextLiteral(row.entry.name),
+        },
+      );
       const frameLimiterFields = catalogFrameLimiterOverrideFields(
         row.entry.config_overrides,
         capabilities,
@@ -1168,7 +1215,15 @@ namespace Amaterasu {
       backButtonTimeout.max = String(0x7fff_ffff);
       backButtonTimeout.step = "1";
       backButtonTimeout.placeholder = "Inherit";
-      backButtonTimeout.setAttribute("aria-label", `Back button timeout override for ${row.entry.name}`);
+      catalogLocalizedAttributeTemplate(
+        backButtonTimeout,
+        "aria-label",
+        "{field} override for {client}",
+        {
+          field: catalogTextMessage("Back button timeout (milliseconds)"),
+          client: catalogTextLiteral(row.entry.name),
+        },
+      );
       const controller = audioOverrideSelect("controller", row.entry.config_overrides?.controller);
       const gamepad = inputGamepadOverrideSelect("gamepad", row.entry.config_overrides?.gamepad, runtimeStatus);
       const keyboard = audioOverrideSelect("keyboard", row.entry.config_overrides?.keyboard);
@@ -1276,7 +1331,7 @@ namespace Amaterasu {
       editor.replaceChildren(
         panel(
           "Playnite streaming settings",
-          el("p", "muted", `${row.entry.name} · Playnite game ${row.entry.launch.kind === "playnite" ? row.entry.launch.game_id : ""}`),
+          el("p", "muted", catalogTextLiteral(`${row.entry.name} · Playnite game ${row.entry.launch.kind === "playnite" ? row.entry.launch.game_id : ""}`)),
           el(
             "p",
             "muted",
@@ -1338,7 +1393,7 @@ namespace Amaterasu {
             expected_revision: editRevision,
           });
           editor.replaceChildren();
-          notify(row ? "Application updated." : "Application added.");
+          notify(catalogTextMessage(row ? "Application updated." : "Application added."));
           reset();
         });
       });
@@ -1378,7 +1433,7 @@ namespace Amaterasu {
     const outputMode = el("select");
     outputMode.name = "output_mode";
     for (const [value, label] of [["unset", "Use default"], ["value", "Set output"]] as const) {
-      const option = el("option", "", label);
+          const option = el("option", "", label);
       option.value = value;
       outputMode.append(option);
     }

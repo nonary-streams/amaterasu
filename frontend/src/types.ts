@@ -568,7 +568,7 @@ namespace Amaterasu {
   export interface PageContext {
     api: Api;
     content: HTMLElement;
-    notify: (message: string) => void;
+    notify: (message: TextValue) => void;
     navigate: (page: Page) => void;
   }
 }

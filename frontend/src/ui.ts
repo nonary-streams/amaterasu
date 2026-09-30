@@ -1,5 +1,16 @@
 namespace Amaterasu {
-  type Child = Node | string | null | undefined;
+  function uiElementLiteral(value: string): TextValue {
+    return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
+  }
+
+  type Child = Node | TextValue | null | undefined;
+
+  function isTextValue(child: Child): child is TextValue {
+    return typeof child === "string" || (
+      typeof child === "object" && child !== null &&
+      "kind" in child && "value" in child
+    );
+  }
   export function el<K extends keyof HTMLElementTagNameMap>(
     tag: K,
     className = "",
@@ -9,18 +20,21 @@ namespace Amaterasu {
     node.className = className;
     for (const child of children) {
       if (child == null) continue;
-      const textChild =
-        typeof child === "string" &&
-        typeof Amaterasu.localizedTextNode === "function"
-          ? Amaterasu.localizedTextNode(child)
-          : child;
-      node.append(textChild);
+      if (isTextValue(child)) {
+        node.append(
+          typeof Amaterasu.textValueNode === "function"
+            ? Amaterasu.textValueNode(child)
+            : typeof child === "string"
+              ? child
+              : child.value,
+        );
+      } else node.append(child);
     }
     return node;
   }
 
   export function button(
-    text: string,
+    text: TextValue,
     action: () => void | Promise<void>,
     kind = "secondary",
   ): HTMLButtonElement {
@@ -31,9 +45,9 @@ namespace Amaterasu {
   }
 
   export function field(
-    label: string,
+    label: TextValue,
     input: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
-    hint?: string,
+    hint?: TextValue,
   ): HTMLElement {
     const wrapper = el(
       "label",
@@ -58,8 +72,8 @@ namespace Amaterasu {
   }
 
   export function sectionHeading(
-    title: string,
-    description: string,
+    title: TextValue,
+    description: TextValue,
     ...actions: Child[]
   ): HTMLElement {
     return el(
@@ -77,8 +91,8 @@ namespace Amaterasu {
   }
 
   export function empty(
-    title: string,
-    description: string,
+    title: TextValue,
+    description: TextValue,
     action?: HTMLElement,
   ): HTMLElement {
     return el(
@@ -99,17 +113,17 @@ namespace Amaterasu {
       "div",
       "notice error",
       el("strong", "", "Unable to complete request"),
-      el("p", "", messageOf(error)),
+      el("p", "", uiElementLiteral(messageOf(error))),
     );
     box.setAttribute("role", "alert");
     if (retry) box.append(button("Try again", retry));
     return box;
   }
 
-  export function badge(text: string, tone = ""): HTMLElement {
+  export function badge(text: TextValue, tone = ""): HTMLElement {
     return el("span", `badge ${tone}`, text);
   }
-  export function panel(title: string, ...children: Child[]): HTMLElement {
+  export function panel(title: TextValue, ...children: Child[]): HTMLElement {
     return el("section", "panel", el("h2", "", title), ...children);
   }
 
@@ -139,7 +153,11 @@ namespace Amaterasu {
     }
     const body = el("tbody");
     for (const row of rows)
-      body.append(el("tr", "", ...row.map((value) => el("td", "", value))));
+      body.append(el("tr", "", ...row.map((value) => el(
+        "td",
+        "",
+        typeof value === "string" ? uiElementLiteral(value) : value,
+      ))));
     return el(
       "div",
       "table-scroll",
@@ -150,7 +168,7 @@ namespace Amaterasu {
   export function pager(
     back: (() => void) | null,
     next: (() => void) | null,
-    label: string,
+    label: TextValue,
   ): HTMLElement {
     const previous = button("← Previous", () => back?.());
     previous.disabled = !back;
@@ -165,6 +183,10 @@ namespace Amaterasu {
   }
 }
 namespace Amaterasu {
+  function uiControlLiteral(value: string): TextValue {
+    return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
+  }
+
   export function keybindingsControl(current?: number[] | null, global = false): {
     field: HTMLElement;
     read: () => number[] | null;
@@ -180,7 +202,7 @@ namespace Amaterasu {
       : "Blank inherits the next scope. Use [] to clear lower custom mappings; built-in modifiers and the optional Right Alt mapping still apply.";
     return {
       field: field("Keybindings", control,
-        `${scope} Enter up to 256 ordered source/destination byte pairs, such as [0x41, 0x42]. Generic Shift, Control, and Alt always map to their left variants. Other keys use the first mapping for their source, without chaining. A custom Right Alt mapping takes precedence over the Windows-key option.`),
+        uiControlLiteral(`${scope} Enter up to 256 ordered source/destination byte pairs, such as [0x41, 0x42]. Generic Shift, Control, and Alt always map to their left variants. Other keys use the first mapping for their source, without chaining. A custom Right Alt mapping takes precedence over the Windows-key option.`)),
       read: () => {
         const value = parseKeybindingsOverride(control.value);
         if (global && value === null)
@@ -268,7 +290,7 @@ namespace Amaterasu {
       controls.set(value.name, value);
       fields.push(
         field(label, mode, "Inherit the lower scope, or retain an exact software tuning string."),
-        field(`${label} exact value`, value, "Applied by the x264 software backend. Exact strings are validated by the installed codec at launch; hardware encoders preserve these fields without applying them."),
+        field(uiControlLiteral(`${label} exact value`), value, "Applied by the x264 software backend. Exact strings are validated by the installed codec at launch; hardware encoders preserve these fields without applying them."),
       );
     }
     const minThreads = input("min_threads", current?.min_threads?.toString() ?? "", "number");
@@ -316,13 +338,25 @@ namespace Amaterasu {
   }
 
   export function confirmAction(
-    title: string,
-    description: string,
-    label: string,
+    title: TextValue,
+    description: TextValue,
+    label: TextValue,
   ): Promise<boolean> {
     return new Promise((resolve) => {
       const dialog = el("dialog", "confirmation");
-      dialog.setAttribute("aria-label", title);
+      if (typeof title === "object" && title.kind === "literal") {
+        dialog.setAttribute("aria-label", title.value);
+      } else {
+        if (typeof Amaterasu.setLocalizedAttribute === "function") {
+          Amaterasu.setLocalizedAttribute(
+            dialog,
+            "aria-label",
+            typeof title === "string" ? title : title.value,
+          );
+        } else {
+          dialog.setAttribute("aria-label", typeof title === "string" ? title : title.value);
+        }
+      }
       const finish = (accepted: boolean) => {
         dialog.close();
         dialog.remove();

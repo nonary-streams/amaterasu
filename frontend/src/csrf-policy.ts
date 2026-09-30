@@ -1,4 +1,8 @@
 namespace Amaterasu {
+  function csrfPolicyTextMessage(value: string): TextValue {
+    return typeof Amaterasu.localizedMessage === "function" ? Amaterasu.localizedMessage(value) : value;
+  }
+
   export interface CsrfPolicyReply {
     ok: true;
     revision: number;
@@ -127,7 +131,7 @@ namespace Amaterasu {
             try {
               if (selection === undefined) throw new Error("Choose a valid CSRF origin policy.");
               await saveCsrfPolicy(context.api, current, selection);
-              context.notify("CSRF origin policy saved.");
+              context.notify(csrfPolicyTextMessage("CSRF origin policy saved."));
               await load();
             } catch (error) {
               await load();

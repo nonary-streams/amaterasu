@@ -1,4 +1,12 @@
 namespace Amaterasu {
+  function systemTrayTextLiteral(value: string): TextValue {
+    return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
+  }
+
+  function systemTrayTextMessage(value: string): TextValue {
+    return typeof Amaterasu.localizedMessage === "function" ? Amaterasu.localizedMessage(value) : value;
+  }
+
   export interface SystemTraySettings {
     system_tray: boolean;
   }
@@ -80,7 +88,7 @@ namespace Amaterasu {
         if (!isCurrent()) return;
         const checkbox = input("system_tray", "", "checkbox");
         checkbox.checked = current.settings.system_tray;
-        const status = el("p", "muted", `Saved settings revision ${current.revision}.`);
+        const status = el("p", "muted", systemTrayTextLiteral(`Saved settings revision ${current.revision}.`));
         status.setAttribute("role", "status");
         status.setAttribute("aria-live", "polite");
         const save = el("button", "button primary", "Save system tray preference");
@@ -90,7 +98,7 @@ namespace Amaterasu {
         form.append(
           field("Show the system tray icon and desktop notifications", checkbox,
             "Enabled by default. Desktop integration may be unavailable in a headless session."),
-          el("div", "actions", save, badge(`Revision ${current.revision}`)),
+          el("div", "actions", save, badge(systemTrayTextLiteral(`Revision ${current.revision}`))),
           status,
         );
         form.addEventListener("submit", (event) => {
@@ -100,7 +108,7 @@ namespace Amaterasu {
               system_tray: checkbox.checked,
             });
             status.replaceChildren(`Saved settings revision ${current.revision}.`);
-            context.notify("System tray preference saved and read back.");
+            context.notify(systemTrayTextMessage("System tray preference saved and read back."));
             await load();
           });
         });

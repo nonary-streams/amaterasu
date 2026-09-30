@@ -1,4 +1,20 @@
 namespace Amaterasu {
+  function pagesTextLiteral(value: string): TextValue {
+    return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
+  }
+
+  function pagesTextMessage(value: string): TextValue {
+    return typeof Amaterasu.localizedMessage === "function" ? Amaterasu.localizedMessage(value) : value;
+  }
+
+  function pagesSetLocalizedTextContent(target: HTMLElement, source: string): void {
+    if (typeof Amaterasu.setLocalizedTextContent === "function") {
+      Amaterasu.setLocalizedTextContent(target, source);
+    } else {
+      target.textContent = source;
+    }
+  }
+
   function localizedDateTime(unixSeconds: number): Node | string {
     const date = new Date(unixSeconds * 1000);
     return typeof Amaterasu.localeFormattedTextNode === "function"
@@ -32,7 +48,7 @@ namespace Amaterasu {
             "div",
             "metric",
             el("span", "muted", label),
-            el("strong", "", value),
+            el("strong", "", pagesTextLiteral(value)),
             el("small", "muted", detail),
           ),
         );
@@ -101,15 +117,14 @@ namespace Amaterasu {
         el(
           "strong",
           "",
-          ["Catalog", "Sessions", "Applications", "Steam provider"][index] ??
-            "",
+          pagesTextMessage(["Catalog", "Sessions", "Applications", "Steam provider"][index] ?? ""),
         ),
         snapshot.status === "fulfilled"
-          ? badge("Available", "good")
-          : badge("Unavailable"),
+          ? badge(pagesTextMessage("Available"), "good")
+          : badge(pagesTextMessage("Unavailable")),
         snapshot.status === "rejected"
           ? messageOf(snapshot.reason)
-          : "Responded to the latest refresh",
+          : pagesTextMessage("Responded to the latest refresh"),
       ]);
       area.replaceChildren(
         hero,
@@ -325,7 +340,7 @@ namespace Amaterasu {
       savedHistoryPanel,
     );
     function applyHistoryDeleteAvailability(): void {
-      deleteNotice.textContent = historyDeleteReason;
+      pagesSetLocalizedTextContent(deleteNotice, historyDeleteReason);
       for (const control of deleteControls)
         control.button.disabled = !control.ended || !context.api.allows("session.write") || !historyDeleteAvailable;
     }
@@ -373,7 +388,7 @@ namespace Amaterasu {
               if (
                 !(await confirmAction(
                   "Stop this session?",
-                  `Session “${session.key}” will be moved toward its stopped state.`,
+                  pagesTextLiteral(`Session “${session.key}” will be moved toward its stopped state.`),
                   session.state === "stopping" ? "Finish stop" : "Stop session",
                 ))
               )
@@ -383,7 +398,7 @@ namespace Amaterasu {
                   `session/${session.state === "stopping" ? "finish_stop" : "stop"}`,
                   { session_id: session.id },
                 );
-                context.notify("Session updated.");
+                context.notify(pagesTextMessage("Session updated."));
                 await load();
               });
             },
@@ -394,10 +409,10 @@ namespace Amaterasu {
             el(
               "div",
               "",
-              el("strong", "", session.key),
-              el("small", "muted block", `Session ${session.id}`),
+              el("strong", "", pagesTextLiteral(session.key)),
+              el("small", "muted block", pagesTextLiteral(`Session ${session.id}`)),
             ),
-            badge(session.state, session.state === "active" ? "good" : ""),
+            badge(pagesTextLiteral(session.state), session.state === "active" ? "good" : ""),
             String(
               session.lease_count ?? Object.keys(session.leases ?? {}).length,
             ),
@@ -426,7 +441,7 @@ namespace Amaterasu {
                   void load();
                 }
               : null,
-            `Showing from ${offset + 1}`,
+            pagesTextLiteral(`Showing from ${offset + 1}`),
           ),
         );
       } catch (error) {
@@ -453,7 +468,7 @@ namespace Amaterasu {
               if (
                 !(await confirmAction(
                   "Delete this recorded session?",
-                  `The history for ${session.app_name || session.session_id} will be removed.`,
+                  pagesTextLiteral(`The history for ${session.app_name || session.session_id} will be removed.`),
                   "Delete history",
                 ))
               )
@@ -470,7 +485,7 @@ namespace Amaterasu {
                   selectedSavedSession = null;
                   savedDetail.replaceChildren();
                 }
-                context.notify("Recorded session deleted.");
+                context.notify(pagesTextMessage("Recorded session deleted."));
                 await loadSaved();
               });
               await loadHistoryRuntime();
@@ -479,8 +494,8 @@ namespace Amaterasu {
           );
           currentDeleteControls.push({ button: remove, ended: session.ended_at_unix != null });
           return [
-            el("div", "", el("strong", "", session.app_name || session.session_id),
-              el("small", "muted block", session.client_name || session.protocol)),
+            el("div", "", el("strong", "", pagesTextLiteral(session.app_name || session.session_id)),
+              el("small", "muted block", pagesTextLiteral(session.client_name || session.protocol))),
             localizedDateTime(session.started_at_unix),
             session.ended_at_unix == null ? badge("Active", "good") :
               `${session.duration_seconds ?? 0} seconds`,
@@ -509,7 +524,7 @@ namespace Amaterasu {
                   void loadSaved();
                 }
               : null,
-            `Showing from ${savedOffset + 1}`,
+            pagesTextLiteral(`Showing from ${savedOffset + 1}`),
           ),
         );
       } catch (error) {
@@ -532,9 +547,9 @@ namespace Amaterasu {
         if (!detail) return;
         savedDetail.replaceChildren(
           panel(
-            `History for ${detail.session.app_name || detail.session.session_id}`,
-            el("p", "muted", `${detail.session.protocol} · ${detail.session.width}×${detail.session.height} · ${detail.session.target_fps} FPS · ${detail.session.codec || "codec unavailable"}`),
-            el("p", "muted", `${detail.sample_count} samples${detail.samples_truncated ? " (recent samples shown)" : ""} · ${detail.event_count} events${detail.events_truncated ? " (recent events shown)" : ""}`),
+            pagesTextLiteral(`History for ${detail.session.app_name || detail.session.session_id}`),
+            el("p", "muted", pagesTextLiteral(`${detail.session.protocol} · ${detail.session.width}×${detail.session.height} · ${detail.session.target_fps} FPS · ${detail.session.codec || "codec unavailable"}`)),
+            el("p", "muted", pagesTextLiteral(`${detail.sample_count} samples${detail.samples_truncated ? " (recent samples shown)" : ""} · ${detail.event_count} events${detail.events_truncated ? " (recent events shown)" : ""}`)),
             detail.samples.length
               ? table(
                   ["Sample time", "Frames", "Bytes", "Dropped", "FPS", "Bitrate (kbps)"],
@@ -598,7 +613,7 @@ namespace Amaterasu {
               if (
                 !(await confirmAction(
                   "Terminate this application?",
-                  `Stop process ${process.pid ?? process.process_id} and its owned process tree. Unsaved work may be lost.`,
+                  pagesTextLiteral(`Stop process ${process.pid ?? process.process_id} and its owned process tree. Unsaved work may be lost.`),
                   "Terminate",
                 ))
               )
@@ -607,9 +622,7 @@ namespace Amaterasu {
                 await context.api.post("application/terminate", {
                   process_id: process.process_id,
                 });
-                context.notify(
-                  "Termination requested. Refresh to check its status.",
-                );
+                context.notify(pagesTextMessage("Termination requested. Refresh to check its status."));
                 await load();
               });
             },
@@ -619,9 +632,9 @@ namespace Amaterasu {
             process.state !== "running" ||
             !context.api.allows("application.terminate");
           return [
-            el("strong", "", process.operation_id),
+            el("strong", "", pagesTextLiteral(process.operation_id)),
             String(process.pid ?? "—"),
-            badge(process.state, process.state === "running" ? "good" : ""),
+            badge(pagesTextLiteral(process.state), process.state === "running" ? "good" : ""),
             process.exit_code != null ? String(process.exit_code) : "—",
             terminate,
           ];
@@ -657,7 +670,7 @@ namespace Amaterasu {
                   void load();
                 }
               : null,
-            `Showing from ${offset + 1}`,
+            pagesTextLiteral(`Showing from ${offset + 1}`),
           ),
         );
       } catch (error) {
@@ -729,9 +742,7 @@ namespace Amaterasu {
         runAction(scan, status, async () => {
           await context.api.post("steam/refresh");
           resetPagination();
-          context.notify(
-            "Steam scan requested. Refresh to see completed discoveries.",
-          );
+          context.notify(pagesTextMessage("Steam scan requested. Refresh to see completed discoveries."));
           await load();
         }),
       "primary",
@@ -763,7 +774,7 @@ namespace Amaterasu {
       updateForceSyncControl();
       const message =
         "Force catalog sync was accepted, but this session lacks steam.read and cannot check its status.";
-      status.replaceChildren(el("p", "notice warning", message));
+      status.replaceChildren(el("p", "notice warning", pagesTextLiteral(message)));
       context.notify(message);
     }
 
@@ -777,7 +788,7 @@ namespace Amaterasu {
         status.replaceChildren(
           el("p", "notice good", "Steam discovery completed and catalog sync succeeded."),
         );
-        context.notify("Steam discovery completed and catalog sync succeeded.");
+        context.notify(pagesTextMessage("Steam discovery completed and catalog sync succeeded."));
         return;
       }
 
@@ -789,7 +800,7 @@ namespace Amaterasu {
           : provider.complete
             ? "Steam catalog sync ended without a confirmed successful result."
             : "Steam discovery was incomplete; no catalog sync was confirmed.";
-      status.replaceChildren(el("p", "notice warning", message));
+      status.replaceChildren(el("p", "notice warning", pagesTextLiteral(message)));
       context.notify(message);
     }
 
@@ -968,29 +979,29 @@ namespace Amaterasu {
           el(
             "div",
             "",
-            el("strong", "", game.name),
-            el("small", "path block", game.install_directory ?? ""),
+            el("strong", "", pagesTextLiteral(game.name)),
+            el("small", "path block", pagesTextLiteral(game.install_directory ?? "")),
           ),
           String(game.app_id),
-          badge(game.installed ? "Installed" : "Discovered"),
+          badge(pagesTextMessage(game.installed ? "Installed" : "Discovered")),
         ]);
         area.replaceChildren(
           el(
             "div",
             "section-meta",
             badge(
-              provider.enabled === false
+              pagesTextMessage(provider.enabled === false
                 ? "Discovery disabled"
                 : provider.scanning
                 ? "Scan in progress"
                 : provider.complete
                   ? "Scan complete"
-                  : "Scan incomplete",
+                  : "Scan incomplete"),
             ),
             el(
               "span",
               "muted",
-              `${provider.game_count} discoveries · revision ${reply.revision}`,
+              pagesTextLiteral(`${provider.game_count} discoveries · revision ${reply.revision}`),
             ),
           ),
           reply.games.length
@@ -1002,7 +1013,7 @@ namespace Amaterasu {
                   : "Configure Steam library roots on the host, then scan. Discovery does not import or launch games.",
               ),
           ...(provider.warnings ?? []).map((warning) =>
-            el("p", "notice", warning),
+            el("p", "notice", pagesTextLiteral(warning)),
           ),
           pager(
             history.length > 1
@@ -1019,7 +1030,7 @@ namespace Amaterasu {
                   void load();
                 }
               : null,
-            `Page ${history.length}`,
+            pagesTextLiteral(`Page ${history.length}`),
           ),
         );
       } catch (error) {
@@ -1132,12 +1143,12 @@ namespace Amaterasu {
               el(
                 "div",
                 "section-meta",
-                badge(record.level, record.level === "error" ? "bad" : ""),
-                el("small", "muted", `#${record.sequence} · ${record.target}`),
+                badge(pagesTextLiteral(record.level), record.level === "error" ? "bad" : ""),
+                el("small", "muted", pagesTextLiteral(`#${record.sequence} · ${record.target}`)),
               ),
-              el("p", "", record.message),
+              el("p", "", pagesTextLiteral(record.message)),
               ...Object.entries(record.fields).map(([key, value]) =>
-                el("p", "record-field", el("strong", "", `${key}: `), value),
+                el("p", "record-field", el("strong", "", pagesTextLiteral(`${key}: `)), pagesTextLiteral(value)),
               ),
             ),
           ),
@@ -1174,7 +1185,7 @@ namespace Amaterasu {
                   void load();
                 }
               : null,
-            `Page ${history.length}`,
+            pagesTextLiteral(`Page ${history.length}`),
           ),
           panel(
             "Counters",

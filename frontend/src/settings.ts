@@ -1,4 +1,48 @@
 namespace Amaterasu {
+  function settingsTextLiteral(value: string): TextValue {
+    return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
+  }
+
+  function settingsTextMessage(value: string): TextValue {
+    return typeof Amaterasu.localizedMessage === "function" ? Amaterasu.localizedMessage(value) : value;
+  }
+
+  function settingsSetLocalizedTextContent(target: HTMLElement, source: string): void {
+    if (typeof Amaterasu.setLocalizedTextContent === "function") {
+      Amaterasu.setLocalizedTextContent(target, source);
+    } else {
+      target.textContent = source;
+    }
+  }
+
+  function settingsLocalizedAttributeTemplate(
+    target: Element,
+    source: string,
+    values: Readonly<Record<string, TextValue>>,
+  ): void {
+    if (typeof Amaterasu.setLocalizedAttributeTemplate === "function") {
+      Amaterasu.setLocalizedAttributeTemplate(target, "aria-label", source, values);
+      return;
+    }
+    let rendered = source;
+    for (const [name, value] of Object.entries(values)) {
+      const literal = typeof value === "string" ? value : value.value;
+      rendered = rendered.replaceAll(`{${name}}`, () => literal);
+    }
+    target.setAttribute("aria-label", rendered);
+  }
+
+  function settingsClientOverrideAttribute(
+    target: Element,
+    field: string,
+    clientName: string,
+  ): void {
+    settingsLocalizedAttributeTemplate(target, "{field} override for {client}", {
+      field: settingsTextMessage(field),
+      client: settingsTextLiteral(clientName),
+    });
+  }
+
   const maxConfiguredAuthTtlSeconds = 0x7fff_ffff;
   const maxInputKeyRepeatDelayMs = 0x7fff_ffff;
   const minInputBackButtonTimeoutMs = -0x8000_0000;
@@ -641,15 +685,15 @@ namespace Amaterasu {
   export async function recoverNvhttpSaveFailure(
     code: string,
     reload: () => Promise<void>,
-    notify: (message: string) => void,
+    notify: (message: TextValue) => void,
   ): Promise<boolean> {
     if (code !== "revision_conflict" &&
         !["listener_apply_pending", "listener_apply_failed", "listener_not_active"].includes(code))
       return false;
     await reload();
     notify(code === "revision_conflict"
-      ? "Host settings changed elsewhere. Review the latest values before saving."
-      : "Host settings were stored, but listener application is not confirmed. Review the active ports and listener error.");
+      ? settingsTextMessage("Host settings changed elsewhere. Review the latest values before saving.")
+      : settingsTextMessage("Host settings were stored, but listener application is not confirmed. Review the active ports and listener error."));
     return true;
   }
 
@@ -1360,10 +1404,16 @@ namespace Amaterasu {
     }
   }
 
-  function sparseInputOverrideSelect(name: string, current: boolean | undefined): HTMLSelectElement {
+  function sparseInputOverrideSelect(
+    name: string,
+    current: boolean | undefined,
+    accessibleName = name,
+  ): HTMLSelectElement {
     const select = el("select");
     select.name = name;
-    select.setAttribute("aria-label", `${name} override`);
+    settingsLocalizedAttributeTemplate(select, "{field} override", {
+      field: settingsTextMessage(accessibleName),
+    });
     const choices: Array<[string, string]> = [["", "Inherit"], ["true", "Enabled"], ["false", "Disabled"]];
     for (const [value, label] of choices) {
       const option = el("option", "", label);
@@ -2301,7 +2351,7 @@ namespace Amaterasu {
       windowSource.disabled = true;
       pipewireArea.replaceChildren(panel("PipeWire source", el("p", "muted", "Choose a source explicitly for the current host session. This does not change the saved capture backend."), el("div", "actions", monitor, windowSource), status));
       if (!context.api.allows("capture.read")) {
-        status.textContent = "PipeWire source status requires capture.read.";
+        settingsSetLocalizedTextContent(status, "PipeWire source status requires capture.read.");
         return;
       }
       try {
@@ -2317,9 +2367,12 @@ namespace Amaterasu {
           status.textContent += " Starting selection requires capture.write.";
       } catch (error) {
         if (!pipewireArea.isConnected || generation !== pipewireGeneration) return;
-        status.textContent = error instanceof ApiError && error.code === "forbidden"
-          ? "PipeWire source status requires capture.read."
-          : "PipeWire source status is unavailable; refresh to check again.";
+        settingsSetLocalizedTextContent(
+          status,
+          error instanceof ApiError && error.code === "forbidden"
+            ? "PipeWire source status requires capture.read."
+            : "PipeWire source status is unavailable; refresh to check again.",
+        );
       }
     }
     async function beginPipewireSelection(sourceType: PipewireSourceType): Promise<void> {
@@ -2352,12 +2405,12 @@ namespace Amaterasu {
       const cancel = button("Cancel selection", () => {
         cancelled = true;
         cancel.disabled = true;
-        status.textContent = "Cancelling source selection…";
+        settingsSetLocalizedTextContent(status, "Cancelling source selection…");
         if (!beginPending) void requestCancel();
       }, "secondary");
       const cancelOperation = el("div", "actions", cancel);
       pipewireArea.append(cancelOperation);
-      status.textContent = "Opening the desktop source chooser…";
+      settingsSetLocalizedTextContent(status, "Opening the desktop source chooser…");
       try {
         const requestedId = crypto.randomUUID();
         operationId = requestedId;
@@ -2376,9 +2429,12 @@ namespace Amaterasu {
           if (cancelled || !pipewireArea.isConnected || pipewireOperation !== operation) {
             const confirmed = await requestCancel();
             if (pipewireArea.isConnected && pipewireOperation === operation)
-              status.textContent = confirmed
-              ? "Source selection was cancelled."
-                : pipewireCancellationUnconfirmedDescription();
+              settingsSetLocalizedTextContent(
+                status,
+                confirmed
+                  ? "Source selection was cancelled."
+                  : pipewireCancellationUnconfirmedDescription(),
+              );
           } else {
             status.textContent = pipewireSelectionDescription(finalStatus);
           }
@@ -2391,13 +2447,16 @@ namespace Amaterasu {
         if (operationId !== null && !confirmedTimeout && !unconfirmedTimeout)
           cancellationConfirmed = await requestCancel();
         if (pipewireArea.isConnected && pipewireOperation === operation)
-          status.textContent = error instanceof ApiError && error.code === "forbidden"
-            ? "PipeWire source selection requires capture.write."
-            : unconfirmedTimeout || cancellationConfirmed === false
-              ? pipewireCancellationUnconfirmedDescription()
-              : confirmedTimeout
-                ? "Source selection timed out and cancellation was confirmed."
-              : "Source selection failed or timed out. Refresh and check the current status.";
+          settingsSetLocalizedTextContent(
+            status,
+            error instanceof ApiError && error.code === "forbidden"
+              ? "PipeWire source selection requires capture.write."
+              : unconfirmedTimeout || cancellationConfirmed === false
+                ? pipewireCancellationUnconfirmedDescription()
+                : confirmedTimeout
+                  ? "Source selection timed out and cancellation was confirmed."
+                  : "Source selection failed or timed out. Refresh and check the current status.",
+          );
       } finally {
         cancelOperation.remove();
         if (pipewireArea.isConnected && pipewireOperation === operation) {
@@ -2447,7 +2506,7 @@ namespace Amaterasu {
             "Remember-me refresh tokens default to 604800 seconds. Non-remembered refresh tokens remain fixed at 86400 seconds.",
           ),
           status,
-          el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+          el("div", "actions", save, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
@@ -2463,13 +2522,13 @@ namespace Amaterasu {
             } catch (error) {
               if (error instanceof ApiError && error.code === "revision_conflict") {
                 await loadAuth();
-                context.notify("Authentication settings changed elsewhere. Review the latest values and save again.");
+                context.notify(settingsTextMessage("Authentication settings changed elsewhere. Review the latest values and save again."));
                 return;
               }
               throw error;
             }
             await loadAuth();
-            context.notify("Authentication lifetimes saved and confirmed.");
+            context.notify(settingsTextMessage("Authentication lifetimes saved and confirmed."));
           });
         });
         authArea.replaceChildren(panel("Authentication session lifetimes", form));
@@ -2489,7 +2548,7 @@ namespace Amaterasu {
         const level = el("select");
         level.name = "min_log_level";
         for (const optionValue of hostLogLevels) {
-          const option = el("option", "", optionValue.replaceAll("_", " "));
+          const option = el("option", "", settingsTextLiteral(optionValue.replaceAll("_", " ")));
           option.value = optionValue;
           level.append(option);
         }
@@ -2512,12 +2571,12 @@ namespace Amaterasu {
         form.append(
           field("Minimum log level", level, "Product default uses the release channel's policy. Diagnostic records below this level are filtered."),
           field("Log path", path, "A relative path stays beneath the private host state root. The setting applies to diagnostic records when diagnostics confirms the policy."),
-          el("p", "muted", `Effective host policy: ${settings.effective.min_log_level} · ${settings.effective.log_path}`),
+          el("p", "muted", settingsTextLiteral(`Effective host policy: ${settings.effective.min_log_level} · ${settings.effective.log_path}`)),
           el("p", "muted", "The host confirms logging application during save; diagnostics status checks disk delivery. Other host and native logs do not use this sink; a host restart may be required for their separate logging policies."),
           applicationStatus,
           refresh,
           status,
-          el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+          el("div", "actions", save, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
@@ -2530,7 +2589,7 @@ namespace Amaterasu {
             } catch (error) {
               if (error instanceof ApiError && error.code === "revision_conflict") {
                 await loadHostLogging();
-                context.notify("Host configuration changed elsewhere. Review the latest logging settings and save again.");
+                context.notify(settingsTextMessage("Host configuration changed elsewhere. Review the latest logging settings and save again."));
                 return;
               }
               // A failed update reply or readback can occur after persistence. Reload
@@ -2650,7 +2709,7 @@ namespace Amaterasu {
           ),
           runtimeStatus,
           status,
-          el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+          el("div", "actions", save, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
@@ -2674,14 +2733,14 @@ namespace Amaterasu {
               const saved = await saveSteamSettings(context.api, settings, values);
               await loadSteam();
               context.notify(!values.enabled && saved.values.enabled
-                ? "Steam settings saved and confirmed. Steam discovery remains enabled by Linux host policy; scan status is shown below."
-                : "Steam settings saved and confirmed. Scan status is shown below.");
+                ? settingsTextMessage("Steam settings saved and confirmed. Steam discovery remains enabled by Linux host policy; scan status is shown below.")
+                : settingsTextMessage("Steam settings saved and confirmed. Scan status is shown below."));
             } catch (error) {
               if (saveStarted) {
                 await loadSteam();
                 context.notify(error instanceof ApiError && error.code === "revision_conflict"
-                  ? "Steam settings changed elsewhere. Review the latest values before saving again."
-                  : "Steam save could not be confirmed. Review the latest values before saving again.");
+                  ? settingsTextMessage("Steam settings changed elsewhere. Review the latest values before saving again.")
+                  : settingsTextMessage("Steam save could not be confirmed. Review the latest values before saving again."));
                 return;
               }
               throw error;
@@ -2747,7 +2806,7 @@ namespace Amaterasu {
             if (!runtimeStatus.isConnected || !lutrisLoads.isCurrent(loaded.generation)) return;
             runtimeStatus.className = updated.last_error ? "error" : "muted";
             runtimeStatus.textContent = lutrisStatusDescription(updated);
-            context.notify("Lutris refresh requested.");
+            context.notify(settingsTextMessage("Lutris refresh requested."));
           }),
         );
         refresh.disabled =
@@ -2790,7 +2849,7 @@ namespace Amaterasu {
           ),
           runtimeStatus,
           saveStatus,
-          el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+          el("div", "actions", save, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
@@ -2808,13 +2867,13 @@ namespace Amaterasu {
               saveStarted = true;
               await saveLutrisSettings(context.api, settings, values);
               await loadLutris();
-              context.notify("Lutris settings saved and confirmed. Scan status is shown below.");
+              context.notify(settingsTextMessage("Lutris settings saved and confirmed. Scan status is shown below."));
             } catch (error) {
               if (saveStarted) {
                 await loadLutris();
                 context.notify(error instanceof ApiError && error.code === "revision_conflict"
-                  ? "Lutris settings changed elsewhere. Review the latest values before saving again."
-                  : "Lutris save could not be confirmed. Review the latest values before saving again.");
+                  ? settingsTextMessage("Lutris settings changed elsewhere. Review the latest values before saving again.")
+                  : settingsTextMessage("Lutris save could not be confirmed. Review the latest values before saving again."));
                 return;
               }
               throw error;
@@ -2962,7 +3021,7 @@ namespace Amaterasu {
           "Refresh now",
           () => runAction(refresh, refreshStatus, async () => {
             await context.api.post("playnite/refresh");
-            context.notify("Playnite refresh requested.");
+            context.notify(settingsTextMessage("Playnite refresh requested."));
             await loadPlaynite();
           }),
         );
@@ -3063,7 +3122,7 @@ namespace Amaterasu {
           ),
           runtimeStatus,
           saveStatus,
-          el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+          el("div", "actions", save, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
@@ -3108,16 +3167,16 @@ namespace Amaterasu {
               saveStarted = true;
               await savePlayniteSettings(context.api, settings, values);
               await loadPlaynite();
-              context.notify("Playnite settings saved and confirmed. Runtime status is shown below.");
+              context.notify(settingsTextMessage("Playnite settings saved and confirmed. Runtime status is shown below."));
             } catch (error) {
               if (error instanceof ApiError && error.code === "revision_conflict") {
-                context.notify("Playnite settings changed elsewhere. The latest values have been reloaded.");
+                context.notify(settingsTextMessage("Playnite settings changed elsewhere. The latest values have been reloaded."));
                 await loadPlaynite();
                 return;
               }
               if (saveStarted) {
                 await loadPlaynite();
-                context.notify("Playnite save could not be confirmed. Review the latest values before saving again.");
+                context.notify(settingsTextMessage("Playnite save could not be confirmed. Review the latest values before saving again."));
                 return;
               }
               throw error;
@@ -3149,7 +3208,7 @@ namespace Amaterasu {
             panel(
               "Paired client overrides",
               empty("No paired clients", "Pair a Moonlight client before setting client-specific streaming values."),
-              badge(`Revision ${settings.revision}`),
+              badge(settingsTextLiteral(`Revision ${settings.revision}`)),
             ),
           );
           return;
@@ -3164,7 +3223,7 @@ namespace Amaterasu {
           fec.max = "255";
           fec.step = "1";
           fec.placeholder = "Inherit";
-          fec.setAttribute("aria-label", `FEC percentage override for ${client.name}`);
+          settingsClientOverrideAttribute(fec, "FEC percentage", client.name);
           const backButtonTimeout = input(
             `back_button_timeout_${client.certificate_id}`,
             client.config_overrides?.back_button_timeout?.toString() ?? "",
@@ -3174,52 +3233,83 @@ namespace Amaterasu {
           backButtonTimeout.max = String(0x7fff_ffff);
           backButtonTimeout.step = "1";
           backButtonTimeout.placeholder = "Inherit";
-          backButtonTimeout.setAttribute("aria-label", `Back button timeout override for ${client.name}`);
-          const controller = sparseInputOverrideSelect("controller", client.config_overrides?.controller);
-          controller.setAttribute("aria-label", `Controller input override for ${client.name}`);
+          settingsClientOverrideAttribute(
+            backButtonTimeout,
+            "Back button timeout (milliseconds)",
+            client.name,
+          );
+          const controller = sparseInputOverrideSelect(
+            "controller",
+            client.config_overrides?.controller,
+            "Controller input",
+          );
           const gamepadChoices = inputGamepadProfileChoices(
             client.config_overrides?.gamepad ?? "",
             inputStatus?.supported_profiles ?? ["auto"],
             inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])],
           );
           const gamepad = el("select");
-          gamepad.setAttribute("aria-label", `Gamepad profile override for ${client.name}`);
+          settingsClientOverrideAttribute(gamepad, "Gamepad profile", client.name);
           const inheritGamepad = el("option", "", "Inherit");
           inheritGamepad.value = "";
           gamepad.append(inheritGamepad);
           for (const choice of gamepadChoices) {
-            const option = el("option", "", choice.label);
+            const option = el("option", "", settingsTextLiteral(choice.label));
             option.value = choice.value;
             gamepad.append(option);
           }
           gamepad.value = client.config_overrides?.gamepad ?? "";
-          const keyboard = sparseInputOverrideSelect("keyboard", client.config_overrides?.keyboard);
-          keyboard.setAttribute("aria-label", `Keyboard input override for ${client.name}`);
-          const mouse = sparseInputOverrideSelect("mouse", client.config_overrides?.mouse);
-          mouse.setAttribute("aria-label", `Mouse input override for ${client.name}`);
-          const nativePenTouch = sparseInputOverrideSelect("native_pen_touch", client.config_overrides?.native_pen_touch);
-          nativePenTouch.setAttribute("aria-label", `Native pen/touch preference override for ${client.name}`);
+          const keyboard = sparseInputOverrideSelect(
+            "keyboard",
+            client.config_overrides?.keyboard,
+            "Keyboard input",
+          );
+          settingsClientOverrideAttribute(keyboard, "Keyboard input", client.name);
+          const mouse = sparseInputOverrideSelect(
+            "mouse",
+            client.config_overrides?.mouse,
+            "Mouse input",
+          );
+          settingsClientOverrideAttribute(mouse, "Mouse input", client.name);
+          const nativePenTouch = sparseInputOverrideSelect(
+            "native_pen_touch",
+            client.config_overrides?.native_pen_touch,
+            "Native pen and touch policy",
+          );
+          settingsClientOverrideAttribute(
+            nativePenTouch,
+            "Native pen and touch policy",
+            client.name,
+          );
           const ds4BackAsTouchpadClick = sparseInputOverrideSelect(
             "ds4_back_as_touchpad_click", client.config_overrides?.ds4_back_as_touchpad_click,
           );
-          ds4BackAsTouchpadClick.setAttribute("aria-label", `DS4 Back as touchpad click override for ${client.name}`);
+          settingsClientOverrideAttribute(
+            ds4BackAsTouchpadClick,
+            "DS4 Back as touchpad click",
+            client.name,
+          );
           const motionAsDs4 = sparseInputOverrideSelect("motion_as_ds4", client.config_overrides?.motion_as_ds4);
-          motionAsDs4.setAttribute("aria-label", `Motion selects DS4 override for ${client.name}`);
+          settingsClientOverrideAttribute(motionAsDs4, "Motion selects DS4", client.name);
           const touchpadAsDs4 = sparseInputOverrideSelect("touchpad_as_ds4", client.config_overrides?.touchpad_as_ds4);
-          touchpadAsDs4.setAttribute("aria-label", `Touchpad selects DS4 override for ${client.name}`);
+          settingsClientOverrideAttribute(touchpadAsDs4, "Touchpad selects DS4", client.name);
           const ds5InputtinoRandomizeMac = sparseInputOverrideSelect(
             "ds5_inputtino_randomize_mac", client.config_overrides?.ds5_inputtino_randomize_mac,
           );
-          ds5InputtinoRandomizeMac.setAttribute("aria-label", `DS5 random MAC override for ${client.name}`);
+          settingsClientOverrideAttribute(ds5InputtinoRandomizeMac, "DS5 random MAC", client.name);
           const protonDualsenseCompatibility = sparseInputOverrideSelect(
             "proton_dualsense_compatibility", client.config_overrides?.proton_dualsense_compatibility,
           );
-          protonDualsenseCompatibility.setAttribute("aria-label", `Proton DualSense compatibility override for ${client.name}`);
+          settingsClientOverrideAttribute(
+            protonDualsenseCompatibility,
+            "Proton DualSense compatibility",
+            client.name,
+          );
           const advancedInput = advancedInputOverrideControls(client.config_overrides);
           const softwareEncoder = softwareEncoderOverrideControls(client.config_overrides);
           const nvencSettings = nvencSettingsOverrideControls(client.config_overrides);
           const streamAudio = el("select");
-          streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
+          settingsClientOverrideAttribute(streamAudio, "Audio streaming", client.name);
           const audioChoices: Array<[string, string]> = [
             ["", "Inherit"],
             ["true", "Enabled"],
@@ -3234,7 +3324,7 @@ namespace Amaterasu {
             ? ""
             : String(client.config_overrides.stream_audio);
           const audioSinkMode = el("select");
-          audioSinkMode.setAttribute("aria-label", `Audio endpoint override for ${client.name}`);
+          settingsClientOverrideAttribute(audioSinkMode, "Audio capture endpoint", client.name);
           for (const [value, label] of [
             ["inherit", "Inherit application/host"],
             ["automatic", "Automatic/default endpoint"],
@@ -3249,12 +3339,12 @@ namespace Amaterasu {
           const audioSinkId = input(`audio_sink_${client.certificate_id}`, currentAudioSink ?? "");
           audioSinkId.maxLength = 4096;
           audioSinkId.placeholder = "Exact endpoint ID";
-          audioSinkId.setAttribute("aria-label", `Specific audio endpoint ID for ${client.name}`);
+          settingsClientOverrideAttribute(audioSinkId, "Specific endpoint ID", client.name);
           const updateAudioSink = () => { audioSinkId.disabled = audioSinkMode.value !== "specific"; };
           audioSinkMode.addEventListener("change", updateAudioSink);
           updateAudioSink();
           const virtualSinkMode = el("select");
-          virtualSinkMode.setAttribute("aria-label", `Virtual sink override for ${client.name}`);
+          settingsClientOverrideAttribute(virtualSinkMode, "Virtual audio sink", client.name);
           for (const [value, label] of [
             ["inherit", "Inherit application/host"],
             ["automatic", "Clear inherited virtual sink"],
@@ -3269,12 +3359,16 @@ namespace Amaterasu {
           const virtualSinkSelector = input(`virtual_sink_${client.certificate_id}`, currentVirtualSink ?? "");
           virtualSinkSelector.maxLength = 4096;
           virtualSinkSelector.placeholder = "Exact ID or device name";
-          virtualSinkSelector.setAttribute("aria-label", `Specific virtual sink selector for ${client.name}`);
+          settingsClientOverrideAttribute(virtualSinkSelector, "Virtual sink ID or name", client.name);
           const updateVirtualSink = () => { virtualSinkSelector.disabled = virtualSinkMode.value !== "specific"; };
           virtualSinkMode.addEventListener("change", updateVirtualSink);
           updateVirtualSink();
           const captureOnly = el("select");
-          captureOnly.setAttribute("aria-label", `Capture-only audio override for ${client.name}`);
+          settingsClientOverrideAttribute(
+            captureOnly,
+            "Capture audio without changing default outputs",
+            client.name,
+          );
           for (const [value, label] of [
             ["", "Inherit"],
             ["true", "Capture without routing"],
@@ -3333,8 +3427,8 @@ namespace Amaterasu {
                 if (saveStarted) {
                   await loadPairing();
                   context.notify(error instanceof ApiError && error.code === "revision_conflict"
-                    ? "Paired clients changed elsewhere. Review the refreshed overrides before saving again."
-                    : "Paired client override save could not be confirmed. Review the refreshed values before saving again.");
+                    ? settingsTextMessage("Paired clients changed elsewhere. Review the refreshed overrides before saving again.")
+                    : settingsTextMessage("Paired client override save could not be confirmed. Review the refreshed values before saving again."));
                   return;
                 }
                 throw error;
@@ -3348,8 +3442,8 @@ namespace Amaterasu {
           const identity = el(
             "div",
             "",
-            el("strong", "", client.name),
-            el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
+            el("strong", "", settingsTextLiteral(client.name)),
+            el("small", "muted", settingsTextLiteral(`${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`)),
           );
           return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, motionAsDs4, touchpadAsDs4, ds5InputtinoRandomizeMac, protonDualsenseCompatibility, el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields), el("div", "", save, status)];
         });
@@ -3359,7 +3453,7 @@ namespace Amaterasu {
             "Paired client overrides",
             el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save confirms the stored pairing revision. Input preferences apply when the next stream acquires its input lease."),
             tableView,
-            el("div", "actions", badge(`Revision ${settings.revision}`)),
+            el("div", "actions", badge(settingsTextLiteral(`Revision ${settings.revision}`))),
           ),
         );
       } catch (error) {
@@ -3421,7 +3515,7 @@ namespace Amaterasu {
           ttlField,
           sizeField,
           status,
-          el("div", "actions", save, badge(`Revision ${reply.revision}`)),
+          el("div", "actions", save, badge(settingsTextLiteral(`Revision ${reply.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
@@ -3524,7 +3618,7 @@ namespace Amaterasu {
           runtimeStatus?.recognized_profiles ?? [settings.values.gamepad],
         );
         for (const choice of gamepadProfileChoices) {
-          const option = el("option", "", choice.label);
+          const option = el("option", "", settingsTextLiteral(choice.label));
           option.value = choice.value;
           gamepadProfile.append(option);
         }
@@ -3634,7 +3728,7 @@ namespace Amaterasu {
           ),
           gamepadStatus,
           status,
-          el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+          el("div", "actions", save, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
@@ -3668,14 +3762,14 @@ namespace Amaterasu {
               const saved = await saveInputPolicySettings(context.api, settings, values);
               await loadInput();
               context.notify(saved.applied && !saved.cleanup_required
-                ? "Input policy saved and confirmed. Runtime status is shown below."
-                : "Input policy saved and confirmed; releasing held native input is pending.");
+                ? settingsTextMessage("Input policy saved and confirmed. Runtime status is shown below.")
+                : settingsTextMessage("Input policy saved and confirmed; releasing held native input is pending."));
             } catch (error) {
               if (saveStarted) {
                 await loadInput();
                 context.notify(error instanceof ApiError && error.code === "revision_conflict"
-                  ? "Input policy changed elsewhere. Review the latest values before saving again."
-                  : "Input policy save could not be confirmed. Review the latest values before saving again.");
+                  ? settingsTextMessage("Input policy changed elsewhere. Review the latest values before saving again.")
+                  : settingsTextMessage("Input policy save could not be confirmed. Review the latest values before saving again."));
                 return;
               }
               throw error;
@@ -3795,7 +3889,7 @@ namespace Amaterasu {
               try {
                 if (!output.attached || !output.id || parseOutputNameSelection(output.id) !== output.id)
                   continue;
-                const option = el("option", "", `${output.device_name} (${output.id})`);
+                const option = el("option", "", settingsTextLiteral(`${output.device_name} (${output.id})`));
                 option.value = output.id;
                 outputName.append(option);
               } catch {
@@ -3813,7 +3907,7 @@ namespace Amaterasu {
         if (settings.configured_output_name && !Array.from(outputName.options).some(
           (option) => option.value === settings.configured_output_name,
         )) {
-          const saved = el("option", "", `Saved output: ${settings.configured_output_name}`);
+          const saved = el("option", "", settingsTextLiteral(`Saved output: ${settings.configured_output_name}`));
           saved.value = settings.configured_output_name;
           outputName.append(saved);
         }
@@ -3884,7 +3978,7 @@ namespace Amaterasu {
               try {
                 if (!endpoint.id || parseAudioSinkSelection(endpoint.id) !== endpoint.id)
                   continue;
-                const option = el("option", "", `${endpoint.name}${endpoint.default_multimedia ? " (default)" : ""} (${endpoint.id})`);
+                const option = el("option", "", settingsTextLiteral(`${endpoint.name}${endpoint.default_multimedia ? " (default)" : ""} (${endpoint.id})`));
                 option.value = endpoint.id;
                 audioSink.append(option);
               } catch {
@@ -3900,7 +3994,7 @@ namespace Amaterasu {
         if (settings.configured_audio_sink && !Array.from(audioSink.options).some(
           (option) => option.value === settings.configured_audio_sink,
         )) {
-          const saved = el("option", "", `Saved endpoint: ${settings.configured_audio_sink}`);
+          const saved = el("option", "", settingsTextLiteral(`Saved endpoint: ${settings.configured_audio_sink}`));
           saved.value = settings.configured_audio_sink;
           audioSink.append(saved);
         }
@@ -4042,13 +4136,13 @@ namespace Amaterasu {
         form.append(
           ...softwareEncoder.fields,
           softwareAvailability,
-          el("p", "muted", `Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software requests max(client-negotiated slices, this value), subject to x264 frame-size and backend limits. Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`),
+          el("p", "muted", settingsTextLiteral(`Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software requests max(client-negotiated slices, this value), subject to x264 frame-size and backend limits. Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`)),
           field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."),
           field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."),
           field(
             "Global FEC percentage",
             fecPercentage,
-            `Controls the repair percentage used for new streams unless an application or paired client overrides it. Leave blank to use the startup value (${settings.effective_fec_percentage}%). Valid values are 1–255.`,
+            settingsTextLiteral(`Controls the repair percentage used for new streams unless an application or paired client overrides it. Leave blank to use the startup value (${settings.effective_fec_percentage}%). Valid values are 1–255.`),
           ),
           field(
             "Automatic router port mapping (UPnP)",
@@ -4058,7 +4152,7 @@ namespace Amaterasu {
           el(
             "p",
             settings.upnp_status === "error" ? "error" : "muted",
-            `UPnP status: ${settings.upnp_status.replaceAll("_", " ")}${settings.upnp_error ? ` · ${settings.upnp_error}` : ""}`,
+            settingsTextLiteral(`UPnP status: ${settings.upnp_status.replaceAll("_", " ")}${settings.upnp_error ? ` · ${settings.upnp_error}` : ""}`),
           ),
           field(
             "Address family",
@@ -4068,7 +4162,7 @@ namespace Amaterasu {
           field(
             "Use startup bind address",
             useStartupBindAddress,
-            `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`,
+            settingsTextLiteral(`The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`),
           ),
           field(
             "Bind address override",
@@ -4078,7 +4172,7 @@ namespace Amaterasu {
           field(
             "Capture backend",
             capture,
-            `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`,
+            settingsTextLiteral(`Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`),
           ),
           field(
             "Capture output",
@@ -4098,9 +4192,9 @@ namespace Amaterasu {
           field(
             "WGC pacing smoothing",
             wgcPacing,
-            `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`,
+            settingsTextLiteral(`Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`),
           ),
-          field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`),
+          field("Audio capture endpoint", audioSink, settingsTextLiteral(`Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`)),
           field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."),
           field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."),
           field(
@@ -4118,35 +4212,35 @@ namespace Amaterasu {
           field(
             "Video batch size (KiB)",
             videoBatchSize,
-            `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`,
+            settingsTextLiteral(`Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`),
           ),
           field(
             "Maximum bitrate (kbps)",
             maxBitrate,
-            `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`,
+            settingsTextLiteral(`A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`),
           ),
           field(
             "Minimum frame rate (FPS)",
             minimumFpsTarget,
-            `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`,
+            settingsTextLiteral(`On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`),
           ),
           field(
             "Stream ping timeout (ms)",
             pingTimeout,
-            `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`,
+            settingsTextLiteral(`Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`),
           ),
           ...(outputDiscoveryIssue ? [el("p", "muted", outputDiscoveryIssue)] : []),
           ...(audioDiscoveryIssue ? [el("p", "muted", audioDiscoveryIssue)] : []),
           el(
             "p",
             "muted",
-            `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`,
+            settingsTextLiteral(`Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`),
           ),
-          el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`),
+          el("p", "muted", settingsTextLiteral(`Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`)),
           ...(settings.listener_error ? [el("p", "error", settings.listener_error)] : []),
           ...(settings.rtsp_listener_error ? [el("p", "error", settings.rtsp_listener_error)] : []),
           status,
-          el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+          el("div", "actions", save, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
@@ -4193,7 +4287,7 @@ namespace Amaterasu {
             hostLoads.invalidate();
             try {
               await saveNvhttpHostSettings(context.api, settings, values);
-              context.notify("Host settings saved and read back. Future-stream options apply to new streams; check active listener status below.");
+              context.notify(settingsTextMessage("Host settings saved and read back. Future-stream options apply to new streams; check active listener status below."));
               await loadHost();
             } catch (error) {
               if (error instanceof ApiError && await recoverNvhttpSaveFailure(
@@ -4277,7 +4371,7 @@ namespace Amaterasu {
               textControl.maxLength = definition.max_length;
           }
           inputs.set(name, control);
-          form.append(field(name, control, `Type: ${definition.type}`));
+          form.append(field(settingsTextLiteral(name), control, settingsTextLiteral(`Type: ${definition.type}`)));
         }
         const status = el("div");
         const save = el("button", "button primary", "Save settings");
@@ -4286,7 +4380,7 @@ namespace Amaterasu {
         form.append(
           el("p", "muted", "Saving confirms stored values. Runtime use of registered settings is not verified on this page."),
           status,
-          el("div", "actions", save, badge(`Revision ${document.revision}`)),
+          el("div", "actions", save, badge(settingsTextLiteral(`Revision ${document.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
@@ -4299,12 +4393,12 @@ namespace Amaterasu {
             registeredLoads.invalidate();
             try {
               await saveRegisteredConfiguration(context.api, document, values);
-              context.notify("Registered settings saved and read back. Runtime application is not verified here.");
+              context.notify(settingsTextMessage("Registered settings saved and read back. Runtime application is not verified here."));
               await load();
             } catch (error) {
               if (error instanceof ApiError && error.code === "revision_conflict") {
                 await load();
-                context.notify("Registered settings changed elsewhere. Review the latest values and save again.");
+                context.notify(settingsTextMessage("Registered settings changed elsewhere. Review the latest values and save again."));
                 return;
               }
               throw error;

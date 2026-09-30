@@ -1,4 +1,12 @@
 namespace Amaterasu {
+  function updaterTextLiteral(value: string): TextValue {
+    return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
+  }
+
+  function updaterTextMessage(value: string): TextValue {
+    return typeof Amaterasu.localizedMessage === "function" ? Amaterasu.localizedMessage(value) : value;
+  }
+
   const maximumUpdateCheckIntervalSeconds = 0x7fff_ffff;
   const updaterRenderGenerations = new WeakMap<HTMLElement, number>();
   type UpdaterNotificationDelivery = "pending" | "notified" | "disabled" | "unavailable";
@@ -200,9 +208,9 @@ namespace Amaterasu {
     } else if (status.last_error) {
       area.append(el("p", "error", "The most recent release check could not be completed."));
     } else if (status.available_update) {
-      const link = el("a", "", `Version ${status.available_update.version} is available${
+      const link = el("a", "", updaterTextLiteral(`Version ${status.available_update.version} is available${
         status.available_update.prerelease ? " (pre-release)" : ""
-      }`);
+      }`));
       link.href = status.available_update.release_url;
       link.target = "_blank";
       link.rel = "noopener noreferrer";
@@ -213,10 +221,10 @@ namespace Amaterasu {
       area.append(el("p", "muted", "No release check has completed yet."));
     }
     if (status.last_check_unix_ms !== null) {
-      area.append(el("p", "muted", `Last checked ${new Date(status.last_check_unix_ms).toLocaleString()}.`));
+      area.append(el("p", "muted", updaterTextLiteral(`Last checked ${new Date(status.last_check_unix_ms).toLocaleString()}.`)));
     }
     if (status.notification) {
-      area.append(el("p", "muted", `Desktop notification: ${status.notification.delivery}.`));
+      area.append(el("p", "muted", updaterTextLiteral(`Desktop notification: ${status.notification.delivery}.`)));
     }
   }
 
@@ -284,7 +292,7 @@ namespace Amaterasu {
             "The default is 86400 seconds (24 hours). Set 0 to disable periodic checks; a manual check is still available.",
           ),
           el("p", "muted", "The interval is stored in seconds. The control advances in one-minute steps."),
-          el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+          el("div", "actions", save, badge(updaterTextLiteral(`Revision ${settings.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
@@ -295,10 +303,10 @@ namespace Amaterasu {
                 notifyPreReleases.checked,
                 updateInterval.valueAsNumber,
               ));
-              context.notify("Update preferences were saved and read back.");
+              context.notify(updaterTextMessage("Update preferences were saved and read back."));
             } catch (error) {
               if (error instanceof ApiError && error.code === "revision_conflict") {
-                context.notify("Update preferences changed elsewhere. Review the latest values and save again.");
+                context.notify(updaterTextMessage("Update preferences changed elsewhere. Review the latest values and save again."));
               }
               await load();
               throw error;

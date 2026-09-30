@@ -1,4 +1,23 @@
 namespace Amaterasu {
+  function hostMetricsTextLiteral(value: string): TextValue {
+    return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
+  }
+
+  function hostMetricsTextMessage(value: string): TextValue {
+    return typeof Amaterasu.localizedMessage === "function" ? Amaterasu.localizedMessage(value) : value;
+  }
+
+  function hostMetricsSetLocalizedTextContent(
+    target: HTMLElement,
+    source: string,
+  ): void {
+    if (typeof Amaterasu.setLocalizedTextContent === "function") {
+      Amaterasu.setLocalizedTextContent(target, source);
+    } else {
+      target.textContent = source;
+    }
+  }
+
   interface RealtimeSettings {
     enabled: boolean;
     poll_interval_ms: number;
@@ -213,7 +232,7 @@ namespace Amaterasu {
         charts.checked = settings.show_host_charts;
         const sessionHistory = input("realtime_stats_show_session_history", "", "checkbox");
         sessionHistory.checked = settings.show_session_history;
-        const status = el("p", "muted", `Saved settings revision ${current.revision}.`);
+        const status = el("p", "muted", hostMetricsTextLiteral(`Saved settings revision ${current.revision}.`));
         const save = el("button", "button primary", "Save real-time statistics settings");
         save.type = "submit";
         save.disabled = !context.api.allows("configuration.write");
@@ -231,7 +250,7 @@ namespace Amaterasu {
           field("Show host charts", charts),
           field("Show session history", sessionHistory),
           status,
-          el("div", "actions", save, badge(`Revision ${current.revision}`)),
+          el("div", "actions", save, badge(hostMetricsTextLiteral(`Revision ${current.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
@@ -354,7 +373,7 @@ namespace Amaterasu {
         "Real-time statistics are disabled",
         "Enable collection in Settings to show live host telemetry.",
       ));
-      status.textContent = "Sampling is disabled.";
+      hostMetricsSetLocalizedTextContent(status, "Sampling is disabled.");
     }
 
     async function initialize(): Promise<void> {
@@ -421,7 +440,16 @@ namespace Amaterasu {
       svg.style.width = "100%";
       svg.style.height = "84px";
       svg.setAttribute("role", "img");
-      svg.setAttribute("aria-label", `${chart.label} over recent measured samples`);
+      if (typeof Amaterasu.setLocalizedAttributeTemplate === "function") {
+        Amaterasu.setLocalizedAttributeTemplate(
+          svg,
+          "aria-label",
+          "{label} over recent measured samples",
+          { label: hostMetricsTextMessage(chart.label) },
+        );
+      } else {
+        svg.setAttribute("aria-label", `${chart.label} over recent measured samples`);
+      }
       svg.classList.add("host-metric-chart");
       const axis = document.createElementNS(svg.namespaceURI, "path");
       axis.setAttribute("d", "M 0 78 H 320");
@@ -464,7 +492,7 @@ namespace Amaterasu {
         }
       }
       return el("div", "host-metric-chart-card", el("strong", "", chart.label), svg,
-        el("small", "muted", `${chart.values.filter((value) => value !== null).length} measured points`));
+        el("small", "muted", hostMetricsTextLiteral(`${chart.values.filter((value) => value !== null).length} measured points`)));
     });
     const grid = el("div", "host-metric-chart-grid", ...graphics);
     grid.style.display = "grid";

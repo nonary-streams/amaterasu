@@ -74,8 +74,38 @@ class FakeElement {
     this.children.push(...children);
   }
 
+  replaceChildren(...children) {
+    this.children = [...children];
+    this.textContent = children
+      .map((child) =>
+        typeof child === "string"
+          ? child
+          : child?.nodeValue ?? child?.textContent ?? "",
+      )
+      .join("");
+  }
+
   setAttribute(name, value) {
     this.attributes.set(name, value);
+  }
+
+  getAttribute(name) {
+    return this.attributes.has(name) ? this.attributes.get(name) : null;
+  }
+
+  querySelectorAll(selector) {
+    const match = selector.match(/^\[([^\]]+)\]$/);
+    if (!match) return [];
+    const attribute = match[1];
+    const matches = [];
+    const visit = (element) => {
+      if (element.attributes?.has(attribute)) matches.push(element);
+      for (const child of element.children ?? []) child.querySelectorAll?.(selector).forEach((nested) => {
+        if (!matches.includes(nested)) matches.push(nested);
+      });
+    };
+    visit(this);
+    return matches;
   }
 
   addEventListener(name, listener) {
@@ -174,6 +204,89 @@ test("locale catalogs translate consumed console text and fall back to English",
   );
 });
 
+test("product, catalog, settings, updater, and notice messages cover every translated locale", () => {
+  const requiredMessages = [
+    "Host overview",
+    "Curate your library and manage the services that keep this host running.",
+    "Streaming is still being built",
+    "Client pairing, capture, and stream connections are not available in this release. The management tools shown here are live.",
+    "Your library",
+    "Edit application",
+    "Add application",
+    "Delete entry",
+    "Frame limiter",
+    "Keyboard input",
+    "Mouse input",
+    "Enable Lutris discovery",
+    "Enable Playnite synchronization",
+    "Show the system tray icon and desktop notifications",
+    "Sampling and dashboard interval (ms)",
+    "Maximum retained samples",
+    "A durable catalog of the applications on your host.",
+    "Discover local Steam games and optionally sync a complete scan into the catalog.",
+    "Edit host options and values registered for this management console.",
+    "Inspect and stop sessions owned by this management console.",
+    "Processes launched through this management console.",
+    "Records and counters for this management console.",
+    "Applications launched through the management API appear here. Catalog entries are metadata and do not launch automatically.",
+    "Completed streams appear here when history recording is enabled.",
+    "Sessions created through the management API appear here. Streaming clients and pairing are not available yet.",
+    "Records appear when a service explicitly submits them. Automatic host log collection is not enabled.",
+    "Register a schema for the management principal through the authenticated configuration API. This screen will then show its editable values.",
+    "The registered schema is empty. Schema setup and migration are available through the management API.",
+    "Controls automatic scans of the configured Steam library roots.",
+    "Collect measured host metrics for the live statistics dashboard and while an active stream requests samples.",
+    "The default is 86400 seconds (24 hours). Set 0 to disable periodic checks; a manual check is still available.",
+    "Recording changes wait for active streams to end and pending launches to resolve. Check the runtime status for the effective policy.",
+    "Stable updates are always considered. Pre-releases are included when enabled or when this build is already on a pre-release channel.",
+    "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior.",
+    'A JSON array of literal arguments. Example: ["--fullscreen"]',
+    "Separate tags with commas.",
+    "{field} override for {client}",
+    "{field} override",
+    "{label} over recent measured samples",
+    "DS4 Back as touchpad click",
+    "Motion selects DS4",
+    "Touchpad selects DS4",
+    "DS5 random MAC",
+    "Proton DualSense compatibility",
+    "CPU utilization",
+    "GPU utilization",
+    "Memory use",
+    "Network receive",
+    "Your host, your library",
+    "A home for your applications.",
+    "Active streaming sessions",
+    "Input policy",
+    "Authentication session lifetimes",
+    "Real-time statistics",
+    "Software updates",
+    "System tray",
+    "No active streams",
+    "No paired clients",
+    "No diagnostic records",
+    "Search names, descriptions, tags",
+    "Absolute application path",
+    "Save input policy",
+    "Refresh host metrics",
+    "Check for updates now",
+    "Application removed from the catalog.",
+    "Session updated.",
+    "Core console labels and selected notices are translated; some descriptions remain English.",
+  ];
+  for (const token of expectedLocales.filter((value) => !value.startsWith("en"))) {
+    const messages = locale.localeMessagesFor(token);
+    for (const source of requiredMessages) {
+      assert.equal(typeof messages[source], "string", `${token}: ${source}`);
+      assert.notEqual(messages[source], source, `${token}: ${source}`);
+    }
+  }
+  for (const token of ["en", "en_GB", "en_US"]) {
+    const messages = locale.localeMessagesFor(token);
+    for (const source of requiredMessages) assert.equal(messages[source], source);
+  }
+});
+
 test("locale UI overlays merge over base messages without losing untranslated entries", () => {
   const merged = locale.mergeLocaleMessages(
     {
@@ -212,6 +325,7 @@ test("locale changes translate existing UI text nodes and the browser title", ()
       let index = 0;
       return { nextNode: () => textNodes[index++] ?? null };
     },
+    querySelectorAll: (selector) => root.querySelectorAll(selector),
   };
   const runtimeContext = vm.createContext({
     document,
@@ -221,6 +335,30 @@ test("locale changes translate existing UI text nodes and the browser title", ()
   vm.runInContext(uiSource, runtimeContext);
   runtimeContext.Amaterasu.setLocalizedPageTitle("Overview");
   const heading = runtimeContext.Amaterasu.el("h1", "", "Overview");
+  const literalHeading = runtimeContext.Amaterasu.el(
+    "p",
+    "",
+    runtimeContext.Amaterasu.literalText("Overview"),
+  );
+  const explicitNotice = runtimeContext.Amaterasu.el(
+    "p",
+    "",
+    runtimeContext.Amaterasu.localizedMessage("Session updated."),
+  );
+  const asyncStatus = new FakeElement("p");
+  runtimeContext.Amaterasu.setLocalizedTextContent(asyncStatus, "Session updated.");
+  const menu = new FakeElement("button");
+  runtimeContext.Amaterasu.setLocalizedAttribute(menu, "aria-label", "Toggle navigation");
+  const clientOverride = new FakeElement("input");
+  runtimeContext.Amaterasu.setLocalizedAttributeTemplate(
+    clientOverride,
+    "aria-label",
+    "{field} override for {client}",
+    {
+      field: runtimeContext.Amaterasu.localizedMessage("FEC percentage"),
+      client: runtimeContext.Amaterasu.literalText("Overview"),
+    },
+  );
   const date = new Date(Date.UTC(2024, 0, 2, 15, 4));
   const localizedDate = runtimeContext.Amaterasu.localeFormattedTextNode(
     (locale) => date.toLocaleString(locale),
@@ -228,20 +366,48 @@ test("locale changes translate existing UI text nodes and the browser title", ()
   const dateLabel = new FakeElement("time");
   dateLabel.append(localizedDate);
   root.append(heading);
+  root.append(literalHeading);
+  root.append(explicitNotice);
+  root.append(asyncStatus);
+  root.append(menu);
+  root.append(clientOverride);
   root.append(dateLabel);
   const textNode = heading.children[0];
+  const literalTextNode = literalHeading.children[0];
+  const noticeTextNode = explicitNotice.children[0];
   const dateTextNode = dateLabel.children[0];
 
   assert.equal(textNode.nodeValue, "Overview");
+  assert.equal(literalTextNode.nodeValue, "Overview");
+  assert.equal(noticeTextNode.nodeValue, "Session updated.");
+  assert.equal(asyncStatus.children[0].nodeValue, "Session updated.");
+  assert.equal(menu.getAttribute("aria-label"), "Toggle navigation");
+  assert.equal(clientOverride.getAttribute("aria-label"), "FEC percentage override for Overview");
   assert.equal(dateTextNode.nodeValue, date.toLocaleString("en"));
   runtimeContext.Amaterasu.applyLocale("de");
   assert.equal(textNode.nodeValue, "Übersicht");
+  assert.equal(literalTextNode.nodeValue, "Overview");
+  assert.equal(noticeTextNode.nodeValue, "Sitzung aktualisiert.");
+  assert.equal(
+    asyncStatus.children[0].nodeValue,
+    locale.translateLocaleMessage("Session updated.", locale.localeMessagesFor("de")),
+  );
+  assert.equal(menu.getAttribute("aria-label"), "Navigation umschalten");
+  assert.equal(
+    clientOverride.getAttribute("aria-label"),
+    `${locale.translateLocaleMessage("FEC percentage", locale.localeMessagesFor("de"))} für Overview überschreiben`,
+  );
   assert.equal(dateTextNode.nodeValue, date.toLocaleString("de"));
   assert.equal(document.documentElement.lang, "de");
   assert.equal(document.title, "Übersicht · Amaterasu");
 
   runtimeContext.Amaterasu.applyLocale("en");
   assert.equal(textNode.nodeValue, "Overview");
+  assert.equal(literalTextNode.nodeValue, "Overview");
+  assert.equal(noticeTextNode.nodeValue, "Session updated.");
+  assert.equal(asyncStatus.children[0].nodeValue, "Session updated.");
+  assert.equal(menu.getAttribute("aria-label"), "Toggle navigation");
+  assert.equal(clientOverride.getAttribute("aria-label"), "FEC percentage override for Overview");
   assert.equal(dateTextNode.nodeValue, date.toLocaleString("en"));
   assert.equal(document.title, "Overview · Amaterasu");
 });

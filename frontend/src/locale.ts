@@ -3,7 +3,40 @@ namespace Amaterasu {
   let activeLocaleMessages = localeMessagesFor(activeLocale);
   const localizedTextSources = new WeakMap<Text, string>();
   const localizedTextFormatters = new WeakMap<Text, (locale: string) => string>();
+  const localizedAttributeTemplates = new WeakMap<
+    Element,
+    Map<
+      (typeof LOCALIZED_ATTRIBUTES)[number],
+      { source: string; values: Readonly<Record<string, TextValue>> }
+    >
+  >();
   let currentPageTitle: string | null = null;
+  const LOCALIZED_ATTRIBUTES = ["aria-label", "title", "placeholder"] as const;
+
+  export interface LiteralText {
+    readonly kind: "literal";
+    readonly value: string;
+  }
+
+  export interface LocalizedMessage {
+    readonly kind: "localized";
+    readonly value: string;
+  }
+
+  export type TextValue = string | LiteralText | LocalizedMessage;
+
+  export function literalText(value: string): LiteralText {
+    return { kind: "literal", value };
+  }
+
+  export function localizedMessage(value: string): LocalizedMessage {
+    return { kind: "localized", value };
+  }
+
+  export function textValue(value: TextValue): string {
+    if (typeof value === "string") return translateText(value);
+    return value.kind === "localized" ? translateText(value.value) : value.value;
+  }
 
   export const LOCALE_OPTIONS = [
     "bg",
@@ -153,6 +186,70 @@ namespace Amaterasu {
     return node;
   }
 
+  export function textValueNode(value: TextValue): Text | string {
+    if (typeof value === "string") return localizedTextNode(value);
+    if (value.kind === "localized") return localizedTextNode(value.value);
+    if (typeof document === "undefined" || typeof document.createTextNode !== "function") {
+      return value.value;
+    }
+    return document.createTextNode(value.value);
+  }
+
+  export function setLocalizedAttribute(
+    target: Element,
+    attribute: (typeof LOCALIZED_ATTRIBUTES)[number],
+    source: string,
+  ): void {
+    localizedAttributeTemplates.get(target)?.delete(attribute);
+    target.setAttribute(attribute, translateText(source));
+    target.setAttribute(`data-locale-${attribute}`, source);
+  }
+
+  export function setLocalizedAttributeTemplate(
+    target: Element,
+    attribute: (typeof LOCALIZED_ATTRIBUTES)[number],
+    source: string,
+    values: Readonly<Record<string, TextValue>>,
+  ): void {
+    const templates = localizedAttributeTemplates.get(target) ?? new Map();
+    templates.set(attribute, { source, values: { ...values } });
+    localizedAttributeTemplates.set(target, templates);
+    target.setAttribute(attribute, formatLocalizedAttributeTemplate(source, values));
+    target.setAttribute(`data-locale-${attribute}`, source);
+  }
+
+  function formatLocalizedAttributeTemplate(
+    source: string,
+    values: Readonly<Record<string, TextValue>>,
+  ): string {
+    let result = translateText(source);
+    for (const [name, value] of Object.entries(values)) {
+      result = result.replaceAll(`{${name}}`, () => textValue(value));
+    }
+    return result;
+  }
+
+  export function setLocalizedTextContent(target: Element, source: string): void {
+    target.replaceChildren(localizedTextNode(source));
+  }
+
+  function refreshLocalizedAttributes(): void {
+    if (typeof document === "undefined" || typeof document.querySelectorAll !== "function") return;
+    for (const attribute of LOCALIZED_ATTRIBUTES) {
+      for (const element of document.querySelectorAll(`[data-locale-${attribute}]`)) {
+        const source = element.getAttribute(`data-locale-${attribute}`);
+        if (source === null) continue;
+        const template = localizedAttributeTemplates.get(element)?.get(attribute);
+        element.setAttribute(
+          attribute,
+          template
+            ? formatLocalizedAttributeTemplate(template.source, template.values)
+            : translateText(source),
+        );
+      }
+    }
+  }
+
   export function localeFormattedTextNode(
     format: (locale: string) => string,
   ): Text | string {
@@ -212,6 +309,7 @@ namespace Amaterasu {
       if (currentPageTitle !== null) setLocalizedPageTitle(currentPageTitle);
     }
     if (changed) refreshLocalizedTextNodes();
+    refreshLocalizedAttributes();
     return locale;
   }
 
@@ -281,14 +379,16 @@ namespace Amaterasu {
 
     const label = document.createElement("label");
     label.htmlFor = "global-locale";
-    label.textContent = translateText("Locale");
-    label.title = translateText(
-      "This locale translates navigation and selected labels; untranslated text uses English.",
+    setLocalizedTextContent(label, "Locale");
+    setLocalizedAttribute(
+      label,
+      "title",
+      "Core console labels and selected notices are translated; some descriptions remain English.",
     );
 
     const select = document.createElement("select");
     select.id = "global-locale";
-    select.setAttribute("aria-label", translateText("Locale"));
+    setLocalizedAttribute(select, "aria-label", "Locale");
     for (const locale of LOCALE_OPTIONS) {
       const option = document.createElement("option");
       option.value = locale;
@@ -304,8 +404,9 @@ namespace Amaterasu {
     error.className = "locale-error";
     error.setAttribute("role", "alert");
     const note = document.createElement("small");
-    note.textContent = translateText(
-      "This locale translates navigation and selected labels; untranslated text uses English.",
+    setLocalizedTextContent(
+      note,
+      "Core console labels and selected notices are translated; some descriptions remain English.",
     );
     container.append(label, select, status, error, note);
 
@@ -325,20 +426,23 @@ namespace Amaterasu {
       error.textContent = "";
     };
     const updateLocaleText = (): void => {
-      label.textContent = translateText("Locale");
-      label.title = translateText(
-        "This locale translates navigation and selected labels; untranslated text uses English.",
+      setLocalizedTextContent(label, "Locale");
+      setLocalizedAttribute(
+        label,
+        "title",
+        "Core console labels and selected notices are translated; some descriptions remain English.",
       );
-      select.setAttribute("aria-label", translateText("Locale"));
-      note.textContent = translateText(
-        "This locale translates navigation and selected labels; untranslated text uses English.",
+      setLocalizedAttribute(select, "aria-label", "Locale");
+      setLocalizedTextContent(
+        note,
+        "Core console labels and selected notices are translated; some descriptions remain English.",
       );
     };
 
     const load = async (previousError?: string): Promise<void> => {
       busy = true;
       updateDisabledState();
-      status.textContent = translateText("Loading locale preference…");
+      setLocalizedTextContent(status, "Loading locale preference…");
       clearError();
       try {
         const configuration = await ensureLocaleConfiguration(api);
@@ -349,7 +453,7 @@ namespace Amaterasu {
         revision = configuration.revision;
         loaded = true;
         if (previousError) showError(previousError);
-        else if (!canWrite) status.textContent = translateText("Read only");
+        else if (!canWrite) setLocalizedTextContent(status, "Read only");
         else status.textContent = "";
       } catch (loadError) {
         loaded = false;
@@ -376,7 +480,7 @@ namespace Amaterasu {
       }
       busy = true;
       updateDisabledState();
-      status.textContent = translateText("Saving locale preference…");
+      setLocalizedTextContent(status, "Saving locale preference…");
       clearError();
       void api
         .post("configuration/update", {

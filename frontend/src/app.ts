@@ -1,4 +1,8 @@
 namespace Amaterasu {
+  function appTextLiteral(value: string): TextValue {
+    return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
+  }
+
   const pageNames: Record<Page, string> = {
     overview: "Overview",
     catalog: "Library",
@@ -106,7 +110,7 @@ namespace Amaterasu {
       status.setAttribute("aria-atomic", "true");
       main.append(intro, el("div", "login-side", status));
       this.root.replaceChildren(main);
-      setDocumentTitle("Restoring session · Amaterasu");
+      setLocalizedPageTitle("Restoring session");
     }
 
     private currentPage(): Page {
@@ -201,9 +205,10 @@ namespace Amaterasu {
           token.value = "";
           rememberField.hidden = tokenMode;
           status.replaceChildren();
-          toggle.textContent = tokenMode
-            ? "Use username and password"
-            : "Use an API token instead";
+          setLocalizedTextContent(
+            toggle,
+            tokenMode ? "Use username and password" : "Use an API token instead",
+          );
           (tokenMode ? token : username).focus();
         },
         "link-button",
@@ -264,7 +269,7 @@ namespace Amaterasu {
       main.append(intro, el("div", "login-side", card));
       this.root.replaceChildren(main);
       username.focus();
-      setDocumentTitle("Sign in · Amaterasu");
+      setLocalizedPageTitle("Sign in");
     }
 
     private brand(): HTMLElement {
@@ -282,7 +287,7 @@ namespace Amaterasu {
       const shell = el("div", "shell");
       const sidebar = el("aside", "sidebar");
       const nav = el("nav", "navigation");
-      nav.setAttribute("aria-label", "Main navigation");
+      setLocalizedAttribute(nav, "aria-label", "Main navigation");
       for (const page of Object.keys(pageNames) as Page[]) {
         const icon = el("span", "nav-icon", pageIcons[page]);
         icon.setAttribute("aria-hidden", "true");
@@ -319,7 +324,7 @@ namespace Amaterasu {
         },
         "menu-toggle",
       );
-      menu.setAttribute("aria-label", translateText("Toggle navigation"));
+      setLocalizedAttribute(menu, "aria-label", "Toggle navigation");
       menu.setAttribute("aria-expanded", "false");
       const logout = button(
         "Sign out",
@@ -344,7 +349,7 @@ namespace Amaterasu {
             clearTimeout(this.notificationTimer);
             document.querySelectorAll("dialog").forEach((dialog) => dialog.remove());
             this.loginScreen();
-            const warning = el("p", "error", message);
+            const warning = el("p", "error", appTextLiteral(message));
             warning.setAttribute("role", "alert");
             this.root.querySelector(".login-card")?.prepend(warning);
           });
@@ -368,7 +373,7 @@ namespace Amaterasu {
             "account-avatar",
             this.api.subject.slice(0, 1).toUpperCase(),
           ),
-          el("span", "account-name", this.api.subject),
+          el("span", "account-name", appTextLiteral(this.api.subject)),
           mountLocaleSelector(this.api),
           logout,
         ),
@@ -420,8 +425,12 @@ namespace Amaterasu {
       window.scrollTo(0, 0);
     }
 
-    private notify(message: string): void {
-      this.notification.textContent = message;
+    private notify(message: TextValue): void {
+      if (typeof message === "string") {
+        this.notification.textContent = message;
+      } else {
+        this.notification.replaceChildren(textValueNode(message));
+      }
       this.notification.hidden = false;
       clearTimeout(this.notificationTimer);
       this.notificationTimer = window.setTimeout(() => {
