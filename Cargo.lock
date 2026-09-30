@@ -574,6 +574,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-system-tray"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-module-sdk",
+ "ldtray",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "amaterasu-updater"
 version = "0.1.0"
 dependencies = [
@@ -1296,6 +1307,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
  "spin",
+]
+
+[[package]]
+name = "ldtray"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ff000c773dbfcf62b338606117776c0c51222185bdf36924026189556837142"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]

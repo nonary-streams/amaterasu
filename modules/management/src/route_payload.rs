@@ -35,6 +35,20 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.host-metrics/1" if route.action == "settings_update" => {
             host_metrics_settings_update(object)
         }
+        "amaterasu.updater/1"
+            if route.action == "settings_get"
+                || route.action == "status"
+                || route.action == "check" =>
+        {
+            fields(object, &[], &[])
+        }
+        "amaterasu.updater/1" if route.action == "settings_update" => {
+            updater_settings_update(object)
+        }
+        "amaterasu.system-tray/1" if route.action == "settings_get" => fields(object, &[], &[]),
+        "amaterasu.system-tray/1" if route.action == "settings_update" => {
+            system_tray_settings_update(object)
+        }
         "amaterasu.diagnostics/1" if route.action == "status" || route.action == "counters" => {
             fields(object, &[], &[])
         }
@@ -611,6 +625,56 @@ fn host_metrics_settings_update(object: &Object) -> Result<(), &'static str> {
             .get("max_history_points")
             .and_then(Value::as_u64)
             .is_some_and(|value| (30..=2_000).contains(&value))
+        || object
+            .get("expected_revision")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn updater_settings_update(object: &Object) -> Result<(), &'static str> {
+    fields(object, &["settings", "expected_revision"], &[])?;
+    let settings = object
+        .get("settings")
+        .and_then(Value::as_object)
+        .ok_or(INVALID)?;
+    fields(
+        settings,
+        &["notify_pre_releases", "update_check_interval"],
+        &[],
+    )?;
+    if settings
+        .get("notify_pre_releases")
+        .and_then(Value::as_bool)
+        .is_none()
+        || !settings
+            .get("update_check_interval")
+            .and_then(Value::as_u64)
+            .is_some_and(|interval| interval <= i32::MAX as u64)
+        || object
+            .get("expected_revision")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn system_tray_settings_update(object: &Object) -> Result<(), &'static str> {
+    fields(object, &["settings", "expected_revision"], &[])?;
+    let settings = object
+        .get("settings")
+        .and_then(Value::as_object)
+        .ok_or(INVALID)?;
+    fields(settings, &["system_tray"], &[])?;
+    if settings
+        .get("system_tray")
+        .and_then(Value::as_bool)
+        .is_none()
         || object
             .get("expected_revision")
             .and_then(Value::as_u64)
@@ -4213,5 +4277,64 @@ mod host_metrics_tests {
         let route = resolve("/v1/host-metrics/stats").unwrap();
         assert_eq!(payload(route, b"{}").unwrap()["action"], "stats_read");
         assert!(payload(route, br#"{"limit":1}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod updater_and_tray_tests {
+    use crate::routes::{payload, resolve};
+
+    #[test]
+    fn updater_settings_update_is_strict_and_bounds_seconds() {
+        let route = resolve("/v1/updater/settings_update").unwrap();
+        let valid = serde_json::json!({
+            "settings": {"notify_pre_releases": false, "update_check_interval": 0},
+            "expected_revision": 5,
+        });
+        assert_eq!(
+            payload(route, valid.to_string().as_bytes()).unwrap()["action"],
+            "settings_update"
+        );
+        for settings in [
+            serde_json::json!({"notify_pre_releases":false,"update_check_interval":-1}),
+            serde_json::json!({"notify_pre_releases":false,"update_check_interval":2147483648u64}),
+            serde_json::json!({"notify_pre_releases":"false","update_check_interval":60}),
+            serde_json::json!({"notify_pre_releases":false,"update_check_interval":60,"extra":true}),
+        ] {
+            let mut request = valid.clone();
+            request["settings"] = settings;
+            assert!(payload(route, request.to_string().as_bytes()).is_err());
+        }
+        let mut invalid_revision = valid;
+        invalid_revision["expected_revision"] = serde_json::json!(-1);
+        assert!(payload(route, invalid_revision.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn tray_settings_update_requires_one_boolean_and_revision() {
+        let route = resolve("/v1/system-tray/settings_update").unwrap();
+        let valid = serde_json::json!({
+            "settings": {"system_tray": true},
+            "expected_revision": 0,
+        });
+        assert_eq!(
+            payload(route, valid.to_string().as_bytes()).unwrap()["action"],
+            "settings_update"
+        );
+        for settings in [
+            serde_json::json!({}),
+            serde_json::json!({"system_tray":"true"}),
+            serde_json::json!({"system_tray":true,"extra":false}),
+        ] {
+            let mut request = valid.clone();
+            request["settings"] = settings;
+            assert!(payload(route, request.to_string().as_bytes()).is_err());
+        }
+        let mut missing_revision = valid;
+        missing_revision
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_revision");
+        assert!(payload(route, missing_revision.to_string().as_bytes()).is_err());
     }
 }

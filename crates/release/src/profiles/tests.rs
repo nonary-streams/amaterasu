@@ -66,6 +66,54 @@ fn host_metrics_has_the_delegated_configuration_state_grant() {
 }
 
 #[test]
+fn updater_and_tray_are_registered_with_only_the_required_management_calls() {
+    assert_eq!(UPDATER.library, "amaterasu_updater");
+    assert_eq!(UPDATER.provides, &["amaterasu.updater/1"]);
+    assert!(UPDATER.calls.contains(&"amaterasu.configuration/1"));
+    assert!(UPDATER.calls.contains(&"amaterasu.state/1"));
+    assert!(UPDATER.calls.contains(&"amaterasu.system-tray/1"));
+    assert!(UPDATER.dependencies.contains(&"amaterasu.configuration"));
+    assert!(UPDATER.grants().call.contains("amaterasu.state/1"));
+
+    assert_eq!(SYSTEM_TRAY.library, "amaterasu_system_tray");
+    assert_eq!(SYSTEM_TRAY.provides, &["amaterasu.system-tray/1"]);
+    assert!(SYSTEM_TRAY.calls.contains(&"amaterasu.configuration/1"));
+    assert!(SYSTEM_TRAY.calls.contains(&"amaterasu.state/1"));
+    assert!(
+        SYSTEM_TRAY
+            .dependencies
+            .contains(&"amaterasu.configuration")
+    );
+    assert!(SYSTEM_TRAY.grants().call.contains("amaterasu.state/1"));
+
+    for profile in [
+        PackageProfile::Platform,
+        PackageProfile::StreamProbe,
+        PackageProfile::SoftwareProbe,
+        PackageProfile::LinuxProbe,
+    ] {
+        let components = profile.components();
+        let find = |id| {
+            components
+                .iter()
+                .find(|component| component.id == id)
+                .unwrap()
+        };
+        assert_eq!(find(UPDATER.id).library, UPDATER.library);
+        assert_eq!(find(SYSTEM_TRAY.id).library, SYSTEM_TRAY.library);
+        let management = find(MANAGEMENT.id);
+        assert!(management.calls.contains(&"amaterasu.updater/1"));
+        assert!(management.calls.contains(&"amaterasu.system-tray/1"));
+        assert!(management.dependencies.contains(&UPDATER.id));
+        assert!(management.dependencies.contains(&SYSTEM_TRAY.id));
+        assert!(find(UPDATER.id).dependencies.contains(&SYSTEM_TRAY.id));
+    }
+
+    assert!(!STREAM_SESSION.calls.contains(&"amaterasu.updater/1"));
+    assert!(!STREAM_SESSION.calls.contains(&"amaterasu.system-tray/1"));
+}
+
+#[test]
 fn software_probe_uses_one_real_video_encoder_with_controlled_capture_and_audio() {
     let components = PackageProfile::SoftwareProbe.components();
     let component = |id| {

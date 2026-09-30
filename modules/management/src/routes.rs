@@ -183,6 +183,28 @@ pub fn resolve(path: &str) -> Option<Route> {
             "stats_read",
             Some("diagnostics.read"),
         ),
+        ("updater", "settings") => (
+            "amaterasu.updater/1",
+            "settings_get",
+            Some("configuration.read"),
+        ),
+        ("updater", "settings_update") => (
+            "amaterasu.updater/1",
+            "settings_update",
+            Some("configuration.write"),
+        ),
+        ("updater", "status") => ("amaterasu.updater/1", "status", Some("configuration.read")),
+        ("updater", "check") => ("amaterasu.updater/1", "check", Some("configuration.write")),
+        ("system-tray", "settings") => (
+            "amaterasu.system-tray/1",
+            "settings_get",
+            Some("configuration.read"),
+        ),
+        ("system-tray", "settings_update") => (
+            "amaterasu.system-tray/1",
+            "settings_update",
+            Some("configuration.write"),
+        ),
         ("diagnostics", "query") => ("amaterasu.diagnostics/1", "query", Some("diagnostics.read")),
         ("diagnostics", "status") => (
             "amaterasu.diagnostics/1",
@@ -449,6 +471,54 @@ mod tests {
         }
         assert!(resolve("/v1/host-metrics/stream_activity_begin").is_none());
         assert!(resolve("/v1/host-metrics/stream_activity_end").is_none());
+    }
+
+    #[test]
+    fn updater_and_tray_routes_expose_only_management_settings_and_actions() {
+        for (path, service, action, scope) in [
+            (
+                "/v1/updater/settings",
+                "amaterasu.updater/1",
+                "settings_get",
+                "configuration.read",
+            ),
+            (
+                "/v1/updater/settings_update",
+                "amaterasu.updater/1",
+                "settings_update",
+                "configuration.write",
+            ),
+            (
+                "/v1/updater/status",
+                "amaterasu.updater/1",
+                "status",
+                "configuration.read",
+            ),
+            (
+                "/v1/updater/check",
+                "amaterasu.updater/1",
+                "check",
+                "configuration.write",
+            ),
+            (
+                "/v1/system-tray/settings",
+                "amaterasu.system-tray/1",
+                "settings_get",
+                "configuration.read",
+            ),
+            (
+                "/v1/system-tray/settings_update",
+                "amaterasu.system-tray/1",
+                "settings_update",
+                "configuration.write",
+            ),
+        ] {
+            let route = resolve(path).unwrap();
+            assert_eq!(route.service, service);
+            assert_eq!(route.action, action);
+            assert_eq!(route.scope, Some(scope));
+        }
+        assert!(resolve("/v1/system-tray/events").is_none());
     }
 
     #[test]

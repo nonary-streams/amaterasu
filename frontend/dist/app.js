@@ -4849,6 +4849,7 @@ var Amaterasu;
         const historyArea = Amaterasu.el("div");
         const metricsArea = Amaterasu.el("div");
         const updaterArea = Amaterasu.el("div");
+        const systemTrayArea = Amaterasu.el("div");
         const historyLoads = new HistorySettingsLoadGate();
         const pairingArea = Amaterasu.el("div");
         const pairingLoads = new PairingClientsLoadGate();
@@ -4865,8 +4866,9 @@ var Amaterasu;
             void loadHistorySettings();
             Amaterasu.renderHostMetricsSettings(context, metricsArea);
             Amaterasu.renderUpdaterSettings(context, updaterArea);
+            Amaterasu.renderSystemTraySettings(context, systemTrayArea);
             void loadPairing();
-        })), area, authArea, hostLoggingArea, hostArea, steamArea, lutrisArea, playniteArea, inputArea, historyArea, metricsArea, updaterArea, pairingArea, pipewireArea);
+        })), area, authArea, hostLoggingArea, hostArea, steamArea, lutrisArea, playniteArea, inputArea, historyArea, metricsArea, updaterArea, systemTrayArea, pairingArea, pipewireArea);
         Amaterasu.renderManagementPolicy(context);
         Amaterasu.renderCsrfPolicy(context);
         let pipewireGeneration = 0;
@@ -6167,6 +6169,7 @@ var Amaterasu;
         void loadHistorySettings();
         Amaterasu.renderHostMetricsSettings(context, metricsArea);
         Amaterasu.renderUpdaterSettings(context, updaterArea);
+        Amaterasu.renderSystemTraySettings(context, systemTrayArea);
         void loadPairing();
     }
     Amaterasu.renderSettings = renderSettings;
@@ -7116,6 +7119,101 @@ var Amaterasu;
         void load();
     }
     Amaterasu.renderUpdaterSettings = renderUpdaterSettings;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    const systemTrayRenderGenerations = new WeakMap();
+    function defaultSystemTraySettings() {
+        return { system_tray: true };
+    }
+    Amaterasu.defaultSystemTraySettings = defaultSystemTraySettings;
+    function parseSystemTraySettings(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("System tray settings are invalid.");
+        const settings = value;
+        if (Object.keys(settings).length !== 1 || typeof settings.system_tray !== "boolean")
+            throw new Error("System tray settings must contain only a boolean system_tray value.");
+        return { system_tray: settings.system_tray };
+    }
+    Amaterasu.parseSystemTraySettings = parseSystemTraySettings;
+    function parseSystemTraySettingsReply(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("System tray settings reply is invalid.");
+        const reply = value;
+        if (reply.ok !== true || typeof reply.revision !== "number" ||
+            !Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
+            (reply.availability !== undefined &&
+                !["not_ready", "disabled", "available", "unavailable"].includes(String(reply.availability))))
+            throw new Error("System tray settings reply is invalid.");
+        return {
+            ok: true,
+            revision: reply.revision,
+            settings: parseSystemTraySettings(reply.settings),
+            ...(reply.availability === undefined ? {} : {
+                availability: reply.availability,
+            }),
+        };
+    }
+    Amaterasu.parseSystemTraySettingsReply = parseSystemTraySettingsReply;
+    async function readSystemTraySettings(api) {
+        return parseSystemTraySettingsReply(await api.post("system-tray/settings"));
+    }
+    async function saveSystemTraySettings(api, current, settings) {
+        const desired = parseSystemTraySettings(settings);
+        const updated = parseSystemTraySettingsReply(await api.post("system-tray/settings_update", {
+            settings: desired,
+            expected_revision: current.revision,
+        }));
+        if (updated.revision !== current.revision + 1 ||
+            updated.settings.system_tray !== desired.system_tray)
+            throw new Error("System tray settings update could not be confirmed. Refresh and check the saved value.");
+        const saved = await readSystemTraySettings(api);
+        if (saved.revision !== updated.revision || saved.settings.system_tray !== desired.system_tray)
+            throw new Error("System tray settings could not be confirmed after saving. Refresh and check the saved value.");
+        return saved;
+    }
+    Amaterasu.saveSystemTraySettings = saveSystemTraySettings;
+    function renderSystemTraySettings(context, container) {
+        const generation = (systemTrayRenderGenerations.get(container) ?? 0) + 1;
+        systemTrayRenderGenerations.set(container, generation);
+        const isCurrent = () => container.isConnected && systemTrayRenderGenerations.get(container) === generation;
+        const load = async () => {
+            container.replaceChildren(Amaterasu.el("p", "muted", "Loading system tray preferences…"));
+            try {
+                let current = await readSystemTraySettings(context.api);
+                if (!isCurrent())
+                    return;
+                const checkbox = Amaterasu.input("system_tray", "", "checkbox");
+                checkbox.checked = current.settings.system_tray;
+                const status = Amaterasu.el("p", "muted", `Saved settings revision ${current.revision}.`);
+                status.setAttribute("role", "status");
+                status.setAttribute("aria-live", "polite");
+                const save = Amaterasu.el("button", "button primary", "Save system tray preference");
+                save.type = "submit";
+                save.disabled = !context.api.allows("configuration.write");
+                const form = Amaterasu.el("form", "settings-form");
+                form.append(Amaterasu.field("Show the system tray icon and desktop notifications", checkbox, "Enabled by default. Desktop integration may be unavailable in a headless session."), Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${current.revision}`)), status);
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    void Amaterasu.runAction(save, status, async () => {
+                        current = await saveSystemTraySettings(context.api, current, {
+                            system_tray: checkbox.checked,
+                        });
+                        status.replaceChildren(`Saved settings revision ${current.revision}.`);
+                        context.notify("System tray preference saved and read back.");
+                        await load();
+                    });
+                });
+                container.replaceChildren(Amaterasu.panel("System tray", form));
+            }
+            catch (error) {
+                if (isCurrent())
+                    container.replaceChildren(Amaterasu.errorPanel(error, load));
+            }
+        };
+        void load();
+    }
+    Amaterasu.renderSystemTraySettings = renderSystemTraySettings;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {

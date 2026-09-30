@@ -99,6 +99,36 @@ const HOST_METRICS: ComponentDefinition = ComponentDefinition {
     dependencies: &[RUNTIME_ID, "amaterasu.configuration"],
 };
 
+const UPDATER: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.updater",
+    library: "amaterasu_updater",
+    provides: &["amaterasu.updater/1"],
+    calls: &[
+        "amaterasu.configuration/1",
+        "amaterasu.state/1",
+        "amaterasu.system-tray/1",
+    ],
+    publishes: &[],
+    native_provides: &[],
+    native_uses: &[],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.configuration",
+        "amaterasu.system-tray",
+    ],
+};
+
+const SYSTEM_TRAY: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.system-tray",
+    library: "amaterasu_system_tray",
+    provides: &["amaterasu.system-tray/1"],
+    calls: &["amaterasu.configuration/1", "amaterasu.state/1"],
+    publishes: &[],
+    native_provides: &[],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID, "amaterasu.configuration"],
+};
+
 const CONFIGURATION: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.configuration",
     library: "amaterasu_configuration",
@@ -699,6 +729,8 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.control-transport/1",
         "amaterasu.session-history/1",
         "amaterasu.host-metrics/1",
+        "amaterasu.updater/1",
+        "amaterasu.system-tray/1",
     ],
     publishes: &[],
     native_provides: &[],
@@ -729,6 +761,8 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.nvhttp",
         "amaterasu.session-history",
         "amaterasu.host-metrics",
+        "amaterasu.updater",
+        "amaterasu.system-tray",
     ],
 };
 
@@ -761,6 +795,8 @@ const MANAGEMENT_PROBE: ComponentDefinition = ComponentDefinition {
         "amaterasu.control-transport",
         "amaterasu.session-history",
         "amaterasu.host-metrics",
+        "amaterasu.updater",
+        "amaterasu.system-tray",
     ],
     ..MANAGEMENT
 };
@@ -794,6 +830,8 @@ const MANAGEMENT_SOFTWARE_PROBE: ComponentDefinition = ComponentDefinition {
         "amaterasu.control-transport",
         "amaterasu.session-history",
         "amaterasu.host-metrics",
+        "amaterasu.updater",
+        "amaterasu.system-tray",
     ],
     ..MANAGEMENT
 };
@@ -924,6 +962,8 @@ const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.nvhttp/1",
         "amaterasu.rtsp/1",
         "amaterasu.host-metrics/1",
+        "amaterasu.updater/1",
+        "amaterasu.system-tray/1",
         "amaterasu.video",
         "amaterasu.nvhttp",
         "amaterasu.rtsp",
@@ -959,6 +999,8 @@ const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.control-transport",
         "amaterasu.session-history",
         "amaterasu.host-metrics",
+        "amaterasu.updater",
+        "amaterasu.system-tray",
     ],
     ..MANAGEMENT_SOFTWARE_PROBE
 };
@@ -1000,6 +1042,8 @@ impl PackageProfile {
                 SESSION,
                 SESSION_HISTORY,
                 HOST_METRICS,
+                UPDATER,
+                SYSTEM_TRAY,
                 STREAM_SOURCE,
                 INPUT_PROBE,
                 AUDIO_ENCODE,
@@ -1029,6 +1073,8 @@ impl PackageProfile {
                 SESSION,
                 SESSION_HISTORY,
                 HOST_METRICS,
+                UPDATER,
+                SYSTEM_TRAY,
                 CAPTURE_SOURCE,
                 SOFTWARE_AUDIO_SOURCE,
                 INPUT_PROBE,
@@ -1061,6 +1107,8 @@ impl PackageProfile {
                 SESSION,
                 SESSION_HISTORY,
                 HOST_METRICS,
+                UPDATER,
+                SYSTEM_TRAY,
                 CAPTURE_PIPEWIRE,
                 SOFTWARE_AUDIO_SOURCE,
                 INPUT_PROBE,
@@ -1079,6 +1127,8 @@ impl PackageProfile {
                 SESSION,
                 SESSION_HISTORY,
                 HOST_METRICS,
+                UPDATER,
+                SYSTEM_TRAY,
                 CONFIGURATION,
                 CATALOG,
                 APPLICATION,
