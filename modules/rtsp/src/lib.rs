@@ -1,4 +1,6 @@
 //! Managed encrypted RTSP endpoint. Network data never supplies broker authority.
+#![recursion_limit = "256"]
+
 mod controller;
 mod model;
 mod rpc;

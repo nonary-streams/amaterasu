@@ -501,7 +501,7 @@ pub struct Open {
     pub sw_tune: Option<String>,
     #[serde(default = "default_min_threads")]
     pub min_threads: i32,
-    #[serde(default)]
+    #[serde(default = "default_qp")]
     pub qp: i32,
     #[serde(default)]
     pub nvenc_settings: amaterasu_module_sdk::NvencSettings,
