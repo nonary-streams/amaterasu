@@ -3779,7 +3779,7 @@ var Amaterasu;
     const forwardablePairingOverrideFields = [
         "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "encoder",
         "audio_sink_capture_only", "back_button_timeout", "controller", "gamepad",
-        "keyboard", "mouse", "native_pen_touch",
+        "keyboard", "mouse", "native_pen_touch", "ds4_back_as_touchpad_click",
         "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
         "frame_limiter_fps_limit", "frame_limiter_enable", "frame_limiter_provider",
         "frame_limiter_disable_vsync", "frame_limiter_auto_virtual_framegen",
@@ -3810,7 +3810,7 @@ var Amaterasu;
         if (value === null || value === undefined)
             return false;
         if (["stream_audio", "audio_sink_capture_only", "controller", "keyboard", "mouse",
-            "native_pen_touch", "frame_limiter_enable", "frame_limiter_disable_vsync",
+            "native_pen_touch", "ds4_back_as_touchpad_click", "frame_limiter_enable", "frame_limiter_disable_vsync",
             "nvenc_spatial_aq", "high_resolution_scrolling", "always_send_scancodes",
             "key_rightalt_to_key_win"].includes(field))
             return typeof value === "boolean";
@@ -5119,6 +5119,8 @@ var Amaterasu;
                     mouse.setAttribute("aria-label", `Mouse input override for ${client.name}`);
                     const nativePenTouch = sparseInputOverrideSelect("native_pen_touch", client.config_overrides?.native_pen_touch);
                     nativePenTouch.setAttribute("aria-label", `Native pen/touch preference override for ${client.name}`);
+                    const ds4BackAsTouchpadClick = sparseInputOverrideSelect("ds4_back_as_touchpad_click", client.config_overrides?.ds4_back_as_touchpad_click);
+                    ds4BackAsTouchpadClick.setAttribute("aria-label", `DS4 Back as touchpad click override for ${client.name}`);
                     const advancedInput = Amaterasu.advancedInputOverrideControls(client.config_overrides);
                     const softwareEncoder = Amaterasu.softwareEncoderOverrideControls(client.config_overrides);
                     const streamAudio = Amaterasu.el("select");
@@ -5210,6 +5212,7 @@ var Amaterasu;
                                 keyboard: Amaterasu.parseInputBooleanOverride(keyboard.value, "Keyboard input"),
                                 mouse: Amaterasu.parseInputBooleanOverride(mouse.value, "Mouse input"),
                                 native_pen_touch: Amaterasu.parseInputBooleanOverride(nativePenTouch.value, "Native pen/touch preference"),
+                                ds4_back_as_touchpad_click: Amaterasu.parseInputBooleanOverride(ds4BackAsTouchpadClick.value, "DS4 Back as touchpad click preference"),
                             };
                             saveStarted = true;
                             await savePairingClientOverrides(context.api, settings, client.certificate_id, values);
@@ -5231,9 +5234,9 @@ var Amaterasu;
                     if (unsupported.length > 0)
                         status.textContent = `Save unavailable: this client has stored overrides this editor cannot preserve (${unsupported.join(", ")}).`;
                     const identity = Amaterasu.el("div", "", Amaterasu.el("strong", "", client.name), Amaterasu.el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`));
-                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, Amaterasu.el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields), Amaterasu.el("div", "", save, status)];
+                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, Amaterasu.el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields), Amaterasu.el("div", "", save, status)];
                 });
-                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "Input and software encoding preferences", ""], rows);
+                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "DS4 Back as touchpad click", "Input and software encoding preferences", ""], rows);
                 pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save confirms the stored pairing revision. Input preferences apply when the next stream acquires its input lease."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
             }
             catch (error) {

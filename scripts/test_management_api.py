@@ -26,6 +26,7 @@ PASSWORD = "test-password-for-local-api-only"
 PAIRING_FIXTURES = Path(__file__).resolve().parents[1] / "modules" / "pairing" / "tests" / "fixtures"
 
 CLIENT_INPUT_OVERRIDES = {
+    "ds4_back_as_touchpad_click": False,
     "keybindings": [65, 66, 65, 67, 165, 0],
     "high_resolution_scrolling": False,
     "always_send_scancodes": False,
@@ -34,6 +35,7 @@ CLIENT_INPUT_OVERRIDES = {
     "key_repeat_frequency": 0.0,
 }
 APPLICATION_INPUT_OVERRIDES = {
+    "ds4_back_as_touchpad_click": True,
     "keybindings": [66, 67, 16, 160],
     "high_resolution_scrolling": True,
     "always_send_scancodes": True,
@@ -47,6 +49,7 @@ INVALID_KEYBINDINGS = (
 )
 INVALID_INPUT_OVERRIDES = (
     {"controller": "false"}, {"keyboard": "false"}, {"mouse": 1},
+    {"ds4_back_as_touchpad_click": "false"},
     {"gamepad": "unknown-profile"}, {"high_resolution_scrolling": "false"},
     {"always_send_scancodes": 1}, {"key_rightalt_to_key_win": "true"},
     {"key_repeat_delay": -1}, {"key_repeat_delay": 0.5},
@@ -1272,11 +1275,20 @@ def test_auth_and_crud(console, api):
         {
             "certificate_id": first_client["certificate_id"],
             "expected_revision": paired_after_conflict["revision"],
-            "config_overrides": {"fec_percentage": 53},
+            "config_overrides": {"ds4_back_as_touchpad_click": True},
         },
         token["bearer"],
     )
     assert status == 403 and not result["ok"], result
+    status, pairing_after_denied_update, _ = api.post(
+        "/v1/pairing/list_clients", token=administrator,
+    )
+    assert status == 200 and pairing_after_denied_update["ok"], pairing_after_denied_update
+    first_after_denied_update = next(
+        client for client in pairing_after_denied_update["clients"]
+        if client["certificate_id"] == first_client["certificate_id"]
+    )
+    assert first_after_denied_update["config_overrides"]["ds4_back_as_touchpad_click"] is False, first_after_denied_update
     status, result, _ = api.post("/v1/catalog/create", {"entry": entry, "expected_revision": catalog_revision}, token["bearer"])
     assert status == 403 and not result["ok"], result
     status, result, _ = api.post(
@@ -1564,7 +1576,8 @@ def main():
             assert status == 200 and resumed_session["ok"], resumed_session
             revoked = console.request("amaterasu.authentication/1", {"action": "revoke_token", "token_id": token["token_id"]})
             assert revoked["ok"], revoked
-            assert api.post("/v1/catalog/list", token=token["bearer"])[0] == 403
+            status, revoked_read, _ = api.post("/v1/catalog/list", token=token["bearer"])
+            assert status == 401 and not revoked_read["ok"], revoked_read
             status, reset_host, _ = api.post("/v1/nvhttp/settings_update", {
                 "hostname": "Living Room & Games", "port": moved_port,
                 "address_family": None, "bind_address": None,

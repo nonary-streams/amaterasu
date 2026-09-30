@@ -138,6 +138,7 @@ pub struct PeerIdentity {
     client_keyboard: Option<bool>,
     client_mouse: Option<bool>,
     client_native_pen_touch: Option<bool>,
+    client_ds4_back_as_touchpad_click: Option<bool>,
     client_high_resolution_scrolling: Option<bool>,
     client_always_send_scancodes: Option<bool>,
     client_key_rightalt_to_key_win: Option<bool>,
@@ -177,6 +178,7 @@ impl PeerIdentity {
             client_keyboard: None,
             client_mouse: None,
             client_native_pen_touch: None,
+            client_ds4_back_as_touchpad_click: None,
             client_high_resolution_scrolling: None,
             client_always_send_scancodes: None,
             client_key_rightalt_to_key_win: None,
@@ -224,6 +226,7 @@ impl PeerIdentity {
             keyboard,
             mouse,
             native_pen_touch,
+            ds4_back_as_touchpad_click,
             high_resolution_scrolling,
             always_send_scancodes,
             key_rightalt_to_key_win,
@@ -288,6 +291,7 @@ impl PeerIdentity {
         self.client_keyboard = keyboard;
         self.client_mouse = mouse;
         self.client_native_pen_touch = native_pen_touch;
+        self.client_ds4_back_as_touchpad_click = ds4_back_as_touchpad_click;
         self.client_high_resolution_scrolling = high_resolution_scrolling;
         self.client_always_send_scancodes = always_send_scancodes;
         self.client_key_rightalt_to_key_win = key_rightalt_to_key_win;

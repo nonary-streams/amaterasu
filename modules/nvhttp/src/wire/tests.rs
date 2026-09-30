@@ -91,7 +91,8 @@ impl Broker {
                                 "controller": false,
                                 "gamepad": "auto",
                                 "keyboard": false,
-                                "mouse": true
+                                "mouse": true,
+                                "ds4_back_as_touchpad_click": false
                             }
                         })
                     }
@@ -128,7 +129,8 @@ impl Broker {
                             "controller":true,
                             "gamepad":"auto",
                             "keyboard":true,
-                            "mouse":false
+                            "mouse":false,
+                            "ds4_back_as_touchpad_click":true
                         }
                     }),
                     ("amaterasu.launch/1", "launch_export") => json!({
@@ -152,7 +154,8 @@ impl Broker {
                                 "controller": true,
                                 "gamepad": "auto",
                                 "keyboard": true,
-                                "mouse": false
+                                "mouse": false,
+                                "ds4_back_as_touchpad_click":true
                             }
                         }
                     }),
@@ -471,6 +474,7 @@ fn launch_identity_and_client_override_come_from_the_authenticated_certificate()
     assert_eq!(rtsp_open["gamepad"], "auto");
     assert_eq!(rtsp_open["keyboard"], false);
     assert_eq!(rtsp_open["mouse"], true);
+    assert_eq!(rtsp_open["ds4_back_as_touchpad_click"], false);
 }
 
 #[test]

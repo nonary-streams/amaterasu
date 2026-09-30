@@ -1371,7 +1371,10 @@ fn project_application_policy(
     if let Some(backend) = record.effective_software_encoder.encoder {
         record.selected_encoder = amaterasu_module_sdk::EncoderSelection::Backend(backend);
     }
-    record.scoped_ds4_back_as_touchpad_click = application_overrides.ds4_back_as_touchpad_click;
+    record.scoped_ds4_back_as_touchpad_click = record
+        .peer
+        .client_ds4_back_as_touchpad_click
+        .or(application_overrides.ds4_back_as_touchpad_click);
     let application_fec_percentage = application_overrides.fec_percentage;
     record.application_fec_percentage = application_fec_percentage;
     record.effective_fec_percentage = record

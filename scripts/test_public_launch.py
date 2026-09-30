@@ -133,19 +133,21 @@ def create_application(console, marker, revision, lifetime, config_overrides=Non
     return str(revision + 1)
 
 
-def update_client_input_overrides(console, certificate_id, overrides):
-    clients = console.request("amaterasu.pairing/1", {"action": "list_clients"})
-    updated = console.request(
-        "amaterasu.pairing/1",
+def update_client_input_overrides(api, administrator, certificate_id, overrides):
+    status, clients, _ = api.post("/v1/pairing/list_clients", token=administrator)
+    assert status == 200 and clients["ok"], clients
+    status, updated, _ = api.post(
+        "/v1/pairing/update_client_config_overrides",
         {
-            "action": "update_client_config_overrides",
             "certificate_id": certificate_id,
             "expected_revision": clients["revision"],
             "config_overrides": overrides,
         },
+        administrator,
     )
-    assert updated["ok"], updated
-    clients = console.request("amaterasu.pairing/1", {"action": "list_clients"})
+    assert status == 200 and updated["ok"], updated
+    status, clients, _ = api.post("/v1/pairing/list_clients", token=administrator)
+    assert status == 200 and clients["ok"], clients
     client = next(
         row for row in clients["clients"] if row["certificate_id"] == certificate_id
     )
@@ -502,7 +504,7 @@ def main():
             short_marker = directory / "short-application.pid"
             create_application(console, marker, 0, 60, APPLICATION_INPUT_OVERRIDES)
             short_app = create_application(console, short_marker, 1, 3)
-            update_client_input_overrides(console, certificate_id, CLIENT_INPUT_OVERRIDES)
+            update_client_input_overrides(api, administrator, certificate_id, CLIENT_INPUT_OVERRIDES)
             # Restart the signed host before observing the launch-time policy.
             console.eof()
             console.close()
@@ -517,6 +519,15 @@ def main():
             status, persisted_host, _ = api.post("/v1/nvhttp/settings", token=administrator)
             assert status == 200 and persisted_host["lan_encryption_mode"] == 2, persisted_host
             assert_persisted_input_overrides(console, certificate_id)
+            status, signed_paired_clients, _ = api.post(
+                "/v1/pairing/list_clients", token=administrator,
+            )
+            assert status == 200 and signed_paired_clients["ok"], signed_paired_clients
+            signed_client = next(
+                row for row in signed_paired_clients["clients"]
+                if row["certificate_id"] == certificate_id
+            )
+            assert signed_client["config_overrides"]["ds4_back_as_touchpad_click"] is False, signed_client
             exercise_rejected_launches(console, http, https, context, marker)
             exercise_natural_exit(console, https, context, short_marker, short_app, 17)
             # key_id is an IV salt, not session identity. Fresh AES keys may
@@ -532,10 +543,10 @@ def main():
                     expected_input = CLIENT_INPUT_OVERRIDES
                 elif policy_stage == "client_empty":
                     expected_input = {**CLIENT_INPUT_OVERRIDES, "keybindings": []}
-                    update_client_input_overrides(console, certificate_id, expected_input)
+                    update_client_input_overrides(api, administrator, certificate_id, expected_input)
                 elif policy_stage == "application":
                     update_client_input_overrides(
-                        console, certificate_id,
+                        api, administrator, certificate_id,
                         {key: None for key in CLIENT_INPUT_OVERRIDES},
                     )
                     expected_input = APPLICATION_INPUT_OVERRIDES
@@ -568,7 +579,7 @@ def main():
         "encrypted RTSP and discovered UDP media, TEARDOWN and "
         "certificate-revocation cleanup of capture and controlled child. "
         "Scoped input lease requests preserve certificate-bound client/application "
-        "precedence, false/zero, ordered keybindings and explicit empty maps, "
+        "precedence, DS4 Back mapping, false/zero, ordered keybindings and explicit empty maps, "
         "null inheritance, and restart persistence. "
         "Hardware and full client parity remain unqualified."
     )

@@ -219,6 +219,24 @@ fn peer_with_native_pen_touch(marker: u8, native_pen_touch: Option<bool>) -> Pee
         .unwrap()
 }
 
+fn peer_with_ds4_back_as_touchpad_click(
+    marker: u8,
+    ds4_back_as_touchpad_click: Option<bool>,
+) -> PeerIdentity {
+    let certificate = vec![marker; 32];
+    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            format!("client-{marker}"),
+            fingerprint(&certificate),
+            ClientConfigOverrides {
+                ds4_back_as_touchpad_click,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
 fn request(key: u8) -> LaunchRequest {
     LaunchRequest {
         app_id: 1,
@@ -1998,11 +2016,13 @@ fn native_pen_touch_resolves_client_before_application_and_preserves_inheritance
 }
 
 #[test]
-fn application_ds4_touchpad_override_reaches_rtsp_open_including_false() {
-    for (marker, application_value, expected) in [
-        (61, Some(true), json!(true)),
-        (62, Some(false), json!(false)),
-        (63, None, Value::Null),
+fn paired_client_ds4_touchpad_override_precedes_application_and_preserves_false() {
+    for (marker, client_value, application_value, expected) in [
+        (61, Some(false), Some(true), json!(false)),
+        (62, Some(true), Some(false), json!(true)),
+        (63, None, Some(false), json!(false)),
+        (64, None, None, Value::Null),
+        (65, None, Some(true), json!(true)),
     ] {
         let now = Instant::now();
         let application_overrides = application_value
@@ -2018,7 +2038,7 @@ fn application_ds4_touchpad_override_reaches_rtsp_open_including_false() {
                 .launch(
                     10,
                     request(marker),
-                    peer_with_native_pen_touch(marker, None),
+                    peer_with_ds4_back_as_touchpad_click(marker, client_value),
                     now,
                 )
                 .is_none()

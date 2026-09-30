@@ -608,6 +608,7 @@ pub(super) struct ClientConfigOverrides {
     pub(super) keyboard: Option<bool>,
     pub(super) mouse: Option<bool>,
     pub(super) native_pen_touch: Option<bool>,
+    pub(super) ds4_back_as_touchpad_click: Option<bool>,
     pub(super) high_resolution_scrolling: Option<bool>,
     pub(super) always_send_scancodes: Option<bool>,
     pub(super) key_rightalt_to_key_win: Option<bool>,
