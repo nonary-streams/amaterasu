@@ -61,6 +61,8 @@ struct Harness {
     catalog_preparation: Option<Value>,
     catalog_raw_preparation: Option<Value>,
     catalog_output: Option<Value>,
+    catalog_display_output: Option<Value>,
+    catalog_virtual_screen: Option<Value>,
     catalog_exclude_global_prep_cmd: Option<bool>,
     catalog_config_overrides: Option<Value>,
     catalog_working_directory: Option<String>,
@@ -127,6 +129,8 @@ impl Harness {
             catalog_preparation: None,
             catalog_raw_preparation: None,
             catalog_output: None,
+            catalog_display_output: None,
+            catalog_virtual_screen: None,
             catalog_exclude_global_prep_cmd: None,
             catalog_config_overrides: None,
             catalog_working_directory: None,
@@ -639,6 +643,12 @@ impl Harness {
                         }
                         if let Some(output) = &self.catalog_output {
                             reply["entry"]["output"] = output.clone();
+                        }
+                        if let Some(display_output) = &self.catalog_display_output {
+                            reply["entry"]["display-output"] = display_output.clone();
+                        }
+                        if let Some(virtual_screen) = &self.catalog_virtual_screen {
+                            reply["entry"]["virtual-screen"] = virtual_screen.clone();
                         }
                         if let Some(exclude) = self.catalog_exclude_global_prep_cmd {
                             reply["entry"]["exclude_global_prep_cmd"] = json!(exclude);
@@ -1391,6 +1401,105 @@ fn display_export_is_bound_to_frozen_catalog_policy_and_retained_on_retry() {
     );
     assert_eq!(status["launch"]["application_display_overrides"], display);
     assert_eq!(status["launch"]["config_overrides"], display);
+}
+
+#[test]
+fn per_application_display_settings_are_frozen_and_admission_bound() {
+    let mut harness = Harness::new();
+    harness.catalog_display_output = Some(json!("DISPLAY-1"));
+    harness.catalog_virtual_screen = Some(json!(false));
+    let mut pipeline = pipeline();
+    let preflight = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        json!({
+            "action":"preflight_export",
+            "operation_id":"app-display-settings",
+            "app_id":"app-0000000000000001"
+        }),
+    );
+    let settings = json!({"display_output":"DISPLAY-1","virtual_screen":false});
+    assert_eq!(preflight["application_display_settings"], settings);
+
+    let mut launch = launch_export("app-display-settings");
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["frame_limiter_settings"] = frame_limiter_snapshot();
+    launch["application_display_settings"] = settings.clone();
+    let mut mismatch = launch.clone();
+    mismatch["application_display_settings"]["virtual_screen"] = json!(true);
+    mismatch["display_admission_token"] = json!("00".repeat(32));
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", mismatch)["code"],
+        "application_display_settings_mismatch"
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", {
+            let mut without_preflight = launch_export("app-display-no-preflight");
+            without_preflight["application_display_settings"] = settings.clone();
+            without_preflight
+        })["code"],
+        "preflight_required"
+    );
+
+    let certificate_id = "cd".repeat(32);
+    let request_sha256 = "ab".repeat(32);
+    let mut prepare = json!({
+        "action":"prepare_display_admission",
+        "application_operation_id":"app-display-settings",
+        "global_revision":7,
+        "global_overrides":{},
+        "catalog_revision":preflight["catalog_revision"],
+        "application_display_overrides":{},
+        "application_display_settings":settings,
+        "certificate_id":certificate_id,
+        "client_display_overrides":{},
+        "rtsp_operation_id":"app-display-rtsp",
+        "request_sha256":request_sha256,
+    });
+    let mut prepare_mismatch = prepare.clone();
+    prepare_mismatch["application_display_settings"]["virtual_screen"] = json!(true);
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", prepare_mismatch)["code"],
+        "display_admission_denied"
+    );
+    let admission = harness.request(&mut pipeline, "amaterasu.nvhttp", prepare.clone());
+    assert_eq!(admission["ok"], true, "{admission}");
+    assert_eq!(
+        admission["display_policy_snapshot"]["application_display_settings"],
+        prepare["application_display_settings"]
+    );
+    assert_eq!(
+        harness.request(
+            &mut pipeline,
+            "amaterasu.rtsp",
+            json!({
+                "action":"verify_display_admission",
+                "token":admission["display_admission_token"],
+                "application_operation_id":"app-display-settings",
+                "rtsp_operation_id":"app-display-rtsp",
+                "request_sha256":request_sha256,
+                "display_policy_snapshot":admission["display_policy_snapshot"],
+                "certificate_id":certificate_id,
+                "catalog_revision":preflight["catalog_revision"],
+            }),
+        )["verified"],
+        true
+    );
+    launch["display_admission_token"] = admission["display_admission_token"].clone();
+    let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone());
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    assert_eq!(started["launch"].get("application_display_settings"), None);
+    let mut retry_mismatch = launch;
+    retry_mismatch["application_display_settings"]["display_output"] = json!("DISPLAY-2");
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", retry_mismatch)["code"],
+        "application_display_settings_mismatch"
+    );
+    prepare["application_display_settings"]["virtual_screen"] = json!(true);
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", prepare)["code"],
+        "display_admission_denied"
+    );
 }
 
 #[test]

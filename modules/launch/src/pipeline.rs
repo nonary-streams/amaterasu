@@ -50,6 +50,7 @@ fn display_policy_snapshot(
         "catalog_revision":record.catalog_revision,
         "certificate_id":certificate_id,
         "application_overrides":record.application_display_overrides,
+        "application_display_settings":record.application_display_settings,
         "client_overrides":client_overrides,
         "effective_overrides":effective,
     });
@@ -673,11 +674,15 @@ impl Pipeline {
                 frame_limiter_settings,
                 client_frame_limiter_overrides,
                 application_display_overrides,
+                application_display_settings,
                 virtual_display_intent,
                 proton_dualsense_compatibility,
                 return_on_admission,
             } => {
-                if application_display_overrides.is_some() && preflight_token.is_none() {
+                if (application_display_overrides.is_some()
+                    || application_display_settings.is_some())
+                    && preflight_token.is_none()
+                {
                     return complete(send, request, error("preflight_required"));
                 }
                 if (virtual_display_intent.is_some()
@@ -687,7 +692,9 @@ impl Pipeline {
                 {
                     return complete(send, request, error("preflight_required"));
                 }
-                if virtual_display_intent.is_some() && display_admission_token.is_none() {
+                if (virtual_display_intent.is_some() || application_display_settings.is_some())
+                    && display_admission_token.is_none()
+                {
                     return complete(send, request, error("display_admission_denied"));
                 }
                 if application_display_overrides
@@ -764,6 +771,13 @@ impl Pipeline {
                                 error("application_display_policy_mismatch"),
                             );
                         }
+                        if record.application_display_settings != application_display_settings {
+                            return complete(
+                                send,
+                                request,
+                                error("application_display_settings_mismatch"),
+                            );
+                        }
                         if record.virtual_display_intent != virtual_display_intent {
                             return complete(send, request, error("display_admission_denied"));
                         }
@@ -821,6 +835,7 @@ impl Pipeline {
                 global_overrides,
                 catalog_revision,
                 application_display_overrides,
+                application_display_settings,
                 certificate_id,
                 client_display_overrides,
                 rtsp_operation_id,
@@ -841,6 +856,7 @@ impl Pipeline {
                     || record.preflight_token.is_none()
                     || record.catalog_revision != Some(catalog_revision)
                     || record.application_display_overrides != application_display_overrides
+                    || record.application_display_settings != application_display_settings
                     || virtual_display_intent.as_ref().is_some_and(|intent| {
                         virtual_display_intent_sha256(intent).as_deref()
                             != Some(request_sha256.as_str())
@@ -1247,6 +1263,11 @@ impl Pipeline {
                     Ok(output) => output,
                     Err(code) => return self.dependency_failed(job, code, send),
                 };
+                record.application_display_settings =
+                    match ApplicationDisplaySettings::from_catalog_entry(&payload["entry"]) {
+                        Ok(settings) => settings,
+                        Err(code) => return self.dependency_failed(job, code, send),
+                    };
                 match LaunchTarget::from_catalog_entry_with_preparations(
                     &payload["entry"],
                     &record.global_preparation,

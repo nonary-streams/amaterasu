@@ -37,6 +37,51 @@ namespace Amaterasu {
     target.setAttribute(attribute, rendered);
   }
 
+  interface CatalogApplicationDisplaySettings {
+    "display-output"?: string;
+    "virtual-screen"?: boolean;
+  }
+
+  type CatalogEntryWithDisplaySettings = Entry & CatalogApplicationDisplaySettings;
+
+  export function catalogApplicationDisplayFormValues(entry: Entry | undefined): {
+    display_output: string;
+    virtual_screen: "" | "true" | "false";
+  } {
+    const settings = entry as CatalogEntryWithDisplaySettings | undefined;
+    const displayOutput = settings?.["display-output"];
+    if (displayOutput !== undefined && displayOutput !== null &&
+        (typeof displayOutput !== "string" ||
+          new TextEncoder().encode(displayOutput).length > 1_024 ||
+          /[\u0000-\u001f\u007f-\u009f]/u.test(displayOutput)))
+      throw new Error("Existing display output must contain at most 1024 UTF-8 bytes without control characters.");
+    const virtualScreen = settings?.["virtual-screen"];
+    if (virtualScreen !== undefined && virtualScreen !== null && typeof virtualScreen !== "boolean")
+      throw new Error("Existing virtual screen setting must be a boolean.");
+    return {
+      display_output: displayOutput ?? "",
+      virtual_screen: virtualScreen === undefined || virtualScreen === null
+        ? ""
+        : virtualScreen ? "true" : "false",
+    };
+  }
+
+  export function parseCatalogApplicationDisplaySettings(
+    data: Pick<FormData, "get">,
+  ): CatalogApplicationDisplaySettings {
+    const displayOutput = String(data.get("display_output") ?? "").trim();
+    if (new TextEncoder().encode(displayOutput).length > 1_024 ||
+        /[\u0000-\u001f\u007f-\u009f]/u.test(displayOutput))
+      throw new Error("Display output must contain at most 1024 UTF-8 bytes without control characters.");
+    const virtualScreen = String(data.get("virtual_screen") ?? "");
+    if (virtualScreen !== "" && virtualScreen !== "true" && virtualScreen !== "false")
+      throw new Error("Virtual screen must inherit the host setting or be true or false.");
+    return {
+      ...(displayOutput ? { "display-output": displayOutput } : {}),
+      ...(virtualScreen === "" ? {} : { "virtual-screen": virtualScreen === "true" }),
+    };
+  }
+
   interface SteamArtworkChunk {
     ok: boolean;
     app_id: number;
@@ -1385,6 +1430,7 @@ namespace Amaterasu {
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
           const entry = entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
+          Object.assign(entry, parseCatalogApplicationDisplaySettings(new FormData(form)));
           entry.config_overrides = mergeCatalogConfigOverrides(
             row?.entry.config_overrides,
             new FormData(form).keys(),
@@ -1439,6 +1485,21 @@ namespace Amaterasu {
     description.maxLength = 1024;
     description.rows = 2;
     const tags = input("tags", entry?.tags?.join(", ") ?? "");
+    const appDisplayValues = catalogApplicationDisplayFormValues(entry);
+    const displayOutput = input("display_output", appDisplayValues.display_output);
+    displayOutput.maxLength = 1_024;
+    const virtualScreen = el("select");
+    virtualScreen.name = "virtual_screen";
+    for (const [value, label] of [
+      ["", "Inherit"],
+      ["true", "Request a virtual screen"],
+      ["false", "Do not request a virtual screen"],
+    ] as const) {
+      const option = el("option", "", label);
+      option.value = value;
+      virtualScreen.append(option);
+    }
+    virtualScreen.value = appDisplayValues.virtual_screen;
     const outputValues = applicationOutputFormValues(entry?.output);
     const outputMode = el("select");
     outputMode.name = "output_mode";
@@ -1630,6 +1691,16 @@ namespace Amaterasu {
       el("div", "form-grid", field("Name", name), field("Launch type", kind)),
       field("Description", description),
       field("Tags", tags, "Separate tags with commas."),
+      field(
+        "Display output override",
+        displayOutput,
+        "Leave empty to inherit the next display selection. This is separate from the command output file.",
+      ),
+      field(
+        "Virtual screen request",
+        virtualScreen,
+        "Inherit the host setting or explicitly request or avoid a virtual screen.",
+      ),
       field("Command output", outputMode, "Use default discards command output without saving an output value."),
       outputFile,
       rawPreparation,

@@ -1,6 +1,6 @@
 use crate::protocol::{
-    ApplicationConfigOverrides, LaunchTarget, LegacyPreparationCommand, Outcome, PreparationStep,
-    State,
+    ApplicationConfigOverrides, ApplicationDisplaySettings, LaunchTarget, LegacyPreparationCommand,
+    Outcome, PreparationStep, State,
 };
 use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
 use serde::Serialize;
@@ -63,6 +63,10 @@ pub struct Record {
     pub provider_ticket: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_overrides: Option<ApplicationConfigOverrides>,
+    /// Sparse per-application output/virtual-screen controls frozen from the
+    /// catalog row. They are returned during preflight but kept off status.
+    #[serde(skip)]
+    pub application_display_settings: Option<ApplicationDisplaySettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executable_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,7 +131,7 @@ impl Record {
         json!({"ok":true,"launch":self})
     }
     pub fn preflight_response(&self) -> Value {
-        json!({"ok":true,"preflight_token":self.preflight_token,"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"application_display_overrides":self.application_display_overrides,"executable_path":self.executable_path,"cleanup_budget_ms":self.cleanup_budget_ms})
+        json!({"ok":true,"preflight_token":self.preflight_token,"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"application_display_overrides":self.application_display_overrides,"application_display_settings":self.application_display_settings,"executable_path":self.executable_path,"cleanup_budget_ms":self.cleanup_budget_ms})
     }
 }
 pub struct Records {
@@ -237,6 +241,7 @@ impl Records {
                 legacy_global_preparation,
                 provider_ticket: None,
                 config_overrides: None,
+                application_display_settings: None,
                 executable_path: None,
                 frame_limiter_settings: None,
                 client_frame_limiter_overrides: None,

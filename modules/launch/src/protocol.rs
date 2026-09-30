@@ -53,6 +53,8 @@ pub enum Operation {
         #[serde(default)]
         application_display_overrides: Option<BTreeMap<String, Value>>,
         #[serde(default)]
+        application_display_settings: Option<ApplicationDisplaySettings>,
+        #[serde(default)]
         virtual_display_intent: Option<VirtualDisplayIntent>,
         #[serde(default)]
         proton_dualsense_compatibility: bool,
@@ -67,6 +69,8 @@ pub enum Operation {
         global_overrides: BTreeMap<String, Value>,
         catalog_revision: u64,
         application_display_overrides: BTreeMap<String, Value>,
+        #[serde(default)]
+        application_display_settings: Option<ApplicationDisplaySettings>,
         certificate_id: String,
         client_display_overrides: BTreeMap<String, Value>,
         rtsp_operation_id: String,
@@ -202,6 +206,20 @@ impl Operation {
         {
             return Err("invalid_request");
         }
+        let application_display_settings = match self {
+            Self::LaunchExport {
+                application_display_settings,
+                ..
+            }
+            | Self::PrepareDisplayAdmission {
+                application_display_settings,
+                ..
+            } => application_display_settings.as_ref(),
+            _ => None,
+        };
+        if application_display_settings.is_some_and(|settings| settings.validate().is_err()) {
+            return Err("invalid_request");
+        }
         let virtual_display_intent = match self {
             Self::LaunchExport {
                 virtual_display_intent,
@@ -228,6 +246,73 @@ fn valid_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Per-application display choices have their own inheritance semantics and
+/// remain separate from the sparse dd_* display policy map.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationDisplaySettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_screen: Option<bool>,
+}
+
+impl ApplicationDisplaySettings {
+    /// Reads the separate application fields from a serialized catalog Entry.
+    /// The catalog keeps its native kebab-case field names; launch IPC uses
+    /// this type's snake_case representation.
+    pub fn from_catalog_entry(entry: &Value) -> Result<Option<Self>, &'static str> {
+        if !entry.is_object() {
+            return Err("invalid_catalog_response");
+        }
+        let display_output = match catalog_entry_field(entry, "display-output", "display_output")? {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(_) => return Err("invalid_catalog_response"),
+        };
+        let virtual_screen = match catalog_entry_field(entry, "virtual-screen", "virtual_screen")? {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(value)) => Some(*value),
+            Some(_) => return Err("invalid_catalog_response"),
+        };
+        let settings = Self {
+            display_output,
+            virtual_screen,
+        };
+        settings
+            .validate()
+            .map_err(|_| "invalid_catalog_response")?;
+        Ok(
+            (settings.display_output.is_some() || settings.virtual_screen.is_some())
+                .then_some(settings),
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .display_output
+            .as_deref()
+            .is_some_and(|output| output.len() > 1_024 || output.chars().any(char::is_control))
+        {
+            return Err("invalid_application_display_settings");
+        }
+        Ok(())
+    }
+}
+
+fn catalog_entry_field<'a>(
+    entry: &'a Value,
+    kebab_case: &str,
+    snake_case: &str,
+) -> Result<Option<&'a Value>, &'static str> {
+    let fields = entry.as_object().ok_or("invalid_catalog_response")?;
+    match (fields.get(kebab_case), fields.get(snake_case)) {
+        (Some(_), Some(_)) => Err("invalid_catalog_response"),
+        (Some(value), None) | (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -2096,6 +2181,172 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn application_display_settings_are_sparse_typed_and_validated_on_launch_and_admission() {
+        let inherited = ApplicationDisplaySettings::default();
+        assert_eq!(serde_json::to_value(&inherited).unwrap(), json!({}));
+        assert_eq!(
+            ApplicationDisplaySettings::from_catalog_entry(&json!({"name":"Game"})),
+            Ok(None)
+        );
+        assert_eq!(
+            ApplicationDisplaySettings::from_catalog_entry(&json!({
+                "display-output":null,
+                "virtual-screen":null
+            })),
+            Ok(None)
+        );
+        assert_eq!(
+            ApplicationDisplaySettings::from_catalog_entry(&json!({
+                "display_output":"DISPLAY-1",
+                "virtual_screen":false
+            })),
+            Ok(Some(ApplicationDisplaySettings {
+                display_output: Some("DISPLAY-1".into()),
+                virtual_screen: Some(false),
+            }))
+        );
+        assert!(
+            ApplicationDisplaySettings::from_catalog_entry(&json!({
+                "display-output":"DISPLAY-1",
+                "display_output":"DISPLAY-2"
+            }))
+            .is_err()
+        );
+        assert!(
+            ApplicationDisplaySettings::from_catalog_entry(&json!({
+                "virtual-screen":"false"
+            }))
+            .is_err()
+        );
+
+        let explicit_false = ApplicationDisplaySettings {
+            display_output: Some("DISPLAY-1".into()),
+            virtual_screen: Some(false),
+        };
+        explicit_false.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&explicit_false).unwrap(),
+            json!({"display_output":"DISPLAY-1", "virtual_screen":false})
+        );
+
+        let omitted: Operation = serde_json::from_value(json!({
+            "action":"launch_export",
+            "operation_id":"display-omitted",
+            "app_id":"app-0000000000000001"
+        }))
+        .unwrap();
+        omitted.validate().unwrap();
+        let Operation::LaunchExport {
+            application_display_settings,
+            ..
+        } = omitted
+        else {
+            panic!("expected launch export operation");
+        };
+        assert!(application_display_settings.is_none());
+
+        let launch: Operation = serde_json::from_value(json!({
+            "action":"launch_export",
+            "operation_id":"display-explicit-false",
+            "app_id":"app-0000000000000001",
+            "application_display_settings": {
+                "display_output":"DISPLAY-1",
+                "virtual_screen":false
+            }
+        }))
+        .unwrap();
+        launch.validate().unwrap();
+        let Operation::LaunchExport {
+            application_display_settings: Some(settings),
+            ..
+        } = launch
+        else {
+            panic!("expected launch export settings");
+        };
+        assert_eq!(settings, explicit_false);
+
+        let nulls: Operation = serde_json::from_value(json!({
+            "action":"launch_export",
+            "operation_id":"display-null",
+            "app_id":"app-0000000000000001",
+            "application_display_settings": {
+                "display_output":null,
+                "virtual_screen":null
+            }
+        }))
+        .unwrap();
+        nulls.validate().unwrap();
+        let Operation::LaunchExport {
+            application_display_settings: Some(settings),
+            ..
+        } = nulls
+        else {
+            panic!("expected launch export settings");
+        };
+        assert_eq!(settings, inherited);
+        assert_eq!(serde_json::to_value(settings).unwrap(), json!({}));
+
+        for invalid_settings in [
+            json!({"display_output":true}),
+            json!({"virtual_screen":"false"}),
+            json!({"unknown":false}),
+        ] {
+            assert!(
+                serde_json::from_value::<Operation>(json!({
+                    "action":"launch_export",
+                    "operation_id":"display-bad-type",
+                    "app_id":"app-0000000000000001",
+                    "application_display_settings":invalid_settings
+                }))
+                .is_err()
+            );
+        }
+
+        for invalid_output in ["x".repeat(1_025), "DISPLAY\n1".into()] {
+            let invalid: Operation = serde_json::from_value(json!({
+                "action":"launch_export",
+                "operation_id":"display-bad-value",
+                "app_id":"app-0000000000000001",
+                "application_display_settings":{"display_output":invalid_output}
+            }))
+            .unwrap();
+            assert_eq!(invalid.validate(), Err("invalid_request"));
+        }
+
+        let admitted: Operation = serde_json::from_value(json!({
+            "action":"prepare_display_admission",
+            "application_operation_id":"display-admission",
+            "global_revision":null,
+            "global_overrides":{},
+            "catalog_revision":1,
+            "application_display_overrides":{},
+            "application_display_settings":{"virtual_screen":false},
+            "certificate_id":"a".repeat(64),
+            "client_display_overrides":{},
+            "rtsp_operation_id":"display-rtsp",
+            "request_sha256":"b".repeat(64)
+        }))
+        .unwrap();
+        admitted.validate().unwrap();
+
+        let rejected: Operation = serde_json::from_value(json!({
+            "action":"prepare_display_admission",
+            "application_operation_id":"display-admission",
+            "global_revision":null,
+            "global_overrides":{},
+            "catalog_revision":1,
+            "application_display_overrides":{},
+            "application_display_settings":{"display_output":"x".repeat(1_025)},
+            "certificate_id":"a".repeat(64),
+            "client_display_overrides":{},
+            "rtsp_operation_id":"display-rtsp",
+            "request_sha256":"b".repeat(64)
+        }))
+        .unwrap();
+        assert_eq!(rejected.validate(), Err("invalid_request"));
     }
 
     #[test]

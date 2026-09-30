@@ -55,6 +55,74 @@ fn output_defaults_preserve_exact_text_and_validate_utf8_bounds() {
     }
 }
 
+#[test]
+fn app_display_fields_are_sparse_typed_and_bounded_separately_from_command_output() {
+    let legacy = entry("Legacy output");
+    let serialized = serde_json::to_value(&legacy).unwrap();
+    assert!(serialized.get("display-output").is_none());
+    assert!(serialized.get("virtual-screen").is_none());
+
+    for (key, display_output, virtual_screen) in [
+        ("display-output", Some("Virtual-1"), Some(false)),
+        ("display_output", Some("$(DISPLAY_OUTPUT)"), Some(true)),
+    ] {
+        let mut value = serialized.clone();
+        value[key] = json!(display_output.unwrap());
+        value[if key == "display-output" {
+            "virtual-screen"
+        } else {
+            "virtual_screen"
+        }] = json!(virtual_screen.unwrap());
+        let configured: Entry = serde_json::from_value(value).unwrap();
+        configured.validate().unwrap();
+        assert_eq!(configured.display_output.as_deref(), display_output);
+        assert_eq!(configured.virtual_screen, virtual_screen);
+        let normalized = serde_json::to_value(configured).unwrap();
+        assert!(normalized.get("output").is_none());
+        assert_eq!(normalized["display-output"], display_output.unwrap());
+        assert_eq!(normalized["virtual-screen"], virtual_screen.unwrap());
+    }
+
+    let mut empty_string = serialized.clone();
+    empty_string["display-output"] = json!("");
+    let empty_string: Entry = serde_json::from_value(empty_string).unwrap();
+    empty_string.validate().unwrap();
+    assert_eq!(empty_string.display_output.as_deref(), Some(""));
+
+    for display_output in [
+        "x".repeat(1_025),
+        "é".repeat(513),
+        "output\0name".into(),
+        "output\nname".into(),
+    ] {
+        let mut invalid = legacy.clone();
+        invalid.display_output = Some(display_output);
+        assert!(invalid.validate().is_err());
+    }
+
+    for display_output in [json!(true), json!(42), json!([]), json!({})] {
+        let mut invalid = serialized.clone();
+        invalid["display-output"] = display_output;
+        assert!(serde_json::from_value::<Entry>(invalid).is_err());
+    }
+    for virtual_screen in [json!("true"), json!(0), json!([]), json!({})] {
+        let mut invalid = serialized.clone();
+        invalid["virtual-screen"] = virtual_screen;
+        assert!(serde_json::from_value::<Entry>(invalid).is_err());
+    }
+
+    let mut null_override = serialized;
+    null_override["display-output"] = Value::Null;
+    null_override["virtual-screen"] = Value::Null;
+    let null_override: Entry = serde_json::from_value(null_override).unwrap();
+    null_override.validate().unwrap();
+    assert!(null_override.display_output.is_none());
+    assert!(null_override.virtual_screen.is_none());
+    let normalized = serde_json::to_value(null_override).unwrap();
+    assert!(normalized.get("display-output").is_none());
+    assert!(normalized.get("virtual-screen").is_none());
+}
+
 fn entry(name: &str) -> Entry {
     serde_json::from_value(json!({
         "name": name,

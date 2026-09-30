@@ -135,6 +135,60 @@ test("catalog app and provider saves retain unrendered overrides while applying 
   assert.equal(Object.hasOwn(merge({ keybindings: [65] }, ["keybindings"], {}), "keybindings"), false);
 });
 
+test("application display settings preserve inheritance, explicit false, bounds, and command output separation", () => {
+  const model = context.Amaterasu;
+  const empty = model.catalogApplicationDisplayFormValues({});
+  assert.equal(empty.display_output, "");
+  assert.equal(empty.virtual_screen, "");
+  const falseValue = model.catalogApplicationDisplayFormValues({
+    "display-output": "Virtual-1",
+    "virtual-screen": false,
+    output: "command.log",
+  });
+  assert.equal(falseValue.display_output, "Virtual-1");
+  assert.equal(falseValue.virtual_screen, "false");
+
+  const inherited = JSON.parse(JSON.stringify(model.parseCatalogApplicationDisplaySettings(new FormData())));
+  assert.deepEqual(inherited, {});
+  const fields = new FormData();
+  fields.set("name", "Display settings application");
+  fields.set("kind", "executable");
+  fields.set("path", "/opt/display-game");
+  fields.set("output_mode", "value");
+  fields.set("output_value", "logs/game.log");
+  fields.set("display_output", "  DISPLAY-1  ");
+  fields.set("virtual_screen", "false");
+  const saved = model.entryFromForm(fields);
+  Object.assign(saved, model.parseCatalogApplicationDisplaySettings(fields));
+  assert.equal(saved.output, "logs/game.log");
+  assert.equal(saved["display-output"], "DISPLAY-1");
+  assert.equal(saved["virtual-screen"], false);
+  assert.deepEqual(JSON.parse(JSON.stringify({
+    "display-output": saved["display-output"],
+    "virtual-screen": saved["virtual-screen"],
+  })), { "display-output": "DISPLAY-1", "virtual-screen": false });
+  fields.set("virtual_screen", "true");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(model.parseCatalogApplicationDisplaySettings(fields))),
+    { "display-output": "DISPLAY-1", "virtual-screen": true },
+  );
+  fields.set("virtual_screen", "no");
+  assert.throws(() => model.parseCatalogApplicationDisplaySettings(fields), /Virtual screen/);
+
+  for (const displayOutput of ["x".repeat(1_025), "é".repeat(513), "display\nname"]) {
+    const invalid = new FormData();
+    invalid.set("display_output", displayOutput);
+    assert.throws(() => model.parseCatalogApplicationDisplaySettings(invalid), /Display output/);
+  }
+  for (const entry of [
+    { "display-output": true },
+    { "display-output": "x".repeat(1_025) },
+    { "virtual-screen": "false" },
+  ]) {
+    assert.throws(() => model.catalogApplicationDisplayFormValues(entry), /Existing/);
+  }
+});
+
 test("application refresh rate option editor reads back and writes sparse exact tokens", () => {
   const parse = context.Amaterasu.parseCatalogRefreshRateOptionOverride;
   const fields = new FormData();

@@ -25,6 +25,24 @@ pub struct Entry {
     pub steam_install_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// Optional app-specific display selection. This is separate from
+    /// `output`, which routes command logs.
+    #[serde(
+        default,
+        rename = "display-output",
+        skip_serializing_if = "Option::is_none",
+        alias = "display_output"
+    )]
+    pub display_output: Option<String>,
+    /// Optional app-specific request for a virtual display. Absence leaves
+    /// the effective host display policy untouched.
+    #[serde(
+        default,
+        rename = "virtual-screen",
+        skip_serializing_if = "Option::is_none",
+        alias = "virtual_screen"
+    )]
+    pub virtual_screen: Option<bool>,
     #[serde(default, skip_serializing_if = "ConfigOverrides::is_empty")]
     pub config_overrides: ConfigOverrides,
     #[serde(
@@ -1086,6 +1104,13 @@ impl Entry {
             .is_some_and(|output| !bounded_text(output, 1_024))
         {
             return Err("output exceeds 1024 bytes or contains control characters");
+        }
+        if self
+            .display_output
+            .as_deref()
+            .is_some_and(|output| !bounded_text(output, 1_024))
+        {
+            return Err("display_output exceeds 1024 bytes or contains control characters");
         }
         self.config_overrides.validate()?;
         validate_raw_preparation(&self.prep_cmd)?;
