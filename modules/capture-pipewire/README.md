@@ -104,6 +104,12 @@ They do not qualify actual capture. Actual user permission, nonblack desktop
 frames, desktop-to-encoder/public streaming, client playback, high-load behavior
 and distribution dependencies remain separate acceptance gates.
 
+The current NVHTTP/RTSP flow has no user-facing source-selection route. An
+allowlisted caller must select a source through this capture control service
+before video can open the resulting session-scoped output ID. A launch request
+does not open the portal picker automatically; a signed management UI route is
+still needed for product use.
+
 Primary references: [ScreenCast portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html)
 and [PipeWire capture interfaces](https://docs.pipewire.org/page_tutorial5.html).
 The implementation is original; no Vibeshine capture source was copied.
