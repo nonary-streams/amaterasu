@@ -5,8 +5,13 @@
 On 2026-09-30 the user requested resuming the remaining work with Luna agents
 at Medium through Max reasoning according to task complexity. This supersedes
 all older model and effort assignments below. Use the native agents API with
-six feature coordinators and up to twelve active workers in total; workers do
-not delegate. Coordinators choose Luna Medium, High, or Max for bounded tasks,
+six feature coordinators, each with up to three workers; workers do not
+delegate. The user's subsequent capacity clarification permits roughly 24
+threads in total, subject to the native API's available slots. Six is the
+coordinator count, not the total agent limit. The current API exposes 19 slots,
+so the root and six coordinators leave twelve simultaneous worker slots. Reuse
+completed workers and expand within the user's limit when native capacity allows.
+Coordinators choose Luna Medium, High, or Max for bounded tasks,
 review, and complex lifecycle or native ABI work respectively.
 
 The resumed clean baseline is `e49857173dda77ce358ab4a05766f2604765bdd8`.
