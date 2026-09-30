@@ -29,6 +29,8 @@ pub struct Record {
     pub process_id: Option<u64>,
     pub failure: Option<&'static str>,
     pub cleanup_error: Option<&'static str>,
+    /// Conservative cleanup pass budget frozen before any child or lease effect.
+    pub cleanup_budget_ms: u64,
     #[serde(skip)]
     pub owner: String,
     #[serde(skip)]
@@ -117,7 +119,7 @@ impl Record {
         json!({"ok":true,"launch":self})
     }
     pub fn preflight_response(&self) -> Value {
-        json!({"ok":true,"preflight_token":self.preflight_token,"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"application_display_overrides":self.application_display_overrides,"executable_path":self.executable_path})
+        json!({"ok":true,"preflight_token":self.preflight_token,"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"application_display_overrides":self.application_display_overrides,"executable_path":self.executable_path,"cleanup_budget_ms":self.cleanup_budget_ms})
     }
 }
 pub struct Records {
@@ -211,6 +213,7 @@ impl Records {
                 process_id: None,
                 failure: None,
                 cleanup_error: None,
+                cleanup_budget_ms: 20_000,
                 owner: caller.into(),
                 catalog_principal,
                 catalog_selection,
@@ -269,9 +272,23 @@ impl Records {
             .values
             .values()
             .filter(|record| record.owner == caller)
-            .skip(offset);
-        let records: Vec<_> = owned.by_ref().take(limit).collect();
-        let next = if owned.next().is_some() {
+            .skip(offset)
+            .peekable();
+        let mut records = Vec::new();
+        let mut byte_limit_reached = false;
+        for record in owned.by_ref().take(limit) {
+            records.push(record);
+            let candidate = json!({"ok":true,"launches":records,"next_offset":usize::MAX});
+            if !serde_json::to_vec(&candidate).is_ok_and(|bytes| bytes.len() <= 16_384) {
+                records.pop();
+                byte_limit_reached = true;
+                break;
+            }
+        }
+        if byte_limit_reached && records.is_empty() {
+            return json!({"ok":false,"code":"launch_response_too_large"});
+        }
+        let next = if byte_limit_reached || owned.peek().is_some() {
             offset.checked_add(records.len())
         } else {
             None

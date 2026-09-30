@@ -4063,3 +4063,269 @@ fn malformed_keybindings_catalog_policy_is_rejected_before_preflight_side_effect
         assert!(harness.processes.is_empty());
     }
 }
+
+#[test]
+fn cleanup_budget_is_snapshotted_at_preflight_and_survives_terminal_target_release() {
+    let mut pipeline = Pipeline::new(BTreeMap::new()).unwrap();
+    let mut harness = Harness::new();
+    harness.catalog_playnite_game_id = Some("12345678-1234-1234-1234-123456789abc".into());
+    harness.catalog_playnite_exit_timeout_seconds = 300;
+    harness.catalog_raw_preparation = Some(json!(
+        (0..8)
+            .map(|index| json!({"do":format!("prepare{index}"), "undo":format!("undo{index}")}))
+            .collect::<Vec<_>>()
+    ));
+    let preflight = harness.request_as(&mut pipeline, "amaterasu.nvhttp", "management", json!({"action":"preflight_export","operation_id":"budget-snapshot","app_id":"app-0000000000000001"}));
+    assert_eq!(preflight["cleanup_budget_ms"], 2_745_000);
+    let id = pipeline.records.values.keys().next().copied().unwrap();
+    let record = pipeline.records.values.get_mut(&id).unwrap();
+    assert_eq!(record.cleanup_budget_ms, 2_745_000);
+    let mut cleanup = Workflow::launch(id, 42, 5_000);
+    cleanup.begin_cleanup(record, Outcome::Completed, None);
+    let deadline = cleanup.deadline;
+    assert!(deadline.duration_since(Instant::now()) > Duration::from_secs(2_744));
+    // Catalog mutation and terminal release cannot change the frozen scalar.
+    harness.catalog_playnite_exit_timeout_seconds = 1;
+    harness.catalog_raw_preparation = None;
+    record.target = None;
+    record.state = State::Stopped;
+    assert_eq!(record.response()["launch"]["cleanup_budget_ms"], 2_745_000);
+    assert_eq!(record.preflight_response()["cleanup_budget_ms"], 2_745_000);
+    assert_eq!(cleanup.deadline, deadline);
+}
+
+#[test]
+fn owned_readback_during_cleanup_preserves_deadline_and_rejects_other_mutations() {
+    let mut pipeline = Pipeline::new(BTreeMap::new()).unwrap();
+    let (id, _) = pipeline
+        .records
+        .start(
+            "alice",
+            "alice",
+            "cleanup-owned".into(),
+            "app-0000000000000001".into(),
+            CatalogSelection::Initiator,
+            GlobalPreparation::default(),
+        )
+        .unwrap();
+    let record = pipeline.records.values.get_mut(&id).unwrap();
+    record.cleanup_budget_ms = 2_745_000;
+    record.process_requested = true;
+    record.process_id = Some(3);
+    let mut workflow = Workflow::launch(id, 7, 5_000);
+    workflow.begin_cleanup(record, Outcome::Completed, None);
+    workflow.pending = Some(50);
+    let deadline = workflow.deadline;
+    pipeline.job = Some(workflow);
+    for (caller, request, expected) in [
+        (
+            "alice",
+            json!({"action":"status","launch_id":id}),
+            "stopping",
+        ),
+        (
+            "alice",
+            json!({"action":"lookup","operation_id":"cleanup-owned"}),
+            "stopping",
+        ),
+        ("alice", json!({"action":"stop","launch_id":id}), "stopping"),
+        (
+            "bob",
+            json!({"action":"status","launch_id":id}),
+            "launch_not_found",
+        ),
+        (
+            "bob",
+            json!({"action":"lookup","operation_id":"cleanup-owned"}),
+            "launch_not_found",
+        ),
+        (
+            "bob",
+            json!({"action":"stop","launch_id":id}),
+            "launch_not_found",
+        ),
+        (
+            "alice",
+            json!({"action":"launch","operation_id":"another","app_id":"app-0000000000000001"}),
+            "workflow_busy",
+        ),
+    ] {
+        let mut incoming = Some(Response::Request {
+            id: 42,
+            caller: caller.into(),
+            initiator: caller.into(),
+            service: SERVICE.into(),
+            payload: request,
+            remaining_ms: 5_000,
+        });
+        let mut readback = None;
+        pipeline
+            .tick(|command| {
+                Ok(match command {
+                    Command::Poll {} => incoming.take().unwrap_or(Response::Pending),
+                    Command::TakeResult { request: 50 } => Response::Pending,
+                    Command::Complete {
+                        request: 42,
+                        payload,
+                    } => {
+                        readback = Some(payload);
+                        Response::Ok
+                    }
+                    other => panic!("readback must not issue native effects: {other:?}"),
+                })
+            })
+            .unwrap();
+        let response = readback.unwrap();
+        if expected == "stopping" {
+            assert_eq!(response["launch"]["state"], expected);
+            assert_eq!(response["launch"]["cleanup_budget_ms"], 2_745_000);
+        } else {
+            assert_eq!(response["code"], expected);
+        }
+        assert_eq!(pipeline.job.as_ref().unwrap().deadline, deadline);
+        assert_eq!(pipeline.job.as_ref().unwrap().pending, Some(50));
+        assert_eq!(pipeline.records.values.len(), 1);
+    }
+}
+
+#[test]
+fn cleanup_readback_transport_failure_retains_pending_work_then_settles() {
+    for fail_poll in [false, true] {
+        let mut pipeline = Pipeline::new(BTreeMap::new()).unwrap();
+        let (id, _) = pipeline
+            .records
+            .start(
+                "alice",
+                "alice",
+                "readback-failure".into(),
+                "app-0000000000000001".into(),
+                CatalogSelection::Initiator,
+                GlobalPreparation::default(),
+            )
+            .unwrap();
+        let record = pipeline.records.values.get_mut(&id).unwrap();
+        record.process_requested = true;
+        record.process_id = Some(3);
+        record.cleanup_budget_ms = 2_745_000;
+        let process_operation = record.process_operation.clone();
+        let mut workflow = Workflow::launch(id, 7, 5_000);
+        workflow.begin_cleanup(record, Outcome::Completed, None);
+        workflow.step = Step::AwaitTermination;
+        workflow.pending = Some(50);
+        let deadline = workflow.deadline;
+        pipeline.job = Some(workflow);
+        let failure = pipeline.tick(|command| match command {
+            Command::Poll {} if fail_poll => Err("injected ingress failure".into()),
+            Command::Poll {} => Ok(Response::Request {
+                id: 42,
+                caller: "alice".into(),
+                initiator: "alice".into(),
+                service: SERVICE.into(),
+                payload: json!({"action":"status","launch_id":id}),
+                remaining_ms: 5_000,
+            }),
+            Command::Complete { request: 42, .. } => Ok(Response::Pending),
+            other => panic!("failed ingress must retain dependency: {other:?}"),
+        });
+        assert!(failure.is_err());
+        let retained = pipeline.job.as_ref().unwrap();
+        assert_eq!(retained.launch_id, id);
+        assert_eq!(retained.deadline, deadline);
+        assert_eq!(retained.step, Step::AwaitTermination);
+        assert_eq!(retained.pending, Some(50));
+        assert!(pipeline.records.values[&id].state == State::Stopping);
+        for _ in 0..2 {
+            pipeline.tick(|command| {
+                let response = match command {
+                Command::Poll {} => Response::Pending,
+                Command::TakeResult { request:50 } => Response::Result { payload:json!({"ok":true,"process":{"process_id":3,"operation_id":process_operation,"state":"exited"}}) },
+                Command::Complete { request:7, payload } => { assert_eq!(payload["launch"]["state"], "stopped"); Response::Ok }
+                other => panic!("retained cleanup must settle its original work: {other:?}"),
+                };
+                Ok(response)
+            }).unwrap();
+        }
+        assert!(pipeline.job.is_none());
+        assert!(pipeline.records.values[&id].state == State::Stopped);
+    }
+}
+
+#[test]
+fn cleanup_readback_list_paginates_by_bytes_and_preserves_owner() {
+    let mut pipeline = Pipeline::new(BTreeMap::new()).unwrap();
+    let mut expected = Vec::new();
+    for owner in ["alice", "bob"] {
+        for index in 0..16 {
+            let (id, _) = pipeline
+                .records
+                .start(
+                    owner,
+                    owner,
+                    format!("owned-{index}"),
+                    "app-0000000000000001".into(),
+                    CatalogSelection::Initiator,
+                    GlobalPreparation::default(),
+                )
+                .unwrap();
+            let record = pipeline.records.values.get_mut(&id).unwrap();
+            record.state = State::Stopping;
+            record.frame_limiter_settings = Some(BTreeMap::from([(
+                "rtss_install_path".into(),
+                json!(format!("/{}", "p".repeat(1_000))),
+            )]));
+            record.config_overrides = Some(
+                serde_json::from_value(
+                    json!({"audio_sink":"a".repeat(256),"sw_preset":"p".repeat(256)}),
+                )
+                .unwrap(),
+            );
+            record.cleanup_budget_ms = 2_745_000;
+            if owner == "alice" {
+                expected.push(id);
+            }
+        }
+    }
+    let mut offset = 0;
+    let mut seen = Vec::new();
+    loop {
+        let mut page = None;
+        let mut incoming = Some(Response::Request {
+            id: 42,
+            caller: "alice".into(),
+            initiator: "alice".into(),
+            service: SERVICE.into(),
+            payload: json!({"action":"list","offset":offset,"limit":16}),
+            remaining_ms: 5_000,
+        });
+        pipeline
+            .poll_cleanup_readback(expected[0], &mut |command| {
+                Ok(match command {
+                    Command::Poll {} => incoming.take().unwrap_or(Response::Pending),
+                    Command::Complete {
+                        request: 42,
+                        payload,
+                    } => {
+                        page = Some(payload);
+                        Response::Ok
+                    }
+                    other => panic!("list must remain read-only: {other:?}"),
+                })
+            })
+            .unwrap();
+        let page = page.unwrap();
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 16_384);
+        let records = page["launches"].as_array().unwrap();
+        assert!(!records.is_empty());
+        seen.extend(
+            records
+                .iter()
+                .map(|record| record["launch_id"].as_u64().unwrap()),
+        );
+        let Some(next) = page["next_offset"].as_u64() else {
+            break;
+        };
+        assert!(next > offset as u64);
+        offset = next as usize;
+    }
+    assert_eq!(seen, expected);
+}

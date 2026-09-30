@@ -118,6 +118,7 @@ impl Broker {
                     ("amaterasu.launch/1", "preflight_export") => json!({
                         "ok":true,
                         "preflight_token":"fixture-preflight-token",
+                        "cleanup_budget_ms":20_000,
                         "app_id":payload["app_id"],
                         "catalog_revision":0,
                         "config_overrides":{
@@ -142,6 +143,7 @@ impl Broker {
                             "state": "active",
                             "failure": null,
                             "cleanup_error": null,
+                            "cleanup_budget_ms":20_000,
                             "frame_limiter_settings":payload["frame_limiter_settings"],
                             "catalog_revision": 0,
                             "application_display_overrides": {},

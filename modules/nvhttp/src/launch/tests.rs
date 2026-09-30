@@ -1070,6 +1070,11 @@ struct Broker {
     lost_history_release_result: bool,
     history_release_request: Option<u64>,
     application_state: &'static str,
+    application_cleanup_budget: Value,
+    application_stop_pending: bool,
+    application_terminal_stop_state: Option<&'static str>,
+    held_application_stop_request: Option<u64>,
+    application_stop_expired: bool,
     fail_rtsp_cleanup: bool,
     wrong_application_id: bool,
     lose_rtsp_open_once: bool,
@@ -1140,6 +1145,11 @@ impl Default for Broker {
             lost_history_release_result: false,
             history_release_request: None,
             application_state: "active",
+            application_cleanup_budget: json!(20_000),
+            application_stop_pending: false,
+            application_terminal_stop_state: None,
+            held_application_stop_request: None,
+            application_stop_expired: false,
             fail_rtsp_cleanup: false,
             wrong_application_id: false,
             lose_rtsp_open_once: false,
@@ -1238,11 +1248,23 @@ impl Broker {
                 }
                 if service == "amaterasu.launch/1" && payload["action"] == "stop" {
                     self.application_stopped = true;
+                    if self.application_stop_pending {
+                        self.held_application_stop_request = Some(request);
+                    }
                     self.unsettled_application.insert(request);
                 }
                 let result = self.response(&service, &payload);
                 self.results.insert(request, result);
                 Ok(Response::Accepted { id: request })
+            }
+            Command::TakeResult { request }
+                if self.held_application_stop_request == Some(request) =>
+            {
+                if self.application_stop_expired {
+                    Ok(Response::error("request_ended", "stop RPC expired"))
+                } else {
+                    Ok(Response::Pending)
+                }
             }
             Command::TakeResult { request }
                 if self.history_release_request == Some(request)
@@ -1437,6 +1459,7 @@ impl Broker {
                     "preflight_token":"fixture-preflight-token",
                     "app_id":payload["app_id"],
                     "catalog_revision":1,
+                    "cleanup_budget_ms":self.application_cleanup_budget,
                     "config_overrides":launch["launch"]["config_overrides"].as_object()
                         .map(|overrides| json!(overrides)).unwrap_or_else(|| json!({})),
                     "executable_path":self.application_executable_path,
@@ -1453,7 +1476,13 @@ impl Broker {
             let operation = self.application_operation.as_str();
             let app = self.application_id.as_str();
             let launch_id = if self.wrong_application_id { 99 } else { 41 };
-            let state = if action == "stop" || (action == "status" && self.application_stopped) {
+            let state = if self.application_stopped
+                && let Some(state) = self.application_terminal_stop_state
+            {
+                state
+            } else if self.application_stopped && self.application_stop_pending {
+                "stopping"
+            } else if action == "stop" || (action == "status" && self.application_stopped) {
                 "stopped"
             } else {
                 self.application_state
@@ -1472,6 +1501,7 @@ impl Broker {
                     Value::Null
                 },
                 "catalog_revision": self.application_catalog_revision,
+                "cleanup_budget_ms":self.application_cleanup_budget,
             });
             launch["frame_limiter_settings"] =
                 self.application_snapshot.clone().unwrap_or(Value::Null);
@@ -3716,14 +3746,279 @@ fn natural_application_exit_closes_the_stream_and_releases_the_application() {
 }
 
 #[test]
-fn repeated_cancel_and_revocation_do_not_extend_cleanup_deadlines() {
+fn long_cleanup_outlives_short_stop_rpc_and_automatically_observes_terminal_undo() {
+    for disconnect_cancel in [false, true] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker {
+            // Provider 321s plus eight sequential 300s raw undos with 3s tails.
+            application_cleanup_budget: json!(2_745_000),
+            application_stop_pending: true,
+            ..Broker::default()
+        };
+        launch_ready(&mut controller, &mut broker, now);
+        assert!(controller.cancel(20, &peer(1), now).is_none());
+        let deadline = controller.records.values().next().unwrap().deadline;
+        assert_eq!(deadline, now + Duration::from_secs(2_775));
+        for _ in 0..16 {
+            assert!(
+                controller
+                    .poll(now, &mut |command| broker.send(command))
+                    .is_empty()
+            );
+        }
+        assert!(broker.held_application_stop_request.is_some());
+        // A 15s broker RPC expires independently of the total owed undo budget.
+        broker.application_stop_expired = true;
+        if disconnect_cancel {
+            // An early closed cancel request drops only its delivery slot.
+            controller.connection_closed(20, now + Duration::from_secs(16));
+        }
+        for elapsed in [16, 21, 300, 2_700] {
+            let current = now + Duration::from_secs(elapsed);
+            for _ in 0..12 {
+                assert!(
+                    controller
+                        .poll(current, &mut |command| broker.send(command))
+                        .is_empty()
+                );
+            }
+            let record = controller.records.values().next().unwrap();
+            assert_eq!(record.state, super::record::State::Stopping);
+            assert!(record.application_requested);
+            assert!(!record.application_cleanup_blocked);
+            assert_eq!(record.deadline, deadline);
+            let request_count = broker
+                .commands
+                .iter()
+                .filter(|command| matches!(command, Command::Request { .. }))
+                .count();
+            for _ in 0..12 {
+                assert!(
+                    controller
+                        .poll(current, &mut |command| broker.send(command))
+                        .is_empty()
+                );
+            }
+            assert_eq!(
+                broker
+                    .commands
+                    .iter()
+                    .filter(|command| matches!(command, Command::Request { .. }))
+                    .count(),
+                request_count,
+                "healthy stopping readback waits for the 100ms poll interval"
+            );
+        }
+        broker.application_stop_pending = false;
+        let mut replies = Vec::new();
+        for _ in 0..16 {
+            replies.extend(
+                controller.poll(now + Duration::from_secs(2_701), &mut |command| {
+                    broker.send(command)
+                }),
+            );
+        }
+        let record = controller.records.values().next().unwrap();
+        assert_eq!(record.state, super::record::State::Stopped);
+        assert!(!record.application_requested);
+        assert!(record.application_launch.is_none());
+        assert!(!controller.busy());
+        if disconnect_cancel {
+            assert!(replies.is_empty());
+        } else {
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].0, 20);
+            assert_eq!(replies[0].1.status, 200);
+        }
+        assert_eq!(
+            broker
+                .actions()
+                .iter()
+                .filter(|action| **action == ("amaterasu.launch/1", "stop"))
+                .count(),
+            1
+        );
+        assert!(broker.commands.iter().all(|command| !matches!(command, Command::Request { timeout_ms, .. } if *timeout_ms > 30_000)));
+        assert!(broker.commands.iter().any(|command| matches!(command, Command::Request { service, payload, timeout_ms:15_000, .. } if service == "amaterasu.launch/1" && payload["action"] == "stop")));
+    }
+}
+
+#[test]
+fn cleanup_deadline_expiry_retains_application_until_explicit_retry() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_stop_pending: true,
+        application_stop_expired: true,
+        ..Broker::default()
+    };
+    launch_ready(&mut controller, &mut broker, now);
+    assert!(controller.cancel(20, &peer(1), now).is_none());
+    let deadline = controller.records.values().next().unwrap().deadline;
+    assert_eq!(deadline, now + Duration::from_secs(50));
+
+    for _ in 0..16 {
+        assert!(
+            controller
+                .poll(now, &mut |command| broker.send(command))
+                .is_empty()
+        );
+    }
+
+    let mut replies = Vec::new();
+    for _ in 0..16 {
+        replies.extend(controller.poll(deadline, &mut |command| broker.send(command)));
+    }
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].0, 20);
+    assert_eq!(replies[0].1.status, 503);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.state, super::record::State::CleanupFailed);
+    assert_eq!(record.cleanup_error, Some("cleanup_deadline_exceeded"));
+    assert!(record.application_requested);
+    assert!(controller.busy());
+
+    broker.application_stop_pending = false;
+    let retry_at = deadline + Duration::from_secs(1);
+    assert!(controller.cancel(21, &peer(1), retry_at).is_none());
+    let (_, retried) = poll_until_reply(&mut controller, &mut broker, retry_at);
+    assert_eq!(retried.status, 200);
+    assert!(controller.records.values().next().unwrap().state.terminal());
+    assert!(!controller.busy());
+}
+
+#[test]
+fn cleanup_budget_contract_rejects_missing_malformed_and_out_of_range_preflight() {
+    for budget in [
+        None,
+        Some(Value::Null),
+        Some(json!(false)),
+        Some(json!("30000")),
+        Some(json!(20_000.5)),
+        Some(json!(-1)),
+        Some(json!(19_999)),
+        Some(json!(2_745_001)),
+        Some(json!(u64::MAX)),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker::default();
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        let mut reply = None;
+        for _ in 0..24 {
+            let replies = controller.poll(now, &mut |command| {
+                let response = broker.send(command)?;
+                Ok(match response {
+                    Response::Result { mut payload }
+                        if payload.get("preflight_token").is_some() =>
+                    {
+                        match &budget {
+                            Some(value) => payload["cleanup_budget_ms"] = value.clone(),
+                            None => {
+                                payload.as_object_mut().unwrap().remove("cleanup_budget_ms");
+                            }
+                        }
+                        Response::Result { payload }
+                    }
+                    other => other,
+                })
+            });
+            if let Some(result) = replies.into_iter().next() {
+                reply = Some(result.1);
+                break;
+            }
+        }
+        assert_eq!(
+            reply.expect("invalid budget must produce failure").status,
+            503
+        );
+        assert!(
+            !broker
+                .actions()
+                .contains(&("amaterasu.launch/1", "launch_export"))
+        );
+        assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+    }
+}
+
+#[test]
+fn genuine_application_cleanup_failure_requires_explicit_retry() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
+    broker.application_terminal_stop_state = Some("cleanup_failed");
+    assert!(controller.cancel(20, &peer(1), now).is_none());
+    let (_, failed) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(failed.status, 503);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.state, super::record::State::CleanupFailed);
+    assert!(record.application_requested);
+    assert!(record.application_cleanup_blocked);
+    let deadline = record.deadline;
+    broker.application_terminal_stop_state = None;
+    for _ in 0..8 {
+        assert!(
+            controller
+                .poll(now + Duration::from_secs(1), &mut |command| broker
+                    .send(command))
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        controller.records.values().next().unwrap().deadline,
+        deadline
+    );
+    assert!(
+        controller
+            .cancel(21, &peer(1), now + Duration::from_secs(1))
+            .is_none()
+    );
+    let (_, completed) =
+        poll_until_reply(&mut controller, &mut broker, now + Duration::from_secs(1));
+    assert_eq!(completed.status, 200);
+    assert!(controller.records.values().next().unwrap().state.terminal());
+}
+
+#[test]
+fn changed_cleanup_budget_and_unhealthy_stopping_readback_retain_owned_failure() {
+    for changed_budget in [false, true] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker::default();
+        launch_ready(&mut controller, &mut broker, now);
+        if changed_budget {
+            broker.application_cleanup_budget = json!(21_000);
+        } else {
+            broker.application_stop_pending = true;
+            broker.application_stop_expired = true;
+            broker.application_unhealthy = true;
+        }
+        assert!(controller.cancel(20, &peer(1), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 503);
+        let record = controller.records.values().next().unwrap();
+        assert_eq!(record.state, super::record::State::CleanupFailed);
+        assert!(record.application_requested);
+        assert!(record.application_cleanup_blocked);
+        assert!(controller.busy());
+    }
+}
+
+#[test]
+fn repeated_cancel_and_revocation_do_not_extend_cleanup_deadlines() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_cleanup_budget: json!(2_745_000),
+        ..Broker::default()
+    };
+    launch_ready(&mut controller, &mut broker, now);
 
     assert!(controller.cancel(20, &peer(1), now).is_none());
     let deadline = controller.records.values().next().unwrap().deadline;
+    assert_eq!(deadline, now + Duration::from_secs(2_775));
     assert_eq!(
         controller
             .cancel(21, &peer(1), now + Duration::from_secs(1))
@@ -3742,7 +4037,6 @@ fn repeated_cancel_and_revocation_do_not_extend_cleanup_deadlines() {
         deadline
     );
 }
-
 #[test]
 fn dual_uncertain_cleanup_calls_are_both_retained_and_reconciled_before_success() {
     let now = Instant::now();

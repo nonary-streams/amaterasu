@@ -35,7 +35,12 @@ pub(crate) type Send<'a> = dyn FnMut(Command) -> Transport + 'a;
 
 const MAX_RECORDS: usize = 32;
 const INITIAL_DEADLINE: Duration = Duration::from_secs(40);
-const CLEANUP_DEADLINE: Duration = Duration::from_secs(20);
+const DEFAULT_CLEANUP_BUDGET: Duration = Duration::from_secs(20);
+// Launch/1 contract: provider 321s plus eight raw undos of 300s and 3s containment.
+const MAX_APPLICATION_CLEANUP_BUDGET_MS: u64 = 2_745_000;
+// RTSP close 15s, lookup 5s, history release 5s, and 5s for asynchronous polling.
+const STREAM_CLEANUP_MARGIN_MS: u64 = 30_000;
+const CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MONITOR_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -828,7 +833,7 @@ impl Controller {
         let retry = if record.state == State::CleanupFailed {
             record.retry_cleanup(now)
         } else {
-            record.request_cleanup(None, now + CLEANUP_DEADLINE);
+            record.request_cleanup(None, now);
             None
         };
         if let Some((phase, call)) = retry {
@@ -894,10 +899,7 @@ impl Controller {
             if record.launch_connection == Some(connection) {
                 record.launch_connection = None;
                 if !record.adopted {
-                    record.request_cleanup(
-                        Some("launch_response_unavailable"),
-                        now + CLEANUP_DEADLINE,
-                    );
+                    record.request_cleanup(Some("launch_response_unavailable"), now);
                     affected = Some(record.id);
                 }
             }
@@ -923,7 +925,7 @@ impl Controller {
                 close.extend(record.launch_connection.take());
                 close.extend(record.cancel_connection.take());
                 if !matches!(record.state, State::Stopping | State::CleanupFailed) {
-                    record.request_cleanup(Some("client_revoked"), now + CLEANUP_DEADLINE);
+                    record.request_cleanup(Some("client_revoked"), now);
                     affected.push(record.id);
                 }
             }

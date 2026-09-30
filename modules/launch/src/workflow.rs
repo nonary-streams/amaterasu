@@ -85,7 +85,7 @@ impl Workflow {
         record.cleanup_error = None;
         self.cleanup = true;
         self.pending = None;
-        self.deadline = Instant::now() + cleanup_budget(record.target.as_ref());
+        self.deadline = Instant::now() + Duration::from_millis(record.cleanup_budget_ms);
         self.step = first_cleanup_step(record);
     }
     pub fn parent(&self) -> Option<u64> {
@@ -264,13 +264,21 @@ impl Workflow {
 /// Each RPC still has its own short request deadline; polling does not restart
 /// this budget. The plan is a conservative upper bound because application
 /// preparation alone knows which steps were started and therefore owe undo.
-fn cleanup_budget(target: Option<&LaunchTarget>) -> Duration {
-    let (primary_budget, exit_timeout_seconds, preparation) = match target {
-        Some(LaunchTarget::Executable(executable)) => (
-            Duration::from_secs(executable.exit_timeout_seconds.saturating_add(5).max(20)),
-            executable.exit_timeout_seconds,
-            executable.preparation.as_slice(),
-        ),
+// The resolved plan admits at most eight steps, a 300-second exit timeout,
+// and 30-second structured commands. The largest budget is provider stop plus
+// eight raw undos: 321,000 + 8 * 303,000 milliseconds.
+pub(crate) const MAX_CLEANUP_BUDGET_MS: u64 = 2_745_000;
+
+pub(crate) fn cleanup_budget(target: Option<&LaunchTarget>) -> Duration {
+    let (primary_budget_ms, exit_timeout_seconds, preparation) = match target {
+        Some(LaunchTarget::Executable(executable)) => {
+            let timeout = executable.exit_timeout_seconds.min(300);
+            (
+                (timeout + 5).max(20) * 1_000,
+                timeout,
+                executable.preparation.as_slice(),
+            )
+        }
         Some(LaunchTarget::Playnite {
             exit_timeout_seconds,
             preparation,
@@ -280,31 +288,34 @@ fn cleanup_budget(target: Option<&LaunchTarget>) -> Duration {
             exit_timeout_seconds,
             preparation,
             ..
-        }) => (
+        }) => {
+            let timeout = (*exit_timeout_seconds).min(300);
             // Two bounded authenticated pipe connections, stop, and polling.
-            Duration::from_secs(exit_timeout_seconds.saturating_add(21)),
-            *exit_timeout_seconds,
-            preparation.as_slice(),
-        ),
+            ((timeout + 21) * 1_000, timeout, preparation.as_slice())
+        }
         None => return Duration::from_secs(20),
     };
-    let undo_budget = preparation
+    let budget_ms = preparation
         .iter()
+        .take(8)
         .filter_map(|step| match step {
             PlannedPreparationStep::Structured(step) => step
                 .undo
                 .as_ref()
-                .map(|command| Duration::from_millis(command.timeout_ms)),
+                .map(|command| command.timeout_ms.min(30_000)),
             PlannedPreparationStep::Legacy(step) if !step.undo.is_empty() => {
-                Some(Duration::from_secs(exit_timeout_seconds.max(15)))
+                Some(exit_timeout_seconds.max(15) * 1_000)
             }
             PlannedPreparationStep::Legacy(_) => None,
         })
-        // Containment allows a 200ms stop grace and two-second reap tail.
-        // Round up for asynchronous polling and dependency calls between steps.
-        .map(|timeout| timeout + Duration::from_secs(3))
-        .sum::<Duration>();
-    primary_budget + undo_budget
+        .try_fold(primary_budget_ms, |budget, timeout_ms| {
+            // Containment allows a 200ms stop grace and two-second reap tail.
+            // Round up for asynchronous polling and calls between ordered steps.
+            budget.checked_add(timeout_ms.checked_add(3_000)?)
+        })
+        .unwrap_or(MAX_CLEANUP_BUDGET_MS)
+        .clamp(20_000, MAX_CLEANUP_BUDGET_MS);
+    Duration::from_millis(budget_ms)
 }
 pub fn first_cleanup_step(record: &Record) -> Step {
     if record.session_requested && record.session_id.is_none() {
@@ -392,6 +403,8 @@ mod tests {
             working_directory: None,
             preparation: Vec::new(),
         });
+        record.cleanup_budget_ms =
+            u64::try_from(cleanup_budget(record.target.as_ref()).as_millis()).unwrap();
         record.provider_launch_requested = true;
         let mut workflow = Workflow::launch(launch_id, 1, 30_000);
         workflow.begin_cleanup(record, Outcome::Failed, Some("unknown_start_result"));
@@ -504,6 +517,25 @@ mod tests {
             cleanup_budget(Some(&target(300, vec![structured]))),
             Duration::from_millis(324_025)
         );
+    }
+
+    #[test]
+    fn cleanup_budget_caps_invalid_internal_plans_without_overflow() {
+        let raw = PlannedPreparationStep::Legacy(crate::protocol::LegacyPreparationCommand {
+            do_command: "prepare".into(),
+            undo: "undo".into(),
+            elevated: false,
+        });
+        let target = LaunchTarget::PlayniteFullscreen {
+            exit_timeout_seconds: u64::MAX,
+            working_directory: None,
+            preparation: vec![raw; 100],
+        };
+        assert_eq!(
+            cleanup_budget(Some(&target)),
+            Duration::from_millis(MAX_CLEANUP_BUDGET_MS)
+        );
+        assert_eq!(cleanup_budget(None), Duration::from_secs(20));
     }
 
     #[test]

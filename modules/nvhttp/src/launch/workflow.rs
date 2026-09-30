@@ -1,5 +1,6 @@
 use super::{
-    AudioSinkCaptureOnlyOverrides, CLEANUP_DEADLINE, Controller, Send, app_id,
+    AudioSinkCaptureOnlyOverrides, CLEANUP_POLL_INTERVAL, Controller,
+    MAX_APPLICATION_CLEANUP_BUDGET_MS, Send, app_id,
     call::{Call, Outcome},
     capture_sink_without_routing, key_hex, private_error,
     record::{Record, Stage, State},
@@ -134,7 +135,7 @@ impl Controller {
                 record.state = State::Stopping;
                 record.stage = Stage::Cleanup;
                 if entering_cleanup {
-                    record.deadline = now + CLEANUP_DEADLINE;
+                    record.deadline = record.cleanup_deadline(now);
                 }
                 self.finish_or_retain(job.record, now, replies);
             }
@@ -413,11 +414,16 @@ impl Controller {
                 }
             }
             Phase::PreflightApplication => match application_preflight_response(record, &payload) {
-                Ok((token, catalog_revision, application_overrides, executable_path))
-                    if record.state == State::Starting =>
-                {
+                Ok(ApplicationPreflight {
+                    token,
+                    catalog_revision,
+                    overrides: application_overrides,
+                    executable_path,
+                    cleanup_budget_ms,
+                }) if record.state == State::Starting => {
                     record.application_preflight_token = Some(token);
                     record.application_catalog_revision = Some(catalog_revision);
+                    record.application_cleanup_budget_ms = Some(cleanup_budget_ms);
                     record.executable_path = executable_path;
                     record.application_frame_limiter_settings =
                         application_overrides.frame_limiter_settings();
@@ -569,22 +575,19 @@ impl Controller {
                     }
                     Ok((launch_id, "active", _)) => {
                         record.application_launch = Some(launch_id);
-                        record.request_cleanup(
-                            Some("application_launch_unhealthy"),
-                            now + CLEANUP_DEADLINE,
-                        );
+                        record.request_cleanup(Some("application_launch_unhealthy"), now);
                     }
                     Ok((launch_id, _, _)) => {
                         record.application_launch = Some(launch_id);
                         record.failure.get_or_insert("application_ended");
-                        record.request_cleanup(None, now + CLEANUP_DEADLINE);
+                        record.request_cleanup(None, now);
                     }
                     Err("launch_not_found") if job.phase == Phase::LookupApplication => {
                         record.application_requested = false;
                         record
                             .failure
                             .get_or_insert("application_launch_unavailable");
-                        record.request_cleanup(None, now + CLEANUP_DEADLINE);
+                        record.request_cleanup(None, now);
                     }
                     Err(code) => fail_record(record, code, now),
                 }
@@ -609,7 +612,7 @@ impl Controller {
                 }
                 Ok((ticket, _, _, _)) => {
                     record.rtsp_ticket = Some(ticket);
-                    record.request_cleanup(None, now + CLEANUP_DEADLINE);
+                    record.request_cleanup(None, now);
                 }
                 Err("ticket_not_found") if job.phase == Phase::LookupRtsp => {
                     record.rtsp_requested = false;
@@ -619,12 +622,12 @@ impl Controller {
             },
             Phase::MonitorApplication => match application_response(record, &payload) {
                 Ok((_, "active", true)) => record.monitored(now),
-                Ok(_) => record.request_cleanup(Some("application_ended"), now + CLEANUP_DEADLINE),
+                Ok(_) => record.request_cleanup(Some("application_ended"), now),
                 Err(code) => fail_record(record, code, now),
             },
             Phase::MonitorRtsp => match rtsp_response(record, &payload) {
                 Ok((_, _, "ready" | "arming" | "playing", true)) => record.monitored(now),
-                Ok(_) => record.request_cleanup(Some("stream_ended"), now + CLEANUP_DEADLINE),
+                Ok(_) => record.request_cleanup(Some("stream_ended"), now),
                 Err(code) => fail_record(record, code, now),
             },
             Phase::StopRtsp | Phase::VerifyRtspStopped => {
@@ -644,8 +647,16 @@ impl Controller {
                 if clean_application_terminal(record, &payload) {
                     record.application_requested = false;
                     record.application_launch = None;
-                } else if job.phase == Phase::StopApplication {
+                } else if job.phase == Phase::StopApplication
+                    || application_response(record, &payload)
+                        .is_ok_and(|(_, state, healthy)| state == "stopping" && healthy)
+                {
                     record.stage = Stage::VerifyApplicationCleanup;
+                    record.next_cleanup_poll = if job.phase == Phase::StopApplication {
+                        now
+                    } else {
+                        now + CLEANUP_POLL_INTERVAL
+                    };
                 } else {
                     record.cleanup_error = Some("application_cleanup_unconfirmed");
                     record.application_cleanup_blocked = true;
@@ -748,26 +759,17 @@ impl Controller {
                 record.stage = Stage::Cleanup;
             }
             Phase::PreflightApplication => {
-                record.request_cleanup(
-                    Some("application_preflight_unavailable"),
-                    now + CLEANUP_DEADLINE,
-                );
+                record.request_cleanup(Some("application_preflight_unavailable"), now);
             }
             Phase::SnapshotDisplay | Phase::EnumerateDisplay | Phase::ConfirmDisplay => {
-                record.request_cleanup(
-                    Some("display_preflight_unavailable"),
-                    now + CLEANUP_DEADLINE,
-                );
+                record.request_cleanup(Some("display_preflight_unavailable"), now);
             }
             Phase::LaunchApplication => {
                 record.application_cleanup_blocked = false;
                 record.application_reconcile = Some(Phase::LookupApplication);
             }
             Phase::PrepareDisplayAdmission => {
-                record.request_cleanup(
-                    Some("display_admission_unavailable"),
-                    now + CLEANUP_DEADLINE,
-                );
+                record.request_cleanup(Some("display_admission_unavailable"), now);
             }
             Phase::OpenRtsp => {
                 record.rtsp_cleanup_blocked = false;
@@ -790,24 +792,13 @@ impl Controller {
                 record.rtsp_reconcile = Some(job.phase);
             }
             Phase::MonitorApplication | Phase::MonitorRtsp => {
-                record
-                    .request_cleanup(Some("lifecycle_status_unavailable"), now + CLEANUP_DEADLINE);
+                record.request_cleanup(Some("lifecycle_status_unavailable"), now);
             }
         }
         if record.state == State::Starting && now >= record.deadline {
-            record.request_cleanup(Some("launch_deadline_exceeded"), now + CLEANUP_DEADLINE);
+            record.request_cleanup(Some("launch_deadline_exceeded"), now);
         }
-        if matches!(
-            job.phase,
-            Phase::ReserveHistory
-                | Phase::ReleaseHistory
-                | Phase::PreflightApplication
-                | Phase::SnapshotDisplay
-                | Phase::EnumerateDisplay
-                | Phase::ConfirmDisplay
-        ) {
-            self.finish_or_retain(job.record, now, replies);
-        }
+        self.finish_or_retain(job.record, now, replies);
     }
 
     fn finish_or_retain(&mut self, record_id: u64, now: Instant, replies: &mut Vec<(u64, Reply)>) {
@@ -892,11 +883,10 @@ fn needs_work(record: &Record, now: Instant) -> bool {
     ) || (record.stage == Stage::Live && now >= record.next_monitor)
         || matches!(
             record.stage,
-            Stage::Cleanup
-                | Stage::VerifyRtspCleanup
-                | Stage::VerifyApplicationCleanup
-                | Stage::ReleaseHistory
+            Stage::Cleanup | Stage::VerifyRtspCleanup | Stage::ReleaseHistory
         )
+        || (record.stage == Stage::VerifyApplicationCleanup
+            && (now >= record.next_cleanup_poll || now >= record.deadline))
 }
 
 fn next_phase(record: &Record) -> Phase {
@@ -1342,7 +1332,7 @@ fn display_enumeration(
 }
 
 fn fail_record(record: &mut Record, code: &'static str, now: Instant) {
-    record.request_cleanup(Some(code), now + CLEANUP_DEADLINE);
+    record.request_cleanup(Some(code), now);
 }
 
 fn complete_launch(record: &mut Record, now: Instant, replies: &mut Vec<(u64, Reply)>) {
@@ -1351,7 +1341,7 @@ fn complete_launch(record: &mut Record, now: Instant, replies: &mut Vec<(u64, Re
     if let Some(connection) = record.launch_connection {
         replies.push((connection, success_reply(record)));
     } else {
-        record.request_cleanup(Some("launch_response_unavailable"), now + CLEANUP_DEADLINE);
+        record.request_cleanup(Some("launch_response_unavailable"), now);
     }
 }
 
@@ -1532,6 +1522,12 @@ fn application_response<'a>(
     {
         return Err("invalid_application_response");
     }
+    if application_cleanup_budget_ms(&launch["cleanup_budget_ms"])
+        != record.application_cleanup_budget_ms
+        || record.application_cleanup_budget_ms.is_none()
+    {
+        return Err("invalid_application_response");
+    }
     let state = launch["state"]
         .as_str()
         .filter(|state| {
@@ -1691,10 +1687,24 @@ fn display_policy_snapshot(record: &Record) -> Value {
     })
 }
 
+fn application_cleanup_budget_ms(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .filter(|budget| (20_000..=MAX_APPLICATION_CLEANUP_BUDGET_MS).contains(budget))
+}
+
+struct ApplicationPreflight {
+    token: String,
+    catalog_revision: u64,
+    overrides: ApplicationConfigOverrides,
+    executable_path: Option<String>,
+    cleanup_budget_ms: u64,
+}
+
 fn application_preflight_response(
     record: &Record,
     payload: &Value,
-) -> Result<(String, u64, ApplicationConfigOverrides, Option<String>), &'static str> {
+) -> Result<ApplicationPreflight, &'static str> {
     if payload["ok"] != true || payload["app_id"] != app_id(record.request.app_id) {
         return Err("invalid_application_preflight_response");
     }
@@ -1709,6 +1719,8 @@ fn application_preflight_response(
         .ok_or("invalid_application_preflight_response")?;
     let overrides = parse_application_config_overrides(payload.get("config_overrides"))
         .map_err(|_| "invalid_application_preflight_response")?;
+    let cleanup_budget_ms = application_cleanup_budget_ms(&payload["cleanup_budget_ms"])
+        .ok_or("invalid_application_preflight_response")?;
     let executable_path = payload["executable_path"].as_str().map(str::to_owned);
     if payload
         .get("executable_path")
@@ -1719,12 +1731,13 @@ fn application_preflight_response(
     {
         return Err("invalid_application_preflight_response");
     }
-    Ok((
-        token.to_owned(),
+    Ok(ApplicationPreflight {
+        token: token.to_owned(),
         catalog_revision,
         overrides,
         executable_path,
-    ))
+        cleanup_budget_ms,
+    })
 }
 
 pub(super) fn parse_application_config_overrides(

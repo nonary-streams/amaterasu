@@ -6,7 +6,7 @@ use crate::{
         random_display_admission_token,
     },
     responses,
-    workflow::{Step, Workflow, first_cleanup_step},
+    workflow::{Step, Workflow, cleanup_budget, first_cleanup_step},
 };
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::Value;
@@ -342,6 +342,14 @@ impl Pipeline {
     }
     pub fn tick(&mut self, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
         if let Some(mut job) = self.job.take() {
+            if job.cleanup
+                && let Err(error) = self.poll_cleanup_readback(job.launch_id, &mut send)
+            {
+                // Readback delivery cannot discard the owned cleanup workflow or
+                // its outstanding dependency request when ingress transport fails.
+                self.job = Some(job);
+                return Err(error);
+            }
             if let Some(request) = job.pending.take() {
                 match send(Command::TakeResult { request }) {
                     Ok(Response::Pending) => {
@@ -418,6 +426,54 @@ impl Pipeline {
             }
             _ => Err("launch poll failed".into()),
         }
+    }
+    /// Cleanup advances independently of the initiating request. Keep bounded
+    /// owner-authorized readback available while its native undo is still running.
+    fn poll_cleanup_readback(
+        &self,
+        active_launch: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        let Response::Request {
+            id,
+            caller,
+            service,
+            payload,
+            ..
+        } = send(Command::Poll {})?
+        else {
+            return Ok(());
+        };
+        if service != SERVICE {
+            return complete(send, id, error("invalid_service"));
+        }
+        let operation = serde_json::from_value::<Operation>(payload)
+            .map_err(|_| "invalid_request")
+            .and_then(|operation| {
+                operation.validate()?;
+                Ok(operation)
+            });
+        let response = match operation {
+            Ok(Operation::Status { launch_id }) => self
+                .records
+                .owned(&caller, launch_id)
+                .map(|record| record.response())
+                .unwrap_or_else(error),
+            Ok(Operation::Lookup { operation_id }) => self
+                .records
+                .owned_operation(&caller, &operation_id)
+                .map(|record| record.response())
+                .unwrap_or_else(error),
+            Ok(Operation::List { offset, limit }) => self.records.list(&caller, offset, limit),
+            Ok(Operation::Stop { launch_id }) if launch_id == active_launch => self
+                .records
+                .owned(&caller, launch_id)
+                .map(|record| record.response())
+                .unwrap_or_else(error),
+            Ok(_) => error("workflow_busy"),
+            Err(code) => error(code),
+        };
+        complete(send, id, response)
     }
     fn receive(
         &mut self,
@@ -1041,6 +1097,9 @@ impl Pipeline {
                             }
                             _ => None,
                         };
+                        record.cleanup_budget_ms =
+                            u64::try_from(cleanup_budget(Some(&target)).as_millis())
+                                .map_err(|_| "cleanup budget exceeds protocol range")?;
                         record.target = Some(target);
                     }
                     Err(code) => return self.dependency_failed(job, code, send),

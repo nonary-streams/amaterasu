@@ -3,10 +3,13 @@ use super::{
     VideoEncryptionPolicySnapshot,
 };
 use crate::frame_limiter::FrameLimiterSettings;
-use crate::launch::{CLEANUP_DEADLINE, MONITOR_INTERVAL};
+use crate::launch::{DEFAULT_CLEANUP_BUDGET, MONITOR_INTERVAL, STREAM_CLEANUP_MARGIN_MS};
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use serde_json::Value;
-use std::{collections::VecDeque, time::Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use super::{
     call::Call,
@@ -92,6 +95,8 @@ pub struct Record {
     pub display_admission_token: Option<String>,
     pub application_preflight_token: Option<String>,
     pub application_catalog_revision: Option<u64>,
+    /// Validated cleanup budget frozen by launch preflight before provider effects.
+    pub application_cleanup_budget_ms: Option<u64>,
     pub frame_limiter_snapshot: Option<Value>,
     pub executable_path: Option<String>,
     pub resolved_virtual_sink: Option<String>,
@@ -149,6 +154,7 @@ pub struct Record {
     pub cancel_connection: Option<u64>,
     pub deadline: Instant,
     pub next_monitor: Instant,
+    pub next_cleanup_poll: Instant,
     pub monitor_application_next: bool,
     pub failure: Option<&'static str>,
     pub cleanup_error: Option<&'static str>,
@@ -236,6 +242,7 @@ impl Record {
             display_admission_token: None,
             application_preflight_token: None,
             application_catalog_revision: None,
+            application_cleanup_budget_ms: None,
             frame_limiter_snapshot: None,
             executable_path: None,
             resolved_virtual_sink: None,
@@ -288,6 +295,7 @@ impl Record {
             cancel_connection: None,
             deadline,
             next_monitor: deadline,
+            next_cleanup_poll: deadline,
             monitor_application_next: true,
             failure: None,
             cleanup_error: None,
@@ -302,7 +310,7 @@ impl Record {
         &self.rtsp_operation
     }
 
-    pub fn request_cleanup(&mut self, failure: Option<&'static str>, deadline: Instant) {
+    pub fn request_cleanup(&mut self, failure: Option<&'static str>, now: Instant) {
         if let Some(failure) = failure {
             self.failure.get_or_insert(failure);
         }
@@ -310,9 +318,21 @@ impl Record {
         self.state = State::Stopping;
         self.stage = Stage::Cleanup;
         if !already_stopping {
-            self.deadline = deadline;
+            self.next_cleanup_poll = now;
+            self.deadline = self.cleanup_deadline(now);
         }
         self.cleanup_error = None;
+    }
+
+    pub fn cleanup_deadline(&self, now: Instant) -> Instant {
+        now + self.cleanup_budget()
+    }
+
+    fn cleanup_budget(&self) -> Duration {
+        self.application_cleanup_budget_ms
+            .and_then(|budget| budget.checked_add(STREAM_CLEANUP_MARGIN_MS))
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_CLEANUP_BUDGET)
     }
 
     pub fn fail_cleanup(&mut self, error: &'static str) {
@@ -342,7 +362,8 @@ impl Record {
         self.cleanup_error = None;
         self.rtsp_cleanup_blocked = false;
         self.application_cleanup_blocked = false;
-        self.deadline = now + CLEANUP_DEADLINE;
+        self.deadline = self.cleanup_deadline(now);
+        self.next_cleanup_poll = now;
         self.retrying_uncertainty = true;
         self.uncertain.pop_front().map(|(phase, mut call)| {
             call.retry_settlement();

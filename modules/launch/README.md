@@ -254,7 +254,7 @@ until the terminal outcome is known. Monitoring rotates among active launches an
 gets a turn after at most eight received requests, so continuous status/list traffic
 cannot indefinitely starve it. One dependency workflow runs at a time; dependency
 requests have at most five-second deadlines, normal startup respects the caller's
-capped 30-second deadline, and rollback has a separate 20-second budget. Long-running
+capped 30-second deadline, and rollback has a separate frozen cleanup budget. Long-running
 dependencies can delay unrelated requests within those bounds. Cleanup failures
 retain ownership metadata and require stop retry; they are not silently discarded.
 
@@ -291,8 +291,18 @@ overall cleanup deadline additionally includes every configured undo's execution
 budget and three seconds per undo for containment and polling. Executable
 cleanup similarly includes the application exit timeout and ordered undo;
 individual dependency RPC deadlines remain at most five seconds. The overall
-deadline is set once per cleanup pass and retained during polling. A timeout
-retains ownership and the session lease for an explicit retry. This slice does not
+deadline is set once per cleanup pass and retained during polling.
+The merged resolved plan also freezes `cleanup_budget_ms` before effects. Preflight,
+status, lookup, and retained terminal records report the same 20,000..2,745,000 ms
+scalar even after target ownership is released. NVHTTP consumes that scalar for
+its outer cleanup deadline, so a long configured ordered undo does not encounter
+a fixed 20-second session deadline. While cleanup runs, each tick admits at most
+one owner-authorized status/lookup/list readback before advancing the active
+cleanup work. An owned stop for that active record acknowledges `stopping`
+without restarting undo or extending its deadline. Other mutations return
+`workflow_busy`. Readback transport failure retains the pending cleanup request,
+and list pages obey the 16,384-byte response bound as well as their count limit.
+A timeout retains ownership and the session lease for an explicit retry. This slice does not
 implement the reference helper's focus policy or process watchdog verification.
 
 Launch records, idempotency, and reconciliation are in memory. They assume the
