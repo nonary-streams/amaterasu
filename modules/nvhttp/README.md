@@ -92,7 +92,10 @@ A successful update is acknowledged only after both NVHTTP listeners and the RTS
 listener/UDP bind preflight are active at the requested base. If an RTSP stream is
 active, a TCP or UDP target is occupied, or a listener cannot bind after
 persistence, NVHTTP returns `listener_apply_pending` with `persisted:true`, retains
-the previous active ports, and retries applying the stored port. Restart loads the
+the previous ports while their sockets remain bound, and retries applying the stored port.
+If an overlapping replacement and restoration both fail, active ports and addresses
+become empty until recovery; status does not resurrect a cached listener or clear
+the failure during retry backoff. Restart loads the
 stored base and repeats reconciliation. The settings response includes
 `active_rtsp_port` and `rtsp_listener_error` alongside the active HTTP ports.
 
@@ -105,13 +108,20 @@ the global maximum bitrate, v9 adds the nullable global minimum FPS target, v10
 adds the global audio sink, v11 adds WGC pacing smoothing, v12 adds the external
 IP, v13 adds the ping timeout, and v14 adds audio sink capture-only policy.
 
+NVHTTP, RTSP and per-session media/control sockets share the independently built
+`amaterasu-network-policy` address, port and endpoint contract. IPv6 UDP sockets
+are explicitly v6-only, matching RTSP preflight. Prepared session readback must
+match the requested local IP/family and fixed port before RTSP advertises it;
+substituted endpoints trigger the existing owned-resource cleanup path.
+
 NVHTTP startup also accepts `address_family` (`ipv4` or `both`) and `bind_address`
-(an IP address or empty string). An explicit address replaces the IP for both HTTP
-listeners while preserving their configured ports. If either key is omitted, the
-legacy `http_bind` and `https_bind` addresses remain in effect. With explicit
-`bind_address:""`, remote access disabled keeps the legacy loopback addresses;
-remote access enabled binds the family wildcard. `allow_remote` remains the gate
-for non-loopback listeners. With an explicit IP, that family is used. With an
+(an IP address or empty string). An explicit IP replaces the address for both HTTP
+listeners while preserving their configured ports and must match the selected family.
+When both keys are omitted, the legacy `http_bind` and `https_bind` addresses remain
+in effect. An explicit family with an omitted or empty address selects that family's
+loopbacks, or wildcards when remote access is enabled. An empty address with no
+explicit family follows the family defaults resolved from the legacy bind addresses.
+`allow_remote` remains the gate for non-loopback listeners. With an
 explicit empty address and `both`, each HTTP and HTTPS protocol binds separate
 IPv4 and IPv6 sockets on the same respective port. IPv6 sockets are v6-only, so
 IPv4 reachability does not depend on the host's dual-stack default. When remote

@@ -45,6 +45,11 @@ UDP addresses pass a simultaneous bind check. UDP sockets themselves belong to
 per-session stream owners, so the check does not reserve ports between streams.
 Pending updates keep new opens on the currently bound listener's base until retry
 succeeds.
+An occupied unrelated target leaves the old TCP listeners bound. Same-port
+overlap can require releasing the old set; if replacement and restoration both
+fail, status clears the active tuple and addresses and retries the requested
+policy instead of reporting cached sockets. Live tickets and unconfirmed cleanup
+continue to defer listener changes.
 This does not alter NVHTTP's HTTP/HTTPS listener or weaken its loopback policy.
 
 Startup settings accept `address_family` (`ipv4` or `both`) and `bind_address`
@@ -66,6 +71,11 @@ are loopback-only; otherwise each family uses its wildcard. Wildcard RTSP select
 a concrete same-family local route for each peer and uses it for that ticket's URL
 and UDP binds. Status retains the compatibility `local` field for the primary
 listener and adds `locals` containing every bound address.
+The shared `amaterasu-network-policy` library also binds actual media/control UDP
+sockets with the same v6-only behavior. Each ticket freezes its requested UDP
+endpoints; prepare readback must preserve their IP/family and fixed ports before
+SETUP can advertise them. Provider mismatches retain cleanup ownership until the
+existing stream-session cancellation and release workflow settles.
 
 Replies expose an opaque ticket, bound address, RTSP URL, protocol `state`,
 downstream `stream_state`, and fixed failure/cleanup codes. `playing` means PLAY
