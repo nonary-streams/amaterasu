@@ -264,9 +264,38 @@ filesystem call can still block on unavailable storage. Local artwork validation
 and JPEG/WebP conversion run on a separate bounded worker before a completed
 scan publishes its artwork references; signed local chunk reads use that worker.
 
-Behavior reference: sibling Vibeshine `src/steam_integration.h` and
-`src/steam_artwork.cpp`; source was not copied or translated. Other missing
-parity includes machine-host session-broker discovery, uninstalled owned games,
-app type filtering, play-history selection, launch options/Proton resolution,
-launch/process tracking, watchers, and Steam broker environment handling. This
-provider neither modifies Steam files.
+The signed Linux gate `scripts/test_steam_launch_workflow.py` imports controlled
+local manifests through this provider and launches their catalog entries through
+the management API. It requires a normal Linux user, Python with pidfd support,
+a C compiler, and built workspace artifacts:
+
+```sh
+cargo build --workspace --locked
+python3 scripts/test_steam_launch_workflow.py --skip-build
+```
+
+Every listener is ephemeral loopback. HOME, XDG data and PATH overrides apply
+only to the test host child in a private temporary directory. A native executable
+named `steam` receives the imported literal `-applaunch` arguments; copied native
+game executables run inside their canonical install directories with cwd outside
+those directories. This exercises actual Linux executable-based association and
+descendant tracking, owned stop, natural exit, and fresh same-app lease
+acquisition. Preexisting same-image game processes, the original Steam client,
+new Steam launchers, and an unrelated process carrying game-path text in argv
+survive application stop. An imported directory made absent before launch leaves
+the controlled game unsignaled on stop. An injected failure before process-marker
+registration exercises recovery and cleanup through identity-checked pidfds.
+The outside-install-tree descendant does not terminate itself when the game is
+stopped, so its exit requires independent tracker signaling. Cleanup recovers
+only exact private fixture executable/argv/cwd identities and retains their
+pidfds through exit confirmation.
+
+This qualifies provider/catalog/launch integration and real kernel tracking
+with controlled executables. Installed Steam, Proton/Wine games, physical
+desktop sessions, and Windows/macOS tracking remain native acceptance gates.
+
+Behavior reference: pinned sibling Vibeshine `src/steam_integration.h`,
+`src/steam_artwork.cpp`, and `src/steam_process_tracker.cpp`; source was not
+copied or translated. Remaining parity includes machine-host session-broker
+discovery, user launch options/Proton resolution, watchers, and Steam broker
+environment handling. This provider does not modify Steam files.
