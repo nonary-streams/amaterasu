@@ -22,6 +22,7 @@
     "src/settings.ts",
     "src/locale.ts",
     "src/host_metrics.ts",
+    "src/updater.ts",
     "src/pages.ts",
     "src/app.ts"
   ]

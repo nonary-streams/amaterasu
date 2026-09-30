@@ -2028,6 +2028,7 @@ namespace Amaterasu {
     const inputLoads = new InputPolicyLoadGate();
     const historyArea = el("div");
     const metricsArea = el("div");
+    const updaterArea = el("div");
     const historyLoads = new HistorySettingsLoadGate();
     const pairingArea = el("div");
     const pairingLoads = new PairingClientsLoadGate();
@@ -2047,6 +2048,7 @@ namespace Amaterasu {
           void loadInput();
           void loadHistorySettings();
           renderHostMetricsSettings(context, metricsArea);
+          renderUpdaterSettings(context, updaterArea);
           void loadPairing();
         }),
       ),
@@ -2060,6 +2062,7 @@ namespace Amaterasu {
       inputArea,
       historyArea,
       metricsArea,
+      updaterArea,
       pairingArea,
       pipewireArea,
     );
@@ -3971,6 +3974,7 @@ namespace Amaterasu {
     void loadInput();
     void loadHistorySettings();
     renderHostMetricsSettings(context, metricsArea);
+    renderUpdaterSettings(context, updaterArea);
     void loadPairing();
   }
 }

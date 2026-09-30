@@ -48,6 +48,7 @@ members = [
     "modules/stream-session",
     "modules/session-history",
     "modules/host-metrics",
+    "modules/updater",
     "modules/rtsp",
     "modules/upnp",
     "modules/encode",
@@ -72,6 +73,7 @@ amaterasu-contracts = { path = "crates/contracts" }
 amaterasu-package = { path = "crates/package" }
 amaterasu-module-sdk = { path = "crates/module-sdk" }
 amaterasu-storage = { path = "crates/storage" }
+amaterasu-updater = { path = "modules/updater" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

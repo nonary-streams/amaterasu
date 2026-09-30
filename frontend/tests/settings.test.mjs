@@ -469,7 +469,7 @@ test("host logging form refreshes its revision after an ambiguous persisted save
   };
   const dom = vm.createContext({ TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) } });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
     if (source === "src/settings.ts") {
       vm.runInContext("Amaterasu.renderHostMetricsSettings = () => {}; Amaterasu.renderHostMetricsDashboard = () => {};", dom);
@@ -1019,7 +1019,7 @@ test("history form keeps retention controls visible and saves them while recordi
   };
   const dom = vm.createContext({ TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) } });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
     vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
     vm.runInContext("globalThis.renderHostMetricsSettings = () => {}; globalThis.renderHostMetricsDashboard = () => {};", dom);
@@ -1602,7 +1602,7 @@ test("input form confirms cleanup-pending save, then reloads after a revision co
     TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);
@@ -2061,7 +2061,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
     TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);
@@ -2125,7 +2125,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
     },
   });
   await new Promise(setImmediate);
-  const pairingArea = content.children[11];
+  const pairingArea = content.children[12];
   const fec = find(pairingArea, (node) => node.name === `fec_${"a".repeat(64)}`);
   const ds4BackClick = find(pairingArea, (node) => node.name === "ds4_back_as_touchpad_click");
   const save = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
@@ -2425,7 +2425,7 @@ test("Moonlight host form reloads its revision and listener status after a persi
     TextEncoder, URL, Error,
     document: { createElement: (tagName) => new Element(tagName) },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);
@@ -2808,7 +2808,7 @@ test("Steam form reloads normalized Linux settings and explains the enabled poli
     TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);
