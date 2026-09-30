@@ -37,6 +37,7 @@ impl State {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     ReserveHistory,
+    ReadProtonPolicy,
     PreflightApplication,
     SnapshotDisplay,
     EnumerateDisplay,
@@ -79,6 +80,10 @@ pub struct Record {
     pub client_frame_limiter_settings: FrameLimiterSettings,
     pub application_frame_limiter_settings: FrameLimiterSettings,
     pub application_preflight_overrides: Option<ApplicationConfigOverrides>,
+    /// Authoritative global Proton policy read before application preflight.
+    pub global_proton_dualsense_compatibility: Option<bool>,
+    /// Client/application/global compatibility policy frozen for this launch.
+    pub proton_dualsense_compatibility: bool,
     /// Sparse application display fields frozen at preflight for launch readback.
     pub application_display_overrides: Option<Value>,
     /// Typed catalog display selection, kept separate from dd_* overrides.
@@ -247,6 +252,8 @@ impl Record {
             client_frame_limiter_settings,
             application_frame_limiter_settings: FrameLimiterSettings::default(),
             application_preflight_overrides: None,
+            global_proton_dualsense_compatibility: None,
+            proton_dualsense_compatibility: false,
             application_display_overrides: None,
             application_display_settings: None,
             global_display_revision: None,

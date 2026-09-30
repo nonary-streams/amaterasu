@@ -38,6 +38,21 @@ fn peer_with_fec(marker: u8, fec_percentage: Option<u8>) -> PeerIdentity {
     peer_with_overrides(marker, fec_percentage, None)
 }
 
+fn peer_with_proton_override(marker: u8, proton_dualsense_compatibility: Option<bool>) -> PeerIdentity {
+    let certificate = vec![marker; 32];
+    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            format!("client-{marker}"),
+            fingerprint(&certificate),
+            ClientConfigOverrides {
+                proton_dualsense_compatibility,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
 fn peer_with_stream_overrides(
     marker: u8,
     max_bitrate: Option<i32>,
@@ -140,6 +155,21 @@ fn opened_rtsp_payload(broker: &Broker) -> Value {
             _ => None,
         })
         .expect("RTSP open")
+}
+
+fn launch_export_payload(broker: &Broker) -> Value {
+    broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
+                Some(payload.clone())
+            }
+            _ => None,
+        })
+        .expect("launch export")
 }
 
 fn peer_with_settings(
@@ -1199,6 +1229,8 @@ struct Broker {
     history_release_unavailable: bool,
     history_release_in_use_once: bool,
     history_reserved: bool,
+    input_policy_response: Value,
+    input_policy_requests: usize,
     lose_history_reserve_once: bool,
     lost_history_reserve: bool,
     lose_history_release_result_once: bool,
@@ -1279,6 +1311,13 @@ impl Default for Broker {
             history_release_unavailable: false,
             history_release_in_use_once: false,
             history_reserved: false,
+            input_policy_response: json!({
+                "ok":true,
+                "persisted":true,
+                "revision":1,
+                "values":{"proton_dualsense_compatibility":true}
+            }),
+            input_policy_requests: 0,
             lose_history_reserve_once: false,
             lost_history_reserve: false,
             lose_history_release_result_once: false,
@@ -1445,6 +1484,10 @@ impl Broker {
 
     fn response(&mut self, service: &str, payload: &Value) -> Value {
         let action = payload["action"].as_str().unwrap_or_default();
+        if service == "amaterasu.input/1" && action == "settings_get" {
+            self.input_policy_requests += 1;
+            return self.input_policy_response.clone();
+        }
         if service == "amaterasu.stream-session/1" {
             return match action {
                 "reserve_history_activity" => {
@@ -2711,14 +2754,108 @@ fn success_requires_active_application_and_ready_rtsp_then_retries_same_url() {
     assert_eq!(retry.status, 200);
     controller.reply_delivered(11, now);
     assert_eq!(
-        broker.actions()[..4],
+        broker.actions()[..5],
         [
             ("amaterasu.stream-session/1", "reserve_history_activity"),
+            ("amaterasu.input/1", "settings_get"),
             ("amaterasu.launch/1", "preflight_export"),
             ("amaterasu.launch/1", "launch_export"),
             ("amaterasu.rtsp/1", "open")
         ]
     );
+}
+
+#[test]
+fn proton_compatibility_freezes_client_application_global_precedence() {
+    let cases = [
+        (false, Some(true), Some(false), false),
+        (true, Some(false), None, false),
+        (false, None, Some(true), true),
+        (false, None, None, false),
+        (true, None, None, true),
+    ];
+
+    for (index, (global, application, client, expected)) in cases.into_iter().enumerate() {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker {
+            input_policy_response: json!({
+                "ok":true,
+                "persisted":true,
+                "revision":4,
+                "values":{"proton_dualsense_compatibility":global}
+            }),
+            application_input_overrides: application.map(|value| {
+                json!({"proton_dualsense_compatibility":value})
+            }),
+            ..Broker::default()
+        };
+
+        assert!(controller
+            .launch(
+                10,
+                request(1),
+                peer_with_proton_override(index as u8 + 1, client),
+                now,
+            )
+            .is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200);
+        assert_eq!(broker.input_policy_requests, 1);
+
+        let launch = launch_export_payload(&broker);
+        assert_eq!(launch["proton_dualsense_compatibility"], expected);
+
+        let actions = broker.actions();
+        let position = |service, action| {
+            actions
+                .iter()
+                .position(|entry| *entry == (service, action))
+                .unwrap()
+        };
+        assert!(
+            position("amaterasu.input/1", "settings_get")
+                < position("amaterasu.launch/1", "preflight_export")
+        );
+        assert!(
+            position("amaterasu.launch/1", "preflight_export")
+                < position("amaterasu.launch/1", "launch_export")
+        );
+    }
+}
+
+#[test]
+fn invalid_proton_policy_snapshot_fails_before_application_preflight() {
+    let malformed = [
+        json!({"ok":false,"persisted":false}),
+        json!({"ok":true,"persisted":false,"values":{"proton_dualsense_compatibility":true}}),
+        json!({"ok":true,"persisted":true,"values":{"proton_dualsense_compatibility":"true"}}),
+        json!({"ok":true,"persisted":true,"values":{}}),
+    ];
+
+    for response in malformed {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker {
+            input_policy_response: response,
+            ..Broker::default()
+        };
+
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+
+        assert_ne!(reply.status, 200);
+        assert!(broker
+            .actions()
+            .contains(&("amaterasu.input/1", "settings_get")));
+        assert!(!broker
+            .actions()
+            .contains(&("amaterasu.launch/1", "preflight_export")));
+        assert!(!broker
+            .actions()
+            .contains(&("amaterasu.launch/1", "launch_export")));
+        assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+    }
 }
 
 #[test]

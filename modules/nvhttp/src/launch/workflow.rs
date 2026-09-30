@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
 const LAUNCH_SERVICE: &str = "amaterasu.launch/1";
+const INPUT_SERVICE: &str = "amaterasu.input/1";
 const RTSP_SERVICE: &str = "amaterasu.rtsp/1";
 const DISPLAY_SERVICE: &str = "amaterasu.display/1";
 const STREAM_SESSION_SERVICE: &str = "amaterasu.stream-session/1";
@@ -26,6 +27,7 @@ const STREAM_SESSION_SERVICE: &str = "amaterasu.stream-session/1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     ReserveHistory,
+    ReadProtonPolicy,
     PreflightApplication,
     SnapshotDisplay,
     EnumerateDisplay,
@@ -133,6 +135,7 @@ impl Controller {
                         record.application_cleanup_blocked = true;
                     }
                     Phase::PreflightApplication
+                    | Phase::ReadProtonPolicy
                     | Phase::SnapshotDisplay
                     | Phase::EnumerateDisplay
                     | Phase::ConfirmDisplay => {}
@@ -169,6 +172,7 @@ impl Controller {
                     5_000,
                 )
             }
+            Phase::ReadProtonPolicy => (INPUT_SERVICE, json!({"action":"settings_get"}), 5_000),
             Phase::PreflightApplication => (
                 LAUNCH_SERVICE,
                 json!({
@@ -207,6 +211,8 @@ impl Controller {
                         "application_display_overrides": record.application_display_overrides,
                         "application_display_settings": record.application_display_settings,
                         "virtual_display_intent": record.virtual_display_intent,
+                        "proton_dualsense_compatibility": record
+                            .proton_dualsense_compatibility,
                         "frame_limiter_settings": record.frame_limiter_snapshot,
                         "client_frame_limiter_overrides":
                             client_frame_limiter_overrides(record),
@@ -438,7 +444,18 @@ impl Controller {
                     "unavailable"
                 };
                 if record.state == State::Starting {
-                    record.stage = Stage::PreflightApplication;
+                    record.stage = Stage::ReadProtonPolicy;
+                }
+            }
+            Phase::ReadProtonPolicy => {
+                if record.state == State::Starting {
+                    match proton_policy_response(&payload) {
+                        Ok(value) => {
+                            record.global_proton_dualsense_compatibility = Some(value);
+                            record.stage = Stage::PreflightApplication;
+                        }
+                        Err(code) => fail_record(record, code, now),
+                    }
                 }
             }
             Phase::PreflightApplication => match application_preflight_response(record, &payload) {
@@ -748,8 +765,11 @@ impl Controller {
                 record.history_state = "unavailable";
                 record.history_release_required = false;
                 if record.state == State::Starting {
-                    record.stage = Stage::PreflightApplication;
+                    record.stage = Stage::ReadProtonPolicy;
                 }
+            }
+            Phase::ReadProtonPolicy => {
+                fail_record(record, "input_policy_unavailable", now);
             }
             Phase::ReleaseHistory => {
                 record.cleanup_error = Some("history_release_unavailable");
@@ -809,12 +829,15 @@ impl Controller {
                 }
                 record.history_state = "unavailable";
                 if record.state == State::Starting {
-                    record.stage = Stage::PreflightApplication;
+                    record.stage = Stage::ReadProtonPolicy;
                 }
             }
             Phase::ReleaseHistory => {
                 record.cleanup_error = Some("history_release_unavailable");
                 record.stage = Stage::Cleanup;
+            }
+            Phase::ReadProtonPolicy => {
+                record.request_cleanup(Some("input_policy_unavailable"), now);
             }
             Phase::PreflightApplication => {
                 record.request_cleanup(Some("application_preflight_unavailable"), now);
@@ -909,6 +932,7 @@ impl Phase {
     fn name(self) -> &'static str {
         match self {
             Self::ReserveHistory => "reserve-history",
+            Self::ReadProtonPolicy => "read-proton-policy",
             Self::PreflightApplication => "preflight-launch",
             Self::SnapshotDisplay => "snapshot-display",
             Self::EnumerateDisplay => "enumerate-display",
@@ -940,6 +964,7 @@ fn needs_work(record: &Record, now: Instant) -> bool {
     matches!(
         record.stage,
         Stage::ReserveHistory
+            | Stage::ReadProtonPolicy
             | Stage::PreflightApplication
             | Stage::SnapshotDisplay
             | Stage::EnumerateDisplay
@@ -966,6 +991,7 @@ fn next_phase(record: &Record) -> Phase {
     }
     match record.stage {
         Stage::ReserveHistory => Phase::ReserveHistory,
+        Stage::ReadProtonPolicy => Phase::ReadProtonPolicy,
         Stage::PreflightApplication => Phase::PreflightApplication,
         Stage::SnapshotDisplay => Phase::SnapshotDisplay,
         Stage::EnumerateDisplay => Phase::EnumerateDisplay,
@@ -1638,6 +1664,14 @@ fn project_application_policy(
     application_overrides: &ApplicationConfigOverrides,
     profile: &mut super::StreamProfile,
 ) -> Result<(), &'static str> {
+    let global_proton_compatibility = record
+        .global_proton_dualsense_compatibility
+        .ok_or("input_policy_unavailable")?;
+    record.proton_dualsense_compatibility = record
+        .peer
+        .client_proton_dualsense_compatibility
+        .or(application_overrides.proton_dualsense_compatibility)
+        .unwrap_or(global_proton_compatibility);
     record.effective_software_encoder = record
         .global_software_encoder
         .with_overrides(&amaterasu_module_sdk::SoftwareEncoderOptions {
@@ -2538,6 +2572,15 @@ struct ApplicationPreflight {
     application_display_settings: Option<Value>,
     executable_path: Option<String>,
     cleanup_budget_ms: u64,
+}
+
+fn proton_policy_response(payload: &Value) -> Result<bool, &'static str> {
+    if payload["ok"] != true || payload["persisted"] != true {
+        return Err("input_policy_unavailable");
+    }
+    payload["values"]["proton_dualsense_compatibility"]
+        .as_bool()
+        .ok_or("invalid_input_policy_response")
 }
 
 fn application_preflight_response(

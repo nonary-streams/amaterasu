@@ -50,6 +50,7 @@ impl Broker {
                 assert!(matches!(
                     service.as_str(),
                     PAIRING_SERVICE
+                        | "amaterasu.input/1"
                         | "amaterasu.launch/1"
                         | "amaterasu.rtsp/1"
                         | "amaterasu.stream-session/1"
@@ -73,6 +74,12 @@ impl Broker {
                 }
                 let service = &self.services[&request];
                 let result = match (service.as_str(), payload["action"].as_str().unwrap()) {
+                    ("amaterasu.input/1", "settings_get") => json!({
+                        "ok":true,
+                        "persisted":true,
+                        "revision":1,
+                        "values":{"proton_dualsense_compatibility":true}
+                    }),
                     ("amaterasu.stream-session/1", "reserve_history_activity") => json!({
                         "ok":true,"reserved":true,"activity_id":payload["activity_id"],
                         "rtsp_operation_id":payload["rtsp_operation_id"]
