@@ -325,7 +325,7 @@ fn legacy_identity_paths(source_root: &Path) -> Result<(PathBuf, PathBuf), &'sta
         let contents = String::from_utf8(read_legacy_bytes(&path, MAX_LEGACY_STATE_BYTES)?)
             .map_err(|_| "legacy_pairing_invalid_layout")?;
         for line in contents.lines() {
-            let line = line.trim();
+            let line = strip_unquoted_comment(line).trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;
             }
@@ -356,6 +356,27 @@ fn legacy_identity_paths(source_root: &Path) -> Result<(PathBuf, PathBuf), &'sta
         None => contained_regular_file(&source_root, Path::new("credentials/cacert.pem"))?,
     };
     Ok((certificate, private_key))
+}
+
+fn strip_unquoted_comment(line: &str) -> &str {
+    let mut inside_double_quotes = false;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if inside_double_quotes && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        match character {
+            '"' => inside_double_quotes = !inside_double_quotes,
+            '#' if !inside_double_quotes => return &line[..index],
+            _ => {}
+        }
+    }
+    line
 }
 
 fn contained_regular_file(source_root: &Path, relative: &Path) -> Result<PathBuf, &'static str> {
@@ -628,6 +649,35 @@ mod tests {
             import_legacy_pairing(&fixture.0, fixture_now()),
             Err("legacy_pairing_invalid_layout")
         ));
+    }
+
+    #[test]
+    fn configured_identity_paths_keep_quoted_hashes_and_strip_trailing_comments() {
+        let fixture = TemporaryDirectory::new();
+        write_legacy_source(&fixture.0, true);
+        std::fs::create_dir_all(fixture.0.join("private")).unwrap();
+        let private_key_path = fixture.0.join("private/host#key.pem");
+        let certificate_path = fixture.0.join("private/host#cert.pem");
+        std::fs::write(&private_key_path, HOST_KEY).unwrap();
+        std::fs::write(&certificate_path, HOST_CERT).unwrap();
+        std::fs::write(
+            fixture.0.join("sunshine.conf"),
+            "pkey = \"private/host#key.pem\" # private key\ncert = \"private/host#cert.pem\" # certificate\n",
+        )
+        .unwrap();
+
+        let imported = import_legacy_pairing(&fixture.0, fixture_now()).unwrap();
+        let identity = imported.document.identity.unwrap();
+        assert_eq!(identity.private_key_pem, HOST_KEY);
+        assert_eq!(identity.certificate_pem, HOST_CERT);
+        assert_eq!(
+            std::fs::read(private_key_path).unwrap(),
+            HOST_KEY.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(certificate_path).unwrap(),
+            HOST_CERT.as_bytes()
+        );
     }
 
     #[test]

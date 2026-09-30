@@ -180,9 +180,11 @@ and [RustCrypto RSA](https://docs.rs/rsa/0.9.10/rsa/).
 ## Native TLS identity
 
 Pairing also provides `amaterasu.identity/1`, whose C table is defined by the
-ABI-only `amaterasu-identity` crate. It uses the same persisted host key/certificate
-and client records as pairing; there is no separate TLS key, identity generator or
-key export operation. Add a `native_provide` grant for this service to pairing.
+ABI-only `amaterasu-identity` crate. It serves pairing's effective host certificate
+and committed client records. With `host_configuration` enabled, the configured
+TLS files are authoritative; otherwise, pairing uses its persisted identity. The
+private key remains inside pairing, and no key-export operation is provided. Add a
+`native_provide` grant for this service to pairing.
 Consumers need both its `native_use` grant and membership in pairing's existing
 `transport_principals` setting. Administrator membership alone does not authorize
 native binding. A consumer warming through the public `identity` control action
@@ -222,12 +224,23 @@ trust when required, and must not let session resumption bypass revocation.
 
 ### Committed snapshot and availability
 
-At startup, native identity is unavailable until an existing identity/read operation
+When the platform enables `host_configuration`, the effective `pkey` and `cert`
+paths provide the TLS identity used by pairing and its native identity API. If both
+files are absent on first use, pairing generates a self-signed RSA identity and
+creates the configured files without replacing existing paths. Missing parent
+directories are created with Unix mode `0700`, and new Unix key and certificate
+files are mode `0600`. If only one file exists, or either existing file is unsafe
+or invalid, pairing fails closed and leaves the configured material untouched.
+With the platform provider disabled, pairing continues to use its persisted
+identity.
+
+At startup, native identity is unavailable until an identity/read operation
 successfully loads and validates durable pairing state (or initialization/import
-successfully commits). The public `identity` control action is the normal warm/reload
-path. Ordinary read-only loads keep the last known committed snapshot available;
-a successful same-revision reload preserves it, avoiding spurious failures for
-in-flight TLS handshakes. A changed revision replaces the entire snapshot atomically.
+successfully commits) and the configured TLS files validate. The public `identity`
+control action is the normal warm/reload path. Ordinary read-only loads keep the
+last known committed snapshot available; a successful same-revision reload
+preserves it, avoiding spurious failures for in-flight TLS handshakes. A changed
+revision replaces the entire snapshot atomically.
 
 Before a potentially durable mutation, pairing suspends the native snapshot. The
 new identity/client set is published only after the state service acknowledges its

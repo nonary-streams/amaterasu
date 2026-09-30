@@ -219,6 +219,79 @@ fn configured_identity_files_require_safe_paths_and_a_matching_valid_pair() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn configured_identity_provisions_both_missing_files_once_with_private_permissions() {
+    let directory = temporary_identity_directory();
+    let credentials = directory.join("credentials");
+    let certificate_path = credentials.join("cacert.pem");
+    let key_path = credentials.join("cakey.pem");
+    let now = current_time();
+
+    let configured = ConfiguredIdentity::load(
+        certificate_path.to_str().unwrap(),
+        key_path.to_str().unwrap(),
+        10,
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(&certificate_path).unwrap(),
+        configured.certificate_pem
+    );
+    assert_eq!(
+        fs::read_to_string(&key_path).unwrap(),
+        configured.private_key_pem
+    );
+    assert!(credentials.is_dir());
+
+    let reloaded = ConfiguredIdentity::load(
+        certificate_path.to_str().unwrap(),
+        key_path.to_str().unwrap(),
+        11,
+        current_time().max(now),
+    )
+    .unwrap();
+    assert_eq!(reloaded.certificate_pem, configured.certificate_pem);
+    assert_eq!(reloaded.private_key_pem, configured.private_key_pem);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&credentials).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for path in [&certificate_path, &key_path] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn configured_identity_does_not_repair_or_replace_a_partial_pair() {
+    let directory = temporary_identity_directory();
+    let certificate_path = directory.join("existing-certificate.pem");
+    let key_path = directory.join("missing-key.pem");
+    fs::write(&certificate_path, HOST_CERT).unwrap();
+
+    assert!(
+        ConfiguredIdentity::load(
+            certificate_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            12,
+            current_time(),
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read_to_string(&certificate_path).unwrap(), HOST_CERT);
+    assert!(!key_path.exists());
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn configured_identity_open_rejects_a_symlinked_effective_file() {

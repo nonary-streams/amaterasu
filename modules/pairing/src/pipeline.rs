@@ -112,7 +112,12 @@ impl Pipeline {
         mut send: impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         let result = match self.advance_host_configuration(now, &mut send) {
-            Ok(true) => self.drive(now, &mut send),
+            Ok(true) => {
+                let validation_time = self
+                    .configured_identity()
+                    .map_or(now, |identity| now.max(identity.minimum_validation_time));
+                self.drive(validation_time, &mut send)
+            }
             Ok(false)
                 if matches!(
                     &self.host_configuration,

@@ -1670,12 +1670,11 @@ fn configured_provider_missing_effective_key_or_certificate_fails_closed() {
 }
 
 #[test]
-fn missing_first_boot_files_recover_after_revision_change_and_matching_import() {
-    let (directory, effective, configured) = generated_configured_files();
+fn missing_first_boot_files_are_provisioned_before_pairing_reads_state() {
+    let (directory, effective, _) = generated_configured_files();
     std::fs::remove_file(effective["cert"].as_str().unwrap()).unwrap();
     std::fs::remove_file(effective["pkey"].as_str().unwrap()).unwrap();
     let mut harness = HostConfigurationHarness::new(effective.clone());
-    harness.revision = 0;
     let mut pipeline =
         Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
     let time = std::time::SystemTime::now()
@@ -1683,58 +1682,35 @@ fn missing_first_boot_files_recover_after_revision_change_and_matching_import() 
         .unwrap()
         .as_secs();
 
-    let unavailable = harness.request(&mut pipeline, "console", json!({"action":"identity"}), time);
-    assert_eq!(unavailable["code"], "host_configuration_unavailable");
-    assert!(pipeline.identity.get(time).is_err());
+    let response = harness.request(&mut pipeline, "console", json!({"action":"identity"}), time);
+    assert_eq!(response["code"], "not_initialized");
+    assert_eq!(harness.state_requests, 1);
+    assert_eq!(harness.state_writes, 0);
     assert_eq!(harness.actions, ["readiness", "get"]);
 
-    harness.revision = 1;
-    std::fs::write(
-        effective["cert"].as_str().unwrap(),
-        &configured.certificate_pem,
+    let certificate_path = effective["cert"].as_str().unwrap();
+    let key_path = effective["pkey"].as_str().unwrap();
+    let provisioned_certificate = std::fs::read_to_string(certificate_path).unwrap();
+    let provisioned_key = std::fs::read_to_string(key_path).unwrap();
+    let configured = crate::identity::ConfiguredIdentity::load(
+        certificate_path,
+        key_path,
+        harness.revision,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
     )
     .unwrap();
-    std::fs::write(
-        effective["pkey"].as_str().unwrap(),
-        &configured.private_key_pem,
-    )
-    .unwrap();
-    harness.enqueue(
-        "console",
-        json!({
-            "action":"import_identity",
-            "certificate_pem":configured.certificate_pem,
-            "private_key_pem":configured.private_key_pem
-        }),
-    );
-    pipeline
-        .tick_at(time, |command| harness.send(command))
-        .unwrap();
-    assert!(
-        harness.output.is_none(),
-        "import waits for the next configuration retry"
-    );
-    for _ in 0..6 {
-        pipeline
-            .tick_at(time + 1, |command| harness.send(command))
-            .unwrap();
-        if harness.output.is_some() {
-            break;
-        }
-    }
-    let imported = harness
-        .output
-        .take()
-        .expect("deferred import must finish after recovery");
-    assert_eq!(imported["ok"], true, "{imported}");
-    assert_eq!(harness.state_writes, 1);
-    assert_eq!(harness.actions, ["readiness", "get", "readiness", "get"]);
-    assert_eq!(harness.operations.len(), 4);
-    assert_ne!(harness.operations[0], harness.operations[2]);
-    assert_ne!(harness.operations[1], harness.operations[3]);
+    assert_eq!(configured.certificate_pem, provisioned_certificate);
+    assert_eq!(configured.private_key_pem, provisioned_key);
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     assert_eq!(
-        pipeline.identity.get(time + 1).unwrap().certificate(),
-        crypto_certificate_der(&configured.certificate_pem)
+        pipeline.identity.get(current_time).unwrap().certificate(),
+        crypto_certificate_der(&provisioned_certificate)
     );
     std::fs::remove_dir_all(directory).unwrap();
 }

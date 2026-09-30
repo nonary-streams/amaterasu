@@ -29,6 +29,7 @@ pub struct ConfiguredIdentity {
     pub(crate) certificate_pem: String,
     pub(crate) private_key_pem: String,
     pub(crate) provider_revision: u64,
+    pub(crate) minimum_validation_time: u64,
 }
 
 impl ConfiguredIdentity {
@@ -38,6 +39,11 @@ impl ConfiguredIdentity {
         provider_revision: u64,
         now: u64,
     ) -> Result<Self, &'static str> {
+        let validation_time = super::provision::create_missing_identity_pair(
+            certificate_path,
+            private_key_path,
+            now,
+        )?;
         let certificate_pem = read_identity_file(certificate_path)?;
         let private_key_pem = read_identity_file(private_key_path)?;
         let validation_identity = Identity {
@@ -45,11 +51,13 @@ impl ConfiguredIdentity {
             certificate_pem: certificate_pem.clone(),
             private_key_pem: private_key_pem.clone(),
         };
-        crypto::validate_identity(&validation_identity, now).map_err(|_| "invalid_identity")?;
+        crypto::validate_identity(&validation_identity, validation_time)
+            .map_err(|_| "invalid_identity")?;
         Ok(Self {
             certificate_pem,
             private_key_pem,
             provider_revision,
+            minimum_validation_time: validation_time,
         })
     }
 }

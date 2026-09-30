@@ -1,4 +1,5 @@
 //! Native TLS identity boundary: immutable bindings share only committed snapshots.
+mod provision;
 mod snapshot;
 use amaterasu_identity::*;
 use amaterasu_module_sdk::abi::*;
