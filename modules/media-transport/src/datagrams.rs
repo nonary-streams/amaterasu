@@ -498,9 +498,7 @@ impl Delivery {
 }
 
 fn bound_socket(local: SocketAddr) -> io::Result<UdpSocket> {
-    let socket = UdpSocket::bind(local)?;
-    socket.set_nonblocking(true)?;
-    Ok(socket)
+    amaterasu_network_policy::bind_udp(local)
 }
 
 #[cfg(test)]

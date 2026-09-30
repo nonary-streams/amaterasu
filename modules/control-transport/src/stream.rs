@@ -71,10 +71,8 @@ impl Stream {
             ControlOrdering::MultipleChannels,
         )
         .map_err(|_| "encryption_failed")?;
-        let socket = UdpSocket::bind(request.local()).map_err(|_| "udp_bind_failed")?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|_| "udp_configuration_failed")?;
+        let socket =
+            amaterasu_network_policy::bind_udp(request.local()).map_err(|_| "udp_bind_failed")?;
         let local = socket
             .local_addr()
             .map_err(|_| "udp_configuration_failed")?;

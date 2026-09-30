@@ -14,6 +14,36 @@ fn stream() -> Stream {
     Stream::open("owner", &request, &[0x35; 16], 0).unwrap()
 }
 
+#[test]
+fn actual_control_stream_uses_ipv6_loopback_and_releases_its_exact_port() {
+    let request = Open {
+        peer_ip: "::1".parse().unwrap(),
+        peer_port: None,
+        local_bind: Some("[::1]:0".parse().unwrap()),
+        connect_data: 7,
+        key_hex: "35".repeat(16),
+        ping_timeout_ms: 10_000,
+        operation_id: None,
+    };
+    let key = request.validate(false).unwrap();
+    let stream = Stream::open("owner", &request, &key, 0).unwrap();
+    let local = stream.local;
+    assert_eq!(local.ip(), request.peer_ip);
+    assert_ne!(local.port(), 0);
+    let ipv4_same_port =
+        UdpSocket::bind(SocketAddr::new("127.0.0.1".parse().unwrap(), local.port())).unwrap();
+    assert!(amaterasu_network_policy::bind_udp(local).is_err());
+    drop(stream);
+    assert_eq!(
+        amaterasu_network_policy::bind_udp(local)
+            .unwrap()
+            .local_addr()
+            .unwrap(),
+        local
+    );
+    drop(ipv4_same_port);
+}
+
 fn client() -> ControlSealer {
     ControlSealer::new(
         &[0x35; 16],

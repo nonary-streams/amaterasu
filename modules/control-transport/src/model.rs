@@ -1,3 +1,4 @@
+use amaterasu_network_policy::{valid_peer, validate_local_bind};
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -56,13 +57,8 @@ impl Open {
             return Err("remote_disabled");
         }
         validate_ping_timeout_ms(self.ping_timeout_ms)?;
-        if let Some(local) = self.local_bind
-            && (local.is_ipv4() != self.peer_ip.is_ipv4()
-                || local.ip().is_multicast()
-                || mapped_ipv4(local.ip())
-                || (!allow_remote && !local.ip().is_loopback()))
-        {
-            return Err("invalid_bind");
+        if let Some(local) = self.local_bind {
+            validate_local_bind(local.ip(), self.peer_ip, allow_remote)?;
         }
         if self
             .operation_id
@@ -99,17 +95,6 @@ pub fn validate_ping_timeout_ms(value: i64) -> ControlResult<u64> {
         return Err("invalid_ping_timeout");
     }
     Ok(value as u64)
-}
-
-fn valid_peer(peer: IpAddr) -> bool {
-    !peer.is_unspecified()
-        && !peer.is_multicast()
-        && peer != IpAddr::V4(Ipv4Addr::BROADCAST)
-        && !mapped_ipv4(peer)
-}
-
-fn mapped_ipv4(address: IpAddr) -> bool {
-    matches!(address, IpAddr::V6(address) if address.to_ipv4_mapped().is_some())
 }
 
 pub fn valid_name(name: &str) -> bool {

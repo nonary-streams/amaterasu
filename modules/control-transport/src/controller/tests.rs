@@ -138,3 +138,29 @@ fn invalid_remote_bind_and_key_inputs_fail_before_resource_admission() {
     assert!(controller.operations.is_empty());
     assert!(controller.used_keys.is_empty());
 }
+
+#[test]
+fn remote_opt_in_does_not_admit_broadcast_multicast_mapped_or_mismatched_binds() {
+    let mut controller = configured();
+    controller.settings.allow_remote = true;
+    for (peer, local) in [
+        ("127.0.0.1", "255.255.255.255:0"),
+        ("127.0.0.1", "239.1.2.3:0"),
+        ("127.0.0.1", "[::1]:0"),
+        ("::1", "[ff02::1]:0"),
+        ("::1", "[::ffff:127.0.0.1]:0"),
+        ("::1", "127.0.0.1:0"),
+    ] {
+        let mut specification = request();
+        specification.peer_ip = peer.parse().unwrap();
+        specification.local_bind = Some(local.parse().unwrap());
+        assert_eq!(
+            controller.open("alice", specification).err(),
+            Some("invalid_bind")
+        );
+    }
+    assert!(controller.streams.is_empty());
+    assert!(controller.operations.is_empty());
+    assert!(controller.issued_ids.is_empty());
+    assert!(controller.used_keys.is_empty());
+}

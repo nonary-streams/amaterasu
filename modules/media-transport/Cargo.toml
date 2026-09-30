@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 amaterasu-module-sdk.workspace = true
 amaterasu-media.workspace = true
 amaterasu-gamestream.workspace = true
+amaterasu-network-policy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 getrandom = "0.3"

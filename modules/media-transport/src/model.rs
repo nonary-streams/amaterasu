@@ -1,4 +1,5 @@
 use amaterasu_gamestream::network::{NetworkEncryptionPolicy, VideoEncryptionMode};
+use amaterasu_network_policy::{valid_peer, validate_local_bind};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -212,11 +213,7 @@ impl Open {
     pub fn validate(&self, allow_remote: bool) -> TransportResult<()> {
         self.validate_video_encryption_policy()?;
         validate_ping_timeout_ms(self.ping_timeout_ms)?;
-        if self.peer_ip.is_unspecified()
-            || self.peer_ip.is_multicast()
-            || matches!(self.peer_ip, IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some())
-            || self.peer_ip == IpAddr::V4(Ipv4Addr::BROADCAST)
-        {
+        if !valid_peer(self.peer_ip) {
             return Err("invalid_destination");
         }
         match (self.video_port, self.audio_port, &self.discovery) {
@@ -233,12 +230,7 @@ impl Open {
             return Err("invalid_video_configuration");
         }
         for bind in [self.video_bind, self.audio_bind].into_iter().flatten() {
-            if bind.is_ipv4() != self.peer_ip.is_ipv4()
-                || bind.ip().is_multicast()
-                || (!allow_remote && !bind.ip().is_loopback())
-            {
-                return Err("invalid_bind");
-            }
+            validate_local_bind(bind.ip(), self.peer_ip, allow_remote)?;
         }
         if !matches!(self.audio.packet_ms, 5 | 10)
             || !matches!(self.audio.channels, 2 | 6 | 8)
@@ -351,6 +343,30 @@ pub fn validate_operation(operation: &str) -> TransportResult<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn remote_opt_in_still_rejects_unsafe_or_mismatched_video_and_audio_binds() {
+        for field in ["video_bind", "audio_bind"] {
+            for (peer, bind) in [
+                ("127.0.0.1", "255.255.255.255:0"),
+                ("127.0.0.1", "239.1.2.3:0"),
+                ("127.0.0.1", "[::1]:0"),
+                ("::1", "[ff02::1]:0"),
+                ("::1", "[::ffff:127.0.0.1]:0"),
+                ("::1", "127.0.0.1:0"),
+            ] {
+                let mut specification = json!({
+                    "peer_ip":peer,
+                    "video_port":50001,
+                    "audio_port":50002,
+                    "audio":{"packet_ms":10,"channels":2,"wire_payload_bytes":4}
+                });
+                specification[field] = bind.into();
+                let request: Open = serde_json::from_value(specification).unwrap();
+                assert_eq!(request.validate(true), Err("invalid_bind"));
+            }
+        }
+    }
 
     #[test]
     fn missing_stream_audio_field_preserves_the_enabled_legacy_default() {

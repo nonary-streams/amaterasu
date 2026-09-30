@@ -57,6 +57,45 @@ fn open_rejects_policy_mismatch_before_udp_setup() {
     ));
 }
 
+#[test]
+fn actual_media_stream_sends_over_ipv6_loopback_and_releases_both_ports() {
+    let video = UdpSocket::bind("[::1]:0").unwrap();
+    let audio = UdpSocket::bind("[::1]:0").unwrap();
+    video
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut specification = request(&video, &audio, false);
+    specification.peer_ip = "::1".parse().unwrap();
+    specification.video_bind = Some("[::1]:0".parse().unwrap());
+    specification.audio_bind = Some("[::1]:0".parse().unwrap());
+    specification.validate(false).unwrap();
+    let mut stream = Stream::open("owner", &specification).unwrap();
+    let locals = [stream.video_local, stream.audio_local];
+    for local in locals {
+        assert_eq!(local.ip(), specification.peer_ip);
+        assert_ne!(local.port(), 0);
+        assert!(amaterasu_network_policy::bind_udp(local).is_err());
+    }
+    let frame = [0, 0, 0, 1, 0x65, 1, 2, 3];
+    // SAFETY: the owned frame remains live through this synchronous submission.
+    assert_eq!(
+        unsafe { stream.submit_video(&video_packet(&frame, 0)) },
+        STATUS_OK
+    );
+    stream.delivery.tick();
+    assert!(!receive(&video).is_empty());
+    drop(stream);
+    for local in locals {
+        assert_eq!(
+            amaterasu_network_policy::bind_udp(local)
+                .unwrap()
+                .local_addr()
+                .unwrap(),
+            local
+        );
+    }
+}
+
 pub(crate) fn video_packet(bytes: &[u8], sequence: u64) -> EncodedPacket {
     EncodedPacket {
         codec: CODEC_H264,

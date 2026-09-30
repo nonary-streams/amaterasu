@@ -7,6 +7,7 @@ members = [
     "crates/identity",
     "crates/gamestream",
     "crates/input-policy",
+    "crates/network-policy",
     "crates/contracts",
     "crates/runtime",
     "crates/package",
@@ -64,6 +65,7 @@ amaterasu-windows-capture-geometry = { path = "crates/windows-capture-geometry" 
 amaterasu-identity = { path = "crates/identity" }
 amaterasu-gamestream = { path = "crates/gamestream" }
 amaterasu-input-policy = { path = "crates/input-policy" }
+amaterasu-network-policy = { path = "crates/network-policy" }
 amaterasu-contracts = { path = "crates/contracts" }
 amaterasu-package = { path = "crates/package" }
 amaterasu-module-sdk = { path = "crates/module-sdk" }
