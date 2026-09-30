@@ -443,9 +443,12 @@ raw commands during execution rather than at reference configuration parsing;
 Raw undo now snapshots max(exit timeout, 15 seconds) for ordinary and provider
 preparation leases. Sequential cleanup receives a conservative bounded budget,
 with contained children and failed undo retained until settlement or retry.
-Structured deadlines retain their explicit policy; raw do stays bounded at ten
-seconds. Settled command outcomes are reported without transcripts, and large
-reports paginate within the broker payload limit. Shared output, Windows
+Structured deadlines retain their explicit policy; raw `do` waits for the child
+to exit without an execution deadline and remains cancellable through its owned
+preparation lease. The public launch admission and response path still needs its
+signed test beyond forty seconds. Settled command outcomes are reported without
+transcripts, and large reports paginate within the broker payload limit. Shared
+output, Windows
 elevation and the reference's detach/forget failure behavior remain unqualified.
 `global:global_prep_cmd` and `per_application:exclude-global-prep-cmd` therefore
 remain pending despite the working structured lifecycle.
