@@ -1,9 +1,10 @@
 # UPnP listener mapping lifecycle
 
-This crate provides an owned UPnP mapping lifecycle. The caller supplies live
-listener endpoints to `MappingManager::reconcile` or protocol-specific endpoints
-to `MappingManager::reconcile_protocols`; inactive, zero-port, and IPv6 endpoints
-are skipped. External and internal ports are the same.
+This crate provides owned UPnP lifecycles for IPv4 port mappings and IPv6 firewall
+pinholes. The caller supplies live listener endpoints to
+`MappingManager::reconcile` or protocol-specific endpoints to
+`MappingManager::reconcile_protocols`; the IPv4 adapter skips inactive,
+zero-port, and IPv6 endpoints. External and internal IPv4 ports are the same.
 
 Reconcile creates every replacement before removing stale mappings. If an add
 fails, mappings created during that attempt are rolled back and the old owned
@@ -36,8 +37,21 @@ must schedule refreshes.
 `discover_gateway` applies the crate's two-second search timeout and returns
 discovery errors. Mapping, cleanup, and refresh errors are returned to the
 caller.
-Tests use a deterministic fake gateway and do not contact a router. The current
-adapter manages IPv4 port mappings; it does not open IPv6 firewall pinholes.
+
+`discover_ipv6_firewalls` separately searches `ff02::c` from each selected local
+IPv6 interface, retaining that interface scope for the gateway's link-local
+control endpoint. `PinholeManager` uses `WANIPv6FirewallControl`, asks for a
+3600-second lease, refreshes owned pinhole IDs on the caller's schedule, and
+deletes only IDs created by that manager. As in the reference behavior,
+`GetFirewallStatus` gates additions on `NewInboundPinholeAllowed`; the reported
+firewall-enabled bit is informational. The NVHTTP caller runs discovery and
+refresh every 120 seconds and removes owned pinholes during orderly shutdown.
+This exact-ID tracking and cleanup is a stricter lifecycle than the pinned
+implementation, which relies on lease expiry after `AddPinhole`.
+
+Tests use deterministic fake IPv4/IPv6 gateway controls and local protocol
+fixtures; they do not contact a router or change host firewall state. No physical
+router interoperability test has been run.
 
 Mapping ownership is deliberately stricter than the pinned implementation:
 pre-existing or externally changed conflicts are preserved instead of deleted.
