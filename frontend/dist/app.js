@@ -4067,11 +4067,97 @@ var Amaterasu;
     }
     Amaterasu.parseOutputNameSelection = parseOutputNameSelection;
     function parseCaptureSelection(value) {
-        if (value === "auto" || value === "ddx" || value === "wgc" || value === "wgcc")
+        if (value === "auto" || value === "ddx" || value === "wgc" || value === "wgcc" || value === "pipewire")
             return value;
-        throw new Error("Choose Automatic, Desktop Duplication, or a Windows Graphics Capture mode.");
+        throw new Error("Choose Automatic, Desktop Duplication, a Windows Graphics Capture mode, or PipeWire.");
     }
     Amaterasu.parseCaptureSelection = parseCaptureSelection;
+    function parsePipewireCaptureReply(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("PipeWire capture status is invalid.");
+        const reply = value;
+        const selectionStates = ["permission_required", "selecting", "ready", "denied", "failed", "cancelled"];
+        if ((reply.availability !== "available" && reply.availability !== "unavailable") ||
+            !selectionStates.includes(reply.selection_state))
+            throw new Error("PipeWire capture status is invalid.");
+        if (reply.reason !== undefined && (typeof reply.reason !== "string" || reply.reason.length > 64 || !/^[a-z0-9_]+$/.test(reply.reason)))
+            throw new Error("PipeWire capture status is invalid.");
+        if (reply.source_type !== undefined && reply.source_type !== "monitor" && reply.source_type !== "window")
+            throw new Error("PipeWire capture status is invalid.");
+        for (const dimension of ["width", "height"]) {
+            if (reply[dimension] !== undefined && (!Number.isSafeInteger(reply[dimension]) || reply[dimension] < 1 || reply[dimension] > 32768))
+                throw new Error("PipeWire capture status is invalid.");
+        }
+        if (reply.operation_id !== undefined && typeof reply.operation_id !== "string")
+            throw new Error("PipeWire capture status is invalid.");
+        return {
+            availability: reply.availability,
+            selection_state: reply.selection_state,
+            ...(reply.reason === undefined ? {} : { reason: reply.reason }),
+            ...(reply.source_type === undefined ? {} : { source_type: reply.source_type }),
+            ...(reply.width === undefined ? {} : { width: reply.width }),
+            ...(reply.height === undefined ? {} : { height: reply.height }),
+            ...(reply.operation_id === undefined ? {} : { operation_id: reply.operation_id }),
+        };
+    }
+    Amaterasu.parsePipewireCaptureReply = parsePipewireCaptureReply;
+    function pipewireUnavailableDescription(reason) {
+        switch (reason) {
+            case "not_linux": return "PipeWire source selection is available on Linux hosts only.";
+            case "portal_unavailable": return "The desktop capture portal is unavailable. Start a supported desktop session and refresh.";
+            case "capture_unavailable": return "PipeWire capture is unavailable on this host.";
+            default: return "PipeWire source selection is unavailable on this host.";
+        }
+    }
+    function pipewireSelectionDescription(reply) {
+        if (reply.availability === "unavailable")
+            return pipewireUnavailableDescription(reply.reason);
+        switch (reply.selection_state) {
+            case "ready": {
+                const source = reply.source_type === "window" ? "Window" : "Monitor";
+                return reply.width !== undefined && reply.height !== undefined
+                    ? `${source} source selected (${reply.width} × ${reply.height}).`
+                    : `${source} source selected.`;
+            }
+            case "permission_required": return "Choose a monitor or window to grant capture permission.";
+            case "selecting": return "A source chooser is currently open.";
+            case "denied": return "Source selection was denied.";
+            case "cancelled": return "Source selection was cancelled.";
+            case "failed": return "Source selection failed. Refresh and try again.";
+        }
+    }
+    Amaterasu.pipewireSelectionDescription = pipewireSelectionDescription;
+    async function waitForPipewireSelection(api, operationId, isActive, onState, pollIntervalMs = 400, timeoutMs = 15_000) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline && isActive()) {
+            await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+            if (!isActive())
+                break;
+            let timeout;
+            const poll = api.post("capture/pipewire_selection_poll", { operation_id: operationId });
+            let rawReply;
+            try {
+                rawReply = await Promise.race([
+                    poll,
+                    new Promise((_, reject) => {
+                        timeout = setTimeout(() => reject(new Error("Source selection timed out and was cancelled.")), Math.max(1, Math.min(2_000, deadline - Date.now())));
+                    }),
+                ]);
+            }
+            finally {
+                if (timeout !== undefined)
+                    clearTimeout(timeout);
+            }
+            const reply = parsePipewireCaptureReply(rawReply);
+            onState(reply);
+            if (reply.selection_state !== "selecting" && reply.selection_state !== "permission_required")
+                return;
+        }
+        await api.post("capture/pipewire_selection_cancel", { operation_id: operationId });
+        if (isActive())
+            throw new Error("Source selection timed out and was cancelled.");
+    }
+    Amaterasu.waitForPipewireSelection = waitForPipewireSelection;
     function parseVideoMaxBatchSize(value) {
         if (value.trim() === "")
             return null;
@@ -4638,6 +4724,7 @@ var Amaterasu;
         const hostLoggingLoads = new HostLoggingLoadGate();
         const hostArea = Amaterasu.el("div");
         const hostLoads = new NvhttpSettingsLoadGate();
+        const pipewireArea = Amaterasu.el("div");
         const steamArea = Amaterasu.el("div");
         const steamLoads = new ImportSettingsLoadGate();
         const lutrisArea = Amaterasu.el("div");
@@ -4655,15 +4742,116 @@ var Amaterasu;
             void loadAuth();
             void loadHostLogging();
             void loadHost();
+            void loadPipewireChooser();
             void loadSteam();
             void loadLutris();
             void loadPlaynite();
             void loadInput();
             void loadHistorySettings();
             void loadPairing();
-        })), area, authArea, hostLoggingArea, hostArea, steamArea, lutrisArea, playniteArea, inputArea, historyArea, pairingArea);
+        })), area, authArea, hostLoggingArea, hostArea, steamArea, lutrisArea, playniteArea, inputArea, historyArea, pairingArea, pipewireArea);
         Amaterasu.renderManagementPolicy(context);
         Amaterasu.renderCsrfPolicy(context);
+        let pipewireGeneration = 0;
+        let pipewireOperation = 0;
+        async function loadPipewireChooser() {
+            const generation = ++pipewireGeneration;
+            pipewireOperation += 1;
+            const status = Amaterasu.el("p", "muted", "Checking PipeWire capture availability…");
+            status.setAttribute("role", "status");
+            status.setAttribute("aria-live", "polite");
+            const monitor = Amaterasu.button("Choose a monitor", () => void beginPipewireSelection("monitor"), "secondary");
+            const windowSource = Amaterasu.button("Choose a window", () => void beginPipewireSelection("window"), "secondary");
+            monitor.disabled = true;
+            windowSource.disabled = true;
+            pipewireArea.replaceChildren(Amaterasu.panel("PipeWire source", Amaterasu.el("p", "muted", "Choose a source explicitly for the current host session. This does not change the saved capture backend."), Amaterasu.el("div", "actions", monitor, windowSource), status));
+            if (!context.api.allows("capture.read")) {
+                status.textContent = "PipeWire source status requires capture.read.";
+                return;
+            }
+            try {
+                const reply = parsePipewireCaptureReply(await context.api.post("capture/pipewire_status"));
+                if (!pipewireArea.isConnected || generation !== pipewireGeneration)
+                    return;
+                status.textContent = pipewireSelectionDescription(reply);
+                const available = reply.availability === "available";
+                monitor.disabled = !available || !context.api.allows("capture.write");
+                windowSource.disabled = !available || !context.api.allows("capture.write");
+                if (available && !context.api.allows("capture.write"))
+                    status.textContent += " Starting selection requires capture.write.";
+            }
+            catch (error) {
+                if (!pipewireArea.isConnected || generation !== pipewireGeneration)
+                    return;
+                status.textContent = error instanceof Amaterasu.ApiError && error.code === "forbidden"
+                    ? "PipeWire source status requires capture.read."
+                    : "PipeWire source status is unavailable; refresh to check again.";
+            }
+        }
+        async function beginPipewireSelection(sourceType) {
+            if (!context.api.allows("capture.write"))
+                return;
+            const operation = ++pipewireOperation;
+            const status = pipewireArea.querySelector("[role=status]");
+            const monitor = Array.from(pipewireArea.querySelectorAll("button")).find((item) => item.textContent === "Choose a monitor");
+            const windowSource = Array.from(pipewireArea.querySelectorAll("button")).find((item) => item.textContent === "Choose a window");
+            if (!status)
+                return;
+            if (monitor)
+                monitor.disabled = true;
+            if (windowSource)
+                windowSource.disabled = true;
+            let cancelled = false;
+            const cancel = Amaterasu.button("Cancel selection", () => {
+                cancelled = true;
+                cancel.disabled = true;
+                status.textContent = "Cancelling source selection…";
+            }, "secondary");
+            const cancelOperation = Amaterasu.el("div", "actions", cancel);
+            pipewireArea.append(cancelOperation);
+            status.textContent = "Opening the desktop source chooser…";
+            let operationId = null;
+            try {
+                const requestedId = crypto.randomUUID();
+                parsePipewireCaptureReply(await context.api.post("capture/pipewire_selection_begin", {
+                    source_type: sourceType,
+                    operation_id: requestedId,
+                }));
+                operationId = requestedId;
+                const active = () => pipewireArea.isConnected && pipewireOperation === operation && !cancelled;
+                await waitForPipewireSelection(context.api, operationId, active, (reply) => {
+                    if (active())
+                        status.textContent = pipewireSelectionDescription(reply);
+                });
+                if (pipewireArea.isConnected && pipewireOperation === operation) {
+                    const finalStatus = parsePipewireCaptureReply(await context.api.post("capture/pipewire_selection_poll", { operation_id: operationId }));
+                    status.textContent = pipewireSelectionDescription(finalStatus);
+                }
+            }
+            catch (error) {
+                if (operationId !== null) {
+                    if (!(error instanceof Error && error.message === "Source selection timed out and was cancelled.")) {
+                        try {
+                            await context.api.post("capture/pipewire_selection_cancel", { operation_id: operationId });
+                        }
+                        catch { }
+                    }
+                }
+                if (pipewireArea.isConnected && pipewireOperation === operation)
+                    status.textContent = error instanceof Amaterasu.ApiError && error.code === "forbidden"
+                        ? "PipeWire source selection requires capture.write."
+                        : "Source selection failed or timed out. Refresh and check the current status.";
+            }
+            finally {
+                cancelOperation.remove();
+                if (pipewireArea.isConnected && pipewireOperation === operation) {
+                    if (monitor)
+                        monitor.disabled = false;
+                    if (windowSource)
+                        windowSource.disabled = false;
+                }
+            }
+        }
         async function loadAuth() {
             authArea.replaceChildren(Amaterasu.el("p", "muted", "Loading authentication lifetimes…"));
             try {
@@ -5811,6 +5999,7 @@ var Amaterasu;
         void loadAuth();
         void loadHostLogging();
         void loadHost();
+        void loadPipewireChooser();
         void loadSteam();
         void loadLutris();
         void loadPlaynite();

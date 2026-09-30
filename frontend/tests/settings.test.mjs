@@ -4,7 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 
-const context = vm.createContext({ TextEncoder, URL });
+const context = vm.createContext({ TextEncoder, URL, setTimeout, clearTimeout });
 vm.runInContext(
   ts.transpile(readFileSync("src/model.ts", "utf8"), { target: ts.ScriptTarget.ES2022 }),
   context,
@@ -2443,12 +2443,49 @@ test("capture output selection preserves exact IDs and automatic reset", () => {
     assert.throws(() => parse(invalid));
 });
 
-test("capture backend selection accepts only the four supported modes", () => {
+test("capture backend selection accepts supported modes including PipeWire", () => {
   const parse = context.Amaterasu.parseCaptureSelection;
-  for (const mode of ["auto", "ddx", "wgc", "wgcc"])
+  for (const mode of ["auto", "ddx", "wgc", "wgcc", "pipewire"])
     assert.equal(parse(mode), mode);
   for (const invalid of ["", "dxgi", "WGC", "wgcc ", "other"])
     assert.throws(() => parse(invalid));
+});
+
+test("PipeWire chooser replies validate only safe status and describe availability without metadata", () => {
+  const parse = context.Amaterasu.parsePipewireCaptureReply;
+  const describe = context.Amaterasu.pipewireSelectionDescription;
+  assert.equal(describe(parse({ availability: "unavailable", selection_state: "failed", reason: "portal_unavailable" })),
+    "The desktop capture portal is unavailable. Start a supported desktop session and refresh.");
+  assert.equal(describe(parse({ availability: "available", selection_state: "ready", source_type: "monitor", width: 1920, height: 1080 })),
+    "Monitor source selected (1920 × 1080).");
+  assert.equal(describe(parse({ availability: "available", selection_state: "denied" })),
+    "Source selection was denied.");
+  for (const invalid of [
+    { availability: "available", selection_state: "ready", width: 0, height: 1080 },
+    { availability: "available", selection_state: "ready", source_type: "screen" },
+    { availability: "available", selection_state: "ready", reason: "raw D-Bus error" },
+  ]) assert.throws(() => parse(invalid));
+});
+
+test("PipeWire chooser polls until a terminal state and cancels on close or timeout", async () => {
+  const calls = [];
+  const replies = [
+    { availability: "available", selection_state: "selecting" },
+    { availability: "available", selection_state: "ready", source_type: "window", width: 800, height: 600 },
+  ];
+  const api = { async post(route, body) { calls.push([route, body]); return replies.shift(); } };
+  const seen = [];
+  await context.Amaterasu.waitForPipewireSelection(api, "opaque-handle", () => true, (reply) => seen.push(reply.selection_state), 1, 100);
+  assert.deepEqual(calls.map(([route]) => route), ["capture/pipewire_selection_poll", "capture/pipewire_selection_poll"]);
+  assert.deepEqual(calls.map(([, body]) => ordinary(body)), [{ operation_id: "opaque-handle" }, { operation_id: "opaque-handle" }]);
+  assert.deepEqual(seen, ["selecting", "ready"]);
+
+  const cancelCalls = [];
+  const cancelApi = { async post(route, body) { cancelCalls.push([route, ordinary(body)]); return {}; } };
+  await context.Amaterasu.waitForPipewireSelection(cancelApi, "private-handle", () => false, () => {}, 1, 100);
+  assert.deepEqual(cancelCalls, [["capture/pipewire_selection_cancel", { operation_id: "private-handle" }]]);
+  await assert.rejects(context.Amaterasu.waitForPipewireSelection(cancelApi, "expired-handle", () => true, () => {}, 1, 0), /timed out and was cancelled/);
+  assert.equal(cancelCalls.at(-1)[0], "capture/pipewire_selection_cancel");
 });
 
 test("video batch size editor preserves default and bounded reference values", () => {

@@ -139,7 +139,7 @@ namespace Amaterasu {
     configured_bind_address: string | null;
     configured_output_name: string | null;
     effective_output_name: string | null;
-    configured_capture: "auto" | "ddx" | "wgc" | "wgcc";
+    configured_capture: "auto" | "ddx" | "wgc" | "wgcc" | "pipewire";
     capture_provider: "dxgi" | "wgc" | null;
     configured_video_max_batch_size_kb: number | null;
     effective_video_max_batch_size_kb: number;
