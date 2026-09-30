@@ -1,7 +1,9 @@
 use super::record::{Record, State};
 use amaterasu_gamestream::control::{
-    AbsoluteViewport, Input, InputEvent, InputTranslator, MouseButton, PenTouch, PointerDevice,
-    PointerEvent, ScrollAxis, TranslatedKeyState, TranslationError,
+    AbsoluteViewport, ControllerArrival, ControllerBattery, ControllerBatteryState,
+    ControllerMotion, ControllerMotionType, ControllerTouch, ControllerTouchEvent, Input,
+    InputEvent, InputTranslator, MouseButton, PenTouch, PointerDevice, PointerEvent, ScrollAxis,
+    TranslatedKeyState, TranslationError,
 };
 use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
@@ -55,12 +57,12 @@ pub(super) fn next_input_batch_size(record: &Record) -> usize {
     let Some(first) = record.input_events.front() else {
         return 0;
     };
-    let controller_batch = first["kind"] == "controller";
+    let controller_batch = is_controller_payload(first);
     record
         .input_events
         .iter()
         .take(MAX_BATCH_EVENTS)
-        .take_while(|event| (event["kind"] == "controller") == controller_batch)
+        .take_while(|event| is_controller_payload(event) == controller_batch)
         .count()
 }
 
@@ -105,8 +107,15 @@ pub(super) fn queue_control_input(
     }
     // Require an explicit capability from the active backend lease so a host
     // without virtual gamepad support can keep processing keyboard and mouse.
-    if matches!(&input, Input::Controller(_)) && !record.input_controller_supported {
+    if is_controller_input(&input) && !record.input_controller_supported {
         record.unsupported_controls = record.unsupported_controls.saturating_add(1);
+        return Ok(());
+    }
+    if let Some(event) = controller_payload(&input) {
+        if record.input_events.len() >= MAX_QUEUED_EVENTS {
+            return Err("input_queue_overflow");
+        }
+        record.input_events.push_back(event);
         return Ok(());
     }
     if let Input::PenTouch(packet) = input {
@@ -314,7 +323,7 @@ pub(super) fn accept_controller_batch_failure(
             .input_events
             .iter()
             .take(record.input_inflight)
-            .any(|event| event["kind"] != "controller")
+            .any(|event| !is_controller_payload(event))
     {
         return Err("input_batch_failed");
     }
@@ -384,6 +393,102 @@ fn optional_bool(payload: &Value, name: &str) -> Result<bool, &'static str> {
         None => Ok(false),
         Some(_) => Err("invalid_input_response"),
     }
+}
+
+fn is_controller_input(input: &Input<'_>) -> bool {
+    matches!(
+        input,
+        Input::Controller(_)
+            | Input::ControllerArrival(_)
+            | Input::ControllerTouch(_)
+            | Input::ControllerMotion(_)
+            | Input::ControllerBattery(_)
+    )
+}
+
+fn is_controller_payload(payload: &Value) -> bool {
+    matches!(
+        payload["kind"].as_str(),
+        Some(
+            "controller"
+                | "controller_arrival"
+                | "controller_touch"
+                | "controller_motion"
+                | "controller_battery"
+        )
+    )
+}
+
+fn controller_payload(input: &Input<'_>) -> Option<Value> {
+    match input {
+        Input::ControllerArrival(arrival) => Some(controller_arrival_payload(*arrival)),
+        Input::ControllerTouch(touch) => Some(controller_touch_payload(*touch)),
+        Input::ControllerMotion(motion) => Some(controller_motion_payload(*motion)),
+        Input::ControllerBattery(battery) => Some(controller_battery_payload(*battery)),
+        _ => None,
+    }
+}
+
+fn controller_arrival_payload(arrival: ControllerArrival) -> Value {
+    json!({
+        "kind":"controller_arrival",
+        "number":arrival.number,
+        "controller_type":arrival.controller_type,
+        "capabilities":u32::from(arrival.capabilities),
+        "supported_buttons":arrival.supported_buttons,
+    })
+}
+
+fn controller_touch_payload(touch: ControllerTouch) -> Value {
+    json!({
+        "kind":"controller_touch",
+        "number":touch.number,
+        "touchpad_index":touch.touchpad_index,
+        "pointer_id":touch.pointer_id,
+        "phase":match touch.event {
+            ControllerTouchEvent::Hover => "hover",
+            ControllerTouchEvent::Down => "down",
+            ControllerTouchEvent::Up => "up",
+            ControllerTouchEvent::Move => "move",
+            ControllerTouchEvent::Cancel => "cancel",
+            ControllerTouchEvent::ButtonOnly => "button_only",
+            ControllerTouchEvent::HoverLeave => "hover_leave",
+            ControllerTouchEvent::CancelAll => "cancel_all",
+        },
+        "x":f32::from_bits(touch.x).clamp(0.0, 1.0),
+        "y":f32::from_bits(touch.y).clamp(0.0, 1.0),
+        "pressure":f32::from_bits(touch.pressure).clamp(0.0, 1.0),
+    })
+}
+
+fn controller_motion_payload(motion: ControllerMotion) -> Value {
+    json!({
+        "kind":"controller_motion",
+        "number":motion.number,
+        "motion_type":match motion.motion_type {
+            ControllerMotionType::Accel => "accel",
+            ControllerMotionType::Gyro => "gyro",
+        },
+        "x":f32::from_bits(motion.x),
+        "y":f32::from_bits(motion.y),
+        "z":f32::from_bits(motion.z),
+    })
+}
+
+fn controller_battery_payload(battery: ControllerBattery) -> Value {
+    json!({
+        "kind":"controller_battery",
+        "number":battery.number,
+        "state":match battery.state {
+            ControllerBatteryState::Unknown => "unknown",
+            ControllerBatteryState::NotPresent => "not_present",
+            ControllerBatteryState::Discharging => "discharging",
+            ControllerBatteryState::Charging => "charging",
+            ControllerBatteryState::NotCharging => "not_charging",
+            ControllerBatteryState::Full => "full",
+        },
+        "percentage":battery.percentage,
+    })
 }
 
 fn pen_touch_payload(

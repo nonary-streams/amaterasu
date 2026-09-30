@@ -30,6 +30,10 @@ pub enum Input<'a> {
     },
     Text(&'a str),
     Controller(ControllerState),
+    ControllerArrival(ControllerArrival),
+    ControllerTouch(ControllerTouch),
+    ControllerMotion(ControllerMotion),
+    ControllerBattery(ControllerBattery),
     PenTouch(PenTouch),
     EnableHaptics {
         enabled: bool,
@@ -85,6 +89,69 @@ pub struct ControllerState {
     pub right_y: i16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllerArrival {
+    pub number: u8,
+    pub controller_type: u8,
+    pub capabilities: u16,
+    pub supported_buttons: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllerTouch {
+    pub number: u8,
+    pub touchpad_index: u8,
+    pub event: ControllerTouchEvent,
+    pub pointer_id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub pressure: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerTouchEvent {
+    Hover,
+    Down,
+    Up,
+    Move,
+    Cancel,
+    ButtonOnly,
+    HoverLeave,
+    CancelAll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllerMotion {
+    pub number: u8,
+    pub motion_type: ControllerMotionType,
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerMotionType {
+    Accel,
+    Gyro,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllerBattery {
+    pub number: u8,
+    pub state: ControllerBatteryState,
+    pub percentage: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerBatteryState {
+    Unknown,
+    NotPresent,
+    Discharging,
+    Charging,
+    NotCharging,
+    Full,
+}
+
 pub(super) fn decode(bytes: &[u8]) -> Result<Input<'_>, DecodeError> {
     if bytes.len() < 8 || be32(bytes, 0) as usize != bytes.len() - 4 {
         return Err(DecodeError::InvalidLength);
@@ -127,6 +194,10 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Input<'_>, DecodeError> {
         }
         0x17 => text(body),
         0x0c => controller(body).map(Input::Controller),
+        0x55000004 => controller_arrival(body).map(Input::ControllerArrival),
+        0x55000005 => controller_touch(body).map(Input::ControllerTouch),
+        0x55000006 => controller_motion(body).map(Input::ControllerMotion),
+        0x55000007 => controller_battery(body).map(Input::ControllerBattery),
         0x0d => {
             exact(body, 2)?;
             let enabled = le16(body, 0);
@@ -143,6 +214,110 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Input<'_>, DecodeError> {
             payload: body,
         }),
     }
+}
+
+fn controller_arrival(body: &[u8]) -> Result<ControllerArrival, DecodeError> {
+    exact(body, 8)?;
+    let number = body[0];
+    if number >= 16 {
+        return Err(DecodeError::InvalidValue);
+    }
+    Ok(ControllerArrival {
+        number,
+        controller_type: body[1],
+        capabilities: le16(body, 2),
+        supported_buttons: le32(body, 4),
+    })
+}
+
+fn controller_touch(body: &[u8]) -> Result<ControllerTouch, DecodeError> {
+    exact(body, 20)?;
+    let number = body[0];
+    let event = match body[1] {
+        0 => ControllerTouchEvent::Hover,
+        1 => ControllerTouchEvent::Down,
+        2 => ControllerTouchEvent::Up,
+        3 => ControllerTouchEvent::Move,
+        4 => ControllerTouchEvent::Cancel,
+        5 => ControllerTouchEvent::ButtonOnly,
+        6 => ControllerTouchEvent::HoverLeave,
+        7 => ControllerTouchEvent::CancelAll,
+        _ => return Err(DecodeError::InvalidValue),
+    };
+    let touchpad_index = body[3];
+    if number >= 16 || body[2] != 0 || touchpad_index > 1 {
+        return Err(DecodeError::InvalidValue);
+    }
+    let (x, y, pressure) = (le32(body, 8), le32(body, 12), le32(body, 16));
+    if [x, y, pressure]
+        .into_iter()
+        .any(|bits| !f32::from_bits(bits).is_finite())
+    {
+        return Err(DecodeError::InvalidValue);
+    }
+    Ok(ControllerTouch {
+        number,
+        touchpad_index,
+        event,
+        pointer_id: le32(body, 4),
+        x,
+        y,
+        pressure,
+    })
+}
+
+fn controller_motion(body: &[u8]) -> Result<ControllerMotion, DecodeError> {
+    exact(body, 16)?;
+    let number = body[0];
+    let motion_type = match body[1] {
+        1 => ControllerMotionType::Accel,
+        2 => ControllerMotionType::Gyro,
+        _ => return Err(DecodeError::InvalidValue),
+    };
+    if number >= 16 || body[2..4] != [0, 0] {
+        return Err(DecodeError::InvalidValue);
+    }
+    let (x, y, z) = (le32(body, 4), le32(body, 8), le32(body, 12));
+    if [x, y, z]
+        .into_iter()
+        .any(|bits| !f32::from_bits(bits).is_finite())
+    {
+        return Err(DecodeError::InvalidValue);
+    }
+    Ok(ControllerMotion {
+        number,
+        motion_type,
+        x,
+        y,
+        z,
+    })
+}
+
+fn controller_battery(body: &[u8]) -> Result<ControllerBattery, DecodeError> {
+    exact(body, 4)?;
+    let number = body[0];
+    let state = match body[1] {
+        0 => ControllerBatteryState::Unknown,
+        1 => ControllerBatteryState::NotPresent,
+        2 => ControllerBatteryState::Discharging,
+        3 => ControllerBatteryState::Charging,
+        4 => ControllerBatteryState::NotCharging,
+        5 => ControllerBatteryState::Full,
+        _ => return Err(DecodeError::InvalidValue),
+    };
+    let percentage = match body[2] {
+        0..=100 => Some(body[2]),
+        0xff => None,
+        _ => return Err(DecodeError::InvalidValue),
+    };
+    if number >= 16 || body[3] != 0 {
+        return Err(DecodeError::InvalidValue);
+    }
+    Ok(ControllerBattery {
+        number,
+        state,
+        percentage,
+    })
 }
 
 fn pen_touch(magic: u32, body: &[u8]) -> Result<PenTouch, DecodeError> {

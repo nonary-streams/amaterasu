@@ -158,6 +158,10 @@ impl InputTranslator {
             }
             Input::Controller(_) => return Err(TranslationError::InvalidController),
             Input::Text(_)
+            | Input::ControllerArrival(_)
+            | Input::ControllerTouch(_)
+            | Input::ControllerMotion(_)
+            | Input::ControllerBattery(_)
             | Input::EnableHaptics { .. }
             | Input::PenTouch(_)
             | Input::Unsupported { .. } => {

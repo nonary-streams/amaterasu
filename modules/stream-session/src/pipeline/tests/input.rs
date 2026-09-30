@@ -212,6 +212,23 @@ fn controller_packet(sequence: u64) -> crate::plane::ControlRecord {
     }
 }
 
+fn controller_extension_packet(
+    magic: u32,
+    body: &[u8],
+    sequence: u64,
+) -> crate::plane::ControlRecord {
+    let mut payload = vec![0u8; 8 + body.len()];
+    let declared_size = (payload.len() - 4) as u32;
+    payload[..4].copy_from_slice(&declared_size.to_be_bytes());
+    payload[4..8].copy_from_slice(&magic.to_le_bytes());
+    payload[8..].copy_from_slice(body);
+    crate::plane::ControlRecord {
+        message_type: 0x0206,
+        payload,
+        sequence,
+    }
+}
+
 #[test]
 fn controller_input_remains_unsupported_without_failing_an_active_stream() {
     let mut host = Harness::new();
@@ -258,6 +275,161 @@ fn controller_state_is_forwarded_when_the_input_lease_advertises_support() {
     );
     assert_eq!(host.pipeline.records[&id].input_events_sent, 1);
     assert_eq!(host.pipeline.records[&id].unsupported_controls, 0);
+}
+
+#[test]
+fn authenticated_controller_extension_packets_reach_the_native_input_contract() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+
+    let mut arrival = [0u8; 8];
+    arrival[0] = 3;
+    arrival[1] = 2;
+    arrival[2..4].copy_from_slice(&0x0123u16.to_le_bytes());
+    arrival[4..8].copy_from_slice(&0x89ab_cdefu32.to_le_bytes());
+    let mut controls = vec![controller_extension_packet(0x55000004, &arrival, 1)];
+
+    for event_type in 0..=7 {
+        let mut touch = [0u8; 20];
+        touch[0] = 3;
+        touch[1] = event_type;
+        touch[3] = 1;
+        touch[4..8].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        touch[8..12].copy_from_slice(&1.25f32.to_bits().to_le_bytes());
+        touch[12..16].copy_from_slice(&(-0.25f32).to_bits().to_le_bytes());
+        touch[16..20].copy_from_slice(&0.75f32.to_bits().to_le_bytes());
+        controls.push(controller_extension_packet(
+            0x55000005,
+            &touch,
+            u64::from(event_type) + 2,
+        ));
+    }
+
+    let mut motion = [0u8; 16];
+    motion[0] = 3;
+    motion[1] = 1;
+    motion[4..8].copy_from_slice(&(-1.25f32).to_bits().to_le_bytes());
+    motion[8..12].copy_from_slice(&2.5f32.to_bits().to_le_bytes());
+    motion[12..16].copy_from_slice(&3.75f32.to_bits().to_le_bytes());
+    controls.push(controller_extension_packet(0x55000006, &motion, 10));
+    controls.push(controller_extension_packet(
+        0x55000007,
+        &[3, 5, 0xff, 0],
+        11,
+    ));
+
+    host.plane.borrow_mut().controls.extend(controls);
+    host.idle();
+
+    assert_eq!(host.broker.input_events.len(), 11);
+    assert_eq!(
+        host.broker.input_events[0],
+        json!({
+            "kind":"controller_arrival",
+            "number":3,
+            "controller_type":2,
+            "capabilities":0x0123,
+            "supported_buttons":0x89ab_cdefu32,
+        })
+    );
+    let phases = [
+        "hover",
+        "down",
+        "up",
+        "move",
+        "cancel",
+        "button_only",
+        "hover_leave",
+        "cancel_all",
+    ];
+    for (index, phase) in phases.into_iter().enumerate() {
+        assert_eq!(
+            host.broker.input_events[index + 1],
+            json!({
+                "kind":"controller_touch",
+                "number":3,
+                "touchpad_index":1,
+                "pointer_id":0x1234_5678u32,
+                "phase":phase,
+                "x":1.0,
+                "y":0.0,
+                "pressure":0.75,
+            })
+        );
+    }
+    assert_eq!(
+        host.broker.input_events[9],
+        json!({
+            "kind":"controller_motion",
+            "number":3,
+            "motion_type":"accel",
+            "x":-1.25,
+            "y":2.5,
+            "z":3.75,
+        })
+    );
+    assert_eq!(
+        host.broker.input_events[10],
+        json!({
+            "kind":"controller_battery",
+            "number":3,
+            "state":"full",
+            "percentage":null,
+        })
+    );
+    assert_eq!(host.pipeline.records[&id].input_events_sent, 11);
+    assert_eq!(host.pipeline.records[&id].input_batches, 1);
+    assert_eq!(host.pipeline.records[&id].unsupported_controls, 0);
+}
+
+#[test]
+fn controller_extension_packets_are_dropped_without_native_controller_support() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+
+    let mut motion = [0u8; 16];
+    motion[1] = 1;
+    host.plane.borrow_mut().controls.extend([
+        controller_extension_packet(0x55000004, &[0; 8], 1),
+        controller_extension_packet(0x55000005, &[0; 20], 2),
+        controller_extension_packet(0x55000006, &motion, 3),
+        controller_extension_packet(0x55000007, &[0; 4], 4),
+    ]);
+    host.idle();
+
+    assert!(host.broker.input_events.is_empty());
+    assert_eq!(host.pipeline.records[&id].unsupported_controls, 4);
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+}
+
+#[test]
+fn controller_extension_batch_failure_drops_only_the_uncertain_native_event() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    host.broker.fail_controller_input = true;
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+
+    let mut motion = [0u8; 16];
+    motion[1] = 1;
+    host.plane.borrow_mut().controls.extend([
+        controller_extension_packet(0x55000004, &[0; 8], 1),
+        controller_extension_packet(0x55000005, &[0; 20], 2),
+        controller_extension_packet(0x55000006, &motion, 3),
+        controller_extension_packet(0x55000007, &[0; 4], 4),
+    ]);
+    host.idle();
+
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert_eq!(host.pipeline.records[&id].input_events_sent, 3);
+    assert_eq!(host.pipeline.records[&id].unsupported_controls, 1);
+    assert!(host.pipeline.records[&id].input_events.is_empty());
 }
 
 #[test]

@@ -790,9 +790,18 @@ impl Broker {
                 let events = payload["events"].as_array().unwrap();
                 self.input_events.extend(events.iter().cloned());
                 if self.fail_controller_input
-                    && events
-                        .first()
-                        .is_some_and(|event| event["kind"] == "controller")
+                    && events.first().is_some_and(|event| {
+                        matches!(
+                            event["kind"].as_str(),
+                            Some(
+                                "controller"
+                                    | "controller_arrival"
+                                    | "controller_touch"
+                                    | "controller_motion"
+                                    | "controller_battery"
+                            )
+                        )
+                    })
                 {
                     self.fail_controller_input = false;
                     return json!({"ok":false,"lease":self.input_lease,
