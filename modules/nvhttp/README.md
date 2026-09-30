@@ -435,6 +435,27 @@ before that boundary causes cleanup; a normal connection close after it does not
 stop the adopted stream. `/cancel` performs the same owned cleanup and returns
 `gamesession=0` only when it is confirmed.
 
+Launch preflight supplies a required integer `cleanup_budget_ms`, frozen from the
+resolved application/provider plan before effects. NVHTTP accepts 20,000 through
+2,745,000 ms and requires subsequent owned launch readback to match the snapshot.
+Missing or malformed budgets, including responses from an older launch module,
+reject preflight before application or RTSP launch. Deploy these module versions
+together. Each cleanup pass uses that budget plus 30 seconds for serial RTSP close,
+lookups, history release, and polling. Cancellation, revocation, and healthy status
+polling do not extend the deadline; an explicit failed-cleanup retry starts one new
+pass. RPC limits remain unchanged: application stop 15 seconds and status 5 seconds.
+A short stop RPC expiry triggers owned readback rather than cancelling the native
+undo plan. Healthy `stopping` readback is polled at most every 100 ms until terminal
+cleanup or the fixed deadline. Actual `cleanup_failed`, unhealthy or mismatched
+readback, and ambiguous broker settlement retain ownership for explicit retry.
+The HTTP routing window can still close a long cancel request; background cleanup
+and terminal reconciliation continue without its response delivery slot. The
+signed `scripts/test_public_preparation_cleanup.py` fixture qualifies Linux
+loopback natural exit, cancel, and RTSP teardown with controlled children and
+synthetic capture/input. It does not change the native worker's five-second EOF
+watchdog or qualify whole-host shutdown, hardware capture, client playback,
+installed hosts, or Windows/macOS native behavior.
+
 ## Pairing transcript
 
 Each request includes the same `uniqueid` (1..64 identifier bytes). The adapter
