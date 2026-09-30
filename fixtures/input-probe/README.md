@@ -8,6 +8,11 @@ orchestration and protocol handling rather than an operating-system input effect
 The startup setting is `{"enabled":false}`. Acquisition defaults off and must be
 enabled explicitly in a test profile.
 
+The fixture also supports the trusted NVHTTP `{"action":"settings_get"}`
+preflight read. It reports the synthetic global
+`proton_dualsense_compatibility` value (default `true`) as persisted and applied;
+it does not model the other global input preferences.
+
 The input service accepts:
 
 ```json

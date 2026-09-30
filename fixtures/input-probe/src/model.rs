@@ -4,10 +4,54 @@ use serde_json::{Value, json};
 
 pub const MAX_BATCH_EVENTS: usize = 64;
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub enabled: bool,
+    #[serde(default = "default_proton_dualsense_compatibility")]
+    pub proton_dualsense_compatibility: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            proton_dualsense_compatibility: true,
+        }
+    }
+}
+
+const fn default_proton_dualsense_compatibility() -> bool {
+    true
+}
+
+impl Settings {
+    pub fn settings_get_response(&self) -> Value {
+        json!({
+            "ok":true,
+            "persisted":true,
+            "applied":true,
+            "cleanup_required":false,
+            "revision":0,
+            "values":{"proton_dualsense_compatibility":self.proton_dualsense_compatibility}
+        })
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::Settings;
+    use serde_json::json;
+
+    #[test]
+    fn settings_read_reports_persisted_default_proton_policy() {
+        let settings: Settings = serde_json::from_value(json!({"enabled":true})).unwrap();
+        let response = settings.settings_get_response();
+
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["persisted"], true);
+        assert_eq!(response["values"]["proton_dualsense_compatibility"], true);
+    }
 }
 
 #[derive(Deserialize)]

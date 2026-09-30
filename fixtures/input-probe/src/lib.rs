@@ -14,6 +14,7 @@ const METRICS_SERVICE: &str = "test.input-probe/1";
 struct InputProbe {
     runtime: RuntimeClient,
     controller: Controller,
+    settings: Settings,
 }
 
 impl ManagedModule for InputProbe {
@@ -31,6 +32,7 @@ impl ManagedModule for InputProbe {
         Ok(Self {
             runtime,
             controller: Controller::new(settings.enabled),
+            settings,
         })
     }
 
@@ -96,6 +98,26 @@ impl InputProbe {
                 FixtureError::new("invalid_service", "unsupported input probe service").payload(),
                 false,
             );
+        }
+        if payload.get("action").and_then(Value::as_str) == Some("settings_get") {
+            if caller != "amaterasu.management" && caller != "amaterasu.nvhttp" {
+                return (
+                    FixtureError::new(
+                        "permission_denied",
+                        "input settings require the management or NVHTTP principal",
+                    )
+                    .payload(),
+                    false,
+                );
+            }
+            if payload != json!({"action":"settings_get"}) {
+                return (
+                    FixtureError::new("invalid_request", "settings_get accepts no fields")
+                        .payload(),
+                    false,
+                );
+            }
+            return (self.settings.settings_get_response(), false);
         }
         let operation = match serde_json::from_value::<Operation>(payload) {
             Ok(operation) => operation,

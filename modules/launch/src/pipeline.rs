@@ -1782,7 +1782,21 @@ impl Pipeline {
         job: &mut Workflow,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
-        let request = job.request.ok_or("missing launch request")?;
+        // return_on_admission completes the caller's request as soon as the
+        // process/provider accepts startup. The owned workflow still waits for
+        // the session to become active, but there is no second caller reply.
+        let request = match job.request {
+            Some(request) => request,
+            None if self
+                .records
+                .values
+                .get(&job.launch_id)
+                .is_some_and(|record| record.return_on_admission) =>
+            {
+                return Ok(());
+            }
+            None => return Err("missing launch request".into()),
+        };
         let active = matches!(send(Command::CheckRequest { request }), Ok(Response::Ok));
         let delivered = active
             && matches!(

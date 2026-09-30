@@ -2322,6 +2322,49 @@ fn launch_export_can_acknowledge_admission_while_owned_startup_remains_stoppable
 }
 
 #[test]
+fn detached_launch_activation_does_not_complete_the_admission_request_twice() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    let operation_id = "detached-activation";
+    let preflight = harness.request_as(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        "management",
+        json!({"action":"preflight_export","operation_id":operation_id,
+            "app_id":"app-0000000000000001"}),
+    );
+    let mut launch = launch_export(operation_id);
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["frame_limiter_settings"] = frame_limiter_snapshot();
+    launch["proton_dualsense_compatibility"] = json!(true);
+    launch["return_on_admission"] = json!(true);
+    let admitted = harness.request_as(&mut pipeline, "amaterasu.nvhttp", "management", launch);
+    assert_eq!(admitted["launch"]["state"], "starting", "{admitted}");
+    assert_eq!(
+        pipeline.job.as_ref().unwrap().step,
+        crate::workflow::Step::Activate
+    );
+    assert_eq!(pipeline.job.as_ref().unwrap().request, None);
+
+    pipeline.tick(|command| harness.send(command)).unwrap();
+    pipeline.tick(|command| harness.send(command)).unwrap();
+
+    assert!(pipeline.job.is_none());
+    assert!(pipeline.records.values.values().next().unwrap().state == State::Active);
+    assert!(
+        harness.output.is_none(),
+        "detached activation has no second reply"
+    );
+    let status = harness.request_as(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        "management",
+        json!({"action":"status","launch_id":admitted["launch"]["launch_id"]}),
+    );
+    assert_eq!(status["launch"]["state"], "active", "{status}");
+}
+
+#[test]
 fn frame_limiter_snapshot_rejects_invalid_runtime_context_and_host_policy() {
     let mut harness = Harness::new();
     let mut pipeline = pipeline();

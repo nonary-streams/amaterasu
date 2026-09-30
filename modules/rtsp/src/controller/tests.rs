@@ -135,6 +135,19 @@ fn record(state: State) -> Record {
     }
 }
 
+#[test]
+fn response_echoes_frozen_display_policy_for_authenticated_launch_readback() {
+    let mut record = record(State::Ready);
+    let snapshot = json!({
+        "global_revision": 7,
+        "application_overrides": {"dd_configuration_option":"verify_only"},
+        "virtual_display_intent": null,
+    });
+    record.config.display_policy_snapshot = Some(snapshot.clone());
+
+    assert_eq!(record.response()["display_policy_snapshot"], snapshot);
+}
+
 fn attested_open() -> Open {
     serde_json::from_value(json!({
         "operation_id":"rtsp-one","application_operation_id":"launch-one",
