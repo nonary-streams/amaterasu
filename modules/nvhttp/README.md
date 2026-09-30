@@ -108,14 +108,28 @@ migrate it to `false`. The management settings response also exposes runtime-onl
 `waiting_for_gateway_route`, `active`, and `error`.
 
 When enabled, NVHTTP discovers the IPv4 gateway and maps only live listener
-addresses and ports. The lease is 3600 seconds; mapping discovery and lease
-refresh run every 120 seconds. Failed cleanup remains visible and retries while
-the process is running. Shutdown makes three best-effort cleanup attempts; if
-the gateway remains unavailable, surviving mappings may stay active until their
-lease expires. Pre-existing or externally changed mappings are preserved.
-Management HTTPS is mapped only when the live management peer policy enables
-WAN access and a TLS listener is active. The current IGD adapter manages IPv4
-port mappings and does not create IPv6 firewall pinholes.
+addresses and ports. With `address_family: both`, it separately searches scoped
+IPv6 interfaces for `WANIPv6FirewallControl` and opens pinholes only for active
+IPv6 listeners on those interfaces. Wildcard IPv6 listeners use the selected
+local interface address; explicit listeners are accepted only when that address
+belongs to the interface. IPv4-only mode skips the IPv6 search.
+
+IPv4 mappings and IPv6 pinholes request 3600-second leases and refresh every 120
+seconds. Failed cleanup remains visible and retries while the process is running.
+Shutdown makes three best-effort cleanup attempts; if the gateway remains
+unavailable, surviving leases may remain active until they expire. The IPv4
+manager preserves pre-existing or externally changed mappings. The IPv6 manager
+tracks exact gateway-issued IDs and deletes only pinholes created by that owner.
+Management HTTPS is exposed only when the live management peer policy enables
+WAN access and a TLS listener is active, for both address families.
+
+IPv6 firewall status is queried before reconciliation; additions follow the
+gateway's `NewInboundPinholeAllowed` policy. Tests use fake gateway controls and
+local protocol fixtures, and do not contact physical routers or change host
+firewall state. If no pinholes remain active because a discovered gateway denies
+inbound pinholes, runtime status is `error` with the bounded detail
+`IPv6 gateway policy disallows inbound pinholes` rather than implying route
+discovery failed.
 
 The live settings response includes the configured port, derived https_port, and
 active_http_port/active_https_port values. Product document versions 1 through 14

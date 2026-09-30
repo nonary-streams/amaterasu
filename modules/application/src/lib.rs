@@ -6,6 +6,7 @@ mod lifecycle;
 mod output;
 mod processes;
 mod protocol;
+mod proton_hook;
 mod steam_tracking;
 pub use processes::ProcessManager;
 

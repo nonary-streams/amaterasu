@@ -363,6 +363,8 @@ namespace Amaterasu {
     if (reply.ok !== true || !Number.isSafeInteger(reply.revision) || (reply.revision as number) < 0 ||
         typeof reply.configured_hostname !== "string" ||
         typeof reply.upnp !== "boolean" ||
+        ![0, 1, 2].includes(reply.lan_encryption_mode as number) ||
+        ![0, 1, 2].includes(reply.wan_encryption_mode as number) ||
         !["disabled", "active", "waiting_for_ipv4_listener", "waiting_for_gateway_route", "waiting_for_listener", "error"].includes(String(reply.upnp_status)) ||
         !(reply.upnp_error === null || typeof reply.upnp_error === "string") ||
         !(reply.configured_fec_percentage === null ||
@@ -407,6 +409,8 @@ namespace Amaterasu {
       configured_hostname: values.hostname,
       port: values.port,
       upnp: values.upnp,
+      lan_encryption_mode: values.lan_encryption_mode,
+      wan_encryption_mode: values.wan_encryption_mode,
       configured_fec_percentage: values.fec_percentage,
       effective_fec_percentage: values.fec_percentage ?? current.effective_fec_percentage,
       configured_address_family: values.address_family,
@@ -970,6 +974,13 @@ namespace Amaterasu {
 
   export function parseGlobalFecPercentage(value: string): number | null {
     return parseClientFecOverride(value).fec_percentage;
+  }
+
+  export function parseEncryptionMode(value: string): 0 | 1 | 2 {
+    if (value === "0") return 0;
+    if (value === "1") return 1;
+    if (value === "2") return 2;
+    throw new Error("Encryption mode must be disabled, optional, or required.");
   }
 
   const forwardablePairingOverrideFields = [
@@ -3638,6 +3649,24 @@ namespace Amaterasu {
         audioSinkCaptureOnly.checked = settings.audio_sink_capture_only;
         const externalIp = input("external_ip", settings.configured_external_ip ?? "");
         externalIp.maxLength = 4096;
+        const encryptionChoices: Array<[string, string]> = [
+          ["0", "Disabled"],
+          ["1", "Optional"],
+          ["2", "Required"],
+        ];
+        const makeEncryptionSelect = (name: string, current: 0 | 1 | 2): HTMLSelectElement => {
+          const control = el("select");
+          control.name = name;
+          for (const [value, label] of encryptionChoices) {
+            const option = el("option", "", label);
+            option.value = value;
+            control.append(option);
+          }
+          control.value = String(current);
+          return control;
+        };
+        const lanEncryptionMode = makeEncryptionSelect("lan_encryption_mode", settings.lan_encryption_mode);
+        const wanEncryptionMode = makeEncryptionSelect("wan_encryption_mode", settings.wan_encryption_mode);
         const videoBatchSize = input(
           "video_max_batch_size_kb",
           settings.configured_video_max_batch_size_kb === null
@@ -3762,6 +3791,8 @@ namespace Amaterasu {
           globalPreparationValidation,
           field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."),
           field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."),
+          field("LAN video encryption", lanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for LAN peers. Applies to new streams."),
+          field("WAN video encryption", wanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for WAN peers. Applies to new streams."),
           field(
             "Video batch size (KiB)",
             videoBatchSize,
@@ -3821,6 +3852,8 @@ namespace Amaterasu {
               virtual_sink: parseVirtualSinkSelection(virtualSinkEnabled.checked, virtualSink.value),
               audio_sink_capture_only: audioSinkCaptureOnly.checked,
               external_ip: parseExternalIp(externalIp.value),
+              lan_encryption_mode: parseEncryptionMode(lanEncryptionMode.value),
+              wan_encryption_mode: parseEncryptionMode(wanEncryptionMode.value),
               wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),
               ...softwareEncoder.read(),
               global_preparation: parsePreparationSteps(globalPreparation.value),

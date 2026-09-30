@@ -137,8 +137,9 @@ fn parse_management_exposure(payload: &Value) -> ManagementExposureSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct DesiredMappings {
+pub(crate) struct DesiredMappings {
     enabled: bool,
+    ipv6_enabled: bool,
     endpoints: Vec<MappingEndpoint>,
 }
 
@@ -167,7 +168,10 @@ pub(crate) struct UpnpLifecycle {
     commands: Sender<LifecycleCommand>,
     statuses: Receiver<UpnpRuntimeStatus>,
     worker: Option<JoinHandle<()>>,
+    ipv6_lifecycle: crate::upnp_ipv6::Ipv6PinholeLifecycle,
     last_desired: Option<DesiredMappings>,
+    ipv4_status: UpnpRuntimeStatus,
+    ipv6_status: UpnpRuntimeStatus,
     status: UpnpRuntimeStatus,
 }
 
@@ -187,39 +191,28 @@ impl UpnpLifecycle {
                 error: Some("UPnP lifecycle worker could not be started".into()),
             }
         };
+        let ipv6_lifecycle = crate::upnp_ipv6::Ipv6PinholeLifecycle::new();
+        let ipv6_status = ipv6_lifecycle.status().clone();
         Self {
             commands: command_tx,
             statuses: status_rx,
             worker,
+            ipv6_lifecycle,
             last_desired: None,
+            ipv4_status: status.clone(),
+            ipv6_status,
             status,
         }
     }
 
-    pub(crate) fn update(
-        &mut self,
-        enabled: bool,
-        http_addresses: &[SocketAddr],
-        https_addresses: &[SocketAddr],
-        rtsp_base_port: Option<u16>,
-        rtsp_addresses: &[String],
-        management: ManagementExposureSnapshot,
-    ) {
-        let desired = build_desired_mappings(
-            enabled,
-            http_addresses,
-            https_addresses,
-            rtsp_base_port,
-            rtsp_addresses,
-            management,
-        );
+    pub(crate) fn update(&mut self, desired: DesiredMappings) {
         if self.last_desired.as_ref() != Some(&desired) {
             if self
                 .commands
                 .send(LifecycleCommand::Configure(desired.clone()))
                 .is_ok()
             {
-                self.last_desired = Some(desired);
+                self.last_desired = Some(desired.clone());
             } else {
                 self.status = UpnpRuntimeStatus {
                     status: "error".into(),
@@ -228,8 +221,12 @@ impl UpnpLifecycle {
             }
         }
         while let Ok(status) = self.statuses.try_recv() {
-            self.status = status;
+            self.ipv4_status = status;
         }
+        self.ipv6_lifecycle
+            .update(desired.enabled, desired.ipv6_enabled, &desired.endpoints);
+        self.ipv6_status = self.ipv6_lifecycle.status().clone();
+        self.status = merge_runtime_status(&self.ipv4_status, &self.ipv6_status);
     }
 
     pub(crate) fn status(&self) -> &UpnpRuntimeStatus {
@@ -237,16 +234,16 @@ impl UpnpLifecycle {
     }
 
     pub(crate) fn shutdown(&mut self) {
-        if self.worker.is_none() {
-            return;
-        }
-        let _ = self.commands.send(LifecycleCommand::Shutdown);
         if let Some(worker) = self.worker.take() {
+            let _ = self.commands.send(LifecycleCommand::Shutdown);
             let _ = worker.join();
         }
         while let Ok(status) = self.statuses.try_recv() {
-            self.status = status;
+            self.ipv4_status = status;
         }
+        self.ipv6_lifecycle.shutdown();
+        self.ipv6_status = self.ipv6_lifecycle.status().clone();
+        self.status = merge_runtime_status(&self.ipv4_status, &self.ipv6_status);
     }
 }
 
@@ -256,13 +253,14 @@ impl Drop for UpnpLifecycle {
     }
 }
 
-fn build_desired_mappings(
+pub(crate) fn build_desired_mappings(
     enabled: bool,
     http_addresses: &[SocketAddr],
     https_addresses: &[SocketAddr],
     rtsp_base_port: Option<u16>,
     rtsp_addresses: &[String],
     management: ManagementExposureSnapshot,
+    address_family_includes_ipv6: bool,
 ) -> DesiredMappings {
     if !enabled {
         return DesiredMappings::default();
@@ -323,7 +321,41 @@ fn build_desired_mappings(
 
     DesiredMappings {
         enabled: true,
+        ipv6_enabled: address_family_includes_ipv6,
         endpoints,
+    }
+}
+
+fn merge_runtime_status(ipv4: &UpnpRuntimeStatus, ipv6: &UpnpRuntimeStatus) -> UpnpRuntimeStatus {
+    let error = combine_runtime_errors(ipv4.error.iter().chain(ipv6.error.iter()).cloned());
+    if ipv4.status == "active" || ipv6.status == "active" {
+        return UpnpRuntimeStatus {
+            status: "active".into(),
+            error,
+        };
+    }
+    if let Some(error) = error {
+        return UpnpRuntimeStatus {
+            status: "error".into(),
+            error: Some(error),
+        };
+    }
+    let status = if ipv4.status == "waiting_for_gateway_route"
+        || ipv6.status == "waiting_for_gateway_route"
+    {
+        "waiting_for_gateway_route"
+    } else if ipv4.status == "waiting_for_ipv4_listener"
+        || ipv6.status == "waiting_for_ipv4_listener"
+    {
+        "waiting_for_ipv4_listener"
+    } else if ipv4.status == "waiting_for_listener" || ipv6.status == "waiting_for_listener" {
+        "waiting_for_listener"
+    } else {
+        "disabled"
+    };
+    UpnpRuntimeStatus {
+        status: status.into(),
+        error: None,
     }
 }
 
@@ -897,6 +929,7 @@ mod tests {
                 wan_enabled: true,
                 tls_address: Some(address("0.0.0.0:49999")),
             },
+            false,
         );
         let ports = plan
             .endpoints
@@ -929,6 +962,7 @@ mod tests {
                 wan_enabled: false,
                 tls_address: Some(address("0.0.0.0:49999")),
             },
+            false,
         );
         assert_eq!(
             plan.endpoints
@@ -936,6 +970,31 @@ mod tests {
                 .map(|endpoint| endpoint.port)
                 .collect::<Vec<_>>(),
             [47_989]
+        );
+    }
+
+    #[test]
+    fn endpoint_plan_keeps_ipv6_family_gate_separate_from_active_listeners() {
+        let plan = build_desired_mappings(
+            true,
+            &[address("0.0.0.0:47989"), address("[::]:47989")],
+            &[address("0.0.0.0:47984"), address("[::]:47984")],
+            Some(47_989),
+            &["0.0.0.0:48010".into(), "[::]:48010".into()],
+            ManagementExposureSnapshot::default(),
+            true,
+        );
+
+        assert!(plan.ipv6_enabled);
+        assert!(
+            plan.endpoints
+                .iter()
+                .any(|endpoint| endpoint.address.is_ipv6())
+        );
+        assert!(
+            plan.endpoints
+                .iter()
+                .any(|endpoint| endpoint.address.is_ipv4())
         );
     }
 

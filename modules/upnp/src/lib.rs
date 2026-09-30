@@ -6,8 +6,18 @@
 //! still match the exact recorded mapping.
 
 mod igd;
+mod ipv6;
+mod pinhole;
 
 pub use igd::{IgdGateway, SEARCH_TIMEOUT, discover_gateway};
+pub use ipv6::{
+    IPV6_SEARCH_TIMEOUT, IgdIpv6Firewall, Ipv6InterfaceAddress, discover_ipv6_firewalls,
+    ipv6_interface_addresses,
+};
+pub use pinhole::{
+    FirewallStatus, Ipv6FirewallControl, PINHOLE_LEASE_SECONDS, PinholeDeleteOutcome,
+    PinholeEndpoint, PinholeError, PinholeManager, PinholeRefreshOutcome, PinholeReport,
+};
 
 use std::collections::BTreeMap;
 use std::fmt;

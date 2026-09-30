@@ -1838,6 +1838,15 @@ test("global FEC editor preserves the startup value and validates the reference 
     assert.throws(() => parse(value));
 });
 
+test("video encryption mode editor accepts only the three reference selections", () => {
+  const parse = context.Amaterasu.parseEncryptionMode;
+  assert.equal(parse("0"), 0);
+  assert.equal(parse("1"), 1);
+  assert.equal(parse("2"), 2);
+  for (const value of ["", "3", "01", "1.0", "-1", "disabled"])
+    assert.throws(() => parse(value));
+});
+
 test("NVHTTP network settings preserve startup null and explicit blank overrides", () => {
   const parse = context.Amaterasu.parseNvhttpNetworkOverrides;
   assert.deepEqual(ordinary(parse("startup", true, "")), {
@@ -2215,6 +2224,7 @@ function nvhttpHostUpdate() {
   return {
     hostname: "Living Room", port: 47989,
     upnp: false,
+    lan_encryption_mode: 1, wan_encryption_mode: 2,
     fec_percentage: null,
     address_family: null, bind_address: null,
     capture: "auto", output_name: "", stream_audio: true,
@@ -2280,6 +2290,23 @@ test("Moonlight settings require and round-trip UPnP and global FEC selections",
   assert.throws(() => context.Amaterasu.parseNvhttpSettingsReply(invalidUpnpStatus), /reply is invalid/);
   const invalidFec = { ...current, effective_fec_percentage: 256 };
   assert.throws(() => context.Amaterasu.parseNvhttpSettingsReply(invalidFec), /reply is invalid/);
+  const invalidEncryption = { ...current, wan_encryption_mode: 3 };
+  assert.throws(() => context.Amaterasu.parseNvhttpSettingsReply(invalidEncryption), /reply is invalid/);
+});
+
+test("Moonlight host editor confirms updated LAN and WAN encryption modes", async () => {
+  const current = nvhttpHostSettings();
+  const values = { ...nvhttpHostUpdate(), lan_encryption_mode: 2, wan_encryption_mode: 0 };
+  const updated = { ...nvhttpUpdatedHost(), lan_encryption_mode: 2, wan_encryption_mode: 0 };
+  const calls = [];
+  const saved = await context.Amaterasu.saveNvhttpHostSettings({ async post(route, body = {}) {
+    calls.push([route, ordinary(body)]);
+    return updated;
+  } }, current, values);
+  assert.equal(saved.lan_encryption_mode, 2);
+  assert.equal(saved.wan_encryption_mode, 0);
+  assert.equal(calls[0][1].lan_encryption_mode, 2);
+  assert.equal(calls[0][1].wan_encryption_mode, 0);
 });
 
 test("Moonlight host editor rejects mismatched configured or unrelated fields and concurrent readback", async () => {

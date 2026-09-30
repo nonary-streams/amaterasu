@@ -6,6 +6,7 @@ use crate::output::{SharedOutput, check_output_support};
 use crate::protocol::{
     Action, LaunchSpec, MAX_EXIT_TIMEOUT_SECONDS, PreparationSpec, ProcessState, TerminalOutcome,
 };
+use crate::proton_hook::ProtonHookManager;
 use crate::steam_tracking::{SteamGameLiveness, SteamProcessTracker};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -158,11 +159,22 @@ struct ProcessRecord {
     steam_launcher: Option<DetachedChild>,
     #[serde(skip)]
     steam_tracker: Option<SteamProcessTracker>,
+    #[serde(skip)]
+    steam_proton_hook_app_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     steam_game_liveness: Option<SteamGameLiveness>,
 }
 
 impl ProcessRecord {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            ProcessState::Exited { .. }
+                | ProcessState::LaunchFailed { .. }
+                | ProcessState::Cancelled
+        )
+    }
+
     fn new(
         process_id: u64,
         caller: &str,
@@ -194,6 +206,7 @@ impl ProcessRecord {
             detached_children: Vec::new(),
             steam_launcher: None,
             steam_tracker: None,
+            steam_proton_hook_app_id: None,
             steam_game_liveness: None,
         };
         match SharedOutput::open(record.spec.output.as_deref()) {
@@ -795,6 +808,7 @@ impl PreparationLease {
 pub struct ProcessManager {
     records: BTreeMap<u64, ProcessRecord>,
     preparations: BTreeMap<(String, String), PreparationLease>,
+    proton_hooks: ProtonHookManager,
     next_id: u64,
 }
 
@@ -1004,7 +1018,10 @@ impl ProcessManager {
             return Err("process_limit");
         }
         let process_id = self.next_id.checked_add(1).ok_or("process_limit")?;
-        let record = ProcessRecord::new(process_id, caller, operation_id, spec, detached_requests);
+        let proton_hook_app_id = self.proton_hooks.acquire(&spec)?;
+        let mut record =
+            ProcessRecord::new(process_id, caller, operation_id, spec, detached_requests);
+        record.steam_proton_hook_app_id = proton_hook_app_id;
         let response = json!({"ok":true,"process":record});
         self.records.insert(process_id, record);
         self.next_id = process_id;
@@ -1125,11 +1142,21 @@ impl ProcessManager {
     /// Advance every process and lifecycle command once without waiting.
     pub fn reap_exited(&mut self) -> Result<(), &'static str> {
         let mut failure = None;
+        let mut release_hooks = Vec::new();
         for record in self.records.values_mut() {
             if let Err(error) = record.advance() {
                 failure = Some(error);
             }
+            if record.is_terminal()
+                && let Some(app_id) = record.steam_proton_hook_app_id.take()
+            {
+                release_hooks.push(app_id);
+            }
         }
+        for app_id in release_hooks {
+            self.proton_hooks.release(&app_id);
+        }
+        self.proton_hooks.reap();
         for lease in self.preparations.values_mut() {
             lease.advance();
         }
@@ -1142,6 +1169,7 @@ impl ProcessManager {
         let deadline = Instant::now() + self.shutdown_budget();
         let mut failure = None;
         loop {
+            let mut release_hooks = Vec::new();
             for record in self.records.values_mut() {
                 if let Err(error) = record.prepare_shutdown() {
                     failure = Some(error);
@@ -1149,6 +1177,14 @@ impl ProcessManager {
                 if let Err(error) = record.advance() {
                     failure = Some(error);
                 }
+                if record.is_terminal()
+                    && let Some(app_id) = record.steam_proton_hook_app_id.take()
+                {
+                    release_hooks.push(app_id);
+                }
+            }
+            for app_id in release_hooks {
+                self.proton_hooks.release(&app_id);
             }
             for lease in self.preparations.values_mut() {
                 lease.prepare_shutdown();

@@ -10,6 +10,7 @@ mod server;
 mod settings;
 mod tls;
 mod upnp;
+mod upnp_ipv6;
 mod wire;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
@@ -389,14 +390,16 @@ impl ManagedModule for NvhttpModule {
             .active_rtsp_addresses()
             .unwrap_or_default()
             .to_vec();
-        self.upnp_lifecycle.update(
+        let desired_upnp_mappings = upnp::build_desired_mappings(
             self.product_settings.loaded() && self.product_settings.upnp_enabled(),
             &http_addresses,
             &https_addresses,
             self.product_settings.active_rtsp_base_port(),
             &rtsp_addresses,
             self.management_exposure.snapshot(),
+            self.product_settings.effective_address_family() == settings::AddressFamily::Both,
         );
+        self.upnp_lifecycle.update(desired_upnp_mappings);
         let upnp_status = self.upnp_lifecycle.status().clone();
         self.product_settings
             .set_upnp_runtime_status(upnp_status.status, upnp_status.error);
