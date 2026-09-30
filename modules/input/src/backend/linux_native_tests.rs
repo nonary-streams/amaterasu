@@ -425,6 +425,18 @@ fn native_key(source: u8, state: KeyState) -> Event {
     }
 }
 
+fn native_temporary_modifier(source: u8, state: KeyState) -> Event {
+    Event::Key {
+        key: Key::MoonlightVk {
+            code: source,
+            normalized: true,
+            repeat_modifiers: 0,
+            temporary_modifier: true,
+        },
+        state,
+    }
+}
+
 #[test]
 #[ignore = "creates a real uinput keyboard; requires uinput and owned evdev access; grabs before emitting"]
 fn native_uinput_keybinding_targets_keep_source_ownership_and_teardown() {
@@ -500,6 +512,53 @@ fn native_uinput_keybinding_targets_keep_source_ownership_and_teardown() {
         .expect("255 source finally releases A");
     assert_frame(reader.read_report(1), vec![(EV_KEY, 30, 0)]);
     reader.assert_key_state(30, false);
+
+    for (generic, left, right, left_evdev, right_evdev) in [
+        (0x10, 0xa0, 0xa1, 42, 54),
+        (0x11, 0xa2, 0xa3, 29, 97),
+        (0x12, 0xa4, 0xa5, 56, 100),
+    ] {
+        backend.set_keybindings(&KeyBindings::from_flat(vec![0x41, right]).unwrap());
+        backend
+            .inject(&native_key(0x41, KeyState::Down))
+            .expect("ordinary source presses mapped right modifier");
+        assert_frame(reader.read_report(1), vec![(EV_KEY, right_evdev, 1)]);
+        backend.set_keybindings(&KeyBindings::empty());
+        backend
+            .inject(&native_temporary_modifier(generic, KeyState::Down))
+            .expect("temporary chord owns the saved right modifier plan");
+        reader.assert_quiet();
+        reader.assert_key_state(right_evdev, true);
+        reader.assert_key_state(left_evdev, false);
+
+        backend
+            .inject(&native_key(left, KeyState::Down))
+            .expect("real opposite-side modifier remains a distinct native key");
+        assert_frame(reader.read_report(1), vec![(EV_KEY, left_evdev, 1)]);
+        reader.assert_key_state(right_evdev, true);
+        reader.assert_key_state(left_evdev, true);
+        backend
+            .inject(&native_key(left, KeyState::Up))
+            .expect("real left modifier releases independently");
+        assert_frame(reader.read_report(1), vec![(EV_KEY, left_evdev, 0)]);
+        reader.assert_key_state(right_evdev, true);
+        backend
+            .inject(&native_key(0x41, KeyState::Repeat))
+            .expect("remapped source repeats its original right modifier");
+        assert_frame(reader.read_report(1), vec![(EV_KEY, right_evdev, 2)]);
+        backend
+            .inject(&native_key(0x41, KeyState::Up))
+            .expect("temporary source retains ownership after real source release");
+        reader.assert_quiet();
+        reader.assert_key_state(right_evdev, true);
+        backend
+            .inject(&native_temporary_modifier(generic, KeyState::Up))
+            .expect("final temporary owner releases the original right modifier");
+        assert_frame(reader.read_report(1), vec![(EV_KEY, right_evdev, 0)]);
+        reader.assert_key_state(right_evdev, false);
+        reader.assert_key_state(left_evdev, false);
+    }
+    backend.set_keybindings(&custom);
     backend
         .inject(&native_key(0xa0, KeyState::Down))
         .expect("leave a mapped destination held for teardown");
@@ -509,6 +568,6 @@ fn native_uinput_keybinding_targets_keep_source_ownership_and_teardown() {
         .expect("destroy owned keyboard while grabbed");
     reader.assert_disconnected();
     println!(
-        "Qualified grabbed Linux keyboard mapping, target collisions, repeat/release across policy replacement, builtin/Right Alt priority, reserved source bytes, and held-device teardown. Ordinary service-account access, Windows, and game/client delivery remain unqualified."
+        "Qualified grabbed Linux keyboard mapping, target collisions, repeat/release across policy replacement, builtin/Right Alt priority, reserved source bytes, temporary Shift/Ctrl/Alt ownership of mapped right modifiers with distinct real left keys, and held-device teardown. Ordinary service-account access, Windows, and game/client delivery remain unqualified."
     );
 }
