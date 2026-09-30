@@ -18,6 +18,10 @@ const MAX_LEGACY_STATE_BYTES: u64 = 1024 * 1024;
 const STATE_FORMAT_VERSION: u32 = 1;
 const PAIRING_PRINCIPAL: &str = "amaterasu.pairing";
 const PAIRING_STATE_KEY: &str = "pairing/v1";
+const HOST_CONFIGURATION_PRINCIPAL: &str = "amaterasu.host-configuration";
+const HOST_CONFIGURATION_STATE_KEY: &str = "global/amaterasu.host-configuration";
+const DEFAULT_CERTIFICATE_PATH: &str = "credentials/cacert.pem";
+const DEFAULT_PRIVATE_KEY_PATH: &str = "credentials/cakey.pem";
 const LEGACY_STATE_FILES: &[&str] = &[
     "sunshine_state.json",
     "vibeshine_state.json",
@@ -128,6 +132,19 @@ pub fn seed_pairing_state(
     if !namespace.values.is_empty() {
         return Ok(PairingSeedOutcome::ExistingAmaterasuState);
     }
+    let identity = import
+        .document
+        .identity
+        .as_ref()
+        .ok_or("legacy_pairing_invalid_identity")?;
+    let (certificate_path, private_key_path) = configured_identity_paths(state_root)?;
+    crate::identity::materialize_imported_identity_pair(
+        &certificate_path,
+        &private_key_path,
+        identity,
+        now,
+    )
+    .map_err(|_| "legacy_pairing_identity_conflict")?;
     namespace
         .revision
         .checked_add(1)
@@ -488,10 +505,7 @@ impl Default for StateNamespace {
 }
 
 fn read_namespace(path: &Path) -> Result<StateNamespace, &'static str> {
-    if !path
-        .try_exists()
-        .map_err(|_| "legacy_pairing_state_unavailable")?
-    {
+    if !is_safe_existing_file_path(path)? {
         return Ok(StateNamespace::default());
     }
     let namespace: StateNamespace = serde_json::from_slice(
@@ -505,7 +519,15 @@ fn read_namespace(path: &Path) -> Result<StateNamespace, &'static str> {
 }
 
 fn pairing_namespace_path(state_root: &Path) -> PathBuf {
-    let encoded: String = PAIRING_PRINCIPAL
+    namespace_path(state_root, PAIRING_PRINCIPAL)
+}
+
+fn host_configuration_namespace_path(state_root: &Path) -> PathBuf {
+    namespace_path(state_root, HOST_CONFIGURATION_PRINCIPAL)
+}
+
+fn namespace_path(state_root: &Path, principal: &str) -> PathBuf {
+    let encoded: String = principal
         .as_bytes()
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -515,6 +537,182 @@ fn pairing_namespace_path(state_root: &Path) -> PathBuf {
         path.push(std::str::from_utf8(component).expect("hex is ASCII"));
     }
     path.join("state.json")
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredHostConfiguration {
+    version: u32,
+    #[allow(dead_code)]
+    revision: u64,
+    file_state: String,
+    vibeshine_file_state: String,
+    #[serde(default)]
+    credentials_file: String,
+    pkey: String,
+    cert: String,
+    log_path: String,
+    min_log_level: String,
+}
+
+fn configured_identity_paths(state_root: &Path) -> Result<(String, String), &'static str> {
+    let host_configuration_path = host_configuration_namespace_path(state_root);
+    let namespace = read_namespace(&host_configuration_path)?;
+    let Some(value) = namespace.values.get(HOST_CONFIGURATION_STATE_KEY) else {
+        return Ok((
+            resolve_configured_path(state_root, DEFAULT_CERTIFICATE_PATH)?,
+            resolve_configured_path(state_root, DEFAULT_PRIVATE_KEY_PATH)?,
+        ));
+    };
+    let settings: StoredHostConfiguration = serde_json::from_value(value.clone())
+        .map_err(|_| "legacy_pairing_host_configuration_invalid")?;
+    if settings.version != 1 {
+        return Err("legacy_pairing_host_configuration_invalid");
+    }
+    if !matches!(
+        settings.min_log_level.as_str(),
+        "product_default" | "verbose" | "debug" | "info" | "warning" | "error" | "fatal" | "none"
+    ) {
+        return Err("legacy_pairing_host_configuration_invalid");
+    }
+    for (value, empty_allowed) in [
+        (settings.file_state.as_str(), false),
+        (settings.vibeshine_file_state.as_str(), false),
+        (settings.credentials_file.as_str(), true),
+        (settings.pkey.as_str(), false),
+        (settings.cert.as_str(), false),
+        (settings.log_path.as_str(), false),
+    ] {
+        validate_host_configuration_path(value, empty_allowed)?;
+    }
+    Ok((
+        resolve_configured_path(state_root, &settings.cert)?,
+        resolve_configured_path(state_root, &settings.pkey)?,
+    ))
+}
+
+fn validate_host_configuration_path(value: &str, empty_allowed: bool) -> Result<(), &'static str> {
+    if value.is_empty() {
+        return if empty_allowed {
+            Ok(())
+        } else {
+            Err("legacy_pairing_host_configuration_invalid")
+        };
+    }
+    let path = Path::new(value);
+    if value.len() > 4096
+        || value.chars().any(char::is_control)
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        || (!path.is_absolute()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::CurDir)))
+    {
+        return Err("legacy_pairing_host_configuration_invalid");
+    }
+    #[cfg(windows)]
+    if !path.is_absolute()
+        && path
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_)))
+    {
+        return Err("legacy_pairing_host_configuration_invalid");
+    }
+    #[cfg(not(windows))]
+    if !path.is_absolute()
+        && path
+            .components()
+            .any(|component| matches!(component, Component::RootDir))
+    {
+        return Err("legacy_pairing_host_configuration_invalid");
+    }
+    Ok(())
+}
+
+fn resolve_configured_path(state_root: &Path, configured: &str) -> Result<String, &'static str> {
+    let configured_path = Path::new(configured);
+    let mut resolved = if configured_path.is_absolute() {
+        PathBuf::new()
+    } else {
+        state_root.to_path_buf()
+    };
+    for component in configured_path.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::Normal(name) => resolved.push(name),
+            Component::CurDir => (),
+            Component::ParentDir => {
+                return Err("legacy_pairing_host_configuration_invalid");
+            }
+        }
+    }
+    if !resolved.is_absolute() {
+        return Err("legacy_pairing_host_configuration_invalid");
+    }
+    Ok(resolved.to_string_lossy().into_owned())
+}
+
+/// Checks every existing path component without following symlinks. A missing
+/// component is an absent namespace; an existing malformed path fails closed.
+fn is_safe_existing_file_path(path: &Path) -> Result<bool, &'static str> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err("legacy_pairing_state_unavailable");
+    }
+    let components: Vec<_> = path.components().collect();
+    let mut current = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::Normal(name) => current.push(name),
+            Component::CurDir | Component::ParentDir => {
+                return Err("legacy_pairing_state_unavailable");
+            }
+        }
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
+        let is_target = index + 1 == components.len();
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err("legacy_pairing_state_unavailable"),
+        };
+        if is_reparse_or_symlink(&metadata) {
+            return Err("legacy_pairing_state_unavailable");
+        }
+        if is_target {
+            if !metadata.is_file() {
+                return Err("legacy_pairing_state_unavailable");
+            }
+        } else if !metadata.is_dir() {
+            return Err("legacy_pairing_state_unavailable");
+        }
+    }
+    Ok(true)
+}
+
+fn is_reparse_or_symlink(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn create_namespace_directories(state_root: &Path, path: &Path) -> Result<(), &'static str> {
@@ -538,7 +736,7 @@ mod tests {
     use super::*;
     use crate::protocol::Document;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use x509_cert::der::DecodePem;
+    use x509_cert::der::{DecodePem, Encode};
 
     const HOST_CERT: &str = include_str!("../tests/fixtures/host-cert.pem");
     const HOST_KEY: &str = include_str!("../tests/fixtures/host-key.pem");
@@ -789,6 +987,271 @@ mod tests {
             import_legacy_pairing(&fixture.0, fixture_now()),
             Err("legacy_pairing_state_ambiguous")
         ));
+    }
+
+    fn configured_snapshot(
+        state_root: &Path,
+        now: u64,
+    ) -> std::sync::Arc<crate::identity::Snapshot> {
+        let (certificate_path, private_key_path) = configured_identity_paths(state_root).unwrap();
+        let configured_identity =
+            crate::identity::ConfiguredIdentity::load(&certificate_path, &private_key_path, 0, now)
+                .unwrap();
+        let namespace: StateNamespace =
+            serde_json::from_slice(&std::fs::read(pairing_namespace_path(state_root)).unwrap())
+                .unwrap();
+        let document: Document =
+            serde_json::from_value(namespace.values[PAIRING_STATE_KEY].clone()).unwrap();
+        crate::identity::Snapshot::prepare_with_configured_identity(
+            &document,
+            now,
+            &configured_identity,
+        )
+        .unwrap()
+    }
+
+    fn write_host_configuration(state_root: &Path, cert: &str, pkey: &str) {
+        let path = host_configuration_namespace_path(state_root);
+        create_namespace_directories(state_root, &path).unwrap();
+        let mut namespace = StateNamespace::default();
+        namespace.values.insert(
+            HOST_CONFIGURATION_STATE_KEY.into(),
+            serde_json::json!({
+                "version": 1,
+                "revision": 1,
+                "file_state": "sunshine_state.json",
+                "vibeshine_file_state": "vibeshine_state.json",
+                "credentials_file": "",
+                "pkey": pkey,
+                "cert": cert,
+                "log_path": "amaterasu.log",
+                "min_log_level": "product_default"
+            }),
+        );
+        std::fs::write(&path, serde_json::to_vec(&namespace).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn imported_tls_identity_and_paired_client_trust_survive_runtime_reload() {
+        let source = TemporaryDirectory::new();
+        let state = TemporaryDirectory::new();
+        write_legacy_source(&source.0, true);
+        let imported = import_legacy_pairing(&source.0, fixture_now()).unwrap();
+        let imported_identity = imported.document.identity.as_ref().unwrap();
+        let expected_fingerprint = crate::crypto::parse_certificate(
+            &imported_identity.certificate_pem,
+            Some(fixture_now()),
+        )
+        .unwrap()
+        .fingerprint;
+        let imported_client = crate::crypto::parse_certificate(CLIENT_CERT, None)
+            .unwrap()
+            .certificate
+            .to_der()
+            .unwrap();
+
+        assert_eq!(
+            seed_pairing_state(&state.0, &imported).unwrap(),
+            PairingSeedOutcome::Seeded
+        );
+        let (certificate_path, private_key_path) = configured_identity_paths(&state.0).unwrap();
+        assert!(std::fs::read(&certificate_path).unwrap() == HOST_CERT.as_bytes());
+        assert!(std::fs::read(&private_key_path).unwrap() == HOST_KEY.as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&certificate_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&private_key_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        for _restart in 0..2 {
+            let snapshot = configured_snapshot(&state.0, fixture_now());
+            let configured_certificate = crate::crypto::parse_certificate(HOST_CERT, None).unwrap();
+            assert!(snapshot.certificate() == configured_certificate.certificate.to_der().unwrap());
+            assert!(snapshot.verify_client(&imported_client, fixture_now()));
+            let (certificate_path, private_key_path) = configured_identity_paths(&state.0).unwrap();
+            let configured = crate::identity::ConfiguredIdentity::load(
+                &certificate_path,
+                &private_key_path,
+                0,
+                fixture_now(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::crypto::parse_certificate(&configured.certificate_pem, Some(fixture_now()))
+                    .unwrap()
+                    .fingerprint,
+                expected_fingerprint
+            );
+            assert!(configured.certificate_pem == HOST_CERT);
+            assert!(configured.private_key_pem == HOST_KEY);
+        }
+
+        assert_eq!(
+            seed_pairing_state(&state.0, &imported).unwrap(),
+            PairingSeedOutcome::ExistingAmaterasuState
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imported_matching_identity_files_are_restricted_to_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = TemporaryDirectory::new();
+        let state = TemporaryDirectory::new();
+        write_legacy_source(&source.0, true);
+        let imported = import_legacy_pairing(&source.0, fixture_now()).unwrap();
+        let certificate_path = state.0.join(DEFAULT_CERTIFICATE_PATH);
+        let private_key_path = state.0.join(DEFAULT_PRIVATE_KEY_PATH);
+        std::fs::create_dir_all(certificate_path.parent().unwrap()).unwrap();
+        std::fs::write(&certificate_path, HOST_CERT).unwrap();
+        std::fs::write(&private_key_path, HOST_KEY).unwrap();
+        std::fs::set_permissions(&certificate_path, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        std::fs::set_permissions(&private_key_path, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+
+        assert_eq!(
+            seed_pairing_state(&state.0, &imported).unwrap(),
+            PairingSeedOutcome::Seeded
+        );
+        assert_eq!(
+            std::fs::metadata(certificate_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(private_key_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn imported_identity_uses_saved_host_configuration_paths() {
+        let source = TemporaryDirectory::new();
+        let state = TemporaryDirectory::new();
+        write_legacy_source(&source.0, true);
+        write_host_configuration(&state.0, "private/host-cert.pem", "private/host-key.pem");
+        let imported = import_legacy_pairing(&source.0, fixture_now()).unwrap();
+
+        assert_eq!(
+            seed_pairing_state(&state.0, &imported).unwrap(),
+            PairingSeedOutcome::Seeded
+        );
+        assert!(
+            std::fs::read(state.0.join("private/host-cert.pem")).unwrap() == HOST_CERT.as_bytes()
+        );
+        assert!(
+            std::fs::read(state.0.join("private/host-key.pem")).unwrap() == HOST_KEY.as_bytes()
+        );
+        assert!(!state.0.join(DEFAULT_CERTIFICATE_PATH).exists());
+        assert!(!state.0.join(DEFAULT_PRIVATE_KEY_PATH).exists());
+    }
+
+    #[test]
+    fn imported_identity_supports_absolute_host_configuration_paths() {
+        let source = TemporaryDirectory::new();
+        let state = TemporaryDirectory::new();
+        let target = TemporaryDirectory::new();
+        write_legacy_source(&source.0, true);
+        let cert = target.0.join("host-cert.pem");
+        let pkey = target.0.join("host-key.pem");
+        write_host_configuration(&state.0, cert.to_str().unwrap(), pkey.to_str().unwrap());
+        let imported = import_legacy_pairing(&source.0, fixture_now()).unwrap();
+
+        assert_eq!(
+            seed_pairing_state(&state.0, &imported).unwrap(),
+            PairingSeedOutcome::Seeded
+        );
+        assert!(std::fs::read(cert).unwrap() == HOST_CERT.as_bytes());
+        assert!(std::fs::read(pkey).unwrap() == HOST_KEY.as_bytes());
+    }
+
+    #[test]
+    fn partial_or_conflicting_target_identity_blocks_pairing_commit_without_overwrite() {
+        for conflict in [false, true] {
+            let source = TemporaryDirectory::new();
+            let state = TemporaryDirectory::new();
+            write_legacy_source(&source.0, true);
+            let imported = import_legacy_pairing(&source.0, fixture_now()).unwrap();
+            let certificate_path = state.0.join(DEFAULT_CERTIFICATE_PATH);
+            let private_key_path = state.0.join(DEFAULT_PRIVATE_KEY_PATH);
+            std::fs::create_dir_all(certificate_path.parent().unwrap()).unwrap();
+            let sentinel = b"preexisting certificate file";
+            std::fs::write(&certificate_path, sentinel).unwrap();
+            if conflict {
+                std::fs::write(&private_key_path, b"preexisting private key file").unwrap();
+            }
+
+            assert!(matches!(
+                seed_pairing_state(&state.0, &imported),
+                Err("legacy_pairing_identity_conflict")
+            ));
+            assert!(std::fs::read(&certificate_path).unwrap() == sentinel);
+            assert!(!pairing_namespace_path(&state.0).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_symlinked_host_configuration_namespace() {
+        use std::os::unix::fs::symlink;
+
+        let source = TemporaryDirectory::new();
+        let state = TemporaryDirectory::new();
+        let external = TemporaryDirectory::new();
+        write_legacy_source(&source.0, true);
+        let imported = import_legacy_pairing(&source.0, fixture_now()).unwrap();
+        let external_path = host_configuration_namespace_path(&external.0);
+        create_namespace_directories(&external.0, &external_path).unwrap();
+        let mut namespace = StateNamespace::default();
+        namespace.values.insert(
+            HOST_CONFIGURATION_STATE_KEY.into(),
+            serde_json::json!({
+                "version": 1,
+                "revision": 1,
+                "file_state": "sunshine_state.json",
+                "vibeshine_file_state": "vibeshine_state.json",
+                "credentials_file": "",
+                "pkey": "credentials/cakey.pem",
+                "cert": "credentials/cacert.pem",
+                "log_path": "amaterasu.log",
+                "min_log_level": "product_default"
+            }),
+        );
+        std::fs::write(&external_path, serde_json::to_vec(&namespace).unwrap()).unwrap();
+        let host_path = host_configuration_namespace_path(&state.0);
+        create_namespace_directories(&state.0, &host_path).unwrap();
+        symlink(external_path, &host_path).unwrap();
+
+        assert!(matches!(
+            seed_pairing_state(&state.0, &imported),
+            Err("legacy_pairing_state_unavailable")
+        ));
+        assert!(!state.0.join(DEFAULT_CERTIFICATE_PATH).exists());
+        assert!(!pairing_namespace_path(&state.0).exists());
     }
 
     #[test]

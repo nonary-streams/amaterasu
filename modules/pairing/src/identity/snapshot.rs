@@ -324,7 +324,7 @@ impl Shared {
     }
 }
 
-fn read_identity_file(path_value: &str) -> Result<String, &'static str> {
+pub(super) fn read_identity_file(path_value: &str) -> Result<String, &'static str> {
     let path = Path::new(path_value);
     validate_identity_file_path(path)?;
 

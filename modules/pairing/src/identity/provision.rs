@@ -1,5 +1,5 @@
 //! First-run provisioning for the host-configured TLS identity files.
-use crate::crypto;
+use crate::{crypto, protocol::Identity};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -48,10 +48,74 @@ pub(super) fn create_missing_identity_pair(
     }
 
     // Publish the public certificate first. If creating the private key then
-    // fails, the incomplete pair remains fail-closed and no secret is exposed.
-    create_private_file(certificate_path, identity.certificate_pem.as_bytes())?;
-    create_private_file(private_key_path, identity.private_key_pem.as_bytes())?;
+    // fails, remove only the exact certificate file created by this call.
+    create_private_identity_pair(
+        certificate_path,
+        identity.certificate_pem.as_bytes(),
+        private_key_path,
+        identity.private_key_pem.as_bytes(),
+    )?;
     Ok(validation_time)
+}
+
+/// Materializes a validated migrated identity at its effective TLS paths.
+/// Existing files must be the exact imported pair; partial or conflicting
+/// paths never get repaired or replaced.
+pub(super) fn materialize_imported_identity_pair(
+    certificate_value: &str,
+    private_key_value: &str,
+    identity: &Identity,
+    now: u64,
+) -> Result<(), &'static str> {
+    let certificate_path = Path::new(certificate_value);
+    let private_key_path = Path::new(private_key_value);
+    if same_path(certificate_path, private_key_path) {
+        return Err("unsafe_identity_path");
+    }
+    crypto::validate_identity(identity, now).map_err(|_| "invalid_identity")?;
+
+    match (
+        inspect_target(certificate_path)?,
+        inspect_target(private_key_path)?,
+    ) {
+        (TargetState::Existing, TargetState::Existing) => {
+            let certificate = super::snapshot::read_identity_file(certificate_value)?;
+            let private_key = super::snapshot::read_identity_file(private_key_value)?;
+            if certificate != identity.certificate_pem || private_key != identity.private_key_pem {
+                return Err("identity_file_conflict");
+            }
+            crypto::validate_identity(
+                &Identity {
+                    host_id: identity.host_id.clone(),
+                    certificate_pem: certificate,
+                    private_key_pem: private_key,
+                },
+                now,
+            )
+            .map_err(|_| "invalid_identity")?;
+            amaterasu_storage::protect_machine_private_file(certificate_path)
+                .map_err(|_| "identity_file_unavailable")?;
+            amaterasu_storage::protect_machine_private_file(private_key_path)
+                .map_err(|_| "identity_file_unavailable")?;
+            Ok(())
+        }
+        (TargetState::Missing, TargetState::Missing) => {
+            ensure_parent_directories(certificate_path)?;
+            ensure_parent_directories(private_key_path)?;
+            if inspect_target(certificate_path)? != TargetState::Missing
+                || inspect_target(private_key_path)? != TargetState::Missing
+            {
+                return Err("identity_file_conflict");
+            }
+            create_private_identity_pair(
+                certificate_path,
+                identity.certificate_pem.as_bytes(),
+                private_key_path,
+                identity.private_key_pem.as_bytes(),
+            )
+        }
+        _ => Err("identity_file_conflict"),
+    }
 }
 
 fn current_time() -> Result<u64, &'static str> {
@@ -180,7 +244,27 @@ fn create_private_directory(path: &Path) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn create_private_file(path: &Path, bytes: &[u8]) -> Result<(), &'static str> {
+fn create_private_identity_pair(
+    certificate_path: &Path,
+    certificate_bytes: &[u8],
+    private_key_path: &Path,
+    private_key_bytes: &[u8],
+) -> Result<(), &'static str> {
+    let certificate_file = create_private_file(certificate_path, certificate_bytes)?;
+    match create_private_file(private_key_path, private_key_bytes) {
+        Ok(private_key_file) => {
+            drop(private_key_file);
+            drop(certificate_file);
+            Ok(())
+        }
+        Err(error) => {
+            remove_created_file_if_same(certificate_path, certificate_file);
+            Err(error)
+        }
+    }
+}
+
+fn create_private_file(path: &Path, bytes: &[u8]) -> Result<File, &'static str> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -220,11 +304,54 @@ fn create_private_file(path: &Path, bytes: &[u8]) -> Result<(), &'static str> {
     let mut file: File = options
         .open(path)
         .map_err(|_| "identity_file_unavailable")?;
-    file.write_all(bytes)
+    if file
+        .write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|_| "identity_file_unavailable")?;
+        .is_err()
+    {
+        remove_created_file_if_same(path, file);
+        return Err("identity_file_unavailable");
+    }
+    if amaterasu_storage::protect_machine_private_file(path).is_err() {
+        remove_created_file_if_same(path, file);
+        return Err("identity_file_unavailable");
+    }
+    Ok(file)
+}
+
+fn remove_created_file_if_same(path: &Path, file: File) {
+    let Ok(created_metadata) = file.metadata() else {
+        return;
+    };
     drop(file);
-    amaterasu_storage::protect_machine_private_file(path).map_err(|_| "identity_file_unavailable")
+    let Ok(current_metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if is_reparse_or_symlink(&current_metadata) || !same_file(&created_metadata, &current_metadata)
+    {
+        return;
+    }
+    let _ = fs::remove_file(path);
+}
+
+#[cfg(unix)]
+fn same_file(created: &fs::Metadata, current: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    created.dev() == current.dev() && created.ino() == current.ino()
+}
+
+#[cfg(windows)]
+fn same_file(created: &fs::Metadata, current: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    created.volume_serial_number().is_some()
+        && created.volume_serial_number() == current.volume_serial_number()
+        && created.file_index().is_some()
+        && created.file_index() == current.file_index()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(_created: &fs::Metadata, _current: &fs::Metadata) -> bool {
+    false
 }
 
 fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
@@ -258,5 +385,52 @@ fn same_path(left: &Path, right: &Path) -> bool {
     #[cfg(not(windows))]
     {
         left == right
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn new() -> Self {
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "amaterasu-pairing-provision-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn second_identity_file_failure_removes_only_the_first_file_created_here() {
+        let directory = TemporaryDirectory::new();
+        let certificate_path = directory.0.join("certificate.pem");
+        let private_key_path = directory.0.join("private-key.pem");
+        fs::create_dir(&private_key_path).unwrap();
+
+        assert_eq!(
+            create_private_identity_pair(
+                &certificate_path,
+                b"test-certificate",
+                &private_key_path,
+                b"test-private-key",
+            ),
+            Err("identity_file_unavailable")
+        );
+        assert!(!certificate_path.exists());
+        assert!(private_key_path.is_dir());
     }
 }

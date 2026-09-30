@@ -11,6 +11,15 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) fn materialize_imported_identity_pair(
+    certificate_path: &str,
+    private_key_path: &str,
+    identity: &crate::protocol::Identity,
+    now: u64,
+) -> Result<(), &'static str> {
+    provision::materialize_imported_identity_pair(certificate_path, private_key_path, identity, now)
+}
+
 pub struct Factory {
     pub api: NativeServiceFactory,
     shared: Arc<Shared>,
