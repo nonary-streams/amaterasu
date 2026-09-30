@@ -21,6 +21,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 
 from test_component_updates import CARGO, WORKSPACE, run
 from test_host_service import Console
@@ -200,8 +201,31 @@ def update_policy(api, token, selection):
     assert status == 200 and changed["ok"], (status, changed)
     confirmed = api.settings(token)
     assert confirmed == changed and confirmed["revision"] == previous["revision"] + 1, (confirmed, changed)
-    assert confirmed["values"] == {"origin_web_ui_allowed": selection}, confirmed
+    assert confirmed["values"] == {
+        "origin_web_ui_allowed": selection,
+        "csrf_allowed_origins": None,
+    }, confirmed
     return confirmed
+
+
+def start_ready_console(harness):
+    console = Console(harness)
+    started = time.monotonic()
+    deadline = started + 60
+    try:
+        # Signed package verification and candidate health precede console
+        # dispatch. Wait for the owned worker, without replaying any mutation.
+        while not any(line.startswith("Development worker ready: pid=")
+                      for line in console.errors):
+            assert console.process.poll() is None, "".join(console.errors[-40:])
+            assert time.monotonic() < deadline, "signed private-peer host startup deadline"
+            time.sleep(0.025)
+        print(f"Private-peer signed host ready in {time.monotonic() - started:.2f}s", flush=True)
+        return console
+    except BaseException:
+        print("".join(console.errors[-40:]), file=sys.stderr)
+        console.close()
+        raise
 
 
 def exercise_private_peers():
@@ -209,7 +233,7 @@ def exercise_private_peers():
         harness = PlatformHarness(Path(temporary))
         certificate = configure_host(harness)
         harness.stage(harness.package(1))
-        console = Console(harness)
+        console = start_ready_console(harness)
         try:
             initial = ready(console)
             assert initial["origin_web_ui_allowed"] == "lan" and initial["revision"] == 0, initial
@@ -245,7 +269,7 @@ def exercise_private_peers():
             assert_peer_denied(lan)
             assert_peer_denied(wan)
             stop_console(console)
-            console = Console(harness)
+            console = start_ready_console(harness)
             assert ready(console)["revision"] == narrowed["revision"]
             peers = {source: PeerTlsApi(console, certificate, source)
                      for source in [PC_ADDRESS, LAN_ADDRESS, WAN_ADDRESS]}
@@ -263,6 +287,10 @@ def exercise_private_peers():
             assert reset["origin_web_ui_allowed"] == "lan"
             assert lan.settings(administrator) == pc.settings(administrator)
             assert_peer_denied(wan)
+        except BaseException:
+            print("Private-peer host exit:", console.process.poll(), file=sys.stderr)
+            print("".join(console.errors[-40:]), file=sys.stderr)
+            raise
         finally:
             console.close()
     print("Passed: signed native management HTTPS with verified private TLS identity, actual PC/LAN/WAN peers, authorization, narrowing disconnect, restart policy and PC-only health in an isolated Linux network namespace.")

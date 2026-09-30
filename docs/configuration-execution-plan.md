@@ -240,7 +240,10 @@ Admission and active connections enforce the actual peer tier; uncertain writes
 close ingress until settlement and confirmed readback. Its `allowed_origins`
 setting remains a separate browser-origin check. Signed loopback HTTPS tests
 qualify policy persistence, authorization, Host/Origin checks and restart;
-actual remote identity/trust, admission and narrowing disconnect remain gates.
+An opt-in Linux test in a private user/network namespace now checks real
+PC/LAN/WAN socket peers, certificate trust and IP identity, restart persistence,
+PC-only health and disconnect on policy narrowing. Physical LAN/WAN reachability
+and installed service/TLS provisioning remain gates.
 Vibeshine also maps its
 configuration UI port through UPnP only in WAN mode when UPnP is enabled;
 Amaterasu has no UPnP mapping. The pinned implementation is in `src/config.cpp`,
@@ -283,8 +286,11 @@ releases the stream. On Windows, the tracker likewise associates only new
 same-user game processes with canonical install-tree image evidence and
 creation-time identity, expands to verified descendants, and rechecks the
 same process handle before a graceful window close or forced stop. Native
-tests cover both stop paths and unrelated processes. Linux runtime
-qualification and Gamescope capture-source handoff remain pending.
+tests cover both stop paths and unrelated processes. Signed controlled Linux
+process tests qualify baseline preservation, install-tree association,
+descendant stop, pidfd identity fencing, natural exit and abort recovery.
+Actual Steam/game delivery, installed-service discovery and Gamescope
+capture-source handoff remain pending.
 
 The global base port now derives HTTP, HTTPS, RTSP, and streaming UDP ports.
 IPv4 and IPv6 listeners can coexist where the startup policy requests both.
@@ -381,8 +387,13 @@ provider stop is confirmed before reverse undo. A failed undo retains the
 session for retry. Vibeshine's `global_prep_cmd` accepts raw `do`/`undo` command
 strings, an `elevated` flag, and `$()` environment expansion. Amaterasu expands
 raw commands during execution rather than at reference configuration parsing;
-Windows elevation and the reference's timeout/output/failure semantics remain
-unqualified.
+Raw undo now snapshots max(exit timeout, 15 seconds) for ordinary and provider
+preparation leases. Sequential cleanup receives a conservative bounded budget,
+with contained children and failed undo retained until settlement or retry.
+Structured deadlines retain their explicit policy; raw do stays bounded at ten
+seconds. Settled command outcomes are reported without transcripts, and large
+reports paginate within the broker payload limit. Shared output, Windows
+elevation and the reference's detach/forget failure behavior remain unqualified.
 `global:global_prep_cmd` and `per_application:exclude-global-prep-cmd` therefore
 remain pending despite the working structured lifecycle.
 The launch default for an omitted per-application `exit-timeout` now matches
@@ -393,8 +404,10 @@ and empty PATH entries against an expanded explicit working directory when
 provided, otherwise the captured host directory. Detached targets
 infer their own directory when no application directory was configured. Process
 parity still requires native elevated launch qualification, configuration-time
-raw environment expansion, full Windows quote/PATHEXT handling and the source
-undo timeout behavior.
+raw environment expansion and full Windows quote/PATHEXT handling. Direct
+application cleanup budgets include owed sequential undo, but host-worker EOF
+still has a separate five-second watchdog; long undo must settle through normal
+nonblocking stop before unload.
 
 The Windows global capture output can now be selected by exact provider ID
 and persists through host restart. A launch snapshots that output into RTSP
@@ -494,9 +507,15 @@ precedence over application values. Amaterasu now resolves scoped `keyboard`
 and `mouse` values at input lease acquisition, preserving explicit false.
 Scrolling, scan-code, Right Alt and repeat are also scoped, with false and zero
 preserved through persistence and signed public lease-request tests. Those probe
-tests do not establish native delivery or effective global defaults. Keybindings
-and their precedence over the Right Alt alias remain an implementation gap;
-native input and the supported-platform matrix keep these IDs pending.
+tests do not establish native delivery or effective global defaults. Ordered
+byte-pair keybindings now persist globally and as whole-list application/client
+overrides; explicit empty lists suppress inherited custom mappings. Builtin
+generic modifiers precede custom mappings, which precede the Right Alt alias.
+Source-owned native target plans survive policy changes, repeats and collisions.
+A grabbed Linux keyboard test verifies kernel events/state and teardown with
+narrowly authorized elevated readback; ordinary-user evdev access fails before
+events. Service-account delivery, desktop cadence, Windows and actual client/game
+behavior keep these IDs pending.
 
 ### Controller and gamepad implementation sequence
 
