@@ -127,12 +127,12 @@ setting and maps either packet form through the existing fixed US-to-evdev table
 unmapped raw keys are rejected during batch validation.
 
 With `gamepad:"auto"`, Windows probes a real ViGEmClient/ViGEmBus connection
-and selects `x360` only after that connection succeeds. Linux probes the
-configured native target and reports its effective profile only after creation
-and destruction succeed. Explicit `x360`, Windows `ds4`, and Linux `xone`,
-`ds4`, and `ds5` select their corresponding platform probes; other recognized
-explicit profiles return `controller_input:false` with a status reason, leave
-keyboard and mouse usable, and never fall back to `auto`.
+and selects `x360` only after that connection succeeds. Linux probes each
+native Auto route and reports controller support when at least one route can
+create and destroy its device. Explicit `x360`, Windows `ds4`, and Linux
+`xone`, `ds4`, `ds5`, and `switch` select their corresponding platform probes;
+other recognized explicit profiles return `controller_input:false` with a
+status reason, leave keyboard and mouse usable, and never fall back to `auto`.
 Status reports the requested `gamepad`, `supported_profiles`, and the effective
 profile as `effective_gamepad_profile`. Linux Auto reports `auto` as its
 configured selector, not as one controller's selected route; `controller_input`
@@ -141,10 +141,11 @@ report null when their probe fails. `supported_profiles` lists implemented
 profiles, not a promise that a host can open the required device node or driver.
 An active lease retains the requested and effective profiles from acquisition.
 
-Linux creates per-lease uinput gamepads when its startup probe succeeds. It maps
-controller number and active mask across 16 slots, projects assigned buttons,
-triggers, and signed axes, removes inactive slots, and retries failed
-timeout-driven state writes while retaining slot ownership. The global
+Linux creates per-lease Xone and Switch uinput gamepads when their startup
+probes succeed, and maps controller number and active mask across 16 slots. It
+projects profile-specific buttons, triggers, and signed axes, removes inactive
+slots, and retries failed timeout-driven state writes while retaining slot
+ownership. The global
 `back_button_timeout` defaults to `-1`; nonnegative values schedule a Back
 deadline per slot. On expiry, the module releases Back, pulses Guide for 100
 milliseconds after successful delivery, and suppresses Back until the client
@@ -200,17 +201,29 @@ reports are recognized and consumed but are not delivered to the client.
 Synthetic USB descriptor, feature-query, identity, input-report, recovery, and
 release tests cover this path. They do not establish hardware or game delivery.
 
+Linux `switch` creates a USB-bus uinput device named
+`Sunshine Nintendo (virtual) pad` with VID/PID `057e:2009` and version `0x8111`.
+It maps client A/B/X/Y buttons to Nintendo's east/south/north/west face layout,
+Home to Mode, Back to Select, capture to Z, and L2/R2 to digital ZL/ZR keys.
+D-pad directions use hat
+axes with up and left winning when opposite directions arrive together; stick
+Y axes are inverted, and stick calibration uses fuzz 250 and flat 500. Touch,
+motion, and battery reports are unsupported for this profile. It does not
+advertise force feedback because the input service has no callback to deliver
+rumble requests to the client. Synthetic identity, report-mapping, probe,
+recovery, and release tests cover this path; hardware and game delivery remain
+unqualified.
+
 For Linux `auto`, Xbox arrivals use `xone`; PlayStation arrivals use `ds5`;
-Nintendo arrivals select `switch`; and unknown devices with enabled motion or
+Nintendo arrivals use `switch`; and unknown devices with enabled motion or
 touchpad preferences and matching capabilities use `ds5`. Unknown arrivals
-without those capabilities use `xone`. Auto probes the xone and DS5 backends
-independently, reports the configured selector as `effective_gamepad_profile:
-"auto"`, and accepts controller input when at least one route is available.
-Each arrival keeps its selected route: if that profile cannot be created, the
-event returns `controller_unavailable` and does not fall back to another
-profile. Nintendo's `switch` route is selected correctly but remains unavailable
-pending its native implementation. `controller_input` reports aggregate Auto
-viability; it does not promise that every controller route is available.
+without those capabilities use `xone`. Auto probes the xone, DS5, and Switch
+backends independently, reports the configured selector as
+`effective_gamepad_profile:"auto"`, and accepts controller input when at least
+one route is available. Each arrival keeps its selected route: if that profile
+cannot be created, the event returns `controller_unavailable` and does not fall
+back to another profile. `controller_input` reports aggregate Auto viability; it
+does not promise that every controller route is available.
 
 Windows uses ViGEm's Xbox 360 profile when a
 compatible ViGEmBus driver is installed and a vetted `ViGEmClient.dll` is
@@ -236,12 +249,13 @@ certificate-bound client policy before application policy and freezes the choice
 for launch. Signed host restart and synthetic input-probe tests qualify that
 projection. Windows DS4 touchpad-click and game delivery remain unqualified.
 Windows does not select another profile when ViGEm is missing. Linux provides
-its Xbox-like uinput backend under `xone` and native UHID implementations for
-`ds4` and `ds5`; it does not link or call Inputtino. The Nintendo Switch profile,
-VHF profiles, and VHF/UMDF device creation remain unimplemented. Linux UHID
-runtime behavior has not been exercised with a physical controller or game, and
-Windows virtual-device delivery has not been qualified against an installed
-ViGEmBus driver, so platform-qualified controller parity remains pending.
+its Xbox-like uinput backend under `xone`, native UHID implementations for `ds4`
+and `ds5`, and the Nintendo Switch uinput profile; it does not link or call
+Inputtino. VHF profiles and VHF/UMDF device creation remain unimplemented. Linux
+virtual-device runtime behavior has not been exercised with a physical
+controller or game, and Windows virtual-device delivery has not been qualified
+against an installed ViGEmBus driver, so platform-qualified controller parity
+remains pending.
 
 If an active ViGEm target rejects a report, input detaches that target before
 creating a replacement and submitting the current state. A failed detach keeps
