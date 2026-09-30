@@ -13,11 +13,13 @@ struct Fake {
     audio_busy: bool,
     pcm_busy: bool,
     control_failed: bool,
+    feedback_busy: bool,
     encoder_failed: bool,
     video_failure_after_submit: bool,
     videos_sent: Vec<(u32, Vec<u8>)>,
     audio_sent: Vec<Vec<u8>>,
     audio_flags: Vec<u32>,
+    feedback_sent: Vec<HostFeedbackMessage>,
     pcm_sent: usize,
     encoder_drains: usize,
     transport_drains: usize,
@@ -30,6 +32,13 @@ impl Backend for Fake {
         } else {
             Ok(None)
         }
+    }
+    fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool> {
+        if self.feedback_busy {
+            return Ok(false);
+        }
+        self.feedback_sent.push(message.clone());
+        Ok(true)
     }
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>> {
         self.video_reads += 1;
@@ -135,6 +144,23 @@ fn pcm() -> PcmPacket {
     unsafe { PcmPacket::copy(&frame).unwrap() }
 }
 
+fn rumble(controller: u16, low_frequency: u16, high_frequency: u16) -> HostFeedback {
+    HostFeedback::Rumble {
+        controller,
+        low_frequency,
+        high_frequency,
+    }
+}
+
+fn haptics_pcm(sequence: u32) -> HostFeedback {
+    HostFeedback::HapticsPcm {
+        controller: 0,
+        sequence,
+        frames: 240,
+        samples_s16le: vec![0; 240 * 4],
+    }
+}
+
 #[test]
 fn surround_pcm_and_encoded_packets_cross_plane_and_drain() {
     for channels in [6, 8] {
@@ -197,6 +223,126 @@ fn fragments_form_one_access_unit_without_waiting_for_a_later_frame() {
             vec![0, 0, 0, 1, 0x65, 1, 2, 3]
         )]
     );
+}
+
+#[test]
+fn feedback_busy_retains_the_same_event_until_transport_local_admission() {
+    let backend = Fake {
+        feedback_busy: true,
+        ..Fake::default()
+    };
+    let mut pump = Pump::new(backend);
+    assert_eq!(
+        pump.enqueue_feedback(rumble(3, 10, 20)),
+        Ok(FeedbackEnqueueOutcome::Queued)
+    );
+    let progress = pump.tick(false).unwrap();
+    assert_eq!(progress.accepted_video_access_units, 0);
+    assert!(pump.backend.feedback_sent.is_empty());
+    assert_eq!(pump.pending_feedback.len(), 1);
+
+    pump.backend.feedback_busy = false;
+    let progress = pump.tick(false).unwrap();
+    assert_eq!(progress.accepted_video_access_units, 0);
+    assert_eq!(pump.pending_feedback.len(), 0);
+    assert_eq!(pump.backend.feedback_sent.len(), 1);
+    assert_eq!(pump.backend.feedback_sent[0].message_type, 0x010b);
+}
+
+#[test]
+fn queue_pressure_drops_pcm_but_preserves_critical_feedback() {
+    let mut pump = Pump::new(Fake::default());
+    for sequence in 100..116 {
+        assert_eq!(
+            pump.enqueue_feedback(haptics_pcm(sequence)),
+            Ok(FeedbackEnqueueOutcome::Queued)
+        );
+    }
+    assert_eq!(
+        pump.enqueue_feedback(haptics_pcm(116)),
+        Ok(FeedbackEnqueueOutcome::DroppedBestEffort)
+    );
+
+    for index in 0..45 {
+        assert_eq!(
+            pump.enqueue_feedback(HostFeedback::RgbLed {
+                controller: 0,
+                red: index,
+                green: 2,
+                blue: 3,
+            }),
+            Ok(FeedbackEnqueueOutcome::Queued)
+        );
+    }
+    for critical_state in [
+        HostFeedback::TriggerRumble {
+            controller: 0,
+            left: 0,
+            right: 0,
+        },
+        HostFeedback::Motion {
+            controller: 0,
+            report_rate_hz: 0,
+            motion_type: amaterasu_gamestream::control::ControllerMotionType::Accel,
+        },
+        HostFeedback::RgbLed {
+            controller: 0,
+            red: 0,
+            green: 0,
+            blue: 0,
+        },
+    ] {
+        assert_eq!(
+            pump.enqueue_feedback(critical_state),
+            Ok(FeedbackEnqueueOutcome::Queued)
+        );
+    }
+    assert_eq!(pump.pending_feedback.len(), MAX_PENDING_FEEDBACK_MESSAGES);
+    assert_eq!(
+        pump.enqueue_feedback(rumble(0, 0, 0)),
+        Ok(FeedbackEnqueueOutcome::Queued)
+    );
+    assert_eq!(pump.pending_feedback.len(), MAX_PENDING_FEEDBACK_MESSAGES);
+
+    while !pump.pending_feedback.is_empty() {
+        pump.tick(false).unwrap();
+    }
+    assert_eq!(pump.backend.feedback_sent.len(), 64);
+    let sent_pcm_sequences: Vec<u32> = pump
+        .backend
+        .feedback_sent
+        .iter()
+        .filter(|message| message.message_type == 0x5601)
+        .map(|message| u32::from_le_bytes(message.payload[4..8].try_into().unwrap()))
+        .collect();
+    assert_eq!(sent_pcm_sequences, (101..116).collect::<Vec<_>>());
+    let sent_types: Vec<u16> = pump
+        .backend
+        .feedback_sent
+        .iter()
+        .map(|message| message.message_type)
+        .collect();
+    for critical_type in [0x010b, 0x5500, 0x5501, 0x5502] {
+        assert!(sent_types.contains(&critical_type));
+    }
+}
+
+#[test]
+fn stop_cancels_pending_feedback_and_rejects_new_events() {
+    let mut pump = Pump::new(Fake::default());
+    assert_eq!(
+        pump.enqueue_feedback(rumble(1, 1, 1)),
+        Ok(FeedbackEnqueueOutcome::Queued)
+    );
+    pump.stopping = true;
+    pump.cancel_feedback();
+    assert!(pump.pending_feedback.is_empty());
+    assert_eq!(
+        pump.enqueue_feedback(rumble(1, 0, 0)),
+        Err(FeedbackEnqueueError::Stopped)
+    );
+    pump.tick(false).unwrap();
+    assert!(pump.backend.feedback_sent.is_empty());
 }
 
 #[test]

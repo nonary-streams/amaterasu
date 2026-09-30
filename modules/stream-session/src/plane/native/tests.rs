@@ -6,6 +6,8 @@ struct Provider {
     duplicate: bool,
     invalid_status: bool,
     audio_failed: bool,
+    send_busy: bool,
+    sent_control: Vec<(u64, u32, u32, u32, Vec<u8>)>,
 }
 
 struct Host {
@@ -161,8 +163,33 @@ unsafe extern "C" fn submit_video(_: *mut c_void, _: u64, _: *const EncodedPacke
 unsafe extern "C" fn submit_audio(_: *mut c_void, _: u64, _: *const EncodedAudioPacket) -> Status {
     MEDIA_BUSY
 }
-unsafe extern "C" fn send_control(_: *mut c_void, _: u64, _: *const ControlMessage) -> Status {
-    MEDIA_BUSY
+unsafe extern "C" fn send_control(
+    context: *mut c_void,
+    stream: u64,
+    message: *const ControlMessage,
+) -> Status {
+    if context.is_null() || message.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the backend lends a live message and the boxed test provider stays
+    // allocated until all native calls have returned.
+    let provider = unsafe { &mut *context.cast::<Provider>() };
+    let message = unsafe { &*message };
+    let Ok(bytes) = (unsafe { message.bytes() }) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    provider.sent_control.push((
+        stream,
+        message.message_type,
+        message.channel,
+        message.delivery,
+        bytes.to_vec(),
+    ));
+    if provider.send_busy {
+        MEDIA_BUSY
+    } else {
+        STATUS_OK
+    }
 }
 unsafe extern "C" fn drain(_: *mut c_void, _: u64) -> Status {
     STATUS_OK
@@ -205,6 +232,44 @@ fn actual_native_tables_copy_borrowed_bytes_and_release_all_bindings() {
     assert!(!backend.submit_video(&header).unwrap());
     drop(backend);
     assert_eq!(host.released, [1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn feedback_uses_the_bound_authenticated_stream_and_keeps_enet_routing_metadata() {
+    let mut host = Host::new();
+    let mut backend = NativeBackend::new(&host.runtime(), handles()).unwrap();
+    let event = HostFeedback::Rumble {
+        controller: 7,
+        low_frequency: 0x1234,
+        high_frequency: 0xabcd,
+    };
+    let message = encode_host_feedback(event).unwrap();
+    assert!(backend.send_feedback(&message).unwrap());
+    assert_eq!(
+        host.provider.sent_control,
+        [(
+            50,
+            0x010b,
+            0,
+            CONTROL_RELIABLE,
+            vec![0xee, 0xff, 0xc0, 0, 7, 0, 0x34, 0x12, 0xcd, 0xab],
+        )]
+    );
+
+    let pcm = encode_host_feedback(HostFeedback::HapticsPcm {
+        controller: 7,
+        sequence: 1,
+        frames: 1,
+        samples_s16le: vec![0; 4],
+    })
+    .unwrap();
+    host.provider.send_busy = true;
+    assert!(!backend.send_feedback(&pcm).unwrap());
+    assert_eq!(host.provider.sent_control[1].0, 50);
+    assert_eq!(host.provider.sent_control[1].1, 0x5601);
+    assert_eq!(host.provider.sent_control[1].2, 8);
+    assert_eq!(host.provider.sent_control[1].3, CONTROL_UNRELIABLE);
+    assert_eq!(host.provider.sent_control[1].4, pcm.payload);
 }
 
 #[test]

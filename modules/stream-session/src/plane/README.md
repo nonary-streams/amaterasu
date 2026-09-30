@@ -21,6 +21,29 @@ from later frames. One assembly is capped at 8 MiB and 1,024 fragments; a copied
 incoming fragment can temporarily add another 8 MiB. The encoder must declare a
 real access-unit boundary through the ABI flag.
 
+Host feedback enters through `Plane::enqueue_feedback`, which accepts an owned,
+validated `HostFeedback` into a session-bound queue capped at 64 messages and
+16 KiB. The result `Queued` means the plane now owns the event; it is not transport
+admission or client acknowledgement. When full, the plane may drop best-effort
+PCM or evict an older PCM event to preserve a reliable rumble stop, trigger,
+motion-state, or LED update. It never drops a reliable event to admit PCM; if no
+PCM can be evicted, the caller gets `QueueFull` and must retain the source event.
+PCM sequence gaps therefore indicate bounded best-effort loss.
+
+After each authenticated control receive pass, the plane attempts up to four
+feedback sends through the control handle already bound to this stream. The
+provider encrypts the typed inner record with its own sequence and sends it only
+to the authorized peer. `STATUS_OK` removes the event from the plane queue because
+the provider copied it into its own bounded outgoing queue; this does not mean the
+client received or consumed it. `MEDIA_BUSY` and `MEDIA_PENDING` consume nothing
+and retain the exact event at the queue head for retry. `stop` discards pending
+feedback and prevents later enqueue attempts from reviving it.
+
+PCM records require both the negotiated control feature and capability for the
+specific client-relative controller slot. The input/session coordinator must
+apply those gates before enqueueing; a structurally valid codec record alone does
+not prove the client advertised haptics support.
+
 Audio requires 48 kHz stereo interleaved f32 or i16 PCM. No rate conversion or
 channel remix is invented. At most one PCM frame and one encoded Opus packet are
 retained by the plane, each bounded by the media ABI. Up to four encoded packets

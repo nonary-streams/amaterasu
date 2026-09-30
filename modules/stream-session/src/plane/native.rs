@@ -73,6 +73,32 @@ impl Backend for NativeBackend {
         output.finish(status)
     }
 
+    fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool> {
+        // SAFETY: the owned binding and message allocation remain live through
+        // the synchronous provider call. The transport copies accepted bytes.
+        let api = unsafe { self.control.table::<ControlTransportApi>() }
+            .map_err(|_| "native_layout_mismatch")?;
+        let control_message = ControlMessage {
+            message_type: u32::from(message.message_type),
+            channel: u32::from(message.channel),
+            delivery: match message.delivery {
+                HostFeedbackDelivery::Reliable => CONTROL_RELIABLE,
+                HostFeedbackDelivery::SequencedUnreliable => CONTROL_UNRELIABLE,
+            },
+            reserved: 0,
+            data: message.payload.as_ptr(),
+            len: message.payload.len(),
+            sequence: 0,
+        };
+        accepted(unsafe {
+            (api.send)(
+                self.control.context(),
+                self.handles.control_transport,
+                &control_message,
+            )
+        })
+    }
+
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>> {
         let mut output = Delivery::default();
         // SAFETY: binding and output are retained throughout synchronous delivery.

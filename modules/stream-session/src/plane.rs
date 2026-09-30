@@ -1,14 +1,39 @@
 //! Bounded, synchronous native media forwarding. Provider resources belong to the
-//! pipeline; this plane owns only bindings and copied pending output.
+//! pipeline; this plane owns only bindings and bounded copied pending output.
 mod native;
 mod packets;
 
+use amaterasu_gamestream::control::{
+    FeedbackEncodeError, HostFeedback, HostFeedbackDelivery, HostFeedbackMessage,
+    encode_host_feedback,
+};
 use amaterasu_media::*;
 use amaterasu_module_sdk::RuntimeClient;
 use packets::{AudioPacket, PcmPacket, VideoAssembly, VideoPacket};
+use std::collections::VecDeque;
 
 pub type PlaneResult<T> = Result<T, &'static str>;
 const READ_BUDGET: usize = 4;
+const FEEDBACK_SEND_BUDGET: usize = 4;
+const MAX_PENDING_FEEDBACK_MESSAGES: usize = 64;
+const MAX_PENDING_FEEDBACK_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedbackEnqueueOutcome {
+    /// The plane owns the validated event and will retry it until the transport
+    /// accepts it or the stream is stopped.
+    Queued,
+    /// Best-effort PCM was dropped under bounded queue pressure. Sequence gaps
+    /// are expected, and the caller may acknowledge this event locally.
+    DroppedBestEffort,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedbackEnqueueError {
+    Invalid(FeedbackEncodeError),
+    QueueFull,
+    Stopped,
+}
 
 #[derive(Clone, Copy)]
 pub struct Handles {
@@ -64,9 +89,21 @@ impl Plane {
         self.pump.tick(media_active)
     }
 
-    /// Stops new PCM capture. The pipeline separately drains the video provider.
+    /// Transfers one event into this session's bounded queue. `Queued` means the
+    /// plane owns it; it does not mean the transport or client accepted it.
+    #[allow(dead_code)] // The coordinator-owned Input poll call site is landing separately.
+    pub fn enqueue_feedback(
+        &mut self,
+        feedback: HostFeedback,
+    ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError> {
+        self.pump.enqueue_feedback(feedback)
+    }
+
+    /// Stops new PCM capture and cancels pending feedback. The pipeline separately
+    /// drains the video provider.
     pub fn stop(&mut self) {
         self.pump.stopping = true;
+        self.pump.cancel_feedback();
     }
 
     /// Both EOS markers were accepted and transport draining has started. The
@@ -82,6 +119,7 @@ impl Plane {
 
 trait Backend {
     fn control(&mut self) -> PlaneResult<Option<ControlRecord>>;
+    fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool>;
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>>;
     fn pcm(&mut self) -> PlaneResult<Option<PcmPacket>>;
     fn audio(&mut self) -> PlaneResult<Option<AudioPacket>>;
@@ -99,6 +137,8 @@ struct Pump<B> {
     video: VideoAssembly,
     pending_pcm: Option<PcmPacket>,
     pending_audio: Option<AudioPacket>,
+    pending_feedback: VecDeque<HostFeedbackMessage>,
+    pending_feedback_bytes: usize,
     stopping: bool,
     encoder_draining: bool,
     video_ended: bool,
@@ -123,6 +163,8 @@ impl<B: Backend> Pump<B> {
             video: VideoAssembly::default(),
             pending_pcm: None,
             pending_audio: None,
+            pending_feedback: VecDeque::new(),
+            pending_feedback_bytes: 0,
             stopping: false,
             encoder_draining: false,
             video_ended: false,
@@ -168,6 +210,9 @@ impl<B: Backend> Pump<B> {
             };
             progress.controls.push(message);
         }
+        if let Err(code) = self.pump_feedback() {
+            return Err(TickFailure { code, progress });
+        }
         if !media_active {
             return Ok(progress);
         }
@@ -186,6 +231,70 @@ impl<B: Backend> Pump<B> {
             };
         }
         Ok(progress)
+    }
+
+    fn enqueue_feedback(
+        &mut self,
+        feedback: HostFeedback,
+    ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError> {
+        if self.stopping || self.failure.is_some() {
+            return Err(FeedbackEnqueueError::Stopped);
+        }
+        let message = encode_host_feedback(feedback).map_err(FeedbackEnqueueError::Invalid)?;
+        let message_bytes = message.payload.len();
+        if message_bytes > MAX_PENDING_FEEDBACK_BYTES {
+            return Err(FeedbackEnqueueError::QueueFull);
+        }
+        if message.delivery == HostFeedbackDelivery::SequencedUnreliable
+            && self.would_exceed_feedback_bounds(message_bytes)
+        {
+            return Ok(FeedbackEnqueueOutcome::DroppedBestEffort);
+        }
+        while self.would_exceed_feedback_bounds(message_bytes) {
+            let pcm_index = self
+                .pending_feedback
+                .iter()
+                .position(|pending| pending.delivery == HostFeedbackDelivery::SequencedUnreliable);
+            let Some(pcm_index) = pcm_index else {
+                return Err(FeedbackEnqueueError::QueueFull);
+            };
+            let dropped = self
+                .pending_feedback
+                .remove(pcm_index)
+                .expect("located PCM entry");
+            self.pending_feedback_bytes -= dropped.payload.len();
+        }
+        self.pending_feedback_bytes += message_bytes;
+        self.pending_feedback.push_back(message);
+        Ok(FeedbackEnqueueOutcome::Queued)
+    }
+
+    fn would_exceed_feedback_bounds(&self, incoming_bytes: usize) -> bool {
+        self.pending_feedback.len() >= MAX_PENDING_FEEDBACK_MESSAGES
+            || self.pending_feedback_bytes.saturating_add(incoming_bytes)
+                > MAX_PENDING_FEEDBACK_BYTES
+    }
+
+    fn cancel_feedback(&mut self) {
+        self.pending_feedback.clear();
+        self.pending_feedback_bytes = 0;
+    }
+
+    fn pump_feedback(&mut self) -> PlaneResult<()> {
+        for _ in 0..FEEDBACK_SEND_BUDGET {
+            let Some(message) = self.pending_feedback.front() else {
+                break;
+            };
+            if !self.backend.send_feedback(message)? {
+                break;
+            }
+            let accepted = self
+                .pending_feedback
+                .pop_front()
+                .expect("front was present");
+            self.pending_feedback_bytes -= accepted.payload.len();
+        }
+        Ok(())
     }
 
     fn pump_video(&mut self, progress: &mut Progress) -> PlaneResult<()> {
