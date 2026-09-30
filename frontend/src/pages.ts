@@ -1,4 +1,11 @@
 namespace Amaterasu {
+  function localizedDateTime(unixSeconds: number): Node | string {
+    const date = new Date(unixSeconds * 1000);
+    return typeof Amaterasu.localeFormattedTextNode === "function"
+      ? Amaterasu.localeFormattedTextNode((locale) => date.toLocaleString(locale))
+      : date.toLocaleString();
+  }
+
   export function renderOverview(context: PageContext): void {
     const area = el("div");
     context.content.append(
@@ -474,7 +481,7 @@ namespace Amaterasu {
           return [
             el("div", "", el("strong", "", session.app_name || session.session_id),
               el("small", "muted block", session.client_name || session.protocol)),
-            new Date(session.started_at_unix * 1000).toLocaleString(),
+            localizedDateTime(session.started_at_unix),
             session.ended_at_unix == null ? badge("Active", "good") :
               `${session.duration_seconds ?? 0} seconds`,
             el("div", "actions", details, remove),
@@ -532,7 +539,7 @@ namespace Amaterasu {
               ? table(
                   ["Sample time", "Frames", "Bytes", "Dropped", "FPS", "Bitrate (kbps)"],
                   detail.samples.map((sample) => [
-                    new Date(sample.recorded_at_unix * 1000).toLocaleString(),
+                    localizedDateTime(sample.recorded_at_unix),
                     String(sample.frames_sent),
                     String(sample.bytes_sent),
                     String(sample.dropped_frames),
@@ -545,7 +552,7 @@ namespace Amaterasu {
               ? table(
                   ["Event time", "Event"],
                   detail.events.map((event) => [
-                    new Date(event.recorded_at_unix * 1000).toLocaleString(),
+                    localizedDateTime(event.recorded_at_unix),
                     event.event_type,
                   ]),
                 )

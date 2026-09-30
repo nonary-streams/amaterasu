@@ -7,7 +7,15 @@ namespace Amaterasu {
   ): HTMLElementTagNameMap[K] {
     const node = document.createElement(tag);
     node.className = className;
-    for (const child of children) if (child != null) node.append(child);
+    for (const child of children) {
+      if (child == null) continue;
+      const textChild =
+        typeof child === "string" &&
+        typeof Amaterasu.localizedTextNode === "function"
+          ? Amaterasu.localizedTextNode(child)
+          : child;
+      node.append(textChild);
+    }
     return node;
   }
 

@@ -327,10 +327,14 @@ namespace Amaterasu {
         if (disposed || !container.isConnected || request !== requestGeneration ||
             settings.pause_when_hidden && document.visibilityState !== "visible") return;
         area.replaceChildren(...panels);
+        const locale =
+          typeof Amaterasu.activeIntlLocale === "function"
+            ? Amaterasu.activeIntlLocale()
+            : undefined;
         status.textContent = result.available
           ? result.sampled_at_unix_ms === null
             ? `Host telemetry is available on ${result.platform}; waiting for its first measured sample.`
-            : `Measured ${result.platform} host values at ${new Date(result.sampled_at_unix_ms).toLocaleTimeString()}. Missing sensors are shown as unavailable.`
+            : `Measured ${result.platform} host values at ${new Date(result.sampled_at_unix_ms).toLocaleTimeString(locale)}. Missing sensors are shown as unavailable.`
           : `Host telemetry is unsupported on this platform (${result.platform}); no sample values were invented.`;
       } catch (error) {
         if (!disposed && container.isConnected && request === requestGeneration)

@@ -1709,12 +1709,404 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    const BASE_MESSAGE_KEYS = [
+        "Overview",
+        "Library",
+        "Settings",
+        "Sessions",
+        "Applications",
+        "Steam",
+        "Diagnostics",
+        "Host workspace",
+        "Sign out",
+        "Locale",
+        "Loading locale preference…",
+        "Saving locale preference…",
+        "Read only",
+        "This locale translates navigation and selected labels; untranslated text uses English.",
+    ];
+    const UI_MESSAGE_KEYS = [
+        "← Previous",
+        "Next →",
+        "Refresh",
+        "Save",
+        "Cancel",
+        "Close",
+        "Search",
+        "Edit",
+        "Delete",
+        "Try again",
+        "Unable to complete request",
+    ];
+    const SHELL_MESSAGE_KEYS = [
+        "WORKSPACE",
+        "Development preview",
+        "Local management console",
+        "Streaming features are in progress.",
+        "Toggle navigation",
+    ];
+    const localeTranslations = {
+        bg: {
+            base: [
+                "Общ преглед", "Библиотека", "Настройки", "Сесии", "Приложения", "Steam", "Диагностика",
+                "Работно пространство на хоста", "Изход", "Език", "Зареждане на езиковата настройка…",
+                "Запазване на езиковата настройка…", "Само за четене",
+                "Тази локализация превежда навигацията и избрани етикети; останалият текст е на английски.",
+            ],
+            ui: [
+                "← Предишна", "Следваща →", "Обновяване", "Запазване", "Отказ", "Затвори", "Търсене",
+                "Редактиране", "Изтриване", "Опитай отново", "Заявката не можа да бъде изпълнена",
+            ],
+        },
+        cs: {
+            base: [
+                "Přehled", "Knihovna", "Nastavení", "Relace", "Aplikace", "Steam", "Diagnostika",
+                "Pracovní prostor hostitele", "Odhlásit", "Jazyk", "Načítání jazykového nastavení…",
+                "Ukládání jazykového nastavení…", "Pouze pro čtení",
+                "Toto locale překládá navigaci a vybrané popisky; ostatní text zůstává v angličtině.",
+            ],
+            ui: [
+                "← Předchozí", "Další →", "Obnovit", "Uložit", "Zrušit", "Zavřít", "Hledat", "Upravit",
+                "Odstranit", "Zkusit znovu", "Požadavek se nepodařilo dokončit",
+            ],
+        },
+        de: {
+            base: [
+                "Übersicht", "Bibliothek", "Einstellungen", "Sitzungen", "Anwendungen", "Steam", "Diagnose",
+                "Arbeitsbereich des Hosts", "Abmelden", "Sprache", "Spracheinstellung wird geladen…",
+                "Spracheinstellung wird gespeichert…", "Schreibgeschützt",
+                "Diese Spracheinstellung übersetzt die Navigation und ausgewählte Beschriftungen; anderer Text bleibt Englisch.",
+            ],
+            ui: [
+                "← Zurück", "Weiter →", "Aktualisieren", "Speichern", "Abbrechen", "Schließen", "Suchen",
+                "Bearbeiten", "Löschen", "Erneut versuchen", "Anfrage konnte nicht ausgeführt werden",
+            ],
+        },
+        es: {
+            base: [
+                "Resumen", "Biblioteca", "Ajustes", "Sesiones", "Aplicaciones", "Steam", "Diagnóstico",
+                "Espacio de trabajo del host", "Cerrar sesión", "Idioma", "Cargando la preferencia de idioma…",
+                "Guardando la preferencia de idioma…", "Solo lectura",
+                "Este idioma traduce la navegación y algunas etiquetas; el resto del texto aparece en inglés.",
+            ],
+            ui: [
+                "← Anterior", "Siguiente →", "Actualizar", "Guardar", "Cancelar", "Cerrar", "Buscar", "Editar",
+                "Eliminar", "Intentar de nuevo", "No se pudo completar la solicitud",
+            ],
+        },
+        fr: {
+            base: [
+                "Vue d’ensemble", "Bibliothèque", "Paramètres", "Sessions", "Applications", "Steam", "Diagnostics",
+                "Espace de travail de l’hôte", "Déconnexion", "Langue", "Chargement de la préférence de langue…",
+                "Enregistrement de la préférence de langue…", "Lecture seule",
+                "Cette langue traduit la navigation et certains libellés ; le reste du texte reste en anglais.",
+            ],
+            ui: [
+                "← Précédent", "Suivant →", "Actualiser", "Enregistrer", "Annuler", "Fermer", "Rechercher",
+                "Modifier", "Supprimer", "Réessayer", "Impossible de terminer la requête",
+            ],
+        },
+        hu: {
+            base: [
+                "Áttekintés", "Könyvtár", "Beállítások", "Munkamenetek", "Alkalmazások", "Steam", "Diagnosztika",
+                "A gazdagép munkaterülete", "Kijelentkezés", "Nyelv", "Nyelvi beállítás betöltése…",
+                "Nyelvi beállítás mentése…", "Csak olvasható",
+                "Ez a nyelv a navigációt és néhány címkét fordít le; a többi szöveg angol marad.",
+            ],
+            ui: [
+                "← Előző", "Következő →", "Frissítés", "Mentés", "Mégse", "Bezárás", "Keresés", "Szerkesztés",
+                "Törlés", "Próbálja újra", "A kérést nem sikerült végrehajtani",
+            ],
+        },
+        it: {
+            base: [
+                "Panoramica", "Libreria", "Impostazioni", "Sessioni", "Applicazioni", "Steam", "Diagnostica",
+                "Area di lavoro dell’host", "Esci", "Lingua", "Caricamento della preferenza della lingua…",
+                "Salvataggio della preferenza della lingua…", "Sola lettura",
+                "Questa lingua traduce la navigazione e alcune etichette; il resto del testo rimane in inglese.",
+            ],
+            ui: [
+                "← Precedente", "Successivo →", "Aggiorna", "Salva", "Annulla", "Chiudi", "Cerca", "Modifica",
+                "Elimina", "Riprova", "Impossibile completare la richiesta",
+            ],
+        },
+        ja: {
+            base: [
+                "概要", "ライブラリ", "設定", "セッション", "アプリケーション", "Steam", "診断",
+                "ホストのワークスペース", "サインアウト", "言語", "言語設定を読み込み中…", "言語設定を保存中…",
+                "読み取り専用", "この言語ではナビゲーションと一部のラベルが翻訳されます。その他のテキストは英語で表示されます。",
+            ],
+            ui: [
+                "← 前へ", "次へ →", "更新", "保存", "キャンセル", "閉じる", "検索", "編集", "削除", "再試行",
+                "リクエストを完了できませんでした",
+            ],
+        },
+        ko: {
+            base: [
+                "개요", "라이브러리", "설정", "세션", "애플리케이션", "Steam", "진단",
+                "호스트 작업 공간", "로그아웃", "언어", "언어 설정을 불러오는 중…", "언어 설정을 저장하는 중…",
+                "읽기 전용", "이 언어는 탐색 메뉴와 일부 레이블을 번역합니다. 나머지 텍스트는 영어로 표시됩니다.",
+            ],
+            ui: [
+                "← 이전", "다음 →", "새로 고침", "저장", "취소", "닫기", "검색", "편집", "삭제", "다시 시도",
+                "요청을 완료할 수 없습니다",
+            ],
+        },
+        pl: {
+            base: [
+                "Przegląd", "Biblioteka", "Ustawienia", "Sesje", "Aplikacje", "Steam", "Diagnostyka",
+                "Obszar roboczy hosta", "Wyloguj", "Język", "Wczytywanie preferencji języka…",
+                "Zapisywanie preferencji języka…", "Tylko do odczytu",
+                "Ten język tłumaczy nawigację i wybrane etykiety; pozostały tekst jest wyświetlany po angielsku.",
+            ],
+            ui: [
+                "← Poprzednia", "Następna →", "Odśwież", "Zapisz", "Anuluj", "Zamknij", "Szukaj", "Edytuj", "Usuń",
+                "Spróbuj ponownie", "Nie można wykonać żądania",
+            ],
+        },
+        pt: {
+            base: [
+                "Visão geral", "Biblioteca", "Configurações", "Sessões", "Aplicativos", "Steam", "Diagnóstico",
+                "Área de trabalho do host", "Sair", "Idioma", "Carregando a preferência de idioma…",
+                "Salvando a preferência de idioma…", "Somente leitura",
+                "Este idioma traduz a navegação e alguns rótulos; o restante do texto aparece em inglês.",
+            ],
+            ui: [
+                "← Anterior", "Próxima →", "Atualizar", "Salvar", "Cancelar", "Fechar", "Pesquisar", "Editar",
+                "Excluir", "Tentar novamente", "Não foi possível concluir a solicitação",
+            ],
+        },
+        pt_BR: {
+            base: [
+                "Visão geral", "Biblioteca", "Configurações", "Sessões", "Aplicativos", "Steam", "Diagnóstico",
+                "Área de trabalho do host", "Sair", "Idioma", "Carregando a preferência de idioma…",
+                "Salvando a preferência de idioma…", "Somente leitura",
+                "Este idioma traduz a navegação e alguns rótulos; o restante do texto aparece em inglês.",
+            ],
+            ui: [
+                "← Anterior", "Próxima →", "Atualizar", "Salvar", "Cancelar", "Fechar", "Pesquisar", "Editar",
+                "Excluir", "Tentar novamente", "Não foi possível concluir a solicitação",
+            ],
+        },
+        ru: {
+            base: [
+                "Обзор", "Библиотека", "Настройки", "Сеансы", "Приложения", "Steam", "Диагностика",
+                "Рабочая область хоста", "Выйти", "Язык", "Загрузка языковых настроек…", "Сохранение языковых настроек…",
+                "Только для чтения", "Этот язык переводит навигацию и отдельные подписи; остальной текст отображается на английском.",
+            ],
+            ui: [
+                "← Назад", "Далее →", "Обновить", "Сохранить", "Отмена", "Закрыть", "Поиск", "Изменить", "Удалить",
+                "Повторить попытку", "Не удалось выполнить запрос",
+            ],
+        },
+        sv: {
+            base: [
+                "Översikt", "Bibliotek", "Inställningar", "Sessioner", "Program", "Steam", "Diagnostik",
+                "Värdens arbetsyta", "Logga ut", "Språk", "Läser in språkval…", "Sparar språkval…", "Skrivskyddad",
+                "Det här språket översätter navigeringen och vissa etiketter; övrig text visas på engelska.",
+            ],
+            ui: [
+                "← Föregående", "Nästa →", "Uppdatera", "Spara", "Avbryt", "Stäng", "Sök", "Redigera", "Ta bort",
+                "Försök igen", "Det gick inte att slutföra begäran",
+            ],
+        },
+        tr: {
+            base: [
+                "Genel Bakış", "Kitaplık", "Ayarlar", "Oturumlar", "Uygulamalar", "Steam", "Tanılama",
+                "Ana makine çalışma alanı", "Oturumu kapat", "Dil", "Dil tercihi yükleniyor…", "Dil tercihi kaydediliyor…",
+                "Salt okunur", "Bu dil gezinme menüsünü ve seçili etiketleri çevirir; diğer metinler İngilizce gösterilir.",
+            ],
+            ui: [
+                "← Önceki", "Sonraki →", "Yenile", "Kaydet", "İptal", "Kapat", "Ara", "Düzenle", "Sil", "Tekrar dene",
+                "İstek tamamlanamadı",
+            ],
+        },
+        uk: {
+            base: [
+                "Огляд", "Бібліотека", "Налаштування", "Сеанси", "Програми", "Steam", "Діагностика",
+                "Робочий простір хоста", "Вийти", "Мова", "Завантаження мовних налаштувань…",
+                "Збереження мовних налаштувань…", "Лише для читання",
+                "Ця мова перекладає навігацію та окремі підписи; решта тексту відображається англійською.",
+            ],
+            ui: [
+                "← Назад", "Далі →", "Оновити", "Зберегти", "Скасувати", "Закрити", "Пошук", "Редагувати", "Видалити",
+                "Спробувати знову", "Не вдалося виконати запит",
+            ],
+        },
+        vi: {
+            base: [
+                "Tổng quan", "Thư viện", "Cài đặt", "Phiên", "Ứng dụng", "Steam", "Chẩn đoán",
+                "Không gian làm việc của máy chủ", "Đăng xuất", "Ngôn ngữ", "Đang tải tùy chọn ngôn ngữ…",
+                "Đang lưu tùy chọn ngôn ngữ…", "Chỉ đọc",
+                "Ngôn ngữ này dịch phần điều hướng và một số nhãn; văn bản còn lại sẽ hiển thị bằng tiếng Anh.",
+            ],
+            ui: [
+                "← Trước", "Tiếp →", "Làm mới", "Lưu", "Hủy", "Đóng", "Tìm kiếm", "Chỉnh sửa", "Xóa", "Thử lại",
+                "Không thể hoàn tất yêu cầu",
+            ],
+        },
+        zh: {
+            base: [
+                "概览", "应用库", "设置", "会话", "应用", "Steam", "诊断", "主机工作区", "退出登录", "语言",
+                "正在加载语言偏好…", "正在保存语言偏好…", "只读",
+                "此语言会翻译导航菜单和部分标签；其他文本将以英语显示。",
+            ],
+            ui: [
+                "← 上一页", "下一页 →", "刷新", "保存", "取消", "关闭", "搜索", "编辑", "删除", "重试", "无法完成请求",
+            ],
+        },
+        zh_TW: {
+            base: [
+                "概覽", "應用程式庫", "設定", "工作階段", "應用程式", "Steam", "診斷", "主機工作區", "登出", "語言",
+                "正在載入語言偏好設定…", "正在儲存語言偏好設定…", "唯讀",
+                "此語言會翻譯導覽選單和部分標籤；其他文字會以英文顯示。",
+            ],
+            ui: [
+                "← 上一頁", "下一頁 →", "重新整理", "儲存", "取消", "關閉", "搜尋", "編輯", "刪除", "重試", "無法完成要求",
+            ],
+        },
+    };
+    const shellTranslations = {
+        bg: [
+            "РАБОТНО ПРОСТРАНСТВО", "Прегледна версия", "Локална конзола за управление",
+            "Функциите за стрийминг са в процес на разработка.", "Превключване на навигацията",
+        ],
+        cs: [
+            "PRACOVNÍ PROSTOR", "Vývojová verze", "Místní konzole pro správu",
+            "Funkce streamování jsou ve vývoji.", "Přepnout navigaci",
+        ],
+        de: [
+            "ARBEITSBEREICH", "Entwicklungsvorschau", "Lokale Verwaltungskonsole",
+            "Streamingfunktionen sind in Arbeit.", "Navigation umschalten",
+        ],
+        es: [
+            "ESPACIO DE TRABAJO", "Versión de vista previa", "Consola de administración local",
+            "Las funciones de streaming están en desarrollo.", "Alternar navegación",
+        ],
+        fr: [
+            "ESPACE DE TRAVAIL", "Aperçu de développement", "Console de gestion locale",
+            "Les fonctions de streaming sont en cours de développement.", "Afficher ou masquer la navigation",
+        ],
+        hu: [
+            "MUNKATERÜLET", "Fejlesztői előzetes", "Helyi felügyeleti konzol",
+            "A streamelési funkciók fejlesztés alatt állnak.", "Navigáció váltása",
+        ],
+        it: [
+            "AREA DI LAVORO", "Anteprima di sviluppo", "Console di gestione locale",
+            "Le funzioni di streaming sono in fase di sviluppo.", "Mostra o nascondi la navigazione",
+        ],
+        ja: [
+            "ワークスペース", "開発プレビュー", "ローカル管理コンソール",
+            "ストリーミング機能は開発中です。", "ナビゲーションの表示を切り替え",
+        ],
+        ko: [
+            "작업 공간", "개발 미리 보기", "로컬 관리 콘솔",
+            "스트리밍 기능은 개발 중입니다.", "탐색 메뉴 전환",
+        ],
+        pl: [
+            "OBSZAR ROBOCZY", "Wersja podglądowa", "Lokalna konsola zarządzania",
+            "Funkcje strumieniowania są w trakcie prac.", "Przełącz nawigację",
+        ],
+        pt: [
+            "ÁREA DE TRABALHO", "Prévia de desenvolvimento", "Console de gerenciamento local",
+            "Os recursos de streaming estão em desenvolvimento.", "Alternar navegação",
+        ],
+        pt_BR: [
+            "ÁREA DE TRABALHO", "Prévia de desenvolvimento", "Console de gerenciamento local",
+            "Os recursos de streaming estão em desenvolvimento.", "Alternar navegação",
+        ],
+        ru: [
+            "РАБОЧАЯ ОБЛАСТЬ", "Предварительная версия", "Локальная консоль управления",
+            "Функции потоковой передачи находятся в разработке.", "Переключить навигацию",
+        ],
+        sv: [
+            "ARBETSYTA", "Förhandsversion", "Lokal hanteringskonsol",
+            "Strömningsfunktioner är under utveckling.", "Visa eller dölj navigeringen",
+        ],
+        tr: [
+            "ÇALIŞMA ALANI", "Geliştirme önizlemesi", "Yerel yönetim konsolu",
+            "Akış özellikleri geliştirme aşamasındadır.", "Gezinme menüsünü aç veya kapat",
+        ],
+        uk: [
+            "РОБОЧИЙ ПРОСТІР", "Попередня версія", "Локальна консоль керування",
+            "Функції потокового передавання ще розробляються.", "Перемкнути навігацію",
+        ],
+        vi: [
+            "KHÔNG GIAN LÀM VIỆC", "Bản xem trước dành cho nhà phát triển", "Bảng điều khiển quản lý cục bộ",
+            "Các tính năng phát trực tuyến đang được phát triển.", "Bật hoặc tắt điều hướng",
+        ],
+        zh: [
+            "工作区", "开发预览版", "本地主机管理控制台", "串流功能仍在开发中。", "切换导航菜单",
+        ],
+        zh_TW: [
+            "工作區", "開發預覽版", "本地主機管理主控台", "串流功能仍在開發中。", "切換導覽選單",
+        ],
+    };
+    function catalogFromTranslations(keys, translations) {
+        const catalog = {};
+        if (!translations)
+            return catalog;
+        if (translations.length !== keys.length) {
+            throw new Error("The locale catalog contains an incomplete message list.");
+        }
+        keys.forEach((key, index) => {
+            const translation = translations[index];
+            if (translation !== undefined)
+                catalog[key] = translation;
+        });
+        return catalog;
+    }
+    function englishCatalog(keys) {
+        return Object.fromEntries(keys.map((key) => [key, key]));
+    }
+    function mergeLocaleMessages(base, overlay) {
+        const result = { ...base };
+        for (const [key, value] of Object.entries(overlay)) {
+            const existing = result[key];
+            result[key] =
+                value &&
+                    typeof value === "object" &&
+                    !Array.isArray(value) &&
+                    existing &&
+                    typeof existing === "object" &&
+                    !Array.isArray(existing)
+                    ? mergeLocaleMessages(existing, value)
+                    : value;
+        }
+        return result;
+    }
+    Amaterasu.mergeLocaleMessages = mergeLocaleMessages;
+    function localeMessagesFor(locale) {
+        const englishBase = englishCatalog(BASE_MESSAGE_KEYS);
+        const englishUi = englishCatalog(UI_MESSAGE_KEYS);
+        const englishShell = englishCatalog(SHELL_MESSAGE_KEYS);
+        const translations = localeTranslations[locale];
+        const localeBase = catalogFromTranslations(BASE_MESSAGE_KEYS, translations?.base);
+        const localeUi = catalogFromTranslations(UI_MESSAGE_KEYS, translations?.ui);
+        const localeShell = catalogFromTranslations(SHELL_MESSAGE_KEYS, shellTranslations[locale]);
+        return mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(englishBase, englishUi), englishShell), localeBase), mergeLocaleMessages(localeUi, localeShell));
+    }
+    Amaterasu.localeMessagesFor = localeMessagesFor;
+    function translateLocaleMessage(source, messages) {
+        const message = messages[source];
+        return typeof message === "string" ? message : source;
+    }
+    Amaterasu.translateLocaleMessage = translateLocaleMessage;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function el(tag, className = "", ...children) {
         const node = document.createElement(tag);
         node.className = className;
-        for (const child of children)
-            if (child != null)
-                node.append(child);
+        for (const child of children) {
+            if (child == null)
+                continue;
+            const textChild = typeof child === "string" &&
+                typeof Amaterasu.localizedTextNode === "function"
+                ? Amaterasu.localizedTextNode(child)
+                : child;
+            node.append(textChild);
+        }
         return node;
     }
     Amaterasu.el = el;
@@ -6606,6 +6998,11 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    let activeLocale = "en";
+    let activeLocaleMessages = Amaterasu.localeMessagesFor(activeLocale);
+    const localizedTextSources = new WeakMap();
+    const localizedTextFormatters = new WeakMap();
+    let currentPageTitle = null;
     Amaterasu.LOCALE_OPTIONS = [
         "bg",
         "cs",
@@ -6707,6 +7104,80 @@ var Amaterasu;
         return validateLocale(value).replaceAll("_", "-");
     }
     Amaterasu.documentLanguage = documentLanguage;
+    function translateText(source) {
+        return Amaterasu.translateLocaleMessage(source, activeLocaleMessages);
+    }
+    Amaterasu.translateText = translateText;
+    function activeIntlLocale() {
+        return activeLocale.replaceAll("_", "-");
+    }
+    Amaterasu.activeIntlLocale = activeIntlLocale;
+    function localizedTextNode(source) {
+        if (typeof document === "undefined" ||
+            typeof document.createTextNode !== "function") {
+            return source;
+        }
+        const node = document.createTextNode(translateText(source));
+        localizedTextSources.set(node, source);
+        return node;
+    }
+    Amaterasu.localizedTextNode = localizedTextNode;
+    function localeFormattedTextNode(format) {
+        const initial = format(activeIntlLocale());
+        if (typeof document === "undefined" ||
+            typeof document.createTextNode !== "function") {
+            return initial;
+        }
+        const node = document.createTextNode(initial);
+        localizedTextFormatters.set(node, format);
+        return node;
+    }
+    Amaterasu.localeFormattedTextNode = localeFormattedTextNode;
+    function setDocumentTitle(title) {
+        currentPageTitle = null;
+        document.title = title;
+    }
+    Amaterasu.setDocumentTitle = setDocumentTitle;
+    function setLocalizedPageTitle(source) {
+        currentPageTitle = source;
+        document.title = `${translateText(source)} · Amaterasu`;
+    }
+    Amaterasu.setLocalizedPageTitle = setLocalizedPageTitle;
+    function refreshLocalizedTextNodes() {
+        if (typeof document === "undefined" ||
+            typeof document.createTreeWalker !== "function" ||
+            typeof NodeFilter === "undefined") {
+            return;
+        }
+        const walker = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_TEXT);
+        let node = walker.nextNode();
+        while (node) {
+            const source = localizedTextSources.get(node);
+            if (source !== undefined)
+                node.textContent = translateText(source);
+            else {
+                const format = localizedTextFormatters.get(node);
+                if (format)
+                    node.textContent = format(activeIntlLocale());
+            }
+            node = walker.nextNode();
+        }
+    }
+    function applyLocale(value) {
+        const locale = validateLocale(value);
+        const changed = locale !== activeLocale;
+        activeLocale = locale;
+        activeLocaleMessages = Amaterasu.localeMessagesFor(locale);
+        if (typeof document !== "undefined" && document.documentElement) {
+            document.documentElement.lang = documentLanguage(locale);
+            if (currentPageTitle !== null)
+                setLocalizedPageTitle(currentPageTitle);
+        }
+        if (changed)
+            refreshLocalizedTextNodes();
+        return locale;
+    }
+    Amaterasu.applyLocale = applyLocale;
     function errorMessage(error) {
         return error instanceof Error ? error.message : String(error);
     }
@@ -6755,11 +7226,11 @@ var Amaterasu;
         container.className = "locale-control";
         const label = document.createElement("label");
         label.htmlFor = "global-locale";
-        label.textContent = "Locale";
-        label.title = "Stored locale preference. Console text remains English.";
+        label.textContent = translateText("Locale");
+        label.title = translateText("This locale translates navigation and selected labels; untranslated text uses English.");
         const select = document.createElement("select");
         select.id = "global-locale";
-        select.setAttribute("aria-label", "Locale");
+        select.setAttribute("aria-label", translateText("Locale"));
         for (const locale of Amaterasu.LOCALE_OPTIONS) {
             const option = document.createElement("option");
             option.value = locale;
@@ -6774,7 +7245,7 @@ var Amaterasu;
         error.className = "locale-error";
         error.setAttribute("role", "alert");
         const note = document.createElement("small");
-        note.textContent = "Console text remains English.";
+        note.textContent = translateText("This locale translates navigation and selected labels; untranslated text uses English.");
         container.append(label, select, status, error, note);
         const canWrite = api.allows("configuration.write");
         let busy = false;
@@ -6790,22 +7261,29 @@ var Amaterasu;
         const clearError = () => {
             error.textContent = "";
         };
+        const updateLocaleText = () => {
+            label.textContent = translateText("Locale");
+            label.title = translateText("This locale translates navigation and selected labels; untranslated text uses English.");
+            select.setAttribute("aria-label", translateText("Locale"));
+            note.textContent = translateText("This locale translates navigation and selected labels; untranslated text uses English.");
+        };
         const load = async (previousError) => {
             busy = true;
             updateDisabledState();
-            status.textContent = "Loading locale preference…";
+            status.textContent = translateText("Loading locale preference…");
             clearError();
             try {
                 const configuration = await ensureLocaleConfiguration(api);
                 const locale = localeFromConfiguration(configuration);
+                applyLocale(locale);
+                updateLocaleText();
                 select.value = locale;
-                document.documentElement.lang = documentLanguage(locale);
                 revision = configuration.revision;
                 loaded = true;
                 if (previousError)
                     showError(previousError);
                 else if (!canWrite)
-                    status.textContent = "Read only";
+                    status.textContent = translateText("Read only");
                 else
                     status.textContent = "";
             }
@@ -6834,7 +7312,7 @@ var Amaterasu;
             }
             busy = true;
             updateDisabledState();
-            status.textContent = "Saving locale preference…";
+            status.textContent = translateText("Saving locale preference…");
             clearError();
             void api
                 .post("configuration/update", {
@@ -7118,10 +7596,13 @@ var Amaterasu;
                     settings.pause_when_hidden && document.visibilityState !== "visible")
                     return;
                 area.replaceChildren(...panels);
+                const locale = typeof Amaterasu.activeIntlLocale === "function"
+                    ? Amaterasu.activeIntlLocale()
+                    : undefined;
                 status.textContent = result.available
                     ? result.sampled_at_unix_ms === null
                         ? `Host telemetry is available on ${result.platform}; waiting for its first measured sample.`
-                        : `Measured ${result.platform} host values at ${new Date(result.sampled_at_unix_ms).toLocaleTimeString()}. Missing sensors are shown as unavailable.`
+                        : `Measured ${result.platform} host values at ${new Date(result.sampled_at_unix_ms).toLocaleTimeString(locale)}. Missing sensors are shown as unavailable.`
                     : `Host telemetry is unsupported on this platform (${result.platform}); no sample values were invented.`;
             }
             catch (error) {
@@ -7647,6 +8128,12 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function localizedDateTime(unixSeconds) {
+        const date = new Date(unixSeconds * 1000);
+        return typeof Amaterasu.localeFormattedTextNode === "function"
+            ? Amaterasu.localeFormattedTextNode((locale) => date.toLocaleString(locale))
+            : date.toLocaleString();
+    }
     function renderOverview(context) {
         const area = Amaterasu.el("div");
         context.content.append(Amaterasu.sectionHeading("Host overview", "Your applications, sessions, and local services in one place.", Amaterasu.button("Refresh", load)), area);
@@ -7990,7 +8477,7 @@ var Amaterasu;
                     currentDeleteControls.push({ button: remove, ended: session.ended_at_unix != null });
                     return [
                         Amaterasu.el("div", "", Amaterasu.el("strong", "", session.app_name || session.session_id), Amaterasu.el("small", "muted block", session.client_name || session.protocol)),
-                        new Date(session.started_at_unix * 1000).toLocaleString(),
+                        localizedDateTime(session.started_at_unix),
                         session.ended_at_unix == null ? Amaterasu.badge("Active", "good") :
                             `${session.duration_seconds ?? 0} seconds`,
                         Amaterasu.el("div", "actions", details, remove),
@@ -8032,7 +8519,7 @@ var Amaterasu;
                     return;
                 savedDetail.replaceChildren(Amaterasu.panel(`History for ${detail.session.app_name || detail.session.session_id}`, Amaterasu.el("p", "muted", `${detail.session.protocol} · ${detail.session.width}×${detail.session.height} · ${detail.session.target_fps} FPS · ${detail.session.codec || "codec unavailable"}`), Amaterasu.el("p", "muted", `${detail.sample_count} samples${detail.samples_truncated ? " (recent samples shown)" : ""} · ${detail.event_count} events${detail.events_truncated ? " (recent events shown)" : ""}`), detail.samples.length
                     ? Amaterasu.table(["Sample time", "Frames", "Bytes", "Dropped", "FPS", "Bitrate (kbps)"], detail.samples.map((sample) => [
-                        new Date(sample.recorded_at_unix * 1000).toLocaleString(),
+                        localizedDateTime(sample.recorded_at_unix),
                         String(sample.frames_sent),
                         String(sample.bytes_sent),
                         String(sample.dropped_frames),
@@ -8041,7 +8528,7 @@ var Amaterasu;
                     ]))
                     : Amaterasu.el("p", "muted", "No samples recorded."), detail.events.length
                     ? Amaterasu.table(["Event time", "Event"], detail.events.map((event) => [
-                        new Date(event.recorded_at_unix * 1000).toLocaleString(),
+                        localizedDateTime(event.recorded_at_unix),
                         event.event_type,
                     ]))
                     : Amaterasu.el("p", "muted", "No events recorded.")));
@@ -8582,7 +9069,7 @@ var Amaterasu;
             status.setAttribute("aria-atomic", "true");
             main.append(intro, Amaterasu.el("div", "login-side", status));
             this.root.replaceChildren(main);
-            document.title = "Restoring session · Amaterasu";
+            Amaterasu.setDocumentTitle("Restoring session · Amaterasu");
         }
         currentPage() {
             const value = location.hash.slice(1);
@@ -8662,7 +9149,7 @@ var Amaterasu;
             main.append(intro, Amaterasu.el("div", "login-side", card));
             this.root.replaceChildren(main);
             username.focus();
-            document.title = "Sign in · Amaterasu";
+            Amaterasu.setDocumentTitle("Sign in · Amaterasu");
         }
         brand() {
             return Amaterasu.el("div", "brand", Amaterasu.el("span", "brand-symbol", Amaterasu.el("span")), Amaterasu.el("span", "", "amaterasu"));
@@ -8691,7 +9178,7 @@ var Amaterasu;
                 const open = shell.classList.toggle("menu-open");
                 menu.setAttribute("aria-expanded", String(open));
             }, "menu-toggle");
-            menu.setAttribute("aria-label", "Toggle navigation");
+            menu.setAttribute("aria-label", Amaterasu.translateText("Toggle navigation"));
             menu.setAttribute("aria-expanded", "false");
             const logout = Amaterasu.button("Sign out", () => {
                 logout.disabled = true;
@@ -8757,7 +9244,7 @@ var Amaterasu;
                 diagnostics: Amaterasu.renderDiagnostics,
             };
             renderers[page](context);
-            document.title = `${pageNames[page]} · Amaterasu`;
+            Amaterasu.setLocalizedPageTitle(pageNames[page]);
             fresh.focus({ preventScroll: true });
             window.scrollTo(0, 0);
         }

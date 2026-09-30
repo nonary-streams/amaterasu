@@ -5,7 +5,13 @@ import vm from "node:vm";
 import ts from "typescript";
 
 const context = vm.createContext({});
-const localeSource = ts.transpile(readFileSync("src/locale.ts", "utf8"), {
+const localeSource = ts.transpile(
+  `${readFileSync("src/locale-catalogs.ts", "utf8")}\n${readFileSync("src/locale.ts", "utf8")}`,
+  {
+    target: ts.ScriptTarget.ES2022,
+  },
+);
+const uiSource = ts.transpile(readFileSync("src/ui.ts", "utf8"), {
   target: ts.ScriptTarget.ES2022,
 });
 vm.runInContext(localeSource, context);
@@ -102,6 +108,21 @@ class FakeElement {
   }
 }
 
+class FakeTextNode {
+  constructor(text) {
+    this.nodeType = 3;
+    this.nodeValue = text;
+  }
+
+  get textContent() {
+    return this.nodeValue;
+  }
+
+  set textContent(value) {
+    this.nodeValue = value;
+  }
+}
+
 function mountLocaleSelector(api) {
   const document = {
     documentElement: { lang: "en" },
@@ -126,6 +147,103 @@ test("locale validation accepts every exact supported token", () => {
       token,
     );
   }
+});
+
+test("locale catalogs translate consumed console text and fall back to English", () => {
+  for (const token of expectedLocales) {
+    const messages = locale.localeMessagesFor(token);
+    assert.equal(typeof messages.Overview, "string");
+    assert.equal(typeof messages["Sign out"], "string");
+    assert.equal(typeof messages["Toggle navigation"], "string");
+    assert.equal(
+      locale.translateLocaleMessage("A page-specific sentence", messages),
+      "A page-specific sentence",
+    );
+  }
+
+  const german = locale.localeMessagesFor("de");
+  assert.equal(locale.translateLocaleMessage("Overview", german), "Übersicht");
+  assert.equal(locale.translateLocaleMessage("Sign out", german), "Abmelden");
+  assert.equal(
+    locale.translateLocaleMessage("Streaming features are in progress.", german),
+    "Streamingfunktionen sind in Arbeit.",
+  );
+  assert.equal(
+    locale.translateLocaleMessage("Overview", locale.localeMessagesFor("en_GB")),
+    "Overview",
+  );
+});
+
+test("locale UI overlays merge over base messages without losing untranslated entries", () => {
+  const merged = locale.mergeLocaleMessages(
+    {
+      labels: { save: "Save", cancel: "Cancel" },
+      shared: "Base value",
+    },
+    {
+      labels: { save: "Guardar" },
+      shared: "Overlay value",
+    },
+  );
+
+  assert.deepEqual(ordinary(merged), {
+    labels: { save: "Guardar", cancel: "Cancel" },
+    shared: "Overlay value",
+  });
+});
+
+test("locale changes translate existing UI text nodes and the browser title", () => {
+  const root = new FakeElement("html");
+  const document = {
+    documentElement: root,
+    title: "Overview · Amaterasu",
+    createElement: (tagName) => new FakeElement(tagName),
+    createTextNode: (text) => new FakeTextNode(text),
+    createTreeWalker(node) {
+      const textNodes = [];
+      const collect = (candidate) => {
+        if (candidate instanceof FakeTextNode) {
+          textNodes.push(candidate);
+          return;
+        }
+        for (const child of candidate.children ?? []) collect(child);
+      };
+      collect(node);
+      let index = 0;
+      return { nextNode: () => textNodes[index++] ?? null };
+    },
+  };
+  const runtimeContext = vm.createContext({
+    document,
+    NodeFilter: { SHOW_TEXT: 4 },
+  });
+  vm.runInContext(localeSource, runtimeContext);
+  vm.runInContext(uiSource, runtimeContext);
+  runtimeContext.Amaterasu.setLocalizedPageTitle("Overview");
+  const heading = runtimeContext.Amaterasu.el("h1", "", "Overview");
+  const date = new Date(Date.UTC(2024, 0, 2, 15, 4));
+  const localizedDate = runtimeContext.Amaterasu.localeFormattedTextNode(
+    (locale) => date.toLocaleString(locale),
+  );
+  const dateLabel = new FakeElement("time");
+  dateLabel.append(localizedDate);
+  root.append(heading);
+  root.append(dateLabel);
+  const textNode = heading.children[0];
+  const dateTextNode = dateLabel.children[0];
+
+  assert.equal(textNode.nodeValue, "Overview");
+  assert.equal(dateTextNode.nodeValue, date.toLocaleString("en"));
+  runtimeContext.Amaterasu.applyLocale("de");
+  assert.equal(textNode.nodeValue, "Übersicht");
+  assert.equal(dateTextNode.nodeValue, date.toLocaleString("de"));
+  assert.equal(document.documentElement.lang, "de");
+  assert.equal(document.title, "Übersicht · Amaterasu");
+
+  runtimeContext.Amaterasu.applyLocale("en");
+  assert.equal(textNode.nodeValue, "Overview");
+  assert.equal(dateTextNode.nodeValue, date.toLocaleString("en"));
+  assert.equal(document.title, "Overview · Amaterasu");
 });
 
 test("locale validation rejects unsupported and normalized spellings", () => {

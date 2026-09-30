@@ -106,7 +106,7 @@ namespace Amaterasu {
       status.setAttribute("aria-atomic", "true");
       main.append(intro, el("div", "login-side", status));
       this.root.replaceChildren(main);
-      document.title = "Restoring session · Amaterasu";
+      setDocumentTitle("Restoring session · Amaterasu");
     }
 
     private currentPage(): Page {
@@ -264,7 +264,7 @@ namespace Amaterasu {
       main.append(intro, el("div", "login-side", card));
       this.root.replaceChildren(main);
       username.focus();
-      document.title = "Sign in · Amaterasu";
+      setDocumentTitle("Sign in · Amaterasu");
     }
 
     private brand(): HTMLElement {
@@ -319,7 +319,7 @@ namespace Amaterasu {
         },
         "menu-toggle",
       );
-      menu.setAttribute("aria-label", "Toggle navigation");
+      menu.setAttribute("aria-label", translateText("Toggle navigation"));
       menu.setAttribute("aria-expanded", "false");
       const logout = button(
         "Sign out",
@@ -415,7 +415,7 @@ namespace Amaterasu {
         diagnostics: renderDiagnostics,
       };
       renderers[page](context);
-      document.title = `${pageNames[page]} · Amaterasu`;
+      setLocalizedPageTitle(pageNames[page]);
       fresh.focus({ preventScroll: true });
       window.scrollTo(0, 0);
     }

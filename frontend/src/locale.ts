@@ -1,4 +1,10 @@
 namespace Amaterasu {
+  let activeLocale: LocaleToken = "en";
+  let activeLocaleMessages = localeMessagesFor(activeLocale);
+  const localizedTextSources = new WeakMap<Text, string>();
+  const localizedTextFormatters = new WeakMap<Text, (locale: string) => string>();
+  let currentPageTitle: string | null = null;
+
   export const LOCALE_OPTIONS = [
     "bg",
     "cs",
@@ -127,6 +133,88 @@ namespace Amaterasu {
     return validateLocale(value).replaceAll("_", "-");
   }
 
+  export function translateText(source: string): string {
+    return translateLocaleMessage(source, activeLocaleMessages);
+  }
+
+  export function activeIntlLocale(): string {
+    return activeLocale.replaceAll("_", "-");
+  }
+
+  export function localizedTextNode(source: string): Text | string {
+    if (
+      typeof document === "undefined" ||
+      typeof document.createTextNode !== "function"
+    ) {
+      return source;
+    }
+    const node = document.createTextNode(translateText(source));
+    localizedTextSources.set(node, source);
+    return node;
+  }
+
+  export function localeFormattedTextNode(
+    format: (locale: string) => string,
+  ): Text | string {
+    const initial = format(activeIntlLocale());
+    if (
+      typeof document === "undefined" ||
+      typeof document.createTextNode !== "function"
+    ) {
+      return initial;
+    }
+    const node = document.createTextNode(initial);
+    localizedTextFormatters.set(node, format);
+    return node;
+  }
+
+  export function setDocumentTitle(title: string): void {
+    currentPageTitle = null;
+    document.title = title;
+  }
+
+  export function setLocalizedPageTitle(source: string): void {
+    currentPageTitle = source;
+    document.title = `${translateText(source)} · Amaterasu`;
+  }
+
+  function refreshLocalizedTextNodes(): void {
+    if (
+      typeof document === "undefined" ||
+      typeof document.createTreeWalker !== "function" ||
+      typeof NodeFilter === "undefined"
+    ) {
+      return;
+    }
+    const walker = document.createTreeWalker(
+      document.documentElement,
+      NodeFilter.SHOW_TEXT,
+    );
+    let node = walker.nextNode();
+    while (node) {
+      const source = localizedTextSources.get(node as Text);
+      if (source !== undefined) node.textContent = translateText(source);
+      else {
+        const format = localizedTextFormatters.get(node as Text);
+        if (format) node.textContent = format(activeIntlLocale());
+      }
+      node = walker.nextNode();
+    }
+  }
+
+  export function applyLocale(value: unknown): LocaleToken {
+    const locale = validateLocale(value);
+    const changed = locale !== activeLocale;
+    activeLocale = locale;
+    activeLocaleMessages = localeMessagesFor(locale);
+    if (typeof document !== "undefined" && document.documentElement) {
+      document.documentElement.lang = documentLanguage(locale);
+      if (currentPageTitle !== null) setLocalizedPageTitle(currentPageTitle);
+    }
+    if (changed) refreshLocalizedTextNodes();
+    return locale;
+  }
+
   function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
   }
@@ -193,12 +281,14 @@ namespace Amaterasu {
 
     const label = document.createElement("label");
     label.htmlFor = "global-locale";
-    label.textContent = "Locale";
-    label.title = "Stored locale preference. Console text remains English.";
+    label.textContent = translateText("Locale");
+    label.title = translateText(
+      "This locale translates navigation and selected labels; untranslated text uses English.",
+    );
 
     const select = document.createElement("select");
     select.id = "global-locale";
-    select.setAttribute("aria-label", "Locale");
+    select.setAttribute("aria-label", translateText("Locale"));
     for (const locale of LOCALE_OPTIONS) {
       const option = document.createElement("option");
       option.value = locale;
@@ -214,7 +304,9 @@ namespace Amaterasu {
     error.className = "locale-error";
     error.setAttribute("role", "alert");
     const note = document.createElement("small");
-    note.textContent = "Console text remains English.";
+    note.textContent = translateText(
+      "This locale translates navigation and selected labels; untranslated text uses English.",
+    );
     container.append(label, select, status, error, note);
 
     const canWrite = api.allows("configuration.write");
@@ -232,21 +324,32 @@ namespace Amaterasu {
     const clearError = (): void => {
       error.textContent = "";
     };
+    const updateLocaleText = (): void => {
+      label.textContent = translateText("Locale");
+      label.title = translateText(
+        "This locale translates navigation and selected labels; untranslated text uses English.",
+      );
+      select.setAttribute("aria-label", translateText("Locale"));
+      note.textContent = translateText(
+        "This locale translates navigation and selected labels; untranslated text uses English.",
+      );
+    };
 
     const load = async (previousError?: string): Promise<void> => {
       busy = true;
       updateDisabledState();
-      status.textContent = "Loading locale preference…";
+      status.textContent = translateText("Loading locale preference…");
       clearError();
       try {
         const configuration = await ensureLocaleConfiguration(api);
         const locale = localeFromConfiguration(configuration);
+        applyLocale(locale);
+        updateLocaleText();
         select.value = locale;
-        document.documentElement.lang = documentLanguage(locale);
         revision = configuration.revision;
         loaded = true;
         if (previousError) showError(previousError);
-        else if (!canWrite) status.textContent = "Read only";
+        else if (!canWrite) status.textContent = translateText("Read only");
         else status.textContent = "";
       } catch (loadError) {
         loaded = false;
@@ -273,7 +376,7 @@ namespace Amaterasu {
       }
       busy = true;
       updateDisabledState();
-      status.textContent = "Saving locale preference…";
+      status.textContent = translateText("Saving locale preference…");
       clearError();
       void api
         .post("configuration/update", {
