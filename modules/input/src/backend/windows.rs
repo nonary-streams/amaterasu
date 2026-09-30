@@ -114,7 +114,14 @@ impl WindowsBackend {
         mut send_input: impl FnMut(&INPUT, Option<KeyboardPlan>) -> InputResult<()>,
     ) -> InputResult<()> {
         self.validate(event)?;
-        if matches!(event, Event::Controller { .. }) {
+        if matches!(
+            event,
+            Event::Controller { .. }
+                | Event::ControllerArrival { .. }
+                | Event::ControllerTouch { .. }
+                | Event::ControllerMotion { .. }
+                | Event::ControllerBattery { .. }
+        ) {
             return self.gamepads.inject(event);
         }
         if matches!(event, Event::PenTouch { .. }) {
@@ -258,6 +265,14 @@ impl Backend for WindowsBackend {
 
     fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
         self.gamepads.set_ds4_back_as_touchpad_click(enabled);
+    }
+
+    fn set_motion_as_ds4(&mut self, enabled: bool) {
+        self.gamepads.set_motion_as_ds4(enabled);
+    }
+
+    fn set_touchpad_as_ds4(&mut self, enabled: bool) {
+        self.gamepads.set_touchpad_as_ds4(enabled);
     }
 
     fn disable_controller_input(&mut self) -> InputResult<()> {
