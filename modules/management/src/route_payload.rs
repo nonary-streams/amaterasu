@@ -2215,6 +2215,44 @@ mod pairing_override_tests {
     }
 
     #[test]
+    fn ds4_back_touchpad_click_override_accepts_only_optional_booleans() {
+        let route = Route {
+            service: "amaterasu.pairing/1",
+            action: "update_client_config_overrides",
+            scope: Some("pairing.admin"),
+            requires_empty_body: false,
+        };
+        for value in [
+            Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(false),
+        ] {
+            let payload = serde_json::json!({
+                "certificate_id":"a".repeat(64), "expected_revision":0,
+                "config_overrides":{"ds4_back_as_touchpad_click":value},
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_ok(),
+                "{payload}"
+            );
+        }
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!("false"),
+            serde_json::json!([]),
+        ] {
+            let payload = serde_json::json!({
+                "certificate_id":"a".repeat(64), "expected_revision":0,
+                "config_overrides":{"ds4_back_as_touchpad_click":value},
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_err(),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
     fn virtual_sink_override_is_sparse_and_bounded_for_apps_and_clients() {
         for (service, action, scope) in [
             (
@@ -2615,6 +2653,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                     "keyboard",
                     "mouse",
                     "native_pen_touch",
+                    "ds4_back_as_touchpad_click",
                     "high_resolution_scrolling",
                     "always_send_scancodes",
                     "key_rightalt_to_key_win",
@@ -2633,6 +2672,12 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
             }
             if config_overrides
                 .get("stream_audio")
+                .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
+            {
+                return Err(INVALID);
+            }
+            if config_overrides
+                .get("ds4_back_as_touchpad_click")
                 .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
             {
                 return Err(INVALID);

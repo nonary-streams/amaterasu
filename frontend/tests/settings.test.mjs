@@ -1860,6 +1860,7 @@ const pairedClients = () => ({
       paired_at: 100, config_overrides: {
         fec_percentage: 20, native_pen_touch: false,
         max_bitrate: 15000, frame_limiter_enable: false,
+        ds4_back_as_touchpad_click: false,
       } },
     { certificate_id: "b".repeat(64), client_id: "desk", name: "Desk",
       paired_at: 200, config_overrides: { audio_sink: "headphones" } },
@@ -1868,7 +1869,8 @@ const pairedClients = () => ({
 
 test("paired-client editor preserves hidden overrides and confirms complete signed readback", async () => {
   const current = pairedClients();
-  const values = { fec_percentage: 35, native_pen_touch: true, stream_audio: false };
+  const values = { fec_percentage: 35, native_pen_touch: true, stream_audio: false,
+    ds4_back_as_touchpad_click: false };
   const expected = { ...current.clients[0].config_overrides, ...values };
   const saved = { ...current, revision: 8, clients: [
     { ...current.clients[0], config_overrides: expected }, current.clients[1],
@@ -1888,6 +1890,26 @@ test("paired-client editor preserves hidden overrides and confirms complete sign
   assert.deepEqual(ordinary(await context.Amaterasu.savePairingClientOverrides(
     api, current, "a".repeat(64), values)), saved);
   assert.deepEqual(routes, ["pairing/update_client_config_overrides", "pairing/list_clients"]);
+  assert.equal(saved.clients[0].config_overrides.ds4_back_as_touchpad_click, false);
+});
+
+test("paired-client DS4 Back inheritance omits the field when saving", async () => {
+  const current = pairedClients();
+  const id = "a".repeat(64);
+  const desired = { ...current.clients[0].config_overrides };
+  delete desired.ds4_back_as_touchpad_click;
+  const saved = { ...current, revision: 8, clients: [
+    { ...current.clients[0], config_overrides: desired }, current.clients[1],
+  ] };
+  const api = { async post(route, body) {
+    if (route === "pairing/update_client_config_overrides") {
+      assert.equal(Object.hasOwn(body.config_overrides, "ds4_back_as_touchpad_click"), false);
+      return { ok: true, certificate_id: id };
+    }
+    return saved;
+  } };
+  assert.deepEqual(ordinary(await context.Amaterasu.savePairingClientOverrides(
+    api, current, id, { ds4_back_as_touchpad_click: null })), saved);
 });
 
 test("paired-client editor rejects unknown fields, mismatched identity and stale readback", async () => {
@@ -2057,6 +2079,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
           assert.equal(body.config_overrides.max_bitrate, 15000);
           assert.equal(body.config_overrides.frame_limiter_enable, false);
           assert.equal(body.config_overrides.native_pen_touch, true);
+          assert.equal(body.config_overrides.ds4_back_as_touchpad_click, false);
           assert.equal(body.config_overrides.high_resolution_scrolling, false);
           assert.equal(body.config_overrides.always_send_scancodes, false);
           assert.equal(body.config_overrides.key_rightalt_to_key_win, true);
@@ -2078,8 +2101,12 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   await new Promise(setImmediate);
   const pairingArea = content.children[10];
   const fec = find(pairingArea, (node) => node.name === `fec_${"a".repeat(64)}`);
+  const ds4BackClick = find(pairingArea, (node) => node.name === "ds4_back_as_touchpad_click");
   const save = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
   assert.ok(fec);
+  assert.ok(ds4BackClick);
+  assert.equal(ds4BackClick.value, "false");
+  assert.equal(ds4BackClick.attributes.get("aria-label"), "DS4 Back as touchpad click override for Living room");
   assert.ok(save);
   const keybindings = find(pairingArea, (node) => node.name === "keybindings");
   assert.equal(keybindings.value, "[65,66,65,67]");

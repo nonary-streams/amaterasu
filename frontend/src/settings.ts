@@ -955,7 +955,7 @@ namespace Amaterasu {
   const forwardablePairingOverrideFields = [
     "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "encoder",
     "audio_sink_capture_only", "back_button_timeout", "controller", "gamepad",
-    "keyboard", "mouse", "native_pen_touch",
+    "keyboard", "mouse", "native_pen_touch", "ds4_back_as_touchpad_click",
     "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
     "frame_limiter_fps_limit", "frame_limiter_enable", "frame_limiter_provider",
     "frame_limiter_disable_vsync", "frame_limiter_auto_virtual_framegen",
@@ -979,7 +979,7 @@ namespace Amaterasu {
     }
     if (value === null || value === undefined) return false;
     if (["stream_audio", "audio_sink_capture_only", "controller", "keyboard", "mouse",
-      "native_pen_touch", "frame_limiter_enable", "frame_limiter_disable_vsync",
+      "native_pen_touch", "ds4_back_as_touchpad_click", "frame_limiter_enable", "frame_limiter_disable_vsync",
       "nvenc_spatial_aq", "high_resolution_scrolling", "always_send_scancodes",
       "key_rightalt_to_key_win"].includes(field)) return typeof value === "boolean";
     if (field === "audio_sink" || field === "virtual_sink")
@@ -2702,6 +2702,10 @@ namespace Amaterasu {
           mouse.setAttribute("aria-label", `Mouse input override for ${client.name}`);
           const nativePenTouch = sparseInputOverrideSelect("native_pen_touch", client.config_overrides?.native_pen_touch);
           nativePenTouch.setAttribute("aria-label", `Native pen/touch preference override for ${client.name}`);
+          const ds4BackAsTouchpadClick = sparseInputOverrideSelect(
+            "ds4_back_as_touchpad_click", client.config_overrides?.ds4_back_as_touchpad_click,
+          );
+          ds4BackAsTouchpadClick.setAttribute("aria-label", `DS4 Back as touchpad click override for ${client.name}`);
           const advancedInput = advancedInputOverrideControls(client.config_overrides);
           const softwareEncoder = softwareEncoderOverrideControls(client.config_overrides);
           const streamAudio = el("select");
@@ -2798,6 +2802,9 @@ namespace Amaterasu {
                   keyboard: parseInputBooleanOverride(keyboard.value, "Keyboard input"),
                   mouse: parseInputBooleanOverride(mouse.value, "Mouse input"),
                   native_pen_touch: parseInputBooleanOverride(nativePenTouch.value, "Native pen/touch preference"),
+                  ds4_back_as_touchpad_click: parseInputBooleanOverride(
+                    ds4BackAsTouchpadClick.value, "DS4 Back as touchpad click preference",
+                  ),
                 };
                 saveStarted = true;
                 await savePairingClientOverrides(context.api, settings, client.certificate_id, values);
@@ -2825,9 +2832,9 @@ namespace Amaterasu {
             el("strong", "", client.name),
             el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
           );
-          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields), el("div", "", save, status)];
+          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields), el("div", "", save, status)];
         });
-        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "Input and software encoding preferences", ""], rows);
+        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "DS4 Back as touchpad click", "Input and software encoding preferences", ""], rows);
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",

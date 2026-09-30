@@ -311,6 +311,7 @@ namespace Amaterasu {
       keyboard?: boolean;
       mouse?: boolean;
       native_pen_touch?: boolean;
+      ds4_back_as_touchpad_click?: boolean;
       [key: string]: unknown;
     };
   }
