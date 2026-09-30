@@ -181,6 +181,8 @@ pub struct ConfigOverrides {
     )]
     pub frame_limiter_auto_virtual_framegen: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lossless_scaling_framegen: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtss_frame_limit_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ds4_back_as_touchpad_click: Option<bool>,
@@ -381,6 +383,7 @@ impl ConfigOverrides {
             && self.frame_limiter_provider.is_none()
             && self.frame_limiter_disable_vsync.is_none()
             && self.frame_limiter_auto_virtual_framegen.is_none()
+            && self.lossless_scaling_framegen.is_none()
             && self.rtss_frame_limit_type.is_none()
             && self.ds4_back_as_touchpad_click.is_none()
             && self.native_pen_touch.is_none()
@@ -1237,6 +1240,39 @@ mod tests {
             serde_json::to_value(disabled).unwrap(),
             json!({"fec_percentage":37,"stream_audio":false})
         );
+    }
+
+    #[test]
+    fn lossless_scaling_framegen_override_defaults_off_and_preserves_explicit_false() {
+        for value in [json!({}), json!({"lossless_scaling_framegen": null})] {
+            let overrides: ConfigOverrides = serde_json::from_value(value).unwrap();
+            assert_eq!(overrides.lossless_scaling_framegen, None);
+            assert!(overrides.is_empty());
+            assert_eq!(serde_json::to_value(overrides).unwrap(), json!({}));
+        }
+
+        for enabled in [false, true] {
+            let overrides: ConfigOverrides = serde_json::from_value(json!({
+                "lossless_scaling_framegen": enabled
+            }))
+            .unwrap();
+            overrides.validate().unwrap();
+            assert_eq!(overrides.lossless_scaling_framegen, Some(enabled));
+            assert!(!overrides.is_empty());
+            assert_eq!(
+                serde_json::to_value(overrides).unwrap(),
+                json!({"lossless_scaling_framegen": enabled})
+            );
+        }
+
+        for value in [json!("true"), json!(0)] {
+            assert!(
+                serde_json::from_value::<ConfigOverrides>(json!({
+                    "lossless_scaling_framegen": value
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]

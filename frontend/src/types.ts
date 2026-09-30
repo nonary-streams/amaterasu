@@ -82,6 +82,7 @@ namespace Amaterasu {
       frame_limiter_provider?: CatalogFrameLimiterProvider | null;
       frame_limiter_disable_vsync?: boolean | null;
       frame_limiter_auto_virtual_framegen?: CatalogAutoVirtualFramegenMode | null;
+      lossless_scaling_framegen?: boolean | null;
       rtss_frame_limit_type?: CatalogRtssFrameLimitType | null;
       ds4_back_as_touchpad_click?: boolean | null;
       dd_refresh_rate_option?: RefreshRateOption | null;

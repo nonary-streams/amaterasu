@@ -2553,7 +2553,7 @@ fn launch_export_includes_admitted_frame_limiter_settings_and_context() {
         "lossless_scaling_limit_millihz":null,
         "virtual_display_active":null,
         "physical_framegen_capture":null,
-        "game_frame_generation_mode":null,
+        "game_frame_generation_mode":"none",
         "rtss_frame_limit_type_explicit_override":null
     });
 
@@ -2702,6 +2702,7 @@ fn application_frame_limiter_values_decode_sparsely_and_reject_malformed_values(
         json!({"frame_limiter_provider":[]}),
         json!({"frame_limiter_disable_vsync":1}),
         json!({"frame_limiter_auto_virtual_framegen":"invalid"}),
+        json!({"lossless_scaling_framegen":"true"}),
         json!({"rtss_frame_limit_type":false}),
         json!({"ds4_back_as_touchpad_click":"false"}),
         json!({"unrecognized_override":true}),
@@ -2732,6 +2733,54 @@ fn application_frame_limiter_values_decode_sparsely_and_reject_malformed_values(
             Command::Request { service, payload, .. }
                 if service == "amaterasu.rtsp/1" && payload["action"] == "open"
         )));
+    }
+}
+
+#[test]
+fn application_lossless_scaling_framegen_projects_into_the_frozen_launch_snapshot() {
+    for (offset, application_overrides, expected_mode) in [
+        (0, None, "none"),
+        (1, Some(json!({})), "none"),
+        (2, Some(json!({"lossless_scaling_framegen":null})), "none"),
+        (3, Some(json!({"lossless_scaling_framegen":false})), "none"),
+        (
+            4,
+            Some(json!({"lossless_scaling_framegen":true})),
+            "lossless-scaling",
+        ),
+    ] {
+        let now = Instant::now();
+        let marker = 80 + offset;
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker {
+            application_input_overrides: application_overrides,
+            ..Broker::default()
+        };
+
+        assert!(
+            controller
+                .launch(10, request(marker), peer(marker), now)
+                .is_none()
+        );
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+        let launch_payload = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .expect("launch export request");
+        assert_eq!(
+            launch_payload["frame_limiter_settings"]["game_frame_generation_mode"],
+            expected_mode,
+            "application override case {offset}"
+        );
     }
 }
 

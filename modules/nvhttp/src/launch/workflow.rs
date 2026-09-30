@@ -1589,6 +1589,7 @@ pub(super) struct ApplicationConfigOverrides {
     frame_limiter_provider: Option<String>,
     frame_limiter_disable_vsync: Option<bool>,
     frame_limiter_auto_virtual_framegen: Option<String>,
+    lossless_scaling_framegen: Option<bool>,
     rtss_frame_limit_type: Option<String>,
     high_resolution_scrolling: Option<bool>,
     always_send_scancodes: Option<bool>,
@@ -1621,6 +1622,14 @@ fn resolved_virtual_sink(
 }
 
 impl ApplicationConfigOverrides {
+    fn game_frame_generation_mode(&self) -> &'static str {
+        if self.lossless_scaling_framegen == Some(true) {
+            "lossless-scaling"
+        } else {
+            "none"
+        }
+    }
+
     pub(super) fn frame_limiter_settings(&self) -> FrameLimiterSettings {
         FrameLimiterSettings {
             frame_limiter_enable: self.frame_limiter_enable,
@@ -1981,6 +1990,11 @@ fn frame_limiter_launch_snapshot(record: &Record) -> Value {
             .application_frame_limiter_settings
             .rtss_frame_limit_type
             .is_some();
+    let game_frame_generation_mode = record
+        .application_preflight_overrides
+        .as_ref()
+        .map(ApplicationConfigOverrides::game_frame_generation_mode)
+        .unwrap_or("none");
 
     json!({
         "version":1,
@@ -1990,7 +2004,7 @@ fn frame_limiter_launch_snapshot(record: &Record) -> Value {
         "lossless_scaling_limit_millihz":null,
         "virtual_display_active":null,
         "physical_framegen_capture":null,
-        "game_frame_generation_mode":null,
+        "game_frame_generation_mode":game_frame_generation_mode,
         "rtss_frame_limit_type_explicit_override":explicit_rtss_override.then_some(true)
     })
 }

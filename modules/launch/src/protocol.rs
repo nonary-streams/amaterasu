@@ -1181,6 +1181,8 @@ pub struct ApplicationConfigOverrides {
     )]
     pub frame_limiter_auto_virtual_framegen: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lossless_scaling_framegen: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtss_frame_limit_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ds4_back_as_touchpad_click: Option<bool>,
@@ -1327,6 +1329,7 @@ impl ApplicationConfigOverrides {
             && self.frame_limiter_provider.is_none()
             && self.frame_limiter_disable_vsync.is_none()
             && self.frame_limiter_auto_virtual_framegen.is_none()
+            && self.lossless_scaling_framegen.is_none()
             && self.rtss_frame_limit_type.is_none()
             && self.ds4_back_as_touchpad_click.is_none()
     }
@@ -2206,6 +2209,7 @@ mod tests {
             "frame_limiter_provider":null,
             "frame_limiter_disable_vsync":null,
             "frame_limiter_auto_virtual_framegen":null,
+            "lossless_scaling_framegen":null,
             "rtss_frame_limit_type":null,
             "ds4_back_as_touchpad_click":null,
         }))
@@ -2219,6 +2223,7 @@ mod tests {
             "frame_limiter_provider":"auto",
             "frame_limiter_disable_vsync":false,
             "frame_limiter_auto_virtual_framegen":true,
+            "lossless_scaling_framegen":false,
             "ds4_back_as_touchpad_click":false,
         }))
         .unwrap();
@@ -2231,6 +2236,7 @@ mod tests {
             configured.frame_limiter_auto_virtual_framegen.as_deref(),
             Some("enabled")
         );
+        assert_eq!(configured.lossless_scaling_framegen, Some(false));
         assert_eq!(configured.ds4_back_as_touchpad_click, Some(false));
         assert_eq!(
             serde_json::to_value(configured).unwrap(),
@@ -2240,9 +2246,32 @@ mod tests {
                 "frame_limiter_provider":"auto",
                 "frame_limiter_disable_vsync":false,
                 "frame_limiter_auto_virtual_framegen":"enabled",
+                "lossless_scaling_framegen":false,
                 "ds4_back_as_touchpad_click":false,
             })
         );
+
+        let enabled: ApplicationConfigOverrides = serde_json::from_value(json!({
+            "lossless_scaling_framegen":true
+        }))
+        .unwrap();
+        enabled.validate().unwrap();
+        assert_eq!(enabled.lossless_scaling_framegen, Some(true));
+        assert!(!enabled.is_empty());
+        assert_eq!(
+            serde_json::to_value(enabled).unwrap(),
+            json!({"lossless_scaling_framegen":true})
+        );
+
+        for invalid in [json!("true"), json!(0)] {
+            assert!(
+                serde_json::from_value::<ApplicationConfigOverrides>(json!({
+                    "lossless_scaling_framegen":invalid
+                }))
+                .is_err(),
+                "accepted non-boolean Lossless Scaling frame generation value {invalid}"
+            );
+        }
 
         for fps_limit in [0.0, 1.234, 1000.0] {
             ApplicationConfigOverrides {

@@ -295,6 +295,7 @@ namespace Amaterasu {
     | "frame_limiter_provider"
     | "frame_limiter_disable_vsync"
     | "frame_limiter_auto_virtual_framegen"
+    | "lossless_scaling_framegen"
     | "rtss_frame_limit_type"
     | "ds4_back_as_touchpad_click"
   >;
@@ -331,6 +332,7 @@ namespace Amaterasu {
       frame_limiter_provider: text(overrides?.frame_limiter_provider),
       frame_limiter_disable_vsync: text(overrides?.frame_limiter_disable_vsync),
       frame_limiter_auto_virtual_framegen: text(overrides?.frame_limiter_auto_virtual_framegen),
+      lossless_scaling_framegen: text(overrides?.lossless_scaling_framegen),
       rtss_frame_limit_type: text(overrides?.rtss_frame_limit_type),
       ds4_back_as_touchpad_click: text(overrides?.ds4_back_as_touchpad_click),
     };
@@ -344,6 +346,12 @@ namespace Amaterasu {
     const enable = audioOverrideSelect(
       "frame_limiter_enable",
       values.frame_limiter_enable === "" ? undefined : values.frame_limiter_enable === "true",
+    );
+    const losslessScalingFramegen = audioOverrideSelect(
+      "lossless_scaling_framegen",
+      values.lossless_scaling_framegen === ""
+        ? undefined
+        : values.lossless_scaling_framegen === "true",
     );
     const fpsLimit = input("frame_limiter_fps_limit", values.frame_limiter_fps_limit, "number");
     fpsLimit.min = "0";
@@ -379,6 +387,11 @@ namespace Amaterasu {
     );
     return [
       field("Frame limiter", enable, "Blank inherits. Runtime application remains pending."),
+      field(
+        "Lossless Scaling frame generation",
+        losslessScalingFramegen,
+        "Enable when this application's Lossless Scaling frame generation is active. Blank defaults off.",
+      ),
       field("Frame limiter FPS limit", fpsLimit, "Blank inherits. Use 0–1000 Hz in 0.001 Hz steps."),
       catalogFrameLimiterOverrideField(
         "Frame limiter provider",
@@ -468,6 +481,10 @@ namespace Amaterasu {
       frame_limiter_disable_vsync: Amaterasu.parseInputBooleanOverride(
         text("frame_limiter_disable_vsync"),
         "Disable VSync for RTSS",
+      ),
+      lossless_scaling_framegen: Amaterasu.parseInputBooleanOverride(
+        text("lossless_scaling_framegen"),
+        "Lossless Scaling frame generation",
       ),
       frame_limiter_auto_virtual_framegen: parseCatalogFrameLimiterEnum(
         text("frame_limiter_auto_virtual_framegen"),

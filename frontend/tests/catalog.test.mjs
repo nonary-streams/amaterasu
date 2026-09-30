@@ -31,7 +31,7 @@ test("catalog output edits preserve raw preparation, keybindings, and sparse fra
   const model = context.Amaterasu;
   const rawPreparation = [{ do: " prepare $(PROFILE) ", undo: " restore ", elevated: true }];
   const overrides = { keybindings: [65, 66, 65, 67], frame_limiter_enable: false,
-    frame_limiter_fps_limit: 0, frame_limiter_provider: "auto" };
+    frame_limiter_fps_limit: 0, frame_limiter_provider: "auto", lossless_scaling_framegen: false };
   for (const output of [undefined, null, "", "null", " logs/$(APP).log "]) {
     const fields = new FormData();
     fields.set("name", "Output application");
@@ -57,6 +57,7 @@ test("catalog output edits preserve raw preparation, keybindings, and sparse fra
     assert.equal(ordinary.config_overrides.frame_limiter_enable, false);
     assert.equal(ordinary.config_overrides.frame_limiter_fps_limit, 0);
     assert.equal(ordinary.config_overrides.frame_limiter_provider, "auto");
+    assert.equal(ordinary.config_overrides.lossless_scaling_framegen, false);
     assert.equal(ordinary.description, "Keep this description");
     assert.deepEqual(ordinary.tags, ["arcade", "streaming"]);
     assert.deepEqual(ordinary.launch.arguments, ["--fullscreen"]);
@@ -111,6 +112,7 @@ test("Catalog frame limiter editor round-trips inherited values, explicit false,
     frame_limiter_provider: "",
     frame_limiter_disable_vsync: "",
     frame_limiter_auto_virtual_framegen: "",
+    lossless_scaling_framegen: "",
     rtss_frame_limit_type: "",
     ds4_back_as_touchpad_click: "",
   });
@@ -121,6 +123,7 @@ test("Catalog frame limiter editor round-trips inherited values, explicit false,
     frame_limiter_provider: "auto",
     frame_limiter_disable_vsync: null,
     frame_limiter_auto_virtual_framegen: null,
+    lossless_scaling_framegen: false,
     rtss_frame_limit_type: null,
     ds4_back_as_touchpad_click: false,
   };
@@ -131,6 +134,7 @@ test("Catalog frame limiter editor round-trips inherited values, explicit false,
     frame_limiter_provider: "auto",
     frame_limiter_disable_vsync: "",
     frame_limiter_auto_virtual_framegen: "",
+    lossless_scaling_framegen: "false",
     rtss_frame_limit_type: "",
     ds4_back_as_touchpad_click: "false",
   });
@@ -144,6 +148,7 @@ test("Catalog frame limiter editor round-trips inherited values, explicit false,
     frame_limiter_provider: "auto",
     frame_limiter_disable_vsync: null,
     frame_limiter_auto_virtual_framegen: null,
+    lossless_scaling_framegen: false,
     rtss_frame_limit_type: null,
     ds4_back_as_touchpad_click: false,
   });
@@ -161,6 +166,7 @@ test("Catalog frame limiter controls enforce the current override types and doma
     frame_limiter_provider: null,
     frame_limiter_disable_vsync: null,
     frame_limiter_auto_virtual_framegen: null,
+    lossless_scaling_framegen: null,
     rtss_frame_limit_type: null,
     ds4_back_as_touchpad_click: null,
   });
@@ -172,10 +178,18 @@ test("Catalog frame limiter controls enforce the current override types and doma
   for (const name of [
     "frame_limiter_enable",
     "frame_limiter_disable_vsync",
+    "lossless_scaling_framegen",
     "ds4_back_as_touchpad_click",
   ]) {
     fields.set(name, "true");
     assert.equal(parse(fields, windowsCapabilities)[name], true);
+  }
+  for (const value of ["true", "false"]) {
+    fields.set("lossless_scaling_framegen", value);
+    assert.equal(
+      parse(fields, windowsCapabilities).lossless_scaling_framegen,
+      value === "true",
+    );
   }
   for (const mode of ["enabled", "vrr", "legacy", "disabled"]) {
     fields.set("frame_limiter_auto_virtual_framegen", mode);
@@ -193,6 +207,7 @@ test("Catalog frame limiter controls enforce the current override types and doma
   for (const [name, value] of [
     ["frame_limiter_enable", "yes"],
     ["frame_limiter_disable_vsync", "0"],
+    ["lossless_scaling_framegen", "yes"],
     ["ds4_back_as_touchpad_click", "FALSE"],
     ["frame_limiter_fps_limit", "1.0001"],
     ["frame_limiter_fps_limit", "1.2345"],
@@ -208,7 +223,7 @@ test("Catalog frame limiter controls enforce the current override types and doma
     invalidFields.set(name, value);
     assert.throws(
       () => parse(invalidFields, windowsCapabilities),
-      /Frame limiter|VSync|DS4 Back|Auto virtual|RTSS frame limit/,
+      /Frame limiter|Lossless Scaling|VSync|DS4 Back|Auto virtual|RTSS frame limit/,
     );
   }
 });

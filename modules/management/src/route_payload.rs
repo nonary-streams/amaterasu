@@ -1251,6 +1251,7 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
             "frame_limiter_provider",
             "frame_limiter_disable_vsync",
             "frame_limiter_auto_virtual_framegen",
+            "lossless_scaling_framegen",
             "rtss_frame_limit_type",
             "ds4_back_as_touchpad_click",
         ],
@@ -1283,6 +1284,7 @@ fn optional_catalog_frame_limiter_overrides(overrides: &Object) -> Result<(), &'
         "frame_limiter_enable",
         "frame_limiter_disable_vsync",
         "ds4_back_as_touchpad_click",
+        "lossless_scaling_framegen",
     ] {
         if overrides
             .get(key)
@@ -3785,6 +3787,7 @@ mod catalog_tests {
             "frame_limiter_provider",
             "frame_limiter_disable_vsync",
             "frame_limiter_auto_virtual_framegen",
+            "lossless_scaling_framegen",
             "rtss_frame_limit_type",
             "ds4_back_as_touchpad_click",
         ] {
@@ -3803,6 +3806,7 @@ mod catalog_tests {
             "frame_limiter_provider": "auto",
             "frame_limiter_disable_vsync": false,
             "frame_limiter_auto_virtual_framegen": "disabled",
+            "lossless_scaling_framegen": false,
             "ds4_back_as_touchpad_click": false,
         }));
         assert!(validate(route, explicit.as_object().unwrap()).is_ok());
@@ -3817,6 +3821,18 @@ mod catalog_tests {
         assert_eq!(
             explicit["entry"]["config_overrides"]["ds4_back_as_touchpad_click"].as_bool(),
             Some(false)
+        );
+        assert_eq!(
+            explicit["entry"]["config_overrides"]["lossless_scaling_framegen"].as_bool(),
+            Some(false)
+        );
+        let enabled = catalog_create_with_overrides(serde_json::json!({
+            "lossless_scaling_framegen": true
+        }));
+        assert!(validate(route, enabled.as_object().unwrap()).is_ok());
+        assert_eq!(
+            enabled["entry"]["config_overrides"]["lossless_scaling_framegen"].as_bool(),
+            Some(true)
         );
 
         let valid_providers = {
@@ -3877,6 +3893,8 @@ mod catalog_tests {
             serde_json::json!({"frame_limiter_provider":false}),
             serde_json::json!({"frame_limiter_provider":unsupported_provider}),
             serde_json::json!({"frame_limiter_disable_vsync":0}),
+            serde_json::json!({"lossless_scaling_framegen":"true"}),
+            serde_json::json!({"lossless_scaling_framegen":0}),
             serde_json::json!({"frame_limiter_auto_virtual_framegen":"vrrr"}),
             serde_json::json!({"frame_limiter_auto_virtual_framegen":1}),
             serde_json::json!({"frame_limiter_auto_virtual_framegen":[]}),
