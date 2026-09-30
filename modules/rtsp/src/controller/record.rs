@@ -76,10 +76,12 @@ impl Record {
         let encryption = self.negotiated_encryption?;
         let slices_per_frame = self.negotiated_slices_per_frame?;
         let client_feature_flags = self.client_feature_flags?;
-        Some(
-            self.config
-                .arm_with_negotiation(session, encryption, slices_per_frame, client_feature_flags),
-        )
+        Some(self.config.arm_with_negotiation(
+            session,
+            encryption,
+            slices_per_frame,
+            client_feature_flags,
+        ))
     }
 
     pub fn operation(&self) -> String {
