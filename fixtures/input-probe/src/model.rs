@@ -1,3 +1,4 @@
+use amaterasu_input_policy::KeyBindings;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -39,6 +40,8 @@ pub enum Operation {
         #[serde(default)]
         key_rightalt_to_key_win: Option<bool>,
         #[serde(default)]
+        keybindings: Option<KeyBindings>,
+        #[serde(default)]
         key_repeat_delay: Option<u32>,
         #[serde(default)]
         key_repeat_frequency: Option<f64>,
@@ -74,6 +77,7 @@ pub struct RequestedPolicy {
     pub high_resolution_scrolling: Option<bool>,
     pub always_send_scancodes: Option<bool>,
     pub key_rightalt_to_key_win: Option<bool>,
+    pub keybindings: Option<KeyBindings>,
     pub key_repeat_delay: Option<u32>,
     pub key_repeat_frequency: Option<f64>,
 }

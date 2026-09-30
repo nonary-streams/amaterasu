@@ -1,4 +1,5 @@
 use crate::gamepad_profile::GamepadProfile;
+use amaterasu_input_policy::KeyBindings;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -56,6 +57,8 @@ pub enum Operation {
         always_send_scancodes: Option<bool>,
         #[serde(default)]
         key_rightalt_to_key_win: Option<bool>,
+        #[serde(default)]
+        keybindings: Option<KeyBindings>,
         #[serde(default)]
         key_repeat_delay: Option<u32>,
         #[serde(default)]
@@ -610,6 +613,43 @@ pub fn validate_operation_id(operation_id: &str) -> InputResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acquire_keybindings_preserve_optional_ordered_byte_lists() {
+        for supplied in [
+            None,
+            Some(Value::Null),
+            Some(json!([])),
+            Some(json!([0, 255, 65, 66, 65, 67])),
+        ] {
+            let mut request = json!({"action":"acquire"});
+            if let Some(value) = supplied.clone() {
+                request["keybindings"] = value;
+            }
+            let operation: Operation = serde_json::from_value(request).unwrap();
+            let Operation::Acquire { keybindings, .. } = operation else {
+                panic!("wrong operation");
+            };
+            assert_eq!(
+                serde_json::to_value(keybindings).unwrap(),
+                supplied.unwrap_or(Value::Null)
+            );
+        }
+        for invalid in [
+            json!([0]),
+            json!([0, 256]),
+            json!([-1, 0]),
+            json!([0.0, 1]),
+            json!(vec![0_u8; 514]),
+        ] {
+            assert!(
+                serde_json::from_value::<Operation>(
+                    json!({"action":"acquire", "keybindings":invalid})
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn acquire_timeout_override_is_sparse_signed_and_strictly_bounded_by_i32() {

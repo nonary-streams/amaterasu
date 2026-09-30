@@ -32,6 +32,8 @@ struct FakeBackend {
     back_button_timeout_ms: i32,
     always_send_scancodes: bool,
     key_rightalt_to_key_win: bool,
+    keybindings: KeyBindings,
+    keybinding_updates: Vec<KeyBindings>,
     right_alt_mapping_trace: Vec<(KeyState, bool)>,
     fail_controller_disable: bool,
     controller_disable_calls: usize,
@@ -157,6 +159,10 @@ impl Backend for FakeBackend {
     fn set_key_rightalt_to_key_win(&mut self, enabled: bool) {
         self.key_rightalt_to_key_win = enabled;
     }
+    fn set_keybindings(&mut self, keybindings: &KeyBindings) {
+        self.keybindings = keybindings.clone();
+        self.keybinding_updates.push(keybindings.clone());
+    }
     fn set_gamepad_profile(&mut self, profile: GamepadProfile) {
         self.gamepad_profile = profile;
     }
@@ -261,6 +267,7 @@ fn acquire_operation() -> Operation {
         high_resolution_scrolling: None,
         always_send_scancodes: None,
         key_rightalt_to_key_win: None,
+        keybindings: None,
         key_repeat_delay: None,
         key_repeat_frequency: None,
     }
@@ -388,6 +395,7 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -424,6 +432,7 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -453,6 +462,7 @@ fn scoped_ds4_back_mapping_survives_global_updates_and_restores_after_release() 
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -498,6 +508,7 @@ fn unscoped_ds4_back_mapping_is_snapshotted_from_the_v9_default() {
         high_resolution_scrolling: None,
         always_send_scancodes: None,
         key_rightalt_to_key_win: None,
+        keybindings: None,
         key_repeat_delay: None,
         key_repeat_frequency: None,
     };
@@ -552,6 +563,7 @@ fn native_pen_touch_resolution_is_snapshotted_and_retry_identity_is_optional_val
         high_resolution_scrolling: None,
         always_send_scancodes: None,
         key_rightalt_to_key_win: None,
+        keybindings: None,
         key_repeat_delay: None,
         key_repeat_frequency: None,
     };
@@ -671,6 +683,7 @@ fn acquire_retry_with_a_different_ds4_back_mapping_conflicts() {
         high_resolution_scrolling: None,
         always_send_scancodes: None,
         key_rightalt_to_key_win: None,
+        keybindings: None,
         key_repeat_delay: None,
         key_repeat_frequency: None,
     };
@@ -702,6 +715,7 @@ fn acquire_retry_distinguishes_zero_key_repeat_delay_from_unspecified() {
         high_resolution_scrolling: None,
         always_send_scancodes: None,
         key_rightalt_to_key_win: None,
+        keybindings: None,
         key_repeat_delay,
         key_repeat_frequency: None,
     };
@@ -754,6 +768,7 @@ fn acquired_key_repeat_frequency_controls_cadence_and_retry_identity() {
         high_resolution_scrolling: None,
         always_send_scancodes: None,
         key_rightalt_to_key_win: None,
+        keybindings: None,
         key_repeat_delay: Some(100),
         key_repeat_frequency: Some(frequency),
     };
@@ -835,6 +850,7 @@ fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -857,6 +873,7 @@ fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -892,6 +909,7 @@ fn controller_capability_is_present_in_status_and_active_lease_responses() {
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -1044,6 +1062,7 @@ fn active_lease_keeps_the_profile_selected_at_acquire_time() {
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -1117,6 +1136,7 @@ fn scoped_input_policy_overrides_host_defaults_then_restores_them_on_release() {
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -1203,6 +1223,7 @@ fn scoped_input_policy_overrides_host_defaults_then_restores_them_on_release() {
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -1257,6 +1278,7 @@ fn scoped_keyboard_and_scroll_overrides_hold_through_cleanup_and_restore_default
             high_resolution_scrolling: Some(false),
             always_send_scancodes: Some(false),
             key_rightalt_to_key_win: Some(true),
+            keybindings: None,
             key_repeat_delay: Some(0),
             key_repeat_frequency: Some(0.0),
         },
@@ -1366,6 +1388,7 @@ fn scoped_keyboard_and_scroll_overrides_hold_through_cleanup_and_restore_default
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -1938,6 +1961,7 @@ fn failed_releases_remain_tracked_block_new_leases_and_retry() {
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -2079,6 +2103,7 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -2103,6 +2128,7 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -2146,6 +2172,7 @@ fn lost_error_replies_preserve_the_existing_lease_and_pressed_keys() {
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -2195,6 +2222,7 @@ fn lost_success_replies_release_new_acquisition_and_batch_state() {
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -2249,6 +2277,7 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
         high_resolution_scrolling: None,
         always_send_scancodes: None,
         key_rightalt_to_key_win: None,
+        keybindings: None,
         key_repeat_delay: None,
         key_repeat_frequency: None,
     };
@@ -2301,6 +2330,7 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -3031,6 +3061,7 @@ fn lease_repeat_overrides_survive_global_policy_updates() {
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: Some(20),
             key_repeat_frequency: Some(25.0),
         },
@@ -3570,6 +3601,7 @@ fn pen_touch_policy_suppresses_global_disable_but_honors_scoped_lease_override()
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -3921,4 +3953,205 @@ fn pen_touch_shutdown_cancels_each_owned_pointer() {
         })
         .collect::<Vec<_>>();
     assert_eq!(cancellations, [PEN_POINTER_ID, 31]);
+}
+
+fn acquire_with_keybindings(operation_id: &str, keybindings: Option<KeyBindings>) -> Operation {
+    let mut operation = acquire_operation();
+    if let Operation::Acquire {
+        operation_id: requested_id,
+        keybindings: requested_bindings,
+        ..
+    } = &mut operation
+    {
+        *requested_id = Some(operation_id.into());
+        *requested_bindings = keybindings;
+    }
+    operation
+}
+
+#[test]
+fn inherited_keybindings_follow_live_global_policy_and_status() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    assert_eq!(controller.backend.keybindings, KeyBindings::default());
+    let first = KeyBindings::from_flat(vec![65, 66]).unwrap();
+    let second = KeyBindings::from_flat(vec![65, 67]).unwrap();
+    controller.set_keybindings(&first);
+    let now = Instant::now();
+    let acquired = controller.handle(
+        "owner",
+        acquire_with_keybindings("inherited-bindings", None),
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(acquired["ok"], true);
+    assert!(acquired["keybindings"].is_null());
+    assert_eq!(controller.backend.keybindings, first);
+    controller.set_keybindings(&second);
+    assert_eq!(controller.backend.keybindings, second);
+    let status = controller.status("owner", now);
+    assert_eq!(status["keybindings"], json!([65, 67]));
+    assert_eq!(status["lease"]["keybindings"], json!([65, 67]));
+    assert!(status["lease"]["requested_keybindings"].is_null());
+    let retry = controller.handle(
+        "owner",
+        acquire_with_keybindings("inherited-bindings", None),
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(retry["lease"], acquired["lease"]);
+    assert_eq!(controller.backend.starts, 1);
+}
+
+#[test]
+fn explicit_empty_keybindings_suppress_global_custom_values_until_cleanup_finishes() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let global = KeyBindings::from_flat(vec![65, 66]).unwrap();
+    let newer_global = KeyBindings::from_flat(vec![65, 67]).unwrap();
+    controller.set_keybindings(&global);
+    let now = Instant::now();
+    let acquired = controller.handle(
+        "owner",
+        acquire_with_keybindings("empty-bindings", Some(KeyBindings::empty())),
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(acquired["keybindings"], json!([]));
+    assert_eq!(controller.backend.keybindings.resolve(65, false), 65);
+    assert_eq!(controller.backend.keybindings.resolve(16, false), 160);
+    let update_count = controller.backend.keybinding_updates.len();
+    controller.set_keybindings(&newer_global);
+    assert_eq!(controller.backend.keybinding_updates.len(), update_count);
+    assert_eq!(
+        controller.status("owner", now)["lease"]["keybindings"],
+        json!([])
+    );
+    assert_eq!(controller.keybindings(), &newer_global);
+
+    controller.backend.fail_stop = true;
+    let token = acquired["lease"].as_str().unwrap().to_owned();
+    assert_eq!(
+        controller.handle(
+            "owner",
+            Operation::Release {
+                lease: token.clone()
+            },
+            now,
+            &mut || Ok(())
+        )["error"]["code"],
+        "release_failed"
+    );
+    assert_eq!(controller.backend.keybindings, KeyBindings::empty());
+    controller.backend.fail_stop = false;
+    assert_eq!(
+        controller.handle(
+            "owner",
+            Operation::Release { lease: token },
+            now,
+            &mut || Ok(())
+        )["ok"],
+        true
+    );
+    assert_eq!(controller.backend.keybindings, newer_global);
+    let terminal = controller.lookup("owner", "empty-bindings", now).unwrap();
+    assert_eq!(terminal["keybindings"], json!([]));
+    assert!(terminal["lease"].is_null());
+}
+
+#[test]
+fn exact_ordered_keybinding_request_is_required_for_active_and_terminal_replay() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let now = Instant::now();
+    let original = KeyBindings::from_flat(vec![65, 66, 65, 67]).unwrap();
+    let reordered = KeyBindings::from_flat(vec![65, 67, 65, 66]).unwrap();
+    let acquired = controller.handle(
+        "owner",
+        acquire_with_keybindings("ordered-bindings", Some(original.clone())),
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(acquired["keybindings"], json!([65, 66, 65, 67]));
+    let different_requests = [None, Some(KeyBindings::empty()), Some(reordered)];
+    for request in &different_requests {
+        assert_eq!(
+            controller.handle(
+                "owner",
+                acquire_with_keybindings("ordered-bindings", request.clone()),
+                now,
+                &mut || Ok(())
+            )["error"]["code"],
+            "operation_conflict"
+        );
+    }
+    assert_eq!(
+        controller.handle(
+            "owner",
+            Operation::Release {
+                lease: acquired["lease"].as_str().unwrap().into()
+            },
+            now,
+            &mut || Ok(())
+        )["ok"],
+        true
+    );
+    for request in different_requests {
+        assert_eq!(
+            controller.handle(
+                "owner",
+                acquire_with_keybindings("ordered-bindings", request),
+                now,
+                &mut || Ok(())
+            )["error"]["code"],
+            "operation_conflict"
+        );
+    }
+    let retry = controller.handle(
+        "owner",
+        acquire_with_keybindings("ordered-bindings", Some(original)),
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(retry["state"], "released");
+    assert_eq!(retry["keybindings"], json!([65, 66, 65, 67]));
+    assert_eq!(
+        controller
+            .lookup("foreign", "ordered-bindings", now)
+            .unwrap_err()
+            .code,
+        "not_found"
+    );
+}
+
+#[test]
+fn failed_acquisition_restores_global_keybindings_before_the_next_attempt() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            fail_start_once: true,
+            ..FakeBackend::default()
+        },
+        true,
+    );
+    let global = KeyBindings::from_flat(vec![65, 66]).unwrap();
+    controller.set_keybindings(&global);
+    let now = Instant::now();
+    assert_eq!(
+        controller.handle(
+            "owner",
+            acquire_with_keybindings("failed-bindings", Some(KeyBindings::empty())),
+            now,
+            &mut || Ok(())
+        )["ok"],
+        false
+    );
+    assert_eq!(controller.backend.keybindings, global);
+    assert!(controller.lease.is_none());
+    assert_eq!(
+        controller.handle(
+            "owner",
+            acquire_with_keybindings("next-bindings", None),
+            now,
+            &mut || Ok(())
+        )["ok"],
+        true
+    );
+    assert_eq!(controller.backend.keybindings, global);
 }

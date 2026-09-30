@@ -26,13 +26,18 @@ expired and cancelled tombstones. Missing operation IDs are not recoverable.
 There are at most 128 lifetime leases and 128 retained operation records.
 
 Acquisition also accepts the nullable scoped keyboard, mouse, controller, Back
-timeout, gamepad, pen/touch, scrolling, scancode, Right Alt and repeat fields from
+timeout, gamepad, pen/touch, scrolling, scancode, Right Alt, keybinding and repeat fields from
 the input lease contract. The fixture preserves explicit `false` and zero values.
 Gamepad names must be canonical choices recognized by the input contract on
 the current target; recognition does not imply native availability. Repeat
 delay accepts whole milliseconds from zero through 2147483647; repeat
 frequency accepts finite nonnegative numbers. It records the request without
-resolving global defaults or simulating native input effects.
+resolving global defaults or simulating native input effects. The typed
+`keybindings` request preserves `null`, explicit `[]`, pair order, and duplicates.
+It accepts an even flat list of at most 512 exact integer bytes in 0 through 255;
+no global list, built-in mapping, or native delivery is emulated. Omitted and null
+requests both record inheritance, while an explicit empty list remains distinct
+for active and terminal operation replay.
 
 Batches contain 1–64 events and are validated atomically before recording. The
 fixture accepts Moonlight virtual-key codes 1–255 with down, up and repeat state;
@@ -71,6 +76,7 @@ At most 128 keys and buttons may be held.
     "high_resolution_scrolling": false,
     "always_send_scancodes": false,
     "key_rightalt_to_key_win": true,
+    "keybindings": [],
     "key_repeat_delay": 0,
     "key_repeat_frequency": 0.0
   }

@@ -81,7 +81,7 @@ fn absent_product_document_uses_enabled_bootstrap_defaults() {
     assert_eq!(policy, InputPolicy::default());
     assert_eq!(
         policy.values(),
-        json!({"keyboard":true,"mouse":true,"controller":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true,"native_pen_touch":true})
+        json!({"keyboard":true,"mouse":true,"controller":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true,"native_pen_touch":true,"keybindings":[16,160,17,162,18,164]})
     );
     assert_eq!(revision, 0);
 }
@@ -360,7 +360,7 @@ fn product_v3_reads_scancode_policy_and_defaults_a_missing_field_on() {
 #[test]
 fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
     for document in [
-        json!({"ok":true,"found":true,"version":11,"revision":1,"values":{"keyboard":true,"mouse":true}}),
+        json!({"ok":true,"found":true,"version":12,"revision":1,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":9,"revision":1,"values":{"keyboard":true,"mouse":true,"native_pen_touch":false}}),
         json!({"ok":true,"found":true,"version":10,"revision":1,"values":{"keyboard":true,"mouse":true,"native_pen_touch":"false"}}),
         json!({"ok":true,"found":true,"version":10,"revision":1,"values":{"keyboard":true,"mouse":true,"unexpected":true}}),
@@ -390,7 +390,7 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
 }
 
 #[test]
-fn update_requires_current_revision_and_sends_whole_v10_document() {
+fn update_requires_current_revision_and_sends_whole_v11_document() {
     let mut settings = ProductSettings::new();
     settings.ready = true;
     settings.revision = 4;
@@ -451,14 +451,14 @@ fn update_requires_current_revision_and_sends_whole_v10_document() {
         &json!({
             "action":"product_update",
             "expected_revision":4,
-            "version":10,
-            "values":{"keyboard":false,"mouse":false,"controller":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true,"native_pen_touch":true},
+            "version":11,
+            "values":{"keyboard":false,"mouse":false,"controller":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true,"native_pen_touch":true,"keybindings":[16,160,17,162,18,164]},
         })
     );
 }
 
 #[test]
-fn v10_update_serializes_an_explicitly_disabled_native_pen_touch_setting() {
+fn v11_update_serializes_an_explicitly_disabled_native_pen_touch_setting() {
     let policy = InputPolicy {
         native_pen_touch: false,
         ..InputPolicy::default()
@@ -466,7 +466,7 @@ fn v10_update_serializes_an_explicitly_disabled_native_pen_touch_setting() {
 
     let payload = policy.update_payload(12);
 
-    assert_eq!(payload["version"], 10);
+    assert_eq!(payload["version"], 11);
     assert_eq!(payload["values"]["native_pen_touch"], false);
 }
 
@@ -503,10 +503,10 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     let Call::Submit { payload, .. } = &settings.pending.as_ref().unwrap().call else {
         panic!("legacy settings update was not submitted");
     };
-    assert_eq!(payload["version"], 10);
+    assert_eq!(payload["version"], 11);
     assert_eq!(
         payload["values"],
-        json!({"keyboard":false,"mouse":true,"controller":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0,"back_button_timeout":-1,"gamepad":selected_supported_profile().as_str(),"ds4_back_as_touchpad_click":false,"native_pen_touch":false})
+        json!({"keyboard":false,"mouse":true,"controller":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0,"back_button_timeout":-1,"gamepad":selected_supported_profile().as_str(),"ds4_back_as_touchpad_click":false,"native_pen_touch":false,"keybindings":[16,160,17,162,18,164]})
     );
     assert!(
         !settings
@@ -614,6 +614,7 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
         gamepad: selected_supported_profile(),
         ds4_back_as_touchpad_click: false,
         native_pen_touch: false,
+        keybindings: KeyBindings::default(),
     };
 
     settings
@@ -835,6 +836,7 @@ fn native_release_failure_reports_saved_policy_as_pending() {
             high_resolution_scrolling: None,
             always_send_scancodes: None,
             key_rightalt_to_key_win: None,
+            keybindings: None,
             key_repeat_delay: None,
             key_repeat_frequency: None,
         },
@@ -907,4 +909,217 @@ fn native_release_failure_reports_saved_policy_as_pending() {
         false
     );
     assert_eq!(settings.get_response(&controller)["applied"], false);
+}
+
+#[test]
+fn legacy_documents_keep_saved_values_and_default_only_the_new_keybindings() {
+    for version in 1..=10 {
+        let (policy, revision) = read_document(&json!({
+            "ok":true, "found":true, "version":version, "revision":19,
+            "values":{"keyboard":false,"mouse":false}
+        }))
+        .unwrap();
+        assert!(!policy.keyboard);
+        assert!(!policy.mouse);
+        assert_eq!(policy.keybindings, KeyBindings::default());
+        assert_eq!(revision, 19);
+        let updated = policy.update_payload(revision);
+        assert_eq!(updated["version"], 11);
+        assert_eq!(updated["values"]["keyboard"], false);
+        assert_eq!(updated["values"]["mouse"], false);
+        assert_eq!(
+            updated["values"]["keybindings"],
+            json!([16, 160, 17, 162, 18, 164])
+        );
+    }
+}
+
+#[test]
+fn v11_documents_preserve_empty_order_duplicates_and_exact_byte_boundaries() {
+    for bindings in [json!([]), json!([0, 255, 255, 0]), json!([65, 66, 65, 67])] {
+        let (policy, _) = read_document(&json!({
+            "ok":true, "found":true, "version":11, "revision":2,
+            "values":{"keybindings":bindings}
+        }))
+        .unwrap();
+        assert_eq!(policy.values()["keybindings"], bindings);
+    }
+    for invalid in [
+        json!(null),
+        json!([0]),
+        json!([0, 256]),
+        json!([0.0, 1]),
+        json!(vec![0_u8; 514]),
+    ] {
+        assert!(
+            read_document(&json!({
+                "ok":true, "found":true, "version":11, "revision":2,
+                "values":{"keybindings":invalid}
+            }))
+            .is_err()
+        );
+    }
+    assert!(
+        read_document(&json!({
+            "ok":true, "found":true, "version":10, "revision":2,
+            "values":{"keybindings":[]}
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn omitted_keybinding_updates_retain_the_list_and_explicit_empty_replaces_it() {
+    let mut settings = ProductSettings::new();
+    settings.policy.keybindings = KeyBindings::from_flat(vec![65, 66, 65, 67]).unwrap();
+    let legacy = settings.merge_update(InputPolicyUpdate {
+        keyboard: false,
+        mouse: true,
+        ..InputPolicyUpdate::default()
+    });
+    assert_eq!(legacy.keybindings, settings.policy.keybindings);
+    assert_eq!(legacy.values()["keybindings"], json!([65, 66, 65, 67]));
+    let explicit = settings.merge_update(InputPolicyUpdate {
+        keyboard: false,
+        mouse: true,
+        keybindings: Some(KeyBindings::empty()),
+        ..InputPolicyUpdate::default()
+    });
+    assert_eq!(explicit.values()["keybindings"], json!([]));
+}
+
+#[test]
+fn keybinding_write_uses_cas_and_verified_readback_before_applying_or_completing() {
+    let mut settings = ProductSettings::new();
+    settings.ready = true;
+    settings.pending = None;
+    settings.revision = 7;
+    let desired = InputPolicy {
+        keybindings: KeyBindings::empty(),
+        ..InputPolicy::default()
+    };
+    let mut controller = Controller::new(TestBackend::default(), true);
+    let mut script = Script::new([
+        Response::Accepted { id: 51 },
+        Response::Result {
+            payload: json!({"ok":true,"found":true,"version":11,
+            "revision":8,"values":desired.values()}),
+        },
+        Response::Ok,
+        Response::Ok,
+    ]);
+    let conflict = settings
+        .begin_update(70, 6, desired.clone(), 10_000)
+        .unwrap_err();
+    assert_eq!(conflict["error"]["code"], "revision_conflict");
+    assert_eq!(controller.keybindings(), &KeyBindings::default());
+    settings.begin_update(71, 7, desired, 10_000).unwrap();
+    for _ in 0..2 {
+        settings
+            .advance(&mut |command| script.send(command), &mut controller)
+            .unwrap();
+        assert_eq!(controller.keybindings(), &KeyBindings::default());
+    }
+    settings
+        .advance(&mut |command| script.send(command), &mut controller)
+        .unwrap();
+    let Command::Request { payload: write, .. } = &script.commands[0] else {
+        panic!("missing write");
+    };
+    assert_eq!(write["expected_revision"], 7);
+    assert_eq!(write["version"], 11);
+    assert_eq!(write["values"]["keybindings"], json!([]));
+    let Command::Complete {
+        request: 71,
+        payload: complete,
+    } = &script.commands[3]
+    else {
+        panic!("missing completion");
+    };
+    assert_eq!(complete["ok"], true);
+    assert_eq!(complete["persisted"], true);
+    assert_eq!(complete["applied"], true);
+    assert_eq!(controller.keybindings(), &KeyBindings::empty());
+    assert_eq!(
+        settings.get_response(&controller)["values"]["keybindings"],
+        json!([])
+    );
+
+    let mut restarted = ProductSettings::new();
+    let mut restarted_controller = Controller::new(TestBackend::default(), true);
+    let mut load = Script::new([
+        Response::Accepted { id: 61 },
+        Response::Result {
+            payload: json!({"ok":true,"found":true,"version":11,
+            "revision":8,"values":settings.policy.values()}),
+        },
+        Response::Ok,
+    ]);
+    for _ in 0..3 {
+        restarted
+            .advance(&mut |command| load.send(command), &mut restarted_controller)
+            .unwrap();
+    }
+    assert_eq!(restarted_controller.keybindings(), &KeyBindings::empty());
+    assert_eq!(restarted.get_response(&restarted_controller)["revision"], 8);
+    assert_eq!(
+        restarted.get_response(&restarted_controller)["values"]["keybindings"],
+        json!([])
+    );
+}
+
+#[test]
+fn reordered_keybinding_readback_is_reconciled_and_never_reported_as_the_attempted_write() {
+    let mut settings = ProductSettings::new();
+    let mut controller = Controller::new(TestBackend::default(), true);
+    let desired = InputPolicy {
+        keybindings: KeyBindings::from_flat(vec![65, 66, 65, 67]).unwrap(),
+        ..InputPolicy::default()
+    };
+    let actual = InputPolicy {
+        keybindings: KeyBindings::from_flat(vec![65, 67, 65, 66]).unwrap(),
+        ..InputPolicy::default()
+    };
+    let mut script = Script::new([]);
+    settings
+        .on_terminal(
+            &mut |command| script.send(command),
+            &mut controller,
+            Work::Update {
+                management_request: 72,
+                expected_revision: 7,
+                desired: desired.clone(),
+            },
+            ChildOutcome::Payload(
+                json!({"ok":true,"found":true,"version":11,"revision":8,"values":actual.values()}),
+            ),
+        )
+        .unwrap();
+    assert!(matches!(
+        settings.pending.as_ref().unwrap().work,
+        Work::ReconcileUpdate { .. }
+    ));
+    assert_eq!(controller.keybindings(), &KeyBindings::default());
+    let mut script = Script::new([Response::Ok]);
+    settings
+        .on_terminal(
+            &mut |command| script.send(command),
+            &mut controller,
+            Work::ReconcileUpdate {
+                management_request: 72,
+                expected_revision: 7,
+                desired,
+            },
+            ChildOutcome::Payload(
+                json!({"ok":true,"found":true,"version":11,"revision":8,"values":actual.values()}),
+            ),
+        )
+        .unwrap();
+    let Command::Complete { payload, .. } = &script.commands[0] else {
+        panic!("missing completion");
+    };
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error"]["code"], "write_unresolved");
+    assert_eq!(payload["values"]["keybindings"], json!([65, 67, 65, 66]));
+    assert_eq!(controller.keybindings(), &actual.keybindings);
 }

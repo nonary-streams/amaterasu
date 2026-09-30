@@ -7,6 +7,7 @@ mod gamepad_profile;
 mod model;
 mod product_settings;
 
+use amaterasu_input_policy::KeyBindings;
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use backend::NativeBackend;
 use controller::Controller;
@@ -62,6 +63,8 @@ enum SettingsOperation {
         always_send_scancodes: Option<bool>,
         #[serde(default)]
         key_rightalt_to_key_win: Option<bool>,
+        #[serde(default, deserialize_with = "deserialize_keybindings_update")]
+        keybindings: Option<KeyBindings>,
         #[serde(default)]
         key_repeat_delay: Option<u32>,
         #[serde(default)]
@@ -77,6 +80,15 @@ enum SettingsOperation {
         expected_revision: u64,
     },
 }
+// Only omission preserves the saved global list. A present field must be a
+// validated flat byte list, including an explicit empty list; null is invalid.
+fn deserialize_keybindings_update<'de, D>(deserializer: D) -> Result<Option<KeyBindings>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    KeyBindings::deserialize(deserializer).map(Some)
+}
+
 impl ManagedModule for InputModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
@@ -221,6 +233,7 @@ impl InputModule {
                     high_resolution_scrolling,
                     always_send_scancodes,
                     key_rightalt_to_key_win,
+                    keybindings,
                     key_repeat_delay,
                     key_repeat_frequency,
                     back_button_timeout,
@@ -243,6 +256,7 @@ impl InputModule {
                         high_resolution_scrolling,
                         always_send_scancodes,
                         key_rightalt_to_key_win,
+                        keybindings,
                         key_repeat_delay,
                         key_repeat_frequency,
                         back_button_timeout,
@@ -395,6 +409,34 @@ mod tests {
             SERVICE,
             &json!({"action":"status"}),
         ));
+    }
+
+    #[test]
+    fn settings_keybindings_preserve_omission_and_validate_explicit_replacement() {
+        for supplied in [None, Some(json!([])), Some(json!([0, 255, 65, 66]))] {
+            let mut request = json!({"action":"settings_update", "keyboard":true, "mouse":true, "expected_revision":2});
+            if let Some(value) = supplied.clone() {
+                request["keybindings"] = value;
+            }
+            let operation: SettingsOperation = serde_json::from_value(request).unwrap();
+            let SettingsOperation::SettingsUpdate { keybindings, .. } = operation else {
+                panic!("wrong operation");
+            };
+            assert_eq!(
+                serde_json::to_value(keybindings).unwrap(),
+                supplied.unwrap_or(serde_json::Value::Null)
+            );
+        }
+        for invalid in [
+            serde_json::Value::Null,
+            json!([0]),
+            json!([0, 256]),
+            json!([-1, 0]),
+            json!([0.0, 1]),
+            json!(vec![0_u8; 514]),
+        ] {
+            assert!(serde_json::from_value::<SettingsOperation>(json!({"action":"settings_update", "keyboard":true, "mouse":true, "expected_revision":2, "keybindings":invalid})).is_err());
+        }
     }
 
     #[test]

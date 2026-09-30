@@ -97,6 +97,7 @@ impl Controller {
                 high_resolution_scrolling,
                 always_send_scancodes,
                 key_rightalt_to_key_win,
+                keybindings,
                 key_repeat_delay,
                 key_repeat_frequency,
             } => self.acquire(
@@ -114,6 +115,7 @@ impl Controller {
                     high_resolution_scrolling,
                     always_send_scancodes,
                     key_rightalt_to_key_win,
+                    keybindings,
                     key_repeat_delay,
                     key_repeat_frequency,
                 },

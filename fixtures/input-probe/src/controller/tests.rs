@@ -318,3 +318,88 @@ fn invalid_gamepad_profiles_never_allocate_or_replace_the_observed_policy() {
         "auto"
     );
 }
+
+#[test]
+fn keybindings_snapshot_preserves_order_empty_and_inherited_policy_without_emulation() {
+    let now = Instant::now();
+    for bindings in [json!(null), json!([]), json!([0, 255, 65, 66, 65, 67])] {
+        let mut controller = Controller::new(true);
+        let request =
+            json!({"action":"acquire","operation_id":"keybindings","keybindings":bindings});
+        let acquired = controller.handle("owner", operation(request.clone()), now);
+        assert_eq!(acquired["ok"], true);
+        let metrics = controller.metrics(now);
+        assert_eq!(metrics["requested_policy"]["keybindings"], bindings);
+        assert!(metrics.get("lease").is_none());
+        assert!(metrics.get("token").is_none());
+        assert!(metrics.get("operation_id").is_none());
+        assert!(metrics.get("owner").is_none());
+        let retry = controller.handle("owner", operation(request.clone()), now);
+        assert_eq!(lease(&retry), lease(&acquired));
+        let mut changed = request;
+        changed["keybindings"] = if bindings.is_null() {
+            json!([])
+        } else {
+            json!(null)
+        };
+        assert_eq!(
+            error_code(&controller.handle("owner", operation(changed.clone()), now)),
+            Some("operation_conflict")
+        );
+        let released = controller.handle(
+            "owner",
+            operation(json!({"action":"release","lease":lease(&acquired)})),
+            now,
+        );
+        assert_eq!(released["ok"], true);
+        assert_eq!(
+            error_code(&controller.handle("owner", operation(changed), now)),
+            Some("operation_conflict")
+        );
+        let lookup = controller.handle(
+            "owner",
+            operation(json!({"action":"lookup","operation_id":"keybindings"})),
+            now,
+        );
+        assert_eq!(lookup["state"], "released");
+        assert!(lookup["lease"].is_null());
+        assert!(controller.metrics(now)["requested_policy"].is_null());
+    }
+}
+
+#[test]
+fn keybindings_omission_and_null_share_the_inherited_request_and_invalid_bytes_are_rejected() {
+    let now = Instant::now();
+    let mut controller = Controller::new(true);
+    let acquired = controller.handle(
+        "owner",
+        operation(json!({"action":"acquire","operation_id":"inherit"})),
+        now,
+    );
+    assert_eq!(acquired["ok"], true);
+    let retry = controller.handle(
+        "owner",
+        operation(json!({"action":"acquire","operation_id":"inherit","keybindings":null})),
+        now,
+    );
+    assert_eq!(lease(&retry), lease(&acquired));
+    for invalid in [
+        json!([0]),
+        json!([-1, 0]),
+        json!([0, 256]),
+        json!([0.0, 1]),
+        json!(["0", 1]),
+        json!(vec![0_u8; 514]),
+    ] {
+        assert!(
+            serde_json::from_value::<Operation>(json!({"action":"acquire","keybindings":invalid}))
+                .is_err()
+        );
+    }
+    assert!(
+        serde_json::from_value::<Operation>(
+            json!({"action":"acquire","keybindings":vec![0_u8;512]})
+        )
+        .is_ok()
+    );
+}

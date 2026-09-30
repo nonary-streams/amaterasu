@@ -5,6 +5,7 @@ use crate::model::{
     MAX_PEN_TOUCH_CONTACTS, MAX_PRESSED, Operation, PenTouchDevice, PenTouchPhase, Pressed,
     is_temporary_modifier, lease_duration, repeat_modifiers, validate_operation_id,
 };
+use amaterasu_input_policy::KeyBindings;
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
@@ -32,6 +33,7 @@ struct AcquireRequest {
     high_resolution_scrolling: Option<bool>,
     always_send_scancodes: Option<bool>,
     key_rightalt_to_key_win: Option<bool>,
+    keybindings: Option<KeyBindings>,
     key_repeat_delay: Option<u32>,
     key_repeat_frequency: Option<f64>,
 }
@@ -55,6 +57,7 @@ struct Lease {
     requested_high_resolution_scrolling: Option<bool>,
     requested_always_send_scancodes: Option<bool>,
     requested_key_rightalt_to_key_win: Option<bool>,
+    requested_keybindings: Option<KeyBindings>,
     requested_key_repeat_delay: Option<u32>,
     requested_key_repeat_frequency: Option<f64>,
     back_button_timeout_ms: i32,
@@ -78,6 +81,7 @@ struct TerminalAcquire {
     requested_high_resolution_scrolling: Option<bool>,
     requested_always_send_scancodes: Option<bool>,
     requested_key_rightalt_to_key_win: Option<bool>,
+    requested_keybindings: Option<KeyBindings>,
     requested_key_repeat_delay: Option<u32>,
     requested_key_repeat_frequency: Option<f64>,
     reason: &'static str,
@@ -131,6 +135,7 @@ pub struct Controller<B: Backend> {
     high_resolution_scrolling: bool,
     always_send_scancodes: bool,
     key_rightalt_to_key_win: bool,
+    keybindings: KeyBindings,
     key_repeat_delay_ms: u32,
     key_repeat_frequency_hz: f64,
     back_button_timeout_ms: i32,
@@ -153,7 +158,7 @@ pub struct Controller<B: Backend> {
 }
 impl<B: Backend> Controller<B> {
     pub fn new(mut backend: B, enabled: bool) -> Self {
-        backend.set_keybindings(&amaterasu_input_policy::KeyBindings::default());
+        backend.set_keybindings(&KeyBindings::default());
         Self {
             backend,
             enabled,
@@ -161,6 +166,7 @@ impl<B: Backend> Controller<B> {
             high_resolution_scrolling: true,
             always_send_scancodes: true,
             key_rightalt_to_key_win: false,
+            keybindings: KeyBindings::default(),
             key_repeat_delay_ms: DEFAULT_KEY_REPEAT_DELAY_MS,
             key_repeat_frequency_hz: DEFAULT_KEY_REPEAT_FREQUENCY_HZ,
             back_button_timeout_ms: DEFAULT_BACK_BUTTON_TIMEOUT_MS,
@@ -203,6 +209,7 @@ impl<B: Backend> Controller<B> {
                 high_resolution_scrolling,
                 always_send_scancodes,
                 key_rightalt_to_key_win,
+                keybindings,
                 key_repeat_delay,
                 key_repeat_frequency,
             } => self.acquire(
@@ -220,6 +227,7 @@ impl<B: Backend> Controller<B> {
                     high_resolution_scrolling,
                     always_send_scancodes,
                     key_rightalt_to_key_win,
+                    keybindings,
                     key_repeat_delay,
                     key_repeat_frequency,
                 },
@@ -336,6 +344,27 @@ impl<B: Backend> Controller<B> {
             .as_ref()
             .and_then(|lease| lease.requested_key_rightalt_to_key_win)
             .unwrap_or(self.key_rightalt_to_key_win)
+    }
+
+    fn effective_keybindings(&self) -> &KeyBindings {
+        self.lease
+            .as_ref()
+            .and_then(|lease| lease.requested_keybindings.as_ref())
+            .unwrap_or(&self.keybindings)
+    }
+
+    pub fn keybindings(&self) -> &KeyBindings {
+        &self.keybindings
+    }
+
+    pub fn set_keybindings(&mut self, keybindings: &KeyBindings) {
+        let previous = self.effective_keybindings().clone();
+        self.keybindings = keybindings.clone();
+        let effective = self.effective_keybindings();
+        if previous != *effective {
+            let effective = effective.clone();
+            self.backend.set_keybindings(&effective);
+        }
     }
 
     fn effective_key_repeat_policy(&self) -> (u32, f64) {
@@ -582,6 +611,7 @@ impl<B: Backend> Controller<B> {
             high_resolution_scrolling: requested_high_resolution_scrolling,
             always_send_scancodes: requested_always_send_scancodes,
             key_rightalt_to_key_win: requested_key_rightalt_to_key_win,
+            keybindings: requested_keybindings,
             key_repeat_delay: requested_key_repeat_delay,
             key_repeat_frequency: requested_key_repeat_frequency,
         } = request;
@@ -612,6 +642,7 @@ impl<B: Backend> Controller<B> {
                         != requested_high_resolution_scrolling
                     || lease.requested_always_send_scancodes != requested_always_send_scancodes
                     || lease.requested_key_rightalt_to_key_win != requested_key_rightalt_to_key_win
+                    || lease.requested_keybindings != requested_keybindings
                     || lease.requested_key_repeat_delay != requested_key_repeat_delay
                     || lease.requested_key_repeat_frequency != requested_key_repeat_frequency
                 {
@@ -638,6 +669,7 @@ impl<B: Backend> Controller<B> {
                     || terminal.requested_always_send_scancodes != requested_always_send_scancodes
                     || terminal.requested_key_rightalt_to_key_win
                         != requested_key_rightalt_to_key_win
+                    || terminal.requested_keybindings != requested_keybindings
                     || terminal.requested_key_repeat_delay != requested_key_repeat_delay
                     || terminal.requested_key_repeat_frequency != requested_key_repeat_frequency
                 {
@@ -705,6 +737,8 @@ impl<B: Backend> Controller<B> {
             .set_always_send_scancodes(always_send_scancodes);
         self.backend
             .set_key_rightalt_to_key_win(key_rightalt_to_key_win);
+        self.backend
+            .set_keybindings(requested_keybindings.as_ref().unwrap_or(&self.keybindings));
         if let Err(error) = self.backend.start() {
             self.startup_cleanup_pending = true;
             let _ = self.retry_startup_cleanup(now);
@@ -717,6 +751,7 @@ impl<B: Backend> Controller<B> {
                 .set_always_send_scancodes(self.always_send_scancodes);
             self.backend
                 .set_key_rightalt_to_key_win(self.key_rightalt_to_key_win);
+            self.backend.set_keybindings(&self.keybindings);
             return Err(error);
         }
         self.reset_scroll_remainders();
@@ -738,6 +773,7 @@ impl<B: Backend> Controller<B> {
             requested_high_resolution_scrolling,
             requested_always_send_scancodes,
             requested_key_rightalt_to_key_win,
+            requested_keybindings,
             requested_key_repeat_delay,
             requested_key_repeat_frequency,
             back_button_timeout_ms,
@@ -1317,6 +1353,7 @@ impl<B: Backend> Controller<B> {
             .set_always_send_scancodes(self.always_send_scancodes);
         self.backend
             .set_key_rightalt_to_key_win(self.key_rightalt_to_key_win);
+        self.backend.set_keybindings(&self.keybindings);
         let Some(lease) = self.lease.take() else {
             self.reset_scroll_remainders();
             self.retry_at = now;
@@ -1339,6 +1376,7 @@ impl<B: Backend> Controller<B> {
                 requested_high_resolution_scrolling: lease.requested_high_resolution_scrolling,
                 requested_always_send_scancodes: lease.requested_always_send_scancodes,
                 requested_key_rightalt_to_key_win: lease.requested_key_rightalt_to_key_win,
+                requested_keybindings: lease.requested_keybindings,
                 requested_key_repeat_delay: lease.requested_key_repeat_delay,
                 requested_key_repeat_frequency: lease.requested_key_repeat_frequency,
                 reason: lease.termination_reason.unwrap_or(reason),
@@ -1366,6 +1404,8 @@ impl<B: Backend> Controller<B> {
                 "high_resolution_scrolling":lease.requested_high_resolution_scrolling.unwrap_or(self.high_resolution_scrolling),
                 "always_send_scancodes":lease.requested_always_send_scancodes.unwrap_or(self.always_send_scancodes),
                 "key_rightalt_to_key_win":lease.requested_key_rightalt_to_key_win.unwrap_or(self.key_rightalt_to_key_win),
+                "keybindings":self.effective_keybindings(),
+                "requested_keybindings":lease.requested_keybindings,
                 "key_repeat_delay":lease.requested_key_repeat_delay.unwrap_or(self.key_repeat_delay_ms),
                 "key_repeat_frequency":lease.requested_key_repeat_frequency.unwrap_or(self.key_repeat_frequency_hz),
                 "gamepad_profile":lease.gamepad_profile.as_str(),
@@ -1375,7 +1415,7 @@ impl<B: Backend> Controller<B> {
                 "gamepad_unavailable_reason":gamepad_unavailable_reason,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"startup_cleanup_required":self.startup_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,"native_pen_touch":self.native_pen_touch,"pen_touch_supported":self.backend.pen_touch_supported(),"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"startup_cleanup_required":self.startup_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"keybindings":self.keybindings,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,"native_pen_touch":self.native_pen_touch,"pen_touch_supported":self.backend.pen_touch_supported(),"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();
@@ -1405,6 +1445,7 @@ fn active_lease<B: Backend>(lease: &Lease, now: Instant, backend: &B) -> Value {
         "high_resolution_scrolling": lease.requested_high_resolution_scrolling,
         "always_send_scancodes": lease.requested_always_send_scancodes,
         "key_rightalt_to_key_win": lease.requested_key_rightalt_to_key_win,
+        "keybindings": lease.requested_keybindings,
         "key_repeat_delay": lease.requested_key_repeat_delay,
         "key_repeat_frequency": lease.requested_key_repeat_frequency,
         "expires_in_ms": lease.expires.saturating_duration_since(now).as_millis() as u64,
@@ -1504,6 +1545,7 @@ fn terminal_acquire(operation: &TerminalAcquire) -> Value {
         "lease": Value::Null,
         "reason": operation.reason,
         "native_pen_touch": operation.native_pen_touch,
+        "keybindings": operation.requested_keybindings,
     })
 }
 

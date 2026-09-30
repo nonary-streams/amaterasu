@@ -3,17 +3,18 @@ use crate::controller::Controller;
 use crate::gamepad_profile::GamepadProfile;
 use crate::model::DevicePolicy;
 use crate::{CONFIGURATION_SERVICE, backend::Backend};
+use amaterasu_input_policy::KeyBindings;
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const PRODUCT_SETTINGS_VERSION: u32 = 10;
+pub const PRODUCT_SETTINGS_VERSION: u32 = 11;
 const CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
 const DEFAULT_KEY_REPEAT_FREQUENCY_HZ: f64 = 24.9;
 type Sender<'a> = &'a mut dyn FnMut(Command) -> ModuleResult<Response>;
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputPolicy {
     #[serde(default = "default_enabled")]
@@ -28,6 +29,8 @@ pub struct InputPolicy {
     pub always_send_scancodes: bool,
     #[serde(default)]
     pub key_rightalt_to_key_win: bool,
+    #[serde(default)]
+    pub keybindings: KeyBindings,
     #[serde(default = "default_key_repeat_delay")]
     pub key_repeat_delay: u32,
     #[serde(default = "default_key_repeat_frequency")]
@@ -42,7 +45,7 @@ pub struct InputPolicy {
     pub native_pen_touch: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct InputPolicyUpdate {
     pub keyboard: bool,
     pub mouse: bool,
@@ -50,6 +53,7 @@ pub struct InputPolicyUpdate {
     pub high_resolution_scrolling: Option<bool>,
     pub always_send_scancodes: Option<bool>,
     pub key_rightalt_to_key_win: Option<bool>,
+    pub keybindings: Option<KeyBindings>,
     pub key_repeat_delay: Option<u32>,
     pub key_repeat_frequency: Option<f64>,
     pub back_button_timeout: Option<i32>,
@@ -63,14 +67,14 @@ const fn default_enabled() -> bool {
 }
 
 impl InputPolicy {
-    fn device_policy(self) -> DevicePolicy {
+    fn device_policy(&self) -> DevicePolicy {
         DevicePolicy {
             keyboard: self.keyboard,
             mouse: self.mouse,
         }
     }
 
-    fn values(self) -> Value {
+    fn values(&self) -> Value {
         json!({
             "keyboard":self.keyboard,
             "mouse":self.mouse,
@@ -78,6 +82,7 @@ impl InputPolicy {
             "high_resolution_scrolling":self.high_resolution_scrolling,
             "always_send_scancodes":self.always_send_scancodes,
             "key_rightalt_to_key_win":self.key_rightalt_to_key_win,
+            "keybindings":self.keybindings,
             "key_repeat_delay":self.key_repeat_delay,
             "key_repeat_frequency":self.key_repeat_frequency,
             "back_button_timeout":self.back_button_timeout,
@@ -87,7 +92,7 @@ impl InputPolicy {
         })
     }
 
-    fn validate(self) -> Result<(), &'static str> {
+    fn validate(&self) -> Result<(), &'static str> {
         if self.key_repeat_delay > i32::MAX as u32 {
             return Err("key_repeat_delay must not exceed 2147483647 milliseconds");
         }
@@ -97,7 +102,7 @@ impl InputPolicy {
         Ok(())
     }
 
-    fn update_payload(self, expected_revision: u64) -> Value {
+    fn update_payload(&self, expected_revision: u64) -> Value {
         json!({
             "action":"product_update",
             "expected_revision":expected_revision,
@@ -128,6 +133,7 @@ impl Default for InputPolicy {
             high_resolution_scrolling: true,
             always_send_scancodes: true,
             key_rightalt_to_key_win: false,
+            keybindings: KeyBindings::default(),
             key_repeat_delay: DEFAULT_KEY_REPEAT_DELAY_MS,
             key_repeat_frequency: DEFAULT_KEY_REPEAT_FREQUENCY_HZ,
             back_button_timeout: default_back_button_timeout(),
@@ -225,6 +231,9 @@ impl ProductSettings {
             key_rightalt_to_key_win: update
                 .key_rightalt_to_key_win
                 .unwrap_or(self.policy.key_rightalt_to_key_win),
+            keybindings: update
+                .keybindings
+                .unwrap_or_else(|| self.policy.keybindings.clone()),
             key_repeat_delay: update
                 .key_repeat_delay
                 .unwrap_or(self.policy.key_repeat_delay),
@@ -281,7 +290,7 @@ impl ProductSettings {
             work: Work::Update {
                 management_request: request,
                 expected_revision,
-                desired,
+                desired: desired.clone(),
             },
             call: Call::Submit {
                 payload: desired.update_payload(expected_revision),
@@ -487,12 +496,13 @@ impl ProductSettings {
             Work::StartupLoad => match outcome {
                 ChildOutcome::Payload(payload) => match read_document(&payload) {
                     Ok((policy, revision)) => {
-                        self.policy = policy;
+                        self.policy = policy.clone();
                         self.revision = revision;
                         self.ready = true;
                         controller.set_high_resolution_scrolling(policy.high_resolution_scrolling);
                         controller.set_always_send_scancodes(policy.always_send_scancodes);
                         controller.set_key_rightalt_to_key_win(policy.key_rightalt_to_key_win);
+                        controller.set_keybindings(&policy.keybindings);
                         controller.set_key_repeat_policy(
                             policy.key_repeat_delay,
                             policy.key_repeat_frequency,
@@ -564,12 +574,13 @@ impl ProductSettings {
                         // Reconciliation establishes the currently durable policy even when the
                         // write outcome is uncertain, but never reports the attempted update as
                         // successful unless its exact next revision is present.
-                        self.policy = actual;
+                        self.policy = actual.clone();
                         self.revision = revision;
                         self.ready = true;
                         controller.set_high_resolution_scrolling(actual.high_resolution_scrolling);
                         controller.set_always_send_scancodes(actual.always_send_scancodes);
                         controller.set_key_rightalt_to_key_win(actual.key_rightalt_to_key_win);
+                        controller.set_keybindings(&actual.keybindings);
                         controller.set_key_repeat_policy(
                             actual.key_repeat_delay,
                             actual.key_repeat_frequency,
@@ -616,12 +627,13 @@ impl ProductSettings {
         policy: InputPolicy,
         revision: u64,
     ) -> ModuleResult<()> {
-        self.policy = policy;
+        self.policy = policy.clone();
         self.revision = revision;
         self.ready = true;
         controller.set_high_resolution_scrolling(policy.high_resolution_scrolling);
         controller.set_always_send_scancodes(policy.always_send_scancodes);
         controller.set_key_rightalt_to_key_win(policy.key_rightalt_to_key_win);
+        controller.set_keybindings(&policy.keybindings);
         controller.set_key_repeat_policy(policy.key_repeat_delay, policy.key_repeat_frequency);
         controller.set_back_button_timeout_ms(policy.back_button_timeout);
         controller.set_gamepad_profile(policy.gamepad);
@@ -658,6 +670,7 @@ impl ProductSettings {
             && controller.high_resolution_scrolling() == self.policy.high_resolution_scrolling
             && controller.always_send_scancodes() == self.policy.always_send_scancodes
             && controller.key_rightalt_to_key_win() == self.policy.key_rightalt_to_key_win
+            && controller.keybindings() == &self.policy.keybindings
             && controller.key_repeat_policy()
                 == (
                     self.policy.key_repeat_delay,
@@ -669,7 +682,7 @@ impl ProductSettings {
             && controller.native_pen_touch() == self.policy.native_pen_touch
             && !cleanup_required;
         settings_response_with_state(
-            self.policy,
+            self.policy.clone(),
             self.revision,
             persisted,
             applied,
@@ -739,7 +752,7 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
         {
             Ok((InputPolicy::default(), 0))
         }
-        Some(true) if matches!(payload["version"].as_u64(), Some(1..=10)) => {
+        Some(true) if matches!(payload["version"].as_u64(), Some(1..=11)) => {
             let values = payload["values"].as_object().ok_or("values not object")?;
             let version = payload["version"].as_u64().unwrap_or_default();
             let has_unknown_key = values.keys().any(|key| match version {
@@ -834,6 +847,22 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
                         | "gamepad"
                         | "ds4_back_as_touchpad_click"
                         | "native_pen_touch"
+                ),
+                11 => !matches!(
+                    key.as_str(),
+                    "keyboard"
+                        | "mouse"
+                        | "controller"
+                        | "high_resolution_scrolling"
+                        | "always_send_scancodes"
+                        | "key_rightalt_to_key_win"
+                        | "key_repeat_delay"
+                        | "key_repeat_frequency"
+                        | "back_button_timeout"
+                        | "gamepad"
+                        | "ds4_back_as_touchpad_click"
+                        | "native_pen_touch"
+                        | "keybindings"
                 ),
                 _ => true,
             });

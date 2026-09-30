@@ -20,9 +20,9 @@ other platforms report unsupported native injection instead of simulated success
 ## Durable input policy
 
 The input module loads the caller-scoped product document `product/amaterasu.input`
-after startup. Version 10 stores `keyboard`, `mouse`, `controller`,
+after startup. Version 11 stores `keyboard`, `mouse`, `controller`,
 `high_resolution_scrolling`, `always_send_scancodes`, and
-`key_rightalt_to_key_win`, `key_repeat_delay`, and
+`key_rightalt_to_key_win`, `keybindings`, `key_repeat_delay`, and
 `key_repeat_frequency`, `back_button_timeout`, and the global `gamepad` profile;
 it also stores `ds4_back_as_touchpad_click` and `native_pen_touch`. An absent
 document enables keyboard, mouse, and controller input,
@@ -38,8 +38,10 @@ enabled. Version 3 preserves all four earlier values and defaults right-Alt
 mapping to disabled. Versions 1 through 7 default controller input to enabled.
 Versions 1 through 8 default the DS4 Back mapping to enabled, and versions 1
 through 9 default native pen/touch to enabled. Missing native pen/touch in a
-version 10 document also defaults to enabled. The next update writes the complete
-v10 document. Delay is
+version 10 or 11 document also defaults to enabled. Versions 1 through 10 add
+the default flat keybinding list `[16,160,17,162,18,164]` while retaining all saved
+policy values. A missing v11 keybinding field uses that same default. The next
+update writes the complete v11 document. Delay is
 an integer from 0 through 2,147,483,647 milliseconds; zero disables repeat.
 Frequency is a finite nonnegative decimal in Hz. Zero keeps Vibeshine's 24.9 Hz
 default. Back timeout is a signed 32-bit millisecond value; any negative value
@@ -52,8 +54,8 @@ Administrators use the fixed management routes `/v1/input/settings_get` and
 `/v1/input/settings_update`, protected by `configuration.read` and
 `configuration.write`. An update body contains both keyboard and mouse fields,
 `expected_revision`, and may contain `high_resolution_scrolling`,
-`always_send_scancodes`, and `key_rightalt_to_key_win`. Older updates that omit
-newer fields preserve their current durable values. The update may also include
+`always_send_scancodes`, `key_rightalt_to_key_win`, and `keybindings`. Older updates
+that omit newer fields preserve their current durable values. The update may also include
 `key_repeat_delay`, `key_repeat_frequency`, `back_button_timeout`, `gamepad`,
 `ds4_back_as_touchpad_click`, `native_pen_touch`, and the optional `controller`
 boolean. Omitted controller and native pen/touch fields preserve their durable
@@ -67,7 +69,7 @@ Windows recognizes `auto`, `x360`, `ds4`, `vhf`, `vhf_xbox`, `vhf_xbox_one`,
 `457237db7e57f9c4be21c35bb07e28d1c100eb7d`. Unsupported-but-recognized profiles
 remain valid settings so deployments can retain an intended choice; a lease
 reports them unavailable, rejects controller snapshots, and never silently
-selects another profile. The next update writes the complete v10 document.
+selects another profile. The next update writes the complete v11 document.
 Product settings actions accept only the exact runtime caller
 `amaterasu.management`.
 
@@ -93,7 +95,7 @@ bootstrap defaults as persisted settings.
 
 The live global policy includes `keyboard`, `mouse`, `controller`,
 `high_resolution_scrolling`, `always_send_scancodes`,
-`key_rightalt_to_key_win`, `key_repeat_delay`,
+`key_rightalt_to_key_win`, `keybindings`, `key_repeat_delay`,
 `key_repeat_frequency`, `back_button_timeout`, `gamepad`,
 `ds4_back_as_touchpad_click`, and `native_pen_touch`. Native pen/touch defaults
 to enabled. The input module stores and snapshots this setting, which gates the
@@ -196,8 +198,9 @@ connection succeeds. Lease release during reconnection cancels the retry.
 Real ViGEmBus removal and restoration still need hardware qualification.
 
 When `key_rightalt_to_key_win` is enabled, Moonlight VK_RMENU (`0xA5`) maps to
-VK_LWIN (`0x5B`) before native injection. This applies to normalized and raw
-Moonlight packets on Windows and Linux. The backend records the native key chosen
+VK_LWIN (`0x5B`) before native injection when the selected `keybindings` list has
+no custom source `0xA5` pair. A custom pair takes priority over this alias. This
+applies to normalized and raw Moonlight packets on Windows and Linux. The backend records the native key chosen
 at key-down so a setting change cannot send key-up for a different key. Linux
 maps VK_LWIN through its existing table to `KEY_LEFTMETA`; Linux runtime behavior
 has not been exercised on this Windows host.
@@ -214,6 +217,29 @@ equivalent real modifier is held; their markers are validated across batches and
 remain tracked for lease cleanup on native failure. Linux emits the same
 repeat-event form through uinput, but runtime typing/repeat behavior has not
 been qualified on this Windows development host.
+
+The `keybindings` value is an ordered flat list of source/destination virtual-key
+bytes. It accepts exact integers from 0 through 255, an even number of values,
+and at most 256 pairs (512 values). Floats, strings, negatives, wider integers,
+and odd lists are rejected. Built-in generic modifiers always resolve first:
+`0x10`→`0xA0`, `0x11`→`0xA2`, `0x12`→`0xA4`. Then the first custom pair for the
+source wins; the Right Alt alias is considered last. Mapping applies once rather
+than chaining through destination pairs. Native admission validates the resolved
+destination against the selected platform and keyboard mode; valid policy bytes
+do not imply every destination can be injected.
+
+An acquire may send a nullable `keybindings` list. Omission or `null` follows the
+live global list, including later durable global changes. A supplied list replaces
+the global list for that lease, and `[]` retains only the built-ins and optional
+Right Alt alias. Settings updates that omit the field retain the saved global
+list; a present `null` is rejected, and an explicit `[]` is saved unchanged.
+Acquire and operation lookup return the requested list as `keybindings`, preserving `null` and `[]`. Active status also
+reports the effective lease list and its nullable `requested_keybindings`.
+Operation replay requires the same ordered request list, including duplicate pairs
+and the difference between inherited and explicit empty policy, for active leases
+and terminal records. Successful lease cleanup restores the current global list.
+Backend plans retain the native destination selected for each held source across
+policy changes, so its repeat and release target remains stable.
 
 ## JSON API
 
@@ -271,12 +297,14 @@ At most 128 keys/buttons and 16 pen/touch contacts may be held. Supported events
   optional `extended`; Linux requires `linux_evdev` with a keyboard code from
   1–248, excluding `KEY_UNKNOWN` (240). These are native encoding ranges, not a
   portable key map; clients must choose a defined code for the target platform.
-  Trusted protocol adapters may instead use `moonlight_vk` with a normalized,
-  allowlisted Win32 virtual-key code. The module's fixed US physical mapping
-  produces the corresponding Windows set-1/extended or Linux evdev key. Generic
-  and left Shift/Ctrl/Alt aliases have one pressed identity. A lease cannot mix
-  native and Moonlight key encodings, preventing two names from owning one native
-  key independently.
+  Trusted protocol adapters may instead use `moonlight_vk` with a byte-sized
+  Win32 virtual-key source. The selected list resolves that source once; native
+  validation checks the destination against the platform and keyboard mode.
+  Normalized packets use a fixed US physical mapping to produce the corresponding
+  Windows set-1/extended or Linux evdev key. Generic and left Shift/Ctrl/Alt are
+  distinct source identities whose native destination is shared through backend
+  ownership. A lease cannot mix native and Moonlight key encodings, preventing
+  two names from owning one native key independently.
   `moonlight_vk.normalized` is optional and defaults to `true` for older clients.
   Protocol adapters set it to `false` for a non-normalized virtual-key packet.
   Windows then applies `always_send_scancodes`; Linux uses its fixed mapping and

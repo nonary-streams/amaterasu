@@ -265,6 +265,7 @@ dependencies = [
 name = "amaterasu-input-probe"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-input-policy",
  "amaterasu-module-sdk",
  "getrandom 0.3.4",
  "serde",

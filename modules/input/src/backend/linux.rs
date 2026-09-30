@@ -1177,6 +1177,7 @@ mod tests {
                 high_resolution_scrolling: None,
                 always_send_scancodes: None,
                 key_rightalt_to_key_win: None,
+                keybindings: None,
                 key_repeat_delay: None,
                 key_repeat_frequency: None,
             },
