@@ -22,9 +22,17 @@ use std::{
 const PA_CHANNELS_MAX: usize = 32;
 const PA_INVALID_INDEX: u32 = u32::MAX;
 const PA_CONTEXT_NOAUTOSPAWN: c_int = 1;
+const PA_CONTEXT_UNCONNECTED: c_int = 0;
+const PA_CONTEXT_CONNECTING: c_int = 1;
+const PA_CONTEXT_AUTHORIZING: c_int = 2;
+const PA_CONTEXT_SETTING_NAME: c_int = 3;
 const PA_CONTEXT_READY: c_int = 4;
 const PA_CONTEXT_FAILED: c_int = 5;
 const PA_CONTEXT_TERMINATED: c_int = 6;
+const PA_ERR_ACCESS: c_int = 1;
+const PA_ERR_TIMEOUT: c_int = 8;
+const PA_ERR_AUTHKEY: c_int = 9;
+const PA_ERR_INVALIDSERVER: c_int = 13;
 const PA_OPERATION_DONE: c_int = 1;
 const PA_OPERATION_CANCELLED: c_int = 2;
 const PA_STREAM_READY: c_int = 2;
@@ -161,6 +169,7 @@ unsafe extern "C" {
     ) -> c_int;
     fn pa_context_disconnect(context: *mut PaContext);
     fn pa_context_get_state(context: *const PaContext) -> c_int;
+    fn pa_context_errno(context: *const PaContext) -> c_int;
     fn pa_context_get_server_info(
         context: *mut PaContext,
         callback: Option<unsafe extern "C" fn(*mut PaContext, *const PaServerInfo, *mut c_void)>,
@@ -300,21 +309,37 @@ impl PulseClient {
         if unsafe { pa_context_connect(context, ptr::null(), PA_CONTEXT_NOAUTOSPAWN, ptr::null()) }
             < 0
         {
-            return Err("audio_server_unavailable");
+            return Err(context_connection_error(context));
         }
-        let context = client.context;
-        client.wait_until(CONTROL_TIMEOUT, || {
-            // SAFETY: context remains owned by client.
-            let state = unsafe { pa_context_get_state(context) };
-            if state == PA_CONTEXT_READY {
-                Some(Ok(()))
-            } else if matches!(state, PA_CONTEXT_FAILED | PA_CONTEXT_TERMINATED) {
-                Some(Err("audio_server_unavailable"))
-            } else {
-                None
-            }
-        })?;
+        client.wait_until_connected(CONTROL_TIMEOUT)?;
         Ok(client)
+    }
+
+    fn wait_until_connected(&mut self, timeout: Duration) -> AudioResult<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Connecting, authorizing, and setting the application name are
+            // normal asynchronous states. Unlike operation waits below, this
+            // wait must drive the mainloop before requiring READY.
+            // SAFETY: context remains owned by this client.
+            let state = unsafe { pa_context_get_state(self.context) };
+            if let Some(result) =
+                context_connection_state(state, unsafe { pa_context_errno(self.context) })
+            {
+                return result;
+            }
+            let mut retval = 0;
+            // SAFETY: the live mainloop and output pointer stay valid here.
+            if unsafe { pa_mainloop_iterate(self.mainloop, 0, &mut retval) } < 0 {
+                return Err(context_connection_error(self.context));
+            }
+            if Instant::now() >= deadline {
+                return Err("audio_server_timeout");
+            }
+            if retval == 0 {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 
     fn is_ready(&self) -> bool {
@@ -524,6 +549,32 @@ impl PulseClient {
             }
         })?;
         Ok(capture)
+    }
+}
+
+fn context_connection_state(state: c_int, error: c_int) -> Option<AudioResult<()>> {
+    match state {
+        PA_CONTEXT_READY => Some(Ok(())),
+        PA_CONTEXT_FAILED | PA_CONTEXT_TERMINATED => Some(Err(context_error_code(error))),
+        PA_CONTEXT_UNCONNECTED
+        | PA_CONTEXT_CONNECTING
+        | PA_CONTEXT_AUTHORIZING
+        | PA_CONTEXT_SETTING_NAME => None,
+        _ => Some(Err("audio_server_unavailable")),
+    }
+}
+
+fn context_connection_error(context: *const PaContext) -> &'static str {
+    // SAFETY: caller passes the live context held by PulseClient.
+    context_error_code(unsafe { pa_context_errno(context) })
+}
+
+fn context_error_code(error: c_int) -> &'static str {
+    match error {
+        PA_ERR_ACCESS | PA_ERR_AUTHKEY => "audio_server_access_denied",
+        PA_ERR_TIMEOUT => "audio_server_timeout",
+        PA_ERR_INVALIDSERVER => "audio_server_configuration_invalid",
+        _ => "audio_server_unavailable",
     }
 }
 
@@ -1572,6 +1623,44 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_connect_wait_accepts_every_documented_transition_state() {
+        for state in [
+            PA_CONTEXT_UNCONNECTED,
+            PA_CONTEXT_CONNECTING,
+            PA_CONTEXT_AUTHORIZING,
+            PA_CONTEXT_SETTING_NAME,
+        ] {
+            assert_eq!(context_connection_state(state, 0), None);
+        }
+        assert_eq!(context_connection_state(PA_CONTEXT_READY, 0), Some(Ok(())));
+        assert_eq!(
+            context_connection_state(PA_CONTEXT_FAILED, PA_ERR_ACCESS),
+            Some(Err("audio_server_access_denied"))
+        );
+        assert_eq!(
+            context_connection_state(PA_CONTEXT_TERMINATED, PA_ERR_TIMEOUT),
+            Some(Err("audio_server_timeout"))
+        );
+        assert_eq!(
+            context_connection_state(-1, 0),
+            Some(Err("audio_server_unavailable"))
+        );
+    }
+
+    #[test]
+    fn pulse_connection_errors_distinguish_auth_and_invalid_server() {
+        assert_eq!(
+            context_error_code(PA_ERR_AUTHKEY),
+            "audio_server_access_denied"
+        );
+        assert_eq!(
+            context_error_code(PA_ERR_INVALIDSERVER),
+            "audio_server_configuration_invalid"
+        );
+        assert_eq!(context_error_code(0), "audio_server_unavailable");
+    }
 
     #[test]
     fn pulse_virtual_layouts_match_the_advertised_pcm_channel_masks() {
