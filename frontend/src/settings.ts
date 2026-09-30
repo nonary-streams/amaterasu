@@ -3411,7 +3411,7 @@ namespace Amaterasu {
         form.append(
           ...softwareEncoder.fields,
           softwareAvailability,
-          el("p", "muted", `Effective software tuning: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum threads ${settings.effective_min_threads ?? 2}.`),
+          el("p", "muted", `Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, thread minimum request ${settings.effective_min_threads ?? 2}. The codec may use fewer threads for small frames or due to runtime constraints.`),
           field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."),
           field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."),
           field(

@@ -267,12 +267,12 @@ namespace Amaterasu {
     minThreads.min = "1";
     minThreads.max = "256";
     minThreads.step = "1";
-    minThreads.placeholder = global ? "Default (2)" : "Inherit";
+    minThreads.placeholder = global ? "Default request (2)" : "Inherit";
     controls.set(minThreads.name, minThreads);
     fields.push(field(
-      "Minimum software encoding threads",
+      "Requested software thread minimum",
       minThreads,
-      "Sets the minimum thread count for software H.264 encoding. Hardware selections preserve this value without applying it.",
+      "Requests a minimum thread count for software H.264 encoding. The codec may cap the effective thread count based on frame size and runtime constraints. Hardware selections preserve this request without applying it.",
     ));
     const backend = el("select");
     backend.name = "encoder_backend";

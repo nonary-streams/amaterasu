@@ -82,7 +82,7 @@ test("application software editor preserves raw values and forwards its selector
 test("global software editor shows the default thread count and inherits configured values", () => {
   const editor = context.Amaterasu.softwareEncoderOverrideControls({ min_threads: null }, true);
   const fields = controls(editor.fields);
-  assert.equal(fields.get("min_threads").placeholder, "Default (2)");
+  assert.equal(fields.get("min_threads").placeholder, "Default request (2)");
   assert.equal(fields.get("min_threads").value, "");
   fields.get("min_threads").value = "256";
   assert.equal(editor.read().min_threads, 256);
