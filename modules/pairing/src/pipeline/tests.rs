@@ -771,7 +771,8 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
                 "native_pen_touch":false,
                 "nvenc_spatial_aq":false,
                 "audio_sink_capture_only":false,
-                "back_button_timeout":-1
+                "back_button_timeout":-1,
+                "ds4_back_as_touchpad_click":false
             }
         }),
         now(),
@@ -828,6 +829,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     assert_eq!(
         certificate_readback["config_overrides"]["back_button_timeout"],
         -1
+    );
+    assert_eq!(
+        certificate_readback["config_overrides"]["ds4_back_as_touchpad_click"],
+        false
     );
     let duplicate_client_id_readback = state.request(
         &mut pipeline,
@@ -888,6 +893,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
         persisted["clients"][0]["config_overrides"]["back_button_timeout"],
         -1
     );
+    assert_eq!(
+        persisted["clients"][0]["config_overrides"]["ds4_back_as_touchpad_click"],
+        false
+    );
 
     // A second administrator holding the same pre-write revision must reload
     // and receive a conflict rather than silently replacing the committed value.
@@ -927,6 +936,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
         false
     );
     assert_eq!(unchanged["config_overrides"]["back_button_timeout"], -1);
+    assert_eq!(
+        unchanged["config_overrides"]["ds4_back_as_touchpad_click"],
+        false
+    );
 }
 
 #[test]

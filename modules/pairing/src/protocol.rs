@@ -273,6 +273,8 @@ pub struct ClientConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gamepad: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ds4_back_as_touchpad_click: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyboard: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
@@ -447,6 +449,7 @@ impl ClientConfigOverrides {
             && self.back_button_timeout.is_none()
             && self.controller.is_none()
             && self.gamepad.is_none()
+            && self.ds4_back_as_touchpad_click.is_none()
             && self.keyboard.is_none()
             && self.mouse.is_none()
             && self.native_pen_touch.is_none()
@@ -875,6 +878,39 @@ mod tests {
             json!({"native_pen_touch":{}}),
         ] {
             assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn client_ds4_back_touchpad_click_override_is_sparse_and_preserves_legacy_records() {
+        let legacy: ClientConfigOverrides = serde_json::from_value(json!({
+            "controller": true,
+            "gamepad": "xbox"
+        }))
+        .unwrap();
+        assert_eq!(legacy.ds4_back_as_touchpad_click, None);
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap(),
+            json!({"controller":true,"gamepad":"xbox"})
+        );
+
+        let inherited = ClientConfigOverrides::default();
+        assert_eq!(inherited.ds4_back_as_touchpad_click, None);
+        assert!(inherited.is_empty());
+        assert_eq!(serde_json::to_value(inherited).unwrap(), json!({}));
+
+        for value in [false, true] {
+            let overrides: ClientConfigOverrides = serde_json::from_value(json!({
+                "ds4_back_as_touchpad_click": value
+            }))
+            .unwrap();
+            assert_eq!(overrides.ds4_back_as_touchpad_click, Some(value));
+            assert!(!overrides.is_empty());
+            overrides.validate().unwrap();
+            assert_eq!(
+                serde_json::to_value(overrides).unwrap(),
+                json!({"ds4_back_as_touchpad_click":value})
+            );
         }
     }
 
