@@ -115,3 +115,40 @@ fn explicit_cancel_stops_application_while_preparation_is_still_running() {
     assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
     assert_eq!(controller.current_game(&peer(1)), 0);
 }
+
+#[test]
+fn application_readiness_reuses_an_existing_rtsp_ticket() {
+    let started = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_state: "starting",
+        ..Broker::default()
+    };
+
+    assert!(controller.launch(10, request(1), peer(1), started).is_none());
+    for _ in 0..128 {
+        assert!(controller
+            .poll(started, &mut |command| broker.send(command))
+            .is_empty());
+        if controller.records.values().next().unwrap().stage == Stage::AwaitApplicationReady {
+            break;
+        }
+    }
+    assert_eq!(
+        controller.records.values().next().unwrap().stage,
+        Stage::AwaitApplicationReady
+    );
+
+    let record = controller.records.values_mut().next().unwrap();
+    record.rtsp_ticket = Some(77);
+    record.rtsp_url = Some("rtspenc://127.0.0.1:48010/existing".into());
+    record.rtsp_requested = true;
+    broker.application_state = "active";
+
+    let (connection, reply) =
+        poll_until_reply(&mut controller, &mut broker, started + Duration::from_secs(1));
+
+    assert_eq!(connection, 10);
+    assert_eq!(reply.status, 200);
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+}
