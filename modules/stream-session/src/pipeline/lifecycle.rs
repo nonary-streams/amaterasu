@@ -302,6 +302,7 @@ impl Pipeline {
         if payload["ok"] != true {
             if job.step == Step::InputBatch && payload["error"]["code"] == "controller_unavailable"
             {
+                record.session_effects.vigem_missing(record.id);
                 match accept_controller_batch_failure(record, &payload) {
                     Ok(()) => return false,
                     Err(code) => job.fail(record, code, now),
@@ -410,6 +411,8 @@ impl Pipeline {
                     record.state = State::Active;
                     record.history.activated(now);
                     record.host_metrics.activated(record.id);
+                    record.session_effects.activated(record.id);
+                    self.activate_tray_session(record.id);
                     Ok(self.deliver_success(record, job, now, send))
                 }
             }
@@ -418,6 +421,8 @@ impl Pipeline {
                 record.state = State::Active;
                 record.history.activated(now);
                 record.host_metrics.activated(record.id);
+                record.session_effects.activated(record.id);
+                self.activate_tray_session(record.id);
                 Ok(self.deliver_success(record, job, now, send))
             }
             Step::RenewInput => {

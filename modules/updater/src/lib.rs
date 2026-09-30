@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SERVICE: &str = "amaterasu.updater/1";
 const MANAGEMENT: &str = "amaterasu.management";
+const STREAM_SESSION: &str = "amaterasu.stream-session";
 const SYSTEM_TRAY: &str = "amaterasu.system-tray/1";
 const NETWORK_TIMEOUT_MS: u64 = 12_000;
 const MAX_DEFERRED_REQUESTS: usize = 32;
@@ -34,6 +35,12 @@ enum Operation {
     },
     Status {},
     Check {},
+    StreamStarted {
+        session_id: String,
+    },
+    StreamStopped {
+        session_id: String,
+    },
 }
 
 struct NotificationStatus {
@@ -76,6 +83,9 @@ struct UpdaterModule {
     check_in_progress: bool,
     next_check_at: Option<Instant>,
     configured_interval: Option<u32>,
+    last_check_started: Option<Instant>,
+    active_streams: BTreeSet<String>,
+    stream_start_check_at: Option<Instant>,
     last_check_unix_ms: Option<i64>,
     last_error: Option<&'static str>,
     releases: ReleaseSet,
@@ -110,6 +120,9 @@ impl ManagedModule for UpdaterModule {
             check_in_progress: false,
             next_check_at: None,
             configured_interval: None,
+            last_check_started: None,
+            active_streams: BTreeSet::new(),
+            stream_start_check_at: None,
             last_check_unix_ms: None,
             last_error: None,
             releases: ReleaseSet {
@@ -159,6 +172,7 @@ impl ManagedModule for UpdaterModule {
         self.drain_deferred_requests()?;
         self.collect_release_result(Instant::now());
         self.start_periodic_check_if_due(Instant::now());
+        self.start_stream_check_if_due(Instant::now());
         self.advance_tray_call()?;
         Ok(())
     }
@@ -171,7 +185,13 @@ impl UpdaterModule {
         caller: &str,
         operation: Operation,
     ) -> ModuleResult<()> {
-        if caller != MANAGEMENT {
+        if caller != MANAGEMENT
+            && !(caller == STREAM_SESSION
+                && matches!(
+                    operation,
+                    Operation::StreamStarted { .. } | Operation::StreamStopped { .. }
+                ))
+        {
             return self.complete(
                 request,
                 failure(
@@ -227,6 +247,28 @@ impl UpdaterModule {
                     }),
                 )
             }
+            Operation::StreamStarted { session_id } => {
+                if !valid_stream_session_id(&session_id) {
+                    return self.complete(
+                        request,
+                        failure("invalid_request", "stream session identifier is invalid"),
+                    );
+                }
+                if self.active_streams.insert(session_id) && self.active_streams.len() == 1 {
+                    self.stream_start_check_at = Instant::now().checked_add(Duration::from_secs(3));
+                }
+                self.complete(request, json!({"ok":true}))
+            }
+            Operation::StreamStopped { session_id } => {
+                if !valid_stream_session_id(&session_id) {
+                    return self.complete(
+                        request,
+                        failure("invalid_request", "stream session identifier is invalid"),
+                    );
+                }
+                self.active_streams.remove(&session_id);
+                self.complete(request, json!({"ok":true}))
+            }
         }
     }
 
@@ -256,20 +298,40 @@ impl UpdaterModule {
             return;
         }
         let interval = self.product_settings.settings().0.update_check_interval;
+        let initial = self.configured_interval.is_none();
         if self.configured_interval == Some(interval) {
             return;
         }
         self.configured_interval = Some(interval);
-        self.next_check_at = if interval == 0 { None } else { Some(now) };
+        self.next_check_at = periodic_deadline(now, interval);
+        if initial && interval > 0 {
+            self.start_check(now);
+        }
     }
 
     fn start_periodic_check_if_due(&mut self, now: Instant) {
-        if periodic_check_due(
-            self.configured_interval,
-            self.next_check_at,
-            now,
-            self.check_in_progress,
-        ) {
+        let Some(interval) = self.configured_interval.filter(|interval| *interval > 0) else {
+            return;
+        };
+        if self.next_check_at.is_some_and(|deadline| now >= deadline) {
+            self.next_check_at = periodic_deadline(now, interval);
+        } else {
+            return;
+        }
+        if self.active_streams.is_empty()
+            && !self.check_in_progress
+            && periodic_check_eligible(interval, self.last_check_started, now)
+        {
+            self.start_check(now);
+        }
+    }
+
+    fn start_stream_check_if_due(&mut self, now: Instant) {
+        if self
+            .stream_start_check_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.stream_start_check_at = None;
             self.start_check(now);
         }
     }
@@ -279,7 +341,7 @@ impl UpdaterModule {
             return false;
         }
         self.check_in_progress = true;
-        self.next_check_at = None;
+        self.last_check_started = Some(now);
         let sender = self.release_sender.clone();
         let result = thread::Builder::new()
             .name("amaterasu-updater-check".into())
@@ -338,16 +400,8 @@ impl UpdaterModule {
         }
     }
 
-    fn finish_check_time(&mut self, now: Instant) {
+    fn finish_check_time(&mut self, _now: Instant) {
         self.last_check_unix_ms = unix_time_milliseconds();
-        let interval = if self.product_settings.is_ready() {
-            self.product_settings.settings().0.update_check_interval
-        } else {
-            0
-        };
-        self.next_check_at = (interval > 0)
-            .then(|| now.checked_add(Duration::from_secs(u64::from(interval))))
-            .flatten();
     }
 
     fn advance_tray_call(&mut self) -> ModuleResult<()> {
@@ -525,15 +579,31 @@ fn failure(code: &str, message: &str) -> Value {
     json!({"ok":false,"code":code,"message":message})
 }
 
-fn periodic_check_due(
-    interval_seconds: Option<u32>,
-    deadline: Option<Instant>,
+fn periodic_deadline(now: Instant, interval_seconds: u32) -> Option<Instant> {
+    if interval_seconds == 0 {
+        return None;
+    }
+    now.checked_add(Duration::from_secs(u64::from(interval_seconds)))
+}
+
+fn periodic_check_eligible(
+    interval_seconds: u32,
+    last_check_started: Option<Instant>,
     now: Instant,
-    check_in_progress: bool,
 ) -> bool {
-    interval_seconds.is_some_and(|interval| interval > 0)
-        && !check_in_progress
-        && deadline.is_some_and(|deadline| now >= deadline)
+    interval_seconds > 0
+        && last_check_started.is_none_or(|started| {
+            now.saturating_duration_since(started)
+                >= Duration::from_secs(u64::from(interval_seconds))
+        })
+}
+
+fn valid_stream_session_id(session_id: &str) -> bool {
+    session_id
+        .strip_prefix("stream-session-")
+        .is_some_and(|identifier| {
+            identifier.len() == 16 && identifier.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 fn unix_time_milliseconds() -> Option<i64> {
@@ -557,10 +627,23 @@ mod tests {
         assert_eq!(MAX_UPDATE_CHECK_INTERVAL_SECONDS, 2_147_483_647);
 
         let now = Instant::now();
-        assert!(!periodic_check_due(Some(0), Some(now), now, false));
-        assert!(!periodic_check_due(None, Some(now), now, false));
-        assert!(periodic_check_due(Some(60), Some(now), now, false));
-        assert!(!periodic_check_due(Some(60), Some(now), now, true));
+        assert_eq!(periodic_deadline(now, 0), None);
+        assert_eq!(
+            periodic_deadline(now, 60),
+            now.checked_add(Duration::from_secs(60))
+        );
+        assert!(periodic_check_eligible(60, None, now));
+        assert!(!periodic_check_eligible(0, None, now));
+        assert!(!periodic_check_eligible(
+            60,
+            Some(now - Duration::from_secs(59)),
+            now
+        ));
+        assert!(periodic_check_eligible(
+            60,
+            Some(now - Duration::from_secs(60)),
+            now
+        ));
 
         assert!(
             Settings {
@@ -592,5 +675,14 @@ mod tests {
         assert_eq!(status["settings_ready"], false);
         assert_eq!(status["latest_stable"], Value::Null);
         assert_eq!(status["available_update"], Value::Null);
+    }
+
+    #[test]
+    fn stream_session_ids_are_bounded_and_safe_for_idempotency_keys() {
+        assert!(valid_stream_session_id("stream-session-0000000000000001"));
+        assert!(!valid_stream_session_id(""));
+        assert!(!valid_stream_session_id("../session"));
+        assert!(!valid_stream_session_id(&"a".repeat(129)));
+        assert!(!valid_stream_session_id("stream-session-not-an-id"));
     }
 }

@@ -71,6 +71,13 @@ fn reserved_activity_binds_signed_prepare_and_history_session_id() {
             .host_metrics_activities
             .contains(&format!("stream-session-{session:016x}"))
     );
+    assert_eq!(host.broker.updater_session_starts.len(), 1);
+    assert_eq!(
+        host.broker.updater_session_starts[0]["session_id"],
+        format!("stream-session-{session:016x}")
+    );
+    assert_eq!(host.broker.updater_active_sessions.len(), 1);
+    assert_eq!(host.broker.tray_activity_updates[0]["state"], "playing");
     assert_eq!(
         host.response_from(
             10,
@@ -84,6 +91,9 @@ fn reserved_activity_binds_signed_prepare_and_history_session_id() {
     assert!(host.broker.host_metrics_activities.is_empty());
     assert_eq!(host.broker.host_metrics_activity_begins.len(), 1);
     assert_eq!(host.broker.host_metrics_activity_ends.len(), 1);
+    assert_eq!(host.broker.updater_session_stops.len(), 1);
+    assert!(host.broker.updater_active_sessions.is_empty());
+    assert_eq!(host.broker.tray_activity_updates[1]["state"], "stopped");
     let release = json!({"action":"release_history_activity", "activity_id":"launch-activity",
         "rtsp_operation_id":"launch-activity"});
     assert_eq!(

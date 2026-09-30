@@ -9,6 +9,7 @@ mod route_payload;
 mod routes;
 mod server;
 mod tls;
+mod tray_events;
 
 #[cfg(test)]
 mod csrf_adversarial_tests;
@@ -43,6 +44,7 @@ struct ManagementModule {
     server: Option<Server>,
     operational_health: Option<OperationalHealth>,
     product_settings: product_settings::ProductSettings,
+    tray_events: tray_events::TrayEventConsumer,
 }
 
 const CATALOG_SERVICE: &str = "amaterasu.catalog/1";
@@ -99,6 +101,7 @@ impl ManagedModule for ManagementModule {
             server,
             operational_health: None,
             product_settings: product_settings::ProductSettings::default(),
+            tray_events: tray_events::TrayEventConsumer::default(),
         })
     }
 
@@ -111,6 +114,7 @@ impl ManagedModule for ManagementModule {
             server.set_csrf_policy(self.product_settings.csrf_origins());
             server.tick(&self.runtime)?;
         }
+        self.tray_events.tick(&self.runtime, self.server.as_ref())?;
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {

@@ -104,13 +104,21 @@ fn updater_and_tray_are_registered_with_only_the_required_management_calls() {
         let management = find(MANAGEMENT.id);
         assert!(management.calls.contains(&"amaterasu.updater/1"));
         assert!(management.calls.contains(&"amaterasu.system-tray/1"));
+        assert!(management.calls.contains(&"amaterasu.host-lifecycle/1"));
         assert!(management.dependencies.contains(&UPDATER.id));
         assert!(management.dependencies.contains(&SYSTEM_TRAY.id));
         assert!(find(UPDATER.id).dependencies.contains(&SYSTEM_TRAY.id));
     }
 
-    assert!(!STREAM_SESSION.calls.contains(&"amaterasu.updater/1"));
-    assert!(!STREAM_SESSION.calls.contains(&"amaterasu.system-tray/1"));
+    assert!(STREAM_SESSION.calls.contains(&"amaterasu.updater/1"));
+    assert!(STREAM_SESSION.calls.contains(&"amaterasu.system-tray/1"));
+    assert!(STREAM_SESSION.dependencies.contains(&UPDATER.id));
+    assert!(STREAM_SESSION.dependencies.contains(&SYSTEM_TRAY.id));
+    assert!(PAIRING.calls.contains(&"amaterasu.system-tray/1"));
+    assert!(PAIRING.dependencies.contains(&SYSTEM_TRAY.id));
+    assert!(PLATFORM_PAIRING.calls.contains(&"amaterasu.system-tray/1"));
+    assert!(PLATFORM_PAIRING.dependencies.contains(&SYSTEM_TRAY.id));
+    assert!(!STREAM_SESSION.calls.contains(&"amaterasu.host-lifecycle/1"));
 }
 
 #[test]
@@ -600,13 +608,18 @@ fn platform_registers_host_configuration_with_runtime_and_state_dependencies() {
         .unwrap();
     assert_eq!(
         pairing.calls,
-        &["amaterasu.state/1", "amaterasu.host-configuration/1"]
+        &[
+            "amaterasu.state/1",
+            "amaterasu.host-configuration/1",
+            "amaterasu.system-tray/1",
+        ]
     );
-    assert_eq!(pairing.calls.len(), 2);
-    assert_eq!(pairing.dependencies.len(), 3);
+    assert_eq!(pairing.calls.len(), 3);
+    assert_eq!(pairing.dependencies.len(), 4);
     assert!(pairing.dependencies.contains(&RUNTIME_ID));
     assert!(pairing.dependencies.contains(&HOST_CONFIGURATION.id));
     assert!(pairing.dependencies.contains(&STATE.id));
+    assert!(pairing.dependencies.contains(&SYSTEM_TRAY.id));
     let provider_index = platform
         .iter()
         .position(|component| component.id == HOST_CONFIGURATION.id)
@@ -697,13 +710,18 @@ fn diagnostics_and_management_receive_narrow_host_configuration_grants() {
         assert_eq!(policy.settings[PAIRING.id]["host_configuration"], true);
         assert_eq!(
             policy.principals[PAIRING.id].call.len(),
-            2,
-            "configured pairing may call state and read-only host configuration"
+            3,
+            "configured pairing may call state, host configuration, and the tray"
         );
         assert!(
             policy.principals[PAIRING.id]
                 .call
                 .contains("amaterasu.state/1")
+        );
+        assert!(
+            policy.principals[PAIRING.id]
+                .call
+                .contains("amaterasu.system-tray/1")
         );
         assert!(
             policy.principals[PAIRING.id]
@@ -856,6 +874,8 @@ fn stream_probe_replaces_platform_sources_without_widening_native_interfaces() {
                         "amaterasu.session-history/1",
                         "amaterasu.frame-limiter/1",
                         "amaterasu.host-metrics/1",
+                        "amaterasu.updater/1",
+                        "amaterasu.system-tray/1",
                     ]
                     .contains(service)
                 })

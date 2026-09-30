@@ -127,6 +127,8 @@ impl Pipeline {
                 };
                 record.history.teardown_confirmed(now, outcome, reason);
                 record.host_metrics.teardown_confirmed(record.id);
+                record.session_effects.teardown_confirmed(record.id);
+                self.stop_tray_session(record.id);
                 record.resources.remove(&Resource::Session);
                 record.attempted.remove(&Resource::Session);
             }

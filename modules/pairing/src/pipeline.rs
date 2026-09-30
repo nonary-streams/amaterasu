@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STATE_KEY: &str = "pairing/v1";
+const SYSTEM_TRAY_SERVICE: &str = "amaterasu.system-tray/1";
 const HOST_CONFIGURATION_SERVICE: &str = "amaterasu.host-configuration/1";
 const HOST_CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
 const HOST_CONFIGURATION_REFRESH_SECONDS: u64 = 2;
@@ -61,6 +62,12 @@ pub struct Pipeline {
     refresh_identity: Option<Arc<ConfiguredIdentity>>,
     host_configuration_retry_seconds: u64,
     identity_migration_checked: bool,
+    pairing_notice: Option<PairingNoticeStage>,
+}
+
+enum PairingNoticeStage {
+    Waiting(u64),
+    Releasing(u64),
 }
 
 enum HostConfigurationState {
@@ -116,11 +123,51 @@ impl Pipeline {
             refresh_identity: None,
             host_configuration_retry_seconds: 1,
             identity_migration_checked: false,
+            pairing_notice: None,
         }
     }
 
     pub fn invalidate_identity(&self) {
         self.identity.invalidate();
+    }
+
+    fn request_pairing_notice(
+        &mut self,
+        request: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) {
+        if self.pairing_notice.is_some() {
+            return;
+        }
+        if let Ok(Response::Accepted { id }) = send(Command::Request {
+            service: SYSTEM_TRAY_SERVICE.into(),
+            payload: json!({"action":"notify_pairing"}),
+            timeout_ms: 5_000,
+            operation_id: format!("pairing.{request}.tray-notification"),
+            parent: None,
+        }) {
+            self.pairing_notice = Some(PairingNoticeStage::Waiting(id));
+        }
+    }
+
+    fn progress_pairing_notice(&mut self, send: &mut impl FnMut(Command) -> Transport) {
+        let Some(stage) = self.pairing_notice.take() else {
+            return;
+        };
+        self.pairing_notice = match stage {
+            PairingNoticeStage::Waiting(request) => match send(Command::TakeResult { request }) {
+                Ok(Response::Result { .. }) => Some(PairingNoticeStage::Releasing(request)),
+                Ok(Response::Error { code, .. }) if code == "not_found" => None,
+                _ => Some(PairingNoticeStage::Waiting(request)),
+            },
+            PairingNoticeStage::Releasing(request) => {
+                match send(Command::ReleaseResult { request }) {
+                    Ok(Response::Ok) => None,
+                    Ok(Response::Error { code, .. }) if code == "not_found" => None,
+                    _ => Some(PairingNoticeStage::Releasing(request)),
+                }
+            }
+        };
     }
 
     pub fn tick(&mut self, send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
@@ -136,6 +183,7 @@ impl Pipeline {
         now: u64,
         mut send: impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        self.progress_pairing_notice(&mut send);
         let result = match self.advance_host_configuration(now, &mut send) {
             Ok(true) => {
                 let validation_time = self
@@ -921,11 +969,15 @@ impl Pipeline {
             Some(configured_identity) => overlay_document(&document, configured_identity),
             None => document,
         };
+        let is_server_certificate_request = matches!(&operation, Operation::GetServerCert { .. });
         match self
             .engine
             .apply(&request.caller, operation, engine_document, engine_now)
         {
             Ok(Change::Read(mut response)) => {
+                if is_server_certificate_request && response["pending"] == true {
+                    self.request_pairing_notice(request.id, send);
+                }
                 if include_revision {
                     response["revision"] = revision.into();
                 }

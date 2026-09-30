@@ -10,6 +10,7 @@ mod limiter;
 mod record;
 mod responses;
 mod rpc;
+mod session_effects;
 #[cfg(test)]
 mod tests;
 mod workflow;
@@ -60,6 +61,7 @@ pub struct Pipeline {
     control_after: u64,
     history_after: u64,
     history_activities: history_activity::HistoryActivities,
+    tray_activity: session_effects::TrayActivityEffects,
 }
 
 impl Pipeline {
@@ -75,6 +77,7 @@ impl Pipeline {
             control_after: 0,
             history_after: 0,
             history_activities: history_activity::HistoryActivities::default(),
+            tray_activity: session_effects::TrayActivityEffects::default(),
         })
     }
 
@@ -181,6 +184,8 @@ impl Pipeline {
         }
         self.progress_history(now, send);
         self.progress_host_metrics(now, send);
+        self.progress_session_effects(now, send);
+        self.tray_activity.progress(now, send);
         if let Some(mut job) = self.job.take() {
             let mut record = self
                 .records
@@ -278,6 +283,20 @@ impl Pipeline {
         for record in self.records.values_mut() {
             record.host_metrics.progress(record.id, now, send);
         }
+    }
+
+    fn progress_session_effects(&mut self, now: u64, send: &mut Send<'_>) {
+        for record in self.records.values_mut() {
+            record.session_effects.progress(now, send);
+        }
+    }
+
+    fn activate_tray_session(&mut self, record_id: u64) {
+        self.tray_activity.activated(record_id);
+    }
+
+    fn stop_tray_session(&mut self, record_id: u64) {
+        self.tray_activity.teardown_confirmed(record_id);
     }
 
     fn schedule_control(&mut self, now: u64) -> bool {

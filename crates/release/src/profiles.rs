@@ -262,19 +262,24 @@ const PAIRING: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.pairing",
     library: "amaterasu_pairing",
     provides: &["amaterasu.pairing/1"],
-    calls: &["amaterasu.state/1"],
+    calls: &["amaterasu.state/1", "amaterasu.system-tray/1"],
     publishes: &[],
     native_provides: &["amaterasu.identity/1"],
     native_uses: &[],
-    dependencies: &[RUNTIME_ID, "amaterasu.state"],
+    dependencies: &[RUNTIME_ID, "amaterasu.state", "amaterasu.system-tray"],
 };
 
 const PLATFORM_PAIRING: ComponentDefinition = ComponentDefinition {
-    calls: &["amaterasu.state/1", "amaterasu.host-configuration/1"],
+    calls: &[
+        "amaterasu.state/1",
+        "amaterasu.host-configuration/1",
+        "amaterasu.system-tray/1",
+    ],
     dependencies: &[
         RUNTIME_ID,
         "amaterasu.state",
         "amaterasu.host-configuration",
+        "amaterasu.system-tray",
     ],
     ..PAIRING
 };
@@ -515,6 +520,8 @@ const STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.encode/1",
         "amaterasu.session-history/1",
         "amaterasu.host-metrics/1",
+        "amaterasu.updater/1",
+        "amaterasu.system-tray/1",
         "amaterasu.frame-limiter/1",
     ],
     publishes: &[],
@@ -534,6 +541,8 @@ const STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.state",
         "amaterasu.session-history",
         "amaterasu.host-metrics",
+        "amaterasu.updater",
+        "amaterasu.system-tray",
         "amaterasu.video",
         "amaterasu.audio",
         "amaterasu.audio-encode",
@@ -731,6 +740,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.host-metrics/1",
         "amaterasu.updater/1",
         "amaterasu.system-tray/1",
+        "amaterasu.host-lifecycle/1",
     ],
     publishes: &[],
     native_provides: &[],
@@ -964,6 +974,7 @@ const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.host-metrics/1",
         "amaterasu.updater/1",
         "amaterasu.system-tray/1",
+        "amaterasu.host-lifecycle/1",
         "amaterasu.video",
         "amaterasu.nvhttp",
         "amaterasu.rtsp",

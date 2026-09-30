@@ -90,6 +90,11 @@ pub struct Broker {
     pub host_metrics_activities: BTreeSet<String>,
     pub host_metrics_activity_begins: Vec<Value>,
     pub host_metrics_activity_ends: Vec<Value>,
+    pub updater_active_sessions: BTreeSet<String>,
+    pub updater_session_starts: Vec<Value>,
+    pub updater_session_stops: Vec<Value>,
+    pub tray_activity_updates: Vec<Value>,
+    pub tray_vigem_notifications: usize,
     pub limiter_unavailable: bool,
     pub limiter_admission_unavailable: bool,
     pub limiter_restore_failures: usize,
@@ -342,6 +347,37 @@ impl Broker {
                     json!({"ok":true,"active":false})
                 }
                 _ => panic!("unexpected host metrics action"),
+            };
+        }
+        if service == "amaterasu.updater/1" {
+            return match action {
+                "stream_started" => {
+                    self.updater_session_starts.push(call.payload.clone());
+                    self.updater_active_sessions
+                        .insert(call.payload["session_id"].as_str().unwrap().into());
+                    json!({"ok":true})
+                }
+                "stream_stopped" => {
+                    self.updater_session_stops.push(call.payload.clone());
+                    self.updater_active_sessions
+                        .remove(call.payload["session_id"].as_str().unwrap());
+                    json!({"ok":true})
+                }
+                _ => panic!("unexpected updater action"),
+            };
+        }
+        if service == "amaterasu.system-tray/1" {
+            return match action {
+                "activity_update" => {
+                    self.tray_activity_updates
+                        .push(call.payload["update"].clone());
+                    json!({"ok":true,"delivery":"notified"})
+                }
+                "notify_vigem_missing" => {
+                    self.tray_vigem_notifications += 1;
+                    json!({"ok":true,"delivery":"notified"})
+                }
+                _ => panic!("unexpected system tray action"),
             };
         }
         if service == "amaterasu.session-history/1" {

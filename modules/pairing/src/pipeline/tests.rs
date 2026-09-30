@@ -58,6 +58,7 @@ struct Harness {
     conflict_next_write: bool,
     cancelled: bool,
     check_cancelled: bool,
+    tray_notifications: usize,
 }
 impl Harness {
     fn new() -> Self {
@@ -72,6 +73,7 @@ impl Harness {
             conflict_next_write: false,
             cancelled: false,
             check_cancelled: false,
+            tray_notifications: 0,
         }
     }
     fn send(&mut self, command: Command) -> Transport {
@@ -90,6 +92,12 @@ impl Harness {
                 payload,
                 ..
             } => {
+                if service == "amaterasu.system-tray/1" {
+                    assert_eq!(parent, None);
+                    assert_eq!(payload, json!({"action":"notify_pairing"}));
+                    self.tray_notifications += 1;
+                    return Ok(Response::Accepted { id: 70 });
+                }
                 assert_eq!(service, STATE_SERVICE);
                 assert_eq!(parent, Some(7));
                 assert_eq!(payload["key"], STATE_KEY);
@@ -139,6 +147,10 @@ impl Harness {
             Command::TakeResult { request: 50 } => {
                 self.state_reply.take().unwrap_or(Response::Pending)
             }
+            Command::TakeResult { request: 70 } => Response::Result {
+                payload: json!({"ok":true}),
+            },
+            Command::ReleaseResult { request: 70 } => Response::Ok,
             Command::Complete {
                 request: 7,
                 payload,
@@ -336,7 +348,9 @@ fn full_moonlight_gen7_transcript_persists_certificate_before_success() {
         )["pending"],
         true
     );
+    assert_eq!(state.tray_notifications, 1);
     let client = exchange(&mut state, &mut pipeline, &id, "1234", now());
+    assert_eq!(state.tray_notifications, 1);
     state.enqueue("nvhttp",json!({"action":"client_pairing_secret","pairing_id":id,"clientpairingsecret":client.finish()}));
     pipeline
         .tick_at(now(), |command| state.send(command))
@@ -350,6 +364,14 @@ fn full_moonlight_gen7_transcript_persists_certificate_before_success() {
         .tick_at(now(), |command| state.send(command))
         .unwrap();
     assert_eq!(state.output.as_ref().unwrap()["paired"], 1);
+    assert_eq!(state.tray_notifications, 1);
+    pipeline
+        .tick_at(now(), |command| state.send(command))
+        .unwrap();
+    pipeline
+        .tick_at(now(), |command| state.send(command))
+        .unwrap();
+    assert_eq!(state.tray_notifications, 1);
     let mut pipeline = Pipeline::new(settings());
     assert_eq!(
         state.request(
