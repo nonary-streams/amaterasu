@@ -18,17 +18,34 @@ auto-detection.
 
 ## Runtime behavior
 
-64-bit Windows can detect a running RTSS process and inspect profile values
-through `RTSSHooks64.dll`, but it cannot safely mutate those profiles through
-the available API. The RTSS profile interface separates `SetProfileProperty`
-from an unconditional, void `SaveProfile` call and offers no compare-and-save
-operation or lock shared with the RTSS UI. An external writer could change the
-profile after a comparison and have that change overwritten by the save. The
-module therefore leaves those mutation calls unbound. A policy-required RTSS
-apply returns `runtime_unavailable` with
-`rtss_conditional_profile_write_unsupported`, `applied: false`, and no lease.
-Other providers, 32-bit Windows, and non-Windows RTSS requests also remain
-unavailable. `auto` has no unimplemented fallback.
+64-bit Windows reads RTSS profile values through `RTSSHooks64.dll` and updates
+an existing executable profile through its `.cfg` file. Before changing any
+bytes, the provider opens that regular file without following a final-component
+reparse point, denies delete/rename opens, and takes a nonblocking exclusive
+Win32 byte-range lock over the full file range. It reads and compares the three
+`[Framerate]` values while holding the lock, replaces only their numeric text,
+flushes and verifies the file, then asks RTSS to reload the profile and checks
+the values through the hooks API. An expected-value mismatch or lock failure
+does not mutate the profile. Apply and restore use the same transaction, with
+the lease journal durable before apply and restore conditional on the exact
+applied values.
+
+The lock denies ordinary Windows reads and writes through other handles;
+Windows documents that byte-range locks do not constrain memory-mapped file
+writes.
+The provider cannot coordinate with edits RTSS has already buffered in its UI,
+or prevent a writer from changing the profile after the lock is released. The
+post-reload readback catches changes visible at verification time. Later edits
+remain intact because lease restore compares the current profile to the
+applied snapshot and retains a stale lease instead of overwriting a mismatch.
+If RTSS Hooks appears to show the original values already, restore still checks
+the profile file under the lock; a third locked snapshot remains stale even if
+the Hooks view is behind it.
+The in-place file update is not crash-atomic; failed writes attempt to restore
+the original bytes while the lock is held, and an unverified result leaves the
+durable pending lease for recovery. Profiles with missing, duplicate, or
+malformed frame-rate keys are refused. 32-bit Windows and non-Windows RTSS
+requests remain unavailable. `auto` has no unimplemented fallback.
 
 The RTSS limiter-disabled flag is global, so the module only reads it. If RTSS
 has disabled the limiter globally, apply reports unavailable without changing
@@ -54,12 +71,11 @@ filter by session. When no owned lease exists, `status` probes the RTSS process
 and required API and reports provider availability separately from lease state.
 
 The provider-independent lease manager supports exact restore and retains a
-lease after restore failure. The native RTSS adapter currently cannot execute
-that write safely, so restore of a retained RTSS lease returns
-`restore_failed` with `rtss_conditional_profile_write_unsupported`; its token is
-kept for retry if a future provider gains safe conditional writes. A detected
-external change is reported as `stale_lease` and is never overwritten. Legacy
-leases from a runtime that created a profile remain stale; recovery never
+lease after restore failure. A detected external change is reported as
+`stale_lease` and is never overwritten. A precondition mismatch between the
+lease manager's read and the locked file transaction is also rechecked; if the
+profile is not already at its original snapshot, the lease remains stale.
+Legacy leases from a runtime that created a profile remain stale; recovery never
 deletes or overwrites that profile. The journal keeps the latest 256 completed
 lease tombstones; a repeated restore returns `restored` while its tombstone
 remains, then returns `not_found` after eviction. Callers should use unique
@@ -109,16 +125,15 @@ conditional profile writes.
 
 ## Remaining integration and platform gates
 
-The lifecycle contract is implemented behind the fake-provider test seam, but
-Team 2 cannot receive an applied RTSS lease until RTSS supplies a safe
-conditional profile-write API or a supported shared locking protocol. No Team 2
-files were changed in this slice. Live RTSS process/API detection and profile
-readback were not exercised because RTSS is not installed and running in the
-build environment. RTSS hooks may also be blocked by a game's anti-cheat. The
+The lifecycle contract is implemented behind the fake-provider test seam.
+Live RTSS process/API detection, profile locking, reload, and game behavior were
+not exercised because RTSS is not installed and running in the build
+environment. RTSS hooks may also be blocked by a game's anti-cheat. The
 community `SyncLimiter` numeric mapping and read behavior still require
 verification against supported RTSS versions.
 NVIDIA Control Panel, VSync control, MangoHUD, and Proton runtime providers
 remain unimplemented; unsupported provider choices return `runtime_unavailable`.
 
-Focused policy and lifecycle tests are in `src/tests.rs` and `src/lease.rs`;
-strict service wire tests are inline in `src/service.rs`.
+Focused policy, lifecycle, and disposable profile-file transaction tests are in
+`src/tests.rs`, `src/lease.rs`, and `src/rtss_profile.rs`; strict service wire
+tests are inline in `src/service.rs`.

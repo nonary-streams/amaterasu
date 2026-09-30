@@ -3,6 +3,8 @@ mod lease;
 mod model;
 mod policy;
 mod rtss;
+#[cfg(any(all(windows, target_pointer_width = "64"), test))]
+mod rtss_profile;
 mod runtime;
 mod service;
 

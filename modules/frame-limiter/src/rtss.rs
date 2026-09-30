@@ -1,5 +1,7 @@
-//! Read-only RTSS profile inspection with an explicit safe-mutation gate.
+//! RTSS profile inspection and guarded per-profile frame-limit updates.
 use crate::lease::{FrameLimitProvider, ProfileValues, ProviderError};
+#[cfg(all(windows, target_pointer_width = "64"))]
+use crate::rtss_profile::write_profile_file_verified;
 #[cfg(all(windows, target_pointer_width = "64"))]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 #[cfg(all(windows, target_pointer_width = "64"))]
@@ -62,25 +64,38 @@ impl FrameLimitProvider for RtssProvider {
     }
 
     fn ensure_safe_writes_supported(&mut self) -> Result<(), ProviderError> {
-        Err(ProviderError::Unavailable(
-            "rtss_conditional_profile_write_unsupported",
-        ))
+        self.api()?;
+        Ok(())
     }
 
     fn write_profile_verified(
         &mut self,
-        _profile: &str,
-        _expected: ProfileValues,
-        _values: ProfileValues,
+        profile: &str,
+        expected: ProfileValues,
+        values: ProfileValues,
     ) -> Result<(), ProviderError> {
-        // The RTSS profile API separates property writes from unconditional
-        // SaveProfile and offers no compare-and-save operation. Since an RTSS
-        // UI or another process does not share our lease lock, mutation cannot
-        // preserve external edits safely. Keep native writes unavailable until
-        // RTSS provides a conditional profile update primitive.
-        Err(ProviderError::PreconditionFailed(
-            "rtss_conditional_profile_write_unsupported",
-        ))
+        validate_profile_name(profile)?;
+        let path = self.profile_path(profile)?;
+        // The locked file comparison is authoritative for writes. A Hooks
+        // snapshot can lag a direct profile-file edit, so it must not be used
+        // to accept or reject the expected file state.
+        write_profile_file_verified(&path, expected, values)?;
+
+        let current = {
+            let api = self.api()?;
+            // Match RTSS's disk-reload sequence: select the global profile,
+            // publish all profiles, then inspect the executable profile.
+            api.load_profile("")?;
+            api.update_profiles();
+            api.load_profile(profile)?;
+            api.read_profile_values()?
+        };
+        if current != values {
+            return Err(ProviderError::VerifyFailed(
+                "rtss_profile_write_verification_failed",
+            ));
+        }
+        Ok(())
     }
 
     fn limiter_disabled(&mut self) -> Result<bool, ProviderError> {
@@ -200,6 +215,8 @@ type GetProfileProperty = unsafe extern "system" fn(*const i8, *mut u8, u32) -> 
 #[cfg(all(windows, target_pointer_width = "64"))]
 type ProfileOperation = unsafe extern "system" fn(*const i8);
 #[cfg(all(windows, target_pointer_width = "64"))]
+type UpdateProfiles = unsafe extern "system" fn();
+#[cfg(all(windows, target_pointer_width = "64"))]
 type GetFlags = unsafe extern "system" fn() -> u32;
 
 #[cfg(all(windows, target_pointer_width = "64"))]
@@ -207,6 +224,7 @@ struct WindowsRtssApi {
     library: *mut std::ffi::c_void,
     get_profile_property: GetProfileProperty,
     load_profile: ProfileOperation,
+    update_profiles: UpdateProfiles,
     get_flags: GetFlags,
 }
 
@@ -254,6 +272,7 @@ impl WindowsRtssApi {
                 library,
                 get_profile_property: resolve_symbol(library, b"GetProfileProperty\0")?,
                 load_profile: resolve_symbol(library, b"LoadProfile\0")?,
+                update_profiles: resolve_symbol(library, b"UpdateProfiles\0")?,
                 get_flags: resolve_symbol(library, b"GetFlags\0")?,
             })
         };
@@ -285,6 +304,12 @@ impl WindowsRtssApi {
         // SAFETY: GetFlags is a read-only RTSSHooks export with no arguments.
         let flags = unsafe { (self.get_flags)() };
         Ok(flags & LIMITER_DISABLED_FLAG != 0)
+    }
+
+    fn update_profiles(&self) {
+        // SAFETY: this no-argument RTSSHooks export is resolved from the
+        // configured installation and the library remains owned by `self`.
+        unsafe { (self.update_profiles)() };
     }
 
     fn get_i32_property(&self, property: &str) -> Result<i32, ProviderError> {
