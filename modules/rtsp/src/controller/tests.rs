@@ -112,6 +112,7 @@ fn record(state: State) -> Record {
         negotiation: None,
         negotiated_encryption: None,
         negotiated_slices_per_frame: None,
+        negotiated_video_stream_format: None,
         client_feature_flags: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
@@ -813,6 +814,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         negotiation: None,
         negotiated_encryption: None,
         negotiated_slices_per_frame: None,
+        negotiated_video_stream_format: None,
         client_feature_flags: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
@@ -1638,6 +1640,24 @@ fn accepted_announce_freezes_pcm_haptics_flag_into_authenticated_start() {
     assert!(record.accept_announce(&announce));
     let payload = record.authenticated_start_payload(23).unwrap();
     assert_eq!(payload["configuration"]["client_feature_flags"], 7);
+    assert_eq!(
+        payload["configuration"]["configuration"]["video_stream_format"],
+        serde_json::to_value(announce.video.format).unwrap()
+    );
+}
+
+#[test]
+fn unsupported_negotiated_codec_cannot_arm_h264_start_configuration() {
+    let (mut record, mut announce) = announced_profile_record();
+    announce.video.format = amaterasu_module_sdk::VideoStreamFormat {
+        codec: amaterasu_module_sdk::VideoCodec::Hevc,
+        bit_depth: 8,
+        dynamic_range: amaterasu_module_sdk::DynamicRange::Sdr,
+    };
+
+    assert!(!record.accept_announce(&announce));
+    assert!(record.negotiated_video_stream_format.is_none());
+    assert!(record.authenticated_start_payload(23).is_none());
 }
 
 #[test]
@@ -1679,6 +1699,8 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
             audio: false,
         });
         record.negotiated_slices_per_frame = Some(1);
+        record.negotiated_video_stream_format =
+            Some(amaterasu_module_sdk::VideoStreamFormat::H264_SDR);
         record.client_feature_flags = Some(3);
         record.config.frame_limiter_settings = Some(snapshot.clone());
         record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());

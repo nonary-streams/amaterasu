@@ -375,6 +375,7 @@ impl Profile {
             && announce.video.bitrate_kbps == self.bitrate_kbps
             && announce.video.max_reference_frames == self.max_reference_frames
             && announce.video.color == ColorMode::Bt709Limited
+            && announce.video.format == amaterasu_module_sdk::VideoStreamFormat::H264_SDR
             && announce.encryption.video == self.encrypt_video
     }
 
@@ -913,6 +914,7 @@ impl Open {
         session: u64,
         encryption: EncryptionSnapshot,
         slices_per_frame: i32,
+        video_stream_format: amaterasu_module_sdk::VideoStreamFormat,
         client_feature_flags: u32,
     ) -> serde_json::Value {
         let mut payload = self.arm(session);
@@ -920,6 +922,8 @@ impl Open {
         payload["configuration"]["encrypt_audio"] = serde_json::json!(encryption.audio);
         payload["configuration"]["configuration"]["slices_per_frame"] =
             serde_json::json!(slices_per_frame);
+        payload["configuration"]["configuration"]["video_stream_format"] =
+            serde_json::json!(video_stream_format);
         payload["configuration"]["client_feature_flags"] = serde_json::json!(client_feature_flags);
         payload
     }

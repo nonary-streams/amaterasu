@@ -671,6 +671,12 @@ pub enum CaptureProvider {
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VideoConfiguration {
+    /// Codec and range accepted by the authenticated RTSP ANNOUNCE.
+    #[serde(
+        default = "default_video_stream_format",
+        skip_serializing_if = "is_default_video_stream_format"
+    )]
+    pub video_stream_format: amaterasu_module_sdk::VideoStreamFormat,
     /// Client-requested H.264 slices per frame from Moonlight's ANNOUNCE.
     #[serde(
         default = "default_slices_per_frame",
@@ -694,8 +700,8 @@ pub struct VideoConfiguration {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
-    /// Zero leaves reference-frame selection to the encoder; one requires a
-    /// single H.264 reference frame.
+    /// Zero leaves H.264 reference-frame selection to the encoder; a positive
+    /// value requests the exact maximum in the stream's H.264 SPS.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_reference_frames: u32,
     /// Frozen host hardware-encoder controls resolved before stream activation.
@@ -703,6 +709,14 @@ pub struct VideoConfiguration {
     pub nvenc_settings: amaterasu_module_sdk::NvencSettings,
     #[serde(default)]
     pub nvenc_spatial_aq: bool,
+}
+
+fn default_video_stream_format() -> amaterasu_module_sdk::VideoStreamFormat {
+    amaterasu_module_sdk::VideoStreamFormat::H264_SDR
+}
+
+fn is_default_video_stream_format(format: &amaterasu_module_sdk::VideoStreamFormat) -> bool {
+    *format == amaterasu_module_sdk::VideoStreamFormat::H264_SDR
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -938,7 +952,9 @@ fn valid_minimum_fps_target(value: f64) -> bool {
 
 impl VideoConfiguration {
     fn valid(&self) -> bool {
-        (16..=3840).contains(&self.width)
+        self.video_stream_format.validate().is_ok()
+            && self.video_stream_format == amaterasu_module_sdk::VideoStreamFormat::H264_SDR
+            && (16..=3840).contains(&self.width)
             && (16..=2160).contains(&self.height)
             && self.width.is_multiple_of(2)
             && self.height.is_multiple_of(2)
@@ -1081,11 +1097,16 @@ mod tests {
             serde_json::to_value(&start.configuration).unwrap()["max_reference_frames"].is_null()
         );
         let mut strict = start.configuration.clone();
-        strict.max_reference_frames = 1;
+        strict.max_reference_frames = 2;
+        assert!(strict.valid());
         assert_eq!(
             serde_json::to_value(&strict).unwrap()["max_reference_frames"],
-            1
+            2
         );
+        strict.max_reference_frames = 16;
+        assert!(strict.valid());
+        strict.max_reference_frames = 17;
+        assert!(!strict.valid());
     }
 
     #[test]
@@ -1189,6 +1210,28 @@ mod tests {
         unknown["client_feature_flags"] = json!(8);
         let start: StartConfig = serde_json::from_value(unknown).unwrap();
         assert_eq!(start.validate(true), Err("invalid_start_configuration"));
+    }
+
+    #[test]
+    fn negotiated_video_format_defaults_to_h264_sdr_and_rejects_unimplemented_codecs() {
+        let legacy: StartConfig = serde_json::from_value(start_json()).unwrap();
+        assert_eq!(
+            legacy.configuration.video_stream_format,
+            amaterasu_module_sdk::VideoStreamFormat::H264_SDR
+        );
+        assert!(
+            serde_json::to_value(&legacy).unwrap()["configuration"]
+                .get("video_stream_format")
+                .is_none()
+        );
+        assert!(legacy.validate(true).is_ok());
+
+        let mut hevc = start_json();
+        hevc["configuration"]["video_stream_format"] = json!({
+            "codec":"hevc", "bit_depth":8, "dynamic_range":"sdr"
+        });
+        let hevc: StartConfig = serde_json::from_value(hevc).unwrap();
+        assert_eq!(hevc.validate(true), Err("invalid_start_configuration"));
     }
 
     #[test]
@@ -1495,7 +1538,7 @@ mod tests {
             ("fps", 121),
             ("bitrate", 99999),
             ("bitrate", 100000001),
-            ("max_reference_frames", 2),
+            ("max_reference_frames", 17),
         ] {
             let mut config = start_json();
             config["configuration"][field] = json!(value);

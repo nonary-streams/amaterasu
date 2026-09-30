@@ -28,6 +28,7 @@ pub(super) struct Record {
     pub negotiation: Option<Negotiation>,
     pub negotiated_encryption: Option<crate::model::EncryptionSnapshot>,
     pub negotiated_slices_per_frame: Option<i32>,
+    pub negotiated_video_stream_format: Option<amaterasu_module_sdk::VideoStreamFormat>,
     pub client_feature_flags: Option<u32>,
     pub url: String,
     pub session_token: String,
@@ -68,6 +69,7 @@ impl Record {
             audio: announce.encryption.audio,
         });
         self.negotiated_slices_per_frame = accepted.then_some(announce.video.slices_per_frame);
+        self.negotiated_video_stream_format = accepted.then_some(announce.video.format);
         self.client_feature_flags = accepted.then_some(announce.client_feature_flags);
         accepted
     }
@@ -75,11 +77,13 @@ impl Record {
     pub(super) fn authenticated_start_payload(&self, session: u64) -> Option<Value> {
         let encryption = self.negotiated_encryption?;
         let slices_per_frame = self.negotiated_slices_per_frame?;
+        let video_stream_format = self.negotiated_video_stream_format?;
         let client_feature_flags = self.client_feature_flags?;
         Some(self.config.arm_with_negotiation(
             session,
             encryption,
             slices_per_frame,
+            video_stream_format,
             client_feature_flags,
         ))
     }
