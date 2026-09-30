@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_PREPARATION_SHUTDOWN: Duration = Duration::from_secs(8 * 2 * 30);
+const MAX_PAYLOAD_BYTES: usize = 16_384;
 
 fn spawn_detached_commands_with(
     spec: &LaunchSpec,
@@ -165,6 +165,7 @@ impl ProcessRecord {
             spec.preparation.clone(),
             spec.environment.clone(),
             spec.preparation_cwd.clone(),
+            spec.exit_timeout_seconds,
         );
         let mut record = Self {
             process_id,
@@ -665,6 +666,7 @@ impl PreparationLease {
             spec.preparation.clone(),
             spec.environment.clone(),
             spec.cwd.clone(),
+            spec.exit_timeout_seconds,
         )
         .expect("validated preparation lease is nonempty");
         Self {
@@ -767,7 +769,7 @@ impl ProcessManager {
         if caller.is_empty() || caller.len() > 256 {
             return error("invalid_caller");
         }
-        if serde_json::to_vec(&payload).map_or(true, |bytes| bytes.len() > 16_384) {
+        if serde_json::to_vec(&payload).map_or(true, |bytes| bytes.len() > MAX_PAYLOAD_BYTES) {
             return error("request_too_large");
         }
         let action = match serde_json::from_value(payload) {
@@ -868,12 +870,14 @@ impl ProcessManager {
                 operation_id,
                 environment,
                 cwd,
+                exit_timeout_seconds,
                 preparation,
             } => {
                 let spec = PreparationSpec {
                     preparation: preparation.into_vec(),
                     environment,
                     cwd,
+                    exit_timeout_seconds,
                 };
                 spec.validate(&operation_id)
                     .map_err(|_| "invalid_preparation")?;
@@ -1024,11 +1028,32 @@ impl ProcessManager {
             .filter(|record| record.owner == caller)
             .skip(offset);
         let mut processes = Vec::new();
+        // Reserve the largest possible offset encoding. The broker's payload
+        // bound applies to the full response, including its JSON envelope.
+        let mut response_bytes = serde_json::to_vec(&json!({
+            "ok":true,"processes":[],"next_offset":usize::MAX,
+        }))
+        .expect("fixed response envelope is serializable")
+        .len();
+        let mut byte_limit_reached = false;
         for record in owned.by_ref().take(limit) {
             record.advance()?;
-            processes.push(json!(record));
+            let process = json!(record);
+            let process_bytes = serde_json::to_vec(&process)
+                .expect("process response is serializable")
+                .len()
+                + usize::from(!processes.is_empty());
+            if response_bytes + process_bytes > MAX_PAYLOAD_BYTES {
+                if processes.is_empty() {
+                    return Err("response_too_large");
+                }
+                byte_limit_reached = true;
+                break;
+            }
+            response_bytes += process_bytes;
+            processes.push(process);
         }
-        let next_offset = if owned.next().is_some() {
+        let next_offset = if byte_limit_reached || owned.next().is_some() {
             offset.checked_add(processes.len())
         } else {
             None
@@ -1130,14 +1155,30 @@ impl ProcessManager {
     }
 
     fn shutdown_budget(&self) -> Duration {
-        let longest_grace = self
+        let process_budget = self
             .records
             .values()
-            .map(|record| record.spec.exit_timeout_seconds)
+            .map(|record| {
+                Duration::from_secs(
+                    record
+                        .spec
+                        .exit_timeout_seconds
+                        .min(MAX_EXIT_TIMEOUT_SECONDS),
+                ) + REAP_TIMEOUT
+                    + record
+                        .lifecycle
+                        .as_ref()
+                        .map_or(Duration::ZERO, ApplicationLifecycle::cleanup_budget)
+            })
             .max()
-            .unwrap_or_default()
-            .min(MAX_EXIT_TIMEOUT_SECONDS);
-        (Duration::from_secs(longest_grace) + REAP_TIMEOUT).max(MAX_PREPARATION_SHUTDOWN)
+            .unwrap_or(REAP_TIMEOUT);
+        let preparation_budget = self
+            .preparations
+            .values()
+            .map(|lease| lease.lifecycle.cleanup_budget() + REAP_TIMEOUT)
+            .max()
+            .unwrap_or(REAP_TIMEOUT);
+        process_budget.max(preparation_budget)
     }
 }
 
@@ -1190,6 +1231,75 @@ mod failed_preparation_shutdown_tests {
 
 fn error(code: &str) -> Value {
     json!({"ok":false,"code":code})
+}
+
+#[cfg(test)]
+mod report_payload_tests {
+    use super::*;
+    use crate::lifecycle::{CommandFailure, CommandFailureKind, CommandOutcome};
+
+    #[test]
+    fn list_keeps_worst_case_lifecycle_reports_within_the_broker_payload_bound() {
+        let mut manager = ProcessManager::default();
+        for index in 0..16 {
+            let operation_id = format!("{index:03}{}", "\"".repeat(125));
+            let response = manager.handle(
+                "alice",
+                json!({
+                    "action":"launch",
+                    "operation_id":operation_id,
+                    "executable":std::env::current_exe().unwrap(),
+                    "preparation":[{}],
+                }),
+            );
+            let process_id = response["process"]["process_id"].as_u64().unwrap();
+            let record = manager.records.get_mut(&process_id).unwrap();
+            record.state = ProcessState::CleanupFailed {
+                outcome: TerminalOutcome::Cancelled,
+            };
+            let lifecycle = record.lifecycle.as_mut().unwrap();
+            let outcome = || CommandOutcome {
+                step: 7,
+                success: false,
+                exit_code: Some(i32::MIN),
+                kind: Some(CommandFailureKind::ContainmentFailed),
+                os_error: Some(i32::MIN),
+            };
+            lifecycle.preparation.last_command = Some(outcome());
+            lifecycle.cleanup.last_command = Some(outcome());
+            lifecycle.cleanup.failures = (0..8)
+                .map(|step| CommandFailure {
+                    phase: "undo",
+                    step,
+                    kind: CommandFailureKind::ContainmentFailed,
+                    exit_code: Some(i32::MIN),
+                    os_error: Some(i32::MIN),
+                })
+                .collect();
+        }
+
+        let mut offset = 0;
+        let mut received_ids = Vec::new();
+        loop {
+            let page = manager.handle("alice", json!({"action":"list","offset":offset}));
+            let bytes = serde_json::to_vec(&page).unwrap().len();
+            assert!(
+                bytes <= 16_384,
+                "list exceeds broker payload bound: {bytes}"
+            );
+            for process in page["processes"].as_array().unwrap() {
+                received_ids.push(process["process_id"].as_u64().unwrap());
+            }
+            match page["next_offset"].as_u64() {
+                Some(next) => {
+                    assert!(next > offset);
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(received_ids, (1..=16).collect::<Vec<_>>());
+    }
 }
 
 #[cfg(test)]

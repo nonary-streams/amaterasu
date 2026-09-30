@@ -1505,6 +1505,10 @@ fn failed_preparation_spawn_retains_the_suspended_child_for_retry() {
     crate::containment::fail_next_failed_spawn_termination();
     let failed = wait_for_state(&mut manager, "alice", process_id, "cleanup_failed");
     assert_eq!(failed["process"]["outcome"], "launch_failed", "{failed}");
+    assert!(
+        failed["process"]["preparation"]["last_command"].is_null(),
+        "an owned suspended child has not settled: {failed}"
+    );
     assert!(!marker.exists());
 
     let retry = manager.handle(
@@ -1514,6 +1518,10 @@ fn failed_preparation_spawn_retains_the_suspended_child_for_retry() {
     assert_eq!(retry["process"]["state"], "stopping", "{retry}");
     let settled = wait_for_state(&mut manager, "alice", process_id, "launch_failed");
     assert_eq!(settled["process"]["cleanup"]["state"], "complete");
+    assert_eq!(
+        settled["process"]["preparation"]["last_command"]["kind"],
+        "spawn_failed"
+    );
     assert!(!marker.exists());
     manager.shutdown().unwrap();
     std::fs::remove_dir_all(marker.parent().unwrap()).unwrap();
@@ -1650,6 +1658,10 @@ fn preparation_runs_in_order_and_undo_runs_once_in_reverse() {
 
     let running = wait_for_state(&mut manager, "alice", id, "running");
     assert_eq!(running["process"]["preparation"]["completed"], 2);
+    assert_eq!(
+        running["process"]["preparation"]["last_command"],
+        json!({"step":1,"success":true,"exit_code":0})
+    );
     assert_eq!(running["process"]["cleanup"]["remaining"], 2);
     assert_eq!(trace_events(&trace), ["prepare-one", "prepare-two"]);
 
@@ -1669,6 +1681,10 @@ fn preparation_runs_in_order_and_undo_runs_once_in_reverse() {
     let cancelled = wait_for_state(&mut manager, "alice", id, "cancelled");
     assert_eq!(cancelled["process"]["cleanup"]["state"], "complete");
     assert_eq!(cancelled["process"]["cleanup"]["remaining"], 0);
+    assert_eq!(
+        cancelled["process"]["cleanup"]["last_command"],
+        json!({"step":0,"success":true,"exit_code":0})
+    );
     assert_eq!(
         trace_events(&trace),
         ["prepare-one", "prepare-two", "undo-two", "undo-one"]
@@ -1829,6 +1845,53 @@ fn prepare_only_lease_is_idempotent_and_undoes_in_reverse_without_launching_a_pr
         "preparation_not_found"
     );
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn prepare_exit_policy_defaults_is_bounded_and_changes_conflict() {
+    let mut manager = ProcessManager::default();
+    let request = json!({
+        "action":"prepare",
+        "operation_id":"prepare-default-exit-policy",
+        "preparation":[{}],
+    });
+    assert_eq!(manager.handle("alice", request.clone())["ok"], true);
+    let mut explicit_default = request.clone();
+    explicit_default["exit_timeout_seconds"] = json!(10);
+    assert_eq!(manager.handle("alice", explicit_default)["ok"], true);
+    let mut conflict = request;
+    conflict["exit_timeout_seconds"] = json!(15);
+    assert_eq!(
+        manager.handle("alice", conflict)["code"],
+        "operation_conflict"
+    );
+    for timeout in [0, 300] {
+        assert_eq!(
+            manager.handle(
+                "alice",
+                json!({
+                    "action":"prepare",
+                    "operation_id":format!("prepare-exit-policy-{timeout}"),
+                    "preparation":[{}],
+                    "exit_timeout_seconds":timeout,
+                })
+            )["ok"],
+            true
+        );
+    }
+    assert_eq!(
+        manager.handle(
+            "alice",
+            json!({
+                "action":"prepare",
+                "operation_id":"prepare-exit-policy-oversized",
+                "preparation":[{}],
+                "exit_timeout_seconds":301,
+            })
+        )["code"],
+        "invalid_preparation"
+    );
+    manager.shutdown().unwrap();
 }
 
 #[test]
@@ -2032,6 +2095,10 @@ fn failed_preparation_rolls_back_the_started_step_and_prior_steps() {
         "exit_failed"
     );
     assert_eq!(failed["process"]["preparation"]["failure"]["step"], 1);
+    assert_eq!(
+        failed["process"]["preparation"]["last_command"],
+        json!({"step":1,"success":false,"exit_code":3,"kind":"exit_failed"})
+    );
     assert_eq!(failed["process"]["cleanup"]["state"], "complete");
     assert_eq!(
         trace_events(&trace),
@@ -2120,6 +2187,10 @@ fn cancellation_settles_an_active_preparation_before_undo() {
     assert_eq!(cancelled["process"]["preparation"]["completed"], 0);
     assert_eq!(
         cancelled["process"]["preparation"]["failure"]["kind"],
+        "cancelled"
+    );
+    assert_eq!(
+        cancelled["process"]["preparation"]["last_command"]["kind"],
         "cancelled"
     );
     assert_eq!(trace_events(&trace), ["prepare-long", "undo-long"]);

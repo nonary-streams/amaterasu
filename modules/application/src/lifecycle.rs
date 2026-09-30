@@ -149,6 +149,15 @@ impl PreparationStep {
     }
 }
 
+impl PreparationCommand<'_> {
+    fn execution_timeout(self, raw_timeout: Duration) -> Duration {
+        match self {
+            Self::Structured(command) => Duration::from_millis(command.timeout_ms),
+            Self::Raw { .. } => raw_timeout,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,7 +498,7 @@ impl CommandFailure {
 enum CommandPoll {
     Running,
     Blocked(CommandFailure),
-    Finished(Result<(), CommandFailure>),
+    Finished(Result<ExitStatus, CommandFailure>),
 }
 
 struct CommandTask {
@@ -517,16 +526,17 @@ impl CommandTask {
         spec: PreparationCommand<'_>,
         environment: &BTreeMap<String, String>,
         application_working_directory: Option<&str>,
+        execution_timeout: Duration,
         now: Instant,
     ) -> Result<Self, TaskSpawnError> {
-        let (mut command, timeout_ms, elevated) = match spec {
+        let (mut command, elevated) = match spec {
             PreparationCommand::Structured(spec) => {
                 let mut command = Command::new(&spec.executable);
                 command.args(&spec.args).env_clear().envs(&spec.environment);
                 if let Some(cwd) = &spec.cwd {
                     command.current_dir(cwd);
                 }
-                (command, spec.timeout_ms, false)
+                (command, false)
             }
             PreparationCommand::Raw { text, elevated } => {
                 let expanded = expand_environment_references(text, environment)?;
@@ -554,7 +564,7 @@ impl CommandTask {
                 {
                     command.current_dir(working_directory);
                 }
-                (command, default_command_timeout_ms(), elevated)
+                (command, elevated)
             }
         };
         command
@@ -564,7 +574,7 @@ impl CommandTask {
         match ContainedChild::spawn(&mut command, elevated) {
             Ok(child) => Ok(Self {
                 child,
-                execution_deadline: now + Duration::from_millis(timeout_ms),
+                execution_deadline: now + execution_timeout,
                 stop_requested_at: None,
                 force_requested: false,
                 observed_exit: false,
@@ -634,7 +644,7 @@ impl CommandTask {
                 let result = self.outcome.take().map_or_else(
                     || {
                         if status.success() {
-                            Ok(())
+                            Ok(status)
                         } else {
                             Err(CommandFailure::exit(status))
                         }
@@ -668,6 +678,8 @@ pub(crate) enum CleanupState {
 pub(crate) struct PreparationReport {
     pub completed: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_command: Option<CommandOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<CommandFailure>,
 }
 
@@ -675,8 +687,48 @@ pub(crate) struct PreparationReport {
 pub(crate) struct CleanupReport {
     pub state: CleanupState,
     pub remaining: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_command: Option<CommandOutcome>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<CommandFailure>,
+}
+
+/// The most recently settled command in a phase, without trusted command text or
+/// environment values. A failed wait never masquerades as a settled outcome.
+#[derive(Debug, Serialize)]
+pub(crate) struct CommandOutcome {
+    pub step: usize,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<CommandFailureKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_error: Option<i32>,
+}
+
+impl CommandOutcome {
+    fn settled(step: usize, result: &Result<ExitStatus, CommandFailure>) -> Self {
+        match result {
+            Ok(status) => Self {
+                step,
+                success: status.success(),
+                exit_code: status.code(),
+                kind: None,
+                os_error: None,
+            },
+            Err(failure) => Self::failed(step, failure),
+        }
+    }
+
+    fn failed(step: usize, failure: &CommandFailure) -> Self {
+        Self {
+            step,
+            success: false,
+            exit_code: failure.exit_code,
+            kind: Some(failure.kind),
+            os_error: failure.os_error,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -711,6 +763,8 @@ pub(crate) struct ApplicationLifecycle {
     #[serde(skip)]
     preparation_working_directory: Option<String>,
     #[serde(skip)]
+    raw_undo_timeout: Duration,
+    #[serde(skip)]
     next_preparation: usize,
     #[serde(skip)]
     pending_undo: Vec<usize>,
@@ -725,27 +779,31 @@ pub(crate) struct ApplicationLifecycle {
 impl ApplicationLifecycle {
     #[cfg(test)]
     pub(crate) fn new(steps: Vec<PreparationStep>) -> Option<Self> {
-        Self::new_with_context(steps, BTreeMap::new(), None)
+        Self::new_with_context(steps, BTreeMap::new(), None, 10)
     }
 
     pub(crate) fn new_with_context(
         steps: Vec<PreparationStep>,
         environment: BTreeMap<String, String>,
         preparation_working_directory: Option<String>,
+        exit_timeout_seconds: u64,
     ) -> Option<Self> {
         (!steps.is_empty()).then_some(Self {
             preparation: PreparationReport {
                 completed: 0,
+                last_command: None,
                 failure: None,
             },
             cleanup: CleanupReport {
                 state: CleanupState::Deferred,
                 remaining: 0,
+                last_command: None,
                 failures: Vec::new(),
             },
             steps,
             environment,
             preparation_working_directory,
+            raw_undo_timeout: Duration::from_secs(exit_timeout_seconds.max(15)),
             next_preparation: 0,
             pending_undo: Vec::new(),
             attempted_undo: Vec::new(),
@@ -823,6 +881,7 @@ impl ApplicationLifecycle {
                 command,
                 &self.environment,
                 self.preparation_working_directory.as_deref(),
+                command.execution_timeout(Duration::from_millis(default_command_timeout_ms())),
                 now,
             ) {
                 Ok(task) => {
@@ -836,8 +895,12 @@ impl ApplicationLifecycle {
                     });
                 }
                 Err(failure) => {
-                    self.preparation.failure =
-                        Some(CommandFailure::spawn(&failure.error).at("preparation", index));
+                    let command_failure = CommandFailure::spawn(&failure.error);
+                    if failure.task.is_none() {
+                        self.preparation.last_command =
+                            Some(CommandOutcome::failed(index, &command_failure));
+                    }
+                    self.preparation.failure = Some(command_failure.at("preparation", index));
                     if let Some(task) = failure.task {
                         self.pending_undo.push(index);
                         self.cleanup.remaining = self.pending_undo.len();
@@ -872,6 +935,7 @@ impl ApplicationLifecycle {
             command,
             &self.environment,
             self.preparation_working_directory.as_deref(),
+            command.execution_timeout(self.raw_undo_timeout),
             now,
         ) {
             Ok(task) => {
@@ -881,7 +945,12 @@ impl ApplicationLifecycle {
                 });
             }
             Err(failure) => {
-                self.record_undo_failure(index, CommandFailure::spawn(&failure.error));
+                let command_failure = CommandFailure::spawn(&failure.error);
+                if failure.task.is_none() {
+                    self.cleanup.last_command =
+                        Some(CommandOutcome::failed(index, &command_failure));
+                }
+                self.record_undo_failure(index, command_failure);
                 if let Some(task) = failure.task {
                     self.active = Some(ActiveCommand {
                         purpose: CommandPurpose::UndoRetry(index),
@@ -894,10 +963,22 @@ impl ApplicationLifecycle {
         }
     }
 
-    fn finish_command(&mut self, purpose: CommandPurpose, result: Result<(), CommandFailure>) {
+    fn finish_command(
+        &mut self,
+        purpose: CommandPurpose,
+        result: Result<ExitStatus, CommandFailure>,
+    ) {
+        match purpose {
+            CommandPurpose::Preparation(index) => {
+                self.preparation.last_command = Some(CommandOutcome::settled(index, &result));
+            }
+            CommandPurpose::Undo(index) | CommandPurpose::UndoRetry(index) => {
+                self.cleanup.last_command = Some(CommandOutcome::settled(index, &result));
+            }
+        }
         match purpose {
             CommandPurpose::Preparation(index) if self.phase == Phase::Preparing => match result {
-                Ok(()) => {
+                Ok(_) => {
                     self.preparation.completed += 1;
                     self.next_preparation = index + 1;
                 }
@@ -911,14 +992,14 @@ impl ApplicationLifecycle {
             // cancellation reason, but its undo remains required.
             CommandPurpose::Preparation(_) => {}
             CommandPurpose::Undo(index) => match result {
-                Ok(()) => self.complete_undo(index),
+                Ok(_) => self.complete_undo(index),
                 Err(failure) => self.record_undo_failure(index, failure),
             },
             // A blocked undo is retained with its child handle until an explicit
             // cleanup retry can observe it again. Once it settles, a failed result
             // remains owed for another explicit cleanup pass.
             CommandPurpose::UndoRetry(index) => match result {
-                Ok(()) => self.complete_undo(index),
+                Ok(_) => self.complete_undo(index),
                 Err(failure) => self.record_undo_failure(index, failure),
             },
         }
@@ -1013,6 +1094,18 @@ impl ApplicationLifecycle {
     pub(crate) fn has_active_command(&self) -> bool {
         self.active.is_some()
     }
+
+    /// Budget only owed work. Shutdown cancels an active preparation command,
+    /// then executes each remaining undo against its own bounded deadline.
+    pub(crate) fn cleanup_budget(&self) -> Duration {
+        let containment_budget = COMMAND_STOP_GRACE + COMMAND_REAP_TIMEOUT;
+        self.pending_undo
+            .iter()
+            .filter_map(|index| self.steps[*index].undo_command())
+            .map(|command| command.execution_timeout(self.raw_undo_timeout) + containment_budget)
+            .sum::<Duration>()
+            + containment_budget
+    }
 }
 
 #[cfg(test)]
@@ -1087,3 +1180,7 @@ mod undo_retry_tests {
         assert_eq!(lifecycle.cleanup.failures.len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "preparation_timeout_tests.rs"]
+mod preparation_timeout_tests;

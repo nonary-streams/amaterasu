@@ -1,4 +1,4 @@
-use crate::protocol::{LaunchTarget, Outcome, State};
+use crate::protocol::{LaunchTarget, Outcome, PlannedPreparationStep, State};
 use crate::records::{CatalogSelection, Record};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -85,20 +85,7 @@ impl Workflow {
         record.cleanup_error = None;
         self.cleanup = true;
         self.pending = None;
-        let cleanup_seconds = match record.target.as_ref() {
-            Some(LaunchTarget::Playnite {
-                exit_timeout_seconds,
-                ..
-            // The provider may spend up to two 8-second authenticated pipe
-                // connections before its bounded stop wait, plus one poll interval.
-                }) => exit_timeout_seconds.saturating_add(21).min(321),
-            Some(LaunchTarget::PlayniteFullscreen {
-                exit_timeout_seconds,
-                ..
-            }) => exit_timeout_seconds.saturating_add(21).min(321),
-            _ => 20,
-        };
-        self.deadline = Instant::now() + Duration::from_secs(cleanup_seconds);
+        self.deadline = Instant::now() + cleanup_budget(record.target.as_ref());
         self.step = first_cleanup_step(record);
     }
     pub fn parent(&self) -> Option<u64> {
@@ -145,22 +132,24 @@ impl Workflow {
                 _ => return Err("invalid_workflow"),
             },
             Step::PreparePlaynite => {
-                let (preparation, working_directory) = match record.target.as_ref() {
-                    Some(LaunchTarget::Playnite {
-                        preparation,
-                        working_directory,
-                        ..
-                    })
-                    | Some(LaunchTarget::PlayniteFullscreen {
-                        preparation,
-                        working_directory,
-                        ..
-                    }) => (preparation, working_directory),
-                    _ => return Err("invalid_workflow"),
-                };
+                let (preparation, working_directory, exit_timeout_seconds) =
+                    match record.target.as_ref() {
+                        Some(LaunchTarget::Playnite {
+                            preparation,
+                            working_directory,
+                            exit_timeout_seconds,
+                            ..
+                        })
+                        | Some(LaunchTarget::PlayniteFullscreen {
+                            preparation,
+                            working_directory,
+                            exit_timeout_seconds,
+                        }) => (preparation, working_directory, exit_timeout_seconds),
+                        _ => return Err("invalid_workflow"),
+                    };
                 (
                     APPLICATION,
-                    json!({"action":"prepare","operation_id":record.preparation_operation,"environment":environment,"cwd":working_directory,"preparation":preparation}),
+                    json!({"action":"prepare","operation_id":record.preparation_operation,"environment":environment,"cwd":working_directory,"exit_timeout_seconds":exit_timeout_seconds,"preparation":preparation}),
                 )
             }
             Step::AwaitPreparation => (
@@ -270,6 +259,53 @@ impl Workflow {
         })
     }
 }
+
+/// The workflow owns one deadline across provider stop and sequential undo.
+/// Each RPC still has its own short request deadline; polling does not restart
+/// this budget. The plan is a conservative upper bound because application
+/// preparation alone knows which steps were started and therefore owe undo.
+fn cleanup_budget(target: Option<&LaunchTarget>) -> Duration {
+    let (primary_budget, exit_timeout_seconds, preparation) = match target {
+        Some(LaunchTarget::Executable(executable)) => (
+            Duration::from_secs(executable.exit_timeout_seconds.saturating_add(5).max(20)),
+            executable.exit_timeout_seconds,
+            executable.preparation.as_slice(),
+        ),
+        Some(LaunchTarget::Playnite {
+            exit_timeout_seconds,
+            preparation,
+            ..
+        })
+        | Some(LaunchTarget::PlayniteFullscreen {
+            exit_timeout_seconds,
+            preparation,
+            ..
+        }) => (
+            // Two bounded authenticated pipe connections, stop, and polling.
+            Duration::from_secs(exit_timeout_seconds.saturating_add(21)),
+            *exit_timeout_seconds,
+            preparation.as_slice(),
+        ),
+        None => return Duration::from_secs(20),
+    };
+    let undo_budget = preparation
+        .iter()
+        .filter_map(|step| match step {
+            PlannedPreparationStep::Structured(step) => step
+                .undo
+                .as_ref()
+                .map(|command| Duration::from_millis(command.timeout_ms)),
+            PlannedPreparationStep::Legacy(step) if !step.undo.is_empty() => {
+                Some(Duration::from_secs(exit_timeout_seconds.max(15)))
+            }
+            PlannedPreparationStep::Legacy(_) => None,
+        })
+        // Containment allows a 200ms stop grace and two-second reap tail.
+        // Round up for asynchronous polling and dependency calls between steps.
+        .map(|timeout| timeout + Duration::from_secs(3))
+        .sum::<Duration>();
+    primary_budget + undo_budget
+}
 pub fn first_cleanup_step(record: &Record) -> Step {
     if record.session_requested && record.session_id.is_none() {
         Step::FindSession
@@ -366,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn playnite_preparation_forwards_the_explicit_catalog_directory() {
+    fn playnite_preparation_forwards_the_explicit_catalog_directory_and_exit_policy() {
         let mut records = Records::new().unwrap();
         let (launch_id, _) = records
             .start(
@@ -387,7 +423,7 @@ mod tests {
         for target in [
             LaunchTarget::Playnite {
                 game_id: "a1b2c3d4-1234-5678-9abc-0123456789ab".into(),
-                exit_timeout_seconds: 10,
+                exit_timeout_seconds: 300,
                 working_directory: Some(directory.clone()),
                 preparation: vec![crate::protocol::PlannedPreparationStep::Legacy(
                     crate::protocol::LegacyPreparationCommand {
@@ -398,7 +434,7 @@ mod tests {
                 )],
             },
             LaunchTarget::PlayniteFullscreen {
-                exit_timeout_seconds: 10,
+                exit_timeout_seconds: 300,
                 working_directory: Some(directory.clone()),
                 preparation: vec![crate::protocol::PlannedPreparationStep::Legacy(
                     crate::protocol::LegacyPreparationCommand {
@@ -424,9 +460,50 @@ mod tests {
             assert_eq!(service, APPLICATION);
             assert_eq!(payload["action"], "prepare");
             assert_eq!(payload["cwd"], directory);
+            assert_eq!(payload["exit_timeout_seconds"], 300);
             assert_eq!(payload["environment"]["GAME_PROFILE"], "profile-a");
             assert_eq!(payload["preparation"][0]["do"], "configure $(GAME_PROFILE)");
         }
+    }
+
+    #[test]
+    fn cleanup_deadline_covers_all_raw_undos_and_structured_explicit_timeouts() {
+        let target = |timeout, steps| LaunchTarget::PlayniteFullscreen {
+            exit_timeout_seconds: timeout,
+            working_directory: None,
+            preparation: steps,
+        };
+        let raw = PlannedPreparationStep::Legacy(crate::protocol::LegacyPreparationCommand {
+            do_command: "prepare".into(),
+            undo: "cleanup".into(),
+            elevated: false,
+        });
+        assert_eq!(
+            cleanup_budget(Some(&target(300, vec![raw.clone(); 8]))),
+            Duration::from_secs(321 + 8 * 303)
+        );
+        assert_eq!(
+            cleanup_budget(Some(&target(0, vec![raw]))),
+            Duration::from_secs(21 + 18)
+        );
+        let command = crate::protocol::ConfiguredCommand {
+            executable: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: None,
+            timeout_ms: 25,
+        };
+        let structured = PlannedPreparationStep::Structured(crate::protocol::PreparationStep {
+            run: command.clone(),
+            undo: Some(command),
+        });
+        assert_eq!(
+            cleanup_budget(Some(&target(300, vec![structured]))),
+            Duration::from_millis(324_025)
+        );
     }
 
     #[test]

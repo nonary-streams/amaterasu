@@ -112,12 +112,19 @@ Raw preparation uses the same bounded executable lookup as detached commands.
 Explicit relative target paths resolve against the configured preparation cwd
 or the current host directory. Both raw preparation and detached commands reject
 implicit `.bat`/`.cmd` targets; configure an interpreter explicitly instead.
-Raw preparation retains the existing 10-second default and 30-second maximum
-command timeout and null standard handles. Windows URL and associated-file
+Raw `do` retains its 10-second deadline. Raw `undo` snapshots a deadline of
+`max(exit_timeout_seconds, 15)` seconds, matching the reference's undo wait
+budget. Prepare-only leases accept the same `exit_timeout_seconds` policy as
+launch (default 10, range 0 through 300); changing that policy under an existing
+operation ID conflicts. Structured commands retain their explicitly configured
+1–30,000 ms deadlines. All preparation output still uses null standard handles.
+Windows URL and associated-file
 launches are not resolved through shell associations. These bounded execution
 rules differ from the reference helper, which waits for raw `do` commands
 without a timeout, sends their output to its configured pipe, and continues
-through undo failures. Preparation output is discarded here. Cleanup attempts
+through undo failures. The reference detaches an undo that exceeds its deadline;
+this module terminates and reaps its contained tree before attempting an older
+undo. Preparation output is discarded here. Cleanup attempts
 each owed undo once per pass in reverse order and continues after spawn errors,
 nonzero exits, and timeouts whose commands have been contained and reaped. It
 retains each failed obligation and reports all failures from the pass; successful
@@ -168,6 +175,12 @@ Prepared records also contain `preparation` and `cleanup` reports.
 the phase, zero-based step, kind, and available exit/OS code. `cleanup.state` is
 `deferred`, `pending`, `failed`, or `complete`; `remaining` counts owed steps and
 optional `failures` describes the current undo/containment failures.
+Each report's optional `last_command` identifies its most recently settled
+command by zero-based `step`, `success`, nullable `exit_code`, and an optional
+failure `kind` and `os_error`. A spawn failure without a child also settles an
+outcome. A wait/containment failure with an owned child does not update this
+field until that child settles. It contains no command text, environment, or
+output transcript; cleanup retries replace the last outcome after settlement.
 `cleanup_failed` includes the retained intended `outcome` (`exited`,
 `launch_failed`, or `cancelled`). It is not terminal: ownership and pending undo
 remain retained, and another terminate request explicitly retries cleanup.
@@ -178,6 +191,10 @@ later OS operations; the manager uses owned child handles. Lists return
 `{"ok":true,"processes":[...],"next_offset":null}` or an offset for the next
 page, ordered by process ID and scoped to the caller. Requests cannot inspect or
 terminate another caller's processes.
+Pages may contain fewer records than the requested count to keep the complete
+serialized response within the broker's 16,384-byte limit. `next_offset` advances
+only over records returned, so large lifecycle reports remain readable on the
+following page.
 
 An `operation_id` is unique per caller during the module lifetime. Retrying the
 same launch specification returns the original process's current state, including
@@ -216,8 +233,10 @@ Limits, measured in UTF-8 bytes unless otherwise stated:
 - Environment: at most 32 keys, keys of 1–128 ASCII alphanumeric/underscore
   bytes, values at most 1,024 bytes without NUL, 4,096 key/value bytes combined.
   Keys must be unique ignoring ASCII case.
-- Preparation: at most eight steps. Each run/undo command has the same path,
-  argument, and environment limits as the application plus a 1–30,000 ms timeout.
+- Preparation: at most eight steps. Structured run/undo commands have the same
+  path, argument, and environment limits as the application plus a 1–30,000 ms
+  timeout. Raw run has a 10-second deadline; raw undo uses the 15–300 second
+  snapshotted application exit policy.
 - List page: 1–16 records; default offset 0 and limit 16. Record responses omit
   command arguments and environment and remain below the runtime payload bound.
 
@@ -225,7 +244,8 @@ Errors use `{"ok":false,"code":"..."}`. Codes are `invalid_caller`,
 `request_too_large`, `invalid_request`, `invalid_launch`, `invalid_limit`,
 `detached_output_unsupported`, `detached_output_unavailable`,
 `operation_conflict`, `process_limit`, `process_not_found`, `process_wait_failed`,
-`process_kill_failed`, and `process_wait_timeout`. Missing and foreign process IDs share
+`process_kill_failed`, and `process_wait_timeout`. `response_too_large` protects
+a list from an individually oversized record. Missing and foreign process IDs share
 `process_not_found`. OS spawning errors create retained `launch_failed` records.
 
 On Unix, each launch creates a new process group before exec. Termination sends
@@ -268,8 +288,11 @@ for a running preparation/undo command. They perform at most a bounded spawn,
 observation, or containment action and retain child ownership between ticks.
 Containment errors and the bounded reap deadline become `cleanup_failed` instead
 of discarding the child; an explicit terminate retries. Manager shutdown requests
-all stops and advances owed undo against one shared deadline based on the longest
-configured application exit timeout plus a 2-second reap deadline. If a long lifecycle command outlasts that deadline, shutdown
+all stops and advances owed undo against one shared deadline covering each
+record's configured application exit timeout, a 2-second root reap deadline,
+and every currently owed undo's execution and containment budget. Successful
+undos no longer contribute to that budget; prepare-only leases contribute their
+own owed work. If a long lifecycle command outlasts that deadline, shutdown
 returns an error while the live manager still retains ownership for retry. Drop
 first attempts normal cleanup, then cancels remaining lifecycle commands and
 makes a final bounded containment attempt. Drop cannot report failure, and
@@ -277,6 +300,13 @@ persistent OS errors, uninterruptible kernel operations, or host death prevent a
 absolute no-orphan guarantee. Windows closes private jobs on host death; Unix
 host death can bypass cleanup. There is no durable watcher or restart
 reconciliation.
+
+The installed host's worker shutdown deadline is currently five seconds after
+EOF. Direct manager shutdown budgets do not extend that external deadline.
+Long undo commands must be settled through the nonblocking launch/stop lifecycle
+before host unload; host-EOF shutdown qualification for those waits remains
+pending. Windows SYSTEM/UAC, associations, and Windows native execution remain
+separate platform qualification gates on the current Linux host.
 
 Platform references: [POSIX waitid](https://www.man7.org/linux/man-pages/man3/waitid.3p.html),
 [Windows job objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects),

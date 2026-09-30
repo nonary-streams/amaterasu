@@ -74,6 +74,9 @@ preparation must finish before the provider starts. Cleanup confirms the provide
 has stopped before running reverse-order undo, and retains the session lease if
 undo fails so the caller can retry. Executable launches merge global steps before
 catalog steps, and owe reverse-order undo for every run command they started.
+Prepare-only provider leases receive the target's snapshotted exit timeout, so
+raw undo uses `max(exit_timeout_seconds, 15)` seconds for both executable and
+Playnite targets. Structured undo keeps its explicit millisecond timeout.
 Raw commands are forwarded as opaque command text with their elevation flag;
 catalog and launch do not expand or shell-parse their strings. The application
 provider expands `$(NAME)` and `$$` only when it executes a raw preparation step.
@@ -268,7 +271,13 @@ the extension's launcher connection receives an active-game sync for a running
 matching GUID. Missing or malformed status, disconnect, and stop timeout retain the
 lease as `cleanup_failed`, where an explicit stop retries recovery. The Playnite
 cleanup deadline allows for two authenticated pipe connections and status polling,
-with a 321-second maximum for a 300-second provider timeout. This slice does not
+with a 321-second provider-stop budget for a 300-second provider timeout. The
+overall cleanup deadline additionally includes every configured undo's execution
+budget and three seconds per undo for containment and polling. Executable
+cleanup similarly includes the application exit timeout and ordered undo;
+individual dependency RPC deadlines remain at most five seconds. The overall
+deadline is set once per cleanup pass and retained during polling. A timeout
+retains ownership and the session lease for an explicit retry. This slice does not
 implement the reference helper's focus policy or process watchdog verification.
 
 Launch records, idempotency, and reconciliation are in memory. They assume the

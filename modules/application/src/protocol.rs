@@ -45,6 +45,8 @@ pub(crate) enum Action {
         environment: BTreeMap<String, String>,
         #[serde(default)]
         cwd: Option<String>,
+        #[serde(default = "default_exit_timeout_seconds")]
+        exit_timeout_seconds: u64,
         #[serde(default)]
         preparation: Box<[PreparationStep]>,
     },
@@ -79,6 +81,7 @@ pub(crate) struct PreparationSpec {
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    pub exit_timeout_seconds: u64,
 }
 
 impl PreparationSpec {
@@ -91,6 +94,9 @@ impl PreparationSpec {
         }
         if self.preparation.is_empty() {
             return Err("preparation must contain at least one step");
+        }
+        if self.exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
+            return Err("exit timeout exceeds bounds");
         }
         validate_environment(&self.environment)?;
         if self.cwd.as_deref().is_some_and(|cwd| !valid_path(cwd)) {
@@ -494,6 +500,7 @@ mod tests {
             preparation: preparation.into_vec(),
             environment: BTreeMap::new(),
             cwd: None,
+            exit_timeout_seconds: 10,
         }
         .validate("raw-global-preparation")
         .unwrap();
