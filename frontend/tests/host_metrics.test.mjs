@@ -30,6 +30,10 @@ class FakeElement {
   get textContent() {
     return this.children.map((child) => typeof child === "string" ? child : child?.textContent ?? "").join("");
   }
+
+  set textContent(value) {
+    this.replaceChildren(String(value));
+  }
 }
 
 function descendants(element) {
@@ -107,4 +111,47 @@ test("host metrics settings editor reads, bounds and confirms revisioned prefere
     "host-metrics/settings",
   ]);
   assert.match(container.textContent, /Saved settings revision 5/);
+});
+
+test("disabled dashboard renders its saved state without polling stats", async () => {
+  const calls = [];
+  const context = vm.createContext({
+    document: {
+      body: new FakeElement("body"),
+      visibilityState: "visible",
+      createElement: (tag) => new FakeElement(tag),
+      addEventListener() {},
+      removeEventListener() {},
+    },
+    window: { setTimeout: () => 1, clearTimeout() {} },
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    Error,
+    console,
+  });
+  for (const source of ["src/model.ts", "src/ui.ts", "src/host_metrics.ts"]) {
+    vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), context);
+    if (source === "src/model.ts" || source === "src/ui.ts")
+      vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
+  }
+
+  const container = new FakeElement("section");
+  const savedHistory = new FakeElement("section");
+  const page = {
+    api: {
+      async post(route) {
+        calls.push(route);
+        assert.equal(route, "host-metrics/settings");
+        return { ok: true, settings: { ...settings, enabled: false }, revision: 8 };
+      },
+    },
+  };
+  context.Amaterasu.renderHostMetricsDashboard(page, container, savedHistory);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(calls, ["host-metrics/settings"]);
+  assert.match(container.textContent, /Real-time statistics are disabled/);
+  assert.match(container.textContent, /Sampling is disabled/);
 });

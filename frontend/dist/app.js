@@ -6614,6 +6614,10 @@ var Amaterasu;
                 return;
             if (sessionHistoryContainer)
                 sessionHistoryContainer.hidden = !settings.show_session_history;
+            if (!settings.enabled) {
+                renderDisabledState();
+                return;
+            }
             if (settings.pause_when_hidden && document.visibilityState !== "visible") {
                 if (timer !== undefined)
                     window.clearTimeout(timer);
@@ -6628,13 +6632,12 @@ var Amaterasu;
             const request = ++requestGeneration;
             if (disposed || !container.isConnected)
                 return;
-            if (settings.pause_when_hidden && document.visibilityState !== "visible")
-                return;
             if (!settings.enabled) {
-                area.replaceChildren(Amaterasu.empty("Real-time statistics are disabled", "Enable collection in Settings to show live host telemetry."));
-                status.textContent = "Sampling is disabled.";
+                renderDisabledState();
                 return;
             }
+            if (settings.pause_when_hidden && document.visibilityState !== "visible")
+                return;
             try {
                 const result = parseHostStatsReply(await context.api.post("host-metrics/stats"));
                 if (disposed || !container.isConnected || request !== requestGeneration ||
@@ -6670,6 +6673,10 @@ var Amaterasu;
                 return;
             timer = window.setTimeout(() => void refresh(), settings.poll_interval_ms);
         }
+        function renderDisabledState() {
+            area.replaceChildren(Amaterasu.empty("Real-time statistics are disabled", "Enable collection in Settings to show live host telemetry."));
+            status.textContent = "Sampling is disabled.";
+        }
         async function initialize() {
             try {
                 const loaded = await loadRealtimeSettings(context.api);
@@ -6678,6 +6685,10 @@ var Amaterasu;
                 settings = loaded.settings;
                 if (sessionHistoryContainer)
                     sessionHistoryContainer.hidden = !settings.show_session_history;
+                if (!settings.enabled) {
+                    renderDisabledState();
+                    return;
+                }
                 applyVisibility();
             }
             catch (error) {

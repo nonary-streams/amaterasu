@@ -292,6 +292,10 @@ namespace Amaterasu {
       if (disposed || !container.isConnected) return;
       if (sessionHistoryContainer)
         sessionHistoryContainer.hidden = !settings.show_session_history;
+      if (!settings.enabled) {
+        renderDisabledState();
+        return;
+      }
       if (settings.pause_when_hidden && document.visibilityState !== "visible") {
         if (timer !== undefined) window.clearTimeout(timer);
         timer = undefined;
@@ -304,12 +308,11 @@ namespace Amaterasu {
       timer = undefined;
       const request = ++requestGeneration;
       if (disposed || !container.isConnected) return;
-      if (settings.pause_when_hidden && document.visibilityState !== "visible") return;
       if (!settings.enabled) {
-        area.replaceChildren(empty("Real-time statistics are disabled", "Enable collection in Settings to show live host telemetry."));
-        status.textContent = "Sampling is disabled.";
+        renderDisabledState();
         return;
       }
+      if (settings.pause_when_hidden && document.visibilityState !== "visible") return;
       try {
         const result = parseHostStatsReply(await context.api.post<unknown>("host-metrics/stats"));
         if (disposed || !container.isConnected || request !== requestGeneration ||
@@ -342,6 +345,14 @@ namespace Amaterasu {
       timer = window.setTimeout(() => void refresh(), settings.poll_interval_ms);
     }
 
+    function renderDisabledState(): void {
+      area.replaceChildren(empty(
+        "Real-time statistics are disabled",
+        "Enable collection in Settings to show live host telemetry.",
+      ));
+      status.textContent = "Sampling is disabled.";
+    }
+
     async function initialize(): Promise<void> {
       try {
         const loaded = await loadRealtimeSettings(context.api);
@@ -349,6 +360,10 @@ namespace Amaterasu {
         settings = loaded.settings;
         if (sessionHistoryContainer)
           sessionHistoryContainer.hidden = !settings.show_session_history;
+        if (!settings.enabled) {
+          renderDisabledState();
+          return;
+        }
         applyVisibility();
       } catch (error) {
         if (!disposed && container.isConnected) area.replaceChildren(errorPanel(error));
