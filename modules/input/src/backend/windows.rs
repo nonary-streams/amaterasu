@@ -1,11 +1,14 @@
 use super::Backend;
-use super::owned_keys::{HeldKeyPlans, OwnedKeyPlan};
+use super::owned_keys::{HeldKeyPlans, HostModifier, OwnedKeyPlan};
 use crate::gamepad_profile::GamepadProfile;
 #[path = "windows_gamepad.rs"]
 mod windows_gamepad;
 #[path = "windows_pen_touch.rs"]
 mod windows_pen_touch;
-use crate::model::{Axis, Button, Event, InputError, InputResult, Key, KeyState, PenTouchDevice};
+use crate::model::{
+    Axis, Button, Event, InputError, InputResult, Key, KeyState, PenTouchDevice,
+    is_temporary_modifier,
+};
 use amaterasu_input_policy::{KeyBindings, host_modifier_identity};
 use windows_gamepad::WindowsGamepads;
 use windows_pen_touch::WindowsPenTouch;
@@ -38,19 +41,27 @@ impl WindowsBackend {
 
     fn keyboard_binding(&self, key: &Key) -> InputResult<OwnedKeyPlan<KeyboardPlan>> {
         match key {
-            Key::WindowsScan { code, extended } => Ok(OwnedKeyPlan {
-                target: *code,
-                native: KeyboardPlan::Scan {
+            Key::WindowsScan { code, extended } => {
+                let native = KeyboardPlan::Scan {
                     code: *code,
                     extended: *extended,
-                },
-            }),
+                };
+                Ok(OwnedKeyPlan {
+                    target: *code,
+                    native,
+                    modifier: native.modifier(),
+                })
+            }
             Key::MoonlightVk {
-                code, normalized, ..
+                code,
+                normalized,
+                temporary_modifier,
+                ..
             } => {
                 if let Some(held) = self.held_key_plans.held(*code) {
                     return Ok(held);
                 }
+                let source = *code;
                 let code = self
                     .keybindings
                     .resolve(*code, self.key_rightalt_to_key_win);
@@ -63,7 +74,15 @@ impl WindowsBackend {
                 } else {
                     raw_keyboard_plan(code, self.always_send_scancodes, map_virtual_key)
                 }?;
-                Ok(OwnedKeyPlan { target, native })
+                Ok(self.held_key_plans.select(
+                    source,
+                    OwnedKeyPlan {
+                        target,
+                        native,
+                        modifier: native.modifier(),
+                    },
+                    *temporary_modifier,
+                ))
             }
             Key::LinuxEvdev { .. } => Err(InputError::new(
                 "unsupported_event",
@@ -105,12 +124,16 @@ impl WindowsBackend {
             && let Some(identity) = Self::moonlight_key_identity(key)
         {
             let binding = self.keyboard_binding(key)?;
-            return self
-                .held_key_plans
-                .apply(identity, *state, binding, |plan| {
+            return self.held_key_plans.apply(
+                identity,
+                *state,
+                binding,
+                is_temporary_modifier(key),
+                |plan| {
                     let input = native_input_with_plan(event, plan)?;
                     send_input(&input, Some(plan))
-                });
+                },
+            );
         }
         let plan = self.event_keyboard_plan(event)?;
         let input = native_input_with_plan(event, plan)?;
@@ -254,6 +277,32 @@ impl Backend for WindowsBackend {
 enum KeyboardPlan {
     Scan { code: u16, extended: bool },
     Virtual { code: u8, extended: bool },
+}
+
+impl KeyboardPlan {
+    const fn modifier(self) -> Option<HostModifier> {
+        match self {
+            Self::Scan {
+                code: 0x2a | 0x36,
+                extended: false,
+            } => Some(HostModifier::Shift),
+            Self::Scan { code: 0x1d, .. } => Some(HostModifier::Control),
+            Self::Scan { code: 0x38, .. } => Some(HostModifier::Alt),
+            Self::Virtual {
+                code: 0x10 | 0xa0 | 0xa1,
+                ..
+            } => Some(HostModifier::Shift),
+            Self::Virtual {
+                code: 0x11 | 0xa2 | 0xa3,
+                ..
+            } => Some(HostModifier::Control),
+            Self::Virtual {
+                code: 0x12 | 0xa4 | 0xa5,
+                ..
+            } => Some(HostModifier::Alt),
+            _ => None,
+        }
+    }
 }
 
 fn normalized_keyboard_plan(code: u8) -> InputResult<KeyboardPlan> {
@@ -455,6 +504,202 @@ mod tests {
         }
     }
 
+    fn temporary_key(code: u8, state: KeyState) -> Event {
+        Event::Key {
+            key: Key::MoonlightVk {
+                code,
+                normalized: true,
+                repeat_modifiers: 0,
+                temporary_modifier: true,
+            },
+            state,
+        }
+    }
+
+    fn keyboard_fields(input: &INPUT) -> (u16, u16, u32) {
+        let record = keyboard_record_ref(input);
+        (record.wVk, record.wScan, record.dwFlags)
+    }
+
+    #[test]
+    fn temporary_chords_reuse_remapped_right_modifiers_without_changing_flags_or_real_left_keys() {
+        for (generic, left, right, left_scan, right_scan, extended) in [
+            (0x10, 0xa0, 0xa1, 0x2a, 0x36, false),
+            (0x11, 0xa2, 0xa3, 0x1d, 0x1d, true),
+            (0x12, 0xa4, 0xa5, 0x38, 0x38, true),
+        ] {
+            for first_normalized in [true, false] {
+                let mut backend = WindowsBackend::new(String::new());
+                backend.set_always_send_scancodes(false);
+                backend.set_keybindings(
+                    &KeyBindings::from_flat(vec![0x41, right, right, 0x44]).unwrap(),
+                );
+                let first_plan = if first_normalized {
+                    KeyboardPlan::Scan {
+                        code: right_scan,
+                        extended,
+                    }
+                } else {
+                    KeyboardPlan::Virtual {
+                        code: right,
+                        extended,
+                    }
+                };
+                let first_fields = if first_normalized {
+                    (0, right_scan, KEYEVENTF_SCANCODE | extended_flag(extended))
+                } else {
+                    (u16::from(right), 0, extended_flag(extended))
+                };
+                let mut records = Vec::new();
+                backend
+                    .inject_with_sender(
+                        &key(0x41, first_normalized, KeyState::Down),
+                        |input, held| {
+                            assert_eq!(held, Some(first_plan));
+                            assert_eq!(keyboard_fields(input), first_fields);
+                            records.push(keyboard_fields(input));
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                let first = backend.held_key_plans.held(0x41).unwrap();
+                // The source and mode now resolve differently; reuse its saved host plan.
+                backend.set_keybindings(&KeyBindings::empty());
+                backend.set_always_send_scancodes(true);
+                let synthetic_down = temporary_key(generic, KeyState::Down);
+                backend
+                    .inject_with_sender(&synthetic_down, |_, _| {
+                        panic!("temporary generic chord must not emit an opposite-side down")
+                    })
+                    .unwrap();
+                assert!(is_temporary_modifier(match &synthetic_down {
+                    Event::Key { key, .. } => key,
+                    _ => unreachable!(),
+                }));
+                assert_eq!(backend.held_key_plans.held(generic), Some(first));
+                assert_eq!(records.len(), 1);
+                backend
+                    .inject_with_sender(&key(left, true, KeyState::Down), |input, held| {
+                        assert_eq!(
+                            held,
+                            Some(KeyboardPlan::Scan {
+                                code: left_scan,
+                                extended: false
+                            })
+                        );
+                        assert_eq!(keyboard_fields(input), (0, left_scan, KEYEVENTF_SCANCODE));
+                        records.push(keyboard_fields(input));
+                        Ok(())
+                    })
+                    .unwrap();
+                backend
+                    .inject_with_sender(&key(left, true, KeyState::Up), |input, _| {
+                        assert_eq!(
+                            keyboard_fields(input),
+                            (0, left_scan, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP)
+                        );
+                        records.push(keyboard_fields(input));
+                        Ok(())
+                    })
+                    .unwrap();
+                backend
+                    .inject_with_sender(&temporary_key(generic, KeyState::Up), |_, _| {
+                        panic!("temporary release must retain the original real owner")
+                    })
+                    .unwrap();
+                assert_eq!(backend.held_key_plans.held(0x41), Some(first));
+                assert!(!backend.held_key_plans.contains_key(&generic));
+                for state in [KeyState::Repeat, KeyState::Up] {
+                    backend
+                        .inject_with_sender(&key(0x41, !first_normalized, state), |input, held| {
+                            assert_eq!(held, Some(first_plan));
+                            let expected_flags = first_fields.2
+                                | if state == KeyState::Up {
+                                    KEYEVENTF_KEYUP
+                                } else {
+                                    0
+                                };
+                            assert_eq!(
+                                keyboard_fields(input),
+                                (first_fields.0, first_fields.1, expected_flags)
+                            );
+                            records.push(keyboard_fields(input));
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                assert_eq!(records.len(), 5);
+                assert!(backend.held_key_plans.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_right_modifier_and_failed_final_temporary_release_preserve_original_plan() {
+        let mut backend = WindowsBackend::new(String::new());
+        backend.set_always_send_scancodes(false);
+        backend.set_keybindings(&KeyBindings::from_flat(vec![0x41, 0xa3]).unwrap());
+        let first_plan = KeyboardPlan::Virtual {
+            code: 0xa3,
+            extended: true,
+        };
+        assert!(
+            backend
+                .inject_with_sender(&key(0x41, false, KeyState::Down), |input, held| {
+                    assert_eq!(held, Some(first_plan));
+                    assert_eq!(keyboard_fields(input), (0xa3, 0, KEYEVENTF_EXTENDEDKEY));
+                    Err(InputError::new(
+                        "injection_failed",
+                        "ambiguous right control down",
+                    ))
+                })
+                .is_err()
+        );
+        let first = backend.held_key_plans.held(0x41).unwrap();
+        backend.set_keybindings(&KeyBindings::empty());
+        backend.set_always_send_scancodes(true);
+        backend
+            .inject_with_sender(&temporary_key(0x11, KeyState::Down), |_, _| {
+                panic!("uncertain owned right control still satisfies synthetic control")
+            })
+            .unwrap();
+        backend
+            .inject_with_sender(&key(0x41, true, KeyState::Up), |_, _| {
+                panic!("temporary source owns the original host plan")
+            })
+            .unwrap();
+        assert!(!backend.held_key_plans.contains_key(&0x41));
+        assert_eq!(backend.held_key_plans.held(0x11), Some(first));
+        let release = temporary_key(0x11, KeyState::Up);
+        assert!(
+            backend
+                .inject_with_sender(&release, |input, held| {
+                    assert_eq!(held, Some(first_plan));
+                    assert_eq!(
+                        keyboard_fields(input),
+                        (0xa3, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP)
+                    );
+                    Err(InputError::new(
+                        "injection_failed",
+                        "ambiguous final temporary release",
+                    ))
+                })
+                .is_err()
+        );
+        assert_eq!(backend.held_key_plans.held(0x11), Some(first));
+        backend
+            .inject_with_sender(&release, |input, held| {
+                assert_eq!(held, Some(first_plan));
+                assert_eq!(
+                    keyboard_fields(input),
+                    (0xa3, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP)
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(backend.held_key_plans.is_empty());
+    }
+
     fn keyboard_record(input: INPUT) -> KEYBDINPUT {
         keyboard_record_ref(&input)
     }
@@ -561,6 +806,7 @@ mod tests {
             OwnedKeyPlan {
                 target: 0x41,
                 native: down_plan,
+                modifier: None,
             },
         );
         backend.set_always_send_scancodes(false);
@@ -727,6 +973,7 @@ mod tests {
                 OwnedKeyPlan {
                     target: 0x5b,
                     native: plan,
+                    modifier: plan.modifier(),
                 },
             );
 

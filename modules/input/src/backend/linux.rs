@@ -1,13 +1,16 @@
 use super::Backend;
 use super::owned_devices::{acquire_input_pair, recover_input_device, release_input_pair};
-use super::owned_keys::{HeldKeyPlans, OwnedKeyPlan};
+use super::owned_keys::{HeldKeyPlans, HostModifier, OwnedKeyPlan};
 use crate::gamepad::{
     ControllerSnapshot, GAMEPAD_ABSOLUTE_AXES, GamepadDevice, GamepadSlots, NativeGamepadEvent,
     controller_state_events, gamepad_key_codes, possible_controller_state_after_write_failure,
     release_owned_device, replace_failed_device,
 };
 use crate::gamepad_profile::GamepadProfile;
-use crate::model::{Axis, Button, Event, InputError, InputResult, Key, KeyState, PenTouchDevice};
+use crate::model::{
+    Axis, Button, Event, InputError, InputResult, Key, KeyState, PenTouchDevice,
+    is_temporary_modifier,
+};
 use amaterasu_input_policy::KeyBindings;
 #[path = "linux_pen_touch.rs"]
 mod linux_pen_touch;
@@ -74,6 +77,7 @@ struct Device {
 struct FakeInputAdapter {
     next_id: u8,
     writes: Vec<u8>,
+    frames: Vec<Vec<(u16, u16, i32)>>,
     destroys: Vec<u8>,
     fail_write: Option<u8>,
     fail_destroy: Option<u8>,
@@ -234,6 +238,7 @@ impl Device {
         if let Some((id, adapter)) = &self.fake {
             let mut state = adapter.borrow_mut();
             state.writes.push(*id);
+            state.frames.push(values.to_vec());
             if state.fail_write == Some(*id) {
                 state.fail_write = None;
                 return Err(InputError::new("injection_failed", "fake partial frame"));
@@ -285,6 +290,15 @@ impl Drop for Device {
         // Best effort fallback for keyboard/pointer teardown and unrecoverable
         // object drops. Gamepads explicitly destroy before ownership is cleared.
         let _ = self.destroy();
+    }
+}
+
+const fn modifier_for_evdev(code: u16) -> Option<HostModifier> {
+    match code {
+        42 | 54 => Some(HostModifier::Shift),
+        29 | 97 => Some(HostModifier::Control),
+        56 | 100 => Some(HostModifier::Alt),
+        _ => None,
     }
 }
 
@@ -733,7 +747,9 @@ impl Backend for LinuxBackend {
                     OwnedKeyPlan {
                         target: code,
                         native: code,
+                        modifier: modifier_for_evdev(code),
                     },
+                    is_temporary_modifier(key),
                     emit,
                 )
             } else {
@@ -1121,6 +1137,121 @@ mod tests {
             },
             state,
         }
+    }
+
+    fn temporary_modifier(code: u8, state: KeyState) -> Event {
+        Event::Key {
+            key: Key::MoonlightVk {
+                code,
+                normalized: true,
+                repeat_modifiers: 0,
+                temporary_modifier: true,
+            },
+            state,
+        }
+    }
+
+    #[test]
+    fn temporary_modifiers_reuse_remapped_right_host_keys_without_merging_real_left_keys() {
+        for (generic, left, right, left_evdev, right_evdev, group) in [
+            (0x10, 0xa0, 0xa1, 42, 54, HostModifier::Shift),
+            (0x11, 0xa2, 0xa3, 29, 97, HostModifier::Control),
+            (0x12, 0xa4, 0xa5, 56, 100, HostModifier::Alt),
+        ] {
+            let adapter = FakeAdapterGuard::install();
+            let _guard = FakeAdapterGuard;
+            let mut backend = LinuxBackend::new("/missing/uinput".into());
+            backend.set_gamepad_profile(GamepadProfile::Ds4);
+            backend.start().unwrap();
+            backend
+                .set_keybindings(&KeyBindings::from_flat(vec![0x41, right, right, 0x44]).unwrap());
+            backend
+                .inject(&moonlight_key(0x41, KeyState::Down))
+                .unwrap();
+            let first = backend.held_virtual_keycodes.held(0x41).unwrap();
+            assert_eq!(first.native, right_evdev);
+            assert_eq!(first.modifier, Some(group));
+            // Source A no longer maps to a modifier, but its saved native plan does.
+            backend.set_keybindings(&KeyBindings::empty());
+            let synthetic_down = temporary_modifier(generic, KeyState::Down);
+            backend.inject(&synthetic_down).unwrap();
+            assert!(is_temporary_modifier(match &synthetic_down {
+                Event::Key { key, .. } => key,
+                _ => unreachable!(),
+            }));
+            assert_eq!(backend.held_virtual_keycodes.held(generic), Some(first));
+            assert_eq!(adapter.borrow().writes, [1]);
+
+            backend
+                .inject(&moonlight_key(left, KeyState::Down))
+                .unwrap();
+            assert_eq!(backend.held_virtual_keycodes.get(&left), Some(&left_evdev));
+            assert_eq!(backend.held_virtual_keycodes.len(), 3);
+            backend.inject(&moonlight_key(left, KeyState::Up)).unwrap();
+            backend
+                .inject(&temporary_modifier(generic, KeyState::Up))
+                .unwrap();
+            assert_eq!(backend.held_virtual_keycodes.held(0x41), Some(first));
+            assert!(!backend.held_virtual_keycodes.contains_key(&generic));
+            backend
+                .inject(&moonlight_key(0x41, KeyState::Repeat))
+                .unwrap();
+            backend.inject(&moonlight_key(0x41, KeyState::Up)).unwrap();
+            assert!(backend.held_virtual_keycodes.is_empty());
+            assert_eq!(
+                adapter.borrow().frames,
+                [
+                    vec![(EV_KEY, right_evdev, 1)],
+                    vec![(EV_KEY, left_evdev, 1)],
+                    vec![(EV_KEY, left_evdev, 0)],
+                    vec![(EV_KEY, right_evdev, 2)],
+                    vec![(EV_KEY, right_evdev, 0)],
+                ]
+            );
+            backend.stop().unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_temporary_modifier_release_keeps_the_shared_plan_until_exact_device_cleanup() {
+        let adapter = FakeAdapterGuard::install();
+        let _guard = FakeAdapterGuard;
+        let mut backend = LinuxBackend::new("/missing/uinput".into());
+        backend.set_gamepad_profile(GamepadProfile::Ds4);
+        backend.start().unwrap();
+        backend.set_keybindings(&KeyBindings::from_flat(vec![0x41, 0xa3]).unwrap());
+        backend
+            .inject(&moonlight_key(0x41, KeyState::Down))
+            .unwrap();
+        let first = backend.held_virtual_keycodes.held(0x41).unwrap();
+        backend
+            .inject(&temporary_modifier(0x11, KeyState::Down))
+            .unwrap();
+        backend.inject(&moonlight_key(0x41, KeyState::Up)).unwrap();
+        assert_eq!(adapter.borrow().writes, [1]);
+        assert_eq!(backend.held_virtual_keycodes.held(0x11), Some(first));
+        backend.set_keybindings(&KeyBindings::empty());
+        adapter.borrow_mut().fail_write = Some(1);
+        let release = temporary_modifier(0x11, KeyState::Up);
+        assert_eq!(
+            backend.inject(&release).unwrap_err().code,
+            "injection_failed"
+        );
+        assert_eq!(backend.held_virtual_keycodes.held(0x11), Some(first));
+        assert!(backend.keyboard_recovery_required);
+        adapter.borrow_mut().fail_destroy = Some(1);
+        assert_eq!(backend.inject(&release).unwrap_err().code, "release_failed");
+        assert_eq!(backend.held_virtual_keycodes.held(0x11), Some(first));
+        assert_eq!(adapter.borrow().next_id, 2);
+        backend.inject(&release).unwrap();
+        assert!(backend.held_virtual_keycodes.is_empty());
+        assert!(backend.keyboard.is_none());
+        assert_eq!(adapter.borrow().next_id, 2);
+        assert_eq!(
+            adapter.borrow().frames,
+            [vec![(EV_KEY, 97, 1)], vec![(EV_KEY, 97, 0)]]
+        );
+        backend.stop().unwrap();
     }
 
     fn pointer_button(button: Button, pressed: bool) -> Event {
@@ -1646,6 +1777,7 @@ mod tests {
             OwnedKeyPlan {
                 target: down,
                 native: down,
+                modifier: modifier_for_evdev(down),
             },
         );
 

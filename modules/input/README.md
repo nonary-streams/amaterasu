@@ -215,7 +215,15 @@ advances to the next scheduled deadline without replaying missed intervals.
 The input worker ticks every 10–20 ms, so actual cadence has that scheduler
 jitter. Captured synthetic Shift/Ctrl/Alt modifiers are pulsed only when no
 equivalent real modifier is held; their markers are validated across batches and
-remain tracked for lease cleanup on native failure. Linux emits the same
+remain tracked for lease cleanup on native failure. Marked temporary modifiers
+also reuse an already owned left or right native host modifier, including one
+reached by remapping an ordinary source. The saved native plan supplies that
+modifier identity across later policy changes. Real sources continue to share
+only exact destinations, so opposite native modifier sides stay distinct. The
+temporary source keeps its own cleanup ownership without changing the first
+native plan or flags. This behavior has Linux fake
+adapter coverage and Windows injected-sender test cases; Windows execution and
+live desktop delivery remain qualification gates. Linux emits the same
 repeat-event form through uinput. The opt-in grabbed Linux keyboard test checks
 that form and stable release across mapping changes. Desktop typing and repeat
 cadence on Linux and Windows remain qualification gates.
