@@ -8,6 +8,10 @@ rust-version.workspace = true
 ring = "0.17.14"
 aes = { version = "0.8.4", features = ["zeroize"] }
 cbc = { version = "0.1.2", default-features = false, features = ["block-padding"] }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

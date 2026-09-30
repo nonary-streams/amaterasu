@@ -1,10 +1,15 @@
 //! Typed inner messages. Call only after modern control GCM authentication.
+mod feedback;
 mod input;
 #[cfg(test)]
 mod tests;
 mod translate;
 
 use crate::crypto::{Direction, MAX_CONTROL_PAYLOAD_BYTES};
+pub use feedback::{
+    FeedbackEncodeError, HostFeedback, HostFeedbackDelivery, HostFeedbackMessage,
+    encode_host_feedback,
+};
 pub use input::{
     ControllerArrival, ControllerBattery, ControllerBatteryState, ControllerMotion,
     ControllerMotionType, ControllerState, ControllerTouch, ControllerTouchEvent, Input, PenTouch,
