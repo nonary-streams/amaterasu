@@ -2,15 +2,17 @@
 //!
 //! The public gamepad model supplies controller state, motion, touch, and
 //! battery updates. This module owns the Sony USB identity and serializes that
-//! state into the DS4 input report. It deliberately does not claim that the
-//! remote feedback path is available: Amaterasu currently has no native gamepad
-//! output callback for returning rumble or lightbar requests to a client.
+//! state into the DS4 input report. UHID output reports capture rumble and
+//! lightbar changes into the active, slot-owned feedback queue for delivery by
+//! the authenticated stream session.
 
+use crate::feedback::FeedbackProducer;
 use crate::gamepad::{
     ControllerSnapshot, GamepadBatteryState, GamepadDevice, GamepadMotionType, GamepadTouchPhase,
     GamepadTouchReport,
 };
 use crate::model::{InputError, InputResult};
+use amaterasu_gamestream::control::HostFeedback;
 #[cfg(not(test))]
 use std::fs::{File, OpenOptions};
 #[cfg(not(test))]
@@ -158,7 +160,7 @@ impl Default for Ds4ReportState {
             controller: ControllerSnapshot::default(),
             address: [0x02, 0, 0, 4, 0, 0],
             back_as_touchpad_click: true,
-            acceleration: [0.0; 3],
+            acceleration: [0.0, STANDARD_GRAVITY, 0.0],
             gyroscope: [0.0; 3],
             touches: [TouchPoint::RELEASED; 2],
             battery_status: 0x1b,
@@ -338,21 +340,17 @@ impl Ds4ReportState {
     }
 
     fn set_battery(&mut self, state: GamepadBatteryState, percentage: Option<u8>) {
-        if matches!(
-            state,
-            GamepadBatteryState::Unknown | GamepadBatteryState::NotPresent
-        ) {
+        let Some(percentage) = percentage else {
             return;
-        }
-        let current_level = self.battery_status & 0x0f;
+        };
         let level = match state {
+            GamepadBatteryState::Charging | GamepadBatteryState::Discharging => {
+                percentage.min(100) / 10
+            }
             GamepadBatteryState::Full => 11,
-            GamepadBatteryState::Charging
-            | GamepadBatteryState::Discharging
-            | GamepadBatteryState::NotCharging => percentage
-                .map(|percentage| percentage.min(100) / 10)
-                .unwrap_or(current_level),
-            GamepadBatteryState::Unknown | GamepadBatteryState::NotPresent => unreachable!(),
+            GamepadBatteryState::Unknown
+            | GamepadBatteryState::NotPresent
+            | GamepadBatteryState::NotCharging => return,
         };
         let cable_connected = matches!(
             state,
@@ -365,7 +363,7 @@ impl Ds4ReportState {
 
     fn neutralize(&mut self) {
         self.controller = ControllerSnapshot::default();
-        self.acceleration = [0.0; 3];
+        self.acceleration = [0.0, STANDARD_GRAVITY, 0.0];
         self.gyroscope = [0.0; 3];
         self.touches = [TouchPoint::RELEASED; 2];
     }
@@ -617,6 +615,30 @@ fn output_report_is_well_formed(event: &[u8]) -> bool {
         && event.get(4) == Some(&DS4_OUTPUT_REPORT_ID)
 }
 
+fn dispatch_output_feedback(event: &[u8], producer: &FeedbackProducer) -> bool {
+    if !output_report_is_well_formed(event) {
+        return false;
+    }
+    let report = &event[4..4 + DS4_OUTPUT_REPORT_SIZE];
+    let valid_flags = report[1];
+    if valid_flags & 0x01 != 0 {
+        producer.push(HostFeedback::Rumble {
+            controller: producer.controller(),
+            low_frequency: u16::from(report[5]) * 257,
+            high_frequency: u16::from(report[4]) * 257,
+        });
+    }
+    if valid_flags & 0x02 != 0 {
+        producer.push(HostFeedback::RgbLed {
+            controller: producer.controller(),
+            red: report[6],
+            green: report[7],
+            blue: report[8],
+        });
+    }
+    true
+}
+
 fn put_u16(target: &mut [u8], offset: usize, value: u16) {
     target[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
 }
@@ -651,7 +673,12 @@ struct UhidDevice {
 
 #[cfg(not(test))]
 impl UhidDevice {
-    fn create(slot: u8, report: Arc<Mutex<Ds4ReportState>>, address: [u8; 6]) -> InputResult<Self> {
+    fn create(
+        slot: u8,
+        report: Arc<Mutex<Ds4ReportState>>,
+        address: [u8; 6],
+        feedback: FeedbackProducer,
+    ) -> InputResult<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -680,10 +707,13 @@ impl UhidDevice {
             let failure = Arc::clone(&failure);
             let stop = Arc::clone(&stop);
             let started = Arc::clone(&started);
+            let feedback = feedback.clone();
             thread::Builder::new()
                 .name(format!("amaterasu-ds4-{slot}"))
                 .spawn(move || {
-                    if let Err(error) = run_uhid_loop(&worker_file, &report, &stop, &started) {
+                    if let Err(error) =
+                        run_uhid_loop(&worker_file, &report, &feedback, &stop, &started)
+                    {
                         *failure
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
@@ -771,6 +801,7 @@ impl Drop for UhidDevice {
 fn run_uhid_loop(
     file: &Arc<Mutex<File>>,
     report: &Arc<Mutex<Ds4ReportState>>,
+    feedback: &FeedbackProducer,
     stop: &AtomicBool,
     started: &AtomicBool,
 ) -> InputResult<()> {
@@ -839,10 +870,7 @@ fn run_uhid_loop(
                     write_event(file, &set_report_reply(&event, &report))?;
                 }
                 UHID_OUTPUT => {
-                    // Valid reports request rumble and lightbar changes. The
-                    // input service has no host-to-client feedback callback;
-                    // consume only the report shape and document that gap.
-                    let _ = output_report_is_well_formed(&event);
+                    let _ = dispatch_output_feedback(&event, feedback);
                 }
                 _ => {}
             }
@@ -1047,6 +1075,7 @@ impl UhidTransport {
         slot: u8,
         _report: Arc<Mutex<Ds4ReportState>>,
         address: [u8; 6],
+        _feedback: FeedbackProducer,
     ) -> InputResult<Self> {
         #[cfg(test)]
         if let Some(device) = FakeUhidDevice::create(slot, address)? {
@@ -1058,7 +1087,9 @@ impl UhidTransport {
             "DS4 UHID tests require the synthetic adapter",
         ));
         #[cfg(not(test))]
-        Ok(Self::Linux(UhidDevice::create(slot, _report, address)?))
+        Ok(Self::Linux(UhidDevice::create(
+            slot, _report, address, _feedback,
+        )?))
     }
 
     fn send_report(&mut self, _report: &Arc<Mutex<Ds4ReportState>>) -> InputResult<()> {
@@ -1096,10 +1127,15 @@ pub(super) struct Ds4Gamepad {
     report: Arc<Mutex<Ds4ReportState>>,
     recovery_required: bool,
     back_as_touchpad_click: bool,
+    feedback: FeedbackProducer,
 }
 
 impl Ds4Gamepad {
-    pub(super) fn create(slot: u8, back_as_touchpad_click: bool) -> InputResult<Self> {
+    pub(super) fn create(
+        slot: u8,
+        back_as_touchpad_click: bool,
+        feedback: FeedbackProducer,
+    ) -> InputResult<Self> {
         let report = Arc::new(Mutex::new(Ds4ReportState::default()));
         let address = random_device_address(slot)?;
         {
@@ -1112,10 +1148,16 @@ impl Ds4Gamepad {
         Ok(Self {
             slot,
             address,
-            device: Some(UhidTransport::create(slot, Arc::clone(&report), address)?),
+            device: Some(UhidTransport::create(
+                slot,
+                Arc::clone(&report),
+                address,
+                feedback.clone(),
+            )?),
             report,
             recovery_required: false,
             back_as_touchpad_click,
+            feedback,
         })
     }
 
@@ -1231,6 +1273,7 @@ impl GamepadDevice for Ds4Gamepad {
             self.slot,
             Arc::clone(&self.report),
             self.address,
+            self.feedback.clone(),
         )?);
         self.recovery_required = false;
         Ok(())
@@ -1246,6 +1289,12 @@ impl Drop for Ds4Gamepad {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_feedback(slot: u8) -> FeedbackProducer {
+        let queue = crate::feedback::FeedbackQueue::default();
+        let generation = queue.begin_lease();
+        queue.producer(generation, u16::from(slot), 0)
+    }
 
     fn frame(state: &mut Ds4ReportState) -> [u8; DS4_INPUT_REPORT_SIZE] {
         state.input_report()
@@ -1320,7 +1369,7 @@ mod tests {
     #[test]
     fn sensor_reports_use_ds4_acceleration_and_degree_per_second_scales() {
         let mut state = Ds4ReportState::default();
-        assert_eq!(&frame(&mut state)[19..25], &[0; 6]);
+        assert_eq!(&frame(&mut state)[19..25], &[0, 0, 0, 32, 0, 0]);
         state
             .set_motion(
                 GamepadMotionType::Accel,
@@ -1374,9 +1423,13 @@ mod tests {
         assert_eq!(state.battery_status, 6);
         state.set_battery(GamepadBatteryState::Charging, Some(36));
         assert_eq!(state.battery_status, 0x13);
-        state.set_battery(GamepadBatteryState::Full, None);
+        state.set_battery(GamepadBatteryState::Full, Some(100));
         assert_eq!(state.battery_status, 0x1b);
         state.set_battery(GamepadBatteryState::Unknown, None);
+        assert_eq!(state.battery_status, 0x1b);
+        state.set_battery(GamepadBatteryState::NotCharging, Some(20));
+        assert_eq!(state.battery_status, 0x1b);
+        state.set_battery(GamepadBatteryState::Full, None);
         assert_eq!(state.battery_status, 0x1b);
     }
 
@@ -1451,6 +1504,60 @@ mod tests {
     }
 
     #[test]
+    fn output_report_flags_gate_slot_owned_rumble_and_lightbar_feedback() {
+        let queue = crate::feedback::FeedbackQueue::default();
+        let generation = queue.begin_lease();
+        let producer = queue.producer(generation, 3, 0);
+        let mut output = create_event(UHID_OUTPUT);
+        output[4] = DS4_OUTPUT_REPORT_ID;
+        output[5] = 0x03;
+        output[8] = 128;
+        output[9] = 64;
+        output[10..13].copy_from_slice(&[10, 20, 30]);
+        put_u16(
+            &mut output,
+            4 + UHID_DATA_MAX,
+            DS4_OUTPUT_REPORT_SIZE as u16,
+        );
+        output[4 + UHID_DATA_MAX + 2] = UHID_OUTPUT_REPORT;
+
+        assert!(dispatch_output_feedback(&output, &producer));
+        let events = queue.peek(4);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].feedback,
+            HostFeedback::Rumble {
+                controller: 3,
+                low_frequency: 64 * 257,
+                high_frequency: 128 * 257,
+            }
+        );
+        assert_eq!(
+            events[1].feedback,
+            HostFeedback::RgbLed {
+                controller: 3,
+                red: 10,
+                green: 20,
+                blue: 30,
+            }
+        );
+
+        for (flags, expected_events) in [(0x01, 1), (0x02, 1), (0, 0)] {
+            let generation = queue.begin_lease();
+            let producer = queue.producer(generation, 3, 0);
+            output[5] = flags;
+            assert!(dispatch_output_feedback(&output, &producer));
+            let events = queue.peek(4);
+            assert_eq!(events.len(), expected_events);
+            if flags == 0x01 {
+                assert!(matches!(events[0].feedback, HostFeedback::Rumble { .. }));
+            } else if flags == 0x02 {
+                assert!(matches!(events[0].feedback, HostFeedback::RgbLed { .. }));
+            }
+        }
+    }
+
+    #[test]
     fn back_click_option_adds_touchpad_click_without_changing_share_mapping() {
         let mut state = Ds4ReportState::default();
         state.controller.buttons = BACK;
@@ -1466,7 +1573,7 @@ mod tests {
     #[test]
     fn synthetic_uhid_lifecycle_retains_failed_destroy_for_retry() {
         let (guard, adapter) = FakeUhidGuard::install();
-        let mut gamepad = Ds4Gamepad::create(4, false).unwrap();
+        let mut gamepad = Ds4Gamepad::create(4, false, test_feedback(4)).unwrap();
         gamepad.update(ControllerSnapshot::default()).unwrap();
         let created = adapter.borrow().created.clone();
         assert_eq!(created.len(), 1);
@@ -1483,7 +1590,7 @@ mod tests {
     #[test]
     fn report_write_failure_recreates_identity_before_replay() {
         let (guard, adapter) = FakeUhidGuard::install();
-        let mut gamepad = Ds4Gamepad::create(1, false).unwrap();
+        let mut gamepad = Ds4Gamepad::create(1, false, test_feedback(1)).unwrap();
         let id = adapter.borrow().next_id;
         adapter.borrow_mut().fail_report = Some(id);
         let state = ControllerSnapshot {

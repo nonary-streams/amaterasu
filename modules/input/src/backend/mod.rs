@@ -1,3 +1,4 @@
+use crate::feedback::FeedbackQueue;
 use crate::gamepad_profile::GamepadProfile;
 use crate::model::{Event, InputResult, PenTouchDevice};
 use amaterasu_input_policy::KeyBindings;
@@ -54,6 +55,11 @@ pub trait Backend {
     fn set_motion_as_ds4(&mut self, _enabled: bool) {}
     fn set_touchpad_as_ds4(&mut self, _enabled: bool) {}
     fn set_ds5_inputtino_randomize_mac(&mut self, _enabled: bool) {}
+    /// Shares the active lease's bounded output-feedback mailbox with native
+    /// device callbacks. Callback producers still capture a generation per
+    /// device so late output cannot cross a lease boundary.
+    fn set_feedback_queue(&mut self, _queue: FeedbackQueue) {}
+    fn set_feedback_generation(&mut self, _generation: u64) {}
     /// Releases and removes owned virtual controller slots without stopping
     /// keyboard or pointer injection for the current lease.
     fn disable_controller_input(&mut self) -> InputResult<()> {

@@ -1,6 +1,7 @@
 use super::Backend;
 use super::owned_devices::{acquire_input_pair, recover_input_device, release_input_pair};
 use super::owned_keys::{HeldKeyPlans, HostModifier, OwnedKeyPlan};
+use crate::feedback::{FeedbackProducer, FeedbackQueue};
 use crate::gamepad::{
     ControllerSnapshot, GAMEPAD_ABSOLUTE_AXES, GamepadBatteryState, GamepadDevice,
     GamepadMotionType, GamepadSlots, GamepadTouchPhase, GamepadTouchReport, NativeGamepadEvent,
@@ -12,6 +13,7 @@ use crate::model::{
     Axis, Button, ControllerBatteryState, ControllerMotionType, ControllerTouchPhase, Event,
     InputError, InputResult, Key, KeyState, PenTouchDevice, is_temporary_modifier,
 };
+use amaterasu_gamestream::control::{ControllerMotionType as FeedbackMotionType, HostFeedback};
 use amaterasu_input_policy::KeyBindings;
 #[path = "linux_pen_touch.rs"]
 mod linux_pen_touch;
@@ -605,13 +607,22 @@ impl LinuxGamepad {
         profile: GamepadProfile,
         back_as_touchpad_click: bool,
         ds5_randomize_mac: bool,
+        feedback: FeedbackProducer,
     ) -> InputResult<Self> {
         match profile {
             GamepadProfile::Auto | GamepadProfile::Xone => {
                 Ok(Self::Xone(UinputGamepad::create(path, slot)?))
             }
-            GamepadProfile::Ds4 => Ok(Self::Ds4(Ds4Gamepad::create(slot, back_as_touchpad_click)?)),
-            GamepadProfile::Ds5 => Ok(Self::Ds5(Ds5Gamepad::create(slot, ds5_randomize_mac)?)),
+            GamepadProfile::Ds4 => Ok(Self::Ds4(Ds4Gamepad::create(
+                slot,
+                back_as_touchpad_click,
+                feedback.clone(),
+            )?)),
+            GamepadProfile::Ds5 => Ok(Self::Ds5(Ds5Gamepad::create(
+                slot,
+                ds5_randomize_mac,
+                feedback,
+            )?)),
             GamepadProfile::Switch => Ok(Self::Switch(SwitchGamepad::create(path, slot)?)),
         }
     }
@@ -721,6 +732,9 @@ pub struct LinuxBackend {
     ds5_unavailable_reason: Option<String>,
     switch_unavailable_reason: Option<String>,
     controller_routes: [Option<GamepadProfile>; 16],
+    controller_capabilities: [u32; 16],
+    feedback_queue: FeedbackQueue,
+    feedback_generation: u64,
     pen_touch: LinuxPenTouch,
     controller_input_supported: bool,
     profile: GamepadProfile,
@@ -761,6 +775,9 @@ impl LinuxBackend {
             ds5_unavailable_reason: None,
             switch_unavailable_reason: None,
             controller_routes: [None; 16],
+            controller_capabilities: [0; 16],
+            feedback_queue: FeedbackQueue::default(),
+            feedback_generation: 0,
             pen_touch: LinuxPenTouch::new(),
             controller_input_supported: false,
             profile: GamepadProfile::Auto,
@@ -789,6 +806,34 @@ impl LinuxBackend {
             GamepadProfile::Auto => GamepadProfile::Xone,
             profile => profile,
         })
+    }
+
+    fn feedback_producer(&self, number: u16) -> FeedbackProducer {
+        self.feedback_queue.producer(
+            self.feedback_generation,
+            number,
+            self.controller_capabilities[usize::from(number)],
+        )
+    }
+
+    fn activate_motion(&self, number: u16, profile: GamepadProfile) {
+        if !matches!(profile, GamepadProfile::Ds4 | GamepadProfile::Ds5) {
+            return;
+        }
+        let capabilities = self.controller_capabilities[usize::from(number)];
+        let producer = self.feedback_producer(number);
+        for (capability, motion_type) in [
+            (CONTROLLER_CAP_ACCELEROMETER, FeedbackMotionType::Accel),
+            (CONTROLLER_CAP_GYROSCOPE, FeedbackMotionType::Gyro),
+        ] {
+            if capabilities & capability != 0 {
+                producer.push(HostFeedback::Motion {
+                    controller: number,
+                    report_rate_hz: 250,
+                    motion_type,
+                });
+            }
+        }
     }
 
     fn profile_available_for_lease(&self, profile: GamepadProfile) -> bool {
@@ -875,12 +920,15 @@ impl LinuxBackend {
         self.gamepads.remove(number)?;
         let profile = self.route_profile_for_arrival(controller_type, capabilities);
         self.controller_routes[route_index] = Some(profile);
+        self.controller_capabilities[route_index] = capabilities;
         if !self.profile_available_for_lease(profile) {
             return Err(self.profile_unavailable_error(profile));
         }
+        self.activate_motion(number, profile);
 
         let back_as_touchpad_click = self.ds4_back_as_touchpad_click;
         let ds5_randomize_mac = self.ds5_inputtino_randomize_mac;
+        let feedback = self.feedback_producer(number);
         let path = &self.path;
         self.gamepads.ensure(number, |slot| {
             LinuxGamepad::create(
@@ -889,6 +937,7 @@ impl LinuxBackend {
                 profile,
                 back_as_touchpad_click,
                 ds5_randomize_mac,
+                feedback.clone(),
             )
         })
     }
@@ -1023,6 +1072,7 @@ impl Backend for LinuxBackend {
         self.ds5_unavailable_reason = None;
         self.switch_unavailable_reason = None;
         self.controller_routes = [None; 16];
+        self.controller_capabilities = [0; 16];
 
         if matches!(self.profile, GamepadProfile::Auto | GamepadProfile::Xone) {
             match Device::create_gamepad(&self.path, 0) {
@@ -1043,7 +1093,11 @@ impl Backend for LinuxBackend {
         }
 
         if matches!(self.profile, GamepadProfile::Auto | GamepadProfile::Ds5) {
-            match Ds5Gamepad::create(0, self.ds5_inputtino_randomize_mac) {
+            match Ds5Gamepad::create(
+                0,
+                self.ds5_inputtino_randomize_mac,
+                self.feedback_producer(0),
+            ) {
                 Ok(mut probe) => match probe.release() {
                     Ok(()) => self.ds5_available = true,
                     Err(error) => {
@@ -1061,7 +1115,11 @@ impl Backend for LinuxBackend {
         }
 
         if self.profile == GamepadProfile::Ds4 {
-            match Ds4Gamepad::create(0, self.ds4_back_as_touchpad_click) {
+            match Ds4Gamepad::create(
+                0,
+                self.ds4_back_as_touchpad_click,
+                self.feedback_producer(0),
+            ) {
                 Ok(mut probe) => match probe.release() {
                     Ok(()) => self.ds4_available = true,
                     Err(error) => {
@@ -1130,6 +1188,7 @@ impl Backend for LinuxBackend {
             };
             let back_as_touchpad_click = self.ds4_back_as_touchpad_click;
             let ds5_randomize_mac = self.ds5_inputtino_randomize_mac;
+            let feedback = self.feedback_producer(*number);
             let path = &self.path;
             let gamepads = &mut self.gamepads;
             gamepads.ensure(*number, |slot| {
@@ -1139,6 +1198,7 @@ impl Backend for LinuxBackend {
                     profile,
                     back_as_touchpad_click,
                     ds5_randomize_mac,
+                    feedback.clone(),
                 )
             })?;
             return gamepads.set_motion(*number, motion_type, [*x, *y, *z]);
@@ -1166,6 +1226,7 @@ impl Backend for LinuxBackend {
             };
             let back_as_touchpad_click = self.ds4_back_as_touchpad_click;
             let ds5_randomize_mac = self.ds5_inputtino_randomize_mac;
+            let feedback = self.feedback_producer(*number);
             let path = &self.path;
             let gamepads = &mut self.gamepads;
             gamepads.ensure(*number, |slot| {
@@ -1175,6 +1236,7 @@ impl Backend for LinuxBackend {
                     profile,
                     back_as_touchpad_click,
                     ds5_randomize_mac,
+                    feedback.clone(),
                 )
             })?;
             return gamepads.set_touch(
@@ -1206,6 +1268,7 @@ impl Backend for LinuxBackend {
             };
             let back_as_touchpad_click = self.ds4_back_as_touchpad_click;
             let ds5_randomize_mac = self.ds5_inputtino_randomize_mac;
+            let feedback = self.feedback_producer(*number);
             let path = &self.path;
             let gamepads = &mut self.gamepads;
             gamepads.ensure(*number, |slot| {
@@ -1215,6 +1278,7 @@ impl Backend for LinuxBackend {
                     profile,
                     back_as_touchpad_click,
                     ds5_randomize_mac,
+                    feedback.clone(),
                 )
             })?;
             return gamepads.set_battery(*number, state, *percentage);
@@ -1234,6 +1298,7 @@ impl Backend for LinuxBackend {
             for slot in 0..self.controller_routes.len() {
                 if active_mask & (1 << slot) == 0 {
                     self.controller_routes[slot] = None;
+                    self.controller_capabilities[slot] = 0;
                 }
             }
             let profile = self.profile_for_controller(*number);
@@ -1251,6 +1316,7 @@ impl Backend for LinuxBackend {
             };
             let back_as_touchpad_click = self.ds4_back_as_touchpad_click;
             let ds5_randomize_mac = self.ds5_inputtino_randomize_mac;
+            let feedback = self.feedback_producer(*number);
             let (path, gamepads) = (&self.path, &mut self.gamepads);
             return gamepads
                 .apply(
@@ -1266,6 +1332,7 @@ impl Backend for LinuxBackend {
                             profile,
                             back_as_touchpad_click,
                             ds5_randomize_mac,
+                            feedback.clone(),
                         )
                     },
                 )
@@ -1490,6 +1557,7 @@ impl Backend for LinuxBackend {
             && self.gamepad_probe.is_none()
         {
             self.controller_routes = [None; 16];
+            self.controller_capabilities = [0; 16];
         }
         for result in [
             pen_touch_result,
@@ -1579,10 +1647,19 @@ impl Backend for LinuxBackend {
         self.ds5_inputtino_randomize_mac = enabled;
     }
 
+    fn set_feedback_queue(&mut self, queue: FeedbackQueue) {
+        self.feedback_queue = queue;
+    }
+
+    fn set_feedback_generation(&mut self, generation: u64) {
+        self.feedback_generation = generation;
+    }
+
     fn disable_controller_input(&mut self) -> InputResult<()> {
         let result = self.gamepads.stop();
         if result.is_ok() {
             self.controller_routes = [None; 16];
+            self.controller_capabilities = [0; 16];
         }
         result
     }

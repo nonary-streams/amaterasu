@@ -63,6 +63,9 @@ pub struct Broker {
     pub input_ttl_ms: u64,
     pub input_terminal: bool,
     pub input_events: Vec<Value>,
+    pub input_feedback_events: VecDeque<Value>,
+    pub input_feedback_acks: Vec<u64>,
+    pub feedback_ack_failures: usize,
     pub fail_input_batch: bool,
     pub fail_controller_input: bool,
     pub input_cleanup_required: bool,
@@ -816,6 +819,29 @@ impl Broker {
                 }
                 json!({"ok":true,"lease":self.input_lease,"accepted":events.len()})
             }
+            "feedback_peek" => {
+                assert_eq!(payload["lease"], json!(self.input_lease));
+                json!({"ok":true,"events":self.input_feedback_events.iter().take(
+                    payload["limit"].as_u64().unwrap_or(16) as usize
+                ).cloned().collect::<Vec<_>>()})
+            }
+            "feedback_ack" => {
+                assert_eq!(payload["lease"], json!(self.input_lease));
+                let through = payload["through_sequence"].as_u64().unwrap();
+                if self.feedback_ack_failures > 0 {
+                    self.feedback_ack_failures -= 1;
+                    return json!({"ok":false,"error":{"code":"temporarily_unavailable"}});
+                }
+                while self.input_feedback_events.front().is_some_and(|event| {
+                    event["sequence"]
+                        .as_u64()
+                        .is_some_and(|sequence| sequence <= through)
+                }) {
+                    self.input_feedback_events.pop_front();
+                }
+                self.input_feedback_acks.push(through);
+                json!({"ok":true,"through_sequence":through})
+            }
             "release" => {
                 if payload["lease"] != json!(self.input_lease) {
                     return json!({"ok":false,"error":{"code":"not_found"}});
@@ -948,6 +974,8 @@ pub struct PlaneState {
     pub accepted_video_access_units: u64,
     pub accepted_media_payload_bytes: u64,
     pub observed_video_sequence_gaps: u64,
+    pub feedback: Vec<amaterasu_gamestream::control::HostFeedback>,
+    pub feedback_queue_full: usize,
 }
 struct FakePlane(Rc<RefCell<PlaneState>>);
 impl Drive for FakePlane {
@@ -980,6 +1008,18 @@ impl Drive for FakePlane {
             && state
                 .media_ticks_when_stopped
                 .is_some_and(|at_stop| state.media_ticks > at_stop)
+    }
+    fn enqueue_feedback(
+        &mut self,
+        feedback: amaterasu_gamestream::control::HostFeedback,
+    ) -> Result<crate::plane::FeedbackEnqueueOutcome, crate::plane::FeedbackEnqueueError> {
+        let mut state = self.0.borrow_mut();
+        if state.feedback_queue_full > 0 {
+            state.feedback_queue_full -= 1;
+            return Err(crate::plane::FeedbackEnqueueError::QueueFull);
+        }
+        state.feedback.push(feedback);
+        Ok(crate::plane::FeedbackEnqueueOutcome::Queued)
     }
 }
 impl Drop for FakePlane {

@@ -1,4 +1,5 @@
 use super::record::{Record, State};
+use amaterasu_gamestream::control::HostFeedback;
 use amaterasu_gamestream::control::{
     AbsoluteViewport, ControllerArrival, ControllerBattery, ControllerBatteryState,
     ControllerMotion, ControllerMotionType, ControllerTouch, ControllerTouchEvent, Input,
@@ -52,6 +53,90 @@ impl TouchPort {
 
 const MAX_QUEUED_EVENTS: usize = 128;
 pub(super) const MAX_BATCH_EVENTS: usize = 64;
+const FEEDBACK_POLL_INTERVAL_MS: u64 = 20;
+const MAX_FEEDBACK_PEEK: usize = 16;
+
+pub(super) fn accept_feedback_peek(
+    record: &mut Record,
+    payload: &Value,
+    now: u64,
+) -> Result<Option<u64>, &'static str> {
+    let events = payload
+        .get("events")
+        .and_then(Value::as_array)
+        .filter(|events| payload["ok"] == true && events.len() <= MAX_FEEDBACK_PEEK)
+        .ok_or("invalid_feedback_response")?;
+    if events.is_empty() {
+        record.feedback_poll_at = now.saturating_add(FEEDBACK_POLL_INTERVAL_MS);
+        record.feedback_ack_through = None;
+        return Ok(None);
+    }
+
+    let pcm_enabled = record.start.as_ref().is_some_and(|start| {
+        start
+            .client_feature_flags
+            .is_some_and(|flags| flags & amaterasu_gamestream::sdp::CLIENT_FEATURE_HAPTICS_PCM != 0)
+    });
+    let Some(plane) = record.plane.as_mut() else {
+        return Err("feedback_plane_unavailable");
+    };
+    let mut last_accepted = None;
+    let mut previous = 0;
+    for event in events {
+        let sequence = event
+            .get("sequence")
+            .and_then(Value::as_u64)
+            .filter(|sequence| *sequence > previous)
+            .ok_or("invalid_feedback_response")?;
+        let feedback: HostFeedback = serde_json::from_value(
+            event
+                .get("feedback")
+                .cloned()
+                .ok_or("invalid_feedback_response")?,
+        )
+        .map_err(|_| "invalid_feedback_response")?;
+        previous = sequence;
+
+        if matches!(&feedback, HostFeedback::HapticsPcm { .. }) && !pcm_enabled {
+            last_accepted = Some(sequence);
+            continue;
+        }
+        match plane.enqueue_feedback(feedback) {
+            Ok(crate::plane::FeedbackEnqueueOutcome::Queued)
+            | Ok(crate::plane::FeedbackEnqueueOutcome::DroppedBestEffort) => {
+                last_accepted = Some(sequence);
+            }
+            Err(crate::plane::FeedbackEnqueueError::QueueFull) => break,
+            Err(crate::plane::FeedbackEnqueueError::Stopped) => break,
+            Err(crate::plane::FeedbackEnqueueError::Invalid(_)) => {
+                return Err("invalid_feedback_response");
+            }
+        }
+    }
+    if let Some(through_sequence) = last_accepted {
+        record.feedback_ack_through = Some(through_sequence);
+        Ok(Some(through_sequence))
+    } else {
+        record.feedback_poll_at = now.saturating_add(FEEDBACK_POLL_INTERVAL_MS);
+        Ok(None)
+    }
+}
+
+pub(super) fn accept_feedback_ack(
+    record: &mut Record,
+    payload: &Value,
+    now: u64,
+) -> Result<(), &'static str> {
+    let Some(through_sequence) = record.feedback_ack_through else {
+        return Err("unexpected_feedback_ack");
+    };
+    if payload["ok"] != true || payload["through_sequence"] != through_sequence {
+        return Err("invalid_feedback_ack");
+    }
+    record.feedback_ack_through = None;
+    record.feedback_poll_at = now.saturating_add(FEEDBACK_POLL_INTERVAL_MS);
+    Ok(())
+}
 
 pub(super) fn next_input_batch_size(record: &Record) -> usize {
     let Some(first) = record.input_events.front() else {
@@ -235,6 +320,8 @@ pub(super) fn accept_input_lease(
     }
     let lifetime = record.input_expires_at - now;
     record.input_renew_at = now.saturating_add(lifetime / 2);
+    record.feedback_poll_at = now.saturating_add(20);
+    record.feedback_ack_through = None;
     record.input_lookup_required = false;
     configure_translator(record, absolute_pointer)?;
     Ok(())
@@ -377,6 +464,8 @@ pub(super) fn clear_input(record: &mut Record) {
     record.input_request_started_at = 0;
     record.input_expires_at = 0;
     record.input_renew_at = 0;
+    record.feedback_poll_at = 0;
+    record.feedback_ack_through = None;
     record.input_absolute_pointer = false;
     record.input_controller_supported = false;
     record.input_pen_touch_supported = false;

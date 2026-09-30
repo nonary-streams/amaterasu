@@ -1,4 +1,5 @@
 use crate::backend::Backend;
+use crate::feedback::FeedbackQueue;
 use crate::gamepad_profile::GamepadProfile;
 use crate::model::{
     ControllerTouchPhase, DevicePolicy, Event, InputError, InputResult, KeyEncoding, KeyState,
@@ -19,6 +20,8 @@ const MAX_SCROLL_STEPS_PER_EVENT: i32 = 100;
 const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
 const DEFAULT_KEY_REPEAT_FREQUENCY_HZ: f64 = 24.9;
 const DEFAULT_BACK_BUTTON_TIMEOUT_MS: i32 = -1;
+const STREAM_SESSION_CALLER: &str = "amaterasu.stream-session";
+const MAX_FEEDBACK_PEEK: u8 = 16;
 
 fn is_controller_event(event: &Event) -> bool {
     matches!(
@@ -216,11 +219,14 @@ pub struct Controller<B: Backend> {
     // Pen and touch contacts have independent pointer identities and cancel paths.
     pen_touch_contacts: Vec<ActivePenTouch>,
     controller_touch_contacts: Vec<ActiveControllerTouch>,
+    feedback: FeedbackQueue,
     retry_at: Instant,
     terminal_acquires: VecDeque<TerminalAcquire>,
 }
 impl<B: Backend> Controller<B> {
     pub fn new(mut backend: B, enabled: bool) -> Self {
+        let feedback = FeedbackQueue::default();
+        backend.set_feedback_queue(feedback.clone());
         backend.set_keybindings(&KeyBindings::default());
         backend.set_ds5_inputtino_randomize_mac(true);
         Self {
@@ -250,6 +256,7 @@ impl<B: Backend> Controller<B> {
             pressed: Vec::new(),
             pen_touch_contacts: Vec::new(),
             controller_touch_contacts: Vec::new(),
+            feedback,
             retry_at: Instant::now(),
             terminal_acquires: VecDeque::new(),
         }
@@ -313,6 +320,11 @@ impl<B: Backend> Controller<B> {
             Operation::Batch { lease, events } => {
                 return self.batch(caller, &lease, events, now, guard);
             }
+            Operation::FeedbackPeek { lease, limit } => self.feedback_peek(caller, &lease, limit),
+            Operation::FeedbackAck {
+                lease,
+                through_sequence,
+            } => self.feedback_ack(caller, &lease, through_sequence),
             Operation::Release { lease } => self.authorize(caller, &lease, true).and_then(|()| {
                 self.finish_lease(now, "released")?;
                 Ok(json!({"ok":true,"released":true}))
@@ -616,11 +628,17 @@ impl<B: Backend> Controller<B> {
     /// Updates the live controller gate before trying to remove virtual slots.
     /// A failed removal is retried without disabling keyboard or pointer input.
     pub fn set_controller_enabled(&mut self, enabled: bool, now: Instant) -> InputResult<()> {
+        let was_effective_enabled = self.effective_controller_enabled();
         self.controller_enabled = enabled;
         let effective_enabled = self.effective_controller_enabled();
         if effective_enabled && !self.controller_cleanup_pending {
+            if !was_effective_enabled {
+                let generation = self.feedback.begin_lease();
+                self.backend.set_feedback_generation(generation);
+            }
             return Ok(());
         }
+        self.feedback.end_lease();
         self.controller_cleanup_pending = true;
         self.retry_controller_cleanup(now)
     }
@@ -892,7 +910,10 @@ impl<B: Backend> Controller<B> {
             .set_key_rightalt_to_key_win(key_rightalt_to_key_win);
         self.backend
             .set_keybindings(requested_keybindings.as_ref().unwrap_or(&self.keybindings));
+        let feedback_generation = self.feedback.begin_lease();
+        self.backend.set_feedback_generation(feedback_generation);
         if let Err(error) = self.backend.start() {
+            self.feedback.end_lease();
             self.startup_cleanup_pending = true;
             let _ = self.retry_startup_cleanup(now);
             self.backend
@@ -1007,6 +1028,57 @@ impl<B: Backend> Controller<B> {
             ));
         }
         Ok(())
+    }
+
+    fn feedback_peek(&mut self, caller: &str, token: &str, limit: u8) -> InputResult<Value> {
+        self.authorize_feedback_caller(caller)?;
+        self.authorize(caller, token, false)?;
+        if !(1..=MAX_FEEDBACK_PEEK).contains(&limit) {
+            return Err(InputError::new(
+                "invalid_request",
+                "feedback peek limit must be in the range 1..16",
+            ));
+        }
+        if !self.effective_controller_enabled() {
+            return Ok(json!({"ok":true,"events":[]}));
+        }
+        let events = self
+            .feedback
+            .peek(usize::from(limit))
+            .into_iter()
+            .map(|event| {
+                Ok(json!({
+                    "sequence": event.sequence,
+                    "feedback": serde_json::to_value(event.feedback).map_err(|_| {
+                        InputError::new("runtime_error", "feedback serialization failed")
+                    })?,
+                }))
+            })
+            .collect::<InputResult<Vec<_>>>()?;
+        Ok(json!({"ok":true,"events":events}))
+    }
+
+    fn feedback_ack(&self, caller: &str, token: &str, through_sequence: u64) -> InputResult<Value> {
+        self.authorize_feedback_caller(caller)?;
+        self.authorize(caller, token, false)?;
+        if !self.feedback.acknowledge(through_sequence) {
+            return Err(InputError::new(
+                "invalid_request",
+                "feedback acknowledgement exceeds the last peeked sequence",
+            ));
+        }
+        Ok(json!({"ok":true,"through_sequence":through_sequence}))
+    }
+
+    fn authorize_feedback_caller(&self, caller: &str) -> InputResult<()> {
+        if caller == STREAM_SESSION_CALLER {
+            Ok(())
+        } else {
+            Err(InputError::new(
+                "permission_denied",
+                "controller feedback is available only to the active stream session",
+            ))
+        }
     }
     fn batch(
         &mut self,
@@ -1608,6 +1680,9 @@ impl<B: Backend> Controller<B> {
     }
 
     fn finish_lease(&mut self, now: Instant, reason: &'static str) -> InputResult<()> {
+        if self.lease.is_some() {
+            self.feedback.end_lease();
+        }
         self.repeating_key = None;
         if let Some(lease) = &mut self.lease {
             lease.termination_reason.get_or_insert(reason);

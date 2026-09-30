@@ -3,6 +3,7 @@ use crate::model::{
     Axis, Button, ControllerTouchPhase, DevicePolicy, Event as InputEvent, Key, PEN_BUTTON_MASK,
     PEN_POINTER_ID, PenTool, PenTouchDevice, PenTouchPhase,
 };
+use amaterasu_gamestream::control::HostFeedback;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -288,6 +289,113 @@ fn acquire_operation() -> Operation {
         key_repeat_delay: None,
         key_repeat_frequency: None,
     }
+}
+
+#[test]
+fn feedback_pull_is_stream_session_only_lease_bound_and_acknowledged_after_peek() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let now = Instant::now();
+    let acquired = controller.handle(
+        "amaterasu.stream-session",
+        acquire_operation(),
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(acquired["ok"], true);
+    let lease = acquired["lease"].as_str().unwrap().to_owned();
+    let generation = controller.feedback.generation();
+    let producer = controller.feedback.producer(generation, 2, 0);
+    assert!(producer.push(HostFeedback::RgbLed {
+        controller: 2,
+        red: 12,
+        green: 34,
+        blue: 56,
+    }));
+
+    for limit in [0, 17] {
+        let response = controller.handle(
+            "amaterasu.stream-session",
+            Operation::FeedbackPeek {
+                lease: lease.clone(),
+                limit,
+            },
+            now,
+            &mut || Ok(()),
+        );
+        assert_eq!(response["error"]["code"], "invalid_request");
+    }
+
+    let peek = Operation::FeedbackPeek {
+        lease: lease.clone(),
+        limit: 16,
+    };
+    let denied = controller.handle("untrusted.caller", peek, now, &mut || Ok(()));
+    assert_eq!(denied["error"]["code"], "permission_denied");
+
+    let peeked = controller.handle(
+        "amaterasu.stream-session",
+        Operation::FeedbackPeek {
+            lease: lease.clone(),
+            limit: 16,
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(peeked["ok"], true);
+    assert_eq!(peeked["events"][0]["sequence"], 1);
+    assert_eq!(
+        peeked["events"][0]["feedback"],
+        json!({"type":"rgb_led","controller":2,"red":12,"green":34,"blue":56})
+    );
+
+    let ahead = controller.handle(
+        "amaterasu.stream-session",
+        Operation::FeedbackAck {
+            lease: lease.clone(),
+            through_sequence: 2,
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(ahead["error"]["code"], "invalid_request");
+    let acknowledged = controller.handle(
+        "amaterasu.stream-session",
+        Operation::FeedbackAck {
+            lease: lease.clone(),
+            through_sequence: 1,
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(acknowledged["ok"], true);
+    let duplicate_ack = controller.handle(
+        "amaterasu.stream-session",
+        Operation::FeedbackAck {
+            lease: lease.clone(),
+            through_sequence: 1,
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(duplicate_ack["ok"], true);
+    assert!(controller.feedback.peek(16).is_empty());
+
+    assert_eq!(
+        controller.handle(
+            "amaterasu.stream-session",
+            Operation::Release { lease },
+            now,
+            &mut || Ok(()),
+        )["released"],
+        true
+    );
+    assert!(!producer.push(HostFeedback::RgbLed {
+        controller: 2,
+        red: 1,
+        green: 2,
+        blue: 3,
+    }));
+    assert!(controller.feedback.peek(16).is_empty());
 }
 
 #[test]

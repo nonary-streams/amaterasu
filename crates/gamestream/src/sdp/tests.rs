@@ -43,6 +43,7 @@ fn primary_client_shape_negotiates_exact_h264_sdr_requirements() {
     assert_eq!(result.audio.packet_duration_ms, 5);
     assert_eq!(result.fec.minimum_packets, 2);
     assert_eq!(result.control, ControlProtocol::EncryptedEnet);
+    assert_eq!(result.client_feature_flags, 3);
     assert!(!result.encryption.video);
     assert!(result.encryption.remote_input);
     assert!(result.check_support(&TransportSupport::default()).is_err());
@@ -53,6 +54,15 @@ fn primary_client_shape_negotiates_exact_h264_sdr_requirements() {
         result.check_support(&support),
         Err(Error::Unsupported("FEC parity"))
     );
+}
+
+#[test]
+fn pcm_haptics_feature_flag_is_retained_while_unknown_bits_stay_rejected() {
+    let enabled = parse_announce(changed("x-ml-general.featureFlags", "7").as_bytes()).unwrap();
+    assert_eq!(enabled.client_feature_flags, 7);
+    let legacy = parse_announce(changed("x-ml-general.featureFlags", "3").as_bytes()).unwrap();
+    assert_eq!(legacy.client_feature_flags, 3);
+    assert!(parse_announce(changed("x-ml-general.featureFlags", "8").as_bytes()).is_err());
 }
 
 #[test]

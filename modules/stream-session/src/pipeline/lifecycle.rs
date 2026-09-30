@@ -72,6 +72,13 @@ impl Pipeline {
                     return self.consume(record, job, payload, now, send, factory);
                 }
                 rpc::Progress::Failed => {
+                    if matches!(job.step, Step::FeedbackPeek | Step::FeedbackAck) {
+                        if job.step == Step::FeedbackPeek {
+                            record.feedback_ack_through = None;
+                        }
+                        record.feedback_poll_at = now.saturating_add(100);
+                        return false;
+                    }
                     if job.settling_allocation {
                         job.settling_allocation = false;
                         return true;
@@ -300,6 +307,13 @@ impl Pipeline {
             return true;
         }
         if payload["ok"] != true {
+            if matches!(job.step, Step::FeedbackPeek | Step::FeedbackAck) {
+                if job.step == Step::FeedbackPeek {
+                    record.feedback_ack_through = None;
+                }
+                record.feedback_poll_at = now.saturating_add(100);
+                return false;
+            }
             if job.step == Step::InputBatch && payload["error"]["code"] == "controller_unavailable"
             {
                 record.session_effects.vigem_missing(record.id);
@@ -431,6 +445,19 @@ impl Pipeline {
             }
             Step::InputBatch => {
                 accept_input_batch(record, &payload)?;
+                Ok(false)
+            }
+            Step::FeedbackPeek => {
+                if let Some(through_sequence) = accept_feedback_peek(record, &payload, now)? {
+                    record.feedback_ack_through = Some(through_sequence);
+                    job.step = Step::FeedbackAck;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            Step::FeedbackAck => {
+                accept_feedback_ack(record, &payload, now)?;
                 Ok(false)
             }
             Step::ReleaseInput => {

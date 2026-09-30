@@ -112,6 +112,7 @@ fn record(state: State) -> Record {
         negotiation: None,
         negotiated_encryption: None,
         negotiated_slices_per_frame: None,
+        client_feature_flags: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -812,6 +813,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         negotiation: None,
         negotiated_encryption: None,
         negotiated_slices_per_frame: None,
+        client_feature_flags: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -1614,11 +1616,28 @@ fn accepted_announce_encryption_flows_into_authenticated_play_start() {
         payload["configuration"]["encrypt_audio"],
         announce.encryption.audio
     );
+    assert_eq!(
+        payload["configuration"]["client_feature_flags"],
+        announce.client_feature_flags
+    );
+    assert_eq!(
+        payload["configuration"]["configuration"]["slices_per_frame"],
+        announce.video.slices_per_frame
+    );
     assert!(
         record.config.arm(23)["configuration"]
             .get("encrypt_video")
             .is_none()
     );
+}
+
+#[test]
+fn accepted_announce_freezes_pcm_haptics_flag_into_authenticated_start() {
+    let (mut record, mut announce) = announced_profile_record();
+    announce.client_feature_flags |= amaterasu_gamestream::sdp::CLIENT_FEATURE_HAPTICS_PCM;
+    assert!(record.accept_announce(&announce));
+    let payload = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(payload["configuration"]["client_feature_flags"], 7);
 }
 
 #[test]
@@ -1632,6 +1651,7 @@ fn rejected_announce_cannot_produce_an_authenticated_play_start() {
 
     assert!(!record.accept_announce(&announce));
     assert!(record.negotiated_encryption.is_none());
+    assert!(record.client_feature_flags.is_none());
     assert!(record.authenticated_start_payload(23).is_none());
 }
 
@@ -1659,6 +1679,7 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
             audio: false,
         });
         record.negotiated_slices_per_frame = Some(1);
+        record.client_feature_flags = Some(3);
         record.config.frame_limiter_settings = Some(snapshot.clone());
         record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());
         record.config.application_operation_id = Some("launch-one".into());

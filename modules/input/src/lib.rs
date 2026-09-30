@@ -1,6 +1,7 @@
 //! Caller-owned keyboard, mouse, and capability-gated gamepad input with leases.
 mod backend;
 mod controller;
+mod feedback;
 #[cfg(any(target_os = "linux", windows, test))]
 mod gamepad;
 mod gamepad_profile;
@@ -321,6 +322,8 @@ impl InputModule {
                     &operation,
                     Operation::Status
                         | Operation::Lookup { .. }
+                        | Operation::FeedbackPeek { .. }
+                        | Operation::FeedbackAck { .. }
                         | Operation::Acquire {
                             operation_id: Some(_),
                             ..

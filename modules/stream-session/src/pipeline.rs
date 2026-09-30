@@ -18,8 +18,12 @@ mod workflow;
 use crate::{
     SERVICE,
     model::{Operation, Settings},
-    plane::{Handles, Plane, Progress as PlaneProgress, TickFailure as PlaneFailure},
+    plane::{
+        FeedbackEnqueueError, FeedbackEnqueueOutcome, Handles, Plane, Progress as PlaneProgress,
+        TickFailure as PlaneFailure,
+    },
 };
+use amaterasu_gamestream::control::HostFeedback;
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use record::{Record, Resource, State, error};
 use rpc::Send;
@@ -32,6 +36,10 @@ trait Drive {
     fn stop(&mut self);
     fn is_drained(&self) -> bool;
     fn recover_audio(&mut self);
+    fn enqueue_feedback(
+        &mut self,
+        feedback: HostFeedback,
+    ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError>;
 }
 
 impl Drive for Plane {
@@ -46,6 +54,12 @@ impl Drive for Plane {
     }
     fn recover_audio(&mut self) {
         Plane::recover_audio(self)
+    }
+    fn enqueue_feedback(
+        &mut self,
+        feedback: HostFeedback,
+    ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError> {
+        Plane::enqueue_feedback(self, feedback)
     }
 }
 
@@ -306,7 +320,11 @@ impl Pipeline {
                 || (record.state == State::Active
                     && (record.force_idr
                         || (record.input_lease.is_some()
-                            && (now >= record.input_renew_at || !record.input_events.is_empty()))))
+                            && (now >= record.input_renew_at
+                                || (record.feedback_ack_through.is_some()
+                                    && now >= record.feedback_poll_at)
+                                || !record.input_events.is_empty()
+                                || now >= record.feedback_poll_at))))
                 || (record.state == State::Armed && now >= record.next_auth_poll)
         };
         let next = self
@@ -336,11 +354,21 @@ impl Pipeline {
                 Step::RenewInput,
                 record.input_expires_at.min(now.saturating_add(5000)),
             )
+        } else if record.input_lease.is_some()
+            && record.feedback_ack_through.is_some()
+            && now >= record.feedback_poll_at
+        {
+            (
+                Step::FeedbackAck,
+                record.input_expires_at.min(now.saturating_add(5000)),
+            )
         } else if !record.input_events.is_empty() {
             (
                 Step::InputBatch,
                 record.input_expires_at.min(now.saturating_add(5000)),
             )
+        } else if record.input_lease.is_some() && now >= record.feedback_poll_at {
+            (Step::FeedbackPeek, now.saturating_add(5000))
         } else {
             (Step::ForceIdr, now + 5000)
         };

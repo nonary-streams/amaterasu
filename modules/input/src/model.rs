@@ -81,9 +81,22 @@ pub enum Operation {
         lease: String,
         events: Vec<Event>,
     },
+    FeedbackPeek {
+        lease: String,
+        #[serde(default = "default_feedback_limit")]
+        limit: u8,
+    },
+    FeedbackAck {
+        lease: String,
+        through_sequence: u64,
+    },
     Release {
         lease: String,
     },
+}
+
+fn default_feedback_limit() -> u8 {
+    16
 }
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "platform", rename_all = "snake_case", deny_unknown_fields)]
@@ -798,6 +811,41 @@ mod tests {
             let mut payload = json!({"action":"acquire"});
             payload["back_button_timeout"] = value;
             assert!(serde_json::from_value::<Operation>(payload).is_err());
+        }
+    }
+
+    #[test]
+    fn feedback_pull_actions_require_bounded_peek_and_u64_ack_sequence() {
+        let peek: Operation = serde_json::from_value(json!({
+            "action":"feedback_peek",
+            "lease":"lease-token"
+        }))
+        .unwrap();
+        assert!(matches!(peek, Operation::FeedbackPeek { limit: 16, .. }));
+
+        let out_of_range_limit: Operation = serde_json::from_value(json!({
+            "action":"feedback_peek",
+            "lease":"x",
+            "limit":17
+        }))
+        .unwrap();
+        assert!(matches!(
+            out_of_range_limit,
+            Operation::FeedbackPeek { limit: 17, .. }
+        ));
+
+        for invalid in [
+            json!({"action":"feedback_peek","lease":"x","limit":1.5}),
+            json!({"action":"feedback_peek","lease":"x","extra":true}),
+            json!({"action":"feedback_ack","lease":"x","through_sequence":-1}),
+            json!({"action":"feedback_ack","lease":"x","through_sequence":1,"extra":true}),
+        ] {
+            let operation = serde_json::from_value::<Operation>(invalid);
+            if let Ok(Operation::FeedbackPeek { limit, .. }) = &operation {
+                assert!((1..=16).contains(limit));
+            } else {
+                assert!(operation.is_err());
+            }
         }
     }
 

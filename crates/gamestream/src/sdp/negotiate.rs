@@ -1,6 +1,9 @@
 use super::attributes::{Attributes, bounded};
 use super::syntax;
-use super::{Announce, Audio, ColorMode, ControlProtocol, Encryption, Error, Fec, Video};
+use super::{
+    Announce, Audio, ColorMode, ControlProtocol, Encryption, Error, Fec,
+    KNOWN_CLIENT_FEATURE_FLAGS, Video,
+};
 
 pub fn parse_announce(bytes: &[u8]) -> Result<Announce, Error> {
     let document = syntax::parse(bytes)?;
@@ -24,7 +27,7 @@ pub fn parse_announce(bytes: &[u8]) -> Result<Announce, Error> {
     let encryption = encryption(&mut attributes, control)?;
     let fec = fec(&mut attributes)?;
     let client_feature_flags = attributes.default("x-ml-general.featureFlags", 0)?;
-    if client_feature_flags & !3 != 0 {
+    if client_feature_flags & !KNOWN_CLIENT_FEATURE_FLAGS != 0 {
         return Err(Error::Unsupported("client feature flags"));
     }
     attributes.default_value("x-nv-general.enableRecoveryMode", 0)?;

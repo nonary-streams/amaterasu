@@ -25,6 +25,8 @@ pub(super) enum Step {
     ReleaseInput,
     RenewInput,
     InputBatch,
+    FeedbackPeek,
+    FeedbackAck,
     DrainVideo,
     CloseCapture,
     WaitDrain,
@@ -217,6 +219,15 @@ impl Job {
                 if let Some(back_as_touchpad_click) = start.ds4_back_as_touchpad_click {
                     payload["ds4_back_as_touchpad_click"] = json!(back_as_touchpad_click);
                 }
+                if let Some(motion_as_ds4) = start.motion_as_ds4 {
+                    payload["motion_as_ds4"] = json!(motion_as_ds4);
+                }
+                if let Some(touchpad_as_ds4) = start.touchpad_as_ds4 {
+                    payload["touchpad_as_ds4"] = json!(touchpad_as_ds4);
+                }
+                if let Some(ds5_inputtino_randomize_mac) = start.ds5_inputtino_randomize_mac {
+                    payload["ds5_inputtino_randomize_mac"] = json!(ds5_inputtino_randomize_mac);
+                }
                 ("amaterasu.input/1".into(), payload)
             }
             Step::FindInput => (
@@ -234,6 +245,15 @@ impl Job {
             Step::InputBatch => (
                 "amaterasu.input/1".into(),
                 json!({"action":"batch","lease":record.input_lease,"events":record.input_events.iter().take(record.input_inflight).collect::<Vec<_>>() }),
+            ),
+            Step::FeedbackPeek => (
+                "amaterasu.input/1".into(),
+                json!({"action":"feedback_peek","lease":record.input_lease,"limit":16}),
+            ),
+            Step::FeedbackAck => (
+                "amaterasu.input/1".into(),
+                json!({"action":"feedback_ack","lease":record.input_lease,
+                    "through_sequence":record.feedback_ack_through}),
             ),
             Step::DrainVideo => (
                 Resource::Video.service(),

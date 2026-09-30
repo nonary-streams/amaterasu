@@ -508,6 +508,12 @@ pub struct Open {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ds4_back_as_touchpad_click: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_as_ds4: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touchpad_as_ds4: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ds5_inputtino_randomize_mac: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyboard: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
@@ -857,6 +863,9 @@ impl Open {
                 "controller": self.controller,
                 "gamepad": self.gamepad,
                 "ds4_back_as_touchpad_click": self.ds4_back_as_touchpad_click,
+                "motion_as_ds4": self.motion_as_ds4,
+                "touchpad_as_ds4": self.touchpad_as_ds4,
+                "ds5_inputtino_randomize_mac": self.ds5_inputtino_randomize_mac,
                 "keyboard": self.keyboard,
                 "mouse": self.mouse,
                 "native_pen_touch": self.native_pen_touch,
@@ -890,14 +899,19 @@ impl Open {
         payload
     }
 
-    pub(crate) fn arm_with_encryption(
+    pub(crate) fn arm_with_negotiation(
         &self,
         session: u64,
         encryption: EncryptionSnapshot,
+        slices_per_frame: i32,
+        client_feature_flags: u32,
     ) -> serde_json::Value {
         let mut payload = self.arm(session);
         payload["configuration"]["encrypt_video"] = serde_json::json!(encryption.video);
         payload["configuration"]["encrypt_audio"] = serde_json::json!(encryption.audio);
+        payload["configuration"]["configuration"]["slices_per_frame"] =
+            serde_json::json!(slices_per_frame);
+        payload["configuration"]["client_feature_flags"] = serde_json::json!(client_feature_flags);
         payload
     }
 }

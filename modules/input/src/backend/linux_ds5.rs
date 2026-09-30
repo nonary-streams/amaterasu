@@ -3,15 +3,16 @@
 //! The report contract follows the pinned Inputtino USB profile at
 //! `f9eed6d34ff6cb5a30cfce6ee4e6f5362abedb82`: Sony USB identity, report IDs,
 //! sensor scales, touch encoding, feature replies, and the 10 ms input cadence.
-//! Client-to-host rumble, lightbar, adaptive-trigger, and PCM callbacks are not
-//! part of Amaterasu's current input protocol; valid HID output reports are
-//! accepted and consumed without claiming remote feedback delivery.
+//! UHID output reports capture rumble, lightbar, and adaptive-trigger changes
+//! into the active feedback queue. PCM decoding remains unsupported here.
 
+use crate::feedback::FeedbackProducer;
 use crate::gamepad::{
     ControllerSnapshot, GamepadBatteryState, GamepadDevice, GamepadMotionType, GamepadTouchPhase,
     GamepadTouchReport,
 };
 use crate::model::{InputError, InputResult};
+use amaterasu_gamestream::control::HostFeedback;
 #[cfg(not(test))]
 use std::fs::{File, OpenOptions};
 #[cfg(not(test))]
@@ -475,6 +476,53 @@ fn output_report_is_well_formed(event: &[u8]) -> bool {
         && event.get(4) == Some(&DS5_OUTPUT_REPORT_ID)
 }
 
+fn dispatch_output_feedback(event: &[u8], producer: &FeedbackProducer) -> bool {
+    if !output_report_is_well_formed(event) {
+        return false;
+    }
+    let report = &event[4..4 + DS5_OUTPUT_REPORT_SIZE];
+    let flags0 = report[1];
+    let flags1 = report[2];
+    let flags2 = report[39];
+    if flags0 & 0x01 != 0 || flags2 & 0x04 != 0 {
+        producer.push(HostFeedback::Rumble {
+            controller: producer.controller(),
+            low_frequency: u16::from(report[4]) * 257,
+            high_frequency: u16::from(report[3]) * 257,
+        });
+    } else if flags0 == 0 && flags1 == 0 && flags2 == 0 {
+        producer.push(HostFeedback::Rumble {
+            controller: producer.controller(),
+            low_frequency: 0,
+            high_frequency: 0,
+        });
+    }
+    let event_flags = flags0 & 0x0c;
+    if event_flags != 0 {
+        let mut left = [0; 10];
+        let mut right = [0; 10];
+        left.copy_from_slice(&report[23..33]);
+        right.copy_from_slice(&report[12..22]);
+        producer.push(HostFeedback::AdaptiveTriggers {
+            controller: producer.controller(),
+            event_flags,
+            type_left: report[22],
+            type_right: report[11],
+            left,
+            right,
+        });
+    }
+    if flags1 & 0x04 != 0 {
+        producer.push(HostFeedback::RgbLed {
+            controller: producer.controller(),
+            red: report[45],
+            green: report[46],
+            blue: report[47],
+        });
+    }
+    true
+}
+
 fn create_event(event_type: u32) -> Vec<u8> {
     let mut event = vec![0; UHID_EVENT_SIZE];
     put_u32(&mut event, 0, event_type);
@@ -568,6 +616,7 @@ impl UhidDevice {
         report: Arc<Mutex<Ds5ReportState>>,
         address: [u8; 6],
         randomize_mac: bool,
+        feedback: FeedbackProducer,
     ) -> InputResult<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -597,6 +646,7 @@ impl UhidDevice {
             let worker_failure = Arc::clone(&failure);
             let worker_stop = Arc::clone(&stop);
             let worker_started = Arc::clone(&started);
+            let worker_feedback = feedback.clone();
             thread::Builder::new()
                 .name(format!("amaterasu-ds5-{slot}"))
                 .spawn(move || {
@@ -604,6 +654,7 @@ impl UhidDevice {
                         &worker_file,
                         &worker_report,
                         address,
+                        &worker_feedback,
                         &worker_stop,
                         &worker_started,
                     ) {
@@ -706,6 +757,7 @@ fn run_uhid_loop(
     file: &Arc<Mutex<File>>,
     report: &Arc<Mutex<Ds5ReportState>>,
     address: [u8; 6],
+    feedback: &FeedbackProducer,
     stop: &AtomicBool,
     started: &AtomicBool,
 ) -> InputResult<()> {
@@ -775,10 +827,7 @@ fn run_uhid_loop(
                     write_event(file, &set_report_reply(&event, &report_state))?;
                 }
                 UHID_OUTPUT => {
-                    // The native device driver can issue these valid rumble,
-                    // lightbar, and trigger requests, but there is no
-                    // client-feedback route in the current Amaterasu protocol.
-                    let _ = output_report_is_well_formed(&event);
+                    let _ = dispatch_output_feedback(&event, feedback);
                 }
                 _ => {}
             }
@@ -985,6 +1034,7 @@ impl UhidTransport {
         _report: Arc<Mutex<Ds5ReportState>>,
         address: [u8; 6],
         randomize_mac: bool,
+        _feedback: FeedbackProducer,
     ) -> InputResult<Self> {
         #[cfg(test)]
         if let Some(device) = FakeUhidDevice::create(slot, address, randomize_mac)? {
@@ -1001,6 +1051,7 @@ impl UhidTransport {
             _report,
             address,
             randomize_mac,
+            _feedback,
         )?))
     }
 
@@ -1039,10 +1090,15 @@ pub(super) struct Ds5Gamepad {
     device: Option<UhidTransport>,
     report: Arc<Mutex<Ds5ReportState>>,
     recovery_required: bool,
+    feedback: FeedbackProducer,
 }
 
 impl Ds5Gamepad {
-    pub(super) fn create(slot: u8, randomize_mac: bool) -> InputResult<Self> {
+    pub(super) fn create(
+        slot: u8,
+        randomize_mac: bool,
+        feedback: FeedbackProducer,
+    ) -> InputResult<Self> {
         let report = Arc::new(Mutex::new(Ds5ReportState::default()));
         let address = device_address(slot, randomize_mac)?;
         Ok(Self {
@@ -1054,9 +1110,11 @@ impl Ds5Gamepad {
                 Arc::clone(&report),
                 address,
                 randomize_mac,
+                feedback.clone(),
             )?),
             report,
             recovery_required: false,
+            feedback,
         })
     }
 
@@ -1142,6 +1200,7 @@ impl GamepadDevice for Ds5Gamepad {
             Arc::clone(&self.report),
             self.address,
             self.randomize_mac,
+            self.feedback.clone(),
         )?);
         self.recovery_required = false;
         Ok(())
@@ -1178,6 +1237,12 @@ impl Drop for Ds5Gamepad {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_feedback(slot: u8) -> FeedbackProducer {
+        let queue = crate::feedback::FeedbackQueue::default();
+        let generation = queue.begin_lease();
+        queue.producer(generation, u16::from(slot), 0)
+    }
 
     #[test]
     fn ds5_input_report_maps_usb_axes_buttons_triggers_and_sequence() {
@@ -1358,6 +1423,62 @@ mod tests {
     }
 
     #[test]
+    fn valid_output_report_enqueues_slot_owned_rumble_triggers_and_lightbar() {
+        let queue = crate::feedback::FeedbackQueue::default();
+        let generation = queue.begin_lease();
+        let producer = queue.producer(generation, 4, 0);
+        let mut output = create_event(UHID_OUTPUT);
+        output[4] = DS5_OUTPUT_REPORT_ID;
+        output[5] = 0x0d;
+        output[6] = 0x04;
+        output[7] = 128;
+        output[8] = 64;
+        output[15] = 3;
+        output[16..26].copy_from_slice(&[1; 10]);
+        output[26] = 2;
+        output[27..37].copy_from_slice(&[2; 10]);
+        output[49..52].copy_from_slice(&[10, 20, 30]);
+        put_u16(
+            &mut output,
+            4 + UHID_DATA_MAX,
+            u16::try_from(DS5_OUTPUT_REPORT_SIZE).unwrap(),
+        );
+        output[4 + UHID_DATA_MAX + 2] = UHID_OUTPUT_REPORT;
+
+        assert!(dispatch_output_feedback(&output, &producer));
+        let events = queue.peek(4);
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0].feedback,
+            HostFeedback::Rumble {
+                controller: 4,
+                low_frequency: 64 * 257,
+                high_frequency: 128 * 257,
+            }
+        );
+        assert_eq!(
+            events[1].feedback,
+            HostFeedback::AdaptiveTriggers {
+                controller: 4,
+                event_flags: 0x0c,
+                type_left: 2,
+                type_right: 3,
+                left: [2; 10],
+                right: [1; 10],
+            }
+        );
+        assert_eq!(
+            events[2].feedback,
+            HostFeedback::RgbLed {
+                controller: 4,
+                red: 10,
+                green: 20,
+                blue: 30,
+            }
+        );
+    }
+
+    #[test]
     fn get_and_set_report_replies_reject_unsupported_reports() {
         let state = Ds5ReportState::default();
         let address = [0x02, 0, 0, 0, 0, 3];
@@ -1403,7 +1524,7 @@ mod tests {
     #[test]
     fn synthetic_device_failure_recovery_keeps_identity_and_release_retries() {
         let (guard, adapter) = FakeUhidGuard::install();
-        let mut device = Ds5Gamepad::create(4, false).unwrap();
+        let mut device = Ds5Gamepad::create(4, false, test_feedback(4)).unwrap();
         device
             .update(ControllerSnapshot {
                 buttons: A,

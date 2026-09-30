@@ -749,6 +749,15 @@ pub struct StartConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ds4_back_as_touchpad_click: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_as_ds4: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touchpad_as_ds4: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ds5_inputtino_randomize_mac: Option<bool>,
+    /// Immutable Moonlight feature flags retained from the accepted RTSP ANNOUNCE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_feature_flags: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuous_audio: Option<bool>,
     /// Optional PLAY snapshot; when present it must match the immutable
     /// encryption policy accepted during prepare.
@@ -820,6 +829,11 @@ impl StartConfig {
         self.encoder.validate()?;
         if self.continuous_audio == Some(true) && !stream_audio {
             return Err("continuous_audio_requires_stream_audio");
+        }
+        if self.client_feature_flags.is_some_and(|flags| {
+            flags & !amaterasu_gamestream::sdp::KNOWN_CLIENT_FEATURE_FLAGS != 0
+        }) {
+            return Err("invalid_start_configuration");
         }
         if !valid_minimum_fps_target(self.minimum_fps_target) {
             return Err("invalid_minimum_fps_target");
@@ -1147,6 +1161,24 @@ mod tests {
             let parsed: StartConfig = serde_json::from_value(request).unwrap();
             assert_eq!(parsed.validate(true), Err("invalid_minimum_fps_target"));
         }
+    }
+
+    #[test]
+    fn client_feature_flags_are_optional_frozen_known_bits() {
+        let absent: StartConfig = serde_json::from_value(start_json()).unwrap();
+        assert_eq!(absent.client_feature_flags, None);
+        assert!(absent.validate(true).is_ok());
+        for flags in [0, 3, 7] {
+            let mut value = start_json();
+            value["client_feature_flags"] = json!(flags);
+            let start: StartConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(start.client_feature_flags, Some(flags));
+            assert!(start.validate(true).is_ok());
+        }
+        let mut unknown = start_json();
+        unknown["client_feature_flags"] = json!(8);
+        let start: StartConfig = serde_json::from_value(unknown).unwrap();
+        assert_eq!(start.validate(true), Err("invalid_start_configuration"));
     }
 
     #[test]

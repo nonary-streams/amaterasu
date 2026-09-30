@@ -118,6 +118,8 @@ pub(super) struct Record {
     pub input_request_started_at: u64,
     pub input_expires_at: u64,
     pub input_renew_at: u64,
+    pub feedback_poll_at: u64,
+    pub feedback_ack_through: Option<u64>,
     pub input_events: VecDeque<Value>,
     pub input_inflight: usize,
     pub input_events_sent: u64,
@@ -184,6 +186,8 @@ impl Record {
             input_request_started_at: 0,
             input_expires_at: 0,
             input_renew_at: 0,
+            feedback_poll_at: 0,
+            feedback_ack_through: None,
             input_events: VecDeque::new(),
             input_inflight: 0,
             input_events_sent: 0,
@@ -265,6 +269,14 @@ impl Record {
             "history_activity_id": self.config.history_activity_id,
             "rtsp_operation_id": self.config.rtsp_operation_id,
             "state": self.state,
+            "client_feature_flags": self.start.as_ref().and_then(|start| start.client_feature_flags),
+            "haptics_pcm_negotiated": self.start.as_ref().is_some_and(|start| {
+                start.client_feature_flags.is_some_and(|flags| {
+                    flags & amaterasu_gamestream::sdp::CLIENT_FEATURE_HAPTICS_PCM != 0
+                })
+            }),
+            "client_feedback_active": self.input_lease.is_some()
+                && self.state == State::Active,
             "stream_audio": self.config.stream_audio,
             "audio": self.config.audio,
             "frame_limiter_settings": self.config.frame_limiter_settings,

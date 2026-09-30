@@ -5,6 +5,92 @@ fn enable_input(host: &mut Harness) {
     host.pipeline.settings.input_lease_ttl_ms = 1_000;
 }
 
+fn pcm_feedback(sequence: u32) -> Value {
+    serde_json::to_value(amaterasu_gamestream::control::HostFeedback::HapticsPcm {
+        controller: 2,
+        sequence,
+        frames: 1,
+        samples_s16le: vec![1, 2, 3, 4],
+    })
+    .unwrap()
+}
+
+#[test]
+fn feedback_poll_requires_rtsp_flags_gates_pcm_and_retries_before_ack() {
+    for (flags, expected_delivery) in [(3, false), (7, true)] {
+        let mut host = Harness::new();
+        enable_input(&mut host);
+        host.pipeline
+            .settings
+            .allowed_principals
+            .push("amaterasu.rtsp".into());
+        let id = host.response_from(1, "amaterasu.rtsp", prepare())["session"]
+            .as_u64()
+            .unwrap();
+        let mut launch = start(id);
+        launch["configuration"]["client_feature_flags"] = json!(flags);
+        assert_eq!(
+            host.response_from(2, "amaterasu.rtsp", launch)["state"],
+            "active"
+        );
+
+        host.broker.input_feedback_events.push_back(json!({
+            "sequence":1,"feedback":pcm_feedback(9)
+        }));
+        host.plane.borrow_mut().feedback_queue_full = 1;
+        host.idle();
+
+        assert_eq!(host.broker.input_feedback_acks, vec![1]);
+        assert!(host.broker.input_feedback_events.is_empty());
+        assert_eq!(
+            host.plane.borrow().feedback.len(),
+            usize::from(expected_delivery)
+        );
+        assert_eq!(
+            host.pipeline.records[&id].response()["haptics_pcm_negotiated"],
+            expected_delivery
+        );
+    }
+}
+
+#[test]
+fn feedback_ack_failure_retries_same_sequence_without_duplicate_plane_delivery() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let id = host.response_from(1, "amaterasu.rtsp", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let mut launch = start(id);
+    launch["configuration"]["client_feature_flags"] = json!(7);
+    assert_eq!(
+        host.response_from(2, "amaterasu.rtsp", launch)["state"],
+        "active"
+    );
+
+    host.broker.input_feedback_events.push_back(json!({
+        "sequence":1,"feedback":pcm_feedback(9)
+    }));
+    host.broker.feedback_ack_failures = 1;
+    host.idle();
+
+    assert_eq!(host.broker.input_feedback_acks, vec![1]);
+    assert!(host.broker.input_feedback_events.is_empty());
+    assert_eq!(host.plane.borrow().feedback.len(), 1);
+}
+
+#[test]
+fn direct_stream_session_caller_cannot_supply_client_feature_flags() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut launch = start(id);
+    launch["configuration"]["client_feature_flags"] = json!(0);
+    assert_eq!(host.response(2, launch)["code"], "permission_denied");
+}
+
 fn keyboard(pressed: bool, virtual_key: u8) -> crate::plane::ControlRecord {
     keyboard_packet(pressed, u16::from(virtual_key) | 0x8000, 0)
 }
@@ -85,6 +171,9 @@ fn stream_start_snapshots_scoped_input_policy_into_input_acquire() {
     start_request["configuration"]["key_repeat_delay"] = json!(0);
     start_request["configuration"]["key_repeat_frequency"] = json!(0.0);
     start_request["configuration"]["ds4_back_as_touchpad_click"] = json!(true);
+    start_request["configuration"]["motion_as_ds4"] = json!(false);
+    start_request["configuration"]["touchpad_as_ds4"] = json!(true);
+    start_request["configuration"]["ds5_inputtino_randomize_mac"] = json!(false);
 
     assert_eq!(host.response(2, start_request)["state"], "active");
     let acquire = host
@@ -104,6 +193,9 @@ fn stream_start_snapshots_scoped_input_policy_into_input_acquire() {
     assert_eq!(acquire.payload["key_repeat_delay"], 0);
     assert_eq!(acquire.payload["key_repeat_frequency"], 0.0);
     assert_eq!(acquire.payload["ds4_back_as_touchpad_click"], true);
+    assert_eq!(acquire.payload["motion_as_ds4"], false);
+    assert_eq!(acquire.payload["touchpad_as_ds4"], true);
+    assert_eq!(acquire.payload["ds5_inputtino_randomize_mac"], false);
 }
 
 #[test]

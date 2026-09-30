@@ -199,6 +199,11 @@ impl Pipeline {
             remaining,
         } = input;
 
+        if configuration.client_feature_flags.is_some() && owner != "amaterasu.rtsp" {
+            rpc::complete(send, request, error("permission_denied"));
+            return;
+        }
+
         let Some(record) = self
             .records
             .get_mut(&session)

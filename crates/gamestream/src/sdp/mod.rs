@@ -9,6 +9,9 @@ pub const MAX_BYTES: usize = 16 * 1024;
 pub const MAX_LINES: usize = 192;
 pub const MAX_LINE_BYTES: usize = 1024;
 pub const MAX_ATTRIBUTES: usize = 128;
+/// Moonlight client feature flag for PCM controller haptics.
+pub const CLIENT_FEATURE_HAPTICS_PCM: u32 = 0x04;
+pub const KNOWN_CLIENT_FEATURE_FLAGS: u32 = 0x07;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {

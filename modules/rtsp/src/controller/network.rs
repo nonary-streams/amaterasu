@@ -90,6 +90,7 @@ impl Controller {
                 );
                 if !completed {
                     record.negotiated_encryption = None;
+                    record.client_feature_flags = None;
                 }
             }
             Ok(NegotiationStep::Action {

@@ -70,7 +70,7 @@ impl GamepadProfile {
         }
         #[cfg(target_os = "linux")]
         {
-            &["auto", "xone", "ds4"]
+            &["auto", "xone", "ds4", "ds5", "switch"]
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
@@ -157,6 +157,10 @@ mod tests {
         for name in ["xone", "ds4", "ds5", "switch"] {
             assert!(serde_json::from_value::<GamepadProfile>(json!(name)).is_ok());
         }
+        #[cfg(target_os = "linux")]
+        assert!(GamepadProfile::implemented_profiles().contains(&"ds5"));
+        #[cfg(target_os = "linux")]
+        assert!(GamepadProfile::implemented_profiles().contains(&"switch"));
         #[cfg(target_os = "linux")]
         assert!(serde_json::from_value::<GamepadProfile>(json!("vhf")).is_err());
     }
