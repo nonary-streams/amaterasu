@@ -446,6 +446,21 @@ fn apply_decision_accounts_for_virtual_display_framegen_and_lossless_scaling() {
             ..PolicyContext::default()
         }
     ));
+
+    let lossless_scaling_framegen = PolicyContext {
+        frame_generation_provider: FrameGenerationProvider::LosslessScaling,
+        ..PolicyContext::default()
+    };
+    assert!(should_consider_apply(
+        &disabled_auto,
+        lossless_scaling_framegen
+    ));
+    let decision = resolve_rtss_sync_limiter(&disabled_auto, lossless_scaling_framegen);
+    assert_eq!(decision.value, RtssFrameLimitType::FrontEdgeSync);
+    assert_eq!(
+        decision.reason,
+        RtssSyncLimiterReason::FrameGenerationPolicy
+    );
 }
 
 #[test]

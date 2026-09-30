@@ -405,7 +405,8 @@ impl ApplyRequest {
         };
         let explicit_physical_capture = self.physical_framegen_capture.as_ref().copied();
         let inferred_frame_generation = match self.game_frame_generation_mode {
-            Presence::Value(GameFrameGenerationMode::GameProvided)
+            Presence::Value(GameFrameGenerationMode::LosslessScaling)
+            | Presence::Value(GameFrameGenerationMode::GameProvided)
             | Presence::Value(GameFrameGenerationMode::NvidiaSmoothMotion) => Some(true),
             Presence::Value(_) => Some(false),
             Presence::Missing | Presence::Null => None,
@@ -1083,6 +1084,18 @@ mod tests {
         inferred_game_generation["game_frame_generation_mode"] = json!("game-provided");
         let inferred = handle_payload("module-host", inferred_game_generation);
         assert_eq!(inferred["plan"]["should_consider_apply"], true);
+
+        let mut inferred_lossless_generation = apply_json();
+        inferred_lossless_generation["settings"]["frame_limiter_enable"] = json!(false);
+        inferred_lossless_generation["requested_stream_fps_millihz"] = json!(60_000);
+        inferred_lossless_generation["client_display_mode_override_millihz"] = json!(0);
+        inferred_lossless_generation["lossless_scaling_limit_millihz"] = json!(0);
+        inferred_lossless_generation["virtual_display_active"] = json!(false);
+        inferred_lossless_generation["physical_framegen_capture"] = json!(false);
+        inferred_lossless_generation["game_frame_generation_mode"] = json!("lossless-scaling");
+        let inferred = handle_payload("module-host", inferred_lossless_generation);
+        assert_eq!(inferred["plan"]["should_consider_apply"], true);
+        assert_eq!(inferred["plan"]["effective_limit_millihz"], 60_000);
 
         let invalid = handle_payload(
             "module-host",

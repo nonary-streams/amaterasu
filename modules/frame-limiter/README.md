@@ -92,6 +92,11 @@ FPS limit uses, in order, a Lossless Scaling limit, explicit client display-mode
 rate, and authoritative requested-stream FPS. When those sources are known to
 be absent or zero, the result remains `FollowStream`.
 
+An explicit active `lossless-scaling` frame-generation mode also activates the
+limiter policy even when no Lossless Scaling FPS limit is supplied. Its RTSS
+sync type follows the generic frame-generation policy, which uses Front Edge
+Sync unless virtual-display policy selects Reflex.
+
 ## Remaining integration and platform gates
 
 The lifecycle contract is implemented behind the fake-provider test seam, but

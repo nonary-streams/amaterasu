@@ -148,7 +148,9 @@ fn frame_generation_policy_is_active(context: PolicyContext) -> bool {
     context.physical_framegen_capture
         || matches!(
             context.frame_generation_provider,
-            FrameGenerationProvider::GameProvided | FrameGenerationProvider::NvidiaSmoothMotion
+            FrameGenerationProvider::LosslessScaling
+                | FrameGenerationProvider::GameProvided
+                | FrameGenerationProvider::NvidiaSmoothMotion
         )
 }
 
