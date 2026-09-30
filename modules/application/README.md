@@ -242,8 +242,14 @@ outcome. A wait/containment failure with an owned child does not update this
 field until that child settles. It contains no command text, environment, or
 output transcript; cleanup retries replace the last outcome after settlement.
 `cleanup_failed` includes the retained intended `outcome` (`exited`,
-`launch_failed`, or `cancelled`). It is not terminal: ownership and pending undo
-remain retained, and another terminate request explicitly retries cleanup.
+`launch_failed`, or `cancelled`) and a `cleanup_error` code. Process-tree errors
+identify the failed spawn settlement, wait, group inspection, signal, or reap
+operation; prepared cleanup uses `application_cleanup_failed` while its
+`cleanup.failures` report contains the command-level details. A retry clears the
+diagnostic while cleanup is in progress and a successful terminal transition
+never retains the old error. `cleanup_failed` is not terminal: ownership and
+pending undo remain retained, and another terminate request explicitly retries
+cleanup.
 
 `ok:true` means the operation was accepted; check `state` to determine progress
 or outcome. The original PID is retained after exit and must not be used for

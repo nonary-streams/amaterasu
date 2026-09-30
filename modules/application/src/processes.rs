@@ -133,6 +133,8 @@ struct ProcessRecord {
     pid: Option<u32>,
     #[serde(flatten)]
     state: ProcessState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleanup_error: Option<&'static str>,
     #[serde(flatten)]
     lifecycle: Option<ApplicationLifecycle>,
     #[serde(skip)]
@@ -193,6 +195,7 @@ impl ProcessRecord {
             operation_id,
             pid: None,
             state: ProcessState::Preparing,
+            cleanup_error: None,
             lifecycle,
             owner: caller.into(),
             spec,
@@ -308,7 +311,7 @@ impl ProcessRecord {
                     self.child = Some(child);
                     self.stop_deadline = Some(Instant::now());
                     self.completion = Some(completion);
-                    self.mark_cleanup_failed();
+                    self.mark_cleanup_failed("process_spawn_cleanup_failed");
                 } else {
                     self.complete_or_clean(completion);
                 }
@@ -337,6 +340,7 @@ impl ProcessRecord {
     }
 
     fn complete_or_clean(&mut self, completion: Completion) {
+        self.cleanup_error = None;
         if let Some(lifecycle) = &mut self.lifecycle {
             self.completion = Some(completion);
             lifecycle.begin_cleanup();
@@ -396,7 +400,7 @@ impl ProcessRecord {
                         Ok(false) => {}
                         Err(_) => {
                             self.completion = Some(Completion::ExitedPending);
-                            self.mark_cleanup_failed();
+                            self.mark_cleanup_failed("process_group_status_failed");
                             return;
                         }
                     }
@@ -408,19 +412,16 @@ impl ProcessRecord {
                     self.auto_detached = true;
                     return;
                 }
-                if self
-                    .begin_main_stop(Completion::ExitedPending, now)
-                    .is_err()
-                {
+                if let Err(error) = self.begin_main_stop(Completion::ExitedPending, now) {
                     self.completion = Some(Completion::ExitedPending);
-                    self.mark_cleanup_failed();
+                    self.mark_cleanup_failed(error);
                 }
             }
             Err(_) => {
                 // Preserve the owned handle and require an explicit retry before
                 // signaling a tree whose wait ownership could not be confirmed.
                 self.completion = Some(Completion::ExitedPending);
-                self.mark_cleanup_failed();
+                self.mark_cleanup_failed("process_wait_failed");
             }
         }
     }
@@ -448,18 +449,18 @@ impl ProcessRecord {
             return;
         }
         if child.force_stop().is_err() {
-            self.mark_cleanup_failed();
+            self.mark_cleanup_failed("process_kill_failed");
             return;
         }
         let status = match child.try_reap() {
             Ok(Some(status)) => status,
             Ok(None) if now >= deadline + REAP_TIMEOUT => {
-                self.mark_cleanup_failed();
+                self.mark_cleanup_failed("process_reap_timed_out");
                 return;
             }
             Ok(None) => return,
             Err(_) => {
-                self.mark_cleanup_failed();
+                self.mark_cleanup_failed("process_wait_failed");
                 return;
             }
         };
@@ -513,8 +514,9 @@ impl ProcessRecord {
             return;
         };
         if lifecycle.cleanup_failed() {
-            self.mark_cleanup_failed();
+            self.mark_cleanup_failed("application_cleanup_failed");
         } else if lifecycle.is_cleanup_complete() {
+            self.cleanup_error = None;
             let completion = self
                 .completion
                 .take()
@@ -524,12 +526,13 @@ impl ProcessRecord {
         }
     }
 
-    fn mark_cleanup_failed(&mut self) {
+    fn mark_cleanup_failed(&mut self, error: &'static str) {
         let outcome = self
             .completion
             .as_ref()
             .expect("cleanup failure has a retained outcome")
             .outcome();
+        self.cleanup_error = Some(error);
         self.state = ProcessState::CleanupFailed { outcome };
     }
 
@@ -589,6 +592,7 @@ impl ProcessRecord {
             ProcessState::CleanupFailed { .. } if self.child.is_some() => {
                 if self.stop_deadline.is_some() {
                     self.state = ProcessState::Stopping;
+                    self.cleanup_error = None;
                 } else {
                     let completion = self
                         .completion
@@ -596,6 +600,7 @@ impl ProcessRecord {
                         .expect("failed main cleanup has an outcome")
                         .clone();
                     self.begin_main_stop(completion, Instant::now())?;
+                    self.cleanup_error = None;
                 }
             }
             ProcessState::CleanupFailed { .. } => {
@@ -603,6 +608,7 @@ impl ProcessRecord {
                     .as_mut()
                     .expect("cleanup failure without main child has lifecycle")
                     .retry_cleanup();
+                self.cleanup_error = None;
                 self.state = ProcessState::Stopping;
             }
             ProcessState::Stopping
@@ -644,6 +650,7 @@ impl ProcessRecord {
             ProcessState::CleanupFailed { .. } if self.child.is_some() => {
                 if self.stop_deadline.is_some() {
                     self.state = ProcessState::Stopping;
+                    self.cleanup_error = None;
                 } else {
                     let completion = self
                         .completion
@@ -651,11 +658,13 @@ impl ProcessRecord {
                         .expect("failed main cleanup has an outcome")
                         .clone();
                     self.begin_main_stop(completion, Instant::now())?;
+                    self.cleanup_error = None;
                 }
             }
             ProcessState::CleanupFailed { .. } => {
                 if let Some(lifecycle) = &mut self.lifecycle {
                     lifecycle.retry_cleanup();
+                    self.cleanup_error = None;
                     self.state = ProcessState::Stopping;
                 }
             }
@@ -1396,6 +1405,51 @@ mod report_payload_tests {
             }
         }
         assert_eq!(received_ids, (1..=16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn process_cleanup_failure_status_preserves_the_containment_error() {
+        let mut manager = ProcessManager::default();
+        let missing = std::env::temp_dir().join(format!(
+            "amaterasu-missing-cleanup-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let response = manager.handle(
+            "alice",
+            json!({
+                "action":"launch",
+                "operation_id":"cleanup-error",
+                "executable":missing,
+            }),
+        );
+        assert_eq!(response["process"]["state"], "launch_failed", "{response}");
+        let process_id = response["process"]["process_id"].as_u64().unwrap();
+        let record = manager.records.get_mut(&process_id).unwrap();
+        record.completion = Some(Completion::ExitedPending);
+        record.mark_cleanup_failed("process_reap_timed_out");
+
+        let status = manager.handle("alice", json!({"action":"status","process_id":process_id}));
+        assert_eq!(status["process"]["state"], "cleanup_failed", "{status}");
+        assert_eq!(
+            status["process"]["cleanup_error"], "process_reap_timed_out",
+            "{status}"
+        );
+
+        manager
+            .records
+            .get_mut(&process_id)
+            .unwrap()
+            .complete_or_clean(Completion::Exited {
+                exit_code: Some(0),
+                success: true,
+            });
+        let recovered = manager.handle("alice", json!({"action":"status","process_id":process_id}));
+        assert_eq!(recovered["process"]["state"], "exited", "{recovered}");
+        assert!(recovered["process"].get("cleanup_error").is_none());
     }
 }
 
