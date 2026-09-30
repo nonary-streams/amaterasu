@@ -30,6 +30,27 @@ process for the local fixture. Its server is a controlled authentication fixture
 checks qualify browser cookie, reload, refresh, and peer-tab behavior, while the
 signed management host tests qualify the real authentication service.
 
+From the workspace root, `python3 scripts/test_signed_browser_session.py` runs
+Chromium against a freshly signed native HTTPS host and signed production
+assets. It requires a normal
+Linux user, Chromium, Node with built-in WebSocket support, Python `cryptography`,
+and the usual native build tools. Set `AMATERASU_BROWSER` to select the Chromium
+executable, or use `--skip-build` after building the workspace and frontend.
+All listeners use temporary loopback ports; host state and the browser's HOME,
+XDG directories and profile stay in a private temporary directory.
+
+This gate exercises actual UI remembered login and page reload, HttpOnly cookie
+secrecy, CSRF denial, native refresh rotation and administrative revocation,
+policy save and stale-revision conflict, native host restart persistence, and
+peer-tab sign-out. An injected post-admission failure also checks browser helper
+cleanup through retained process descriptors. Chromium receives a certificate
+exception for only the newly generated SPKI key; an unrelated untrusted key
+must still fail browser verification, and Python independently verifies the
+host certificate and loopback IP SAN. No CA, installed browser preference or
+service is changed. This qualifies the controlled Linux host/browser path;
+installed-service trust, physical platform TLS provisioning, and other browsers
+remain separate gates.
+
 The deterministic output is exactly `dist/index.html`, `dist/app.js`, and
 `dist/styles.css`. Built assets are included for the native package builder;
 `node_modules` is not. Source files are small TypeScript namespace modules compiled
