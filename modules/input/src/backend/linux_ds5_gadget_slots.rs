@@ -211,6 +211,7 @@ impl<H: GadgetIo> OwnedGadget<H> {
 
     pub(super) fn cleanup(&mut self) {
         if self.cleanup_on_drop
+            && self.created
             && !self.destroyed
             && let Some(handle) = self.handle.as_mut()
         {
@@ -599,7 +600,8 @@ mod tests {
         assert_eq!(registry.owner(0), None);
         assert_eq!(kernel.borrow().close_saw_exact_reservation, [true]);
         assert_eq!(kernel.borrow().close_attempts.len(), 1);
-        assert_eq!(kernel.borrow().destroy_attempts.len(), 1);
+        assert!(kernel.borrow().destroy_attempts.is_empty());
+        assert_eq!(kernel.borrow().lifecycle, ["close:1"]);
 
         kernel.borrow_mut().create_error = None;
         kernel.borrow_mut().fail_destroy_count = 2;
