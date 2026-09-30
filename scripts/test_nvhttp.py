@@ -33,11 +33,11 @@ FIXTURES = WORKSPACE / "modules/pairing/tests/fixtures"
 CLIENT_ID = "amaterasu-wire-test"
 
 
-def get(base, path, query=None, context=None):
+def get(base, path, query=None, context=None, timeout=15):
     url = base + path + ("?" + urlencode(query) if query else "")
     if context is not None:
         parsed = urlsplit(url)
-        connection = HTTPSConnection(parsed.hostname, parsed.port, context=context, timeout=15)
+        connection = HTTPSConnection(parsed.hostname, parsed.port, context=context, timeout=timeout)
         try:
             connection.connect()
             expected = x509.load_pem_x509_certificate((FIXTURES / "host-cert.pem").read_bytes())
@@ -51,7 +51,7 @@ def get(base, path, query=None, context=None):
         finally:
             connection.close()
     try:
-        response = urlopen(url, context=context, timeout=15)
+        response = urlopen(url, context=context, timeout=timeout)
     except HTTPError as error:
         response = error
     with response:

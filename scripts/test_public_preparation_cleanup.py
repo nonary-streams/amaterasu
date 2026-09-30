@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Signed public preparation/output and cleanup lasting beyond twenty seconds.
+"""Signed public launch with long preparation and cleanup lasting beyond twenty seconds.
 
 Uses private controlled Python children, synthetic capture/input, paired HTTPS,
 encrypted RTSP and the independent ENet client. This qualifies protocol and
@@ -8,6 +8,7 @@ lifecycle behavior on Linux, not hardware capture, playback or installed hosts.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -64,6 +65,7 @@ from test_steam_launch_workflow import OwnedProcesses
 from test_stream_session import start_client, stop_client
 
 LONG_UNDO_SECONDS = 21
+LONG_RAW_DO_SECONDS = 60
 INPUT_PROBE = "test.input-probe/1"
 OUTPUT_ROOT = "AMATERASU_OUTPUT_FIXTURE_ROOT"
 SCRIPT = Path(__file__).resolve()
@@ -103,7 +105,8 @@ def raw_command(owned, directory, trace, event, delay):
 
 
 def create_application(api, bearer, directory, owned, label, lifetime, *, prepared=True,
-                       failed_output=False):
+                       failed_output=False, raw_do_delay=0.05,
+                       structured_undo_delay=LONG_UNDO_SECONDS, raw_undo_delay=0.05):
     trace = directory / (label + ".trace")
     output = directory / (label + ".log")
     arguments = child_arguments(trace, "main" if prepared else "probe", lifetime)
@@ -130,12 +133,12 @@ def create_application(api, bearer, directory, owned, label, lifetime, *, prepar
         entry["launch"]["preparation"] = [{
             "run": structured_command(owned, directory, trace, "structured-do", 0.05),
             "undo": structured_command(
-                owned, directory, trace, "structured-undo", LONG_UNDO_SECONDS,
+                owned, directory, trace, "structured-undo", structured_undo_delay,
             ),
         }]
         entry["prep_cmd"] = [{
-            "do": raw_command(owned, directory, trace, "raw-do", 0.05),
-            "undo": raw_command(owned, directory, trace, "raw-undo", 0.05),
+            "do": raw_command(owned, directory, trace, "raw-do", raw_do_delay),
+            "undo": raw_command(owned, directory, trace, "raw-undo", raw_undo_delay),
         }]
     for _ in range(5):
         catalog = checked(api, "/v1/catalog/list", bearer=bearer)
@@ -313,6 +316,81 @@ def exercise_case(console, https, context, app, owned, exported, mode, oracle, d
     print(json.dumps(evidence, sort_keys=True), flush=True)
 
 
+def exercise_long_raw_do(console, https, context, app, owned, exported):
+    """Keep the signed public launch pending beyond both former 30/40s caps."""
+    baseline = console.request(SOURCE, {"action": "status"})
+    key = secrets.token_bytes(16)
+    query = launch_query(key, exported)
+    started_at = time.monotonic()
+    with ThreadPoolExecutor(max_workers=1) as requests:
+        response = requests.submit(get, https, "/launch", query, context,
+                                   timeout=90)
+
+        wait_until(lambda: any(row["event"] == "raw-do" and row["phase"] == "start"
+                               for row in trace_rows(app["trace"])),
+                   "public launch did not start raw preparation", 20)
+        raw_start = next(row for row in trace_rows(app["trace"])
+                         if row["event"] == "raw-do" and row["phase"] == "start")
+        deadline = started_at + 41
+        while time.monotonic() < deadline:
+            rows = trace_rows(app["trace"])
+            assert not response.done(), "public launch returned before long raw preparation completed"
+            assert not any(row["event"] == "raw-do" and row["phase"] == "done" for row in rows), rows
+            time.sleep(0.05)
+        assert time.monotonic() - started_at > 40, "public launch did not cross the NVHTTP startup deadline"
+        assert raw_start["at"] > started_at, raw_start
+        assert process_start(raw_start["pid"]) == raw_start["start"], \
+            "raw preparation child was no longer alive after 40 seconds"
+        print("Public signed launch remains pending after 40 seconds while raw do is owned and running",
+              flush=True)
+        opened = successful(response.result(timeout=60))
+        response_at = time.monotonic()
+
+    elapsed = time.monotonic() - started_at
+    url = opened.findtext("sessionUrl0", "")
+    assert url.startswith("rtspenc://"), opened.attrib
+    rows = trace_rows(app["trace"])
+    starts = [row for row in rows if row["phase"] == "start"]
+    completed = [row for row in rows if row["phase"] == "done"]
+    raw_done = next(row for row in completed if row["event"] == "raw-do")
+    main_start = next(row for row in starts if row["event"] == "main")
+    assert elapsed > 40, elapsed
+    assert [row["event"] for row in starts] == ["structured-do", "raw-do", "main"], rows
+    assert [row["event"] for row in completed] == ["structured-do", "raw-do"], rows
+    assert raw_done["at"] - raw_start["at"] >= LONG_RAW_DO_SECONDS, rows
+    assert raw_done["at"] <= response_at, "public launch succeeded before raw preparation completed"
+    assert raw_done["at"] <= main_start["at"], rows
+
+    successful(get(https, "/cancel", context=context))
+
+    def settled():
+        owned.recover()
+        current = trace_rows(app["trace"])
+        return (any(row["event"] == "structured-undo" and row["phase"] == "done" for row in current)
+                and any(row["event"] == "raw-undo" and row["phase"] == "done" for row in current)
+                and original_children_gone(app["trace"]) and public_idle(https, context))
+
+    wait_until(settled, "long-preparation cancellation did not settle", 30)
+    rows = trace_rows(app["trace"])
+    starts = [row for row in rows if row["phase"] == "start"]
+    completed = [row["event"] for row in rows if row["phase"] == "done"]
+    assert [row["event"] for row in starts] == [
+        "structured-do", "raw-do", "main", "raw-undo", "structured-undo",
+    ], rows
+    assert completed == ["structured-do", "raw-do", "raw-undo", "structured-undo"], rows
+    output = app["output"].read_text()
+    for row in starts:
+        for stream in ("OUT", "ERR"):
+            assert output.splitlines().count(stream + "-" + row["event"]) == 1, output
+    assert original_children_gone(app["trace"]), rows
+    assert capture_idle(console, baseline), "long preparation retained capture lease"
+    assert not console.request(INPUT_PROBE, {"action": "status"})["active"], "long preparation retained input lease"
+    print(json.dumps({"mode": "long-raw-do", "public_launch_seconds": elapsed,
+                      "raw_do_seconds": raw_done["at"] - raw_start["at"],
+                      "events": [row["event"] + ":" + row["phase"] for row in rows]},
+                     sort_keys=True), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-build", action="store_true", help="use already-built signed fixture artifacts")
@@ -346,6 +424,11 @@ def main():
                                          3 if mode == "natural" else 120)
                 for mode in ("natural", "cancel", "teardown")
             }
+            applications["long-raw-do"] = create_application(
+                api, bearer, directory, owned, "long-raw-do", 120,
+                raw_do_delay=LONG_RAW_DO_SECONDS,
+                structured_undo_delay=0.05,
+            )
             applications["probe"] = create_application(api, bearer, directory, owned,
                                                         "probe", 1, prepared=False)
             applications["failed"] = create_application(api, bearer, directory, owned,
@@ -371,6 +454,12 @@ def main():
                 exported[mode] = matches[0]
             failed_open_has_no_effects(console, https, context, applications["failed"], owned, exported["failed"])
             probe_reacquisition(console, https, context, applications["probe"], owned, exported["probe"])
+            print("Starting signed public preparation case: long raw do", flush=True)
+            exercise_long_raw_do(console, https, context, applications["long-raw-do"],
+                                 owned, exported["long-raw-do"])
+            probe_reacquisition(console, https, context, applications["probe"], owned,
+                                exported["probe"])
+            print("Passed: fresh public launch reacquired leases after long raw do", flush=True)
             control_directory = directory / "control"
             control_directory.mkdir()
             for mode in ("natural", "cancel", "teardown"):
@@ -389,9 +478,10 @@ def main():
             finally:
                 owned.cleanup()
         assert all(original_children_gone(app["trace"]) for app in applications.values())
-    print("Passed: signed paired HTTPS natural exit/cancel and encrypted RTSP TEARDOWN each "
-          "settle >20-second preparation cleanup automatically, append actual stdout/stderr, "
-          "run reverse undo once and reacquire leases. Synthetic capture/input and controlled "
+    print("Passed: signed public launch waited >40 seconds for owned raw preparation, and signed "
+          "paired HTTPS natural exit/cancel plus encrypted RTSP TEARDOWN each settle >20-second "
+          "preparation cleanup automatically, append actual stdout/stderr, run reverse undo once "
+          "and reacquire leases. Synthetic capture/input and controlled "
           "Linux children; hardware, playback and other platforms remain unqualified.", flush=True)
 
 
