@@ -208,6 +208,7 @@ impl PeerIdentity {
             sw_preset: config_overrides.sw_preset.clone(),
             sw_tune: config_overrides.sw_tune.clone(),
             encoder: config_overrides.encoder,
+            min_threads: config_overrides.min_threads,
         };
         client_software_encoder
             .validate()

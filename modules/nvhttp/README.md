@@ -618,7 +618,8 @@ limits.
 
 ## Software encoder policy
 
-Product document v19 persists nullable `sw_preset`, `sw_tune`, and `encoder`.
+Product document v20 persists nullable `sw_preset`, `sw_tune`, `encoder`, and
+`min_threads`.
 An omitted update preserves the current value; null resets tuning to the effective
 `superfast`/`zerolatency` defaults and backend selection to the trusted startup
 selector. Empty tuning is an explicit raw string, preserved across CAS writes,
@@ -627,8 +628,12 @@ bytes respectively and no control characters; the actual x264 consumer validates
 codec names at Open. Backend labels are exactly `auto` and `software`.
 
 Sparse application and certificate-authorized client overrides use the same
-syntax. Every field resolves independently, client before application before
-global. Null inherits the lower scope. NVHTTP freezes global/client values at
+syntax. The requested `min_threads` value defaults to 2 and accepts 1 through
+256. The reference parser accepts an unbounded integer, so this allocation bound
+is an explicit parser-parity difference. Effective x264 thread count can be
+lower than requested because of codec and frame-size limits. Every field
+resolves independently, client before application before global. Null inherits
+the lower scope. NVHTTP freezes global/client values at
 admission and application values at preflight, rejects changed application
 readback, and verifies the RTSP encoder/tuning snapshot before completing launch.
 RTSP copies this into stream-session and video; real video resolves ordinals and
@@ -642,7 +647,8 @@ See [encoder distribution requirements](../encode/README.md#software-x264-select
 Auto prefers registered hardware then available x264, with no hardware probing
 or fallback after failed hardware Open. Unsupported reference vendor labels are
 rejected. Windows software packaging, hardware qualification and live playback
-remain gates; `global:sw_preset`/`global:sw_tune` stay pending.
+remain gates; `global:sw_preset`/`global:sw_tune` and exact
+`global:min_threads` parser parity stay pending.
 
 `python scripts/test_software_encoder_policy.py` builds and loads the signed
 platform package in an isolated temporary host. It checks authenticated global,

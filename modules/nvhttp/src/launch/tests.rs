@@ -1108,6 +1108,7 @@ struct Broker {
     rtsp_encoder: Value,
     rtsp_sw_preset: Value,
     rtsp_sw_tune: Value,
+    rtsp_min_threads: Value,
     rtsp_display_request: Option<Value>,
     rtsp_executable_path: Option<String>,
     wrong_rtsp_snapshot: bool,
@@ -1180,7 +1181,7 @@ impl Default for Broker {
             application_catalog_revision: 1,
             rtsp_snapshot: None,
             rtsp_display_policy_snapshot: None,
-            rtsp_encoder: Value::Null,rtsp_sw_preset:Value::Null,rtsp_sw_tune:Value::Null,
+            rtsp_encoder: Value::Null,rtsp_sw_preset:Value::Null,rtsp_sw_tune:Value::Null,rtsp_min_threads:Value::Null,
             rtsp_display_request: None,
             rtsp_executable_path: None,
             wrong_rtsp_snapshot: false,
@@ -1383,6 +1384,7 @@ impl Broker {
             self.rtsp_encoder = payload["capture"]["encoder"].clone();
             self.rtsp_sw_preset = payload["sw_preset"].clone();
             self.rtsp_sw_tune = payload["sw_tune"].clone();
+            self.rtsp_min_threads = payload["min_threads"].clone();
             self.rtsp_snapshot = payload.get("frame_limiter_settings").cloned();
             self.rtsp_display_policy_snapshot = payload.get("display_policy_snapshot").cloned();
             self.rtsp_display_request = payload.get("display_request").cloned();
@@ -1594,6 +1596,7 @@ impl Broker {
             "session": 11,
             "stream_state": "prepared",
             "encoder":self.rtsp_encoder,"sw_preset":self.rtsp_sw_preset,"sw_tune":self.rtsp_sw_tune,
+            "min_threads":self.rtsp_min_threads,
             "frame_limiter_settings": if wrong_rtsp_snapshot {
                 json!({"wrong":"snapshot"})
             } else {
@@ -4098,19 +4101,20 @@ fn dual_uncertain_cleanup_calls_are_both_retained_and_reconciled_before_success(
 #[test]
 fn software_scopes_freeze_at_admission_and_preserve_null_empty_and_backend() {
     let now=Instant::now();
-    for client_override in [None,Some("")] {
+    for (client_override, client_threads) in [(None,None),(Some(""),Some(8))] {
         let mut controller=Controller::new(Some(config())).unwrap();
-        controller.set_software_encoder_options(SoftwareEncoderOptions {sw_preset:Some("fast".into()),sw_tune:Some("film".into()),encoder:Some(amaterasu_module_sdk::EncoderBackend::Auto)});
-        let mut broker=Broker {application_input_overrides:Some(json!({"sw_preset":"slow","sw_tune":"film,zerolatency","encoder":"software"})),..Default::default()};
+        controller.set_software_encoder_options(SoftwareEncoderOptions {sw_preset:Some("fast".into()),sw_tune:Some("film".into()),encoder:Some(amaterasu_module_sdk::EncoderBackend::Auto),min_threads:Some(4)});
+        let mut broker=Broker {application_input_overrides:Some(json!({"sw_preset":"slow","sw_tune":"film,zerolatency","encoder":"software","min_threads":6})),..Default::default()};
         let cert=vec![9;32];
-        let client=PeerIdentity::new("127.0.0.1".parse().unwrap(),cert.clone()).unwrap().with_paired_identity("client-9".into(),fingerprint(&cert),ClientConfigOverrides {sw_preset:client_override.map(str::to_owned),sw_tune:None,encoder:None,..Default::default()}).unwrap();
+        let client=PeerIdentity::new("127.0.0.1".parse().unwrap(),cert.clone()).unwrap().with_paired_identity("client-9".into(),fingerprint(&cert),ClientConfigOverrides {sw_preset:client_override.map(str::to_owned),sw_tune:None,encoder:None,min_threads:client_threads,..Default::default()}).unwrap();
         assert!(controller.launch(10,request(9),client,now).is_none());
-        controller.set_software_encoder_options(SoftwareEncoderOptions {sw_preset:Some("ultrafast".into()),sw_tune:Some("animation".into()),encoder:None});
+        controller.set_software_encoder_options(SoftwareEncoderOptions {sw_preset:Some("ultrafast".into()),sw_tune:Some("animation".into()),encoder:None,min_threads:Some(32)});
         let (_,reply)=poll_until_reply(&mut controller,&mut broker,now);assert_eq!(reply.status,200);
         let open=opened_rtsp_payload(&broker);
         assert_eq!(open["sw_preset"],client_override.unwrap_or("slow"));
         assert_eq!(open["sw_tune"],"film,zerolatency");
         assert_eq!(open["capture"]["encoder"],"software");
+        assert_eq!(open["min_threads"],client_threads.unwrap_or(6));
         let cert=vec![10;32];
         let unpaired=PeerIdentity::new("127.0.0.1".parse().unwrap(),cert.clone()).unwrap();
         assert!(unpaired.with_paired_identity("client-9".into(),fingerprint(&[9;32]),ClientConfigOverrides {sw_preset:Some("slow".into()),..Default::default()}).is_err());
@@ -4119,7 +4123,7 @@ fn software_scopes_freeze_at_admission_and_preserve_null_empty_and_backend() {
 
 #[test]
 fn malformed_software_application_options_fail_before_rtsp_and_launch() {
-    for overrides in [json!({"sw_preset":false}),json!({"sw_tune":"x".repeat(257)}),json!({"encoder":"nvenc"})] {
+    for overrides in [json!({"sw_preset":false}),json!({"sw_tune":"x".repeat(257)}),json!({"encoder":"nvenc"}),json!({"min_threads":0}),json!({"min_threads":257})] {
         let now=Instant::now();let mut controller=Controller::new(Some(config())).unwrap();
         let mut broker=Broker {application_input_overrides:Some(overrides),..Default::default()};
         assert!(controller.launch(10,request(8),peer(8),now).is_none());

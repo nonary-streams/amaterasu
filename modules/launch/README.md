@@ -329,9 +329,11 @@ missing ticket recovery, and bounded stop timeout. Full dynamic-provider/HTTP
 integration is tested separately by the host.
 
 Sparse software encoder overrides support exact `sw_preset`/`sw_tune` strings
-(up to 128/256 UTF-8 bytes, no controls) and `encoder: "auto" | "software"`.
-Null/absence inherit; empty tuning strings remain explicit. The actual x264
-backend validates codec vocabulary when opening software. NVHTTP resolves each
-field client before application before global and freezes the launch snapshot.
+(up to 128/256 UTF-8 bytes, no controls), `encoder: "auto" | "software"`, and
+a requested `min_threads` integer from 1 through 256 (default 2). Null/absence
+inherit; empty tuning strings remain explicit. The actual x264 backend validates
+codec vocabulary when opening software and may cap the effective thread count
+based on frame size or runtime limits. NVHTTP resolves each field client before
+application before global and freezes the launch snapshot.
 See [software policy](../nvhttp/README.md#software-encoder-policy) for runtime
 availability, source differences and remaining qualification gates.

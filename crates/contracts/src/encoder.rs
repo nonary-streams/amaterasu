@@ -60,11 +60,14 @@ pub struct SoftwareEncoderOptions {
     pub sw_preset: Option<String>,
     pub sw_tune: Option<String>,
     pub encoder: Option<EncoderBackend>,
+    /// Minimum native threads for software encoding; `None` inherits the default of two.
+    pub min_threads: Option<u16>,
 }
 
 impl SoftwareEncoderOptions {
     pub fn validate(&self) -> Result<(), &'static str> {
-        validate_software_options(self.sw_preset.as_deref(), self.sw_tune.as_deref())
+        validate_software_options(self.sw_preset.as_deref(), self.sw_tune.as_deref())?;
+        validate_min_threads(self.min_threads)
     }
 
     /// Each supplied field overrides independently; null/absence retain the lower layer.
@@ -76,7 +79,12 @@ impl SoftwareEncoderOptions {
                 .or_else(|| self.sw_preset.clone()),
             sw_tune: overrides.sw_tune.clone().or_else(|| self.sw_tune.clone()),
             encoder: overrides.encoder.or(self.encoder),
+            min_threads: overrides.min_threads.or(self.min_threads),
         }
+    }
+
+    pub fn effective_threads(&self) -> u16 {
+        self.min_threads.unwrap_or(2)
     }
 
     pub fn effective_preset(&self) -> &str {
@@ -98,6 +106,13 @@ pub fn validate_software_options(
         if value.is_some_and(|value| value.len() > limit || value.chars().any(char::is_control)) {
             return Err("invalid_software_encoder_options");
         }
+    }
+    Ok(())
+}
+
+pub fn validate_min_threads(threads: Option<u16>) -> Result<(), &'static str> {
+    if threads.is_some_and(|threads| !(1..=256).contains(&threads)) {
+        return Err("invalid_software_encoder_options");
     }
     Ok(())
 }
@@ -146,13 +161,19 @@ mod tests {
             sw_preset: Some("slow".into()),
             sw_tune: Some("film,zerolatency".into()),
             encoder: Some(EncoderBackend::Software),
+            min_threads: Some(8),
         };
-        let client: SoftwareEncoderOptions =
-            serde_json::from_value(json!({"sw_preset":"","sw_tune":null,"encoder":null})).unwrap();
+        let client: SoftwareEncoderOptions = serde_json::from_value(
+            json!({"sw_preset":"","sw_tune":null,"encoder":null,"min_threads":null}),
+        )
+        .unwrap();
         let effective = global.with_overrides(&app).with_overrides(&client);
         assert_eq!(effective.effective_preset(), "");
         assert_eq!(effective.effective_tune(), "film,zerolatency");
         assert_eq!(effective.encoder, Some(EncoderBackend::Software));
+        assert_eq!(effective.min_threads, Some(8));
+        assert_eq!(global.effective_threads(), 2);
+        assert_eq!(effective.effective_threads(), 8);
         assert!(effective.validate().is_ok());
         for invalid in [
             json!({"sw_preset":false}),
@@ -170,11 +191,23 @@ mod tests {
                 SoftwareEncoderOptions {
                     sw_preset: preset,
                     sw_tune: tune,
-                    encoder: None
+                    encoder: None,
+                    min_threads: None,
                 }
                 .validate()
                 .is_err()
             );
+        }
+        for threads in [0, 257] {
+            let invalid: SoftwareEncoderOptions =
+                serde_json::from_value(json!({"min_threads":threads})).unwrap();
+            assert!(invalid.validate().is_err());
+        }
+        for threads in [1, 2, 256] {
+            let valid: SoftwareEncoderOptions =
+                serde_json::from_value(json!({"min_threads":threads})).unwrap();
+            assert!(valid.validate().is_ok());
+            assert_eq!(valid.effective_threads(), threads);
         }
     }
 }

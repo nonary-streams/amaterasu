@@ -129,9 +129,11 @@ def initialize(console, encoder_selector):
         "hostname": settings["hostname"], "port": settings["port"],
         "expected_revision": settings["revision"], "lan_encryption_mode": 2,
         "sw_preset": "superfast", "sw_tune": "zerolatency", "encoder": encoder_selector,
+        "min_threads": 3,
     }, bearer)
     assert (settings["effective_sw_preset"], settings["effective_sw_tune"],
-            settings["configured_encoder"]) == ("superfast", "zerolatency", encoder_selector), settings
+            settings["configured_encoder"], settings["configured_min_threads"],
+            settings["effective_min_threads"]) == ("superfast", "zerolatency", encoder_selector, 3, 3), settings
     encoders = checked(api, "/v1/media/encoders", bearer=bearer)
     assert encoders["software_encoder"]["available"], encoders
     candidates = encoders["encoders"]
@@ -329,7 +331,7 @@ def main():
             raise
         finally:
             console.close()
-    print(f"Passed: public {arguments.encoder} selection, signed paired HTTPS launch, encrypted RTSP/ENet/video, real NV12 video/x264, independent FFmpeg decode, post-activation IDR, FEC, graceful drain and owned-source cleanup.")
+    print(f"Passed: public {arguments.encoder} selection, signed settings with min_threads=3, paired HTTPS launch, encrypted RTSP/ENet/video, real NV12 video/x264, independent FFmpeg decode, post-activation IDR, FEC, graceful drain and owned-source cleanup.")
     print(json.dumps(evidence, sort_keys=True))
     print("Not qualified: desktop capture, game/client playback, performance, Windows runtime or production x264 distribution; configuration parity IDs remain pending.")
 

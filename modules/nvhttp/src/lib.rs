@@ -138,6 +138,8 @@ enum Operation {
         #[serde(default, deserialize_with = "deserialize_field_update")]
         encoder: FieldUpdate<amaterasu_module_sdk::EncoderBackend>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
+        min_threads: FieldUpdate<u16>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
         ping_timeout_ms: FieldUpdate<i32>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         global_preparation: FieldUpdate<Vec<preparation::PreparationStep>>,
@@ -586,6 +588,7 @@ impl NvhttpModule {
                                 sw_preset,
                                 sw_tune,
                                 encoder,
+                                min_threads,
                                 ping_timeout_ms,
                                 global_preparation,
                                 legacy_global_preparation,
@@ -650,6 +653,7 @@ impl NvhttpModule {
                                         sw_preset,
                                         sw_tune,
                                         encoder,
+                                        min_threads,
                                     },
                                     ping_timeout_ms,
                                     global_preparation,

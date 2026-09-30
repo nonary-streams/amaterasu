@@ -489,6 +489,8 @@ pub struct Open {
     pub sw_preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_tune: Option<String>,
+    #[serde(default = "default_min_threads")]
+    pub min_threads: u32,
     #[serde(default)]
     pub capture_sink_without_routing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -695,6 +697,9 @@ impl Open {
             self.sw_preset.as_deref(),
             self.sw_tune.as_deref(),
         )?;
+        if !(1..=256).contains(&self.min_threads) {
+            return Err("invalid_software_encoder_options");
+        }
         if self
             .device_name
             .as_deref()
@@ -868,6 +873,7 @@ impl Open {
                     "height": self.profile.height,
                     "fps": self.profile.fps,
                     "bitrate": self.encoder_bitrate_kbps() * 1000,
+                    "min_threads": self.min_threads,
                     "max_reference_frames": self.profile.max_reference_frames,
                 },
             },
@@ -1243,6 +1249,10 @@ fn default_minimum_fps_target() -> f64 {
 
 fn default_wgc_pacing_smoothing() -> bool {
     true
+}
+
+fn default_min_threads() -> u32 {
+    2
 }
 
 fn valid_minimum_fps_target(value: f64) -> bool {

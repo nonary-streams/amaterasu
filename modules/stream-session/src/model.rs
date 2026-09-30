@@ -671,6 +671,12 @@ pub enum CaptureProvider {
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VideoConfiguration {
+    /// Minimum number of native workers requested from a software encoder.
+    #[serde(
+        default = "default_min_threads",
+        skip_serializing_if = "is_default_min_threads"
+    )]
+    pub min_threads: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -687,6 +693,14 @@ pub struct VideoConfiguration {
 
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+fn default_min_threads() -> u32 {
+    2
+}
+
+fn is_default_min_threads(value: &u32) -> bool {
+    *value == default_min_threads()
 }
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -882,6 +896,7 @@ impl VideoConfiguration {
             && self.height.is_multiple_of(2)
             && (1..=120).contains(&self.fps)
             && (100_000..=100_000_000).contains(&self.bitrate)
+            && (1..=256).contains(&self.min_threads)
             && self.max_reference_frames <= 1
             && amaterasu_module_sdk::validate_software_options(
                 self.sw_preset.as_deref(),

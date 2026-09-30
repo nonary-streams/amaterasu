@@ -1107,6 +1107,7 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
             "sw_preset",
             "sw_tune",
             "encoder",
+            "min_threads",
             "stream_audio",
             "audio_sink",
             "virtual_sink",
@@ -1676,6 +1677,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "sw_preset",
                     "sw_tune",
                     "encoder",
+                    "min_threads",
                     "video_max_batch_size_kb",
                     "max_bitrate",
                     "minimum_fps_target",
@@ -2685,6 +2687,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                     "sw_preset",
                     "sw_tune",
                     "encoder",
+                    "min_threads",
                     "max_bitrate",
                     "minimum_fps_target",
                     "video_max_batch_size_kb",
@@ -2763,6 +2766,14 @@ fn optional_software_encoder_options(object: &Object) -> Result<(), &'static str
             && !value
                 .as_str()
                 .is_some_and(|text| matches!(text, "auto" | "software"))
+    }) {
+        return Err(INVALID);
+    }
+    if object.get("min_threads").is_some_and(|value| {
+        !value.is_null()
+            && !value
+                .as_u64()
+                .is_some_and(|threads| (1..=256).contains(&threads))
     }) {
         return Err(INVALID);
     }
@@ -3797,8 +3808,8 @@ mod software_encoder_tests {
     #[test]
     fn signed_software_settings_and_scopes_retain_exact_null_empty_and_combined_tunes() {
         for fields in [
-            json!({"sw_preset":null,"sw_tune":null,"encoder":null}),
-            json!({"sw_preset":"","sw_tune":"film,zerolatency","encoder":"software"}),
+            json!({"sw_preset":null,"sw_tune":null,"encoder":null,"min_threads":null}),
+            json!({"sw_preset":"","sw_tune":"film,zerolatency","encoder":"software","min_threads":2}),
         ] {
             assert!(catalog_config_overrides(&fields).is_ok());
             let route = resolve("/v1/nvhttp/settings_update").unwrap();
@@ -3808,7 +3819,7 @@ mod software_encoder_tests {
                 .unwrap()
                 .extend(fields.as_object().unwrap().clone());
             let forwarded = payload(route, request.to_string().as_bytes()).unwrap();
-            for key in ["sw_preset", "sw_tune", "encoder"] {
+            for key in ["sw_preset", "sw_tune", "encoder", "min_threads"] {
                 assert_eq!(forwarded[key], fields[key]);
             }
             let paired = resolve("/v1/pairing/update_client_config_overrides").unwrap();
@@ -3819,6 +3830,9 @@ mod software_encoder_tests {
             json!({"sw_preset":false}),
             json!({"sw_tune":"x".repeat(257)}),
             json!({"encoder":"nvenc"}),
+            json!({"min_threads":0}),
+            json!({"min_threads":257}),
+            json!({"min_threads":1.5}),
         ] {
             assert!(catalog_config_overrides(&fields).is_err());
             let mut request = json!({"hostname":"Host","port":47989,"expected_revision":4});

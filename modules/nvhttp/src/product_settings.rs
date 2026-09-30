@@ -38,7 +38,8 @@ const DISPLAY_POLICY_SETTINGS_VERSION: u64 = 18;
 const DEFAULT_LAN_ENCRYPTION_MODE: u8 = 0;
 const DEFAULT_WAN_ENCRYPTION_MODE: u8 = 1;
 const SOFTWARE_ENCODER_SETTINGS_VERSION: u64 = 19;
-const SETTINGS_VERSION: u64 = SOFTWARE_ENCODER_SETTINGS_VERSION;
+const MIN_THREADS_SETTINGS_VERSION: u64 = 20;
+const SETTINGS_VERSION: u64 = MIN_THREADS_SETTINGS_VERSION;
 const DISPLAY_POLICY_KEYS: [&str; 8] = [
     "dd_mode_remapping",
     "dd_resolution_option",
@@ -95,6 +96,7 @@ pub(crate) struct SoftwareEncoderUpdate {
     pub(crate) sw_preset: FieldUpdate<String>,
     pub(crate) sw_tune: FieldUpdate<String>,
     pub(crate) encoder: FieldUpdate<EncoderBackend>,
+    pub(crate) min_threads: FieldUpdate<u16>,
 }
 
 fn apply_software_encoder_update(
@@ -105,6 +107,7 @@ fn apply_software_encoder_update(
         sw_preset: apply_field_update(update.sw_preset, current.sw_preset.clone()),
         sw_tune: apply_field_update(update.sw_tune, current.sw_tune.clone()),
         encoder: apply_field_update(update.encoder, current.encoder),
+        min_threads: apply_field_update(update.min_threads, current.min_threads),
     };
     options.validate()?;
     Ok(options)
@@ -2197,8 +2200,10 @@ impl ProductSettings {
                 "configured_sw_preset":self.configured_software_encoder.sw_preset,
                 "configured_sw_tune":self.configured_software_encoder.sw_tune,
                 "configured_encoder":self.configured_software_encoder.encoder,
+                "configured_min_threads":self.configured_software_encoder.min_threads,
                 "effective_sw_preset":self.configured_software_encoder.effective_preset(),
                 "effective_sw_tune":self.configured_software_encoder.effective_tune(),
+                "effective_min_threads":self.configured_software_encoder.effective_threads(),
                 "configured_ping_timeout_ms":self.configured_ping_timeout_ms(),
             }),
             json!({
@@ -2294,6 +2299,7 @@ fn product_update_payload(
         "sw_preset":streaming.software_encoder.sw_preset,
         "sw_tune":streaming.software_encoder.sw_tune,
         "encoder":streaming.software_encoder.encoder,
+        "min_threads":streaming.software_encoder.min_threads,
         "ping_timeout_ms":streaming.ping_timeout_ms,
         "global_preparation":streaming.global_preparation,
         "legacy_global_preparation":streaming.legacy_global_preparation,
@@ -2453,6 +2459,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | GLOBAL_RAW_PREPARATION_SETTINGS_VERSION
             | DISPLAY_POLICY_SETTINGS_VERSION
             | SOFTWARE_ENCODER_SETTINGS_VERSION
+            | MIN_THREADS_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -2479,6 +2486,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         GLOBAL_RAW_PREPARATION_SETTINGS_VERSION => 32,
         DISPLAY_POLICY_SETTINGS_VERSION => 40,
         SOFTWARE_ENCODER_SETTINGS_VERSION => 43,
+        MIN_THREADS_SETTINGS_VERSION => 44,
         _ => unreachable!(),
     };
     let matches_expected_value_count = values.len() == expected_value_count
@@ -2487,6 +2495,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         && ["sw_preset", "sw_tune", "encoder"]
             .iter()
             .any(|key| !values.contains_key(*key)))
+        || (version >= MIN_THREADS_SETTINGS_VERSION && !values.contains_key("min_threads"))
         || !matches_expected_value_count
         || !values.contains_key("hostname")
         || (version >= PORT_SETTINGS_VERSION && !values.contains_key("port"))
@@ -2673,7 +2682,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         None
     };
     let software_encoder: SoftwareEncoderOptions = if version >= SOFTWARE_ENCODER_SETTINGS_VERSION {
-        let options: SoftwareEncoderOptions = serde_json::from_value(json!({"sw_preset":values["sw_preset"],"sw_tune":values["sw_tune"],"encoder":values["encoder"]})).map_err(|_| invalid_state("persisted software encoder options are invalid"))?;
+        let options: SoftwareEncoderOptions = serde_json::from_value(json!({"sw_preset":values["sw_preset"],"sw_tune":values["sw_tune"],"encoder":values["encoder"],"min_threads":values.get("min_threads").cloned().unwrap_or(Value::Null)})).map_err(|_| invalid_state("persisted software encoder options are invalid"))?;
         options
             .validate()
             .map_err(|_| invalid_state("persisted software encoder options are invalid"))?;
@@ -2855,7 +2864,7 @@ fn update_result(
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
-        return Err(invalid_state("product_update did not confirm v19 settings"));
+        return Err(invalid_state("product_update did not confirm v20 settings"));
     }
     let document = parse_document(payload)?;
     if document.hostname.as_deref() != Some(expected.hostname)
@@ -3249,7 +3258,7 @@ mod tests {
         for key in DISPLAY_POLICY_KEYS {
             values.entry(key.to_owned()).or_insert(Value::Null);
         }
-        for key in ["sw_preset", "sw_tune", "encoder"] {
+        for key in ["sw_preset", "sw_tune", "encoder", "min_threads"] {
             values.entry(key.to_owned()).or_insert(Value::Null);
         }
         payload
@@ -3330,7 +3339,7 @@ mod tests {
         let pending = product.pending.take().unwrap();
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["expected_revision"], 7);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 43);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 44);
         let write = pending.payload["values"].clone();
         let response =
             json!({"ok":true,"found":true,"version":SETTINGS_VERSION,"revision":8,"values":write});
@@ -5000,7 +5009,7 @@ mod tests {
             },
         );
         assert_eq!(update["version"], SETTINGS_VERSION);
-        assert_eq!(update["values"].as_object().unwrap().len(), 43);
+        assert_eq!(update["values"].as_object().unwrap().len(), 44);
         assert_eq!(update["values"]["nvenc_spatial_aq"], false);
         assert_eq!(
             update["values"]["global_preparation"]
@@ -5114,7 +5123,7 @@ mod tests {
 
         let mut old_v17 = reply.clone();
         old_v17["version"] = json!(GLOBAL_RAW_PREPARATION_SETTINGS_VERSION);
-        for key in ["sw_preset", "sw_tune", "encoder"] {
+        for key in ["sw_preset", "sw_tune", "encoder", "min_threads"] {
             old_v17["values"].as_object_mut().unwrap().remove(key);
         }
         for key in DISPLAY_POLICY_KEYS {
@@ -5442,6 +5451,7 @@ mod tests {
                     "configured_wgc_pacing_smoothing":null,
                     "configured_sw_preset":null,"configured_sw_tune":null,"configured_encoder":null,
                     "effective_sw_preset":"superfast","effective_sw_tune":"zerolatency",
+                    "configured_min_threads":null,"effective_min_threads":2,
                     "effective_wgc_pacing_smoothing":true,
                     "configured_ping_timeout_ms":null,
                 }),
@@ -6506,10 +6516,26 @@ mod tests {
         );
     }
     #[test]
-    fn software_v19_cas_restart_reset_empty_and_readback_are_exact() {
+    fn software_v20_cas_restart_reset_empty_and_readback_are_exact() {
+        let mut prior_version = display_v18_document(7);
+        prior_version["version"] = json!(SOFTWARE_ENCODER_SETTINGS_VERSION);
+        let prior_values = prior_version["values"].as_object_mut().unwrap();
+        prior_values.insert("sw_preset".into(), Value::Null);
+        prior_values.insert("sw_tune".into(), Value::Null);
+        prior_values.insert("encoder".into(), Value::Null);
+        prior_values.remove("min_threads");
+        let mut prior_settings = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        prior_settings.apply_document(parse_document(&prior_version).unwrap());
+        assert_eq!(
+            prior_settings
+                .software_encoder_options()
+                .effective_threads(),
+            2
+        );
+
         let mut legacy = display_v18_document(7);
         legacy["version"] = json!(DISPLAY_POLICY_SETTINGS_VERSION);
-        for key in ["sw_preset", "sw_tune", "encoder"] {
+        for key in ["sw_preset", "sw_tune", "encoder", "min_threads"] {
             legacy["values"].as_object_mut().unwrap().remove(key);
         }
         let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
@@ -6533,14 +6559,16 @@ mod tests {
             sw_preset: FieldUpdate::Value("slow".into()),
             sw_tune: FieldUpdate::Value(String::new()),
             encoder: FieldUpdate::Value(EncoderBackend::Software),
+            min_threads: FieldUpdate::Value(8),
         };
         product.enqueue(51, 5000, action).unwrap();
         product.start_next();
         let pending = product.pending.take().unwrap();
-        assert_eq!(pending.payload["version"], 19);
+        assert_eq!(pending.payload["version"], 20);
         assert_eq!(pending.payload["expected_revision"], 7);
         assert_eq!(pending.payload["values"]["sw_tune"], "");
-        let saved = json!({"ok":true,"found":true,"version":19,"revision":8,"values":pending.payload["values"]});
+        assert_eq!(pending.payload["values"]["min_threads"], 8);
+        let saved = json!({"ok":true,"found":true,"version":20,"revision":8,"values":pending.payload["values"]});
         product.finish_call(pending.purpose, CallOutcome::Payload(saved.clone()));
         assert_eq!(product.revision(), Some(8));
         let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
@@ -6549,6 +6577,7 @@ mod tests {
             restarted.software_encoder_options(),
             product.software_encoder_options()
         );
+        assert_eq!(restarted.software_encoder_options().effective_threads(), 8);
         let mut action = display_update_action(DisplayPolicyUpdate::default(), 8);
         let AdminAction::Update {
             software_encoder, ..
@@ -6558,13 +6587,15 @@ mod tests {
         };
         software_encoder.sw_preset = FieldUpdate::Null;
         software_encoder.encoder = FieldUpdate::Null;
+        software_encoder.min_threads = FieldUpdate::Null;
         restarted.enqueue(52, 5000, action).unwrap();
         restarted.start_next();
         let pending = restarted.pending.take().unwrap();
         assert!(pending.payload["values"]["sw_preset"].is_null());
         assert_eq!(pending.payload["values"]["sw_tune"], "");
         assert!(pending.payload["values"]["encoder"].is_null());
-        let mut forged = json!({"ok":true,"found":true,"version":19,"revision":9,"values":pending.payload["values"]});
+        assert!(pending.payload["values"]["min_threads"].is_null());
+        let mut forged = json!({"ok":true,"found":true,"version":20,"revision":9,"values":pending.payload["values"]});
         forged["values"]["sw_tune"] = json!("zerolatency");
         restarted.finish_call(pending.purpose, CallOutcome::Payload(forged));
         assert_eq!(restarted.revision(), None);
@@ -6577,6 +6608,8 @@ mod tests {
             ("sw_preset", json!(false)),
             ("sw_tune", json!("x".repeat(257))),
             ("encoder", json!("nvenc")),
+            ("min_threads", json!(0)),
+            ("min_threads", json!(257)),
         ] {
             let mut invalid = saved.clone();
             invalid["values"][field] = value;

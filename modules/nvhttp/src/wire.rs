@@ -585,6 +585,7 @@ pub(super) struct ClientConfigOverrides {
     pub(super) sw_preset: Option<String>,
     pub(super) sw_tune: Option<String>,
     pub(super) encoder: Option<amaterasu_module_sdk::EncoderBackend>,
+    pub(super) min_threads: Option<u16>,
     pub(super) display_mode: Option<String>,
     pub(super) fec_percentage: Option<u8>,
     pub(super) max_bitrate: Option<i32>,

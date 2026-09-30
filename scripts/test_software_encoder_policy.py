@@ -16,7 +16,7 @@ from test_host_service import Console
 from test_management_api import Api, ORIGIN, PASSWORD, stop_console
 from test_platform_modules import PlatformHarness, configure_steam_fixture
 
-FIELDS = ("sw_preset", "sw_tune", "encoder")
+FIELDS = ("sw_preset", "sw_tune", "encoder", "min_threads")
 FIXTURES = WORKSPACE / "modules/pairing/tests/fixtures"
 
 
@@ -83,12 +83,16 @@ def exercise(harness):
         assert selected(settings) == dict.fromkeys(FIELDS), settings
         assert settings["effective_sw_preset"] == "superfast", settings
         assert settings["effective_sw_tune"] == "zerolatency", settings
+        assert settings["effective_min_threads"] == 2, settings
         change = {"hostname": "Software policy", "port": settings["port"],
                   "expected_revision": settings["revision"], "sw_preset": "slow"}
         assert api.post("/v1/nvhttp/settings_update", change, reader)[0] == 403
         settings = update_global(api, bearer, settings,
-                                 sw_preset="  slow  ", sw_tune="film,zerolatency", encoder="software")
-        assert selected(settings) == {"sw_preset": "  slow  ", "sw_tune": "film,zerolatency", "encoder": "software"}
+                                 sw_preset="  slow  ", sw_tune="film,zerolatency", encoder="software",
+                                 min_threads=8)
+        assert selected(settings) == {"sw_preset": "  slow  ", "sw_tune": "film,zerolatency",
+                                      "encoder": "software", "min_threads": 8}
+        assert settings["effective_min_threads"] == 8, settings
         stale = dict(change, expected_revision=settings["revision"] - 1)
         status, conflict, _ = api.post("/v1/nvhttp/settings_update", stale, bearer)
         assert status == 200 and conflict.get("code") == "revision_conflict", conflict
@@ -96,8 +100,10 @@ def exercise(harness):
         assert settings["configured_sw_tune"] == "" and settings["effective_sw_tune"] == "", settings
         # An unrelated update omits all software fields and must retain them.
         settings = update_global(api, bearer, settings)
-        assert selected(settings) == {"sw_preset": "  slow  ", "sw_tune": "", "encoder": "software"}
-        for field, value in [("sw_preset", False), ("sw_tune", "x" * 257), ("encoder", "nvenc")]:
+        assert selected(settings) == {"sw_preset": "  slow  ", "sw_tune": "", "encoder": "software",
+                                      "min_threads": 8}
+        for field, value in [("sw_preset", False), ("sw_tune", "x" * 257), ("encoder", "nvenc"),
+                             ("min_threads", 0), ("min_threads", 257), ("min_threads", 1.5)]:
             invalid = {**change, "expected_revision": settings["revision"], field: value}
             assert api.post("/v1/nvhttp/settings_update", invalid, bearer)[0] == 400
         availability = checked(api, "/v1/media/encoders", bearer=bearer)
@@ -106,7 +112,8 @@ def exercise(harness):
         assert not any(entry["identity"]["clsid"] == "amaterasu.software.x264" for entry in availability["encoders"])
 
         catalog = checked(api, "/v1/catalog/list", bearer=bearer)
-        app_options = {"sw_preset": "7", "sw_tune": "film,zerolatency", "encoder": "auto"}
+        app_options = {"sw_preset": "7", "sw_tune": "film,zerolatency", "encoder": "auto",
+                       "min_threads": 7}
         entry = {"name": "Software policy scoped application", "config_overrides": app_options,
                  "launch": {"kind": "executable", "program": "/usr/bin/true"}}
         created = checked(api, "/v1/catalog/create", {"expected_revision": catalog["revision"], "entry": entry}, bearer)
@@ -129,7 +136,7 @@ def exercise(harness):
             assert imported["ok"], imported
             identities.append(imported["certificate_id"])
         clients = checked(api, "/v1/pairing/list_clients", bearer=bearer)
-        client_options = {"sw_preset": "", "sw_tune": None, "encoder": "software"}
+        client_options = {"sw_preset": "", "sw_tune": None, "encoder": "software", "min_threads": 9}
         request = {"certificate_id": identities[0], "expected_revision": clients["revision"], "config_overrides": client_options}
         assert api.post("/v1/pairing/update_client_config_overrides", request, forbidden)[0] == 403
         checked(api, "/v1/pairing/update_client_config_overrides", request, bearer)
@@ -148,7 +155,9 @@ def exercise(harness):
         assert status == 200 and refused.get("code") == "not_paired", refused
         clients = checked(api, "/v1/pairing/list_clients", bearer=bearer)
         by_certificate = {client["certificate_id"]: client for client in clients["clients"]}
-        assert by_certificate[identities[0]]["config_overrides"] == {"sw_preset": "", "encoder": "software"}, clients
+        assert by_certificate[identities[0]]["config_overrides"] == {
+            "sw_preset": "", "encoder": "software", "min_threads": 9,
+        }, clients
         assert not by_certificate[identities[1]].get("config_overrides"), clients
         console.eof()
     finally:
@@ -164,11 +173,15 @@ def exercise(harness):
         assert app["entry"]["config_overrides"] == app_options, app
         clients = checked(api, "/v1/pairing/list_clients", bearer=bearer)
         by_certificate = {client["certificate_id"]: client for client in clients["clients"]}
-        assert by_certificate[identities[0]]["config_overrides"] == {"sw_preset": "", "encoder": "software"}, clients
+        assert by_certificate[identities[0]]["config_overrides"] == {
+            "sw_preset": "", "encoder": "software", "min_threads": 9,
+        }, clients
         assert not by_certificate[identities[1]].get("config_overrides"), clients
-        reset = update_global(api, bearer, restored, sw_preset=None, sw_tune=None, encoder=None)
+        reset = update_global(api, bearer, restored, sw_preset=None, sw_tune=None, encoder=None,
+                              min_threads=None)
         assert selected(reset) == dict.fromkeys(FIELDS), reset
         assert (reset["effective_sw_preset"], reset["effective_sw_tune"]) == ("superfast", "zerolatency"), reset
+        assert reset["effective_min_threads"] == 2, reset
         console.eof()
     finally:
         stop_console(console)

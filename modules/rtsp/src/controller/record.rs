@@ -81,7 +81,7 @@ impl Record {
         json!({"ok":true,"ticket":self.id,"state":self.state,"local":self.local,
             "rtsp_url":self.url,"session":self.session,"stream_state":self.stream_state,
             "frame_limiter_settings":self.config.frame_limiter_settings,
-            "encoder":self.config.capture.encoder,"sw_preset":self.config.sw_preset,"sw_tune":self.config.sw_tune,
+            "encoder":self.config.capture.encoder,"sw_preset":self.config.sw_preset,"sw_tune":self.config.sw_tune,"min_threads":self.config.min_threads,
             "frame_limiter_executable_path":self.config.frame_limiter_executable_path,
             "history_activity_id":self.config.history_activity_id,
             "display_request":self.config.display_request,

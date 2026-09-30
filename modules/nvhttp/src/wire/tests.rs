@@ -165,6 +165,7 @@ impl Broker {
                         "ok": true,
                         "ticket": 1,
                         "encoder":payload["capture"]["encoder"],"sw_preset":payload["sw_preset"],"sw_tune":payload["sw_tune"],
+                        "min_threads":payload["min_threads"],
                         "rtsp_url": "rtspenc://127.0.0.1:48010",
                         "state": "ready",
                         "frame_limiter_settings": payload["frame_limiter_settings"],

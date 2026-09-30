@@ -6,7 +6,7 @@ pub use native::NativeBinding;
 pub use amaterasu_abi as abi;
 pub use amaterasu_contracts::encoder::{
     EncoderBackend, EncoderIdentity, EncoderSelection, SOFTWARE_ENCODER_ID, SoftwareEncoderOptions,
-    validate_software_options,
+    validate_min_threads, validate_software_options,
 };
 pub use amaterasu_contracts::{Command, Response, RuntimeHostContext};
 

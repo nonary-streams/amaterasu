@@ -217,6 +217,8 @@ pub struct ClientConfigOverrides {
     pub sw_tune: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder: Option<amaterasu_module_sdk::EncoderBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_threads: Option<u16>,
     /// Physical presentation mode; the streamed viewport and cadence are separate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_mode: Option<String>,
@@ -301,6 +303,8 @@ impl ClientConfigOverrides {
             self.sw_tune.as_deref(),
         )
         .map_err(|_| "invalid_config_overrides")?;
+        amaterasu_module_sdk::validate_min_threads(self.min_threads)
+            .map_err(|_| "invalid_config_overrides")?;
         if self
             .display_mode
             .as_deref()
@@ -422,6 +426,7 @@ impl ClientConfigOverrides {
         self.sw_preset.is_none()
             && self.sw_tune.is_none()
             && self.encoder.is_none()
+            && self.min_threads.is_none()
             && self.display_mode.is_none()
             && self.fec_percentage.is_none()
             && self.max_bitrate.is_none()
@@ -1600,9 +1605,10 @@ mod software_encoder_tests {
     use serde_json::json;
     #[test]
     fn software_fields_are_sparse_exact_and_bounded() {
-        let absent: ClientConfigOverrides =
-            serde_json::from_value(json!({"sw_preset":null,"sw_tune":null,"encoder":null}))
-                .unwrap();
+        let absent: ClientConfigOverrides = serde_json::from_value(
+            json!({"sw_preset":null,"sw_tune":null,"encoder":null,"min_threads":null}),
+        )
+        .unwrap();
         assert!(absent.is_empty());
         let selected: ClientConfigOverrides = serde_json::from_value(
             json!({"sw_preset":"","sw_tune":"film,zerolatency","encoder":"software"}),
@@ -1624,9 +1630,20 @@ mod software_encoder_tests {
         for invalid in [
             json!({"sw_preset":"x".repeat(129)}),
             json!({"sw_tune":"film\n"}),
+            json!({"min_threads":0}),
+            json!({"min_threads":257}),
         ] {
             let options: ClientConfigOverrides = serde_json::from_value(invalid).unwrap();
             assert!(options.validate().is_err());
+        }
+        for threads in [1, 2, 256] {
+            let options: ClientConfigOverrides =
+                serde_json::from_value(json!({"min_threads":threads})).unwrap();
+            assert!(options.validate().is_ok());
+            assert_eq!(
+                serde_json::to_value(options).unwrap(),
+                json!({"min_threads":threads})
+            );
         }
     }
 }

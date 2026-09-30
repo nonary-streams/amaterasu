@@ -302,6 +302,7 @@ impl Controller {
                         "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
                         "sw_preset":record.effective_software_encoder.effective_preset(),
                         "sw_tune":record.effective_software_encoder.effective_tune(),
+                        "min_threads":record.effective_software_encoder.effective_threads(),
                         "frame_limiter_settings": record.executable_path.as_ref().and(record.frame_limiter_snapshot.as_ref()),
                         "frame_limiter_executable_path": record.executable_path,
                         "display_policy_snapshot": record.display_policy_snapshot,
@@ -1355,6 +1356,7 @@ fn project_application_policy(
             sw_preset: application_overrides.sw_preset.clone(),
             sw_tune: application_overrides.sw_tune.clone(),
             encoder: application_overrides.encoder,
+            min_threads: application_overrides.min_threads,
         })
         .with_overrides(&record.peer.client_software_encoder);
     if let Some(backend) = record.effective_software_encoder.encoder {
@@ -1555,6 +1557,7 @@ pub(super) struct ApplicationConfigOverrides {
     sw_preset: Option<String>,
     sw_tune: Option<String>,
     encoder: Option<amaterasu_module_sdk::EncoderBackend>,
+    min_threads: Option<u16>,
     dd_mode_remapping: Option<Value>,
     dd_resolution_option: Option<String>,
     dd_manual_resolution: Option<String>,
@@ -1753,6 +1756,8 @@ pub(super) fn parse_application_config_overrides(
         config_overrides.sw_tune.as_deref(),
     )
     .map_err(|_| "invalid_application_response")?;
+    amaterasu_module_sdk::validate_min_threads(config_overrides.min_threads)
+        .map_err(|_| "invalid_application_response")?;
     if config_overrides.fec_percentage == Some(0)
         || config_overrides
             .dd_mode_remapping
@@ -1890,6 +1895,7 @@ fn rtsp_response<'a>(
         || payload["encoder"] != json!(record.selected_encoder)
         || payload["sw_preset"] != record.effective_software_encoder.effective_preset()
         || payload["sw_tune"] != record.effective_software_encoder.effective_tune()
+        || payload["min_threads"] != record.effective_software_encoder.effective_threads()
         || payload.get("failure").is_none()
         || payload.get("cleanup_error").is_none()
         || payload.get("frame_limiter_settings")
