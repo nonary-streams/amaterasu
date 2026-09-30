@@ -13,6 +13,7 @@ amaterasu-input-policy.workspace = true
 amaterasu-module-sdk.workspace = true
 amaterasu-identity.workspace = true
 amaterasu-gamestream.workspace = true
+amaterasu-upnp = { path = "../upnp" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

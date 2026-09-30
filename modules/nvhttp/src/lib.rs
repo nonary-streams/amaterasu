@@ -9,6 +9,7 @@ mod product_settings;
 mod server;
 mod settings;
 mod tls;
+mod upnp;
 mod wire;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
@@ -173,6 +174,8 @@ enum Operation {
         lan_encryption_mode: FieldUpdate<i64>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         wan_encryption_mode: FieldUpdate<i64>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        upnp: FieldUpdate<bool>,
         expected_revision: u64,
     },
 }
@@ -200,6 +203,8 @@ struct NvhttpModule {
     warm: WarmIdentity,
     product_settings: ProductSettings,
     network_settings: NetworkSettings,
+    upnp_lifecycle: upnp::UpnpLifecycle,
+    management_exposure: upnp::ManagementExposure,
     next_listener_rebind: Instant,
     listener_rebind_delay: Duration,
 }
@@ -266,6 +271,8 @@ impl ManagedModule for NvhttpModule {
             warm: WarmIdentity::new(),
             product_settings,
             network_settings: NetworkSettings::default(),
+            upnp_lifecycle: upnp::UpnpLifecycle::new(),
+            management_exposure: upnp::ManagementExposure::default(),
             next_listener_rebind: Instant::now(),
             listener_rebind_delay: Duration::from_secs(1),
         })
@@ -365,6 +372,28 @@ impl ManagedModule for NvhttpModule {
         } else if self.server.is_some() && !self.product_settings.listeners_need_application() {
             self.product_settings.record_listener_apply_success();
         }
+        self.management_exposure.tick(&self.runtime);
+        let (http_addresses, https_addresses) = self
+            .server
+            .as_ref()
+            .map(|server| (server.http_addresses(), server.https_addresses()))
+            .unwrap_or_default();
+        let rtsp_addresses = self
+            .product_settings
+            .active_rtsp_addresses()
+            .unwrap_or_default()
+            .to_vec();
+        self.upnp_lifecycle.update(
+            self.product_settings.loaded() && self.product_settings.upnp_enabled(),
+            &http_addresses,
+            &https_addresses,
+            self.product_settings.active_rtsp_base_port(),
+            &rtsp_addresses,
+            self.management_exposure.snapshot(),
+        );
+        let upnp_status = self.upnp_lifecycle.status().clone();
+        self.product_settings
+            .set_upnp_runtime_status(upnp_status.status, upnp_status.error);
         self.product_settings.flush_completion(&self.runtime);
         self.refresh_identity();
         if let (Some(server), Some(router)) = (&mut self.server, &mut self.router) {
@@ -606,6 +635,7 @@ impl NvhttpModule {
                                 rtss_disable_vsync_ullm,
                                 lan_encryption_mode,
                                 wan_encryption_mode,
+                                upnp,
                                 expected_revision,
                             } => {
                                 if settings::validate_configured_hostname(&hostname).is_err() {
@@ -676,6 +706,7 @@ impl NvhttpModule {
                                         lan_encryption_mode,
                                         wan_encryption_mode,
                                     },
+                                    upnp,
                                     expected_revision,
                                     require_listener_apply: self.server.is_some(),
                                 }
@@ -713,6 +744,7 @@ fn complete_control(
 
 impl Drop for NvhttpModule {
     fn drop(&mut self) {
+        self.upnp_lifecycle.shutdown();
         if let (Some(server), Some(router)) = (&mut self.server, &mut self.router) {
             for id in server.close_all() {
                 router.cancel(id, &self.runtime);

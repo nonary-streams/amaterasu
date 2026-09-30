@@ -1812,6 +1812,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "global_preparation",
                     "lan_encryption_mode",
                     "wan_encryption_mode",
+                    "upnp",
                 ],
             )?;
             let hostname = text(object, "hostname")?;
@@ -1868,6 +1869,12 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             }
             if object
                 .get("stream_audio")
+                .is_some_and(|value| value.as_bool().is_none())
+            {
+                return Err(INVALID);
+            }
+            if object
+                .get("upnp")
                 .is_some_and(|value| value.as_bool().is_none())
             {
                 return Err(INVALID);
@@ -1955,6 +1962,40 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
 #[cfg(test)]
 mod nvhttp_tests {
     use super::*;
+
+    #[test]
+    fn upnp_update_accepts_explicit_booleans_only() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        for value in [serde_json::json!(true), serde_json::json!(false)] {
+            let payload = serde_json::json!({
+                "hostname":"Host",
+                "port":47989,
+                "expected_revision":0,
+                "upnp":value,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_ok(),
+                "{payload}"
+            );
+        }
+        for value in [Value::Null, serde_json::json!(1), serde_json::json!("true")] {
+            let payload = serde_json::json!({
+                "hostname":"Host",
+                "port":47989,
+                "expected_revision":0,
+                "upnp":value,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_err(),
+                "{payload}"
+            );
+        }
+    }
 
     #[test]
     fn nvenc_spatial_aq_update_accepts_optional_nullable_booleans_only() {

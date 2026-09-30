@@ -146,6 +146,38 @@ fn management_loads_after_its_nvhttp_settings_provider() {
 }
 
 #[test]
+fn nvhttp_upnp_management_poll_has_a_scoped_call_grant_without_a_load_cycle() {
+    let service = "amaterasu.management/1";
+    assert!(NVHTTP.calls.contains(&service));
+    assert!(!NVHTTP.dependencies.contains(&MANAGEMENT.id));
+    assert!(MANAGEMENT.dependencies.contains(&NVHTTP.id));
+
+    let components = PackageProfile::Platform.components();
+    let nvhttp = components
+        .iter()
+        .find(|component| component.id == NVHTTP.id)
+        .unwrap();
+    assert!(nvhttp.calls.contains(&service));
+    assert!(!nvhttp.dependencies.contains(&MANAGEMENT.id));
+
+    let directory = std::env::temp_dir().join(format!(
+        "amaterasu-nvhttp-upnp-profile-{}",
+        std::process::id()
+    ));
+    let policy = development_policy(&directory).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+    assert_eq!(policy.principals[NVHTTP.id].call, NVHTTP.grants().call);
+    let management_calls = &policy.principals[MANAGEMENT.id].call;
+    assert!(
+        MANAGEMENT
+            .calls
+            .iter()
+            .all(|service| management_calls.contains(*service))
+    );
+    assert!(management_calls.contains("amaterasu.capture-pipewire/1"));
+}
+
+#[test]
 fn stream_probe_uses_real_management_authority_with_synthetic_dependencies() {
     let components = PackageProfile::StreamProbe.components();
     let management = components

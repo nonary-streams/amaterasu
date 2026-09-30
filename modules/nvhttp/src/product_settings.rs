@@ -39,7 +39,8 @@ const DEFAULT_LAN_ENCRYPTION_MODE: u8 = 0;
 const DEFAULT_WAN_ENCRYPTION_MODE: u8 = 1;
 const SOFTWARE_ENCODER_SETTINGS_VERSION: u64 = 19;
 const MIN_THREADS_SETTINGS_VERSION: u64 = 20;
-const SETTINGS_VERSION: u64 = MIN_THREADS_SETTINGS_VERSION;
+const UPNP_SETTINGS_VERSION: u64 = 21;
+const SETTINGS_VERSION: u64 = UPNP_SETTINGS_VERSION;
 const DISPLAY_POLICY_KEYS: [&str; 8] = [
     "dd_mode_remapping",
     "dd_resolution_option",
@@ -86,6 +87,7 @@ pub(crate) enum AdminAction {
         frame_limiter: FrameLimiterUpdate,
         display_policy: DisplayPolicyUpdate,
         encryption_modes: EncryptionModeUpdate,
+        upnp: FieldUpdate<bool>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -428,6 +430,7 @@ struct UpdatePurpose {
     display_policy: Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
+    upnp: bool,
     expected_revision: u64,
     require_listener_apply: bool,
 }
@@ -475,6 +478,7 @@ struct ProductDocument {
     display_policy: Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
+    upnp: bool,
 }
 
 #[derive(Clone)]
@@ -498,6 +502,7 @@ struct ProductStreamingSettings {
     display_policy: Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
+    upnp: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -554,6 +559,9 @@ pub struct ProductSettings {
     configured_display_policy: Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
+    configured_upnp: bool,
+    upnp_status: String,
+    upnp_error: Option<String>,
     stream_audio: bool,
     active_http_port: Option<u16>,
     active_https_port: Option<u16>,
@@ -661,6 +669,9 @@ impl ProductSettings {
             configured_display_policy: empty_display_policy(),
             lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
             wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
+            configured_upnp: false,
+            upnp_status: "disabled".into(),
+            upnp_error: None,
             stream_audio: true,
             active_http_port: None,
             active_https_port: None,
@@ -826,6 +837,27 @@ impl ProductSettings {
         self.port
     }
 
+    pub fn upnp_enabled(&self) -> bool {
+        self.configured_upnp
+    }
+
+    pub(crate) fn set_upnp_runtime_status(
+        &mut self,
+        status: impl Into<String>,
+        error: Option<String>,
+    ) {
+        self.upnp_status = status.into();
+        self.upnp_error = error;
+    }
+
+    pub(crate) fn active_rtsp_base_port(&self) -> Option<u16> {
+        self.active_rtsp_base_port
+    }
+
+    pub(crate) fn active_rtsp_addresses(&self) -> Option<&[String]> {
+        self.active_rtsp_addresses.as_deref()
+    }
+
     pub fn http_target(&self) -> NetworkTarget {
         NetworkTarget {
             port: self.port,
@@ -884,11 +916,6 @@ impl ProductSettings {
 
     pub fn loaded(&self) -> bool {
         self.loaded
-    }
-
-    #[cfg(test)]
-    pub(crate) fn active_rtsp_base_port(&self) -> Option<u16> {
-        self.active_rtsp_base_port
     }
 
     #[cfg(test)]
@@ -1302,6 +1329,7 @@ impl ProductSettings {
                 frame_limiter,
                 display_policy,
                 encryption_modes,
+                upnp,
                 expected_revision,
                 require_listener_apply,
             } => {
@@ -1554,6 +1582,16 @@ impl ProductSettings {
                         return;
                     }
                 };
+                let upnp = match apply_boolean_update(upnp, self.configured_upnp) {
+                    Ok(value) => value,
+                    Err(()) => {
+                        self.queue_completion(
+                            request.request,
+                            failure("invalid_upnp", "upnp must be a boolean"),
+                        );
+                        return;
+                    }
+                };
                 let target = NetworkTarget {
                     port,
                     address_family: apply_field_update(
@@ -1632,6 +1670,7 @@ impl ProductSettings {
                             display_policy: display_policy.clone(),
                             lan_encryption_mode,
                             wan_encryption_mode,
+                            upnp,
                         },
                     ),
                     Some(request.request),
@@ -1660,6 +1699,7 @@ impl ProductSettings {
                         display_policy,
                         lan_encryption_mode,
                         wan_encryption_mode,
+                        upnp,
                         expected_revision,
                         require_listener_apply,
                     })),
@@ -1791,6 +1831,7 @@ impl ProductSettings {
                     display_policy,
                     lan_encryption_mode,
                     wan_encryption_mode,
+                    upnp,
                     expected_revision,
                     require_listener_apply,
                 } = *update;
@@ -1820,6 +1861,7 @@ impl ProductSettings {
                             display_policy: &display_policy,
                             lan_encryption_mode,
                             wan_encryption_mode,
+                            upnp,
                         };
                         match update_result(&payload, &expected) {
                             Ok(document) if self.validate_document(&document).is_ok() => {
@@ -2140,6 +2182,7 @@ impl ProductSettings {
         self.configured_display_policy = document.display_policy;
         self.lan_encryption_mode = document.lan_encryption_mode;
         self.wan_encryption_mode = document.wan_encryption_mode;
+        self.configured_upnp = document.upnp;
         self.loaded = true;
     }
 
@@ -2151,6 +2194,9 @@ impl ProductSettings {
                 "hostname":self.hostname,
                 "configured_hostname":self.configured_hostname,
                 "port":self.port,
+                "upnp":self.configured_upnp,
+                "upnp_status":self.upnp_status,
+                "upnp_error":self.upnp_error,
             }),
             json!({
                 "https_port":settings::https_port(self.port),
@@ -2305,6 +2351,7 @@ fn product_update_payload(
         "legacy_global_preparation":streaming.legacy_global_preparation,
         "lan_encryption_mode":streaming.lan_encryption_mode,
         "wan_encryption_mode":streaming.wan_encryption_mode,
+        "upnp":streaming.upnp,
     });
     values
         .as_object_mut()
@@ -2431,6 +2478,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             display_policy: empty_display_policy(),
             lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
             wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
+            upnp: false,
         });
     }
 
@@ -2460,6 +2508,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | DISPLAY_POLICY_SETTINGS_VERSION
             | SOFTWARE_ENCODER_SETTINGS_VERSION
             | MIN_THREADS_SETTINGS_VERSION
+            | UPNP_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -2487,6 +2536,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         DISPLAY_POLICY_SETTINGS_VERSION => 40,
         SOFTWARE_ENCODER_SETTINGS_VERSION => 43,
         MIN_THREADS_SETTINGS_VERSION => 44,
+        UPNP_SETTINGS_VERSION => 45,
         _ => unreachable!(),
     };
     let matches_expected_value_count = values.len() == expected_value_count
@@ -2531,6 +2581,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             && DISPLAY_POLICY_KEYS
                 .iter()
                 .any(|key| !values.contains_key(*key)))
+        || (version >= UPNP_SETTINGS_VERSION && !values.contains_key("upnp"))
     {
         return Err(invalid_state(
             "product settings contain unknown or missing values",
@@ -2800,6 +2851,14 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         "wan_encryption_mode",
         DEFAULT_WAN_ENCRYPTION_MODE,
     )?;
+    let upnp = if version >= UPNP_SETTINGS_VERSION {
+        values
+            .get("upnp")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| invalid_state("persisted upnp setting is invalid"))?
+    } else {
+        false
+    };
     Ok(ProductDocument {
         revision,
         hostname: Some(hostname.to_owned()),
@@ -2826,6 +2885,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         display_policy,
         lan_encryption_mode,
         wan_encryption_mode,
+        upnp,
     })
 }
 
@@ -2854,6 +2914,7 @@ struct UpdateExpectation<'a> {
     display_policy: &'a Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
+    upnp: bool,
 }
 
 fn update_result(
@@ -2864,7 +2925,7 @@ fn update_result(
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
-        return Err(invalid_state("product_update did not confirm v20 settings"));
+        return Err(invalid_state("product_update did not confirm v21 settings"));
     }
     let document = parse_document(payload)?;
     if document.hostname.as_deref() != Some(expected.hostname)
@@ -2891,6 +2952,7 @@ fn update_result(
         || &document.display_policy != expected.display_policy
         || document.lan_encryption_mode != expected.lan_encryption_mode
         || document.wan_encryption_mode != expected.wan_encryption_mode
+        || document.upnp != expected.upnp
         || expected.revision.checked_add(1) != Some(document.revision)
     {
         return Err(invalid_state(
@@ -3252,6 +3314,7 @@ mod tests {
         values
             .entry("wan_encryption_mode")
             .or_insert_with(|| json!(DEFAULT_WAN_ENCRYPTION_MODE));
+        values.entry("upnp").or_insert_with(|| json!(false));
         values
             .entry("nvenc_spatial_aq")
             .or_insert_with(|| json!(false));
@@ -3294,6 +3357,8 @@ mod tests {
             encryption_modes: EncryptionModeUpdate::default(),
             expected_revision,
             require_listener_apply: false,
+
+            upnp: FieldUpdate::Omitted,
         }
     }
 
@@ -3339,7 +3404,7 @@ mod tests {
         let pending = product.pending.take().unwrap();
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["expected_revision"], 7);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 44);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 45);
         let write = pending.payload["values"].clone();
         let response =
             json!({"ok":true,"found":true,"version":SETTINGS_VERSION,"revision":8,"values":write});
@@ -4068,6 +4133,8 @@ mod tests {
                 frame_limiter: FrameLimiterSettings::default(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
+
+                upnp: false,
             },
         );
         let initial_document = json!({
@@ -4112,6 +4179,8 @@ mod tests {
                     encryption_modes: EncryptionModeUpdate::default(),
                     expected_revision: 4,
                     require_listener_apply: false,
+
+                    upnp: FieldUpdate::Omitted,
                 },
             )
             .unwrap();
@@ -4256,6 +4325,8 @@ mod tests {
                 frame_limiter: FrameLimiterSettings::default(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
+
+                upnp: false,
             },
         );
 
@@ -4313,6 +4384,8 @@ mod tests {
                         encryption_modes: EncryptionModeUpdate::default(),
                         expected_revision: revision,
                         require_listener_apply: false,
+
+                        upnp: FieldUpdate::Omitted,
                     },
                 )
                 .unwrap();
@@ -4417,6 +4490,8 @@ mod tests {
                     encryption_modes: EncryptionModeUpdate::default(),
                     expected_revision: 11,
                     require_listener_apply: false,
+
+                    upnp: FieldUpdate::Omitted,
                 },
             )
             .unwrap();
@@ -4491,6 +4566,8 @@ mod tests {
                     encryption_modes: EncryptionModeUpdate::default(),
                     expected_revision: 8,
                     require_listener_apply: false,
+
+                    upnp: FieldUpdate::Omitted,
                 },
             )
             .unwrap();
@@ -4564,6 +4641,8 @@ mod tests {
                         encryption_modes: EncryptionModeUpdate::default(),
                         expected_revision: revision,
                         require_listener_apply: false,
+
+                        upnp: FieldUpdate::Omitted,
                     },
                 )
                 .unwrap();
@@ -4648,6 +4727,8 @@ mod tests {
                         encryption_modes: EncryptionModeUpdate::default(),
                         expected_revision: revision,
                         require_listener_apply: false,
+
+                        upnp: FieldUpdate::Omitted,
                     },
                 )
                 .unwrap();
@@ -4837,6 +4918,8 @@ mod tests {
             frame_limiter: &default_frame_limiter,
             lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
             wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
+
+            upnp: false,
         };
         assert_eq!(update_result(&success, &expected).unwrap().revision, 4);
         assert_eq!(
@@ -5006,10 +5089,12 @@ mod tests {
                 frame_limiter: product.configured_frame_limiter().clone(),
                 lan_encryption_mode: product.lan_encryption_mode(),
                 wan_encryption_mode: product.wan_encryption_mode(),
+
+                upnp: false,
             },
         );
         assert_eq!(update["version"], SETTINGS_VERSION);
-        assert_eq!(update["values"].as_object().unwrap().len(), 44);
+        assert_eq!(update["values"].as_object().unwrap().len(), 45);
         assert_eq!(update["values"]["nvenc_spatial_aq"], false);
         assert_eq!(
             update["values"]["global_preparation"]
@@ -5067,6 +5152,8 @@ mod tests {
                 frame_limiter: frame_limiter.clone(),
                 lan_encryption_mode: 2,
                 wan_encryption_mode: 0,
+
+                upnp: false,
             },
         );
         let reply = v17_update_confirmation(json!({
@@ -5123,6 +5210,7 @@ mod tests {
 
         let mut old_v17 = reply.clone();
         old_v17["version"] = json!(GLOBAL_RAW_PREPARATION_SETTINGS_VERSION);
+        old_v17["values"].as_object_mut().unwrap().remove("upnp");
         for key in ["sw_preset", "sw_tune", "encoder", "min_threads"] {
             old_v17["values"].as_object_mut().unwrap().remove(key);
         }
@@ -5194,6 +5282,8 @@ mod tests {
                 frame_limiter: FrameLimiterSettings::default(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
+
+                upnp: false,
             },
         );
         assert_eq!(write["values"]["nvenc_spatial_aq"], false);
@@ -5234,6 +5324,8 @@ mod tests {
                 frame_limiter: FrameLimiterSettings::default(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
+
+                upnp: false,
             },
         );
         let initial_document = parse_document(&json!({
@@ -5279,6 +5371,8 @@ mod tests {
                     },
                     expected_revision: 4,
                     require_listener_apply: false,
+
+                    upnp: FieldUpdate::Omitted,
                 },
             )
             .unwrap();
@@ -5380,6 +5474,9 @@ mod tests {
                     "hostname":"Computer Name",
                     "configured_hostname":"",
                     "port":47989,
+                    "upnp":false,
+                    "upnp_status":"disabled",
+                    "upnp_error":null,
                 }),
                 json!({
                     "https_port":47984,
@@ -5569,7 +5666,8 @@ mod tests {
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
                 expected_revision: 1,
                 require_listener_apply: false,
-            })),
+
+                upnp: false,})),
             CallOutcome::Payload(v17_update_confirmation(json!({
                 "ok":true,
                 "found":true,
@@ -5641,7 +5739,8 @@ mod tests {
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
                 expected_revision: 1,
                 require_listener_apply: true,
-            })),
+
+                upnp: false,})),
             CallOutcome::Payload(v17_update_confirmation(json!({
                 "ok":true,"found":true,"version":16,"revision":2,
                 "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
@@ -5826,7 +5925,8 @@ mod tests {
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
                 expected_revision: 3,
                 require_listener_apply: true,
-            })),
+
+                upnp: false,})),
             CallOutcome::Payload(v17_update_confirmation(json!({
                 "ok":true,"found":true,"version":16,"revision":4,
                 "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
@@ -5943,6 +6043,8 @@ mod tests {
                         encryption_modes: EncryptionModeUpdate::default(),
                         expected_revision,
                         require_listener_apply: false,
+
+                        upnp: FieldUpdate::Omitted,
                     },
                 )
                 .unwrap();
@@ -6084,6 +6186,8 @@ mod tests {
                         encryption_modes: EncryptionModeUpdate::default(),
                         expected_revision: revision,
                         require_listener_apply: false,
+
+                        upnp: FieldUpdate::Omitted,
                     },
                 )
                 .unwrap();
@@ -6180,6 +6284,8 @@ mod tests {
                 frame_limiter: FrameLimiterSettings::default(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
+
+                upnp: false,
             },
         );
         assert_eq!(reset["version"], SETTINGS_VERSION);
@@ -6221,6 +6327,8 @@ mod tests {
                 frame_limiter: FrameLimiterSettings::default(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
+
+                upnp: false,
             },
         );
         assert_eq!(explicit_blank["values"]["address_family"], "both");
@@ -6312,6 +6420,8 @@ mod tests {
                         encryption_modes: EncryptionModeUpdate::default(),
                         expected_revision: revision,
                         require_listener_apply: false,
+
+                        upnp: FieldUpdate::Omitted,
                     },
                 )
                 .unwrap();
@@ -6390,6 +6500,8 @@ mod tests {
                     encryption_modes: EncryptionModeUpdate::default(),
                     expected_revision: 4,
                     require_listener_apply: true,
+
+                    upnp: FieldUpdate::Omitted,
                 },
             )
             .unwrap();
@@ -6439,6 +6551,8 @@ mod tests {
                     encryption_modes: EncryptionModeUpdate::default(),
                     expected_revision: 4,
                     require_listener_apply: true,
+
+                    upnp: FieldUpdate::Omitted,
                 },
             )
             .unwrap();
@@ -6491,6 +6605,8 @@ mod tests {
                     encryption_modes: EncryptionModeUpdate::default(),
                     expected_revision: 4,
                     require_listener_apply: false,
+
+                    upnp: FieldUpdate::Omitted,
                 },
             )
             .unwrap();
@@ -6520,6 +6636,7 @@ mod tests {
         let mut prior_version = display_v18_document(7);
         prior_version["version"] = json!(SOFTWARE_ENCODER_SETTINGS_VERSION);
         let prior_values = prior_version["values"].as_object_mut().unwrap();
+        prior_values.remove("upnp");
         prior_values.insert("sw_preset".into(), Value::Null);
         prior_values.insert("sw_tune".into(), Value::Null);
         prior_values.insert("encoder".into(), Value::Null);
@@ -6535,6 +6652,7 @@ mod tests {
 
         let mut legacy = display_v18_document(7);
         legacy["version"] = json!(DISPLAY_POLICY_SETTINGS_VERSION);
+        legacy["values"].as_object_mut().unwrap().remove("upnp");
         for key in ["sw_preset", "sw_tune", "encoder", "min_threads"] {
             legacy["values"].as_object_mut().unwrap().remove(key);
         }
@@ -6564,11 +6682,11 @@ mod tests {
         product.enqueue(51, 5000, action).unwrap();
         product.start_next();
         let pending = product.pending.take().unwrap();
-        assert_eq!(pending.payload["version"], 20);
+        assert_eq!(pending.payload["version"], UPNP_SETTINGS_VERSION);
         assert_eq!(pending.payload["expected_revision"], 7);
         assert_eq!(pending.payload["values"]["sw_tune"], "");
         assert_eq!(pending.payload["values"]["min_threads"], 8);
-        let saved = json!({"ok":true,"found":true,"version":20,"revision":8,"values":pending.payload["values"]});
+        let saved = json!({"ok":true,"found":true,"version":UPNP_SETTINGS_VERSION,"revision":8,"values":pending.payload["values"]});
         product.finish_call(pending.purpose, CallOutcome::Payload(saved.clone()));
         assert_eq!(product.revision(), Some(8));
         let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
@@ -6595,7 +6713,7 @@ mod tests {
         assert_eq!(pending.payload["values"]["sw_tune"], "");
         assert!(pending.payload["values"]["encoder"].is_null());
         assert!(pending.payload["values"]["min_threads"].is_null());
-        let mut forged = json!({"ok":true,"found":true,"version":20,"revision":9,"values":pending.payload["values"]});
+        let mut forged = json!({"ok":true,"found":true,"version":UPNP_SETTINGS_VERSION,"revision":9,"values":pending.payload["values"]});
         forged["values"]["sw_tune"] = json!("zerolatency");
         restarted.finish_call(pending.purpose, CallOutcome::Payload(forged));
         assert_eq!(restarted.revision(), None);
@@ -6615,5 +6733,42 @@ mod tests {
             invalid["values"][field] = value;
             assert!(parse_document(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn version_twenty_migrates_upnp_off_and_v21_update_persists_it() {
+        let mut prior = display_v18_document(7);
+        prior["version"] = json!(MIN_THREADS_SETTINGS_VERSION);
+        prior["values"].as_object_mut().unwrap().remove("upnp");
+        let migrated = parse_document(&prior).unwrap();
+        assert!(!migrated.upnp);
+
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(migrated);
+        let mut action = display_update_action(DisplayPolicyUpdate::default(), 7);
+        let AdminAction::Update { upnp, .. } = &mut action else {
+            unreachable!()
+        };
+        *upnp = FieldUpdate::Value(true);
+        product.enqueue(81, 5_000, action).unwrap();
+        product.start_next();
+        let pending = product.pending.take().unwrap();
+        assert_eq!(pending.payload["version"], UPNP_SETTINGS_VERSION);
+        assert_eq!(pending.payload["values"]["upnp"], true);
+
+        let saved = json!({
+            "ok":true,
+            "found":true,
+            "version":UPNP_SETTINGS_VERSION,
+            "revision":8,
+            "values":pending.payload["values"]
+        });
+        product.finish_call(pending.purpose, CallOutcome::Payload(saved.clone()));
+        assert!(product.upnp_enabled());
+        product.set_upnp_runtime_status("active", None);
+        assert_eq!(product.settings_payload()["upnp_status"], "active");
+
+        let restarted = parse_document(&saved).unwrap();
+        assert!(restarted.upnp);
     }
 }

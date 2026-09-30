@@ -1,3 +1,4 @@
+use std::net::UdpSocket;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ const MAX_MAPPING_SCAN: u32 = 4096;
 /// A real Internet Gateway Device adapter backed by `igd-next`.
 pub struct IgdGateway {
     gateway: IgdGatewayClient,
+    internal_address: Ipv4Addr,
 }
 
 /// Discovers an IPv4 IGD and returns discovery errors to the caller.
@@ -27,7 +29,50 @@ pub fn discover_gateway() -> Result<IgdGateway, GatewayError> {
     };
     let gateway = igd_next::search_gateway(options)
         .map_err(|error| GatewayError::new(format!("IGD discovery failed: {error}")))?;
-    Ok(IgdGateway { gateway })
+    let internal_address = local_ipv4_route(gateway.addr)?;
+    Ok(IgdGateway {
+        gateway,
+        internal_address,
+    })
+}
+
+impl IgdGateway {
+    /// IPv4 interface selected by the host route to this gateway.
+    pub fn internal_address(&self) -> Ipv4Addr {
+        self.internal_address
+    }
+
+    /// Stable identity used to keep mapping ownership attached to the same IGD.
+    pub fn identity(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.gateway.addr, self.gateway.root_url, self.internal_address
+        )
+    }
+}
+
+fn local_ipv4_route(gateway: SocketAddr) -> Result<Ipv4Addr, GatewayError> {
+    let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+        .map_err(|error| GatewayError::new(format!("failed to select an IGD route: {error}")))?;
+    // UDP connect selects a route and local address without sending a packet.
+    socket
+        .connect(gateway)
+        .map_err(|error| GatewayError::new(format!("failed to select an IGD route: {error}")))?;
+    let address = socket
+        .local_addr()
+        .map_err(|error| GatewayError::new(format!("failed to inspect the IGD route: {error}")))?
+        .ip();
+    let IpAddr::V4(address) = address else {
+        return Err(GatewayError::new(
+            "IGD discovery selected a non-IPv4 local route",
+        ));
+    };
+    if address.is_loopback() || address.is_unspecified() {
+        return Err(GatewayError::new(
+            "IGD discovery selected a non-routable local IPv4 address",
+        ));
+    }
+    Ok(address)
 }
 
 impl Gateway for IgdGateway {

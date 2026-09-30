@@ -263,6 +263,7 @@ const NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.capture-dxgi/1",
         "amaterasu.capture-wgc/1",
         "amaterasu.encode/1",
+        "amaterasu.management/1",
     ],
     publishes: &[],
     native_provides: &[],

@@ -1,10 +1,9 @@
 # UPnP listener mapping lifecycle
 
-This crate provides a caller-driven UPnP lifecycle slice. The caller supplies
-the configured active listener endpoints to `MappingManager::reconcile`; the
-manager skips inactive, zero-port, and IPv6 endpoints and requests matching TCP
-and UDP mappings for each remaining IPv4 endpoint. External and internal ports
-are the same.
+This crate provides an owned UPnP mapping lifecycle. The caller supplies live
+listener endpoints to `MappingManager::reconcile` or protocol-specific endpoints
+to `MappingManager::reconcile_protocols`; inactive, zero-port, and IPv6 endpoints
+are skipped. External and internal ports are the same.
 
 Reconcile creates every replacement before removing stale mappings. If an add
 fails, mappings created during that attempt are rolled back and the old owned
@@ -28,19 +27,19 @@ Call `MappingManager::refresh_owned` periodically to reassert owned mappings.
 It refreshes only mappings whose complete recorded value still matches, drops
 ownership for missing or changed mappings, and preserves changed gateway entries.
 Refresh errors are returned and their mappings remain owned for a later retry.
-The current lease request is zero, which IGDv2 interprets as its maximum lease
-of 604,800 seconds (one week). IGDv2 reports the remaining lease and counts it
-down, so that dynamic value is excluded from stable ownership comparisons. The
-mapping must be refreshed before that lease expires. The recommended
-caller-driven interval `RECOMMENDED_REFRESH_INTERVAL` (30 minutes) is a safety
-margin before expiry, not a timer; callers schedule refreshes. The crate does
-not add a runtime dependency.
+The requested lease is one hour, and
+`RECOMMENDED_REFRESH_INTERVAL` is 120 seconds. IGDv2 reports the remaining lease
+and counts it down, so that dynamic value is excluded from stable ownership
+comparisons. The crate exposes the interval but does not run a timer; its caller
+must schedule refreshes.
 
 `discover_gateway` applies the crate's two-second search timeout and returns
 discovery errors. Mapping, cleanup, and refresh errors are returned to the
 caller.
-Tests use a deterministic fake gateway and do not contact a router.
+Tests use a deterministic fake gateway and do not contact a router. The current
+adapter manages IPv4 port mappings; it does not open IPv6 firewall pinholes.
 
-This slice does not integrate configuration storage, settings migration,
-management editing, WAN exposure policy, or listener startup. `global:upnp`
-remains pending until those integration and parity gates are completed.
+Mapping ownership is deliberately stricter than the pinned implementation:
+pre-existing or externally changed conflicts are preserved instead of deleted.
+The IGD protocol still has check-then-act races around create, refresh, and
+delete; the adapter documents those limits at each operation.

@@ -14,6 +14,7 @@ mod tls;
 mod csrf_adversarial_tests;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use peer_policy::PeerTier;
 use serde::Deserialize;
 use serde_json::json;
 use server::Server;
@@ -130,6 +131,14 @@ impl ManagedModule for ManagementModule {
                 if payload == json!({"action":"operational_health"}) {
                     return self.begin_operational_health(id, remaining_ms);
                 }
+                if payload == json!({"action":"upnp_exposure"}) {
+                    let payload = upnp_exposure_payload(
+                        &caller,
+                        self.product_settings.maximum_peer(),
+                        self.server.as_ref().and_then(Server::tls_address),
+                    );
+                    return complete(&self.runtime, id, payload);
+                }
                 if payload
                     .get("action")
                     .and_then(serde_json::Value::as_str)
@@ -153,6 +162,22 @@ impl ManagedModule for ManagementModule {
             _ => Err("management status polling failed".into()),
         }
     }
+}
+
+fn upnp_exposure_payload(
+    caller: &str,
+    maximum_peer: Option<PeerTier>,
+    tls_address: Option<SocketAddr>,
+) -> serde_json::Value {
+    if caller != "amaterasu.nvhttp" {
+        return json!({"ok":false,"code":"permission_denied"});
+    }
+    let wan_enabled = maximum_peer == Some(PeerTier::Wan);
+    json!({
+        "ok":true,
+        "wan_enabled":wan_enabled,
+        "tls_address":if wan_enabled { tls_address.map(|address| address.to_string()) } else { None::<String> },
+    })
 }
 
 impl ManagementModule {
@@ -353,6 +378,27 @@ amaterasu_module_sdk::export_module!(ManagementModule);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upnp_exposure_is_internal_and_only_publishes_wan_tls_listener() {
+        let tls_address = "0.0.0.0:49999".parse().unwrap();
+        assert_eq!(
+            upnp_exposure_payload("another.module", Some(PeerTier::Wan), Some(tls_address)),
+            json!({"ok":false,"code":"permission_denied"})
+        );
+        assert_eq!(
+            upnp_exposure_payload("amaterasu.nvhttp", Some(PeerTier::Lan), Some(tls_address)),
+            json!({"ok":true,"wan_enabled":false,"tls_address":null})
+        );
+        assert_eq!(
+            upnp_exposure_payload("amaterasu.nvhttp", Some(PeerTier::Wan), Some(tls_address)),
+            json!({"ok":true,"wan_enabled":true,"tls_address":"0.0.0.0:49999"})
+        );
+        assert_eq!(
+            upnp_exposure_payload("amaterasu.nvhttp", Some(PeerTier::Wan), None),
+            json!({"ok":true,"wan_enabled":true,"tls_address":null})
+        );
+    }
 
     #[test]
     fn configuration_defaults_disabled_and_rejects_nonloopback_or_wildcard_origins() {

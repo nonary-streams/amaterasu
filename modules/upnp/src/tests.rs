@@ -4,8 +4,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
 
 use super::{
-    Gateway, GatewayError, ListenerEndpoint, Mapping, MappingKey, MappingManager, Protocol,
-    ReconcileReport, RefreshOutcome, RefreshReport, RemovalOutcome, ShutdownReport, UpnpError,
+    Gateway, GatewayError, ListenerEndpoint, MAPPING_LEASE_SECONDS, Mapping, MappingEndpoint,
+    MappingKey, MappingManager, Protocol, ReconcileReport, RefreshOutcome, RefreshReport,
+    RemovalOutcome, ShutdownReport, UpnpError,
 };
 
 #[derive(Clone, Default)]
@@ -187,6 +188,67 @@ fn reconcile_is_idempotent_for_owned_tcp_and_udp_mappings() {
     assert_eq!(manager.owned_mappings().count(), 2);
     assert_eq!(fake_gateway.add_attempts(), 2);
     assert_eq!(fake_gateway.mappings().len(), 2);
+    assert!(
+        fake_gateway
+            .mappings()
+            .values()
+            .all(|mapping| mapping.lease_duration_seconds == MAPPING_LEASE_SECONDS)
+    );
+}
+
+#[test]
+fn reconcile_protocols_maps_only_live_listener_protocols() {
+    let fake_gateway = FakeGateway::default();
+    let mut manager = manager(fake_gateway.clone());
+    let endpoints = [
+        MappingEndpoint::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            47989,
+            Protocol::Tcp,
+            true,
+        ),
+        MappingEndpoint::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            47998,
+            Protocol::Udp,
+            true,
+        ),
+        MappingEndpoint::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            47997,
+            Protocol::Udp,
+            false,
+        ),
+    ];
+
+    let report = manager.reconcile_protocols(&endpoints).unwrap();
+
+    assert_eq!(report.created, 2);
+    assert!(
+        fake_gateway
+            .mappings()
+            .contains_key(&key(47989, Protocol::Tcp))
+    );
+    assert!(
+        fake_gateway
+            .mappings()
+            .contains_key(&key(47998, Protocol::Udp))
+    );
+    assert!(
+        !fake_gateway
+            .mappings()
+            .contains_key(&key(47989, Protocol::Udp))
+    );
+    assert!(
+        !fake_gateway
+            .mappings()
+            .contains_key(&key(47998, Protocol::Tcp))
+    );
+    assert!(
+        !fake_gateway
+            .mappings()
+            .contains_key(&key(47997, Protocol::Udp))
+    );
 }
 
 #[test]
@@ -676,23 +738,23 @@ fn remaining_lease_countdown_does_not_change_owned_mapping_identity() {
     let tcp_key = key(47989, Protocol::Tcp);
     let udp_key = key(47989, Protocol::Udp);
 
-    fake_gateway.set_remaining_lease_seconds(tcp_key, 604_800);
-    fake_gateway.set_remaining_lease_seconds(udp_key, 604_800);
+    fake_gateway.set_remaining_lease_seconds(tcp_key, MAPPING_LEASE_SECONDS);
+    fake_gateway.set_remaining_lease_seconds(udp_key, MAPPING_LEASE_SECONDS);
     let reconcile_report = manager.reconcile(&configured).unwrap();
 
     assert_eq!(reconcile_report.created, 0);
     assert_eq!(reconcile_report.already_active, 2);
     assert_eq!(manager.owned_mappings().count(), 2);
 
-    fake_gateway.set_remaining_lease_seconds(tcp_key, 604_799);
-    fake_gateway.set_remaining_lease_seconds(udp_key, 604_798);
+    fake_gateway.set_remaining_lease_seconds(tcp_key, MAPPING_LEASE_SECONDS - 1);
+    fake_gateway.set_remaining_lease_seconds(udp_key, MAPPING_LEASE_SECONDS - 2);
     let refresh_report = manager.refresh_owned().unwrap();
 
     assert_eq!(refresh_report.refreshed, 2);
     assert_eq!(manager.owned_mappings().count(), 2);
 
-    fake_gateway.set_remaining_lease_seconds(tcp_key, 604_798);
-    fake_gateway.set_remaining_lease_seconds(udp_key, 604_797);
+    fake_gateway.set_remaining_lease_seconds(tcp_key, MAPPING_LEASE_SECONDS - 2);
+    fake_gateway.set_remaining_lease_seconds(udp_key, MAPPING_LEASE_SECONDS - 3);
     assert_eq!(
         manager.shutdown().unwrap(),
         ShutdownReport {

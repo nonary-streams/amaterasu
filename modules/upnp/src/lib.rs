@@ -21,12 +21,12 @@ mod tests;
 
 static OWNER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Recommended caller-driven interval for refreshing owned mappings.
-///
-/// A zero-duration lease request is the IGDv2 maximum of 604,800 seconds (one week).
-/// Callers must refresh before that lease expires. This interval is a safety margin;
-/// callers schedule it because this crate does not run a refresh timer.
-pub const RECOMMENDED_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Lease requested for each owned mapping.
+pub const MAPPING_LEASE_SECONDS: u32 = 60 * 60;
+
+/// Recommended interval for refreshing owned mappings before their lease expires.
+/// Callers schedule this interval because this crate does not run a refresh timer.
+pub const RECOMMENDED_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
 
 /// The network protocol used by an IGD port mapping.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -93,6 +93,26 @@ impl ListenerEndpoint {
         Self {
             address,
             port,
+            active,
+        }
+    }
+}
+
+/// One protocol-specific mapping for a live listener.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MappingEndpoint {
+    pub address: IpAddr,
+    pub port: u16,
+    pub protocol: Protocol,
+    pub active: bool,
+}
+
+impl MappingEndpoint {
+    pub fn new(address: IpAddr, port: u16, protocol: Protocol, active: bool) -> Self {
+        Self {
+            address,
+            port,
+            protocol,
             active,
         }
     }
@@ -332,6 +352,15 @@ impl<G: Gateway> MappingManager<G> {
         }
     }
 
+    /// Replaces the adapter while retaining ownership records.
+    ///
+    /// The caller must establish that the new adapter addresses the same gateway
+    /// as the previous adapter. This lets a lifecycle owner reconnect after a
+    /// gateway reboot without forgetting which mappings it created.
+    pub fn replace_gateway_adapter(&mut self, gateway: G) {
+        self.gateway = gateway;
+    }
+
     /// Adds or retargets desired mappings before removing stale owned mappings.
     ///
     /// A failed add or retarget rolls back mappings changed by this reconcile
@@ -342,6 +371,22 @@ impl<G: Gateway> MappingManager<G> {
     pub fn reconcile(
         &mut self,
         endpoints: &[ListenerEndpoint],
+    ) -> Result<ReconcileReport, UpnpError> {
+        let protocol_endpoints: Vec<_> = endpoints
+            .iter()
+            .flat_map(|endpoint| {
+                [Protocol::Tcp, Protocol::Udp].map(|protocol| {
+                    MappingEndpoint::new(endpoint.address, endpoint.port, protocol, endpoint.active)
+                })
+            })
+            .collect();
+        self.reconcile_protocols(&protocol_endpoints)
+    }
+
+    /// Reconciles active listeners that require explicit TCP or UDP mappings.
+    pub fn reconcile_protocols(
+        &mut self,
+        endpoints: &[MappingEndpoint],
     ) -> Result<ReconcileReport, UpnpError> {
         let desired = self.desired_mappings(endpoints)?;
         let mut planned_changes = Vec::new();
@@ -618,7 +663,7 @@ impl<G: Gateway> MappingManager<G> {
 
     fn desired_mappings(
         &self,
-        endpoints: &[ListenerEndpoint],
+        endpoints: &[MappingEndpoint],
     ) -> Result<BTreeMap<MappingKey, Mapping>, UpnpError> {
         let mut desired = BTreeMap::new();
 
@@ -631,26 +676,24 @@ impl<G: Gateway> MappingManager<G> {
                 continue;
             };
 
-            for protocol in [Protocol::Tcp, Protocol::Udp] {
-                let mapping = Mapping {
-                    external_port: endpoint.port,
-                    protocol,
-                    internal_address,
-                    internal_port: endpoint.port,
-                    remote_host: String::new(),
-                    enabled: true,
-                    description: self.description.clone(),
-                    lease_duration_seconds: 0,
-                };
-                let key = mapping.key();
+            let mapping = Mapping {
+                external_port: endpoint.port,
+                protocol: endpoint.protocol,
+                internal_address,
+                internal_port: endpoint.port,
+                remote_host: String::new(),
+                enabled: true,
+                description: self.description.clone(),
+                lease_duration_seconds: MAPPING_LEASE_SECONDS,
+            };
+            let key = mapping.key();
 
-                if let Some(previous) = desired.get(&key) {
-                    if previous != &mapping {
-                        return Err(UpnpError::DuplicateDesiredMapping { key });
-                    }
-                } else {
-                    desired.insert(key, mapping);
+            if let Some(previous) = desired.get(&key) {
+                if previous != &mapping {
+                    return Err(UpnpError::DuplicateDesiredMapping { key });
                 }
+            } else {
+                desired.insert(key, mapping);
             }
         }
 
