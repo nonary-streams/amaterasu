@@ -70,7 +70,7 @@ impl GamepadProfile {
         }
         #[cfg(target_os = "linux")]
         {
-            &["auto", "xone"]
+            &["auto", "xone", "ds4"]
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {

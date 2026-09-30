@@ -110,6 +110,44 @@ pub(crate) struct ControllerSnapshot {
     pub right_y: i16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GamepadMotionType {
+    Accel,
+    Gyro,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GamepadTouchPhase {
+    Hover,
+    Down,
+    Up,
+    Move,
+    Cancel,
+    ButtonOnly,
+    HoverLeave,
+    CancelAll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GamepadTouchReport {
+    pub touchpad_index: u8,
+    pub pointer_id: u32,
+    pub phase: GamepadTouchPhase,
+    pub x: f32,
+    pub y: f32,
+    pub pressure: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GamepadBatteryState {
+    Unknown,
+    NotPresent,
+    Charging,
+    Discharging,
+    NotCharging,
+    Full,
+}
+
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NativeGamepadEvent {
@@ -213,6 +251,35 @@ pub(crate) fn gamepad_key_codes() -> impl Iterator<Item = u16> {
 pub(crate) trait GamepadDevice {
     fn update(&mut self, state: ControllerSnapshot) -> InputResult<()>;
 
+    fn set_motion(
+        &mut self,
+        _motion_type: GamepadMotionType,
+        _values: [f32; 3],
+    ) -> InputResult<()> {
+        Err(InputError::new(
+            "unsupported_event",
+            "the selected gamepad profile does not accept motion reports",
+        ))
+    }
+
+    fn set_touch(&mut self, _touch: GamepadTouchReport) -> InputResult<()> {
+        Err(InputError::new(
+            "unsupported_event",
+            "the selected gamepad profile does not accept touch reports",
+        ))
+    }
+
+    fn set_battery(
+        &mut self,
+        _state: GamepadBatteryState,
+        _percentage: Option<u8>,
+    ) -> InputResult<()> {
+        Err(InputError::new(
+            "unsupported_event",
+            "the selected gamepad profile does not accept battery reports",
+        ))
+    }
+
     /// A failed native write may have partially applied. Implementations that
     /// can detach the old device may replace it before the state is sent again.
     fn recover_after_update_failure(&mut self, error: InputError) -> InputResult<()> {
@@ -220,7 +287,7 @@ pub(crate) trait GamepadDevice {
     }
 
     /// Returns whether the active native report needs to be projected again.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn set_ds4_back_as_touchpad_click(&mut self, _enabled: bool) -> bool {
         false
     }
@@ -383,11 +450,29 @@ impl<Device: GamepadDevice> GamepadSlot<Device> {
         self.back_deadline = None;
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
         // The next tick must project the new mapping even if the client keeps
         // holding Back and sends no further controller snapshot.
         self.dirty |= self.device.set_ds4_back_as_touchpad_click(enabled);
+    }
+
+    fn apply_auxiliary_report(
+        &mut self,
+        mut send: impl FnMut(&mut Device) -> InputResult<()>,
+    ) -> InputResult<()> {
+        if let Err(error) = send(&mut self.device) {
+            if error.code == "invalid_event" || error.code == "unsupported_event" {
+                return Err(error);
+            }
+            self.device.recover_after_update_failure(error.clone())?;
+            if let Err(replay_error) = send(&mut self.device) {
+                self.device
+                    .recover_after_update_failure(replay_error.clone())?;
+                return Err(replay_error);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -461,6 +546,95 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
         first_error.map_or(update, Err)
     }
 
+    pub(crate) fn ensure(
+        &mut self,
+        number: u16,
+        mut create: impl FnMut(u8) -> InputResult<Device>,
+    ) -> InputResult<()> {
+        let Some(slot) = self.devices.get_mut(usize::from(number)) else {
+            return Err(InputError::new(
+                "invalid_event",
+                "controller number must be in the range 0..16",
+            ));
+        };
+        if slot.as_ref().is_some_and(|device| device.pending_removal) {
+            Self::release_slot(slot)?;
+        }
+        if slot.is_none() {
+            *slot = Some(GamepadSlot::new(create(number as u8)?));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove(&mut self, number: u16) -> InputResult<()> {
+        let Some(slot) = self.devices.get_mut(usize::from(number)) else {
+            return Err(InputError::new(
+                "invalid_event",
+                "controller number must be in the range 0..16",
+            ));
+        };
+        if let Some(device) = slot.as_mut() {
+            device.cancel_timeout();
+            device.pending_removal = true;
+            Self::release_slot(slot)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_motion(
+        &mut self,
+        number: u16,
+        motion_type: GamepadMotionType,
+        values: [f32; 3],
+    ) -> InputResult<()> {
+        self.with_slot(number, |slot| {
+            slot.apply_auxiliary_report(|device| device.set_motion(motion_type, values))
+        })
+    }
+
+    pub(crate) fn set_touch(&mut self, number: u16, touch: GamepadTouchReport) -> InputResult<()> {
+        self.with_slot(number, |slot| {
+            slot.apply_auxiliary_report(|device| device.set_touch(touch))
+        })
+    }
+
+    pub(crate) fn set_battery(
+        &mut self,
+        number: u16,
+        state: GamepadBatteryState,
+        percentage: Option<u8>,
+    ) -> InputResult<()> {
+        self.with_slot(number, |slot| {
+            slot.apply_auxiliary_report(|device| device.set_battery(state, percentage))
+        })
+    }
+
+    fn with_slot(
+        &mut self,
+        number: u16,
+        apply: impl FnOnce(&mut GamepadSlot<Device>) -> InputResult<()>,
+    ) -> InputResult<()> {
+        let Some(slot) = self.devices.get_mut(usize::from(number)) else {
+            return Err(InputError::new(
+                "invalid_event",
+                "controller number must be in the range 0..16",
+            ));
+        };
+        let slot = slot.as_mut().ok_or_else(|| {
+            InputError::new(
+                "controller_unavailable",
+                "controller auxiliary report arrived before its controller slot was active",
+            )
+        })?;
+        if slot.pending_removal {
+            return Err(InputError::new(
+                "controller_unavailable",
+                "controller slot is being detached",
+            ));
+        }
+        apply(slot)
+    }
+
     pub(crate) fn advance(&mut self, now: Instant) -> InputResult<()> {
         let mut first_error = None;
         for slot in &mut self.devices {
@@ -498,7 +672,7 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
         self.devices.iter().all(Option::is_none)
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(crate) fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
         for slot in self.devices.iter_mut().flatten() {
             slot.set_ds4_back_as_touchpad_click(enabled);
@@ -554,6 +728,7 @@ mod tests {
         created: Vec<u8>,
         updates: Vec<(u8, ControllerSnapshot)>,
         dropped: Vec<u8>,
+        recoveries: usize,
     }
 
     struct FakeDevice {
@@ -564,6 +739,11 @@ mod tests {
     impl GamepadDevice for FakeDevice {
         fn update(&mut self, state: ControllerSnapshot) -> InputResult<()> {
             self.trace.borrow_mut().updates.push((self.slot, state));
+            Ok(())
+        }
+
+        fn recover_after_update_failure(&mut self, _error: InputError) -> InputResult<()> {
+            self.trace.borrow_mut().recoveries += 1;
             Ok(())
         }
     }
@@ -605,6 +785,34 @@ mod tests {
 
     fn has_button(state: ControllerSnapshot, mask: u32) -> bool {
         state.buttons & mask != 0
+    }
+
+    #[test]
+    fn unsupported_auxiliary_reports_do_not_rebuild_a_live_target() {
+        let trace = Rc::new(RefCell::new(Trace::default()));
+        let mut slots = GamepadSlots::new();
+        slots
+            .ensure(0, |slot| create_device(trace.clone(), slot))
+            .unwrap();
+
+        let error = slots
+            .set_touch(
+                0,
+                GamepadTouchReport {
+                    touchpad_index: 0,
+                    pointer_id: 0,
+                    phase: GamepadTouchPhase::Down,
+                    x: 0.5,
+                    y: 0.5,
+                    pressure: 1.0,
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "unsupported_event");
+        assert_eq!(trace.borrow().recoveries, 0);
+        assert_eq!(trace.borrow().created, [0]);
+        assert!(trace.borrow().dropped.is_empty());
     }
 
     #[test]

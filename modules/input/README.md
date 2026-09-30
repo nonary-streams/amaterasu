@@ -127,12 +127,12 @@ setting and maps either packet form through the existing fixed US-to-evdev table
 unmapped raw keys are rejected during batch validation.
 
 With `gamepad:"auto"`, Windows probes a real ViGEmClient/ViGEmBus connection
-and selects `x360` only after that connection succeeds. Linux probes a temporary
-uinput Xbox-like device and selects its `xone` profile only after creation and
-destruction succeed. Explicit `x360`, Windows `ds4`, and Linux `xone` select
-their corresponding platform probes; other recognized explicit profiles return
-`controller_input:false` with a status reason, leave keyboard and mouse usable,
-and never fall back to `auto`.
+and selects `x360` only after that connection succeeds. Linux probes the
+configured native target and reports its effective profile only after creation
+and destruction succeed. Explicit `x360`, Windows `ds4`, Linux `xone`, and Linux
+`ds4` select their corresponding platform probes; other recognized explicit
+profiles return `controller_input:false` with a status reason, leave keyboard
+and mouse usable, and never fall back to `auto`.
 Status reports the requested `gamepad`, `supported_profiles`, and the effective
 profile as `effective_gamepad_profile` (null until a real backend is available).
 An active lease retains the requested and effective profiles from acquisition.
@@ -160,6 +160,30 @@ failed new allocation leaves the slot without a device until the next tick.
 This recovery has been checked with fake devices; Linux target compilation and
 native delivery still need qualification on a Linux build host with uinput.
 
+Linux `ds4` creates a USB-identity DualShock 4 over `/dev/uhid` (Sony VID/PID
+054c:05c4). It publishes the DS4 input, output, and feature-report descriptor,
+answers calibration, pairing, control, and firmware feature queries, and sends
+64-byte reports for buttons, d-pad, triggers, sticks, battery, two touch
+contacts, accelerometer, and gyroscope. Motion samples use m/s² for
+acceleration and degrees per second for gyroscope; touch coordinates and
+pressure are normalized to `[0,1]` and projected onto the DS4's 1920×942
+surface. Each virtual device receives a random local-unicast identity that
+remains stable if a failed report requires device replacement. Back keeps its
+Share mapping and also sets the touchpad-click bit
+when `ds4_back_as_touchpad_click` is enabled. Failed input writes retire and
+recreate the UHID device before replay; failed destruction keeps the descriptor
+owned for cleanup retry. The service has no route for returning rumble or
+lightbar feedback to the client, so valid DS4 output requests are consumed but
+not delivered. Synthetic descriptor, report, feature-query, and lifecycle tests
+cover this path; no physical-controller or game-delivery result is claimed.
+
+For `auto`, Linux chooses `xone` for Xbox arrivals. PlayStation arrivals choose
+`ds5`, Nintendo arrivals choose `switch`, and unknown devices with enabled
+motion or touchpad preference and matching capabilities also choose `ds5`.
+Those profiles remain unavailable in this increment, so their controller events
+are rejected with `controller_unavailable` instead of being sent through the
+Xbox-like device. Unknown arrivals without those capabilities use `xone`.
+
 Windows uses ViGEm's Xbox 360 profile when a
 compatible ViGEmBus driver is installed and a vetted `ViGEmClient.dll` is
 deployed in an allowed load location. The lease-start probe connects to the bus
@@ -176,18 +200,20 @@ report path maps d-pad, standard buttons, triggers, and sticks; it does not
 provide touch coordinates, motion, rumble, or controller feedback.
 `ds4_back_as_touchpad_click` defaults to enabled and adds the Back button to the
 DS4 touchpad-click control while preserving its Share mapping. Client touchpad
-and miscellaneous-button clicks also map to that DS4 control. The durable setting
+clicks map to that DS4 control where the selected native DS4 profile supports
+them. The durable setting
 and sparse acquire override are accepted by the input module. Signed management
 and paired-client editors persist explicit false and inheritance; NVHTTP resolves
 certificate-bound client policy before application policy and freezes the choice
 for launch. Signed host restart and synthetic input-probe tests qualify that
-projection. Native DS4 touchpad-click and game delivery remain unqualified. Windows does not select another
-profile when ViGEm is missing. Linux exposes the Xbox-like uinput backend under
-the pinned `xone` choice; it does not use Inputtino. DS5, Switch, VHF profiles,
-VHF/UMDF device creation, and Inputtino integration remain unimplemented. Linux runtime behavior
-has not been exercised on this Windows host, and
-Windows virtual-device delivery has not been qualified against an installed
-ViGEmBus driver, so platform-qualified controller parity remains pending.
+projection. Windows DS4 touchpad-click and game delivery remain unqualified.
+Windows does not select another profile when ViGEm is missing. Linux provides
+its Xbox-like uinput backend under `xone` and a native UHID implementation for
+explicit `ds4`; it does not use Inputtino. DS5, Switch, VHF profiles, and VHF/UMDF
+device creation remain unimplemented. Linux UHID runtime behavior has not been
+exercised with a physical controller or game, and Windows virtual-device
+delivery has not been qualified against an installed ViGEmBus driver, so
+platform-qualified controller parity remains pending.
 
 If an active ViGEm target rejects a report, input detaches that target before
 creating a replacement and submitting the current state. A failed detach keeps
