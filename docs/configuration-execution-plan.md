@@ -1,5 +1,13 @@
 # Configuration parity execution workflow
 
+## Current task: complete Linux session
+
+The configuration teams finished their bounded handoffs on 2026-09-30. The user
+then replaced active parity work with the complete Linux streaming session in
+[the Linux execution plan](linux-session-execution-plan.md). Follow that plan for
+current implementation and acceptance. Preserve the configuration work and
+qualification limits below as historical context.
+
 ## Current session override: native Luna agents
 
 On 2026-09-30 the user requested resuming the remaining work with Luna agents
