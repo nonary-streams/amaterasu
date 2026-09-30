@@ -734,6 +734,9 @@ fn service_status(payload: &Value, login: bool, operational_health: bool) -> u16
 }
 
 #[cfg(test)]
+mod csrf_revocation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

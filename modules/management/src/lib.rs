@@ -9,6 +9,9 @@ mod routes;
 mod server;
 mod tls;
 
+#[cfg(test)]
+mod csrf_adversarial_tests;
+
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use serde::Deserialize;
 use serde_json::json;

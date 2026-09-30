@@ -482,3 +482,6 @@ fn complete(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod csrf_adversarial_tests;
