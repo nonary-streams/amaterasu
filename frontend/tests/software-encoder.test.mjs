@@ -40,12 +40,15 @@ const controls = (fields) => {
 
 test("application software editor preserves raw values and forwards its selector through the form", () => {
   const editor = context.Amaterasu.softwareEncoderOverrideControls({
-    sw_preset: "  slow  ", sw_tune: "film,zerolatency", encoder: "auto",
+    sw_preset: "  slow  ", sw_tune: "film,zerolatency", min_threads: 2, encoder: "auto",
   });
   const fields = controls(editor.fields);
   assert.equal(fields.get("sw_preset_mode").value, "value");
   assert.equal(fields.get("sw_preset_value").value, "  slow  ");
   assert.equal(fields.get("sw_tune_value").value, "film,zerolatency");
+  assert.equal(fields.get("min_threads").value, "2");
+  assert.equal(fields.get("min_threads").min, "1");
+  assert.equal(fields.get("min_threads").max, "256");
   assert.equal(fields.get("encoder_backend").value, "auto");
   const form = new FormData();
   form.set("name", "Software application");
@@ -56,7 +59,7 @@ test("application software editor preserves raw values and forwards its selector
     return ordinary(context.Amaterasu.entryFromForm(form));
   };
   assert.deepEqual(readEntry().config_overrides, {
-    sw_preset: "  slow  ", sw_tune: "film,zerolatency", encoder: "auto",
+    sw_preset: "  slow  ", sw_tune: "film,zerolatency", min_threads: 2, encoder: "auto",
   });
   const mode = fields.get("sw_preset_mode");
   mode.value = "inherit";
@@ -68,9 +71,21 @@ test("application software editor preserves raw values and forwards its selector
   assert.equal(fields.get("sw_preset_value").disabled, false);
   assert.equal(fields.get("sw_preset_value").value, "  slow  ");
   fields.get("sw_preset_value").value = "";
+  fields.get("min_threads").value = "2";
   fields.get("encoder_backend").value = "software";
   assert.deepEqual(readEntry().config_overrides, {
-    sw_preset: "", sw_tune: "film,zerolatency", encoder: "software",
+    sw_preset: "", sw_tune: "film,zerolatency", min_threads: 2, encoder: "software",
   });
   assert.deepEqual(ordinary(editor.read()), readEntry().config_overrides);
+});
+
+test("global software editor shows the default thread count and inherits configured values", () => {
+  const editor = context.Amaterasu.softwareEncoderOverrideControls({ min_threads: null }, true);
+  const fields = controls(editor.fields);
+  assert.equal(fields.get("min_threads").placeholder, "Default (2)");
+  assert.equal(fields.get("min_threads").value, "");
+  fields.get("min_threads").value = "256";
+  assert.equal(editor.read().min_threads, 256);
+  fields.get("min_threads").value = "";
+  assert.equal(editor.read().min_threads, null);
 });

@@ -414,6 +414,8 @@ namespace Amaterasu {
     });
     for (const key of ["sw_preset", "sw_tune", "encoder"])
       if (Object.prototype.hasOwnProperty.call(values, key)) expected[`configured_${key}`] = values[key];
+    if (Object.prototype.hasOwnProperty.call(current, "configured_min_threads"))
+      expected.configured_min_threads = values.min_threads;
     const confirms = (reply: NvhttpSettings): boolean =>
       reply.revision === current.revision + 1 &&
       Object.entries(expected).every(([key, value]) =>
@@ -953,7 +955,7 @@ namespace Amaterasu {
   }
 
   const forwardablePairingOverrideFields = [
-    "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "encoder",
+    "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "min_threads", "encoder",
     "audio_sink_capture_only", "back_button_timeout", "controller", "gamepad",
     "keyboard", "mouse", "native_pen_touch", "ds4_back_as_touchpad_click",
     "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
@@ -990,6 +992,8 @@ namespace Amaterasu {
         new TextEncoder().encode(value).length <= (field === "sw_preset" ? 128 : 256) &&
         !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
     if (field === "encoder") return value === "auto" || value === "software";
+    if (field === "min_threads")
+      return Number.isSafeInteger(value) && (value as number) >= 1 && (value as number) <= 256;
     if (field === "gamepad")
       return typeof value === "string" && recognizedInputGamepadProfiles.includes(value);
     if (field === "frame_limiter_provider")
@@ -3387,6 +3391,7 @@ namespace Amaterasu {
         const softwareEncoder = softwareEncoderOverrideControls({
           sw_preset: settings.configured_sw_preset,
           sw_tune: settings.configured_sw_tune,
+          min_threads: settings.configured_min_threads,
           encoder: settings.configured_encoder,
         }, true);
         const softwareAvailability = el("p", "muted", "Software x264 availability has not been checked.");
@@ -3406,7 +3411,7 @@ namespace Amaterasu {
         form.append(
           ...softwareEncoder.fields,
           softwareAvailability,
-          el("p", "muted", `Effective software tuning: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}.`),
+          el("p", "muted", `Effective software tuning: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum threads ${settings.effective_min_threads ?? 2}.`),
           field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."),
           field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."),
           field(

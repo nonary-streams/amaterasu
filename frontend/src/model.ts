@@ -79,8 +79,20 @@ namespace Amaterasu {
     return {
       sw_preset: option("sw_preset", 128),
       sw_tune: option("sw_tune", 256),
+      min_threads: parseMinThreadsOverride(raw("min_threads")),
       encoder: backend === "" ? null : backend as "auto" | "software",
     };
+  }
+
+  export function parseMinThreadsOverride(value: string): number | null {
+    const trimmed = value.trim();
+    if (trimmed === "") return null;
+    if (!/^[1-9][0-9]{0,2}$/.test(trimmed))
+      throw new Error("Minimum software encoding threads must be a whole number from 1 to 256, or blank to inherit.");
+    const threads = Number(trimmed);
+    if (threads > 256)
+      throw new Error("Minimum software encoding threads must be a whole number from 1 to 256, or blank to inherit.");
+    return threads;
   }
 
   export function parseArguments(value: string): string[] {

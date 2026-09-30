@@ -96,6 +96,7 @@ namespace Amaterasu {
   export interface SoftwareEncoderOverrides {
     sw_preset?: string | null;
     sw_tune?: string | null;
+    min_threads?: number | null;
     encoder?: "auto" | "software" | null;
   }
   export type RefreshRateOption = "auto" | "disabled" | "manual" | "prefer_highest";
@@ -157,9 +158,11 @@ namespace Amaterasu {
     configured_wgc_pacing_smoothing: boolean | null;
     configured_sw_preset: string | null;
     configured_sw_tune: string | null;
+    configured_min_threads?: number | null;
     configured_encoder: "auto" | "software" | null;
     effective_sw_preset: string;
     effective_sw_tune: string;
+    effective_min_threads?: number;
     effective_wgc_pacing_smoothing: boolean;
     configured_global_preparation: PreparationStep[];
     stream_audio: boolean;

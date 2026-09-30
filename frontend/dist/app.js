@@ -81,10 +81,23 @@ var Amaterasu;
         return {
             sw_preset: option("sw_preset", 128),
             sw_tune: option("sw_tune", 256),
+            min_threads: parseMinThreadsOverride(raw("min_threads")),
             encoder: backend === "" ? null : backend,
         };
     }
     Amaterasu.parseSoftwareEncoderOverrides = parseSoftwareEncoderOverrides;
+    function parseMinThreadsOverride(value) {
+        const trimmed = value.trim();
+        if (trimmed === "")
+            return null;
+        if (!/^[1-9][0-9]{0,2}$/.test(trimmed))
+            throw new Error("Minimum software encoding threads must be a whole number from 1 to 256, or blank to inherit.");
+        const threads = Number(trimmed);
+        if (threads > 256)
+            throw new Error("Minimum software encoding threads must be a whole number from 1 to 256, or blank to inherit.");
+        return threads;
+    }
+    Amaterasu.parseMinThreadsOverride = parseMinThreadsOverride;
     function parseArguments(value) {
         const parsed = JSON.parse(value || "[]");
         if (!Array.isArray(parsed) ||
@@ -1869,6 +1882,13 @@ var Amaterasu;
             controls.set(value.name, value);
             fields.push(Amaterasu.field(label, mode, "Inherit the lower scope, or retain an exact software tuning string."), Amaterasu.field(`${label} exact value`, value, "Applied by the x264 software backend. Exact strings are validated by the installed codec at launch; hardware encoders preserve these fields without applying them."));
         }
+        const minThreads = Amaterasu.input("min_threads", current?.min_threads?.toString() ?? "", "number");
+        minThreads.min = "1";
+        minThreads.max = "256";
+        minThreads.step = "1";
+        minThreads.placeholder = global ? "Default (2)" : "Inherit";
+        controls.set(minThreads.name, minThreads);
+        fields.push(Amaterasu.field("Minimum software encoding threads", minThreads, "Sets the minimum thread count for software H.264 encoding. Hardware selections preserve this value without applying it."));
         const backend = Amaterasu.el("select");
         backend.name = "encoder_backend";
         for (const [value, label] of [
@@ -3340,6 +3360,8 @@ var Amaterasu;
         for (const key of ["sw_preset", "sw_tune", "encoder"])
             if (Object.prototype.hasOwnProperty.call(values, key))
                 expected[`configured_${key}`] = values[key];
+        if (Object.prototype.hasOwnProperty.call(current, "configured_min_threads"))
+            expected.configured_min_threads = values.min_threads;
         const confirms = (reply) => reply.revision === current.revision + 1 &&
             Object.entries(expected).every(([key, value]) => sameConfigurationValue(reply[key], value));
         const updated = parseNvhttpSettingsReply(await api.post("nvhttp/settings_update", {
@@ -3777,7 +3799,7 @@ var Amaterasu;
     }
     Amaterasu.parseClientFecOverride = parseClientFecOverride;
     const forwardablePairingOverrideFields = [
-        "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "encoder",
+        "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "min_threads", "encoder",
         "audio_sink_capture_only", "back_button_timeout", "controller", "gamepad",
         "keyboard", "mouse", "native_pen_touch", "ds4_back_as_touchpad_click",
         "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
@@ -3823,6 +3845,8 @@ var Amaterasu;
                 !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
         if (field === "encoder")
             return value === "auto" || value === "software";
+        if (field === "min_threads")
+            return Number.isSafeInteger(value) && value >= 1 && value <= 256;
         if (field === "gamepad")
             return typeof value === "string" && recognizedInputGamepadProfiles.includes(value);
         if (field === "frame_limiter_provider")
@@ -5614,6 +5638,7 @@ var Amaterasu;
                 const softwareEncoder = Amaterasu.softwareEncoderOverrideControls({
                     sw_preset: settings.configured_sw_preset,
                     sw_tune: settings.configured_sw_tune,
+                    min_threads: settings.configured_min_threads,
                     encoder: settings.configured_encoder,
                 }, true);
                 const softwareAvailability = Amaterasu.el("p", "muted", "Software x264 availability has not been checked.");
@@ -5632,7 +5657,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(...softwareEncoder.fields, softwareAvailability, Amaterasu.el("p", "muted", `Effective software tuning: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}.`), Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation, Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), ...(settings.rtsp_listener_error ? [Amaterasu.el("p", "error", settings.rtsp_listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(...softwareEncoder.fields, softwareAvailability, Amaterasu.el("p", "muted", `Effective software tuning: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum threads ${settings.effective_min_threads ?? 2}.`), Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation, Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), ...(settings.rtsp_listener_error ? [Amaterasu.el("p", "error", settings.rtsp_listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     if (!form.reportValidity())

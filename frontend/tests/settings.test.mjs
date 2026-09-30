@@ -2088,6 +2088,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
           assert.deepEqual(ordinary(body.config_overrides.keybindings), []);
           assert.equal(body.config_overrides.sw_preset, "");
           assert.equal(body.config_overrides.sw_tune, "  film,zerolatency  ");
+          assert.equal(body.config_overrides.min_threads, 2);
           assert.equal(body.config_overrides.encoder, "software");
           stored = { ...stored, revision: 8, clients: [
             { ...stored.clients[0], config_overrides: body.config_overrides }, stored.clients[1],
@@ -2129,6 +2130,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   tuneMode.fire("change");
   assert.equal(tuneValue.disabled, false);
   tuneValue.value = "  film,zerolatency  ";
+  find(pairingArea, (node) => node.name === "min_threads").value = "2";
   assert.equal(find(pairingArea, (node) => node.name === "encoder_backend").value, "software");
   fec.value = "35";
   find(pairingArea, (node) => node.name === "native_pen_touch").value = "true";
@@ -2917,7 +2919,7 @@ test("software availability requires an actual software encoder identity and dis
 test("paired software overrides retain exact empty strings through canonicalization and reject unknown backends", () => {
   const client = {certificate_id:"a".repeat(64),client_id:"client",name:"Client",paired_at:1,config_overrides:{sw_preset:"",sw_tune:"film,zerolatency",encoder:"software"}};
   assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(client)),[]);
-  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields({...client,config_overrides:{sw_tune:"x".repeat(257),encoder:"nvenc"}})),["sw_tune","encoder"]);
+  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields({...client,config_overrides:{sw_tune:"x".repeat(257),min_threads:257,encoder:"nvenc"}})),["sw_tune","min_threads","encoder"]);
 });
 
 test("host software save confirms exact empty/null tuning and rejects stale codec readback", async () => {

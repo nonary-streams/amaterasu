@@ -263,6 +263,17 @@ namespace Amaterasu {
         field(`${label} exact value`, value, "Applied by the x264 software backend. Exact strings are validated by the installed codec at launch; hardware encoders preserve these fields without applying them."),
       );
     }
+    const minThreads = input("min_threads", current?.min_threads?.toString() ?? "", "number");
+    minThreads.min = "1";
+    minThreads.max = "256";
+    minThreads.step = "1";
+    minThreads.placeholder = global ? "Default (2)" : "Inherit";
+    controls.set(minThreads.name, minThreads);
+    fields.push(field(
+      "Minimum software encoding threads",
+      minThreads,
+      "Sets the minimum thread count for software H.264 encoding. Hardware selections preserve this value without applying it.",
+    ));
     const backend = el("select");
     backend.name = "encoder_backend";
     for (const [value, label] of [
