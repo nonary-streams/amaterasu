@@ -185,8 +185,11 @@ game-delivery result is claimed.
 Linux `ds5` prefers the optional `/dev/vibeshine-ds5` native USB gadget and
 falls back to `/dev/uhid` when the gadget cannot be acquired. Both paths expose
 one USB-identity DualSense (Sony VID/PID 054c:0ce6, version 0x8111); they are
-never created together for one controller. The native gadget also supplies a
-four-channel USB-audio event stream. When the stream negotiates HAPTICS_PCM and
+never created together for one controller. A generation-tagged process
+allocator reserves the kernel's four exclusive UAPI slots independently of
+client controller numbers and MAC values, skipping slots already owned by
+another process. The native gadget also supplies a four-channel USB-audio event
+stream. When the stream negotiates HAPTICS_PCM and
 the active controller advertises its per-controller HAPTICS_PCM capability,
 the host selects the two actuator channels and groups them into bounded
 240-frame (5 ms at 48 kHz) PCM messages with a wrapping stream sequence.

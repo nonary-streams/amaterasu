@@ -5,6 +5,9 @@
 //! includes both HID input and four-channel USB audio; callers use UHID only if
 //! this transport cannot be acquired.
 
+#[path = "linux_ds5_gadget_slots.rs"]
+mod slots;
+
 #[cfg(not(test))]
 use super::DS5_REPORT_INTERVAL;
 use super::Ds5HapticsPacketizer;
@@ -16,6 +19,8 @@ use crate::feedback::FeedbackProducer;
 use crate::model::{InputError, InputResult};
 #[cfg(not(test))]
 use std::fs::{File, OpenOptions};
+#[cfg(not(test))]
+use std::io;
 #[cfg(test)]
 use std::mem::offset_of;
 use std::mem::size_of;
@@ -36,8 +41,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(not(test))]
 const DEVICE_PATH: &str = "/dev/vibeshine-ds5";
+use slots::CreateRequest;
 #[cfg(not(test))]
-const UAPI_SLOT_COUNT: u8 = 4;
+use slots::{GadgetIo, OwnedGadget};
 pub(super) const EVENT_OUTPUT: u32 = 1;
 pub(super) const EVENT_PCM: u32 = 2;
 const UAPI_IOCTL_MAGIC: u64 = 0xB5;
@@ -48,14 +54,6 @@ const IOCTL_CREATE: libc::c_ulong = ((UAPI_IOCTL_WRITE << 30)
     | 1) as libc::c_ulong;
 const IOCTL_DESTROY: libc::c_ulong = ((UAPI_IOCTL_MAGIC << 8) | 2) as libc::c_ulong;
 const MAX_EVENT_DATA: usize = 512;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CreateRequest {
-    slot: u32,
-    mac: [u8; 6],
-    reserved: [u8; 2],
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -88,9 +86,13 @@ impl NativeEvent {
 fn dispatch_native_event(
     event: &NativeEvent,
     packetizer: &mut Ds5HapticsPacketizer,
+    client_slot: u8,
     feedback: &FeedbackProducer,
     now: Instant,
 ) {
+    if feedback.controller() != u16::from(client_slot) {
+        return;
+    }
     let Some((event_type, payload)) = event.payload() else {
         return;
     };
@@ -104,13 +106,58 @@ fn dispatch_native_event(
 }
 
 #[cfg(not(test))]
+struct LinuxGadgetHandle {
+    file: Option<Arc<Mutex<File>>>,
+}
+
+#[cfg(not(test))]
+impl LinuxGadgetHandle {
+    fn open() -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(DEVICE_PATH)?;
+        if !file.metadata()?.file_type().is_char_device() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "/dev/vibeshine-ds5 must be a character device",
+            ));
+        }
+        Ok(Self {
+            file: Some(Arc::new(Mutex::new(file))),
+        })
+    }
+
+    fn file(&self) -> &Arc<Mutex<File>> {
+        self.file
+            .as_ref()
+            .expect("open DS5 gadget handle retains its file descriptor")
+    }
+}
+
+#[cfg(not(test))]
+impl GadgetIo for LinuxGadgetHandle {
+    fn create_slot(&mut self, request: &CreateRequest) -> io::Result<()> {
+        create_slot(self.file(), request)
+    }
+
+    fn destroy_slot(&mut self) -> io::Result<()> {
+        destroy_slot(self.file())
+    }
+
+    fn close(&mut self) {
+        self.file.take();
+    }
+}
+
+#[cfg(not(test))]
 pub(super) struct GadgetDevice {
-    file: Arc<Mutex<File>>,
+    slot: OwnedGadget<LinuxGadgetHandle>,
     report: Arc<Mutex<Ds5ReportState>>,
     failure: Arc<Mutex<Option<InputError>>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
-    destroyed: bool,
 }
 
 #[cfg(not(test))]
@@ -121,72 +168,69 @@ impl GadgetDevice {
         address: [u8; 6],
         feedback: FeedbackProducer,
     ) -> InputResult<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(DEVICE_PATH)
-            .map_err(gadget_error)?;
-        if !file
-            .metadata()
-            .map_err(gadget_error)?
-            .file_type()
-            .is_char_device()
-        {
+        if feedback.controller() != u16::from(client_slot) {
             return Err(InputError::new(
-                "invalid_device",
-                "/dev/vibeshine-ds5 must be a character device",
+                "invalid_feedback_owner",
+                "Linux DS5 gadget feedback does not match its client controller slot",
             ));
         }
 
-        let file = Arc::new(Mutex::new(file));
-        let request = CreateRequest {
-            // The UAPI exposes four named gadget slots. Stable/random MACs use
-            // the same final-octet mapping as the pinned reference implementation.
-            slot: u32::from(address[5] % UAPI_SLOT_COUNT),
-            mac: address,
-            reserved: [0; 2],
-        };
-        create_slot(&file, &request)?;
+        let mut slot =
+            OwnedGadget::acquire_process(client_slot, address, |_owner| LinuxGadgetHandle::open())
+                .map_err(gadget_error)?;
+        let owned_client_slot = slot.client_slot();
+        let uapi_slot = slot.uapi_slot();
+        if owned_client_slot != client_slot {
+            return Err(InputError::new(
+                "invalid_feedback_owner",
+                "Linux DS5 UAPI reservation belongs to another client controller slot",
+            ));
+        }
 
         let failure = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let worker = {
-            let worker_file = Arc::clone(&file);
-            let worker_report = Arc::clone(&report);
-            let worker_failure = Arc::clone(&failure);
-            let worker_stop = Arc::clone(&stop);
-            let worker_feedback = feedback;
-            thread::Builder::new()
-                .name(format!("amaterasu-ds5-gadget-{client_slot}"))
-                .spawn(move || {
-                    if let Err(error) = run_gadget_loop(
-                        &worker_file,
-                        &worker_report,
-                        &worker_feedback,
-                        &worker_stop,
-                    ) {
-                        *worker_failure
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
-                    }
-                })
-                .map_err(|error| {
-                    let _ = destroy_slot(&file);
-                    InputError::new(
-                        "controller_unavailable",
-                        format!("cannot start DS5 gadget event thread: {error}"),
-                    )
-                })?
+        let worker_file = Arc::clone(slot.handle().file());
+        let worker_report = Arc::clone(&report);
+        let worker_failure = Arc::clone(&failure);
+        let worker_stop = Arc::clone(&stop);
+        let worker_feedback = feedback;
+        let worker_result = thread::Builder::new()
+            .name(format!(
+                "amaterasu-ds5-gadget-client-{owned_client_slot}-uapi-{uapi_slot}"
+            ))
+            .spawn(move || {
+                if let Err(error) = run_gadget_loop(
+                    &worker_file,
+                    &worker_report,
+                    owned_client_slot,
+                    &worker_feedback,
+                    &worker_stop,
+                ) {
+                    *worker_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                }
+            });
+        let worker = match worker_result {
+            Ok(worker) => worker,
+            Err(error) => {
+                // Drop the acquired slot synchronously before the caller can
+                // fall back to UHID. Its cleanup destroys, closes, then frees
+                // the matching process reservation.
+                slot.cleanup();
+                return Err(InputError::new(
+                    "controller_unavailable",
+                    format!("cannot start DS5 gadget event thread: {error}"),
+                ));
+            }
         };
 
         Ok(Self {
-            file,
+            slot,
             report,
             failure,
             stop,
             worker: Some(worker),
-            destroyed: false,
         })
     }
 
@@ -197,7 +241,7 @@ impl GadgetDevice {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .input_report();
-        write_input_report(&self.file, &report)
+        write_input_report(self.slot.handle().file(), &report)
     }
 
     pub(super) fn check_failure(&self) -> InputResult<()> {
@@ -224,13 +268,8 @@ impl GadgetDevice {
     }
 
     pub(super) fn destroy(&mut self) -> InputResult<()> {
-        if self.destroyed {
-            return Ok(());
-        }
         self.stop_worker()?;
-        destroy_slot(&self.file)?;
-        self.destroyed = true;
-        Ok(())
+        self.slot.destroy().map_err(gadget_error)
     }
 }
 
@@ -238,14 +277,12 @@ impl GadgetDevice {
 impl Drop for GadgetDevice {
     fn drop(&mut self) {
         let _ = self.stop_worker();
-        if !self.destroyed {
-            let _ = destroy_slot(&self.file);
-        }
+        self.slot.cleanup();
     }
 }
 
 #[cfg(not(test))]
-fn create_slot(file: &Arc<Mutex<File>>, request: &CreateRequest) -> InputResult<()> {
+fn create_slot(file: &Arc<Mutex<File>>, request: &CreateRequest) -> io::Result<()> {
     let file = file
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -259,20 +296,20 @@ fn create_slot(file: &Arc<Mutex<File>>, request: &CreateRequest) -> InputResult<
         )
     };
     if status < 0 {
-        return Err(gadget_error(std::io::Error::last_os_error()));
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
 #[cfg(not(test))]
-fn destroy_slot(file: &Arc<Mutex<File>>) -> InputResult<()> {
+fn destroy_slot(file: &Arc<Mutex<File>>) -> io::Result<()> {
     let file = file
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // SAFETY: the no-argument UAPI ioctl uses only this live, owned file handle.
     let status = unsafe { libc::ioctl(file.as_raw_fd(), IOCTL_DESTROY) };
     if status < 0 {
-        return Err(gadget_error(std::io::Error::last_os_error()));
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -281,6 +318,7 @@ fn destroy_slot(file: &Arc<Mutex<File>>) -> InputResult<()> {
 fn run_gadget_loop(
     file: &Arc<Mutex<File>>,
     report: &Arc<Mutex<Ds5ReportState>>,
+    client_slot: u8,
     feedback: &FeedbackProducer,
     stop: &AtomicBool,
 ) -> InputResult<()> {
@@ -323,7 +361,13 @@ fn run_gadget_loop(
         if descriptor.revents & libc::POLLIN != 0
             && let Some(event) = read_event(descriptor.fd)?
         {
-            dispatch_native_event(&event, &mut packetizer, feedback, Instant::now());
+            dispatch_native_event(
+                &event,
+                &mut packetizer,
+                client_slot,
+                feedback,
+                Instant::now(),
+            );
         }
         if Instant::now() >= next_report {
             let input_report = report
@@ -469,7 +513,9 @@ mod tests {
         output.data[1] = 1;
         output.data[3] = 64;
         output.data[4] = 128;
-        dispatch_native_event(&output, &mut packetizer, &producer, now);
+        dispatch_native_event(&output, &mut packetizer, 4, &producer, now);
+        assert!(queue.peek(1).is_empty());
+        dispatch_native_event(&output, &mut packetizer, 5, &producer, now);
         assert_eq!(
             queue.peek(1)[0].feedback,
             HostFeedback::Rumble {
@@ -489,7 +535,7 @@ mod tests {
                 ..NativeEvent::default()
             };
             pcm.data[..source.len()].copy_from_slice(&source);
-            dispatch_native_event(&pcm, &mut packetizer, &producer, now);
+            dispatch_native_event(&pcm, &mut packetizer, 5, &producer, now);
         }
 
         let events = queue.peek(1);
