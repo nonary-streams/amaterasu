@@ -81,9 +81,6 @@ pub(crate) enum ProviderError {
     Unavailable(&'static str),
     #[cfg(any(windows, test))]
     ReadFailed(&'static str),
-    /// The provider rejected the expected state before starting any writes.
-    #[cfg(any(windows, test))]
-    PreconditionFailed(&'static str),
     /// A locked profile-file comparison observed a different limiter snapshot.
     #[cfg(any(windows, test))]
     ProfileMismatch {
@@ -98,7 +95,7 @@ impl ProviderError {
         match self {
             Self::Unavailable(code) | Self::VerifyFailed(code) => code,
             #[cfg(any(windows, test))]
-            Self::ReadFailed(code) | Self::PreconditionFailed(code) => code,
+            Self::ReadFailed(code) => code,
             #[cfg(any(windows, test))]
             Self::ProfileMismatch { code, .. } => code,
         }
@@ -112,9 +109,8 @@ pub(crate) trait FrameLimitProvider {
     fn profile_exists(&mut self, profile: &str) -> Result<bool, ProviderError>;
     fn read_profile(&mut self, profile: &str) -> Result<ProfileValues, ProviderError>;
     fn ensure_safe_writes_supported(&mut self) -> Result<(), ProviderError>;
-    /// Writes only when the current values match `expected`. A precondition
-    /// failure guarantees no mutation; `ProfileMismatch` includes the exact
-    /// profile values observed under the provider's write guard.
+    /// Writes only when the current values match `expected`. `ProfileMismatch`
+    /// includes the exact values observed under the provider's write guard.
     fn write_profile_verified(
         &mut self,
         profile: &str,
@@ -288,10 +284,6 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
                 .write_profile_verified(profile, before.profile, desired_profile)
         {
             return match error {
-                #[cfg(any(windows, test))]
-                ProviderError::PreconditionFailed(code) => {
-                    self.discard_unmutated_pending_apply(record, code)
-                }
                 #[cfg(any(windows, test))]
                 ProviderError::ProfileMismatch { code, .. } => {
                     self.discard_unmutated_pending_apply(record, code)
@@ -628,8 +620,6 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
                     }
                     self.confirm_profile_at_before(lease)?;
                 }
-                #[cfg(any(windows, test))]
-                Err(ProviderError::PreconditionFailed(_)) => return Err(RestoreFailure::Stale),
                 Err(error) => return Err(RestoreFailure::Provider(error.diagnostic())),
             }
         } else if lease.before.profile_exists {
@@ -654,9 +644,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
         ) {
             Ok(()) => Ok(()),
             #[cfg(any(windows, test))]
-            Err(ProviderError::ProfileMismatch { .. } | ProviderError::PreconditionFailed(_)) => {
-                Err(RestoreFailure::Stale)
-            }
+            Err(ProviderError::ProfileMismatch { .. }) => Err(RestoreFailure::Stale),
             Err(error) => Err(RestoreFailure::Provider(error.diagnostic())),
         }
     }
@@ -1592,9 +1580,7 @@ mod tests {
             values: ProfileValues,
         ) -> Result<(), ProviderError> {
             if !self.mutation_supported {
-                return Err(ProviderError::PreconditionFailed(
-                    "fake_safe_write_unsupported",
-                ));
+                return Err(ProviderError::Unavailable("fake_safe_write_unsupported"));
             }
             if self.fail_writes {
                 return Err(ProviderError::Unavailable("fake_write_failure"));
@@ -1609,9 +1595,7 @@ mod tests {
                 });
             }
             let Some(observed) = self.profile_files.get(profile).copied() else {
-                return Err(ProviderError::PreconditionFailed(
-                    "fake_profile_changed_before_write",
-                ));
+                return Err(ProviderError::Unavailable("fake_profile_missing"));
             };
             if !self.profile_exists(profile)? || observed != expected {
                 return Err(ProviderError::ProfileMismatch {
