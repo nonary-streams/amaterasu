@@ -501,6 +501,31 @@ fn v12_documents_migrate_proton_compatibility_to_its_enabled_default() {
 }
 
 #[test]
+fn v13_documents_preserve_proton_choice_when_random_mac_is_added() {
+    let mut values = InputPolicy::default().values();
+    values["proton_dualsense_compatibility"] = json!(false);
+    values
+        .as_object_mut()
+        .unwrap()
+        .remove("ds5_inputtino_randomize_mac");
+    let (policy, revision) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":13,
+        "revision":11,
+        "values":values,
+    }))
+    .unwrap();
+
+    assert_eq!(revision, 11);
+    assert!(!policy.proton_dualsense_compatibility);
+    assert!(policy.ds5_inputtino_randomize_mac);
+    let updated = policy.update_payload(revision);
+    assert_eq!(updated["version"], 14);
+    assert_eq!(updated["values"]["proton_dualsense_compatibility"], false);
+}
+
+#[test]
 fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     let mut settings = ProductSettings::new();
     settings.ready = true;

@@ -913,6 +913,10 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
                     "gamepad",
                     "controller",
                     "ds4_back_as_touchpad_click",
+                    "motion_as_ds4",
+                    "touchpad_as_ds4",
+                    "ds5_inputtino_randomize_mac",
+                    "proton_dualsense_compatibility",
                     "native_pen_touch",
                 ],
             )?;
@@ -954,6 +958,18 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
                     .is_some_and(|value| value.as_bool().is_none())
                 || object
                     .get("ds4_back_as_touchpad_click")
+                    .is_some_and(|value| value.as_bool().is_none())
+                || object
+                    .get("motion_as_ds4")
+                    .is_some_and(|value| value.as_bool().is_none())
+                || object
+                    .get("touchpad_as_ds4")
+                    .is_some_and(|value| value.as_bool().is_none())
+                || object
+                    .get("ds5_inputtino_randomize_mac")
+                    .is_some_and(|value| value.as_bool().is_none())
+                || object
+                    .get("proton_dualsense_compatibility")
                     .is_some_and(|value| value.as_bool().is_none())
                 || object
                     .get("native_pen_touch")
@@ -1392,6 +1408,10 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
             "frame_generation_mode",
             "rtss_frame_limit_type",
             "ds4_back_as_touchpad_click",
+            "motion_as_ds4",
+            "touchpad_as_ds4",
+            "ds5_inputtino_randomize_mac",
+            "proton_dualsense_compatibility",
         ],
     )?;
     if let Some(fec) = overrides.get("fec_percentage")
@@ -1471,6 +1491,10 @@ fn optional_catalog_frame_limiter_overrides(overrides: &Object) -> Result<(), &'
         "frame_limiter_disable_vsync",
         "ds4_back_as_touchpad_click",
         "lossless_scaling_framegen",
+        "motion_as_ds4",
+        "touchpad_as_ds4",
+        "ds5_inputtino_randomize_mac",
+        "proton_dualsense_compatibility",
     ] {
         if overrides
             .get(key)
@@ -1651,6 +1675,11 @@ fn optional_input_overrides(overrides: &Object) -> Result<(), &'static str> {
         "keyboard",
         "mouse",
         "native_pen_touch",
+        "ds4_back_as_touchpad_click",
+        "motion_as_ds4",
+        "touchpad_as_ds4",
+        "ds5_inputtino_randomize_mac",
+        "proton_dualsense_compatibility",
         "high_resolution_scrolling",
         "always_send_scancodes",
         "key_rightalt_to_key_win",
@@ -2949,6 +2978,70 @@ mod pairing_override_tests {
     }
 
     #[test]
+    fn controller_profile_and_proton_overrides_are_sparse_booleans_for_apps_and_clients() {
+        let routes = [
+            Route {
+                service: "amaterasu.catalog/1",
+                action: "update_provider_overrides",
+                scope: Some("catalog.write"),
+                requires_empty_body: false,
+            },
+            Route {
+                service: "amaterasu.pairing/1",
+                action: "update_client_config_overrides",
+                scope: Some("pairing.admin"),
+                requires_empty_body: false,
+            },
+        ];
+        let names = [
+            "motion_as_ds4",
+            "touchpad_as_ds4",
+            "ds5_inputtino_randomize_mac",
+            "proton_dualsense_compatibility",
+        ];
+
+        for route in routes {
+            for name in names {
+                for value in [Value::Bool(true), Value::Bool(false), Value::Null] {
+                    let payload = if route.service == "amaterasu.catalog/1" {
+                        serde_json::json!({
+                            "id":"app-0000000000000001", "expected_revision":4,
+                            "config_overrides":{(name):value},
+                        })
+                    } else {
+                        serde_json::json!({
+                            "certificate_id":"a".repeat(64), "expected_revision":4,
+                            "config_overrides":{(name):value},
+                        })
+                    };
+                    assert!(
+                        validate(route, payload.as_object().unwrap()).is_ok(),
+                        "{payload}"
+                    );
+                }
+
+                for value in [serde_json::json!(0), serde_json::json!("false")] {
+                    let payload = if route.service == "amaterasu.catalog/1" {
+                        serde_json::json!({
+                            "id":"app-0000000000000001", "expected_revision":4,
+                            "config_overrides":{(name):value},
+                        })
+                    } else {
+                        serde_json::json!({
+                            "certificate_id":"a".repeat(64), "expected_revision":4,
+                            "config_overrides":{(name):value},
+                        })
+                    };
+                    assert!(
+                        validate(route, payload.as_object().unwrap()).is_err(),
+                        "{payload}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn back_button_timeout_override_accepts_sparse_signed_i32_values() {
         let provider = Route {
             service: "amaterasu.catalog/1",
@@ -3184,6 +3277,10 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                     "mouse",
                     "native_pen_touch",
                     "ds4_back_as_touchpad_click",
+                    "motion_as_ds4",
+                    "touchpad_as_ds4",
+                    "ds5_inputtino_randomize_mac",
+                    "proton_dualsense_compatibility",
                     "high_resolution_scrolling",
                     "always_send_scancodes",
                     "key_rightalt_to_key_win",

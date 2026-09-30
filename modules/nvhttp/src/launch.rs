@@ -147,6 +147,10 @@ pub struct PeerIdentity {
     client_mouse: Option<bool>,
     client_native_pen_touch: Option<bool>,
     client_ds4_back_as_touchpad_click: Option<bool>,
+    client_motion_as_ds4: Option<bool>,
+    client_touchpad_as_ds4: Option<bool>,
+    client_ds5_inputtino_randomize_mac: Option<bool>,
+    client_proton_dualsense_compatibility: Option<bool>,
     client_high_resolution_scrolling: Option<bool>,
     client_always_send_scancodes: Option<bool>,
     client_key_rightalt_to_key_win: Option<bool>,
@@ -190,6 +194,10 @@ impl PeerIdentity {
             client_mouse: None,
             client_native_pen_touch: None,
             client_ds4_back_as_touchpad_click: None,
+            client_motion_as_ds4: None,
+            client_touchpad_as_ds4: None,
+            client_ds5_inputtino_randomize_mac: None,
+            client_proton_dualsense_compatibility: None,
             client_high_resolution_scrolling: None,
             client_always_send_scancodes: None,
             client_key_rightalt_to_key_win: None,
@@ -257,6 +265,10 @@ impl PeerIdentity {
             mouse,
             native_pen_touch,
             ds4_back_as_touchpad_click,
+            motion_as_ds4,
+            touchpad_as_ds4,
+            ds5_inputtino_randomize_mac,
+            proton_dualsense_compatibility,
             high_resolution_scrolling,
             always_send_scancodes,
             key_rightalt_to_key_win,
@@ -323,6 +335,10 @@ impl PeerIdentity {
         self.client_mouse = mouse;
         self.client_native_pen_touch = native_pen_touch;
         self.client_ds4_back_as_touchpad_click = ds4_back_as_touchpad_click;
+        self.client_motion_as_ds4 = motion_as_ds4;
+        self.client_touchpad_as_ds4 = touchpad_as_ds4;
+        self.client_ds5_inputtino_randomize_mac = ds5_inputtino_randomize_mac;
+        self.client_proton_dualsense_compatibility = proton_dualsense_compatibility;
         self.client_high_resolution_scrolling = high_resolution_scrolling;
         self.client_always_send_scancodes = always_send_scancodes;
         self.client_key_rightalt_to_key_win = key_rightalt_to_key_win;

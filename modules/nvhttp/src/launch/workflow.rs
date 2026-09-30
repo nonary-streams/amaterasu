@@ -290,6 +290,9 @@ impl Controller {
                         "native_pen_touch": record.scoped_native_pen_touch,
                         "ds4_back_as_touchpad_click": record
                             .scoped_ds4_back_as_touchpad_click,
+                        "motion_as_ds4": record.scoped_motion_as_ds4,
+                        "touchpad_as_ds4": record.scoped_touchpad_as_ds4,
+                        "ds5_inputtino_randomize_mac": record.scoped_ds5_inputtino_randomize_mac,
                         "high_resolution_scrolling": record.scoped_high_resolution_scrolling,
                         "always_send_scancodes": record.scoped_always_send_scancodes,
                         "key_rightalt_to_key_win": record.scoped_key_rightalt_to_key_win,
@@ -1394,6 +1397,18 @@ fn project_application_policy(
         .peer
         .client_ds4_back_as_touchpad_click
         .or(application_overrides.ds4_back_as_touchpad_click);
+    record.scoped_motion_as_ds4 = record
+        .peer
+        .client_motion_as_ds4
+        .or(application_overrides.motion_as_ds4);
+    record.scoped_touchpad_as_ds4 = record
+        .peer
+        .client_touchpad_as_ds4
+        .or(application_overrides.touchpad_as_ds4);
+    record.scoped_ds5_inputtino_randomize_mac = record
+        .peer
+        .client_ds5_inputtino_randomize_mac
+        .or(application_overrides.ds5_inputtino_randomize_mac);
     let application_fec_percentage = application_overrides.fec_percentage;
     record.application_fec_percentage = application_fec_percentage;
     record.effective_fec_percentage = record
@@ -1617,6 +1632,10 @@ pub(super) struct ApplicationConfigOverrides {
     mouse: Option<bool>,
     native_pen_touch: Option<bool>,
     ds4_back_as_touchpad_click: Option<bool>,
+    motion_as_ds4: Option<bool>,
+    touchpad_as_ds4: Option<bool>,
+    ds5_inputtino_randomize_mac: Option<bool>,
+    proton_dualsense_compatibility: Option<bool>,
     frame_limiter_enable: Option<bool>,
     frame_limiter_fps_limit: Option<f64>,
     frame_limiter_provider: Option<String>,

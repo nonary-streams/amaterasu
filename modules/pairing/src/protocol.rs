@@ -307,6 +307,14 @@ pub struct ClientConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_pen_touch: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_as_ds4: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touchpad_as_ds4: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ds5_inputtino_randomize_mac: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proton_dualsense_compatibility: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high_resolution_scrolling: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub always_send_scancodes: Option<bool>,
@@ -508,6 +516,10 @@ impl ClientConfigOverrides {
             && self.keyboard.is_none()
             && self.mouse.is_none()
             && self.native_pen_touch.is_none()
+            && self.motion_as_ds4.is_none()
+            && self.touchpad_as_ds4.is_none()
+            && self.ds5_inputtino_randomize_mac.is_none()
+            && self.proton_dualsense_compatibility.is_none()
             && self.high_resolution_scrolling.is_none()
             && self.always_send_scancodes.is_none()
             && self.key_rightalt_to_key_win.is_none()
@@ -933,6 +945,38 @@ mod tests {
             json!({"native_pen_touch":{}}),
         ] {
             assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn client_ds4_and_proton_overrides_are_sparse_and_strictly_boolean() {
+        for name in [
+            "motion_as_ds4",
+            "touchpad_as_ds4",
+            "ds5_inputtino_randomize_mac",
+            "proton_dualsense_compatibility",
+        ] {
+            let missing: ClientConfigOverrides = serde_json::from_value(json!({})).unwrap();
+            assert!(missing.is_empty());
+
+            for value in [true, false] {
+                let overrides: ClientConfigOverrides =
+                    serde_json::from_value(json!({(name):value})).unwrap();
+                let serialized = serde_json::to_value(&overrides).unwrap();
+                assert_eq!(serialized[name], value);
+            }
+
+            let explicit_null: ClientConfigOverrides =
+                serde_json::from_value(json!({(name):null})).unwrap();
+            assert!(explicit_null.is_empty());
+
+            for invalid in [json!(0), json!(1), json!("false"), json!([]), json!({})] {
+                assert!(
+                    serde_json::from_value::<ClientConfigOverrides>(json!({(name):invalid}))
+                        .is_err(),
+                    "{name} accepted {invalid}"
+                );
+            }
         }
     }
 

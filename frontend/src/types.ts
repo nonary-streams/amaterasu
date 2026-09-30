@@ -93,6 +93,10 @@ namespace Amaterasu {
       frame_generation_mode?: CatalogFrameGenerationMode | null;
       rtss_frame_limit_type?: CatalogRtssFrameLimitType | null;
       ds4_back_as_touchpad_click?: boolean | null;
+      motion_as_ds4?: boolean | null;
+      touchpad_as_ds4?: boolean | null;
+      ds5_inputtino_randomize_mac?: boolean | null;
+      proton_dualsense_compatibility?: boolean | null;
       dd_refresh_rate_option?: RefreshRateOption | null;
       prefer_10bit_sdr?: boolean | null;
     };
@@ -356,6 +360,10 @@ namespace Amaterasu {
       mouse?: boolean;
       native_pen_touch?: boolean;
       ds4_back_as_touchpad_click?: boolean;
+      motion_as_ds4?: boolean;
+      touchpad_as_ds4?: boolean;
+      ds5_inputtino_randomize_mac?: boolean;
+      proton_dualsense_compatibility?: boolean;
       [key: string]: unknown;
     };
   }
@@ -383,6 +391,10 @@ namespace Amaterasu {
       gamepad: string;
       controller: boolean;
       ds4_back_as_touchpad_click: boolean;
+      motion_as_ds4: boolean;
+      touchpad_as_ds4: boolean;
+      proton_dualsense_compatibility: boolean;
+      ds5_inputtino_randomize_mac: boolean;
       native_pen_touch: boolean;
     };
   }

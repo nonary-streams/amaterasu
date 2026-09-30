@@ -219,6 +219,28 @@ fn peer_with_native_pen_touch(marker: u8, native_pen_touch: Option<bool>) -> Pee
         .unwrap()
 }
 
+fn peer_with_controller_compatibility_overrides(
+    marker: u8,
+    motion_as_ds4: Option<bool>,
+    touchpad_as_ds4: Option<bool>,
+    ds5_inputtino_randomize_mac: Option<bool>,
+) -> PeerIdentity {
+    let certificate = vec![marker; 32];
+    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            format!("client-{marker}"),
+            fingerprint(&certificate),
+            ClientConfigOverrides {
+                motion_as_ds4,
+                touchpad_as_ds4,
+                ds5_inputtino_randomize_mac,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
 fn peer_with_ds4_back_as_touchpad_click(
     marker: u8,
     ds4_back_as_touchpad_click: Option<bool>,
@@ -783,6 +805,48 @@ fn scoped_input_overrides_use_client_then_application_precedence_and_preserve_fa
     assert_eq!(application_only["gamepad"], "auto");
     assert_eq!(application_only["keyboard"], true);
     assert_eq!(application_only["mouse"], false);
+}
+
+#[test]
+fn scoped_controller_compatibility_overrides_preserve_false_and_client_precedence() {
+    let now = Instant::now();
+    let client_peer =
+        peer_with_controller_compatibility_overrides(88, Some(false), None, Some(false));
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({
+            "motion_as_ds4":true,
+            "touchpad_as_ds4":false,
+            "ds5_inputtino_randomize_mac":true,
+        })),
+        ..Broker::default()
+    };
+    let mut controller = Controller::new(Some(config())).unwrap();
+    assert!(controller.launch(10, request(1), client_peer, now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+    let rtsp_open = opened_rtsp_payload(&broker);
+    assert_eq!(rtsp_open["motion_as_ds4"], false);
+    assert_eq!(rtsp_open["touchpad_as_ds4"], false);
+    assert_eq!(rtsp_open["ds5_inputtino_randomize_mac"], false);
+
+    let now = Instant::now();
+    let mut application_broker = Broker {
+        application_input_overrides: Some(json!({
+            "motion_as_ds4":false,
+            "touchpad_as_ds4":true,
+            "ds5_inputtino_randomize_mac":false,
+        })),
+        ..Broker::default()
+    };
+    let mut application_controller = Controller::new(Some(config())).unwrap();
+    assert!(application_controller
+        .launch(11, request(2), peer(89), now)
+        .is_none());
+    let _ = poll_until_reply(&mut application_controller, &mut application_broker, now);
+    let rtsp_open = opened_rtsp_payload(&application_broker);
+    assert_eq!(rtsp_open["motion_as_ds4"], false);
+    assert_eq!(rtsp_open["touchpad_as_ds4"], true);
+    assert_eq!(rtsp_open["ds5_inputtino_randomize_mac"], false);
 }
 
 fn selected_supported_gamepad_profile() -> &'static str {

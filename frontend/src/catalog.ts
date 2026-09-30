@@ -608,6 +608,56 @@ namespace Amaterasu {
     ];
   }
 
+  export type CatalogInputCompatibilityOverrides = Pick<
+    NonNullable<Entry["config_overrides"]>,
+    | "motion_as_ds4"
+    | "touchpad_as_ds4"
+    | "ds5_inputtino_randomize_mac"
+    | "proton_dualsense_compatibility"
+  >;
+
+  export function catalogInputCompatibilityOverrideFields(
+    overrides: Entry["config_overrides"] | undefined,
+  ): HTMLElement[] {
+    const motion = audioOverrideSelect("motion_as_ds4", overrides?.motion_as_ds4 ?? undefined);
+    const touchpad = audioOverrideSelect("touchpad_as_ds4", overrides?.touchpad_as_ds4 ?? undefined);
+    const randomMac = audioOverrideSelect(
+      "ds5_inputtino_randomize_mac",
+      overrides?.ds5_inputtino_randomize_mac ?? undefined,
+    );
+    const proton = audioOverrideSelect(
+      "proton_dualsense_compatibility",
+      overrides?.proton_dualsense_compatibility ?? undefined,
+    );
+    return [
+      field("Motion sensors select DS4", motion, "Inherit the next scope or override DS4 selection for automatic controller profiles."),
+      field("Touchpad selects DS4", touchpad, "Inherit the next scope or override DS4 selection for automatic controller profiles."),
+      field("Randomize DS5 inputtino MAC", randomMac, "Linux only; inherit or override random versus slot-derived DS5 MAC addresses."),
+      field("Proton DualSense compatibility", proton, "Linux Proton launch environment; inherit the next scope or override."),
+    ];
+  }
+
+  export function parseCatalogInputCompatibilityOverrides(
+    data: FormData,
+  ): CatalogInputCompatibilityOverrides {
+    const text = (name: keyof CatalogInputCompatibilityOverrides) =>
+      String(data.get(name) ?? "");
+    return {
+      motion_as_ds4: Amaterasu.parseInputBooleanOverride(
+        text("motion_as_ds4"), "Motion selects DS4",
+      ),
+      touchpad_as_ds4: Amaterasu.parseInputBooleanOverride(
+        text("touchpad_as_ds4"), "Touchpad selects DS4",
+      ),
+      ds5_inputtino_randomize_mac: Amaterasu.parseInputBooleanOverride(
+        text("ds5_inputtino_randomize_mac"), "DS5 random MAC",
+      ),
+      proton_dualsense_compatibility: Amaterasu.parseInputBooleanOverride(
+        text("proton_dualsense_compatibility"), "Proton DualSense compatibility",
+      ),
+    };
+  }
+
   function parseCatalogFrameLimiterEnum<T extends string>(
     value: string,
     allowedValues: readonly T[],
@@ -1096,6 +1146,9 @@ namespace Amaterasu {
         capabilities,
       );
       const nvencSettingsFields = catalogNvencSettingsOverrideFields(row.entry.config_overrides);
+      const inputCompatibilityFields = catalogInputCompatibilityOverrideFields(
+        row.entry.config_overrides,
+      );
       const streamAudio = audioOverrideSelect(
         "stream_audio",
         row.entry.config_overrides?.stream_audio,
@@ -1144,6 +1197,7 @@ namespace Amaterasu {
         field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."),
         field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."),
         field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
+        ...inputCompatibilityFields,
         ...advancedInput.fields,
         ...softwareEncoder.fields,
         ...nvencSettingsFields,
@@ -1169,6 +1223,7 @@ namespace Amaterasu {
               row.entry.config_overrides,
             ),
             parseCatalogNvencSettingsOverrides(new FormData(form)),
+            parseCatalogInputCompatibilityOverrides(new FormData(form)),
             { dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)) },
           );
           try {
@@ -1187,7 +1242,7 @@ namespace Amaterasu {
                 keyboard?: boolean;
                 mouse?: boolean;
                 dd_refresh_rate_option?: RefreshRateOption | null;
-              } & CatalogFrameLimiterOverrides & CatalogNvencSettingsOverrides;
+              } & CatalogFrameLimiterOverrides & CatalogNvencSettingsOverrides & CatalogInputCompatibilityOverrides;
               changed: boolean;
               replayed: boolean;
             }>("catalog/update_provider_overrides", {
@@ -1275,6 +1330,7 @@ namespace Amaterasu {
               row?.entry.config_overrides,
             ),
             parseCatalogNvencSettingsOverrides(new FormData(form)),
+            parseCatalogInputCompatibilityOverrides(new FormData(form)),
           );
           await api.post(row ? "catalog/update" : "catalog/create", {
             ...(row ? { id: row.id } : {}),
@@ -1412,6 +1468,9 @@ namespace Amaterasu {
       capabilities,
     );
     const nvencSettingsFields = catalogNvencSettingsOverrideFields(entry?.config_overrides);
+    const inputCompatibilityFields = catalogInputCompatibilityOverrideFields(
+      entry?.config_overrides,
+    );
     const streamAudio = audioOverrideSelect(
       "stream_audio",
       entry?.config_overrides?.stream_audio,
@@ -1527,6 +1586,7 @@ namespace Amaterasu {
       field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."),
       field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."),
       field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
+      ...inputCompatibilityFields,
       ...advancedInput.fields,
       ...softwareEncoder.fields,
       ...nvencSettingsFields,

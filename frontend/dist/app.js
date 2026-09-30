@@ -2358,6 +2358,29 @@ var Amaterasu;
             Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick, "Only applies to a DS4 profile. Blank inherits; explicit false is preserved."),
         ];
     }
+    function catalogInputCompatibilityOverrideFields(overrides) {
+        const motion = audioOverrideSelect("motion_as_ds4", overrides?.motion_as_ds4 ?? undefined);
+        const touchpad = audioOverrideSelect("touchpad_as_ds4", overrides?.touchpad_as_ds4 ?? undefined);
+        const randomMac = audioOverrideSelect("ds5_inputtino_randomize_mac", overrides?.ds5_inputtino_randomize_mac ?? undefined);
+        const proton = audioOverrideSelect("proton_dualsense_compatibility", overrides?.proton_dualsense_compatibility ?? undefined);
+        return [
+            Amaterasu.field("Motion sensors select DS4", motion, "Inherit the next scope or override DS4 selection for automatic controller profiles."),
+            Amaterasu.field("Touchpad selects DS4", touchpad, "Inherit the next scope or override DS4 selection for automatic controller profiles."),
+            Amaterasu.field("Randomize DS5 inputtino MAC", randomMac, "Linux only; inherit or override random versus slot-derived DS5 MAC addresses."),
+            Amaterasu.field("Proton DualSense compatibility", proton, "Linux Proton launch environment; inherit the next scope or override."),
+        ];
+    }
+    Amaterasu.catalogInputCompatibilityOverrideFields = catalogInputCompatibilityOverrideFields;
+    function parseCatalogInputCompatibilityOverrides(data) {
+        const text = (name) => String(data.get(name) ?? "");
+        return {
+            motion_as_ds4: Amaterasu.parseInputBooleanOverride(text("motion_as_ds4"), "Motion selects DS4"),
+            touchpad_as_ds4: Amaterasu.parseInputBooleanOverride(text("touchpad_as_ds4"), "Touchpad selects DS4"),
+            ds5_inputtino_randomize_mac: Amaterasu.parseInputBooleanOverride(text("ds5_inputtino_randomize_mac"), "DS5 random MAC"),
+            proton_dualsense_compatibility: Amaterasu.parseInputBooleanOverride(text("proton_dualsense_compatibility"), "Proton DualSense compatibility"),
+        };
+    }
+    Amaterasu.parseCatalogInputCompatibilityOverrides = parseCatalogInputCompatibilityOverrides;
     function parseCatalogFrameLimiterEnum(value, allowedValues, currentValue, label) {
         if (value === "")
             return null;
@@ -2657,6 +2680,7 @@ var Amaterasu;
             fec.setAttribute("aria-label", `FEC percentage override for ${row.entry.name}`);
             const frameLimiterFields = catalogFrameLimiterOverrideFields(row.entry.config_overrides, capabilities);
             const nvencSettingsFields = catalogNvencSettingsOverrideFields(row.entry.config_overrides);
+            const inputCompatibilityFields = catalogInputCompatibilityOverrideFields(row.entry.config_overrides);
             const streamAudio = audioOverrideSelect("stream_audio", row.entry.config_overrides?.stream_audio);
             const audioSink = audioSinkOverrideControls(row.entry.config_overrides?.audio_sink);
             const virtualSink = virtualSinkOverrideControls(row.entry.config_overrides?.virtual_sink);
@@ -2674,7 +2698,7 @@ var Amaterasu;
             const advancedInput = Amaterasu.advancedInputOverrideControls(row.entry.config_overrides);
             const softwareEncoder = Amaterasu.softwareEncoderOverrideControls(row.entry.config_overrides);
             const refreshRateOptionFields = catalogRefreshRateOptionFields(row.entry.config_overrides?.dd_refresh_rate_option);
-            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettingsFields);
+            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettingsFields);
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
             save.type = "submit";
@@ -2685,7 +2709,7 @@ var Amaterasu;
                 if (!form.reportValidity())
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
-                    const config_overrides = mergeCatalogConfigOverrides(row.entry.config_overrides, new FormData(form).keys(), advancedInput.read(), softwareEncoder.read(), Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles), parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form)), { dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)) });
+                    const config_overrides = mergeCatalogConfigOverrides(row.entry.config_overrides, new FormData(form).keys(), advancedInput.read(), softwareEncoder.read(), Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles), parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form)), parseCatalogInputCompatibilityOverrides(new FormData(form)), { dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)) });
                     try {
                         const reply = await api.post("catalog/update_provider_overrides", {
                             id: row.id,
@@ -2736,7 +2760,7 @@ var Amaterasu;
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
                     const entry = Amaterasu.entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
-                    entry.config_overrides = mergeCatalogConfigOverrides(row?.entry.config_overrides, new FormData(form).keys(), entry.config_overrides, parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row?.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form)));
+                    entry.config_overrides = mergeCatalogConfigOverrides(row?.entry.config_overrides, new FormData(form).keys(), entry.config_overrides, parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row?.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form)), parseCatalogInputCompatibilityOverrides(new FormData(form)));
                     await api.post(row ? "catalog/update" : "catalog/create", {
                         ...(row ? { id: row.id } : {}),
                         entry,
@@ -2836,6 +2860,7 @@ var Amaterasu;
         fec.step = "1";
         const frameLimiterFields = catalogFrameLimiterOverrideFields(entry?.config_overrides, capabilities);
         const nvencSettingsFields = catalogNvencSettingsOverrideFields(entry?.config_overrides);
+        const inputCompatibilityFields = catalogInputCompatibilityOverrideFields(entry?.config_overrides);
         const streamAudio = audioOverrideSelect("stream_audio", entry?.config_overrides?.stream_audio);
         const audioSink = audioSinkOverrideControls(entry?.config_overrides?.audio_sink);
         const virtualSink = virtualSinkOverrideControls(entry?.config_overrides?.virtual_sink);
@@ -2883,7 +2908,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettingsFields, steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettingsFields, steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }
@@ -3880,7 +3905,7 @@ var Amaterasu;
         return `Diagnostics is using a newer host logging revision ${status.logging_configuration_revision}. Refresh the saved policy.`;
     }
     Amaterasu.diagnosticsLoggingDescription = diagnosticsLoggingDescription;
-    function parseInputPolicy(keyboard, mouse, highResolutionScrolling, alwaysSendScancodes, keyRightAltToKeyWin, keyRepeatDelay, keyRepeatFrequency, backButtonTimeout = -1, gamepadProfile = "auto", selectableGamepadProfiles = ["auto"], controllerEnabled = true, nativePenTouch = true, keybindings = [16, 160, 17, 162, 18, 164]) {
+    function parseInputPolicy(keyboard, mouse, highResolutionScrolling, alwaysSendScancodes, keyRightAltToKeyWin, keyRepeatDelay, keyRepeatFrequency, backButtonTimeout = -1, gamepadProfile = "auto", selectableGamepadProfiles = ["auto"], controllerEnabled = true, nativePenTouch = true, keybindings = [16, 160, 17, 162, 18, 164], motionAsDs4 = true, touchpadAsDs4 = true, protonDualsenseCompatibility = true, ds5InputtinoRandomizeMac = true) {
         if (typeof keyboard !== "boolean" ||
             typeof mouse !== "boolean" ||
             typeof highResolutionScrolling !== "boolean" ||
@@ -3898,7 +3923,11 @@ var Amaterasu;
             !Array.isArray(selectableGamepadProfiles) ||
             !selectableGamepadProfiles.includes(gamepadProfile) ||
             typeof controllerEnabled !== "boolean" ||
-            typeof nativePenTouch !== "boolean")
+            typeof nativePenTouch !== "boolean" ||
+            typeof motionAsDs4 !== "boolean" ||
+            typeof touchpadAsDs4 !== "boolean" ||
+            typeof protonDualsenseCompatibility !== "boolean"
+            || typeof ds5InputtinoRandomizeMac !== "boolean")
             throw new Error("Input policy values, key repeat settings, or Back timeout are invalid.");
         return {
             keyboard,
@@ -3913,6 +3942,10 @@ var Amaterasu;
             gamepad: gamepadProfile,
             controller: controllerEnabled,
             native_pen_touch: nativePenTouch,
+            motion_as_ds4: motionAsDs4,
+            touchpad_as_ds4: touchpadAsDs4,
+            proton_dualsense_compatibility: protonDualsenseCompatibility,
+            ds5_inputtino_randomize_mac: ds5InputtinoRandomizeMac,
         };
     }
     Amaterasu.parseInputPolicy = parseInputPolicy;
@@ -3932,9 +3965,13 @@ var Amaterasu;
         const values = reply.values;
         if (typeof values.ds4_back_as_touchpad_click !== "boolean")
             throw new Error("Input policy settings reply omitted the DS4 back button policy.");
+        if (typeof values.motion_as_ds4 !== "boolean" || typeof values.touchpad_as_ds4 !== "boolean" ||
+            typeof values.proton_dualsense_compatibility !== "boolean" ||
+            typeof values.ds5_inputtino_randomize_mac !== "boolean")
+            throw new Error("Input policy settings reply omitted controller or Proton compatibility policies.");
         const keybindings = Amaterasu.validateKeybindings(values.keybindings);
         const parsed = {
-            ...parseInputPolicy(values.keyboard, values.mouse, values.high_resolution_scrolling, values.always_send_scancodes, values.key_rightalt_to_key_win, values.key_repeat_delay, values.key_repeat_frequency, values.back_button_timeout, values.gamepad, recognizedInputGamepadProfiles, values.controller, values.native_pen_touch, keybindings),
+            ...parseInputPolicy(values.keyboard, values.mouse, values.high_resolution_scrolling, values.always_send_scancodes, values.key_rightalt_to_key_win, values.key_repeat_delay, values.key_repeat_frequency, values.back_button_timeout, values.gamepad, recognizedInputGamepadProfiles, values.controller, values.native_pen_touch, keybindings, values.motion_as_ds4, values.touchpad_as_ds4, values.proton_dualsense_compatibility, values.ds5_inputtino_randomize_mac),
             ds4_back_as_touchpad_click: values.ds4_back_as_touchpad_click,
         };
         if (!sameConfigurationValue(values, parsed))
@@ -4105,6 +4142,8 @@ var Amaterasu;
         "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "min_threads", "qp", "encoder",
         "audio_sink_capture_only", "back_button_timeout", "controller", "gamepad",
         "keyboard", "mouse", "native_pen_touch", "ds4_back_as_touchpad_click",
+        "motion_as_ds4", "touchpad_as_ds4", "ds5_inputtino_randomize_mac",
+        "proton_dualsense_compatibility",
         "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
         "frame_limiter_fps_limit", "frame_limiter_enable", "frame_limiter_provider",
         "frame_limiter_disable_vsync", "frame_limiter_auto_virtual_framegen",
@@ -4135,10 +4174,15 @@ var Amaterasu;
                 return false;
             }
         }
-        if (value === null || value === undefined)
+        if (value === null)
+            return ["motion_as_ds4", "touchpad_as_ds4", "ds5_inputtino_randomize_mac",
+                "proton_dualsense_compatibility"].includes(field);
+        if (value === undefined)
             return false;
         if (["stream_audio", "audio_sink_capture_only", "controller", "keyboard", "mouse",
             "native_pen_touch", "ds4_back_as_touchpad_click", "frame_limiter_enable", "frame_limiter_disable_vsync",
+            "motion_as_ds4", "touchpad_as_ds4", "ds5_inputtino_randomize_mac",
+            "proton_dualsense_compatibility",
             "nvenc_spatial_aq", "nvenc_h264_cavlc", "nvenc_realtime_hags",
             "nvenc_opengl_vulkan_on_dxgi", "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
             "high_resolution_scrolling", "always_send_scancodes",
@@ -5719,6 +5763,14 @@ var Amaterasu;
                     nativePenTouch.setAttribute("aria-label", `Native pen/touch preference override for ${client.name}`);
                     const ds4BackAsTouchpadClick = sparseInputOverrideSelect("ds4_back_as_touchpad_click", client.config_overrides?.ds4_back_as_touchpad_click);
                     ds4BackAsTouchpadClick.setAttribute("aria-label", `DS4 Back as touchpad click override for ${client.name}`);
+                    const motionAsDs4 = sparseInputOverrideSelect("motion_as_ds4", client.config_overrides?.motion_as_ds4);
+                    motionAsDs4.setAttribute("aria-label", `Motion selects DS4 override for ${client.name}`);
+                    const touchpadAsDs4 = sparseInputOverrideSelect("touchpad_as_ds4", client.config_overrides?.touchpad_as_ds4);
+                    touchpadAsDs4.setAttribute("aria-label", `Touchpad selects DS4 override for ${client.name}`);
+                    const ds5InputtinoRandomizeMac = sparseInputOverrideSelect("ds5_inputtino_randomize_mac", client.config_overrides?.ds5_inputtino_randomize_mac);
+                    ds5InputtinoRandomizeMac.setAttribute("aria-label", `DS5 random MAC override for ${client.name}`);
+                    const protonDualsenseCompatibility = sparseInputOverrideSelect("proton_dualsense_compatibility", client.config_overrides?.proton_dualsense_compatibility);
+                    protonDualsenseCompatibility.setAttribute("aria-label", `Proton DualSense compatibility override for ${client.name}`);
                     const advancedInput = Amaterasu.advancedInputOverrideControls(client.config_overrides);
                     const softwareEncoder = Amaterasu.softwareEncoderOverrideControls(client.config_overrides);
                     const nvencSettings = nvencSettingsOverrideControls(client.config_overrides);
@@ -5813,6 +5865,10 @@ var Amaterasu;
                                 mouse: Amaterasu.parseInputBooleanOverride(mouse.value, "Mouse input"),
                                 native_pen_touch: Amaterasu.parseInputBooleanOverride(nativePenTouch.value, "Native pen/touch preference"),
                                 ds4_back_as_touchpad_click: Amaterasu.parseInputBooleanOverride(ds4BackAsTouchpadClick.value, "DS4 Back as touchpad click preference"),
+                                motion_as_ds4: Amaterasu.parseInputBooleanOverride(motionAsDs4.value, "Motion selects DS4 preference"),
+                                touchpad_as_ds4: Amaterasu.parseInputBooleanOverride(touchpadAsDs4.value, "Touchpad selects DS4 preference"),
+                                ds5_inputtino_randomize_mac: Amaterasu.parseInputBooleanOverride(ds5InputtinoRandomizeMac.value, "DS5 random MAC preference"),
+                                proton_dualsense_compatibility: Amaterasu.parseInputBooleanOverride(protonDualsenseCompatibility.value, "Proton DualSense compatibility"),
                             };
                             saveStarted = true;
                             await savePairingClientOverrides(context.api, settings, client.certificate_id, values);
@@ -5834,9 +5890,9 @@ var Amaterasu;
                     if (unsupported.length > 0)
                         status.textContent = `Save unavailable: this client has stored overrides this editor cannot preserve (${unsupported.join(", ")}).`;
                     const identity = Amaterasu.el("div", "", Amaterasu.el("strong", "", client.name), Amaterasu.el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`));
-                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, Amaterasu.el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields), Amaterasu.el("div", "", save, status)];
+                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, motionAsDs4, touchpadAsDs4, ds5InputtinoRandomizeMac, protonDualsenseCompatibility, Amaterasu.el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields), Amaterasu.el("div", "", save, status)];
                 });
-                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "DS4 Back as touchpad click", "Input and software encoding preferences", ""], rows);
+                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "DS4 Back as touchpad click", "Motion selects DS4", "Touchpad selects DS4", "DS5 random MAC", "Proton DualSense compatibility", "Input and software encoding preferences", ""], rows);
                 pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save confirms the stored pairing revision. Input preferences apply when the next stream acquires its input lease."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
             }
             catch (error) {
@@ -5905,6 +5961,14 @@ var Amaterasu;
                 controller.checked = settings.values.controller;
                 const ds4BackAsTouchpadClick = Amaterasu.input("input_ds4_back_as_touchpad_click", "", "checkbox");
                 ds4BackAsTouchpadClick.checked = settings.values.ds4_back_as_touchpad_click;
+                const motionAsDs4 = Amaterasu.input("input_motion_as_ds4", "", "checkbox");
+                motionAsDs4.checked = settings.values.motion_as_ds4;
+                const touchpadAsDs4 = Amaterasu.input("input_touchpad_as_ds4", "", "checkbox");
+                touchpadAsDs4.checked = settings.values.touchpad_as_ds4;
+                const protonDualsenseCompatibility = Amaterasu.input("input_proton_dualsense_compatibility", "", "checkbox");
+                protonDualsenseCompatibility.checked = settings.values.proton_dualsense_compatibility;
+                const ds5InputtinoRandomizeMac = Amaterasu.input("input_ds5_inputtino_randomize_mac", "", "checkbox");
+                ds5InputtinoRandomizeMac.checked = settings.values.ds5_inputtino_randomize_mac;
                 const nativePenTouch = Amaterasu.input("input_native_pen_touch", "", "checkbox");
                 nativePenTouch.checked = settings.values.native_pen_touch;
                 const highResolutionScrolling = Amaterasu.input("input_high_resolution_scrolling", "", "checkbox");
@@ -5949,7 +6013,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save input policy");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("Controller input", controller, "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue."), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick, "For the DS4 profile, maps Back to a touchpad click when that backend supports it. The preference stays saved if the selected backend cannot apply it."), Amaterasu.field("Native pen and touch policy", nativePenTouch, "Windows-only global preference. Native pen/touch event transport and platform support are not implemented; saving this value does not activate pen or touch events."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), keybindings.field, Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux and Windows, when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other platforms do not inject gamepads."), Amaterasu.field("Gamepad profile", gamepadProfile, "Profiles listed by input status are supported by this backend. A saved platform-recognized profile outside that list remains visible and is labeled unavailable."), gamepadStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("Controller input", controller, "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue."), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick, "For the DS4 profile, maps Back to a touchpad click when that backend supports it. The preference stays saved if the selected backend cannot apply it."), Amaterasu.field("Motion sensors select DS4 when automatic", motionAsDs4, "In automatic mode, selects the PlayStation controller profile when the client reports motion sensors."), Amaterasu.field("Touchpad selects DS4 when automatic", touchpadAsDs4, "In automatic mode, selects the PlayStation controller profile when the client reports a touchpad."), Amaterasu.field("Proton DualSense compatibility", protonDualsenseCompatibility, "For Proton launches, preserve Sony audio and device names unless the application launch already sets those variables."), Amaterasu.field("Randomize DS5 inputtino MAC", ds5InputtinoRandomizeMac, "On Linux, randomize the emulated DS5 controller MAC instead of deriving it from the controller slot."), Amaterasu.field("Native pen and touch policy", nativePenTouch, "Windows-only global preference. Native pen/touch event transport and platform support are not implemented; saving this value does not activate pen or touch events."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), keybindings.field, Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux and Windows, when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other platforms do not inject gamepads."), Amaterasu.field("Gamepad profile", gamepadProfile, "Profiles listed by input status are supported by this backend. A saved platform-recognized profile outside that list remains visible and is labeled unavailable."), gamepadStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
@@ -5957,7 +6021,7 @@ var Amaterasu;
                         let saveStarted = false;
                         try {
                             const values = {
-                                ...parseInputPolicy(keyboard.checked, mouse.checked, highResolutionScrolling.checked, alwaysSendScancodes.checked, keyRightAltToKeyWin.checked, keyRepeatDelay.valueAsNumber, keyRepeatFrequency.valueAsNumber, backButtonTimeout.valueAsNumber, gamepadProfile.value, gamepadProfileChoices.map((choice) => choice.value), controller.checked, nativePenTouch.checked, keybindings.read()),
+                                ...parseInputPolicy(keyboard.checked, mouse.checked, highResolutionScrolling.checked, alwaysSendScancodes.checked, keyRightAltToKeyWin.checked, keyRepeatDelay.valueAsNumber, keyRepeatFrequency.valueAsNumber, backButtonTimeout.valueAsNumber, gamepadProfile.value, gamepadProfileChoices.map((choice) => choice.value), controller.checked, nativePenTouch.checked, keybindings.read(), motionAsDs4.checked, touchpadAsDs4.checked, protonDualsenseCompatibility.checked, ds5InputtinoRandomizeMac.checked),
                                 ds4_back_as_touchpad_click: ds4BackAsTouchpadClick.checked,
                             };
                             saveStarted = true;

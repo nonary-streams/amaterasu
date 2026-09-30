@@ -1097,6 +1097,10 @@ test("input policy editor validates key repeat settings and reports cleanup hone
     gamepad: "auto",
     controller: true,
     native_pen_touch: true,
+    motion_as_ds4: true,
+    touchpad_as_ds4: true,
+    proton_dualsense_compatibility: true,
+    ds5_inputtino_randomize_mac: true,
     keybindings: [16, 160, 17, 162, 18, 164],
   });
   assert.deepEqual(
@@ -1113,6 +1117,10 @@ test("input policy editor validates key repeat settings and reports cleanup hone
       gamepad: "auto",
       controller: true,
       native_pen_touch: true,
+      motion_as_ds4: true,
+      touchpad_as_ds4: true,
+      proton_dualsense_compatibility: true,
+      ds5_inputtino_randomize_mac: true,
       keybindings: [16, 160, 17, 162, 18, 164],
     },
   );
@@ -1417,6 +1425,8 @@ const inputSettingsValues = () => ({
   key_rightalt_to_key_win: false, key_repeat_delay: 500,
   key_repeat_frequency: 24.9, back_button_timeout: -1,
   gamepad: "auto", ds4_back_as_touchpad_click: false, native_pen_touch: true,
+  motion_as_ds4: true, touchpad_as_ds4: true, proton_dualsense_compatibility: true,
+  ds5_inputtino_randomize_mac: true,
   keybindings: [16, 160, 17, 162, 18, 164],
 });
 
@@ -1899,6 +1909,31 @@ const pairedClients = () => ({
     { certificate_id: "b".repeat(64), client_id: "desk", name: "Desk",
       paired_at: 200, config_overrides: { audio_sink: "headphones" } },
   ],
+});
+
+test("paired-client input overrides preserve explicit false and allow inherited null", () => {
+  const client = {
+    certificate_id: "a".repeat(64),
+    client_id: "living-room",
+    name: "Living room",
+    paired_at: 100,
+    config_overrides: {
+      motion_as_ds4: false,
+      touchpad_as_ds4: null,
+      ds5_inputtino_randomize_mac: false,
+      proton_dualsense_compatibility: true,
+    },
+  };
+  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(client)), []);
+  for (const key of [
+    "motion_as_ds4",
+    "touchpad_as_ds4",
+    "ds5_inputtino_randomize_mac",
+    "proton_dualsense_compatibility",
+  ]) {
+    const invalid = { ...client, config_overrides: { [key]: "false" } };
+    assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(invalid)), [key]);
+  }
 });
 
 test("paired-client editor preserves hidden overrides and confirms complete signed readback", async () => {

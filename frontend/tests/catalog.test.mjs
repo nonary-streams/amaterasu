@@ -158,6 +158,31 @@ test("application refresh rate option editor reads back and writes sparse exact 
     assert.equal(context.Amaterasu.catalogManualRefreshRateCompanionVisible(value), false);
 });
 
+test("catalog input compatibility overrides preserve inheritance and explicit false", () => {
+  const parse = context.Amaterasu.parseCatalogInputCompatibilityOverrides;
+  const fields = new FormData();
+  assert.deepEqual(JSON.parse(JSON.stringify(parse(fields))), {
+    motion_as_ds4: null,
+    touchpad_as_ds4: null,
+    ds5_inputtino_randomize_mac: null,
+    proton_dualsense_compatibility: null,
+  });
+  for (const key of [
+    "motion_as_ds4",
+    "touchpad_as_ds4",
+    "ds5_inputtino_randomize_mac",
+    "proton_dualsense_compatibility",
+  ]) {
+    fields.set(key, "false");
+    assert.equal(parse(fields)[key], false);
+    fields.set(key, "true");
+    assert.equal(parse(fields)[key], true);
+    fields.set(key, "invalid");
+    assert.throws(() => parse(fields));
+    fields.delete(key);
+  }
+});
+
 test("catalog reads back 10-bit SDR overrides without collapsing false or accepting malformed values", () => {
   const read = context.Amaterasu.catalogPrefer10BitSdrOverrideValue;
   assert.equal(read(undefined), null);

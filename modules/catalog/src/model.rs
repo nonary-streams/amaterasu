@@ -216,6 +216,14 @@ pub struct ConfigOverrides {
     pub ds4_back_as_touchpad_click: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_pen_touch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_as_ds4: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touchpad_as_ds4: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ds5_inputtino_randomize_mac: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proton_dualsense_compatibility: Option<bool>,
 }
 
 fn deserialize_auto_virtual_framegen<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -457,6 +465,10 @@ impl ConfigOverrides {
             && self.rtss_frame_limit_type.is_none()
             && self.ds4_back_as_touchpad_click.is_none()
             && self.native_pen_touch.is_none()
+            && self.motion_as_ds4.is_none()
+            && self.touchpad_as_ds4.is_none()
+            && self.ds5_inputtino_randomize_mac.is_none()
+            && self.proton_dualsense_compatibility.is_none()
     }
 }
 

@@ -1192,6 +1192,14 @@ pub struct ApplicationConfigOverrides {
     pub rtss_frame_limit_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ds4_back_as_touchpad_click: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_as_ds4: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touchpad_as_ds4: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ds5_inputtino_randomize_mac: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proton_dualsense_compatibility: Option<bool>,
 }
 
 fn deserialize_auto_virtual_framegen<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -1365,6 +1373,10 @@ impl ApplicationConfigOverrides {
             && self.frame_generation_mode.is_none()
             && self.rtss_frame_limit_type.is_none()
             && self.ds4_back_as_touchpad_click.is_none()
+            && self.motion_as_ds4.is_none()
+            && self.touchpad_as_ds4.is_none()
+            && self.ds5_inputtino_randomize_mac.is_none()
+            && self.proton_dualsense_compatibility.is_none()
     }
 }
 
@@ -3403,6 +3415,40 @@ mod advanced_input_override_tests {
             ..Default::default()
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn application_controller_compatibility_overrides_preserve_false_and_inherit() {
+        let selected = json!({
+            "motion_as_ds4":false,
+            "touchpad_as_ds4":false,
+            "ds5_inputtino_randomize_mac":false,
+            "proton_dualsense_compatibility":false,
+        });
+        let overrides: ApplicationConfigOverrides =
+            serde_json::from_value(selected.clone()).unwrap();
+        assert!(overrides.validate().is_ok());
+        assert!(!overrides.is_empty());
+        assert_eq!(serde_json::to_value(overrides).unwrap(), selected);
+
+        for key in [
+            "motion_as_ds4",
+            "touchpad_as_ds4",
+            "ds5_inputtino_randomize_mac",
+            "proton_dualsense_compatibility",
+        ] {
+            let inherited: ApplicationConfigOverrides =
+                serde_json::from_value(json!({(key):null})).unwrap();
+            assert!(inherited.is_empty(), "{key} null must inherit");
+            assert_eq!(serde_json::to_value(inherited).unwrap(), json!({}));
+            for invalid in [json!(0), json!(1), json!("false"), json!([]), json!({})] {
+                assert!(
+                    serde_json::from_value::<ApplicationConfigOverrides>(json!({(key):invalid}))
+                        .is_err(),
+                    "{key} accepted {invalid}"
+                );
+            }
+        }
     }
 }
 

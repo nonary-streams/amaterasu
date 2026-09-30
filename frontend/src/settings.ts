@@ -843,6 +843,10 @@ namespace Amaterasu {
     controllerEnabled: boolean = true,
     nativePenTouch: boolean = true,
     keybindings: unknown = [16, 160, 17, 162, 18, 164],
+    motionAsDs4: boolean = true,
+    touchpadAsDs4: boolean = true,
+    protonDualsenseCompatibility: boolean = true,
+    ds5InputtinoRandomizeMac: boolean = true,
   ): Omit<InputPolicySettings["values"], "ds4_back_as_touchpad_click"> {
     if (
       typeof keyboard !== "boolean" ||
@@ -862,7 +866,11 @@ namespace Amaterasu {
       !Array.isArray(selectableGamepadProfiles) ||
       !selectableGamepadProfiles.includes(gamepadProfile) ||
       typeof controllerEnabled !== "boolean" ||
-      typeof nativePenTouch !== "boolean"
+      typeof nativePenTouch !== "boolean" ||
+      typeof motionAsDs4 !== "boolean" ||
+      typeof touchpadAsDs4 !== "boolean" ||
+      typeof protonDualsenseCompatibility !== "boolean"
+      || typeof ds5InputtinoRandomizeMac !== "boolean"
     )
       throw new Error("Input policy values, key repeat settings, or Back timeout are invalid.");
     return {
@@ -878,6 +886,10 @@ namespace Amaterasu {
       gamepad: gamepadProfile,
       controller: controllerEnabled,
       native_pen_touch: nativePenTouch,
+      motion_as_ds4: motionAsDs4,
+      touchpad_as_ds4: touchpadAsDs4,
+      proton_dualsense_compatibility: protonDualsenseCompatibility,
+      ds5_inputtino_randomize_mac: ds5InputtinoRandomizeMac,
     };
   }
 
@@ -898,6 +910,10 @@ namespace Amaterasu {
     const values = reply.values as Record<string, unknown>;
     if (typeof values.ds4_back_as_touchpad_click !== "boolean")
       throw new Error("Input policy settings reply omitted the DS4 back button policy.");
+    if (typeof values.motion_as_ds4 !== "boolean" || typeof values.touchpad_as_ds4 !== "boolean" ||
+        typeof values.proton_dualsense_compatibility !== "boolean" ||
+        typeof values.ds5_inputtino_randomize_mac !== "boolean")
+      throw new Error("Input policy settings reply omitted controller or Proton compatibility policies.");
     const keybindings = validateKeybindings(values.keybindings);
     const parsed = {
       ...parseInputPolicy(
@@ -914,6 +930,10 @@ namespace Amaterasu {
         values.controller as boolean,
         values.native_pen_touch as boolean,
         keybindings,
+        values.motion_as_ds4,
+        values.touchpad_as_ds4,
+        values.proton_dualsense_compatibility,
+        values.ds5_inputtino_randomize_mac,
       ),
       ds4_back_as_touchpad_click: values.ds4_back_as_touchpad_click,
     };
@@ -1105,6 +1125,8 @@ namespace Amaterasu {
     "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "min_threads", "qp", "encoder",
     "audio_sink_capture_only", "back_button_timeout", "controller", "gamepad",
     "keyboard", "mouse", "native_pen_touch", "ds4_back_as_touchpad_click",
+    "motion_as_ds4", "touchpad_as_ds4", "ds5_inputtino_randomize_mac",
+    "proton_dualsense_compatibility",
     "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
     "frame_limiter_fps_limit", "frame_limiter_enable", "frame_limiter_provider",
     "frame_limiter_disable_vsync", "frame_limiter_auto_virtual_framegen",
@@ -1129,9 +1151,14 @@ namespace Amaterasu {
       if (value == null) return true;
       try { validateKeybindings(value); return true; } catch { return false; }
     }
-    if (value === null || value === undefined) return false;
+    if (value === null)
+      return ["motion_as_ds4", "touchpad_as_ds4", "ds5_inputtino_randomize_mac",
+        "proton_dualsense_compatibility"].includes(field);
+    if (value === undefined) return false;
     if (["stream_audio", "audio_sink_capture_only", "controller", "keyboard", "mouse",
       "native_pen_touch", "ds4_back_as_touchpad_click", "frame_limiter_enable", "frame_limiter_disable_vsync",
+      "motion_as_ds4", "touchpad_as_ds4", "ds5_inputtino_randomize_mac",
+      "proton_dualsense_compatibility",
       "nvenc_spatial_aq", "nvenc_h264_cavlc", "nvenc_realtime_hags",
       "nvenc_opengl_vulkan_on_dxgi", "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
       "high_resolution_scrolling", "always_send_scancodes",
@@ -3129,6 +3156,18 @@ namespace Amaterasu {
             "ds4_back_as_touchpad_click", client.config_overrides?.ds4_back_as_touchpad_click,
           );
           ds4BackAsTouchpadClick.setAttribute("aria-label", `DS4 Back as touchpad click override for ${client.name}`);
+          const motionAsDs4 = sparseInputOverrideSelect("motion_as_ds4", client.config_overrides?.motion_as_ds4);
+          motionAsDs4.setAttribute("aria-label", `Motion selects DS4 override for ${client.name}`);
+          const touchpadAsDs4 = sparseInputOverrideSelect("touchpad_as_ds4", client.config_overrides?.touchpad_as_ds4);
+          touchpadAsDs4.setAttribute("aria-label", `Touchpad selects DS4 override for ${client.name}`);
+          const ds5InputtinoRandomizeMac = sparseInputOverrideSelect(
+            "ds5_inputtino_randomize_mac", client.config_overrides?.ds5_inputtino_randomize_mac,
+          );
+          ds5InputtinoRandomizeMac.setAttribute("aria-label", `DS5 random MAC override for ${client.name}`);
+          const protonDualsenseCompatibility = sparseInputOverrideSelect(
+            "proton_dualsense_compatibility", client.config_overrides?.proton_dualsense_compatibility,
+          );
+          protonDualsenseCompatibility.setAttribute("aria-label", `Proton DualSense compatibility override for ${client.name}`);
           const advancedInput = advancedInputOverrideControls(client.config_overrides);
           const softwareEncoder = softwareEncoderOverrideControls(client.config_overrides);
           const nvencSettings = nvencSettingsOverrideControls(client.config_overrides);
@@ -3230,6 +3269,14 @@ namespace Amaterasu {
                   ds4_back_as_touchpad_click: parseInputBooleanOverride(
                     ds4BackAsTouchpadClick.value, "DS4 Back as touchpad click preference",
                   ),
+                  motion_as_ds4: parseInputBooleanOverride(motionAsDs4.value, "Motion selects DS4 preference"),
+                  touchpad_as_ds4: parseInputBooleanOverride(touchpadAsDs4.value, "Touchpad selects DS4 preference"),
+                  ds5_inputtino_randomize_mac: parseInputBooleanOverride(
+                    ds5InputtinoRandomizeMac.value, "DS5 random MAC preference",
+                  ),
+                  proton_dualsense_compatibility: parseInputBooleanOverride(
+                    protonDualsenseCompatibility.value, "Proton DualSense compatibility",
+                  ),
                 };
                 saveStarted = true;
                 await savePairingClientOverrides(context.api, settings, client.certificate_id, values);
@@ -3257,9 +3304,9 @@ namespace Amaterasu {
             el("strong", "", client.name),
             el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
           );
-          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields), el("div", "", save, status)];
+          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, motionAsDs4, touchpadAsDs4, ds5InputtinoRandomizeMac, protonDualsenseCompatibility, el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields), el("div", "", save, status)];
         });
-        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "DS4 Back as touchpad click", "Input and software encoding preferences", ""], rows);
+        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "DS4 Back as touchpad click", "Motion selects DS4", "Touchpad selects DS4", "DS5 random MAC", "Proton DualSense compatibility", "Input and software encoding preferences", ""], rows);
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
@@ -3367,6 +3414,14 @@ namespace Amaterasu {
         controller.checked = settings.values.controller;
         const ds4BackAsTouchpadClick = input("input_ds4_back_as_touchpad_click", "", "checkbox");
         ds4BackAsTouchpadClick.checked = settings.values.ds4_back_as_touchpad_click;
+        const motionAsDs4 = input("input_motion_as_ds4", "", "checkbox");
+        motionAsDs4.checked = settings.values.motion_as_ds4;
+        const touchpadAsDs4 = input("input_touchpad_as_ds4", "", "checkbox");
+        touchpadAsDs4.checked = settings.values.touchpad_as_ds4;
+        const protonDualsenseCompatibility = input("input_proton_dualsense_compatibility", "", "checkbox");
+        protonDualsenseCompatibility.checked = settings.values.proton_dualsense_compatibility;
+        const ds5InputtinoRandomizeMac = input("input_ds5_inputtino_randomize_mac", "", "checkbox");
+        ds5InputtinoRandomizeMac.checked = settings.values.ds5_inputtino_randomize_mac;
         const nativePenTouch = input("input_native_pen_touch", "", "checkbox");
         nativePenTouch.checked = settings.values.native_pen_touch;
         const highResolutionScrolling = input(
@@ -3470,6 +3525,26 @@ namespace Amaterasu {
             "For the DS4 profile, maps Back to a touchpad click when that backend supports it. The preference stays saved if the selected backend cannot apply it.",
           ),
           field(
+            "Motion sensors select DS4 when automatic",
+            motionAsDs4,
+            "In automatic mode, selects the PlayStation controller profile when the client reports motion sensors.",
+          ),
+          field(
+            "Touchpad selects DS4 when automatic",
+            touchpadAsDs4,
+            "In automatic mode, selects the PlayStation controller profile when the client reports a touchpad.",
+          ),
+          field(
+            "Proton DualSense compatibility",
+            protonDualsenseCompatibility,
+            "For Proton launches, preserve Sony audio and device names unless the application launch already sets those variables.",
+          ),
+          field(
+            "Randomize DS5 inputtino MAC",
+            ds5InputtinoRandomizeMac,
+            "On Linux, randomize the emulated DS5 controller MAC instead of deriving it from the controller slot.",
+          ),
+          field(
             "Native pen and touch policy",
             nativePenTouch,
             "Windows-only global preference. Native pen/touch event transport and platform support are not implemented; saving this value does not activate pen or touch events.",
@@ -3535,6 +3610,10 @@ namespace Amaterasu {
                   controller.checked,
                   nativePenTouch.checked,
                   keybindings.read(),
+                  motionAsDs4.checked,
+                  touchpadAsDs4.checked,
+                  protonDualsenseCompatibility.checked,
+                  ds5InputtinoRandomizeMac.checked,
                 ),
                 ds4_back_as_touchpad_click: ds4BackAsTouchpadClick.checked,
               };
