@@ -2,7 +2,7 @@
 use amaterasu_module_sdk::{Command, Response, RuntimeClient};
 use amaterasu_network_policy::GameStreamPorts;
 use amaterasu_upnp::{
-    IgdGateway, MappingEndpoint, MappingManager, Protocol, RECOMMENDED_REFRESH_INTERVAL,
+    Gateway, IgdGateway, MappingEndpoint, MappingManager, Protocol, RECOMMENDED_REFRESH_INTERVAL,
     discover_gateway,
 };
 use serde_json::{Value, json};
@@ -244,6 +244,9 @@ impl UpnpLifecycle {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        while let Ok(status) = self.statuses.try_recv() {
+            self.status = status;
+        }
     }
 }
 
@@ -348,22 +351,22 @@ fn append_listener_endpoints(
 
 fn run_worker(commands: Receiver<LifecycleCommand>, statuses: Sender<UpnpRuntimeStatus>) {
     let mut desired = DesiredMappings::default();
-    let mut gateways: BTreeMap<String, GatewayOwner> = BTreeMap::new();
+    let mut gateways: BTreeMap<String, GatewayOwner<IgdGateway>> = BTreeMap::new();
     let mut active_gateway: Option<String> = None;
     let mut next_discovery = Instant::now();
     let mut next_retry = Instant::now();
+    let mut configuration_changed = true;
+    let mut last_discovery_error = None;
 
     loop {
         let now = Instant::now();
-        let next_wakeup = if desired.enabled && !desired.endpoints.is_empty() {
-            next_discovery.min(next_retry)
-        } else {
-            next_retry
-        };
+        let has_candidate = desired.enabled && has_ipv4_candidate(&desired.endpoints);
+        let next_wakeup = next_worker_wakeup(has_candidate, next_discovery, next_retry);
         let timeout = next_wakeup.saturating_duration_since(now);
         let mut shutdown = false;
         match commands.recv_timeout(timeout) {
             Ok(LifecycleCommand::Configure(next)) => {
+                configuration_changed |= next != desired;
                 desired = next;
             }
             Ok(LifecycleCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
@@ -373,27 +376,42 @@ fn run_worker(commands: Receiver<LifecycleCommand>, statuses: Sender<UpnpRuntime
         }
 
         if shutdown {
-            shutdown_gateways(&mut gateways);
+            if let Some(error) = shutdown_gateways(&mut gateways) {
+                let _ = statuses.send(UpnpRuntimeStatus {
+                    status: "error".into(),
+                    error: Some(error),
+                });
+            } else {
+                let _ = statuses.send(UpnpRuntimeStatus::default());
+            }
             break;
         }
 
         let now = Instant::now();
         let refresh_due = now >= next_discovery;
-        let rediscover = active_gateway.is_none() || refresh_due;
+        let has_candidate = desired.enabled && has_ipv4_candidate(&desired.endpoints);
+        let rediscover =
+            should_rediscover(has_candidate, configuration_changed, now, next_discovery);
         let status;
         if desired.enabled && !desired.endpoints.is_empty() {
             if !has_ipv4_candidate(&desired.endpoints) {
-                cleanup_gateways(&mut gateways, &mut active_gateway);
+                let cleanup_error = cleanup_gateways(&mut gateways, &mut active_gateway);
                 next_retry = Instant::now() + CLEANUP_RETRY_INTERVAL;
-                status = UpnpRuntimeStatus {
-                    status: "waiting_for_ipv4_listener".into(),
-                    error: None,
-                };
+                status = cleanup_status_or(
+                    cleanup_error,
+                    UpnpRuntimeStatus {
+                        status: "waiting_for_ipv4_listener".into(),
+                        error: None,
+                    },
+                );
             } else {
-                let mut discovery_error = None;
+                let mut discovery_error = last_discovery_error.clone();
                 if rediscover {
+                    configuration_changed = false;
                     match discover_gateway() {
                         Ok(gateway) => {
+                            last_discovery_error = None;
+                            discovery_error = None;
                             let identity = gateway.identity();
                             let internal_address = gateway.internal_address();
                             if active_gateway.as_ref() != Some(&identity)
@@ -419,7 +437,11 @@ fn run_worker(commands: Receiver<LifecycleCommand>, statuses: Sender<UpnpRuntime
                             }
                             active_gateway = Some(identity);
                         }
-                        Err(error) => discovery_error = Some(bounded_runtime_error(error)),
+                        Err(error) => {
+                            let error = bounded_runtime_error(error);
+                            last_discovery_error = Some(error.clone());
+                            discovery_error = Some(error);
+                        }
                     }
                     next_discovery = Instant::now() + RECOMMENDED_REFRESH_INTERVAL;
                 }
@@ -438,7 +460,11 @@ fn run_worker(commands: Receiver<LifecycleCommand>, statuses: Sender<UpnpRuntime
                     {
                         error.get_or_insert_with(|| bounded_runtime_error(reconcile_error));
                     }
-                    cleanup_inactive_gateways(&mut gateways, active_gateway.as_deref());
+                    let cleanup_error =
+                        cleanup_inactive_gateways(&mut gateways, active_gateway.as_deref());
+                    if let Some(cleanup_error) = cleanup_error {
+                        error.get_or_insert(cleanup_error);
+                    }
                     status = if let Some(error) = error {
                         next_retry = Instant::now() + CLEANUP_RETRY_INTERVAL;
                         UpnpRuntimeStatus {
@@ -459,21 +485,30 @@ fn run_worker(commands: Receiver<LifecycleCommand>, statuses: Sender<UpnpRuntime
                         }
                     };
                 } else {
-                    cleanup_gateways(&mut gateways, &mut active_gateway);
-                    next_retry = Instant::now() + CLEANUP_RETRY_INTERVAL;
+                    let cleanup_error = cleanup_gateways(&mut gateways, &mut active_gateway);
+                    next_retry = if cleanup_error.is_some() {
+                        Instant::now() + CLEANUP_RETRY_INTERVAL
+                    } else {
+                        next_discovery
+                    };
                     status = UpnpRuntimeStatus {
                         status: "error".into(),
                         error: Some(
-                            discovery_error
-                                .unwrap_or_else(|| "no UPnP gateway is available".into()),
+                            combine_runtime_errors(
+                                discovery_error
+                                    .into_iter()
+                                    .chain(cleanup_error)
+                                    .chain(std::iter::once("no UPnP gateway is available".into())),
+                            )
+                            .expect("the no-gateway message is always present"),
                         ),
                     };
                 }
             }
         } else {
-            cleanup_gateways(&mut gateways, &mut active_gateway);
+            let cleanup_error = cleanup_gateways(&mut gateways, &mut active_gateway);
             next_retry = Instant::now() + CLEANUP_RETRY_INTERVAL;
-            status = if desired.enabled {
+            let fallback = if desired.enabled {
                 UpnpRuntimeStatus {
                     status: "waiting_for_listener".into(),
                     error: None,
@@ -481,6 +516,7 @@ fn run_worker(commands: Receiver<LifecycleCommand>, statuses: Sender<UpnpRuntime
             } else {
                 UpnpRuntimeStatus::default()
             };
+            status = cleanup_status_or(cleanup_error, fallback);
         }
         let _ = statuses.send(status.clone());
     }
@@ -491,6 +527,27 @@ fn has_ipv4_candidate(endpoints: &[MappingEndpoint]) -> bool {
         endpoint.active
             && matches!(endpoint.address, IpAddr::V4(address) if address.is_unspecified() || !address.is_loopback())
     })
+}
+
+fn should_rediscover(
+    has_candidate: bool,
+    configuration_changed: bool,
+    now: Instant,
+    next_discovery: Instant,
+) -> bool {
+    has_candidate && (configuration_changed || now >= next_discovery)
+}
+
+fn next_worker_wakeup(
+    has_candidate: bool,
+    next_discovery: Instant,
+    next_retry: Instant,
+) -> Instant {
+    if has_candidate {
+        next_discovery.min(next_retry)
+    } else {
+        next_retry
+    }
 }
 
 fn bounded_runtime_error(error: impl std::fmt::Display) -> String {
@@ -558,26 +615,40 @@ fn materialize_gateway_endpoints(
         .collect()
 }
 
-struct GatewayOwner {
-    manager: MappingManager<IgdGateway>,
+struct GatewayOwner<G: Gateway> {
+    manager: MappingManager<G>,
     internal_address: Ipv4Addr,
 }
 
-fn cleanup_gateways(
-    gateways: &mut BTreeMap<String, GatewayOwner>,
+fn cleanup_gateways<G: Gateway>(
+    gateways: &mut BTreeMap<String, GatewayOwner<G>>,
     active_gateway: &mut Option<String>,
-) {
+) -> Option<String> {
+    let mut errors = Vec::new();
     for owner in gateways.values_mut() {
-        let _ = owner.manager.shutdown();
+        if let Err(error) = owner.manager.shutdown() {
+            errors.push(bounded_runtime_error(error));
+        }
     }
     gateways.retain(|_, owner| owner.manager.owned_mappings().next().is_some());
+    let retained_mappings = gateways
+        .values()
+        .map(|owner| owner.manager.owned_mappings().count())
+        .sum::<usize>();
+    if retained_mappings > 0 {
+        errors.push(format!(
+            "{retained_mappings} owned mapping(s) remain pending cleanup"
+        ));
+    }
     *active_gateway = None;
+    combine_runtime_errors(errors)
 }
 
-fn cleanup_inactive_gateways(
-    gateways: &mut BTreeMap<String, GatewayOwner>,
+fn cleanup_inactive_gateways<G: Gateway>(
+    gateways: &mut BTreeMap<String, GatewayOwner<G>>,
     active_gateway: Option<&str>,
-) {
+) -> Option<String> {
+    let mut errors = Vec::new();
     let inactive: Vec<_> = gateways
         .keys()
         .filter(|identity| Some(identity.as_str()) != active_gateway)
@@ -585,7 +656,9 @@ fn cleanup_inactive_gateways(
         .collect();
     for identity in inactive {
         let empty = if let Some(owner) = gateways.get_mut(&identity) {
-            let _ = owner.manager.shutdown();
+            if let Err(error) = owner.manager.shutdown() {
+                errors.push(bounded_runtime_error(error));
+            }
             owner.manager.owned_mappings().next().is_none()
         } else {
             false
@@ -594,25 +667,219 @@ fn cleanup_inactive_gateways(
             gateways.remove(&identity);
         }
     }
+    let retained_mappings = gateways
+        .iter()
+        .filter(|(identity, _)| Some(identity.as_str()) != active_gateway)
+        .map(|(_, owner)| owner.manager.owned_mappings().count())
+        .sum::<usize>();
+    if retained_mappings > 0 {
+        errors.push(format!(
+            "{retained_mappings} owned mapping(s) remain pending cleanup"
+        ));
+    }
+    combine_runtime_errors(errors)
 }
 
-fn shutdown_gateways(gateways: &mut BTreeMap<String, GatewayOwner>) {
+fn shutdown_gateways<G: Gateway>(
+    gateways: &mut BTreeMap<String, GatewayOwner<G>>,
+) -> Option<String> {
+    let mut last_errors = Vec::new();
     for _ in 0..3 {
-        let mut retained = false;
+        let mut attempt_errors = Vec::new();
         for owner in gateways.values_mut() {
-            if owner.manager.shutdown().is_err() {
-                retained = true;
+            if let Err(error) = owner.manager.shutdown() {
+                attempt_errors.push(bounded_runtime_error(error));
             }
         }
-        if !retained {
-            break;
+        let retained_mappings = gateways
+            .values()
+            .map(|owner| owner.manager.owned_mappings().count())
+            .sum::<usize>();
+        if retained_mappings == 0 {
+            return None;
         }
+        last_errors = attempt_errors;
     }
+    let retained_mappings = gateways
+        .values()
+        .map(|owner| owner.manager.owned_mappings().count())
+        .sum::<usize>();
+    let last_error = last_errors
+        .first()
+        .map(String::as_str)
+        .unwrap_or("gateway cleanup did not complete");
+    Some(bounded_runtime_error(format!(
+        "Could not remove {retained_mappings} owned mapping(s) after three shutdown attempts; leases may remain active for up to 3600 seconds. Last error: {last_error}"
+    )))
+}
+
+fn combine_runtime_errors(errors: impl IntoIterator<Item = String>) -> Option<String> {
+    let errors: Vec<_> = errors.into_iter().collect();
+    (!errors.is_empty()).then(|| bounded_runtime_error(errors.join("; ")))
+}
+
+fn cleanup_status_or(error: Option<String>, fallback: UpnpRuntimeStatus) -> UpnpRuntimeStatus {
+    error.map_or(fallback, |error| UpnpRuntimeStatus {
+        status: "error".into(),
+        error: Some(error),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amaterasu_module_sdk::abi::{self, AbiHeader, BorrowedBytes, HostApi, ReplySink};
+    use amaterasu_upnp::{GatewayError, Mapping, MappingKey, RefreshOutcome, RemovalOutcome};
+    use std::{
+        ffi::c_void,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Default)]
+    struct ExposureEndpointState {
+        commands: Vec<Command>,
+        result: Value,
+        release_failures_remaining: usize,
+    }
+
+    #[derive(Default)]
+    struct FakeCleanupGatewayState {
+        mappings: BTreeMap<MappingKey, Mapping>,
+        remove_failures_remaining: usize,
+    }
+
+    #[derive(Clone)]
+    struct FakeCleanupGateway {
+        state: Arc<Mutex<FakeCleanupGatewayState>>,
+    }
+
+    impl Gateway for FakeCleanupGateway {
+        fn find_mappings(&mut self, key: MappingKey) -> Result<Vec<Mapping>, GatewayError> {
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .mappings
+                .get(&key)
+                .cloned()
+                .into_iter()
+                .collect())
+        }
+
+        fn create_if_absent(&mut self, mapping: &Mapping) -> Result<(), GatewayError> {
+            let mut state = self.state.lock().unwrap();
+            if state.mappings.contains_key(&mapping.key()) {
+                return Err(GatewayError::new("mapping already exists"));
+            }
+            state.mappings.insert(mapping.key(), mapping.clone());
+            Ok(())
+        }
+
+        fn remove_if_matches(&mut self, mapping: &Mapping) -> Result<RemovalOutcome, GatewayError> {
+            let mut state = self.state.lock().unwrap();
+            if state.remove_failures_remaining > 0 {
+                state.remove_failures_remaining -= 1;
+                return Err(GatewayError::new("temporary gateway cleanup failure"));
+            }
+            let Some(existing) = state.mappings.get(&mapping.key()) else {
+                return Ok(RemovalOutcome::Missing);
+            };
+            if !existing.has_same_owned_attributes(mapping) {
+                return Ok(RemovalOutcome::Changed);
+            }
+            state.mappings.remove(&mapping.key());
+            Ok(RemovalOutcome::Removed)
+        }
+
+        fn refresh_if_matches(
+            &mut self,
+            mapping: &Mapping,
+        ) -> Result<RefreshOutcome, GatewayError> {
+            let state = self.state.lock().unwrap();
+            let Some(existing) = state.mappings.get(&mapping.key()) else {
+                return Ok(RefreshOutcome::Missing);
+            };
+            if existing.has_same_owned_attributes(mapping) {
+                Ok(RefreshOutcome::Refreshed)
+            } else {
+                Ok(RefreshOutcome::Changed)
+            }
+        }
+    }
+
+    fn owned_fake_gateway(
+        remove_failures_remaining: usize,
+    ) -> (
+        GatewayOwner<FakeCleanupGateway>,
+        Arc<Mutex<FakeCleanupGatewayState>>,
+    ) {
+        let state = Arc::new(Mutex::new(FakeCleanupGatewayState::default()));
+        let gateway = FakeCleanupGateway {
+            state: state.clone(),
+        };
+        let mut manager = MappingManager::new(gateway);
+        manager
+            .reconcile_protocols(&[MappingEndpoint::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                47_989,
+                Protocol::Tcp,
+                true,
+            )])
+            .unwrap();
+        state.lock().unwrap().remove_failures_remaining = remove_failures_remaining;
+        (
+            GatewayOwner {
+                manager,
+                internal_address: Ipv4Addr::new(192, 168, 1, 10),
+            },
+            state,
+        )
+    }
+
+    unsafe extern "C" fn exposure_invoke(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        reply: ReplySink,
+    ) -> abi::Status {
+        // SAFETY: each test retains the Arc that owns this mutex for the runtime lifetime.
+        let state = unsafe { &*context.cast::<Mutex<ExposureEndpointState>>() };
+        let Ok(bytes) = (unsafe { input.read() }) else {
+            return abi::STATUS_INVALID_ARGUMENT;
+        };
+        let Ok(command) = serde_json::from_slice::<Command>(bytes) else {
+            return abi::STATUS_INVALID_ARGUMENT;
+        };
+        let mut state = state.lock().unwrap();
+        state.commands.push(command.clone());
+        let response = match command {
+            Command::Request { .. } => Response::Accepted { id: 41 },
+            Command::TakeResult { request: 41 } => Response::Result {
+                payload: state.result.clone(),
+            },
+            Command::ReleaseResult { request: 41 } if state.release_failures_remaining > 0 => {
+                state.release_failures_remaining -= 1;
+                Response::error("unavailable", "injected release failure")
+            }
+            Command::ReleaseResult { request: 41 } | Command::Cancel { request: 41 } => {
+                Response::Ok
+            }
+            unexpected => panic!("unexpected management exposure command: {unexpected:?}"),
+        };
+        let output = serde_json::to_vec(&response).expect("test response");
+        // SAFETY: the synchronous reply sink copies output bytes before returning.
+        unsafe { reply.send(&output) };
+        abi::STATUS_OK
+    }
+
+    fn exposure_runtime(state: Arc<Mutex<ExposureEndpointState>>) -> RuntimeClient {
+        let api = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: Arc::as_ptr(&state).cast_mut().cast(),
+            invoke: exposure_invoke,
+        };
+        // SAFETY: the caller retains the Arc containing the callback context.
+        unsafe { RuntimeClient::from_endpoint(api) }
+    }
 
     fn address(value: &str) -> SocketAddr {
         value.parse().unwrap()
@@ -717,6 +984,74 @@ mod tests {
     }
 
     #[test]
+    fn management_exposure_releases_completed_runtime_results() {
+        let state = Arc::new(Mutex::new(ExposureEndpointState {
+            result: json!({
+                "ok":true,
+                "wan_enabled":true,
+                "tls_address":"0.0.0.0:49999"
+            }),
+            ..ExposureEndpointState::default()
+        }));
+        let runtime = exposure_runtime(state.clone());
+        let mut exposure = ManagementExposure::default();
+
+        exposure.tick(&runtime);
+        exposure.tick(&runtime);
+
+        assert_eq!(
+            exposure.snapshot(),
+            ManagementExposureSnapshot {
+                wan_enabled: true,
+                tls_address: Some(address("0.0.0.0:49999")),
+            }
+        );
+        let commands = &state.lock().unwrap().commands;
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, Command::ReleaseResult { request: 41 }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn management_exposure_retries_cleanup_after_result_release_failure() {
+        let state = Arc::new(Mutex::new(ExposureEndpointState {
+            result: json!({
+                "ok":true,
+                "wan_enabled":true,
+                "tls_address":"0.0.0.0:49999"
+            }),
+            release_failures_remaining: 1,
+            ..ExposureEndpointState::default()
+        }));
+        let runtime = exposure_runtime(state.clone());
+        let mut exposure = ManagementExposure::default();
+
+        exposure.tick(&runtime);
+        exposure.tick(&runtime);
+
+        assert_eq!(exposure.snapshot(), ManagementExposureSnapshot::default());
+        let commands = &state.lock().unwrap().commands;
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, Command::ReleaseResult { request: 41 }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, Command::Cancel { request: 41 }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn runtime_errors_are_normalized_and_bounded_before_publication() {
         let error = bounded_runtime_error(format!(
             "  gateway\r\n error\t{}  ",
@@ -727,5 +1062,110 @@ mod tests {
         assert_eq!(error.chars().count(), MAX_RUNTIME_ERROR_CHARS);
         assert!(!error.chars().any(char::is_control));
         assert!(!error.contains("  "));
+    }
+
+    #[test]
+    fn cleanup_retries_do_not_accelerate_gateway_rediscovery() {
+        let now = Instant::now();
+        let next_discovery = now + RECOMMENDED_REFRESH_INTERVAL;
+
+        assert!(!should_rediscover(
+            true,
+            false,
+            now + CLEANUP_RETRY_INTERVAL,
+            next_discovery,
+        ));
+        assert!(should_rediscover(
+            true,
+            true,
+            now + CLEANUP_RETRY_INTERVAL,
+            next_discovery,
+        ));
+        assert!(should_rediscover(
+            true,
+            false,
+            next_discovery,
+            next_discovery,
+        ));
+        assert!(!should_rediscover(
+            false,
+            true,
+            next_discovery,
+            next_discovery,
+        ));
+    }
+
+    #[test]
+    fn cleanup_failure_is_reported_and_retried_while_mapping_remains_owned() {
+        let (owner, state) = owned_fake_gateway(1);
+        let mut gateways = BTreeMap::from([("gateway".into(), owner)]);
+        let mut active_gateway = Some("gateway".into());
+        let waiting = UpnpRuntimeStatus {
+            status: "waiting_for_ipv4_listener".into(),
+            error: None,
+        };
+
+        let first_status = cleanup_status_or(
+            cleanup_gateways(&mut gateways, &mut active_gateway),
+            waiting.clone(),
+        );
+        assert_eq!(first_status.status, "error");
+        assert!(
+            first_status
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("mapping cleanup failure"))
+        );
+        assert_eq!(active_gateway, None);
+        assert_eq!(state.lock().unwrap().mappings.len(), 1);
+        assert_eq!(gateways["gateway"].manager.owned_mappings().count(), 1);
+
+        let retry_status = cleanup_status_or(
+            cleanup_gateways(&mut gateways, &mut active_gateway),
+            waiting.clone(),
+        );
+        assert_eq!(retry_status, waiting);
+        assert!(gateways.is_empty());
+        assert!(state.lock().unwrap().mappings.is_empty());
+    }
+
+    #[test]
+    fn shutdown_cleanup_failure_reports_retained_mapping_lease_expiry() {
+        let (owner, state) = owned_fake_gateway(3);
+        let mut gateways = BTreeMap::from([("gateway".into(), owner)]);
+
+        let error = shutdown_gateways(&mut gateways).unwrap();
+
+        assert!(error.contains("three shutdown attempts"));
+        assert!(error.contains("3600 seconds"));
+        assert!(error.contains("mapping cleanup failure"));
+        assert_eq!(state.lock().unwrap().mappings.len(), 1);
+        assert_eq!(gateways["gateway"].manager.owned_mappings().count(), 1);
+    }
+
+    #[test]
+    fn loopback_listener_does_not_spin_on_an_overdue_discovery_deadline() {
+        let now = Instant::now();
+        let next_retry = now + CLEANUP_RETRY_INTERVAL;
+        let overdue_discovery = now - Duration::from_secs(1);
+        let endpoints = [MappingEndpoint::new(
+            "127.0.0.1".parse().unwrap(),
+            47_989,
+            Protocol::Tcp,
+            true,
+        )];
+
+        assert_eq!(
+            next_worker_wakeup(
+                has_ipv4_candidate(&endpoints),
+                overdue_discovery,
+                next_retry,
+            ),
+            next_retry
+        );
+        assert_eq!(
+            next_worker_wakeup(true, overdue_discovery, next_retry),
+            overdue_discovery
+        );
     }
 }

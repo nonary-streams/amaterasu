@@ -99,6 +99,24 @@ the failure during retry backoff. Restart loads the
 stored base and repeats reconciliation. The settings response includes
 `active_rtsp_port` and `rtsp_listener_error` alongside the active HTTP ports.
 
+## UPnP listener mappings
+
+Product document v21 adds the persisted `upnp` boolean; documents v1 through v20
+migrate it to `false`. The management settings response also exposes runtime-only
+`upnp_status` and nullable `upnp_error` fields. Status values are `disabled`,
+`waiting_for_listener`, `waiting_for_ipv4_listener`,
+`waiting_for_gateway_route`, `active`, and `error`.
+
+When enabled, NVHTTP discovers the IPv4 gateway and maps only live listener
+addresses and ports. The lease is 3600 seconds; mapping discovery and lease
+refresh run every 120 seconds. Failed cleanup remains visible and retries while
+the process is running. Shutdown makes three best-effort cleanup attempts; if
+the gateway remains unavailable, surviving mappings may stay active until their
+lease expires. Pre-existing or externally changed mappings are preserved.
+Management HTTPS is mapped only when the live management peer policy enables
+WAN access and a TLS listener is active. The current IGD adapter manages IPv4
+port mappings and does not create IPv6 firewall pinholes.
+
 The live settings response includes the configured port, derived https_port, and
 active_http_port/active_https_port values. Product document versions 1 through 14
 remain readable: v1 stores the hostname, v2 adds the port, v3 adds the listener
