@@ -4,6 +4,7 @@ use super::{
     Announce, Audio, ColorMode, ControlProtocol, Encryption, Error, Fec,
     KNOWN_CLIENT_FEATURE_FLAGS, Video,
 };
+use amaterasu_contracts::encoder::{DynamicRange, VideoCodec, VideoStreamFormat};
 
 pub fn parse_announce(bytes: &[u8]) -> Result<Announce, Error> {
     let document = syntax::parse(bytes)?;
@@ -47,9 +48,8 @@ pub fn parse_announce(bytes: &[u8]) -> Result<Announce, Error> {
 }
 
 fn video(attributes: &mut Attributes<'_>) -> Result<Video, Error> {
-    attributes.require_value("x-nv-vqos[0].bitStreamFormat", 0)?;
+    let format = video_format(attributes)?;
     attributes.default_value("x-nv-clientSupportHevc", 0)?;
-    attributes.require_value("x-nv-video[0].dynamicRangeMode", 0)?;
     attributes.default_value("x-ss-video[0].chromaSamplingType", 0)?;
     attributes.default_value("x-ss-video[0].intraRefresh", 0)?;
     const SLICES_PER_FRAME: &str = "x-nv-video[0].videoEncoderSlicesPerFrame";
@@ -97,6 +97,7 @@ fn video(attributes: &mut Attributes<'_>) -> Result<Video, Error> {
         _ => return Err(Error::Unsupported("color mode")),
     };
     Ok(Video {
+        format,
         width,
         height,
         fps,
@@ -107,6 +108,33 @@ fn video(attributes: &mut Attributes<'_>) -> Result<Video, Error> {
         color,
         max_reference_frames,
     })
+}
+
+fn video_format(attributes: &mut Attributes<'_>) -> Result<VideoStreamFormat, Error> {
+    let codec = match attributes.required("x-nv-vqos[0].bitStreamFormat")? {
+        0 => VideoCodec::H264,
+        1 => VideoCodec::Hevc,
+        2 => VideoCodec::Av1,
+        _ => return Err(Error::Unsupported("video codec")),
+    };
+    let dynamic_range = match attributes.required("x-nv-video[0].dynamicRangeMode")? {
+        0 => DynamicRange::Sdr,
+        1 => DynamicRange::Hdr,
+        _ => return Err(Error::Unsupported("video dynamic range")),
+    };
+    let format = VideoStreamFormat {
+        codec,
+        bit_depth: if dynamic_range == DynamicRange::Hdr {
+            10
+        } else {
+            8
+        },
+        dynamic_range,
+    };
+    format
+        .validate()
+        .map_err(|_| Error::Unsupported("video stream format"))?;
+    Ok(format)
 }
 
 fn bitrate(attributes: &mut Attributes<'_>) -> Result<(u32, Option<u32>), Error> {

@@ -1,4 +1,5 @@
 use super::*;
+use amaterasu_contracts::encoder::{DynamicRange, VideoCodec, VideoStreamFormat};
 const FIXTURE: &str = include_str!("fixtures/moonlight-h264.sdp");
 
 fn changed(name: &str, value: &str) -> String {
@@ -35,6 +36,7 @@ fn primary_client_shape_negotiates_exact_h264_sdr_requirements() {
         (result.video.width, result.video.height, result.video.fps),
         (1920, 1080, 60)
     );
+    assert_eq!(result.video.format, VideoStreamFormat::H264_SDR);
     assert_eq!(result.video.bitrate_kbps, 16000);
     assert_eq!(result.video.configured_bitrate_kbps, Some(20000));
     assert_eq!(result.video.slices_per_frame, 1);
@@ -63,6 +65,56 @@ fn pcm_haptics_feature_flag_is_retained_while_unknown_bits_stay_rejected() {
     let legacy = parse_announce(changed("x-ml-general.featureFlags", "3").as_bytes()).unwrap();
     assert_eq!(legacy.client_feature_flags, 3);
     assert!(parse_announce(changed("x-ml-general.featureFlags", "8").as_bytes()).is_err());
+}
+
+#[test]
+fn selected_codec_and_dynamic_range_produce_the_shared_video_format() {
+    let cases = [
+        (0, 0, VideoCodec::H264, 8, DynamicRange::Sdr),
+        (1, 0, VideoCodec::Hevc, 8, DynamicRange::Sdr),
+        (1, 1, VideoCodec::Hevc, 10, DynamicRange::Hdr),
+        (2, 0, VideoCodec::Av1, 8, DynamicRange::Sdr),
+        (2, 1, VideoCodec::Av1, 10, DynamicRange::Hdr),
+    ];
+
+    for (bitstream_format, range_mode, codec, bit_depth, dynamic_range) in cases {
+        let announce = changed(
+            "x-nv-vqos[0].bitStreamFormat",
+            &bitstream_format.to_string(),
+        );
+        let announce = announce.replace(
+            "a=x-nv-video[0].dynamicRangeMode:0 ",
+            &format!("a=x-nv-video[0].dynamicRangeMode:{range_mode} "),
+        );
+        let parsed = parse_announce(announce.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.video.format,
+            VideoStreamFormat {
+                codec,
+                bit_depth,
+                dynamic_range,
+            },
+            "bitStreamFormat={bitstream_format}, dynamicRangeMode={range_mode}"
+        );
+    }
+}
+
+#[test]
+fn unsupported_codec_and_dynamic_range_combinations_are_rejected() {
+    for (bitstream_format, range_mode) in [(3, 0), (4, 0), (0, 1), (1, 2), (2, 2)] {
+        let announce = changed(
+            "x-nv-vqos[0].bitStreamFormat",
+            &bitstream_format.to_string(),
+        );
+        let announce = announce.replace(
+            "a=x-nv-video[0].dynamicRangeMode:0 ",
+            &format!("a=x-nv-video[0].dynamicRangeMode:{range_mode} "),
+        );
+        assert!(
+            parse_announce(announce.as_bytes()).is_err(),
+            "accepted bitStreamFormat={bitstream_format}, dynamicRangeMode={range_mode}"
+        );
+    }
 }
 
 #[test]
@@ -132,9 +184,9 @@ fn encryption_requirements_are_preserved_and_cannot_silently_downgrade() {
 #[test]
 fn unsupported_media_modes_and_invalid_numeric_boundaries_fail() {
     for (name, value) in [
-        ("x-nv-vqos[0].bitStreamFormat", "1"),
-        ("x-nv-vqos[0].bitStreamFormat", "2"),
-        ("x-nv-video[0].dynamicRangeMode", "1"),
+        ("x-nv-vqos[0].bitStreamFormat", "3"),
+        ("x-nv-vqos[0].bitStreamFormat", "4"),
+        ("x-nv-video[0].dynamicRangeMode", "2"),
         ("x-ss-video[0].chromaSamplingType", "1"),
         ("x-nv-video[0].clientViewportWd", "1919"),
         ("x-nv-video[0].clientViewportHt", "2162"),

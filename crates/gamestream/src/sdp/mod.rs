@@ -1,4 +1,6 @@
 //! A constrained GameStream ANNOUNCE profile, not a generic SDP implementation.
+use amaterasu_contracts::encoder::VideoStreamFormat;
+
 mod attributes;
 mod negotiate;
 mod syntax;
@@ -45,6 +47,8 @@ pub enum ControlProtocol {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Video {
+    /// Codec, bit depth, and dynamic range selected by the client ANNOUNCE.
+    pub format: VideoStreamFormat,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
