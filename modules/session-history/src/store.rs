@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SECONDS_PER_DAY: i64 = 86_400;
 const PRUNE_INTERVAL_SECONDS: i64 = 3_600;
 const BYTES_PER_MEBIBYTE: u64 = 1024 * 1024;
@@ -82,14 +82,14 @@ impl HistoryStore {
         ))?;
         amaterasu_storage::create_private_directory(parent).map_err(|_| HistoryError::Database)?;
 
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;",
         )?;
-        apply_schema(&connection)?;
+        apply_schema(&mut connection)?;
         let store = Self {
             path: path.to_path_buf(),
             settings: HistorySettings::default(),
@@ -921,7 +921,7 @@ fn bound_session_page(
     }
 }
 
-fn apply_schema(connection: &Connection) -> Result<(), HistoryError> {
+fn apply_schema(connection: &mut Connection) -> Result<(), HistoryError> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(HistoryError::Database);
@@ -953,7 +953,7 @@ fn apply_schema(connection: &Connection) -> Result<(), HistoryError> {
             dropped_frames INTEGER NOT NULL,
             actual_fps REAL NOT NULL,
             actual_bitrate_kbps REAL NOT NULL,
-            encode_latency_ms REAL NOT NULL
+            encode_latency_ms REAL
          );
          CREATE INDEX IF NOT EXISTS idx_samples_session_time
          ON samples (session_id, recorded_at_unix, id);
@@ -967,7 +967,49 @@ fn apply_schema(connection: &Connection) -> Result<(), HistoryError> {
          CREATE INDEX IF NOT EXISTS idx_events_session_time
          ON events (session_id, recorded_at_unix, id);",
     )?;
+    migrate_nullable_encode_latency(connection)?;
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn migrate_nullable_encode_latency(connection: &mut Connection) -> Result<(), HistoryError> {
+    let latency_is_required = connection.query_row(
+        "SELECT \"notnull\" FROM pragma_table_info('samples') WHERE name = 'encode_latency_ms'",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !latency_is_required {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "DROP INDEX IF EXISTS idx_samples_session_time;
+         ALTER TABLE samples RENAME TO samples_before_nullable_latency;
+         CREATE TABLE samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+            recorded_at_unix INTEGER NOT NULL,
+            frames_sent INTEGER NOT NULL,
+            bytes_sent INTEGER NOT NULL,
+            dropped_frames INTEGER NOT NULL,
+            actual_fps REAL NOT NULL,
+            actual_bitrate_kbps REAL NOT NULL,
+            encode_latency_ms REAL
+         );
+         INSERT INTO samples (
+            id, session_id, recorded_at_unix, frames_sent, bytes_sent, dropped_frames,
+            actual_fps, actual_bitrate_kbps, encode_latency_ms
+         )
+         SELECT id, session_id, recorded_at_unix, frames_sent, bytes_sent, dropped_frames,
+                actual_fps, actual_bitrate_kbps,
+                CASE WHEN encode_latency_ms = 0.0 THEN NULL ELSE encode_latency_ms END
+         FROM samples_before_nullable_latency;
+         DROP TABLE samples_before_nullable_latency;
+         CREATE INDEX idx_samples_session_time
+         ON samples (session_id, recorded_at_unix, id);",
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1201,6 +1243,81 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn nullable_latency_migration_preserves_samples_and_marks_old_zero_as_unknown() {
+        let database = TemporaryDatabase::new();
+        let path = database.path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE sessions (
+                        session_id TEXT PRIMARY KEY NOT NULL,
+                        protocol TEXT NOT NULL,
+                        client_name TEXT NOT NULL,
+                        device_name TEXT NOT NULL,
+                        app_name TEXT NOT NULL,
+                        width INTEGER NOT NULL,
+                        height INTEGER NOT NULL,
+                        target_fps INTEGER NOT NULL,
+                        target_bitrate_kbps INTEGER NOT NULL,
+                        codec TEXT NOT NULL,
+                        started_at_unix INTEGER NOT NULL,
+                        ended_at_unix INTEGER,
+                        duration_seconds INTEGER
+                    );
+                    INSERT INTO sessions VALUES
+                        ('legacy', 'rtsp', '', '', '', 1, 1, 60, 1000, 'h264', 1, NULL, NULL);
+                    CREATE TABLE samples (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                        recorded_at_unix INTEGER NOT NULL,
+                        frames_sent INTEGER NOT NULL,
+                        bytes_sent INTEGER NOT NULL,
+                        dropped_frames INTEGER NOT NULL,
+                        actual_fps REAL NOT NULL,
+                        actual_bitrate_kbps REAL NOT NULL,
+                        encode_latency_ms REAL NOT NULL
+                    );
+                    CREATE INDEX idx_samples_session_time
+                        ON samples (session_id, recorded_at_unix, id);
+                    INSERT INTO samples
+                        (session_id, recorded_at_unix, frames_sent, bytes_sent, dropped_frames,
+                         actual_fps, actual_bitrate_kbps, encode_latency_ms)
+                    VALUES ('legacy', 2, 60, 1200, 1, 60.0, 1200.0, 0.0),
+                           ('legacy', 3, 120, 2400, 2, 60.0, 1200.0, 4.25);
+                    PRAGMA user_version = 2;",
+                )
+                .unwrap();
+        }
+
+        let store = HistoryStore::open(&path, 10).unwrap();
+        let samples = read_samples(&store.connection, "legacy").unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].encode_latency_ms, None);
+        assert_eq!(samples[0].frames_sent, 60);
+        assert_eq!(samples[1].encode_latency_ms, Some(4.25));
+        assert_eq!(samples[1].frames_sent, 120);
+        let latency_nullable = store
+            .connection
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('samples')
+                 WHERE name = 'encode_latency_ms'",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(!latency_nullable);
+        assert_eq!(
+            store
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
     }
 
     fn metadata(session_id: &str) -> SessionMetadata {
@@ -1528,7 +1645,7 @@ mod tests {
                         dropped_frames: 2,
                         actual_fps: 58.5,
                         actual_bitrate_kbps: 18_000.0,
-                        encode_latency_ms: 4.25,
+                        encode_latency_ms: Some(4.25),
                     })
                     .unwrap()
             );
@@ -1727,7 +1844,7 @@ mod tests {
             dropped_frames: 0,
             actual_fps: 60.0,
             actual_bitrate_kbps: 1_000.0,
-            encode_latency_ms: 1.0,
+            encode_latency_ms: Some(1.0),
         };
         {
             let mut store = HistoryStore::open(&path, 100).unwrap();
@@ -2141,7 +2258,7 @@ mod tests {
                     dropped_frames: 0,
                     actual_fps: 60.0,
                     actual_bitrate_kbps: 20_000.0,
-                    encode_latency_ms: 1.0,
+                    encode_latency_ms: Some(1.0),
                 })
                 .unwrap();
         }
@@ -2185,7 +2302,7 @@ mod tests {
                     dropped_frames: 0,
                     actual_fps: 60.0,
                     actual_bitrate_kbps: 20_000.0,
-                    encode_latency_ms: 1.0,
+                    encode_latency_ms: Some(1.0),
                 })
                 .unwrap();
         }
@@ -2388,7 +2505,7 @@ mod tests {
                     dropped_frames: 0,
                     actual_fps: 60.0,
                     actual_bitrate_kbps: 10_000.0,
-                    encode_latency_ms: 1.0,
+                    encode_latency_ms: Some(1.0),
                 })
                 .unwrap()
         );

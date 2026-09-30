@@ -804,7 +804,7 @@ fn sample_payload_uses_exact_contract_fields_and_local_admission_counter_rates()
     assert!(sample["actual_fps"].as_f64().unwrap().is_finite());
     assert!((sample["actual_fps"].as_f64().unwrap() - 4.0).abs() < 0.01);
     assert!((sample["actual_bitrate_kbps"].as_f64().unwrap() - 9.6).abs() < 0.02);
-    assert_eq!(sample["encode_latency_ms"], 0.0);
+    assert!(sample["encode_latency_ms"].is_null());
     assert_eq!(
         host.broker.history_events[0]["event_type"],
         "telemetry_limits"

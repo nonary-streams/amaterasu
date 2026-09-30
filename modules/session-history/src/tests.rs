@@ -74,6 +74,32 @@ fn history_settings_rpc_rejects_negative_retention_values() {
 }
 
 #[test]
+fn sample_latency_is_nullable_and_missing_legacy_values_are_unknown() {
+    let mut missing = json!({
+        "session_id":"sample",
+        "recorded_at_unix":1,
+        "actual_fps":0.0,
+        "actual_bitrate_kbps":0.0
+    });
+    let sample: model::SessionSample = serde_json::from_value(missing.clone()).unwrap();
+    assert_eq!(sample.encode_latency_ms, None);
+    assert!(sample.validate().is_ok());
+
+    missing["encode_latency_ms"] = json!(null);
+    let explicit_unknown: model::SessionSample = serde_json::from_value(missing).unwrap();
+    assert_eq!(explicit_unknown.encode_latency_ms, None);
+    assert!(explicit_unknown.validate().is_ok());
+
+    let zero_is_a_present_measurement = serde_json::from_value::<model::SessionSample>(json!({
+        "session_id":"sample",
+        "recorded_at_unix":1,
+        "encode_latency_ms":0.0
+    }))
+    .unwrap();
+    assert_eq!(zero_is_a_present_measurement.encode_latency_ms, Some(0.0));
+}
+
+#[test]
 fn status_reports_storage_unavailability_without_failing_the_module() {
     let response = unavailable_status();
     assert_eq!(response["ok"], true);
@@ -510,7 +536,7 @@ fn producer_updates_remain_ordered_and_readable_after_restart() {
                             "dropped_frames":0,
                             "actual_fps":60.0,
                             "actual_bitrate_kbps":480.0,
-                            "encode_latency_ms":0.0
+                            "encode_latency_ms":null
                         }
                     }),
                 )["recorded"],

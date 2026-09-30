@@ -441,7 +441,7 @@ namespace Amaterasu {
         dropped_frames: number;
         actual_fps: number;
         actual_bitrate_kbps: number;
-        encode_latency_ms: number;
+        encode_latency_ms: number | null;
       }[];
       events: {
         session_id: string;

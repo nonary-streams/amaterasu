@@ -45,6 +45,11 @@ operation returns an `{ "ok": ... }` result. Storage failures are returned as
 ordinary failed RPC results and increment the degraded-operation counter; they
 do not fail the history module tick or the stream session.
 
+Session sample `encode_latency_ms` is nullable. `null` means the producer has no
+encoder timing measurement; a number is accepted only when a caller supplies a
+measured value. The schema upgrade preserves historical sample rows and values,
+while converting the old stream-session zero placeholder to unknown.
+
 When `enabled` changes during active streams, the saved value is reported
 immediately, but the effective recording decision remains in place until the
 last active stream ends. New streams admitted during that interval use the

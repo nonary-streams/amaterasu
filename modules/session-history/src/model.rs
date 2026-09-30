@@ -91,20 +91,22 @@ pub struct SessionSample {
     #[serde(default)]
     pub actual_bitrate_kbps: f64,
     #[serde(default)]
-    pub encode_latency_ms: f64,
+    pub encode_latency_ms: Option<f64>,
 }
 
 impl SessionSample {
     pub fn validate(&self) -> Result<(), &'static str> {
         validate_text(&self.session_id, 1, MAX_SESSION_ID_BYTES, "session_id")?;
-        for value in [
-            self.actual_fps,
-            self.actual_bitrate_kbps,
-            self.encode_latency_ms,
-        ] {
+        for value in [self.actual_fps, self.actual_bitrate_kbps] {
             if !value.is_finite() || value < 0.0 {
                 return Err("sample metrics must be finite and nonnegative");
             }
+        }
+        if self
+            .encode_latency_ms
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err("sample metrics must be finite and nonnegative");
         }
         Ok(())
     }

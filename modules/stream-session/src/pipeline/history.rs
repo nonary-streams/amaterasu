@@ -98,7 +98,7 @@ impl SessionHistory {
             json!({
                 "counter_scope":"complete video access units and encoded audio/video payload bytes accepted by the media-transport local queue",
                 "dropped_frames_scope":"forward video sequence gaps between accepted access units; end-to-end frame loss is not observable",
-                "encode_latency_ms":"not measured; the video ABI exposes no encoder timing",
+                "encode_latency_ms":"null means unmeasured; the video ABI exposes no encoder timing",
                 "zero_duration_rates":"actual_fps and actual_bitrate_kbps are numeric zero when no monotonic millisecond elapsed; unknown is not representable in the history schema",
                 "audio_payload_bytes_included":true,
                 "transport_acceptance_is_client_delivery":false
@@ -510,7 +510,7 @@ impl SessionHistory {
                     "dropped_frames":sqlite_counter(self.dropped_frames),
                     "actual_fps":actual_fps,
                     "actual_bitrate_kbps":actual_bitrate_kbps,
-                    "encode_latency_ms":0.0
+                    "encode_latency_ms":null
                 }
             }),
         };

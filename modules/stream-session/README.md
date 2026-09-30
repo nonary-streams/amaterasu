@@ -127,9 +127,9 @@ FEC, encryption overhead, and client delivery. dropped_frames counts only
 forward sequence gaps observed between accepted video access units, not
 end-to-end loss. FPS and bitrate use cumulative accepted counters and
 monotonic-time deltas. The video ABI exposes no encode timing, so
-encode_latency_ms is the schema's numeric zero; a one-time telemetry_limits
-event marks this and end-to-end drops as unavailable and explicitly says local
-transport acceptance does not prove client delivery.
+encode_latency_ms is null to represent the unavailable measurement. A one-time
+telemetry_limits event also marks end-to-end drops as unavailable and explicitly
+says local transport acceptance does not prove client delivery.
 
 ## Current limits
 
