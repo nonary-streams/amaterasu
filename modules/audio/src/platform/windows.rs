@@ -104,20 +104,11 @@ impl SteamDriverInstallStatus {
     }
 }
 
+#[derive(Default)]
 struct SteamDriverInstallManager {
     status: SteamDriverInstallStatus,
     attempted: bool,
     worker: Option<thread::JoinHandle<()>>,
-}
-
-impl Default for SteamDriverInstallManager {
-    fn default() -> Self {
-        Self {
-            status: SteamDriverInstallStatus::default(),
-            attempted: false,
-            worker: None,
-        }
-    }
 }
 
 struct RouteRestoreLifecycle {
@@ -697,7 +688,7 @@ pub fn configure_steam_driver_install(enabled: bool, revision: u64) -> Value {
             if manager.worker.is_none() {
                 let spawn = thread::Builder::new()
                     .name("steam-audio-driver-install".into())
-                    .spawn(move || run_steam_driver_install());
+                    .spawn(run_steam_driver_install);
                 match spawn {
                     Ok(worker) => manager.worker = Some(worker),
                     Err(_) => {
@@ -982,7 +973,7 @@ fn install_steam_driver_inf() -> Result<(), crate::steam_driver::DriverFailure> 
 
     // SAFETY: the module is a live System32 newdev.dll handle and the symbol
     // name is a static NUL-terminated export name.
-    let symbol = unsafe { GetProcAddress(library, b"DiInstallDriverW\0".as_ptr().cast()) };
+    let symbol = unsafe { GetProcAddress(library, c"DiInstallDriverW".as_ptr().cast()) };
     let Some(symbol) = symbol else {
         let error = unsafe { GetLastError() };
         unsafe { FreeLibrary(library) };
