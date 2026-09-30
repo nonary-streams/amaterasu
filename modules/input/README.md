@@ -177,15 +177,24 @@ remains stable if a failed report requires device replacement. Back keeps its
 Share mapping and also sets the touchpad-click bit
 when `ds4_back_as_touchpad_click` is enabled. Failed input writes retire and
 recreate the UHID device before replay; failed destruction keeps the descriptor
-owned for cleanup retry. The service has no route for returning rumble or
-lightbar feedback to the client, so valid DS4 output requests are consumed but
-not delivered. Synthetic descriptor, report, feature-query, and lifecycle tests
-cover this path; no physical-controller or game-delivery result is claimed.
+owned for cleanup retry. Valid rumble and lightbar output reports are routed
+through the active input lease. Synthetic descriptor, report, feature-query,
+feedback, and lifecycle tests cover this path; no physical-controller or
+game-delivery result is claimed.
 
-Linux `ds5` creates a USB-identity DualSense over `/dev/uhid` (Sony VID/PID
-054c:0ce6, version 0x8111). It publishes the USB report descriptor, answers
-calibration, pairing, firmware, and supported control feature requests, and
-sends 64-byte input reports at 100 Hz after UHID starts. Reports include buttons,
+Linux `ds5` prefers the optional `/dev/vibeshine-ds5` native USB gadget and
+falls back to `/dev/uhid` when the gadget cannot be acquired. Both paths expose
+one USB-identity DualSense (Sony VID/PID 054c:0ce6, version 0x8111); they are
+never created together for one controller. The native gadget also supplies a
+four-channel USB-audio event stream. When the stream negotiates HAPTICS_PCM and
+the active controller advertises its per-controller HAPTICS_PCM capability,
+the host selects the two actuator channels and groups them into bounded
+240-frame (5 ms at 48 kHz) PCM messages with a wrapping stream sequence.
+Misaligned source records are ignored and partial packets are dropped after an
+input gap. The UHID fallback has no PCM source. Both paths publish the USB
+report descriptor, answer calibration, pairing, firmware, and supported control
+feature requests, and send 64-byte input reports at 100 Hz after startup.
+Reports include buttons,
 d-pad, triggers, sticks, battery state, two touch contacts, accelerometer
 samples in m/s², and gyroscope samples in degrees per second. Touch coordinates
 are normalized by the protocol and projected onto the DualSense 1920×1080
@@ -195,11 +204,11 @@ identity that remains stable across device recovery. Disabling
 `ds5_inputtino_randomize_mac` uses `02:00:00:00:00:<slot>` for compatibility.
 Failed input writes stop the event worker, destroy the potentially inconsistent
 device, and recreate the same slot and identity before the next report. Failed
-destruction retains the UHID descriptor for cleanup retry. The protocol has no
-client-feedback route, so valid rumble, lightbar, and adaptive-trigger output
-reports are recognized and consumed but are not delivered to the client.
-Synthetic USB descriptor, feature-query, identity, input-report, recovery, and
-release tests cover this path. They do not establish hardware or game delivery.
+destruction retains the native descriptor for cleanup retry. Valid rumble,
+lightbar, and adaptive-trigger output reports are routed through the active
+input lease. Synthetic UAPI, packetization, USB descriptor, feature-query,
+identity, input-report, recovery, and release tests cover these paths; they do
+not establish driver availability, physical-device behavior, or game delivery.
 
 Linux `switch` creates a USB-bus uinput device named
 `Sunshine Nintendo (virtual) pad` with VID/PID `057e:2009` and version `0x8111`.

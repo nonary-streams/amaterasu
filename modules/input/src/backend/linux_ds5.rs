@@ -1,10 +1,14 @@
-//! Linux DualSense USB emulation over UHID.
+//! Linux DualSense USB emulation with a native haptics gadget when available.
 //!
 //! The report contract follows the pinned Inputtino USB profile at
 //! `f9eed6d34ff6cb5a30cfce6ee4e6f5362abedb82`: Sony USB identity, report IDs,
 //! sensor scales, touch encoding, feature replies, and the 10 ms input cadence.
-//! UHID output reports capture rumble, lightbar, and adaptive-trigger changes
-//! into the active feedback queue. PCM decoding remains unsupported here.
+//! The pinned virtual gamepad UAPI supplies the USB-audio haptics stream. PCM is
+//! forwarded only for clients that advertise the per-controller capability;
+//! UHID remains the fallback for systems without the optional gadget driver.
+
+#[path = "linux_ds5_gadget.rs"]
+mod gadget;
 
 use crate::feedback::FeedbackProducer;
 use crate::gamepad::{
@@ -24,9 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(not(test))]
 use std::thread::{self, JoinHandle};
-#[cfg(not(test))]
-use std::time::{Duration, Instant};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const UHID_EVENT_SIZE: usize = 4 + 128 + 64 + 64 + 2 + 2 + 16 + 4096;
 const UHID_DATA_MAX: usize = 4096;
@@ -63,6 +65,11 @@ const STANDARD_GRAVITY: f32 = 9.80665;
 const BUS_USB: u16 = 0x03;
 #[cfg(not(test))]
 const DS5_REPORT_INTERVAL: Duration = Duration::from_millis(10);
+const DS5_PCM_SOURCE_FRAME_BYTES: usize = 8;
+const DS5_PCM_ACTUATOR_OFFSET: usize = 4;
+const DS5_PCM_ACTUATOR_BYTES: usize = 4;
+const DS5_PCM_PACKET_FRAMES: u16 = 240;
+const DS5_PCM_PACKET_GAP: Duration = Duration::from_millis(20);
 
 const DPAD_UP: u32 = 1 << 0;
 const DPAD_DOWN: u32 = 1 << 1;
@@ -480,7 +487,14 @@ fn dispatch_output_feedback(event: &[u8], producer: &FeedbackProducer) -> bool {
     if !output_report_is_well_formed(event) {
         return false;
     }
-    let report = &event[4..4 + DS5_OUTPUT_REPORT_SIZE];
+    dispatch_output_report(&event[4..4 + DS5_OUTPUT_REPORT_SIZE], producer)
+}
+
+fn dispatch_output_report(report: &[u8], producer: &FeedbackProducer) -> bool {
+    if report.len() < DS5_OUTPUT_REPORT_SIZE || report[0] != DS5_OUTPUT_REPORT_ID {
+        return false;
+    }
+    let report = &report[..DS5_OUTPUT_REPORT_SIZE];
     let flags0 = report[1];
     let flags1 = report[2];
     let flags2 = report[39];
@@ -521,6 +535,67 @@ fn dispatch_output_feedback(event: &[u8], producer: &FeedbackProducer) -> bool {
         });
     }
     true
+}
+
+#[derive(Debug)]
+struct Ds5HapticsPacketizer {
+    sequence: u32,
+    frames: usize,
+    samples_s16le: [u8; DS5_PCM_PACKET_FRAMES as usize * DS5_PCM_ACTUATOR_BYTES],
+    last_input_at: Option<Instant>,
+}
+
+impl Default for Ds5HapticsPacketizer {
+    fn default() -> Self {
+        Self {
+            sequence: 0,
+            frames: 0,
+            samples_s16le: [0; DS5_PCM_PACKET_FRAMES as usize * DS5_PCM_ACTUATOR_BYTES],
+            last_input_at: None,
+        }
+    }
+}
+
+impl Ds5HapticsPacketizer {
+    fn push(&mut self, pcm: &[u8], producer: &FeedbackProducer, now: Instant) {
+        let (source_frames, remainder) = pcm.as_chunks::<DS5_PCM_SOURCE_FRAME_BYTES>();
+        if !producer.supports_haptics_pcm() || source_frames.is_empty() || !remainder.is_empty() {
+            return;
+        }
+
+        if self
+            .last_input_at
+            .is_some_and(|previous| now.saturating_duration_since(previous) > DS5_PCM_PACKET_GAP)
+        {
+            if self.frames != 0 {
+                self.sequence = self.sequence.wrapping_add(1);
+            }
+            self.frames = 0;
+        }
+        self.last_input_at = Some(now);
+
+        for source_frame in source_frames {
+            let destination = self.frames * DS5_PCM_ACTUATOR_BYTES;
+            self.samples_s16le[destination..destination + DS5_PCM_ACTUATOR_BYTES].copy_from_slice(
+                &source_frame
+                    [DS5_PCM_ACTUATOR_OFFSET..DS5_PCM_ACTUATOR_OFFSET + DS5_PCM_ACTUATOR_BYTES],
+            );
+            self.frames += 1;
+            if self.frames == usize::from(DS5_PCM_PACKET_FRAMES) {
+                let feedback = HostFeedback::HapticsPcm {
+                    controller: producer.controller(),
+                    sequence: self.sequence,
+                    frames: DS5_PCM_PACKET_FRAMES,
+                    samples_s16le: self.samples_s16le.to_vec(),
+                };
+                // PCM is best-effort. Advance the source sequence even when a
+                // bounded queue drops this packet so later audio stays ordered.
+                producer.push(feedback);
+                self.sequence = self.sequence.wrapping_add(1);
+                self.frames = 0;
+            }
+        }
+    }
 }
 
 fn create_event(event_type: u32) -> Vec<u8> {
@@ -911,6 +986,8 @@ fn uhid_error(error: std::io::Error) -> InputError {
 thread_local! {
     static FAKE_UHID_ADAPTER: std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<FakeUhidAdapter>>>> =
         const { std::cell::RefCell::new(None) };
+    static FAKE_DS5_GADGET_ADAPTER: std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<FakeGadgetAdapter>>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -923,6 +1000,93 @@ pub(super) struct FakeUhidAdapter {
     pub(super) fail_destroy: Option<u8>,
     fail_create: bool,
     fail_report: Option<u8>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FakeGadgetAdapter {
+    next_id: u8,
+    created: Vec<u8>,
+    reports: Vec<(u8, [u8; DS5_INPUT_REPORT_SIZE])>,
+    destroyed: Vec<u8>,
+    fail_create: bool,
+}
+
+#[cfg(test)]
+struct FakeGadgetGuard;
+
+#[cfg(test)]
+impl FakeGadgetGuard {
+    fn install() -> (Self, std::rc::Rc<std::cell::RefCell<FakeGadgetAdapter>>) {
+        let adapter = std::rc::Rc::new(std::cell::RefCell::new(FakeGadgetAdapter::default()));
+        FAKE_DS5_GADGET_ADAPTER
+            .with(|slot| *slot.borrow_mut() = Some(std::rc::Rc::clone(&adapter)));
+        (Self, adapter)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FakeGadgetGuard {
+    fn drop(&mut self) {
+        FAKE_DS5_GADGET_ADAPTER.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+struct FakeGadgetDevice {
+    id: u8,
+    adapter: std::rc::Rc<std::cell::RefCell<FakeGadgetAdapter>>,
+    destroyed: bool,
+}
+
+#[cfg(test)]
+impl FakeGadgetDevice {
+    fn create(_slot: u8, _report: Arc<Mutex<Ds5ReportState>>) -> InputResult<Option<Self>> {
+        let Some(adapter) = FAKE_DS5_GADGET_ADAPTER.with(|slot| slot.borrow().clone()) else {
+            return Ok(None);
+        };
+        let id = {
+            let mut state = adapter.borrow_mut();
+            if std::mem::take(&mut state.fail_create) {
+                return Err(InputError::new(
+                    "acquire_failed",
+                    "synthetic DS5 gadget creation failed",
+                ));
+            }
+            state.next_id = state.next_id.wrapping_add(1);
+            state.next_id
+        };
+        adapter.borrow_mut().created.push(id);
+        Ok(Some(Self {
+            id,
+            adapter,
+            destroyed: false,
+        }))
+    }
+
+    fn send_report(&mut self, report: &Arc<Mutex<Ds5ReportState>>) -> InputResult<()> {
+        let bytes = report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .input_report();
+        self.adapter.borrow_mut().reports.push((self.id, bytes));
+        Ok(())
+    }
+
+    fn destroy(&mut self) -> InputResult<()> {
+        if !self.destroyed {
+            self.adapter.borrow_mut().destroyed.push(self.id);
+            self.destroyed = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for FakeGadgetDevice {
+    fn drop(&mut self) {
+        let _ = self.destroy();
+    }
 }
 
 #[cfg(test)]
@@ -1083,11 +1247,79 @@ impl UhidTransport {
     }
 }
 
+enum Ds5Transport {
+    #[cfg(not(test))]
+    Gadget(gadget::GadgetDevice),
+    #[cfg(test)]
+    FakeGadget(FakeGadgetDevice),
+    Uhid(UhidTransport),
+}
+
+impl Ds5Transport {
+    fn create(
+        slot: u8,
+        report: Arc<Mutex<Ds5ReportState>>,
+        address: [u8; 6],
+        randomize_mac: bool,
+        feedback: FeedbackProducer,
+    ) -> InputResult<Self> {
+        #[cfg(not(test))]
+        if let Ok(device) =
+            gadget::GadgetDevice::create(slot, Arc::clone(&report), address, feedback.clone())
+        {
+            return Ok(Self::Gadget(device));
+        }
+
+        #[cfg(test)]
+        if let Ok(Some(device)) = FakeGadgetDevice::create(slot, Arc::clone(&report)) {
+            return Ok(Self::FakeGadget(device));
+        }
+
+        Ok(Self::Uhid(UhidTransport::create(
+            slot,
+            report,
+            address,
+            randomize_mac,
+            feedback,
+        )?))
+    }
+
+    fn send_report(&mut self, report: &Arc<Mutex<Ds5ReportState>>) -> InputResult<()> {
+        match self {
+            #[cfg(not(test))]
+            Self::Gadget(device) => device.send_report(),
+            #[cfg(test)]
+            Self::FakeGadget(device) => device.send_report(report),
+            Self::Uhid(device) => device.send_report(report),
+        }
+    }
+
+    fn check_failure(&self) -> InputResult<()> {
+        match self {
+            #[cfg(not(test))]
+            Self::Gadget(device) => device.check_failure(),
+            #[cfg(test)]
+            Self::FakeGadget(_) => Ok(()),
+            Self::Uhid(device) => device.check_failure(),
+        }
+    }
+
+    fn destroy(&mut self) -> InputResult<()> {
+        match self {
+            #[cfg(not(test))]
+            Self::Gadget(device) => device.destroy(),
+            #[cfg(test)]
+            Self::FakeGadget(device) => device.destroy(),
+            Self::Uhid(device) => device.destroy(),
+        }
+    }
+}
+
 pub(super) struct Ds5Gamepad {
     slot: u8,
     address: [u8; 6],
     randomize_mac: bool,
-    device: Option<UhidTransport>,
+    device: Option<Ds5Transport>,
     report: Arc<Mutex<Ds5ReportState>>,
     recovery_required: bool,
     feedback: FeedbackProducer,
@@ -1105,7 +1337,7 @@ impl Ds5Gamepad {
             slot,
             address,
             randomize_mac,
-            device: Some(UhidTransport::create(
+            device: Some(Ds5Transport::create(
                 slot,
                 Arc::clone(&report),
                 address,
@@ -1195,7 +1427,7 @@ impl GamepadDevice for Ds5Gamepad {
             device.destroy()?;
         }
         self.device = None;
-        self.device = Some(UhidTransport::create(
+        self.device = Some(Ds5Transport::create(
             self.slot,
             Arc::clone(&self.report),
             self.address,
@@ -1239,9 +1471,21 @@ mod tests {
     use super::*;
 
     fn test_feedback(slot: u8) -> FeedbackProducer {
+        test_feedback_with_capabilities(slot, 0).1
+    }
+
+    fn test_feedback_with_capabilities(
+        slot: u8,
+        capabilities: u32,
+    ) -> (crate::feedback::FeedbackQueue, FeedbackProducer) {
         let queue = crate::feedback::FeedbackQueue::default();
         let generation = queue.begin_lease();
-        queue.producer(generation, u16::from(slot), 0)
+        let producer = queue.producer(generation, u16::from(slot), capabilities);
+        (queue, producer)
+    }
+
+    fn pcm_frames(frame_count: usize, frame: [u8; DS5_PCM_SOURCE_FRAME_BYTES]) -> Vec<u8> {
+        frame.repeat(frame_count)
     }
 
     #[test]
@@ -1476,6 +1720,148 @@ mod tests {
                 blue: 30,
             }
         );
+    }
+
+    #[test]
+    fn pcm_packetizer_selects_actuator_channels_and_emits_bounded_five_ms_packets() {
+        let (queue, producer) = test_feedback_with_capabilities(3, 0x8000);
+        assert!(producer.supports_haptics_pcm());
+        let source_frame = [0x11, 0x22, 0x33, 0x44, 0x85, 0x96, 0xa7, 0xb8];
+        let source = pcm_frames(DS5_PCM_PACKET_FRAMES as usize, source_frame);
+        let mut packetizer = Ds5HapticsPacketizer::default();
+        let start = Instant::now();
+
+        packetizer.push(
+            &source[..239 * DS5_PCM_SOURCE_FRAME_BYTES],
+            &producer,
+            start,
+        );
+        assert!(queue.peek(16).is_empty());
+        assert_eq!(packetizer.frames, 239);
+
+        packetizer.push(
+            &source[239 * DS5_PCM_SOURCE_FRAME_BYTES..],
+            &producer,
+            start,
+        );
+        let queued = queue.peek(16);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].feedback,
+            HostFeedback::HapticsPcm {
+                controller: 3,
+                sequence: 0,
+                frames: DS5_PCM_PACKET_FRAMES,
+                samples_s16le: [0x85, 0x96, 0xa7, 0xb8].repeat(240),
+            }
+        );
+        assert_eq!(packetizer.frames, 0);
+        assert_eq!(packetizer.sequence, 1);
+    }
+
+    #[test]
+    fn pcm_packetizer_requires_capability_and_aligned_source_frames() {
+        let (disabled_queue, disabled) = test_feedback_with_capabilities(0, 0);
+        assert!(!disabled.supports_haptics_pcm());
+        let mut disabled_packetizer = Ds5HapticsPacketizer::default();
+        let packet = pcm_frames(usize::from(DS5_PCM_PACKET_FRAMES), [0; 8]);
+        disabled_packetizer.push(&packet, &disabled, Instant::now());
+        assert!(disabled_queue.peek(16).is_empty());
+        assert_eq!(disabled_packetizer.frames, 0);
+
+        let (queue, producer) = test_feedback_with_capabilities(0, 0x8000);
+        let mut packetizer = Ds5HapticsPacketizer::default();
+        packetizer.push(&[0; 7], &producer, Instant::now());
+        assert_eq!(packetizer.frames, 0);
+        assert!(queue.peek(16).is_empty());
+    }
+
+    #[test]
+    fn pcm_packetizer_discards_stale_partial_packet_and_wraps_sequence() {
+        let (queue, producer) = test_feedback_with_capabilities(2, 0x8000);
+        let mut packetizer = Ds5HapticsPacketizer {
+            sequence: u32::MAX,
+            ..Ds5HapticsPacketizer::default()
+        };
+        let start = Instant::now();
+        let old_frame = [1, 2, 3, 4, 5, 6, 7, 8];
+        let new_frame = [9, 10, 11, 12, 0x81, 0x82, 0x83, 0x84];
+
+        packetizer.push(&old_frame, &producer, start);
+        packetizer.push(
+            &new_frame,
+            &producer,
+            start + DS5_PCM_PACKET_GAP + Duration::from_millis(1),
+        );
+        assert_eq!(packetizer.frames, 1);
+        assert_eq!(packetizer.sequence, 0);
+
+        let remainder = pcm_frames(239, new_frame);
+        packetizer.push(
+            &remainder,
+            &producer,
+            start + DS5_PCM_PACKET_GAP + Duration::from_millis(2),
+        );
+        let queued = queue.peek(16);
+        assert_eq!(queued.len(), 1);
+        let HostFeedback::HapticsPcm {
+            controller,
+            sequence,
+            frames,
+            samples_s16le,
+        } = &queued[0].feedback
+        else {
+            panic!("expected PCM feedback packet");
+        };
+        assert_eq!(*controller, 2);
+        assert_eq!(*sequence, 0);
+        assert_eq!(*frames, DS5_PCM_PACKET_FRAMES);
+        assert_eq!(samples_s16le, &[0x81, 0x82, 0x83, 0x84].repeat(240));
+        assert_eq!(packetizer.sequence, 1);
+
+        packetizer.push(
+            &pcm_frames(240, new_frame),
+            &producer,
+            start + DS5_PCM_PACKET_GAP + Duration::from_millis(3),
+        );
+        let queued = queue.peek(16);
+        assert_eq!(queued.len(), 2);
+        assert!(matches!(
+            queued[1].feedback,
+            HostFeedback::HapticsPcm { sequence: 1, .. }
+        ));
+        assert_eq!(packetizer.sequence, 2);
+    }
+
+    #[test]
+    fn native_gadget_is_preferred_and_release_leaves_one_visible_target() {
+        let (_gadget_guard, gadget) = FakeGadgetGuard::install();
+        let (_uhid_guard, uhid) = FakeUhidGuard::install();
+        let mut device = Ds5Gamepad::create(4, false, test_feedback(4)).unwrap();
+        device
+            .update(ControllerSnapshot {
+                buttons: A,
+                ..ControllerSnapshot::default()
+            })
+            .unwrap();
+        device.release().unwrap();
+
+        assert_eq!(gadget.borrow().created.len(), 1);
+        assert!(!gadget.borrow().reports.is_empty());
+        assert_eq!(gadget.borrow().destroyed.len(), 1);
+        assert!(uhid.borrow().created.is_empty());
+    }
+
+    #[test]
+    fn native_gadget_acquisition_failure_falls_back_to_one_uhid_target() {
+        let (_gadget_guard, gadget) = FakeGadgetGuard::install();
+        gadget.borrow_mut().fail_create = true;
+        let (_uhid_guard, uhid) = FakeUhidGuard::install();
+        let mut device = Ds5Gamepad::create(4, false, test_feedback(4)).unwrap();
+        assert!(gadget.borrow().created.is_empty());
+        assert_eq!(uhid.borrow().created.len(), 1);
+        device.release().unwrap();
+        assert_eq!(uhid.borrow().destroyed.len(), 1);
     }
 
     #[test]

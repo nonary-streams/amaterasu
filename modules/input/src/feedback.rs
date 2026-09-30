@@ -156,9 +156,13 @@ impl FeedbackProducer {
         self.controller
     }
 
+    pub(crate) fn supports_haptics_pcm(&self) -> bool {
+        self.capabilities & HAPTICS_PCM_CAPABILITY != 0
+    }
+
     pub(crate) fn push(&self, feedback: HostFeedback) -> bool {
         if feedback.controller() != self.controller
-            || (feedback.is_best_effort_pcm() && self.capabilities & HAPTICS_PCM_CAPABILITY == 0)
+            || (feedback.is_best_effort_pcm() && !self.supports_haptics_pcm())
         {
             return false;
         }
