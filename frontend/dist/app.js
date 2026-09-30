@@ -4106,6 +4106,25 @@ var Amaterasu;
             default: return "PipeWire source selection is unavailable on this host.";
         }
     }
+    function pipewireCancellationUnconfirmedDescription() {
+        return "Cancellation could not be confirmed. The source selection may remain until the configured provider timeout; refresh to check the current status.";
+    }
+    async function boundedPipewireRequest(request, timeoutMs) {
+        let timeout;
+        try {
+            return await Promise.race([
+                request,
+                new Promise((_, reject) => {
+                    timeout = setTimeout(() => reject(new Error("PipeWire capture request timed out.")), timeoutMs);
+                }),
+            ]);
+        }
+        finally {
+            if (timeout !== undefined)
+                clearTimeout(timeout);
+        }
+    }
+    Amaterasu.boundedPipewireRequest = boundedPipewireRequest;
     function pipewireSelectionDescription(reply) {
         if (reply.availability === "unavailable")
             return pipewireUnavailableDescription(reply.reason);
@@ -4124,7 +4143,7 @@ var Amaterasu;
         }
     }
     Amaterasu.pipewireSelectionDescription = pipewireSelectionDescription;
-    async function waitForPipewireSelection(api, operationId, isActive, onState, pollIntervalMs = 400, timeoutMs = 15_000, cancelSelection = () => api.post("capture/pipewire_selection_cancel", { operation_id: operationId }).then(() => undefined)) {
+    async function waitForPipewireSelection(api, operationId, isActive, onState, pollIntervalMs = 400, timeoutMs = 15_000, cancelSelection = () => api.post("capture/pipewire_selection_cancel", { operation_id: operationId }).then(() => true)) {
         const deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline && isActive()) {
             await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
@@ -4141,6 +4160,15 @@ var Amaterasu;
                     }),
                 ]);
             }
+            catch (error) {
+                if (error instanceof Error && error.message === "Source selection timed out and was cancelled.") {
+                    const confirmed = await cancelSelection();
+                    throw new Error(confirmed === false
+                        ? "Source selection timed out; cancellation could not be confirmed."
+                        : "Source selection timed out and was cancelled.");
+                }
+                throw error;
+            }
             finally {
                 if (timeout !== undefined)
                     clearTimeout(timeout);
@@ -4154,9 +4182,11 @@ var Amaterasu;
             if (reply.selection_state !== "selecting" && reply.selection_state !== "permission_required")
                 return;
         }
-        await cancelSelection();
+        const confirmed = await cancelSelection();
         if (isActive())
-            throw new Error("Source selection timed out and was cancelled.");
+            throw new Error(confirmed === false
+                ? "Source selection timed out; cancellation could not be confirmed."
+                : "Source selection timed out and was cancelled.");
     }
     Amaterasu.waitForPipewireSelection = waitForPipewireSelection;
     function parseVideoMaxBatchSize(value) {
@@ -4771,7 +4801,7 @@ var Amaterasu;
                 return;
             }
             try {
-                const reply = parsePipewireCaptureReply(await context.api.post("capture/pipewire_status"));
+                const reply = parsePipewireCaptureReply(await boundedPipewireRequest(context.api.post("capture/pipewire_status"), 5_000));
                 if (!pipewireArea.isConnected || generation !== pipewireGeneration)
                     return;
                 status.textContent = pipewireSelectionDescription(reply);
@@ -4810,8 +4840,7 @@ var Amaterasu;
                 if (operationId === null)
                     return Promise.resolve(false);
                 if (cancellation === null) {
-                    cancellation = context.api.post("capture/pipewire_selection_cancel", { operation_id: operationId })
-                        .then(() => true, () => false);
+                    cancellation = boundedPipewireRequest(context.api.post("capture/pipewire_selection_cancel", { operation_id: operationId }), 3_000).then(() => true, () => false);
                     const request = cancellation;
                     void request.then((confirmed) => {
                         if (!confirmed && cancellation === request)
@@ -4820,7 +4849,6 @@ var Amaterasu;
                 }
                 return cancellation;
             };
-            const cancelSelection = async () => { await requestCancel(); };
             const cancel = Amaterasu.button("Cancel selection", () => {
                 cancelled = true;
                 cancel.disabled = true;
@@ -4834,10 +4862,10 @@ var Amaterasu;
             try {
                 const requestedId = crypto.randomUUID();
                 operationId = requestedId;
-                parsePipewireCaptureReply(await context.api.post("capture/pipewire_selection_begin", {
+                parsePipewireCaptureReply(await boundedPipewireRequest(context.api.post("capture/pipewire_selection_begin", {
                     source_type: sourceType,
                     operation_id: requestedId,
-                }));
+                }), 10_000));
                 beginPending = false;
                 const active = () => pipewireArea.isConnected && pipewireOperation === operation && !cancelled;
                 if (cancelled)
@@ -4845,15 +4873,15 @@ var Amaterasu;
                 await waitForPipewireSelection(context.api, operationId, active, (reply) => {
                     if (active())
                         status.textContent = pipewireSelectionDescription(reply);
-                }, 400, 15_000, cancelSelection);
+                }, 400, 15_000, requestCancel);
                 if (pipewireArea.isConnected && pipewireOperation === operation) {
-                    const finalStatus = parsePipewireCaptureReply(await context.api.post("capture/pipewire_selection_poll", { operation_id: operationId }));
+                    const finalStatus = parsePipewireCaptureReply(await boundedPipewireRequest(context.api.post("capture/pipewire_selection_poll", { operation_id: operationId }), 5_000));
                     if (cancelled || !pipewireArea.isConnected || pipewireOperation !== operation) {
                         const confirmed = await requestCancel();
                         if (pipewireArea.isConnected && pipewireOperation === operation)
                             status.textContent = confirmed
                                 ? "Source selection was cancelled."
-                                : "Cancellation could not be confirmed. Refresh to check the current status.";
+                                : pipewireCancellationUnconfirmedDescription();
                     }
                     else {
                         status.textContent = pipewireSelectionDescription(finalStatus);
@@ -4862,12 +4890,19 @@ var Amaterasu;
             }
             catch (error) {
                 beginPending = false;
-                if (operationId !== null && !(error instanceof Error && error.message === "Source selection timed out and was cancelled."))
-                    await requestCancel();
+                const confirmedTimeout = error instanceof Error && error.message === "Source selection timed out and was cancelled.";
+                const unconfirmedTimeout = error instanceof Error && error.message === "Source selection timed out; cancellation could not be confirmed.";
+                let cancellationConfirmed = null;
+                if (operationId !== null && !confirmedTimeout && !unconfirmedTimeout)
+                    cancellationConfirmed = await requestCancel();
                 if (pipewireArea.isConnected && pipewireOperation === operation)
                     status.textContent = error instanceof Amaterasu.ApiError && error.code === "forbidden"
                         ? "PipeWire source selection requires capture.write."
-                        : "Source selection failed or timed out. Refresh and check the current status.";
+                        : unconfirmedTimeout || cancellationConfirmed === false
+                            ? pipewireCancellationUnconfirmedDescription()
+                            : confirmedTimeout
+                                ? "Source selection timed out and cancellation was confirmed."
+                                : "Source selection failed or timed out. Refresh and check the current status.";
             }
             finally {
                 cancelOperation.remove();

@@ -2469,6 +2469,13 @@ test("PipeWire chooser replies validate only safe status and describe availabili
   ]) assert.throws(() => parse(invalid));
 });
 
+test("PipeWire status and control requests use a bounded wait", async () => {
+  await assert.rejects(
+    context.Amaterasu.boundedPipewireRequest(new Promise(() => {}), 5),
+    /PipeWire capture request timed out/,
+  );
+});
+
 test("PipeWire chooser polls until a terminal state and cancels on close or timeout", async () => {
   const calls = [];
   const replies = [
@@ -2488,6 +2495,39 @@ test("PipeWire chooser polls until a terminal state and cancels on close or time
   assert.deepEqual(cancelCalls, [["capture/pipewire_selection_cancel", { operation_id: "private-handle" }]]);
   await assert.rejects(context.Amaterasu.waitForPipewireSelection(cancelApi, "expired-handle", () => true, () => {}, 1, 0), /timed out and was cancelled/);
   assert.equal(cancelCalls.at(-1)[0], "capture/pipewire_selection_cancel");
+});
+
+test("PipeWire poll request timeout cancels a picker and reports unconfirmed cancellation", async () => {
+  const cancelCalls = [];
+  const api = { async post(route, body) {
+    if (route === "capture/pipewire_selection_poll") return new Promise(() => {});
+    cancelCalls.push([route, ordinary(body)]);
+    throw new Error("cancel transport failed");
+  } };
+  await assert.rejects(
+    context.Amaterasu.waitForPipewireSelection(
+      api, "stalled-handle", () => true, () => {}, 1, 25,
+      async () => { try { await api.post("capture/pipewire_selection_cancel", { operation_id: "stalled-handle" }); return true; } catch { return false; } },
+    ),
+    /cancellation could not be confirmed/,
+  );
+  assert.deepEqual(cancelCalls, [["capture/pipewire_selection_cancel", { operation_id: "stalled-handle" }]]);
+});
+
+test("PipeWire poll request timeout sends cancellation for a never-resolving poll", async () => {
+  let cancelCount = 0;
+  const api = { async post(route) {
+    assert.equal(route, "capture/pipewire_selection_poll");
+    return new Promise(() => {});
+  } };
+  await assert.rejects(
+    context.Amaterasu.waitForPipewireSelection(
+      api, "never-ready", () => true, () => {}, 1, 20,
+      async () => { cancelCount += 1; return true; },
+    ),
+    /timed out and was cancelled/,
+  );
+  assert.equal(cancelCount, 1);
 });
 
 test("PipeWire chooser cancellation can be sent while the final status request is pending", async () => {
