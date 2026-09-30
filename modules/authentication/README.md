@@ -117,13 +117,15 @@ tokens, 64 scopes per token, 32 methods per scope, 2,048 bytes per path expressi
 and 64 KiB total; larger imports fail closed. Matching uses an anchored full
 path regex and case-insensitive method comparison. Expressions use Rust regex
 syntax with Unicode mode disabled; this is not a full translation of C++
-`std::regex`. The linear-time engine supports the safe common subset, while
-malformed or unsupported expressions (including backreferences and lookaround)
-remain stored but deny access. On the first request that proves the bearer and
-passes both route and named-scope checks, the record's format version advances
-durably. The digest is already lowercase SHA-256, so this does not rehash the
-token or change its grants. Administrator token listings show only legacy token
-metadata and omit path/method scopes.
+`std::regex`. The linear-time engine supports the safe common subset; full
+ECMAScript regex compatibility, including valid constructs unsupported by Rust's
+engine, remains a parity requirement. Malformed or unsupported expressions
+(including backreferences and lookaround) remain stored and cannot authorize by
+themselves; other scopes continue to be checked. On the first request that proves
+the bearer and passes both route and named-scope checks, the record's format
+version advances durably. The digest is already lowercase SHA-256, so this does
+not rehash the token or change its grants. Administrator token listings show
+only legacy token metadata and omit path/method scopes.
 
 The retained password verifier is constant-time checked at login and, after the
 first successful password proof, is replaced in the same durable write with the

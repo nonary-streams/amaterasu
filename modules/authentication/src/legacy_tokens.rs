@@ -181,7 +181,7 @@ fn scope_allows_route(
 
     for (path_pattern, scope) in scopes_by_path {
         let Some(regex) = compile_legacy_path_regex(path_pattern) else {
-            return false;
+            continue;
         };
         if regex.is_match(request_path)
             && scope
@@ -311,6 +311,22 @@ mod tests {
         assert_eq!(
             store.tokens[0].record_version,
             LEGACY_API_TOKEN_STORE_VERSION
+        );
+    }
+
+    #[test]
+    fn unsupported_regex_does_not_hide_a_later_matching_scope() {
+        let mut store = LegacyApiTokenStore::from_legacy_tokens(vec![token(vec![
+            // This sorts before `/api/apps` in the path map and cannot compile.
+            scope("!(", &["GET"]),
+            scope("/api/apps", &["GET"]),
+        ])]);
+
+        assert!(
+            store
+                .verify_route(LEGACY_BEARER, "/api/apps", "GET")
+                .unwrap()
+                .is_some()
         );
     }
 
