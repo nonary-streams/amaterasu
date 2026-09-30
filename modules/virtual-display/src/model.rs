@@ -117,14 +117,23 @@ pub enum Operation {
         height: u32,
         refresh_millihz: u32,
         name: String,
+        /// Stable caller-scoped reference for shared monitor ownership.
+        #[serde(default)]
+        reference_id: Option<String>,
         #[serde(default)]
         dd_virtual_display_scale: i32,
     },
     Status {
         identity: Option<String>,
+        /// Ask whether this specific session still owns a shared monitor reference.
+        #[serde(default)]
+        reference_id: Option<String>,
     },
     Remove {
         identity: String,
+        /// Release only this session's reference when supplied.
+        #[serde(default)]
+        reference_id: Option<String>,
     },
 }
 
@@ -166,6 +175,12 @@ pub fn valid_identity(identity: &str) -> bool {
             }
         })
         && identity.bytes().any(|byte| byte != b'0' && byte != b'-')
+}
+
+pub fn valid_reference_id(reference_id: &str) -> bool {
+    !reference_id.is_empty()
+        && reference_id.len() <= 128
+        && reference_id.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 pub fn display_id(caller: &str, identity: &str) -> u64 {

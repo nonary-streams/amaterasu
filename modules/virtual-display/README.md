@@ -46,6 +46,29 @@ Requests reject unknown fields. Examples:
 {"action":"remove","identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09"}
 ```
 
+Lifecycle callers may attach a stable `reference_id` to `create`, query that
+reference with `status`, and release only it with `remove`:
+
+```json
+{"action":"create","identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","reference_id":"stream-session-42"}
+{"action":"status","identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","reference_id":"stream-session-42"}
+{"action":"remove","identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","reference_id":"stream-session-42"}
+```
+
+Reference IDs are caller-scoped, 1–128 printable ASCII characters, and are
+persisted with the lease journal. Repeating a create with the same caller,
+identity, specification, and reference is idempotent. A second reference with
+the same specification shares the temporary monitor without replaying native
+creation. Releasing a reference leaves the monitor alive while another
+reference remains; releasing the final reference begins exact native cleanup.
+Status reports `reference_owned` for a queried reference and never returns the
+reference token. A remove without `reference_id` preserves caller-wide legacy
+removal. Legacy and reference-counted ownership cannot be mixed for one
+identity. If completion of a newly attached reference is lost, only that new
+reference is released; a previously owned monitor and its other references
+remain intact. Restart resumes either reference ownership or final cleanup from
+the journal.
+
 Create may include the optional integer `dd_virtual_display_scale`; omission
 defaults to `0` and preserves older callers. Accepted values are `-1`, `0`,
 `100`, `125`, `150`, `175`, `200`, `225`, `250`, `300`, `350`, `400`, `450`,

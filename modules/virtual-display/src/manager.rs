@@ -1,10 +1,12 @@
 use crate::backend::{Driver, Ready};
 use crate::journal::{Journal, Record};
-use crate::model::{Operation, Settings, Specification, display_id, failure, valid_identity};
+use crate::model::{
+    Operation, Settings, Specification, display_id, failure, valid_identity, valid_reference_id,
+};
 use crate::protocol::Binding;
 use crate::scale::ScaleSetting;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 const MAX_MONITORS: usize = 8;
@@ -18,6 +20,7 @@ struct Monitor {
     lease: u64,
     prospective_lease: Option<u64>,
     capability: [u8; 32],
+    references: Option<BTreeSet<String>>,
     binding: Option<Binding>,
     ready: Option<Ready>,
     state: &'static str,
@@ -38,11 +41,20 @@ impl Monitor {
             prospective_lease: self.prospective_lease,
             capability: self.capability,
             binding: self.binding,
+            references: self.references.clone(),
         }
     }
-    fn response(&self) -> Value {
+    fn response(&self, reference_id: Option<&str>) -> Value {
         json!({"ok":true,"monitor":{"specification":self.specification,"display_id":format!("{:016x}",self.display_id),
-            "state":self.state,"ready":self.ready,"error":self.error}})
+            "state":self.state,"ready":self.ready,"error":self.error},
+            "reference_owned":reference_id.is_some_and(|reference| self.references.as_ref().is_some_and(|references| references.contains(reference)))})
+    }
+    fn finish_recovery(&mut self) {
+        if self.references.as_ref().is_some_and(BTreeSet::is_empty) {
+            self.begin_cleanup(None);
+        } else {
+            self.state = "recovered";
+        }
     }
     fn begin_cleanup(&mut self, error: Option<&'static str>) {
         self.ready = None;
@@ -56,6 +68,7 @@ impl Monitor {
 pub struct Admission {
     key: (String, String),
     lease: u64,
+    reference_id: Option<String>,
 }
 
 pub struct Manager<D: Driver> {
@@ -96,6 +109,7 @@ impl<D: Driver> Manager<D> {
             lease: record.lease,
             prospective_lease: record.prospective_lease,
             capability: record.capability,
+            references: record.references,
             binding: record.binding,
             ready: None,
             state: "recovered",
@@ -173,7 +187,7 @@ impl<D: Driver> Manager<D> {
                     .upsert(record.clone())?;
                 monitor.lease = record.lease;
                 monitor.prospective_lease = None;
-                monitor.state = "recovered";
+                monitor.finish_recovery();
                 continue;
             }
             if !old.exists
@@ -232,27 +246,44 @@ impl<D: Driver> Manager<D> {
                 self.journal.as_mut().expect("journal").upsert(record)?;
                 monitor.lease = new_lease;
                 monitor.prospective_lease = None;
-                monitor.state = "recovered";
+                monitor.finish_recovery();
             }
         }
         Ok(())
     }
 
     pub fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Admission>) {
-        let new_key = match &operation {
-            Operation::Create { identity, .. } => {
+        let (key, needs_admission, reference_id) = match &operation {
+            Operation::Create {
+                identity,
+                reference_id,
+                ..
+            } => {
                 let key = (caller.to_owned(), identity.clone());
-                (!self.monitors.contains_key(&key)).then_some(key)
+                let needs_admission = self.monitors.get(&key).is_none_or(|monitor| {
+                    reference_id.as_ref().is_some_and(|reference| {
+                        !monitor
+                            .references
+                            .as_ref()
+                            .is_some_and(|references| references.contains(reference))
+                    })
+                });
+                (Some(key), needs_admission, reference_id.clone())
             }
-            _ => None,
+            _ => (None, false, None),
         };
         let response = self.handle(caller, operation);
-        let admission = new_key.and_then(|key| {
-            self.monitors.get(&key).map(|monitor| Admission {
-                lease: monitor.lease,
-                key,
+        let admission = if response["ok"] == true && needs_admission {
+            key.and_then(|key| {
+                self.monitors.get(&key).map(|monitor| Admission {
+                    lease: monitor.lease,
+                    key,
+                    reference_id,
+                })
             })
-        });
+        } else {
+            None
+        };
         (response, admission)
     }
 
@@ -261,21 +292,54 @@ impl<D: Driver> Manager<D> {
         if let Some(monitor) = self.monitors.get_mut(&admission.key)
             && monitor.lease == admission.lease
         {
-            monitor.begin_cleanup(Some("completion_lost"));
+            if let Some(reference_id) = admission.reference_id {
+                if let Some(references) = &mut monitor.references {
+                    let released = references.remove(&reference_id);
+                    let no_references = references.is_empty();
+                    if let Some(journal) = &mut self.journal
+                        && journal.upsert(monitor.record(&admission.key.0)).is_err()
+                    {
+                        if released {
+                            monitor
+                                .references
+                                .as_mut()
+                                .expect("reference monitor")
+                                .insert(reference_id);
+                        }
+                        monitor.error = Some("journal_unavailable");
+                        return;
+                    }
+                    if no_references {
+                        monitor.begin_cleanup(Some("completion_lost"));
+                    }
+                }
+            } else {
+                monitor.begin_cleanup(Some("completion_lost"));
+            }
         }
     }
 
     pub fn handle(&mut self, caller: &str, operation: Operation) -> Value {
         match operation {
-            Operation::Status { identity } => self.status(caller, identity),
+            Operation::Status {
+                identity,
+                reference_id,
+            } => self.status(caller, identity, reference_id),
             Operation::Create {
                 identity,
                 width,
                 height,
                 refresh_millihz,
                 name,
+                reference_id,
                 dd_virtual_display_scale,
             } => {
+                if reference_id
+                    .as_deref()
+                    .is_some_and(|reference| !valid_reference_id(reference))
+                {
+                    return failure("invalid_request");
+                }
                 let scale = match ScaleSetting::try_from(dd_virtual_display_scale) {
                     Ok(scale) => scale,
                     Err(()) => return failure("invalid_request"),
@@ -301,14 +365,36 @@ impl<D: Driver> Manager<D> {
                         refresh_millihz,
                         name,
                     },
+                    reference_id,
                 )
             }
-            Operation::Remove { identity } => self.remove(caller, &identity),
+            Operation::Remove {
+                identity,
+                reference_id,
+            } => {
+                if reference_id
+                    .as_deref()
+                    .is_some_and(|reference| !valid_reference_id(reference))
+                {
+                    return failure("invalid_request");
+                }
+                self.remove(caller, &identity, reference_id.as_deref())
+            }
         }
     }
 
-    fn status(&self, caller: &str, identity: Option<String>) -> Value {
-        if identity.as_deref().is_some_and(|id| !valid_identity(id)) {
+    fn status(
+        &self,
+        caller: &str,
+        identity: Option<String>,
+        reference_id: Option<String>,
+    ) -> Value {
+        if identity.as_deref().is_some_and(|id| !valid_identity(id))
+            || (reference_id.is_some() && identity.is_none())
+            || reference_id
+                .as_deref()
+                .is_some_and(|reference| !valid_reference_id(reference))
+        {
             return failure("invalid_request");
         }
         let monitors: Vec<_> = self
@@ -317,8 +403,16 @@ impl<D: Driver> Manager<D> {
             .filter(|((owner, id), _)| {
                 owner == caller && identity.as_ref().is_none_or(|wanted| wanted == id)
             })
-            .map(|(_, monitor)| monitor.response()["monitor"].clone())
+            .map(|(_, monitor)| monitor.response(reference_id.as_deref())["monitor"].clone())
             .collect();
+        let reference_owned = match (&identity, &reference_id) {
+            (Some(identity), Some(reference_id)) => self
+                .monitors
+                .get(&(caller.to_owned(), identity.clone()))
+                .and_then(|monitor| monitor.references.as_ref())
+                .is_some_and(|references| references.contains(reference_id)),
+            _ => false,
+        };
         let driver = if self.settings.dd_use_sunshine_virtual_display_driver {
             "sunshine"
         } else {
@@ -346,10 +440,16 @@ impl<D: Driver> Manager<D> {
             "activation_supported":false,
             "activation_state":activation_state,
             "activation_error":activation_error,
-            "monitors":monitors,"readiness":"monitor_identity_published_not_capture_ready"})
+            "monitors":monitors,"reference_owned":reference_id.map(|_| reference_owned),
+            "readiness":"monitor_identity_published_not_capture_ready"})
     }
 
-    fn create(&mut self, caller: &str, specification: Specification) -> Value {
+    fn create(
+        &mut self,
+        caller: &str,
+        specification: Specification,
+        reference_id: Option<String>,
+    ) -> Value {
         if let Err(code) = specification.validate() {
             return failure(code);
         }
@@ -362,11 +462,45 @@ impl<D: Driver> Manager<D> {
                     "recovery_pending"
                 });
             }
-            return if existing.specification == specification {
-                existing.response()
-            } else {
-                failure("identity_conflict")
+            if existing.specification != specification {
+                return failure("identity_conflict");
+            }
+            let Some(reference_id) = reference_id else {
+                return if existing.references.is_none() {
+                    existing.response(None)
+                } else {
+                    failure("reference_conflict")
+                };
             };
+            let Some(references) = existing.references.as_ref() else {
+                return failure("reference_conflict");
+            };
+            if references.contains(&reference_id) {
+                return existing.response(Some(&reference_id));
+            }
+            if existing.state == "removing" || existing.state == "cleanup_failed" {
+                return failure("cleanup_pending");
+            }
+            if references.len() >= 64 {
+                return failure("reference_limit");
+            }
+            let monitor = self.monitors.get_mut(&key).expect("existing monitor");
+            monitor
+                .references
+                .as_mut()
+                .expect("reference monitor")
+                .insert(reference_id.clone());
+            if let Some(journal) = &mut self.journal
+                && journal.upsert(monitor.record(&key.0)).is_err()
+            {
+                monitor
+                    .references
+                    .as_mut()
+                    .expect("reference monitor")
+                    .remove(&reference_id);
+                return failure("journal_unavailable");
+            }
+            return monitor.response(Some(&reference_id));
         }
         if self.monitors.len() >= MAX_MONITORS {
             return failure("monitor_limit");
@@ -401,6 +535,9 @@ impl<D: Driver> Manager<D> {
             lease,
             prospective_lease: None,
             capability,
+            references: reference_id
+                .as_ref()
+                .map(|reference_id| BTreeSet::from([reference_id.clone()])),
             binding: None,
             ready: None,
             state: "creating",
@@ -429,16 +566,17 @@ impl<D: Driver> Manager<D> {
             }
             Err(code) => monitor.begin_cleanup(Some(code)),
         }
-        let reply = monitor.response();
+        let reply = monitor.response(reference_id.as_deref());
         self.monitors.insert(key, monitor);
         reply
     }
 
-    fn remove(&mut self, caller: &str, identity: &str) -> Value {
+    fn remove(&mut self, caller: &str, identity: &str, reference_id: Option<&str>) -> Value {
         if !valid_identity(identity) {
             return failure("invalid_request");
         }
-        let Some(monitor) = self.monitors.get_mut(&(caller.into(), identity.into())) else {
+        let key = (caller.to_owned(), identity.to_owned());
+        let Some(monitor) = self.monitors.get_mut(&key) else {
             return json!({"ok":true,"removed":true,"identity":identity});
         };
         if matches!(monitor.state, "ownership_conflict" | "reclaim_pending") {
@@ -453,8 +591,51 @@ impl<D: Driver> Manager<D> {
             // bounded removal window for this exact lease and display.
             monitor.remove_attempts = 0;
         }
+        if let Some(reference_id) = reference_id {
+            if monitor.references.is_none() {
+                return failure("reference_conflict");
+            }
+            let (released, no_references) = {
+                let references = monitor
+                    .references
+                    .as_mut()
+                    .expect("reference monitor checked above");
+                let released = references.remove(reference_id);
+                (released, references.is_empty())
+            };
+            if let Some(journal) = &mut self.journal
+                && journal.upsert(monitor.record(&key.0)).is_err()
+            {
+                if released {
+                    monitor
+                        .references
+                        .as_mut()
+                        .expect("reference monitor")
+                        .insert(reference_id.into());
+                }
+                return failure("journal_unavailable");
+            }
+            if !no_references {
+                let still_owned = monitor
+                    .references
+                    .as_ref()
+                    .expect("reference monitor")
+                    .contains(reference_id);
+                return json!({"ok":true,"removed":false,"identity":identity,
+                    "reference_released":released,"reference_owned":still_owned});
+            }
+        } else if let Some(references) = &mut monitor.references {
+            let previous = references.clone();
+            references.clear();
+            if let Some(journal) = &mut self.journal
+                && journal.upsert(monitor.record(&key.0)).is_err()
+            {
+                monitor.references = Some(previous);
+                return failure("journal_unavailable");
+            }
+        }
         monitor.begin_cleanup(None);
-        monitor.response()
+        monitor.response(reference_id)
     }
 
     pub fn tick(&mut self) {

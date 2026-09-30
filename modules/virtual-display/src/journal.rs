@@ -17,6 +17,10 @@ pub struct Record {
     pub prospective_lease: Option<u64>,
     pub capability: [u8; 32],
     pub binding: Option<crate::protocol::Binding>,
+    /// `None` is the pre-reference API; `Some(empty)` means the final reference
+    /// was released and exact native cleanup is still pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references: Option<BTreeSet<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -106,6 +110,12 @@ impl Journal {
                             lease & 0x6000_0000_0000_0000 != 0x6000_0000_0000_0000
                         })
                         || record.capability == [0; 32]
+                        || record.references.as_ref().is_some_and(|references| {
+                            references.len() > 64
+                                || references
+                                    .iter()
+                                    .any(|reference| !crate::model::valid_reference_id(reference))
+                        })
                     {
                         return Err("invalid virtual display journal record".into());
                     }
@@ -236,12 +246,23 @@ mod tests {
             prospective_lease: None,
             capability: [7; 32],
             binding: None,
+            references: None,
         };
         let mut journal = Journal::open(&path).unwrap();
         journal.upsert(record.clone()).unwrap();
         drop(journal);
-        let journal = Journal::open(&path).unwrap();
+        let mut journal = Journal::open(&path).unwrap();
         assert_eq!(journal.records().next().unwrap().lease, record.lease);
+        assert_eq!(journal.records().next().unwrap().references, None);
+        let mut referenced_record = record.clone();
+        referenced_record.references = Some(BTreeSet::from(["stream-a".into()]));
+        journal.upsert(referenced_record.clone()).unwrap();
+        drop(journal);
+        let journal = Journal::open(&path).unwrap();
+        assert_eq!(
+            journal.records().next().unwrap().references,
+            referenced_record.references
+        );
         drop(journal);
         OpenOptions::new()
             .append(true)
@@ -251,6 +272,10 @@ mod tests {
             .unwrap();
         let mut journal = Journal::open(&path).unwrap();
         assert_eq!(journal.records().next().unwrap().lease, record.lease);
+        assert_eq!(
+            journal.records().next().unwrap().references,
+            referenced_record.references
+        );
         journal
             .delete("alice", &record.specification.identity)
             .unwrap();

@@ -101,6 +101,7 @@ fn create() -> Operation {
         height: 1080,
         refresh_millihz: 60000,
         name: "Test display".into(),
+        reference_id: None,
         dd_virtual_display_scale: 0,
     }
 }
@@ -111,7 +112,19 @@ fn create_with_scale(dd_virtual_display_scale: i32) -> Operation {
         height: 1080,
         refresh_millihz: 60000,
         name: "Test display".into(),
+        reference_id: None,
         dd_virtual_display_scale,
+    }
+}
+fn create_with_reference(reference_id: &str) -> Operation {
+    Operation::Create {
+        identity: ID.into(),
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60000,
+        name: "Test display".into(),
+        reference_id: Some(reference_id.into()),
+        dd_virtual_display_scale: 0,
     }
 }
 fn tick(manager: &mut Manager<Fake>) {
@@ -242,6 +255,7 @@ fn recovery_record(prospective_lease: Option<u64>) -> Record {
         prospective_lease,
         capability: [7; 32],
         binding: None,
+        references: None,
     }
 }
 
@@ -275,7 +289,13 @@ fn restart_reclaims_prepared_owned_create_without_replaying_create() {
         "recovered"
     );
     assert!(
-        manager.handle("bob", Operation::Status { identity: None })["monitors"]
+        manager.handle(
+            "bob",
+            Operation::Status {
+                identity: None,
+                reference_id: None
+            }
+        )["monitors"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -284,11 +304,74 @@ fn restart_reclaims_prepared_owned_create_without_replaying_create() {
         manager.handle(
             "bob",
             Operation::Remove {
-                identity: ID.into()
+                identity: ID.into(),
+                reference_id: None,
             }
         )["removed"],
         true
     );
+    assert_eq!(calls.borrow().creates, 0);
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restart_restores_stable_references_and_resumes_released_cleanup() {
+    let (mut journal, root) = recovery_journal();
+    let mut record = recovery_record(None);
+    record.references = Some(BTreeSet::from(["stream-a".into()]));
+    journal.upsert(record.clone()).unwrap();
+    let calls = Rc::new(RefCell::new(RecoveryCalls {
+        lease: Some(record.lease),
+        display: record.display_id,
+        capability: record.capability,
+        ..Default::default()
+    }));
+    let mut manager = Manager::with_journal(
+        Settings {
+            enabled: true,
+            ..Settings::default()
+        },
+        RecoveryFake(calls.clone()),
+        journal,
+    )
+    .unwrap();
+    let status = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: Some(ID.into()),
+            reference_id: Some("stream-a".into()),
+        },
+    );
+    assert_eq!(status["reference_owned"], true);
+    assert_eq!(status["monitors"][0]["state"], "recovered");
+    assert_eq!(calls.borrow().creates, 0);
+    drop(manager);
+    std::fs::remove_dir_all(&root).unwrap();
+
+    let (mut journal, root) = recovery_journal();
+    let mut record = recovery_record(None);
+    record.references = Some(BTreeSet::new());
+    journal.upsert(record.clone()).unwrap();
+    let calls = Rc::new(RefCell::new(RecoveryCalls {
+        lease: Some(record.lease),
+        display: record.display_id,
+        capability: record.capability,
+        ..Default::default()
+    }));
+    let mut manager = Manager::with_journal(
+        Settings {
+            enabled: true,
+            ..Settings::default()
+        },
+        RecoveryFake(calls.clone()),
+        journal,
+    )
+    .unwrap();
+    assert_eq!(manager.monitors.values().next().unwrap().state, "removing");
+    manager.tick();
+    assert_eq!(calls.borrow().removes, 1);
+    assert!(manager.monitors.is_empty());
     assert_eq!(calls.borrow().creates, 0);
     drop(manager);
     std::fs::remove_dir_all(root).unwrap();
@@ -327,7 +410,8 @@ fn recovered_lease_without_binding_survives_readiness_timeout_and_owner_removes_
         manager.handle(
             "alice",
             Operation::Remove {
-                identity: ID.into()
+                identity: ID.into(),
+                reference_id: None,
             }
         )["monitor"]["state"],
         "removing"
@@ -455,7 +539,8 @@ fn stale_capability_and_specification_mismatch_fail_closed() {
                 manager.handle(
                     "alice",
                     Operation::Remove {
-                        identity: ID.into()
+                        identity: ID.into(),
+                        reference_id: None,
                     }
                 )["code"],
                 "recovery_pending"
@@ -508,7 +593,8 @@ fn shared_or_foreign_lease_never_reclaims_or_clears_ownership() {
             manager.handle(
                 "alice",
                 Operation::Remove {
-                    identity: ID.into()
+                    identity: ID.into(),
+                    reference_id: None,
                 }
             )["code"],
             "ownership_conflict"
@@ -633,7 +719,13 @@ fn driver_selection_rejects_sunshine_driver_without_native_effects() {
         manager.handle("alice", create())["code"],
         "unsupported_driver"
     );
-    let status = manager.handle("alice", Operation::Status { identity: None });
+    let status = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: None,
+            reference_id: None,
+        },
+    );
     assert_eq!(status["dd_activate_virtual_display"], false);
     assert_eq!(status["dd_use_sunshine_virtual_display_driver"], false);
     assert_eq!(status["driver"], "unsupported");
@@ -656,7 +748,13 @@ fn requested_activation_does_not_change_explicit_create_and_status_reports_gap()
     assert!(response["monitor"]["ready"].is_null());
     assert_eq!(calls.borrow().creates.len(), 1);
 
-    let status = manager.handle("alice", Operation::Status { identity: None });
+    let status = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: None,
+            reference_id: None,
+        },
+    );
     assert_eq!(status["enabled"], true);
     assert_eq!(status["dd_activate_virtual_display"], true);
     assert_eq!(status["activation_supported"], false);
@@ -775,8 +873,13 @@ fn permanent_monitor_count_rejects_non_integer_values() {
 #[test]
 fn status_reports_permanent_count_and_unsupported_runtime() {
     let (mut unconfigured_manager, _) = setup_with(Settings::default());
-    let unconfigured_status =
-        unconfigured_manager.handle("alice", Operation::Status { identity: None });
+    let unconfigured_status = unconfigured_manager.handle(
+        "alice",
+        Operation::Status {
+            identity: None,
+            reference_id: None,
+        },
+    );
     assert_eq!(unconfigured_status["dd_virtual_display_permanent_count"], 0);
     assert_eq!(
         unconfigured_status["dd_virtual_display_permanent_count_configured"],
@@ -792,7 +895,13 @@ fn status_reports_permanent_count_and_unsupported_runtime() {
     }))
     .unwrap();
     let (mut manager, _) = setup_with(settings);
-    let status = manager.handle("alice", Operation::Status { identity: None });
+    let status = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: None,
+            reference_id: None,
+        },
+    );
 
     assert_eq!(status["dd_virtual_display_permanent_count"], 2);
     assert_eq!(
@@ -818,11 +927,18 @@ fn identity_is_idempotent_and_owned_by_caller() {
         "bob",
         Operation::Remove {
             identity: ID.into(),
+            reference_id: None,
         },
     );
     assert!(calls.borrow().removes.is_empty());
     assert_eq!(
-        manager.handle("bob", Operation::Status { identity: None })["monitors"],
+        manager.handle(
+            "bob",
+            Operation::Status {
+                identity: None,
+                reference_id: None
+            }
+        )["monitors"],
         json!([])
     );
     let second = manager.handle("bob", create());
@@ -836,6 +952,127 @@ fn identity_is_idempotent_and_owned_by_caller() {
     assert!(!serialized.contains("capability"));
     drop(manager);
     assert_eq!(calls.borrow().creates, calls.borrow().removes);
+}
+
+#[test]
+fn shared_monitor_lives_until_its_last_stable_reference_is_released() {
+    let (mut manager, calls) = setup(true);
+    let first = manager.handle("alice", create_with_reference("stream-a"));
+    let second = manager.handle("alice", create_with_reference("stream-b"));
+    assert_eq!(first["ok"], true);
+    assert!(!first.to_string().contains("stream-a"));
+    assert_eq!(second["ok"], true);
+    assert_eq!(
+        second["monitor"]["display_id"],
+        first["monitor"]["display_id"]
+    );
+    assert_eq!(calls.borrow().creates.len(), 1);
+
+    let duplicate = manager.handle("alice", create_with_reference("stream-a"));
+    assert_eq!(duplicate, first);
+    assert_eq!(calls.borrow().creates.len(), 1);
+
+    let first_status = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: Some(ID.into()),
+            reference_id: Some("stream-a".into()),
+        },
+    );
+    assert_eq!(first_status["reference_owned"], true);
+    assert!(!first_status.to_string().contains("stream-a"));
+    let released_first = manager.handle(
+        "alice",
+        Operation::Remove {
+            identity: ID.into(),
+            reference_id: Some("stream-a".into()),
+        },
+    );
+    assert_eq!(released_first["ok"], true);
+    assert_eq!(released_first["removed"], false);
+    assert_eq!(released_first["reference_released"], true);
+    assert!(calls.borrow().removes.is_empty());
+
+    let second_status = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: Some(ID.into()),
+            reference_id: Some("stream-b".into()),
+        },
+    );
+    assert_eq!(second_status["reference_owned"], true);
+    let released_second = manager.handle(
+        "alice",
+        Operation::Remove {
+            identity: ID.into(),
+            reference_id: Some("stream-b".into()),
+        },
+    );
+    assert_eq!(released_second["monitor"]["state"], "removing");
+    calls.borrow_mut().remove_completes = true;
+    tick(&mut manager);
+    assert!(manager.monitors.is_empty());
+    assert_eq!(calls.borrow().removes.len(), 1);
+}
+
+#[test]
+fn lost_shared_reference_reply_releases_only_the_new_reference() {
+    let (mut manager, calls) = setup(true);
+    manager.handle("alice", create_with_reference("stream-a"));
+
+    let (second, admission) = manager.admit("alice", create_with_reference("stream-b"));
+    assert_eq!(second["reference_owned"], true);
+    assert!(admission.is_some());
+    assert_eq!(calls.borrow().creates.len(), 1);
+    manager.completion_lost(admission);
+
+    let first_status = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: Some(ID.into()),
+            reference_id: Some("stream-a".into()),
+        },
+    );
+    let second_status = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: Some(ID.into()),
+            reference_id: Some("stream-b".into()),
+        },
+    );
+    assert_eq!(first_status["reference_owned"], true);
+    assert_eq!(second_status["reference_owned"], false);
+    assert_eq!(second_status["monitors"][0]["state"], "creating");
+    assert!(calls.borrow().removes.is_empty());
+}
+
+#[test]
+fn reference_ids_are_bounded_printable_and_caller_scoped() {
+    assert!(!crate::model::valid_reference_id(""));
+    assert!(crate::model::valid_reference_id(&"a".repeat(128)));
+    assert!(!crate::model::valid_reference_id(&"a".repeat(129)));
+    assert!(!crate::model::valid_reference_id("stream\nA"));
+
+    let (mut manager, calls) = setup(true);
+    manager.handle("alice", create_with_reference("stream-a"));
+    let unscoped_status = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: None,
+            reference_id: Some("stream-a".into()),
+        },
+    );
+    assert_eq!(unscoped_status["code"], "invalid_request");
+    let unauthorized_release = manager.handle(
+        "bob",
+        Operation::Remove {
+            identity: ID.into(),
+            reference_id: Some("stream-a".into()),
+        },
+    );
+    assert_eq!(unauthorized_release["removed"], true);
+    assert!(calls.borrow().removes.is_empty());
+    assert_eq!(manager.monitors.len(), 1);
 }
 #[test]
 fn readiness_and_feeding_track_exact_owned_lease() {
@@ -896,6 +1133,7 @@ fn only_owned_explicit_remove_retries_exhausted_exact_cleanup() {
         "alice",
         Operation::Remove {
             identity: ID.into(),
+            reference_id: None,
         },
     );
     for _ in 0..5 {
@@ -912,12 +1150,14 @@ fn only_owned_explicit_remove_retries_exhausted_exact_cleanup() {
         "bob",
         Operation::Remove {
             identity: ID.into(),
+            reference_id: None,
         },
     );
     manager.handle(
         "alice",
         Operation::Remove {
             identity: "00000000-0000-0000-0000-000000000002".into(),
+            reference_id: None,
         },
     );
     tick(&mut manager);
@@ -933,6 +1173,7 @@ fn only_owned_explicit_remove_retries_exhausted_exact_cleanup() {
         "alice",
         Operation::Remove {
             identity: ID.into(),
+            reference_id: None,
         },
     );
     tick(&mut manager);
@@ -975,14 +1216,26 @@ fn published_identity_loss_clears_stale_path_and_can_recover() {
 
     calls.borrow_mut().ready = false;
     tick(&mut manager);
-    let status = manager.handle("alice", Operation::Status { identity: None });
+    let status = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: None,
+            reference_id: None,
+        },
+    );
     assert_eq!(status["monitors"][0]["state"], "creating");
     assert!(status["monitors"][0]["ready"].is_null());
     assert!(calls.borrow().removes.is_empty());
 
     calls.borrow_mut().ready = true;
     tick(&mut manager);
-    let status = manager.handle("alice", Operation::Status { identity: None });
+    let status = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: None,
+            reference_id: None,
+        },
+    );
     assert_eq!(status["monitors"][0]["state"], "ready");
     assert_eq!(
         status["monitors"][0]["ready"]["device_path"],
@@ -1026,7 +1279,13 @@ fn departing_lease_revokes_readiness_and_stops_feeding_until_departure() {
     calls.borrow_mut().pending = true;
     manager.monitors.values_mut().next().unwrap().next_feed = Instant::now();
     tick(&mut manager);
-    let departing = manager.handle("alice", Operation::Status { identity: None });
+    let departing = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: None,
+            reference_id: None,
+        },
+    );
     assert_eq!(departing["monitors"][0]["state"], "removing");
     assert_eq!(departing["monitors"][0]["error"], "lease_departing");
     assert!(departing["monitors"][0]["ready"].is_null());
@@ -1051,7 +1310,13 @@ fn departing_lease_during_creation_does_not_wait_for_readiness_timeout() {
     calls.borrow_mut().pending = true;
     tick(&mut manager);
 
-    let departing = manager.handle("alice", Operation::Status { identity: None });
+    let departing = manager.handle(
+        "alice",
+        Operation::Status {
+            identity: None,
+            reference_id: None,
+        },
+    );
     assert_eq!(departing["monitors"][0]["state"], "removing");
     assert_eq!(departing["monitors"][0]["error"], "lease_departing");
     assert!(departing["monitors"][0]["ready"].is_null());
