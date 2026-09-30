@@ -283,6 +283,7 @@ namespace Amaterasu {
   export function renderSessions(context: PageContext): void {
     const area = el("div");
     const status = el("div");
+    const metricsArea = el("div");
     const historyRuntimeArea = el("div");
     const savedArea = el("div");
     const savedDetail = el("div");
@@ -299,6 +300,7 @@ namespace Amaterasu {
     let deleteControls: { button: HTMLButtonElement; ended: boolean }[] = [];
     const deleteNotice = el("p", "muted", historyDeleteReason);
     let selectedSavedSession: string | null = null;
+    const savedHistoryPanel = panel("Recorded stream sessions", savedArea, savedStatus, savedDetail);
     context.content.append(
       sectionHeading(
         "Sessions",
@@ -311,8 +313,9 @@ namespace Amaterasu {
       ),
       status,
       area,
+      panel("Live host metrics", metricsArea),
       panel("History runtime status", historyRuntimeArea),
-      panel("Recorded stream sessions", savedArea, savedStatus, savedDetail),
+      savedHistoryPanel,
     );
     function applyHistoryDeleteAvailability(): void {
       deleteNotice.textContent = historyDeleteReason;
@@ -557,6 +560,7 @@ namespace Amaterasu {
     void load();
     void loadHistoryRuntime();
     void loadSaved();
+    renderHostMetricsDashboard(context, metricsArea, savedHistoryPanel);
   }
 
   export function renderApplications(context: PageContext): void {

@@ -87,6 +87,17 @@ const SESSION_HISTORY: ComponentDefinition = ComponentDefinition {
     dependencies: &[RUNTIME_ID, "amaterasu.configuration"],
 };
 
+const HOST_METRICS: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.host-metrics",
+    library: "amaterasu_host_metrics",
+    provides: &["amaterasu.host-metrics/1"],
+    calls: &["amaterasu.configuration/1"],
+    publishes: &[],
+    native_provides: &[],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID, "amaterasu.configuration"],
+};
+
 const CONFIGURATION: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.configuration",
     library: "amaterasu_configuration",
@@ -472,6 +483,7 @@ const STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.capture-wgc/1",
         "amaterasu.encode/1",
         "amaterasu.session-history/1",
+        "amaterasu.host-metrics/1",
         "amaterasu.frame-limiter/1",
     ],
     publishes: &[],
@@ -490,6 +502,7 @@ const STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.display",
         "amaterasu.state",
         "amaterasu.session-history",
+        "amaterasu.host-metrics",
         "amaterasu.video",
         "amaterasu.audio",
         "amaterasu.audio-encode",
@@ -578,6 +591,7 @@ const STREAM_SESSION_PROBE: ComponentDefinition = ComponentDefinition {
         "amaterasu.display",
         "amaterasu.state",
         "amaterasu.session-history",
+        "amaterasu.host-metrics",
         "amaterasu.stream-source",
         "amaterasu.audio-encode",
         "amaterasu.media-transport",
@@ -595,6 +609,7 @@ const STREAM_SESSION_SOFTWARE_PROBE: ComponentDefinition = ComponentDefinition {
         "amaterasu.display",
         "amaterasu.state",
         "amaterasu.session-history",
+        "amaterasu.host-metrics",
         "amaterasu.video",
         "amaterasu.software-probe-audio",
         "amaterasu.audio-encode",
@@ -682,6 +697,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
         "amaterasu.session-history/1",
+        "amaterasu.host-metrics/1",
     ],
     publishes: &[],
     native_provides: &[],
@@ -711,6 +727,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.video",
         "amaterasu.nvhttp",
         "amaterasu.session-history",
+        "amaterasu.host-metrics",
     ],
 };
 
@@ -742,6 +759,7 @@ const MANAGEMENT_PROBE: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport",
         "amaterasu.control-transport",
         "amaterasu.session-history",
+        "amaterasu.host-metrics",
     ],
     ..MANAGEMENT
 };
@@ -774,6 +792,7 @@ const MANAGEMENT_SOFTWARE_PROBE: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport",
         "amaterasu.control-transport",
         "amaterasu.session-history",
+        "amaterasu.host-metrics",
     ],
     ..MANAGEMENT
 };
@@ -855,6 +874,7 @@ const LINUX_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.control-transport/1",
         "amaterasu.encode/1",
         "amaterasu.session-history/1",
+        "amaterasu.host-metrics/1",
         "amaterasu.frame-limiter/1",
     ],
     dependencies: &[
@@ -864,6 +884,7 @@ const LINUX_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.display",
         "amaterasu.state",
         "amaterasu.session-history",
+        "amaterasu.host-metrics",
         "amaterasu.linux-probe-video",
         "amaterasu.software-probe-audio",
         "amaterasu.audio-encode",
@@ -901,6 +922,7 @@ const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.video/1",
         "amaterasu.nvhttp/1",
         "amaterasu.rtsp/1",
+        "amaterasu.host-metrics/1",
         "amaterasu.video",
         "amaterasu.nvhttp",
         "amaterasu.rtsp",
@@ -935,6 +957,7 @@ const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport",
         "amaterasu.control-transport",
         "amaterasu.session-history",
+        "amaterasu.host-metrics",
     ],
     ..MANAGEMENT_SOFTWARE_PROBE
 };
@@ -975,6 +998,7 @@ impl PackageProfile {
                 NVHTTP,
                 SESSION,
                 SESSION_HISTORY,
+                HOST_METRICS,
                 STREAM_SOURCE,
                 INPUT_PROBE,
                 AUDIO_ENCODE,
@@ -1003,6 +1027,7 @@ impl PackageProfile {
                 NVHTTP,
                 SESSION,
                 SESSION_HISTORY,
+                HOST_METRICS,
                 CAPTURE_SOURCE,
                 SOFTWARE_AUDIO_SOURCE,
                 INPUT_PROBE,
@@ -1034,6 +1059,7 @@ impl PackageProfile {
                 LINUX_NVHTTP,
                 SESSION,
                 SESSION_HISTORY,
+                HOST_METRICS,
                 CAPTURE_PIPEWIRE,
                 SOFTWARE_AUDIO_SOURCE,
                 INPUT_PROBE,
@@ -1051,6 +1077,7 @@ impl PackageProfile {
                 STATE,
                 SESSION,
                 SESSION_HISTORY,
+                HOST_METRICS,
                 CONFIGURATION,
                 CATALOG,
                 APPLICATION,

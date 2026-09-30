@@ -21,6 +21,7 @@
     "src/csrf-policy.ts",
     "src/settings.ts",
     "src/locale.ts",
+    "src/host_metrics.ts",
     "src/pages.ts",
     "src/app.ts"
   ]

@@ -47,6 +47,7 @@ members = [
     "modules/control-transport",
     "modules/stream-session",
     "modules/session-history",
+    "modules/host-metrics",
     "modules/rtsp",
     "modules/upnp",
     "modules/encode",
