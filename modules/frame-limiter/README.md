@@ -97,6 +97,16 @@ limiter policy even when no Lossless Scaling FPS limit is supplied. Its RTSS
 sync type follows the generic frame-generation policy, which uses Front Edge
 Sync unless virtual-display policy selects Reflex.
 
+When the effective rate source is Lossless Scaling, the RTSS profile value is
+derived from half the target rate and rounded to the nearest whole FPS, with
+half-FPS ties rounded upward. This matches the reference's game-input cap for
+generated output. An explicit configured frame-limiter rate keeps precedence
+and is written exactly; all other rate sources also keep their exact
+millihertz ratio. The policy plan continues to report the resolved LS output
+target, while the RTSS lease records the derived game-input cap. Native RTSS
+apply and restore remain unavailable until the provider can perform safe
+conditional profile writes.
+
 ## Remaining integration and platform gates
 
 The lifecycle contract is implemented behind the fake-provider test seam, but

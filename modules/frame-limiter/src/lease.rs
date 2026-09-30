@@ -1,6 +1,6 @@
 //! Caller-owned RTSS leases and compare-before-restore lifecycle.
 use crate::{
-    FrameLimiterProvider, Platform, RtssFrameLimitType,
+    FrameLimitSource, FrameLimiterProvider, Platform, RtssFrameLimitType,
     service::{
         ApplyRequest, Operation, OperationResponse, Presence, ProviderAvailability, ResponseState,
         RestoreRequest, StatusRequest, build_response, evaluate_apply, handle_operation,
@@ -932,11 +932,16 @@ fn handle_apply<P: FrameLimitProvider>(
             return;
         }
     };
-    let (frame_limit, denominator) = exact_rtss_ratio(limit_millihz);
-    let desired_profile = ProfileValues {
-        frame_limit,
-        frame_limit_denominator: denominator,
-        sync_limiter: sync_limiter_value(decision.rtss_sync_limiter.value),
+    let desired_profile = match desired_rtss_profile(
+        decision.effective_limit.source,
+        limit_millihz,
+        decision.rtss_sync_limiter.value,
+    ) {
+        Ok(profile) => profile,
+        Err(code) => {
+            set_unavailable(response, code);
+            return;
+        }
     };
     match manager.apply(LeaseApplyRequest {
         owner: caller,
@@ -1197,6 +1202,36 @@ fn exact_rtss_ratio(millihz: u32) -> (i32, i32) {
     ((millihz / divisor) as i32, (1000 / divisor) as i32)
 }
 
+fn desired_rtss_profile(
+    source: FrameLimitSource,
+    effective_limit_millihz: u32,
+    sync_limiter: RtssFrameLimitType,
+) -> Result<ProfileValues, &'static str> {
+    let rtss_limit_millihz = if source == FrameLimitSource::LosslessScaling {
+        // The reference caps the game's generated-frame input at half the LS
+        // output target, rounding positive half-FPS ties away from zero.
+        let rounded_half_rate_fps = (u64::from(effective_limit_millihz) + 1_000) / 2_000;
+        let Some(limit) = rounded_half_rate_fps.checked_mul(1_000) else {
+            return Err("lossless_scaling_rtss_limit_out_of_range");
+        };
+        let Ok(limit) = u32::try_from(limit) else {
+            return Err("lossless_scaling_rtss_limit_out_of_range");
+        };
+        if limit == 0 {
+            return Err("lossless_scaling_limit_below_rtss_resolution");
+        }
+        limit
+    } else {
+        effective_limit_millihz
+    };
+    let (frame_limit, frame_limit_denominator) = exact_rtss_ratio(rtss_limit_millihz);
+    Ok(ProfileValues {
+        frame_limit,
+        frame_limit_denominator,
+        sync_limiter: sync_limiter_value(sync_limiter),
+    })
+}
+
 fn gcd(mut left: u32, mut right: u32) -> u32 {
     while right != 0 {
         let remainder = left % right;
@@ -1373,6 +1408,66 @@ mod tests {
         frame_limit_denominator: 1_000,
         sync_limiter: 2,
     };
+
+    #[test]
+    fn lossless_scaling_rtss_limit_uses_rounded_half_rate() {
+        let profile = desired_rtss_profile(
+            FrameLimitSource::LosslessScaling,
+            60_000,
+            RtssFrameLimitType::Async,
+        )
+        .unwrap();
+        assert_eq!(profile.frame_limit, 30);
+        assert_eq!(profile.frame_limit_denominator, 1);
+
+        let odd_rate = desired_rtss_profile(
+            FrameLimitSource::LosslessScaling,
+            61_000,
+            RtssFrameLimitType::Async,
+        )
+        .unwrap();
+        assert_eq!(odd_rate.frame_limit, 31);
+        assert_eq!(odd_rate.frame_limit_denominator, 1);
+
+        let fractional_rate = desired_rtss_profile(
+            FrameLimitSource::LosslessScaling,
+            60_500,
+            RtssFrameLimitType::Async,
+        )
+        .unwrap();
+        assert_eq!(fractional_rate.frame_limit, 30);
+        assert_eq!(fractional_rate.frame_limit_denominator, 1);
+    }
+
+    #[test]
+    fn non_lossless_rates_are_exact_and_sub_resolution_lossless_rates_are_rejected() {
+        let configured = desired_rtss_profile(
+            FrameLimitSource::Configured,
+            59_500,
+            RtssFrameLimitType::BackEdgeSync,
+        )
+        .unwrap();
+        assert_eq!(configured.frame_limit, 119);
+        assert_eq!(configured.frame_limit_denominator, 2);
+        assert_eq!(configured.sync_limiter, 2);
+
+        assert_eq!(
+            desired_rtss_profile(
+                FrameLimitSource::LosslessScaling,
+                500,
+                RtssFrameLimitType::Async,
+            ),
+            Err("lossless_scaling_limit_below_rtss_resolution")
+        );
+        let one_fps_target = desired_rtss_profile(
+            FrameLimitSource::LosslessScaling,
+            1_000,
+            RtssFrameLimitType::Async,
+        )
+        .unwrap();
+        assert_eq!(one_fps_target.frame_limit, 1);
+        assert_eq!(one_fps_target.frame_limit_denominator, 1);
+    }
 
     #[derive(Clone)]
     struct FakeProvider {
@@ -1572,6 +1667,39 @@ mod tests {
             manager.preflight_apply("caller.a", "session-1", "same-request"),
             ApplyPreflight::AlreadyApplied(_)
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lossless_scaling_apply_records_half_rate_and_restores_through_fake_provider() {
+        let mut manager = LeaseManager::in_memory(FakeProvider::new());
+        let mut request = runtime_apply_request();
+        request["settings"]["frame_limiter_enable"] = serde_json::json!(false);
+        request["settings"]["frame_limiter_fps_limit_millihz"] = serde_json::json!(0);
+        request["requested_stream_fps_millihz"] = serde_json::json!(61_000);
+        request["lossless_scaling_limit_millihz"] = serde_json::json!(61_000);
+        request["game_frame_generation_mode"] = serde_json::json!("lossless-scaling");
+
+        let applied = handle_runtime_operation("caller.a", request, &mut manager);
+        assert_eq!(applied["state"], "applied");
+        assert_eq!(applied["plan"]["effective_limit_millihz"], 61_000);
+        assert_eq!(manager.records()[0].applied.profile.frame_limit, 31);
+        assert_eq!(
+            manager.records()[0].applied.profile.frame_limit_denominator,
+            1
+        );
+
+        let restored = handle_runtime_operation(
+            "caller.a",
+            serde_json::json!({
+                "action": "restore",
+                "version": crate::CONTRACT_VERSION,
+                "lease": applied["lease"]
+            }),
+            &mut manager,
+        );
+        assert_eq!(restored["state"], "restored");
+        assert_eq!(manager.provider.profiles["game.exe"], START);
     }
 
     #[test]
