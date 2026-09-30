@@ -463,6 +463,9 @@ impl CaptureMode {
 pub enum CaptureProvider {
     Dxgi,
     Wgc,
+    /// An explicitly selected current-user portal source.
+    #[serde(rename = "pipewire")]
+    PipeWire,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

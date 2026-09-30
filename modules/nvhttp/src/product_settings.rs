@@ -814,6 +814,7 @@ impl ProductSettings {
             match provider {
                 crate::launch::CaptureProvider::Dxgi => "dxgi",
                 crate::launch::CaptureProvider::Wgc => "wgc",
+                crate::launch::CaptureProvider::PipeWire => "pipewire",
             }
         })
     }

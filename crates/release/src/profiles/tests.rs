@@ -10,6 +10,7 @@ fn every_profile_contains_unique_providers_and_all_dependencies() {
         PackageProfile::MediaProbe,
         PackageProfile::StreamProbe,
         PackageProfile::SoftwareProbe,
+        PackageProfile::LinuxProbe,
     ] {
         let components = profile.components();
         let ids: BTreeSet<_> = components.iter().map(|component| component.id).collect();
@@ -1323,5 +1324,77 @@ fn public_launch_packages_preserve_transitive_delegation_and_identity_only_nativ
             );
         }
         assert_eq!(adapter.native_uses, &["amaterasu.identity/1"]);
+    }
+}
+
+#[test]
+fn linux_probe_scopes_portal_capture_to_an_explicit_composition() {
+    let components = PackageProfile::LinuxProbe.components();
+    assert!(
+        components
+            .iter()
+            .any(|component| component.id == CAPTURE_PIPEWIRE.id)
+    );
+    assert!(
+        components
+            .iter()
+            .any(|component| component.id == LINUX_VIDEO.id && component.library == VIDEO.library)
+    );
+    assert!(
+        components
+            .iter()
+            .any(|component| component.id == ENCODE.id && component.library == ENCODE.library)
+    );
+    assert!(!components.iter().any(|component| {
+        [CAPTURE_SOURCE.id, CAPTURE_DXGI.id, CAPTURE_WGC.id, VIDEO.id].contains(&component.id)
+    }));
+    assert_eq!(
+        LINUX_VIDEO.native_uses,
+        &["amaterasu.capture-pipewire/1", "amaterasu.encode/1"]
+    );
+    assert!(LINUX_STREAM_SESSION.dependencies.contains(&LINUX_VIDEO.id));
+    for component in [LINUX_NVHTTP, LINUX_RTSP, LINUX_STREAM_SESSION] {
+        assert!(!component.calls.contains(&"amaterasu.capture-pipewire/1"));
+        assert!(!component.calls.contains(&"amaterasu.capture-dxgi/1"));
+        assert!(!component.calls.contains(&"amaterasu.capture-wgc/1"));
+    }
+    assert!(LINUX_VIDEO.calls.contains(&"amaterasu.capture-pipewire/1"));
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-linux-probe-profile-{}",
+        std::process::id()
+    ));
+    let development = development_policy(&root).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(development.settings[CAPTURE_PIPEWIRE.id]["enabled"], false);
+    assert_eq!(
+        development.settings[CAPTURE_PIPEWIRE.id]["selection_principals"],
+        json!([])
+    );
+    assert_eq!(
+        development.settings[CAPTURE_PIPEWIRE.id]["capture_principals"],
+        json!([])
+    );
+    assert_eq!(
+        development.principals[VIDEO.id].native_use,
+        VIDEO.grants().native_use
+    );
+    for component in [NVHTTP, RTSP, STREAM_SESSION] {
+        assert!(
+            !development.principals[component.id]
+                .call
+                .contains("amaterasu.capture-pipewire/1")
+        );
+    }
+    let installer = installer_policy("web", BTreeMap::new());
+    assert!(!installer.principals.contains_key(CAPTURE_PIPEWIRE.id));
+    assert!(!installer.principals.contains_key(LINUX_VIDEO.id));
+    assert!(!installer.settings.contains_key(CAPTURE_PIPEWIRE.id));
+    for component in PackageProfile::Platform.components() {
+        assert!(!component.calls.contains(&"amaterasu.capture-pipewire/1"));
+        assert!(
+            !component
+                .native_uses
+                .contains(&"amaterasu.capture-pipewire/1")
+        );
     }
 }

@@ -15,6 +15,8 @@ pub enum PackageProfile {
     StreamProbe,
     /// Test-only controlled NV12 capture with the real video and encoder modules.
     SoftwareProbe,
+    /// Explicit Linux portal capture with real video/encoder and test-only audio.
+    LinuxProbe,
 }
 
 #[derive(Clone, Copy)]
@@ -607,6 +609,7 @@ const MEDIA_PROBE: ComponentDefinition = ComponentDefinition {
     library: "amaterasu_media_probe",
     provides: &["test.media-probe/1"],
     calls: &[
+        "amaterasu.capture-pipewire/1",
         "amaterasu.capture-dxgi/1",
         "amaterasu.capture-wgc/1",
         "amaterasu.audio-encode/1",
@@ -618,6 +621,7 @@ const MEDIA_PROBE: ComponentDefinition = ComponentDefinition {
     publishes: &[],
     native_provides: &[],
     native_uses: &[
+        "amaterasu.capture-pipewire/1",
         "amaterasu.capture-dxgi/1",
         "amaterasu.capture-wgc/1",
         "amaterasu.audio/1",
@@ -629,6 +633,7 @@ const MEDIA_PROBE: ComponentDefinition = ComponentDefinition {
     ],
     dependencies: &[
         RUNTIME_ID,
+        "amaterasu.capture-pipewire",
         "amaterasu.capture-dxgi",
         "amaterasu.capture-wgc",
         "amaterasu.audio",
@@ -772,12 +777,141 @@ const MANAGEMENT_SOFTWARE_PROBE: ComponentDefinition = ComponentDefinition {
     ..MANAGEMENT
 };
 
+// Linux capture is an explicit qualification composition. It never substitutes
+// for Windows providers or adds capture permissions to the installer policy.
+const CAPTURE_PIPEWIRE: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.capture-pipewire",
+    library: "amaterasu_capture_pipewire",
+    provides: &["amaterasu.capture-pipewire/1"],
+    calls: &[],
+    publishes: &[],
+    native_provides: &["amaterasu.capture-pipewire/1"],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
+};
+
+const LINUX_VIDEO: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.linux-probe-video",
+    calls: &["amaterasu.capture-pipewire/1", "amaterasu.encode/1"],
+    native_uses: &["amaterasu.capture-pipewire/1", "amaterasu.encode/1"],
+    dependencies: &[RUNTIME_ID, "amaterasu.capture-pipewire", "amaterasu.encode"],
+    ..VIDEO
+};
+
+const LINUX_NVHTTP: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.configuration/1",
+        "amaterasu.input/1",
+        "amaterasu.pairing/1",
+        "amaterasu.state/1",
+        "amaterasu.catalog/1",
+        "amaterasu.launch/1",
+        "amaterasu.display/1",
+        "amaterasu.playnite/1",
+        "amaterasu.lutris/1",
+        "amaterasu.application/1",
+        "amaterasu.rtsp/1",
+        "amaterasu.stream-session/1",
+        "amaterasu.session/1",
+        "amaterasu.video/1",
+        "amaterasu.audio/1",
+        "amaterasu.audio-encode/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
+        "amaterasu.encode/1",
+    ],
+    ..NVHTTP
+};
+
+const LINUX_RTSP: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.input/1",
+        "amaterasu.stream-session/1",
+        "amaterasu.session/1",
+        "amaterasu.display/1",
+        "amaterasu.state/1",
+        "amaterasu.launch/1",
+        "amaterasu.video/1",
+        "amaterasu.audio/1",
+        "amaterasu.audio-encode/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
+        "amaterasu.encode/1",
+    ],
+    ..RTSP
+};
+
+const LINUX_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.input/1",
+        "amaterasu.session/1",
+        "amaterasu.display/1",
+        "amaterasu.state/1",
+        "amaterasu.video/1",
+        "amaterasu.audio/1",
+        "amaterasu.audio-encode/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
+        "amaterasu.encode/1",
+        "amaterasu.session-history/1",
+        "amaterasu.frame-limiter/1",
+    ],
+    dependencies: &[
+        "amaterasu.input-probe",
+        RUNTIME_ID,
+        "amaterasu.session",
+        "amaterasu.display",
+        "amaterasu.state",
+        "amaterasu.session-history",
+        "amaterasu.linux-probe-video",
+        "amaterasu.software-probe-audio",
+        "amaterasu.audio-encode",
+        "amaterasu.media-transport",
+        "amaterasu.control-transport",
+        "amaterasu.frame-limiter",
+    ],
+    ..STREAM_SESSION_SOFTWARE_PROBE
+};
+
+const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.authentication",
+        "amaterasu.state",
+        "amaterasu.catalog",
+        "amaterasu.configuration",
+        "amaterasu.session",
+        "amaterasu.application",
+        "amaterasu.input-probe",
+        "amaterasu.steam",
+        "amaterasu.playnite",
+        "amaterasu.lutris",
+        "amaterasu.diagnostics",
+        "amaterasu.host-configuration",
+        "amaterasu.pairing",
+        "amaterasu.display",
+        "amaterasu.launch",
+        "amaterasu.capture-pipewire",
+        "amaterasu.software-probe-audio",
+        "amaterasu.audio-encode",
+        "amaterasu.encode",
+        "amaterasu.linux-probe-video",
+        "amaterasu.nvhttp",
+        "amaterasu.rtsp",
+        "amaterasu.media-transport",
+        "amaterasu.control-transport",
+        "amaterasu.session-history",
+    ],
+    ..MANAGEMENT_SOFTWARE_PROBE
+};
+
 impl PackageProfile {
     pub fn components(self) -> &'static [ComponentDefinition] {
         match self {
             Self::Example => &[RUNTIME, EXAMPLE],
             Self::MediaProbe => &[
                 RUNTIME,
+                CAPTURE_PIPEWIRE,
                 CAPTURE_DXGI,
                 CAPTURE_WGC,
                 AUDIO,
@@ -847,6 +981,37 @@ impl PackageProfile {
                 STREAM_SESSION_SOFTWARE_PROBE,
                 RTSP,
             ],
+            Self::LinuxProbe => &[
+                RUNTIME,
+                STATE,
+                CONFIGURATION,
+                CATALOG,
+                APPLICATION,
+                HOST_CONFIGURATION,
+                DIAGNOSTICS,
+                STEAM,
+                PLAYNITE,
+                LUTRIS,
+                LAUNCH,
+                DISPLAY,
+                AUTHENTICATION,
+                LINUX_MANAGEMENT,
+                PAIRING,
+                LINUX_NVHTTP,
+                SESSION,
+                SESSION_HISTORY,
+                CAPTURE_PIPEWIRE,
+                SOFTWARE_AUDIO_SOURCE,
+                INPUT_PROBE,
+                AUDIO_ENCODE,
+                ENCODE,
+                LINUX_VIDEO,
+                MEDIA_TRANSPORT,
+                CONTROL_TRANSPORT,
+                FRAME_LIMITER,
+                LINUX_STREAM_SESSION,
+                LINUX_RTSP,
+            ],
             Self::Platform => &[
                 RUNTIME,
                 STATE,
@@ -908,6 +1073,7 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
         .components()
         .iter()
         .chain(PackageProfile::SoftwareProbe.components())
+        .chain(PackageProfile::LinuxProbe.components())
         .chain(PackageProfile::Platform.components())
         .chain(PackageProfile::MediaProbe.components())
         .chain(PackageProfile::StreamProbe.components())
@@ -946,6 +1112,18 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             json!({"enabled":false,"allow_remote":false,"allowed_principals":[]}),
         ),
         ("amaterasu.video".into(), json!({"enabled": false})),
+        (
+            "amaterasu.linux-probe-video".into(),
+            json!({"enabled": false}),
+        ),
+        (
+            "amaterasu.capture-pipewire".into(),
+            json!({
+                "enabled": false,
+                "selection_principals": [],
+                "capture_principals": []
+            }),
+        ),
         (
             "amaterasu.control-transport".into(),
             json!({"enabled": false, "allow_remote": false, "allowed_principals": []}),

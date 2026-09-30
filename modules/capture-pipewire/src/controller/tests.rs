@@ -1,0 +1,418 @@
+use super::*;
+use crate::model::Availability;
+use crate::test_support::{Driver, FakeBackend, settings, setup};
+use std::sync::atomic::Ordering;
+
+fn select(
+    controller: &mut Controller<FakeBackend>,
+    owner: &str,
+    operation: &str,
+    now: u64,
+) -> CaptureResult<Reply> {
+    controller.handle(
+        owner,
+        Operation::SelectSource {
+            source_type: SourceType::Monitor,
+            operation_id: operation.into(),
+        },
+        now,
+    )
+}
+pub fn ready(controller: &mut Controller<FakeBackend>, driver: &Driver) -> String {
+    select(controller, "administrator", "selection", 0).unwrap();
+    driver.frame(100, 1000);
+    *driver.state.lock().unwrap() = SourceState::Ready {
+        node: 42,
+        width: 2,
+        height: 2,
+    };
+    controller.refresh(10);
+    controller
+        .handle(
+            "amaterasu.video",
+            Operation::Enumerate {
+                offset: None,
+                limit: None,
+            },
+            10,
+        )
+        .unwrap()
+        .payload["outputs"][0]["id"]
+        .as_str()
+        .unwrap()
+        .into()
+}
+pub fn open(
+    controller: &mut Controller<FakeBackend>,
+    output: &str,
+    caller: &str,
+    operation: &str,
+) -> Reply {
+    controller
+        .handle(
+            caller,
+            Operation::Open {
+                output: output.into(),
+                operation_id: Some(operation.into()),
+                constant_rate: None,
+            },
+            11,
+        )
+        .unwrap()
+}
+
+#[test]
+fn unsupported_constant_rate_does_not_allocate_or_replay_a_lease() {
+    let (mut controller, driver) = setup(settings());
+    let output = ready(&mut controller, &driver);
+    let unsupported = || Operation::Open {
+        output: output.clone(),
+        operation_id: Some("video-1".into()),
+        constant_rate: Some(true),
+    };
+    assert!(matches!(
+        controller.handle("amaterasu.video", unsupported(), 11),
+        Err("unsupported_constant_rate")
+    ));
+    assert!(controller.lease.is_none());
+    assert_eq!(controller.opened, 0);
+    open(&mut controller, &output, "amaterasu.video", "video-1");
+    assert!(matches!(
+        controller.handle("amaterasu.video", unsupported(), 12),
+        Err("unsupported_constant_rate")
+    ));
+    assert_eq!(controller.opened, 1);
+}
+
+#[test]
+fn disabled_or_unallowlisted_selection_and_open_never_touch_the_driver() {
+    let (mut controller, driver) = setup(Settings::default());
+    assert!(matches!(
+        select(&mut controller, "administrator", "selection", 0),
+        Err("capture_disabled")
+    ));
+    assert!(matches!(
+        controller.handle(
+            "amaterasu.video",
+            Operation::Open {
+                output: "guessed".into(),
+                operation_id: None,
+                constant_rate: None
+            },
+            0
+        ),
+        Err("capture_disabled")
+    ));
+    controller.settings.enabled = true;
+    controller
+        .settings
+        .capture_principals
+        .insert("amaterasu.video".into());
+    assert!(matches!(
+        select(&mut controller, "administrator", "selection", 0),
+        Err("selection_permission_denied")
+    ));
+    assert!(matches!(
+        controller.handle(
+            "amaterasu.video",
+            Operation::Open {
+                output: "guessed".into(),
+                operation_id: None,
+                constant_rate: None
+            },
+            0
+        ),
+        Err("source_selection_required")
+    ));
+    let status = controller
+        .handle("administrator", Operation::Status, 0)
+        .unwrap()
+        .payload;
+    assert_eq!(status["selection_state"], "permission_required");
+    assert_eq!(status["availability"]["source_types"], 3);
+    assert_eq!(driver.selections.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn enumeration_is_empty_until_actual_ready_and_geometry_is_not_invented() {
+    let (mut controller, driver) = setup(settings());
+    let initial = controller
+        .handle(
+            "amaterasu.video",
+            Operation::Enumerate {
+                offset: None,
+                limit: None,
+            },
+            0,
+        )
+        .unwrap()
+        .payload;
+    assert_eq!(initial["outputs"], json!([]));
+    assert_eq!(initial["selection_choices"], json!(["monitor", "window"]));
+    let output = ready(&mut controller, &driver);
+    let page = controller
+        .handle(
+            "amaterasu.video",
+            Operation::Enumerate {
+                offset: None,
+                limit: Some(1),
+            },
+            15,
+        )
+        .unwrap()
+        .payload;
+    assert_eq!(page["outputs"][0]["id"], output);
+    assert_eq!(page["outputs"][0]["width"], 2);
+    assert!(page["outputs"][0]["desktop_geometry"].is_null());
+    assert_eq!(page["outputs"][0]["geometry_supported"], false);
+}
+
+#[test]
+fn capture_principals_are_explicit_and_status_does_not_leak_selection_operation_ids() {
+    let (mut controller, driver) = setup(settings());
+    let output = ready(&mut controller, &driver);
+
+    let denied_enumeration = controller.handle(
+        "other",
+        Operation::Enumerate {
+            offset: None,
+            limit: None,
+        },
+        11,
+    );
+    assert!(matches!(
+        denied_enumeration,
+        Err("capture_permission_denied")
+    ));
+    let denied_open = controller.handle(
+        "other",
+        Operation::Open {
+            output: output.clone(),
+            operation_id: Some("other-open".into()),
+            constant_rate: None,
+        },
+        11,
+    );
+    assert!(matches!(denied_open, Err("capture_permission_denied")));
+    assert!(controller.lease.is_none());
+
+    let selection_owner = controller
+        .handle("administrator", Operation::Status, 11)
+        .unwrap()
+        .payload;
+    assert_eq!(selection_owner["selection"]["operation_id"], "selection");
+    let capture_principal = controller
+        .handle("amaterasu.video", Operation::Status, 11)
+        .unwrap()
+        .payload;
+    assert!(capture_principal["selection"]["operation_id"].is_null());
+    assert_eq!(capture_principal["selection"]["output"]["id"], output);
+    let unrelated = controller
+        .handle("other", Operation::Status, 11)
+        .unwrap()
+        .payload;
+    assert!(unrelated["selection"].is_null());
+}
+
+#[test]
+fn selection_operations_are_owner_scoped_replayed_without_picker_and_cancelled_once() {
+    let (mut controller, driver) = setup(settings());
+    let first = select(&mut controller, "administrator", "selection", 0).unwrap();
+    assert!(matches!(first.created, Some(Created::Selection)));
+    assert!(
+        select(&mut controller, "administrator", "selection", 1)
+            .unwrap()
+            .created
+            .is_none()
+    );
+    assert!(matches!(
+        controller.handle(
+            "administrator",
+            Operation::SelectSource {
+                source_type: SourceType::Window,
+                operation_id: "selection".into()
+            },
+            1
+        ),
+        Err("operation_conflict")
+    ));
+    assert!(matches!(
+        controller.handle(
+            "other",
+            Operation::PollSelection {
+                operation_id: "selection".into()
+            },
+            1
+        ),
+        Err("selection_not_found")
+    ));
+    assert!(matches!(
+        controller.handle(
+            "other",
+            Operation::CancelSelection {
+                operation_id: "selection".into()
+            },
+            1
+        ),
+        Err("selection_not_found")
+    ));
+    controller
+        .handle(
+            "administrator",
+            Operation::CancelSelection {
+                operation_id: "selection".into(),
+            },
+            2,
+        )
+        .unwrap();
+    controller
+        .handle(
+            "administrator",
+            Operation::CancelSelection {
+                operation_id: "selection".into(),
+            },
+            3,
+        )
+        .unwrap();
+    assert_eq!(driver.selections.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+    assert!(
+        select(&mut controller, "administrator", "selection", 4)
+            .unwrap()
+            .created
+            .is_none()
+    );
+}
+
+#[test]
+fn owned_lease_open_lookup_retry_close_and_failed_completion_cleanup() {
+    let (mut controller, driver) = setup(settings());
+    let output = ready(&mut controller, &driver);
+    let first = open(&mut controller, &output, "amaterasu.video", "open");
+    let id = first.payload["stream"].as_u64().unwrap();
+    assert_eq!(
+        open(&mut controller, &output, "amaterasu.video", "open").payload,
+        first.payload
+    );
+    assert!(
+        open(&mut controller, &output, "amaterasu.video", "open")
+            .created
+            .is_none()
+    );
+    assert!(controller.reader("other", id).is_err());
+    assert!(matches!(
+        controller.handle(
+            "other",
+            Operation::Lookup {
+                operation_id: "open".into()
+            },
+            12
+        ),
+        Err("not_found")
+    ));
+    assert!(matches!(
+        controller.handle("other", Operation::Close { stream: id }, 12),
+        Err("not_found")
+    ));
+    controller.rollback("amaterasu.video", None);
+    assert!(controller.reader("amaterasu.video", id).is_ok());
+    controller.rollback("amaterasu.video", first.created);
+    controller.close("amaterasu.video", id).unwrap();
+    assert!(controller.close("other", id).is_err());
+    assert!(controller.reader("amaterasu.video", id).is_err());
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        controller
+            .handle("administrator", Operation::Status, 20)
+            .unwrap()
+            .payload["selection_state"],
+        "permission_required"
+    );
+}
+
+#[test]
+fn idle_selection_expires_without_status_extending_its_deadline_and_shutdown_cancels_pending() {
+    let (mut controller, driver) = setup(settings());
+    ready(&mut controller, &driver);
+    controller
+        .handle("administrator", Operation::Status, 2009)
+        .unwrap();
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 0);
+    controller.refresh(2010);
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+    select(&mut controller, "administrator", "new-selection", 2020).unwrap();
+    controller.shutdown();
+    controller.shutdown();
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 2);
+    assert!(controller.selection.is_none());
+}
+
+#[test]
+fn deny_revoke_and_timeout_release_sessions_and_active_leases() {
+    for state in [
+        SourceState::Denied,
+        SourceState::Failed("native_failure"),
+        SourceState::Revoked,
+    ] {
+        let (mut controller, driver) = setup(settings());
+        let output = ready(&mut controller, &driver);
+        let id = open(&mut controller, &output, "amaterasu.video", "open").payload["stream"]
+            .as_u64()
+            .unwrap();
+        *driver.state.lock().unwrap() = state;
+        controller.refresh(50);
+        assert!(controller.reader("amaterasu.video", id).is_err());
+        assert!(controller.selection.is_none());
+        assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+    }
+    let (mut controller, driver) = setup(settings());
+    select(&mut controller, "administrator", "selection", 0).unwrap();
+    controller.refresh(5000);
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+    let result = controller
+        .handle(
+            "administrator",
+            Operation::PollSelection {
+                operation_id: "selection".into(),
+            },
+            5001,
+        )
+        .unwrap()
+        .payload;
+    assert_eq!(result["error"], "source_selection_timeout");
+}
+
+#[test]
+fn settings_and_selection_bounds_fail_before_native_allocation() {
+    assert!(Settings::default().validate().is_ok());
+    let mut policy = settings();
+    policy.selection_timeout_seconds = 301;
+    assert_eq!(policy.validate(), Err("invalid_settings"));
+    let (mut controller, driver) = setup(settings());
+    controller.backend.availability = Availability::unsupported("system_dependencies_unavailable");
+    assert!(matches!(
+        select(&mut controller, "administrator", "selection", 0),
+        Err("system_dependencies_unavailable")
+    ));
+    assert_eq!(driver.selections.load(Ordering::SeqCst), 0);
+    assert!(serde_json::from_value::<Operation>(json!({"action":"select_source","source_type":"monitor","operation_id":"one","caller":"administrator"})).is_err());
+    for index in 0..MAX_SELECTIONS {
+        controller.backend.availability.available = true;
+        controller.backend.availability.source_types = 3;
+        let operation = format!("selection-{index}");
+        select(&mut controller, "administrator", &operation, 0).unwrap();
+        controller
+            .handle(
+                "administrator",
+                Operation::CancelSelection {
+                    operation_id: operation,
+                },
+                0,
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        select(&mut controller, "administrator", "too-many", 0),
+        Err("resource_exhausted")
+    ));
+}

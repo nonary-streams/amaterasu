@@ -2382,6 +2382,12 @@ fn global_capture_modes_reach_rtsp_open_and_are_snapshotted_at_admission() {
             false,
         ),
         (
+            CaptureMode::Auto,
+            CaptureProvider::PipeWire,
+            CaptureProvider::PipeWire,
+            false,
+        ),
+        (
             CaptureMode::Ddx,
             CaptureProvider::Wgc,
             CaptureProvider::Dxgi,
@@ -3240,6 +3246,23 @@ fn paired_client_display_policy_overrides_application_fields_without_global_defa
             .get("display_request")
             .is_none()
     );
+}
+
+#[test]
+fn pipewire_display_topology_mapping_stays_explicitly_unsupported() {
+    let now = Instant::now();
+    let mut streaming = config();
+    streaming.capture.capture_provider = CaptureProvider::PipeWire;
+    streaming.capture.output = "portal-session-source".into();
+    let mut controller = Controller::new(Some(streaming)).unwrap();
+    controller.set_global_display_policy(9, json!({"dd_configuration_option":"verify_only"}));
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_ne!(reply.status, 200);
+    assert_eq!(controller.records.values().next().unwrap().failure, Some("capture_display_mapping_unsupported"));
+    assert!(!broker.commands.iter().any(|command| matches!(command,
+        Command::Request { service, .. } if service == "amaterasu.display/1")));
 }
 
 #[test]

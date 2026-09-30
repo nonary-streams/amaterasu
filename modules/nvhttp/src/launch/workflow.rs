@@ -462,13 +462,10 @@ impl Controller {
                             | "ensure_active"
                             | "ensure_primary"
                             | "ensure_only_display",
-                        ) => {
-                            if capture_source(record).is_ok() {
-                                record.stage = Stage::SnapshotDisplay;
-                            } else {
-                                fail_record(record, "invalid_capture_output", now);
-                            }
-                        }
+                        ) => match capture_source(record) {
+                            Ok(_) => record.stage = Stage::SnapshotDisplay,
+                            Err(code) => fail_record(record, code, now),
+                        },
                         None | Some("disabled") => record.stage = Stage::LaunchApplication,
                         Some(_) => fail_record(record, "display_mutation_unavailable", now),
                     }
@@ -1229,6 +1226,8 @@ fn capture_source(record: &Record) -> Result<&str, &'static str> {
     let output = record.capture_output.as_str();
     let source = match record.capture_provider {
         super::CaptureProvider::Wgc => output,
+        // Portal source IDs cannot identify physical Windows display topology.
+        super::CaptureProvider::PipeWire => return Err("capture_display_mapping_unsupported"),
         super::CaptureProvider::Dxgi => {
             let (luid, source) = output.split_once('/').ok_or("invalid_capture_output")?;
             let Some((high, low)) = luid.split_once(':') else {

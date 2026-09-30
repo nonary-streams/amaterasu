@@ -663,6 +663,9 @@ pub enum CaptureProvider {
     #[default]
     Dxgi,
     Wgc,
+    /// An explicitly selected current-user portal source.
+    #[serde(rename = "pipewire")]
+    PipeWire,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -956,6 +959,21 @@ mod tests {
     fn start_json() -> Value {
         json!({"output":"display-1","encoder":0,"audio_endpoint":"default",
             "configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}})
+    }
+
+    #[test]
+    fn selected_pipewire_source_is_valid_without_windows_capture_flags() {
+        let mut request = start_json();
+        request["capture_provider"] = json!("pipewire");
+        request["output"] = json!("portal-selected-session-source");
+        let mut start: StartConfig = serde_json::from_value(request).unwrap();
+        assert!(start.validate(false).is_ok());
+        assert_eq!(
+            serde_json::to_value(&start).unwrap()["capture_provider"],
+            "pipewire"
+        );
+        start.constant_rate = true;
+        assert_eq!(start.validate(false), Err("constant_rate_requires_wgc"));
     }
 
     #[test]

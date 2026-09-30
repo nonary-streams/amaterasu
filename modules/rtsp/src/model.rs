@@ -293,6 +293,9 @@ pub struct Capture {
 pub enum CaptureProvider {
     Dxgi,
     Wgc,
+    /// An explicitly selected current-user portal source.
+    #[serde(rename = "pipewire")]
+    PipeWire,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -2719,6 +2722,20 @@ mod tests {
         let request: Open = serde_json::from_value(value).unwrap();
 
         assert_eq!(request.validate(false), Err("invalid_max_bitrate"));
+    }
+
+    #[test]
+    fn selected_pipewire_source_reaches_session_without_windows_capture_flags() {
+        let mut request = open();
+        request.capture.capture_provider = CaptureProvider::PipeWire;
+        request.capture.output = "portal-selected-session-source".into();
+        assert!(request.validate(false).is_ok());
+        let configuration = &request.arm(41)["configuration"];
+        assert_eq!(configuration["capture_provider"], "pipewire");
+        assert_eq!(configuration["output"], "portal-selected-session-source");
+        assert_eq!(configuration["constant_rate"], false);
+        request.capture.constant_rate = true;
+        assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
     }
 
     #[test]

@@ -40,6 +40,7 @@ members = [
     "modules/virtual-display",
     "modules/capture-dxgi",
     "modules/capture-wgc",
+    "modules/capture-pipewire",
     "modules/audio",
     "modules/audio-encode",
     "modules/media-transport",

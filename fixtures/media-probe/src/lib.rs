@@ -2,6 +2,7 @@
 mod control;
 mod hardware;
 mod opus;
+mod pipewire;
 mod transport;
 
 use amaterasu_media::{
@@ -17,6 +18,7 @@ struct Probe {
     opus: Option<opus::OpusProbe>,
     control: Option<control::ControlProbe>,
     hardware: Option<hardware::HardwareVideoProbe>,
+    pipewire: Option<pipewire::CaptureProbe>,
     transport: Option<transport::TransportProbe>,
 }
 
@@ -30,6 +32,7 @@ impl ManagedModule for Probe {
             opus: None,
             control: None,
             hardware: None,
+            pipewire: None,
             transport: None,
         })
     }
@@ -43,6 +46,12 @@ impl ManagedModule for Probe {
         if let Some(probe) = &mut self.hardware {
             if probe.tick(&self.runtime)? {
                 self.hardware = None;
+            }
+            return Ok(());
+        }
+        if let Some(probe) = &mut self.pipewire {
+            if probe.tick(&self.runtime)? {
+                self.pipewire = None;
             }
             return Ok(());
         }
@@ -87,6 +96,15 @@ impl ManagedModule for Probe {
                         &self.runtime,
                         id,
                         payload,
+                    )?);
+                    return Ok(());
+                }
+                if payload["action"] == "pipewire_capture" {
+                    let source_type = payload["source_type"].as_str().unwrap_or("monitor");
+                    self.pipewire = Some(pipewire::CaptureProbe::start(
+                        &self.runtime,
+                        id,
+                        source_type,
                     )?);
                     return Ok(());
                 }
