@@ -292,11 +292,16 @@ An opt-in Linux test in a private user/network namespace now checks real
 PC/LAN/WAN socket peers, certificate trust and IP identity, restart persistence,
 PC-only health and disconnect on policy narrowing. Physical LAN/WAN reachability
 and installed service/TLS provisioning remain gates.
-Vibeshine also maps its
-configuration UI port through UPnP only in WAN mode when UPnP is enabled;
-Amaterasu has no UPnP mapping. The pinned implementation is in `src/config.cpp`,
+Vibeshine also maps its configuration UI port through UPnP only in WAN mode
+when UPnP is enabled. Amaterasu now derives its owned IPv4 mappings and IPv6
+firewall pinholes from actual listeners, including management HTTPS only when
+the management exposure policy permits WAN access. Discovery, renewal, bounded
+cleanup retries, and error readback have loopback gateway tests; IPv6 address
+selection also has a Windows cross-compilation gate. Physical router
+interoperability, remote reachability, and installed service qualification
+remain pending. The pinned implementation is in `src/config.cpp`,
 `src/network.cpp`, `src/http_auth_request_policy.cpp`, and `src/upnp.cpp`.
-These transport and exposure gaps keep this ID pending.
+These remaining platform and exposure gates keep this ID pending.
 
 Each worker commits its owned implementation after rustfmt, meaningful tests,
 and Clippy. Use the repository's Nonary Git identity and actual session model

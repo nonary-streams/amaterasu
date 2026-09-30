@@ -124,14 +124,15 @@ absence for inheritance and explicit false/zero; the legacy VSync alias is
 normalized and conflicts with the canonical key are rejected. RTSS install and
 virtual-display settings and MangoHUD settings stay global-only.
 
-L02's coordinator-confirmed version decision is one NVHTTP v16-to-v17 batch;
-no v18 is introduced. The editor currently rejects null encryption modes and
-uses typed readback fields `configured_lan_encryption_mode` and
-`configured_wan_encryption_mode`. L02 still needs to confirm those readback
-keys/shape and whether null is a reset operation. The editor does not send null
-for either mode, so no reset behavior is assumed. L02 remains the only
-persistence writer. Frame-limiter storage, resolved precedence, launch
-snapshot construction, and runtime behavior remain L02/L03/L05 work.
+The historical L02 version decision was one NVHTTP v16-to-v17 batch. The
+2026-09-30 editor increment now follows the actual flat Rust readback fields
+`lan_encryption_mode` and `wan_encryption_mode`, each a numeric `0 | 1 | 2`.
+It sends both values with the existing revision CAS and confirms them on the
+update response and a subsequent GET. Invalid or null modes are rejected;
+the editor does not assume a null reset operation. The product service remains
+the persistence writer. Independent review, frontend typecheck, eleven test
+files, and the generated bundle build passed for this increment. Actual
+LAN/WAN client encryption and platform qualification remain separate gates.
 
 Exact paths in integrated commit `cf0ad6d`:
 
