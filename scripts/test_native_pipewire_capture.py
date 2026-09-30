@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Opt-in real PipeWire capture qualification through the desktop portal.
 
-Without ``--select`` this script only performs non-interactive availability
-checks. It never opens the ScreenCast picker unless the caller explicitly opts
-in. The picker remains the normal desktop portal UI and owns source consent.
+Every run first builds the signed media-probe fixture and proves the PipeWire
+module can be loaded, its native ABI bound, and status plus empty enumeration
+called without selecting a source. The host portal gate is reported separately.
+The script never opens the ScreenCast picker unless the caller explicitly opts
+in with ``--select``. The picker remains the normal desktop portal UI and owns
+source consent.
 The opt-in selection window is limited to 15 seconds so the fixture can clean
 up within the development host's 30-second request deadline.
 """
@@ -160,7 +163,47 @@ def request_capture(console: Console, source_type: str) -> dict[str, object]:
     return result(qualification, payload.get("code") or "none", fixture=payload)
 
 
-def run_qualification(source_type: str) -> dict[str, object]:
+def request_control_status(console: Console) -> dict[str, object]:
+    console.sequence += 1
+    console.send(
+        {
+            "op": "request",
+            "service": "test.media-probe/1",
+            "payload": {"action": "pipewire_control_status"},
+            "timeout_ms": 30_000,
+            "operation_id": f"native-pipewire-control-{console.sequence}",
+        }
+    )
+    response = console.replies.get(timeout=35)
+    assert response is not None, "host exited before signed PipeWire control proof completed"
+    assert response.get("kind") == "result", (response, "".join(console.errors))
+    payload = response["payload"]
+    if (
+        payload.get("control_proof") != "passed"
+        or payload.get("native_api_bound") is not True
+        or payload.get("status_passed") is not True
+        or payload.get("empty_enumeration") is not True
+    ):
+        return result("failed", "signed_control_proof_failed", control=payload)
+    if payload.get("availability") not in {"available", "unavailable"}:
+        return result("failed", "invalid_control_availability", control=payload)
+    return result(
+        "passed",
+        "signed_control_proof_passed",
+        control={
+            "provider_loaded": True,
+            "native_api_bound": True,
+            "status_passed": True,
+            "empty_enumeration": True,
+            "native_supported": payload.get("native_supported"),
+            "availability": payload["availability"],
+            "availability_reason": payload.get("availability_reason"),
+            "source_selection": "not_requested",
+        },
+    )
+
+
+def run_qualification(source_type: str, select: bool) -> dict[str, object]:
     run(CARGO, "build", "--workspace", "--offline", "--locked")
     with tempfile.TemporaryDirectory(prefix="amaterasu-native-pipewire-") as temporary:
         harness = ComponentHarness(Path(temporary))
@@ -179,7 +222,48 @@ def run_qualification(source_type: str) -> dict[str, object]:
 
         console = Console(harness)
         try:
-            return request_capture(console, source_type)
+            control = request_control_status(console)
+            if control["status"] != "passed":
+                return result(
+                    "failed",
+                    "signed_control_proof_failed",
+                    control=control.get("control"),
+                    selection=result("skipped", "control_proof_failed"),
+                )
+            try:
+                unavailable = preflight()
+            except (OSError, subprocess.SubprocessError):
+                unavailable = result("unavailable", "session_bus_unavailable")
+            if unavailable is not None:
+                return result(
+                    "unavailable",
+                    str(unavailable["reason"]),
+                    control=control["control"],
+                    selection=result("unavailable", str(unavailable["reason"])),
+                )
+            control_payload = control["control"]
+            if control_payload["availability"] != "available":
+                reason = control_payload.get("availability_reason") or "portal_unavailable"
+                return result(
+                    "unavailable",
+                    str(reason),
+                    control=control_payload,
+                    selection=result("unavailable", str(reason)),
+                )
+            if not select:
+                return result(
+                    "skipped",
+                    "explicit_selection_consent_required",
+                    control=control_payload,
+                    selection=result("skipped", "explicit_selection_consent_required"),
+                )
+            selection = request_capture(console, source_type)
+            return result(
+                str(selection["status"]),
+                str(selection["reason"]),
+                control=control_payload,
+                selection=selection,
+            )
         finally:
             console.close()
 
@@ -203,23 +287,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     arguments = parse_args()
     try:
-        unavailable = preflight()
-    except (OSError, subprocess.SubprocessError) as error:
-        unavailable = result("unavailable", "session_bus_unavailable", detail=str(error))
-    if unavailable is not None:
-        print(json.dumps(unavailable, sort_keys=True))
-        return 2
-    if not arguments.select:
-        print(json.dumps(result("skipped", "explicit_selection_consent_required"), sort_keys=True))
-        return 0
-
-    try:
-        outcome = run_qualification(arguments.source_type)
+        outcome = run_qualification(arguments.source_type, arguments.select)
     except (AssertionError, OSError, subprocess.SubprocessError, TimeoutError) as error:
         outcome = result("failed", "qualification_runner_error", detail=str(error))
     print(json.dumps(outcome, sort_keys=True))
     if outcome["status"] in {"passed", "skipped", "denied", "unavailable"}:
-        return 0 if outcome["status"] == "passed" else 2
+        return 0 if outcome["status"] in {"passed", "skipped"} else 2
     return 1
 
 

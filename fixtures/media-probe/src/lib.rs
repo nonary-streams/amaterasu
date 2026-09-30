@@ -19,6 +19,7 @@ struct Probe {
     control: Option<control::ControlProbe>,
     hardware: Option<hardware::HardwareVideoProbe>,
     pipewire: Option<pipewire::CaptureProbe>,
+    pipewire_control: Option<pipewire::ControlStatusProbe>,
     transport: Option<transport::TransportProbe>,
 }
 
@@ -33,6 +34,7 @@ impl ManagedModule for Probe {
             control: None,
             hardware: None,
             pipewire: None,
+            pipewire_control: None,
             transport: None,
         })
     }
@@ -52,6 +54,12 @@ impl ManagedModule for Probe {
         if let Some(probe) = &mut self.pipewire {
             if probe.tick(&self.runtime)? {
                 self.pipewire = None;
+            }
+            return Ok(());
+        }
+        if let Some(probe) = &mut self.pipewire_control {
+            if probe.tick(&self.runtime)? {
+                self.pipewire_control = None;
             }
             return Ok(());
         }
@@ -106,6 +114,11 @@ impl ManagedModule for Probe {
                         id,
                         source_type,
                     )?);
+                    return Ok(());
+                }
+                if payload == serde_json::json!({"action":"pipewire_control_status"}) {
+                    self.pipewire_control =
+                        Some(pipewire::ControlStatusProbe::start(&self.runtime, id)?);
                     return Ok(());
                 }
                 let provider = match payload["action"].as_str() {

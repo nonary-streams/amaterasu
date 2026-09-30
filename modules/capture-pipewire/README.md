@@ -104,11 +104,22 @@ They do not qualify actual capture. Actual user permission, nonblack desktop
 frames, desktop-to-encoder/public streaming, client playback, high-load behavior
 and distribution dependencies remain separate acceptance gates.
 
-The current NVHTTP/RTSP flow has no user-facing source-selection route. An
-allowlisted caller must select a source through this capture control service
-before video can open the resulting session-scoped output ID. A launch request
-does not open the portal picker automatically; a signed management UI route is
-still needed for product use.
+The settings editor has an explicit PipeWire source chooser for monitors and
+windows. It uses the fixed management routes
+`/v1/capture/pipewire_status`, `pipewire_selection_begin`,
+`pipewire_selection_poll` and `pipewire_selection_cancel` with dedicated
+`capture.read` and `capture.write` scopes. Status and selection responses expose
+only availability, state, source type and validated dimensions; portal nodes,
+output IDs and bus metadata stay internal. The browser keeps the random picker
+operation handle only in memory and does not save a portal session or restore
+token.
+
+Choosing a source is an explicit user action and never happens during launch.
+Before opening capture, video enumerates the current PipeWire selection and
+requires exactly one current output with supported BGRA format and dimensions
+matching the negotiated stream. Portal geometry and display mapping are not
+supported; an incompatible source fails before capture opens, with no Windows
+provider fallback.
 
 Primary references: [ScreenCast portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html)
 and [PipeWire capture interfaces](https://docs.pipewire.org/page_tutorial5.html).

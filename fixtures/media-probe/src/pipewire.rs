@@ -2,12 +2,13 @@
 //! and reduced to dimensions plus a nonblack-pixel count before the callback ends.
 use amaterasu_media::{
     CAPTURE_INTERFACE_MINOR, CaptureApi, CaptureGeometry, CpuFrame, FrameSink, MEDIA_BUSY,
-    MEDIA_PENDING, MEDIA_UNSUPPORTED, PIXEL_BGRA8,
+    MEDIA_CLOSED, MEDIA_PENDING, MEDIA_UNSUPPORTED, PIXEL_BGRA8,
 };
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient, abi};
 use serde_json::{Value, json};
 use std::{
     ffi::c_void,
+    mem::{MaybeUninit, size_of},
     time::{Duration, Instant},
 };
 
@@ -18,6 +19,167 @@ const CAPTURE: &str = "amaterasu.capture-pipewire/1";
 // selection timeout remains independently configurable from 1 to 300 seconds.
 const SELECTION_WAIT: Duration = Duration::from_secs(15);
 const FRAME_WAIT: Duration = Duration::from_secs(8);
+
+#[derive(Clone, Copy)]
+enum ControlStage {
+    Status,
+    Enumerate,
+}
+
+pub struct ControlStatusProbe {
+    request: u64,
+    pending: u64,
+    stage: ControlStage,
+    status_passed: bool,
+    native_supported: bool,
+    available: bool,
+    availability_reason: Option<String>,
+}
+
+impl ControlStatusProbe {
+    pub fn start(runtime: &RuntimeClient, request: u64) -> ModuleResult<Self> {
+        verify_native_interface(runtime)?;
+        let pending = request_service(
+            runtime,
+            request,
+            json!({"action":"status"}),
+            "native-pipewire-control-status",
+        )?;
+        Ok(Self {
+            request,
+            pending,
+            stage: ControlStage::Status,
+            status_passed: false,
+            native_supported: false,
+            available: false,
+            availability_reason: None,
+        })
+    }
+
+    pub fn tick(&mut self, runtime: &RuntimeClient) -> ModuleResult<bool> {
+        let payload = match runtime.send_ephemeral(Command::TakeResult {
+            request: self.pending,
+        })? {
+            Response::Pending => return Ok(false),
+            Response::Result { payload } if payload["ok"] == true => payload,
+            Response::Result { payload } => {
+                let code = payload["error"]["code"]
+                    .as_str()
+                    .or_else(|| payload["code"].as_str())
+                    .unwrap_or("capture_control_failed");
+                return self.finish(runtime, false, Some(code));
+            }
+            Response::Error { code, .. } => {
+                return self.finish(runtime, false, Some(&code));
+            }
+            _ => {
+                return self.finish(runtime, false, Some("capture_control_response_invalid"));
+            }
+        };
+
+        match self.stage {
+            ControlStage::Status => {
+                if payload["enabled"] != true || payload["selection_state"] != "permission_required"
+                {
+                    return self.finish(runtime, false, Some("capture_status_invalid"));
+                }
+                let Some(native_supported) = payload["native_supported"].as_bool() else {
+                    return self.finish(runtime, false, Some("capture_status_invalid"));
+                };
+                let Some(available) = payload["availability"]["available"].as_bool() else {
+                    return self.finish(runtime, false, Some("capture_status_invalid"));
+                };
+                self.native_supported = native_supported;
+                self.available = available;
+                self.status_passed = true;
+                self.availability_reason = payload["availability"]["reason"]
+                    .as_str()
+                    .filter(|reason| safe_availability_reason(reason))
+                    .map(str::to_owned);
+                self.pending = request_service(
+                    runtime,
+                    self.request,
+                    json!({"action":"enumerate"}),
+                    "native-pipewire-control-enumerate",
+                )?;
+                self.stage = ControlStage::Enumerate;
+                Ok(false)
+            }
+            ControlStage::Enumerate => {
+                let Some(outputs) = payload["outputs"].as_array() else {
+                    return self.finish(runtime, false, Some("capture_enumeration_invalid"));
+                };
+                if !outputs.is_empty()
+                    || payload["geometry_supported"] != false
+                    || !payload["enumeration_id"].is_null()
+                {
+                    return self.finish(runtime, false, Some("capture_enumeration_not_empty"));
+                }
+                self.finish(runtime, true, None)
+            }
+        }
+    }
+
+    fn finish(
+        &self,
+        runtime: &RuntimeClient,
+        passed: bool,
+        code: Option<&str>,
+    ) -> ModuleResult<bool> {
+        let availability = if self.available {
+            "available"
+        } else {
+            "unavailable"
+        };
+        let payload = json!({
+            "ok": passed,
+            "control_proof": if passed { "passed" } else { "failed" },
+            "native_api_bound": true,
+            "status_passed": self.status_passed,
+            "empty_enumeration": passed && matches!(self.stage, ControlStage::Enumerate),
+            "native_supported": self.native_supported,
+            "availability": availability,
+            "availability_reason": self.availability_reason,
+            "source_selection": "not_requested",
+            "code": code,
+        });
+        let result = runtime.send_ephemeral(Command::Complete {
+            request: self.request,
+            payload,
+        })?;
+        Ok(matches!(result, Response::Ok | Response::Error { .. }))
+    }
+}
+
+fn safe_availability_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "session_bus_unavailable"
+            | "portal_unavailable"
+            | "native_dependencies_unavailable"
+            | "unsupported_platform"
+    )
+}
+
+fn verify_native_interface(runtime: &RuntimeClient) -> ModuleResult<()> {
+    let binding = unsafe {
+        runtime.bind_native(
+            CAPTURE,
+            1,
+            CAPTURE_INTERFACE_MINOR,
+            size_of::<CaptureApi>() as u32,
+        )
+    }?;
+    // SAFETY: the signed fixture profile promises the exact capture-v1.1 table.
+    let api = unsafe { binding.table::<CaptureApi>() }?;
+    let mut geometry = MaybeUninit::<CaptureGeometry>::uninit();
+    // SAFETY: output storage is aligned/live; the nonexistent stream is read-only.
+    let status = unsafe { (api.geometry)(api.base.context, u64::MAX, geometry.as_mut_ptr()) };
+    if status != MEDIA_CLOSED {
+        return Err("PipeWire native ABI probe returned an unexpected status".into());
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 enum Stage {
