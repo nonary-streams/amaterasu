@@ -33,6 +33,8 @@ pub(super) fn accept_apply(record: &mut Record, response: &Value) {
     {
         record.display_lease = Some(lease.into());
         record.display_state = "applied".into();
+        record.display_applied = true;
+        record.owns_display_restore = true;
         return;
     }
     if (response["recovery_required"] == true || response["state"] == "recovery_required")
@@ -43,6 +45,8 @@ pub(super) fn accept_apply(record: &mut Record, response: &Value) {
     {
         record.display_lease = Some(lease.into());
         record.display_state = "recovery_required".into();
+        record.display_applied = true;
+        record.owns_display_restore = true;
         return;
     }
     record.display_state = response["error"]["code"]
@@ -64,6 +68,9 @@ pub(super) fn accept_status(record: &mut Record, response: &Value) -> bool {
             record.display_lease = None;
             record.display_attempted = false;
             record.display_status_verified = false;
+            record.display_applied = false;
+            record.owns_display_restore = false;
+            record.display_operation_id = None;
             true
         }
         Some("leased" | "recovery_required") if response["owned_by_caller"] == true => {
@@ -75,6 +82,8 @@ pub(super) fn accept_status(record: &mut Record, response: &Value) -> bool {
                 record.display_lease = response["lease"].as_str().map(str::to_owned);
                 record.display_state = response["state"].as_str().unwrap().into();
                 record.display_status_verified = true;
+                record.display_applied = true;
+                record.owns_display_restore = true;
                 return true;
             }
             false
@@ -93,6 +102,9 @@ pub(super) fn accept_restore(record: &mut Record, response: &Value) -> bool {
         record.display_attempted = false;
         record.display_status_verified = false;
         record.display_state = "restored".into();
+        record.display_applied = false;
+        record.owns_display_restore = false;
+        record.display_operation_id = None;
         return true;
     }
     if response["recovery_required"] == true {

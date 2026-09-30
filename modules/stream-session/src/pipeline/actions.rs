@@ -325,6 +325,9 @@ impl Pipeline {
             job.cleanup = true;
             job.deadline = now + 15000;
             if let Some(mut pending) = record.uncertain.take() {
+                if let Some(step) = record.uncertain_step.take() {
+                    job.step = step;
+                }
                 pending.retry();
                 pending.cancel();
                 job.pending = Some(pending);

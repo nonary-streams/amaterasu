@@ -115,10 +115,30 @@ impl Workflow {
                 let Some(LaunchTarget::Executable(executable)) = record.target.as_ref() else {
                     return Err("invalid_workflow");
                 };
-                (
-                    APPLICATION,
-                    json!({"action":"launch","operation_id":record.process_operation,"output":record.output,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"preparation_cwd":executable.preparation_working_directory,"detached_cwd":executable.preparation_working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"steam_id":executable.steam_id,"steam_install_dir":executable.steam_install_dir,"elevated":executable.elevated,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
-                )
+                let mut payload = json!({
+                    "action":"launch",
+                    "operation_id":record.process_operation,
+                    "output":record.output,
+                    "executable":executable.program,
+                    "args":executable.arguments,
+                    "cwd":executable.working_directory,
+                    "preparation_cwd":executable.preparation_working_directory,
+                    "detached_cwd":executable.preparation_working_directory,
+                    "auto_detach":executable.auto_detach,
+                    "wait_all":executable.wait_all,
+                    "exit_timeout_seconds":executable.exit_timeout_seconds,
+                    "steam_id":executable.steam_id,
+                    "steam_install_dir":executable.steam_install_dir,
+                    "elevated":executable.elevated,
+                    "detached":executable.detached,
+                    "environment":environment,
+                    "preparation":executable.preparation,
+                    "proton_dualsense_compatibility":record.proton_dualsense_compatibility,
+                });
+                if let Some(intent) = &record.virtual_display_intent {
+                    payload["virtual_display_intent"] = json!(intent);
+                }
+                (APPLICATION, payload)
             }
             Step::StartPlaynite => match record.target.as_ref() {
                 Some(LaunchTarget::Playnite { game_id, .. }) => (

@@ -1,3 +1,4 @@
+use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
 use amaterasu_gamestream::{
     rtsp::negotiation::UdpDiscovery,
     sdp::{Announce, ColorMode, ControlProtocol},
@@ -457,6 +458,9 @@ pub struct Open {
     /// frozen policy source and authenticated operation binding.
     #[serde(default)]
     pub display_request: Option<serde_json::Value>,
+    /// Resolved stream-time virtual-display policy, signed by Launch.
+    #[serde(default)]
+    pub virtual_display_intent: Option<VirtualDisplayIntent>,
     /// Private Launch-issued capability, bound to this Open operation.
     #[serde(default)]
     pub display_admission_token: Option<String>,
@@ -551,10 +555,17 @@ pub struct Open {
 impl Open {
     pub fn display_request_sha256(&self) -> Option<String> {
         use sha2::{Digest, Sha256};
-        let request = self.display_request.as_ref()?;
-        let bytes = serde_json::to_vec(request).ok()?;
+        let bytes = if let Some(intent) = &self.virtual_display_intent {
+            serde_json::to_vec(intent).ok()?
+        } else {
+            serde_json::to_vec(self.display_request.as_ref()?).ok()?
+        };
         let digest = Sha256::digest(bytes);
         Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    pub fn display_admission_required(&self) -> bool {
+        self.display_request.is_some() || self.virtual_display_intent.is_some()
     }
 
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
@@ -573,7 +584,7 @@ impl Open {
                         .as_deref()
                         .is_some_and(valid_name) => {}
             (None, Some(app_id), Some(revision))
-                if self.display_request.is_some()
+                if self.display_admission_required()
                     && valid_name(app_id)
                     && self
                         .display_policy_snapshot
@@ -585,7 +596,7 @@ impl Open {
             _ => return Err("frame_limiter_unattested"),
         }
         if self.frame_limiter_settings.is_some()
-            && self.display_request.is_some()
+            && self.display_admission_required()
             && self
                 .display_policy_snapshot
                 .as_ref()
@@ -595,25 +606,49 @@ impl Open {
         {
             return Err("frame_limiter_unattested");
         }
-        match (
-            &self.display_request,
-            &self.display_admission_token,
-            &self.application_operation_id,
-            &self.display_policy_snapshot,
-        ) {
-            (None, None, _, _)
-                if self.frame_limiter_settings.is_some()
-                    || self.application_operation_id.is_none() => {}
-            (Some(request), Some(token), Some(operation), Some(snapshot))
-                if valid_display_request(request)
-                    && valid_display_policy_snapshot(snapshot)
-                    && snapshot.as_object().is_some_and(|fields| fields.len() == 7)
-                    && token.len() == 64
-                    && token
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-                    && valid_name(operation) => {}
-            _ => return Err("display_request_unattested"),
+        if self
+            .virtual_display_intent
+            .as_ref()
+            .is_some_and(|intent| intent.validate().is_err())
+        {
+            return Err("display_request_unattested");
+        }
+        if self.display_admission_required() {
+            let (Some(token), Some(operation), Some(snapshot)) = (
+                self.display_admission_token.as_deref(),
+                self.application_operation_id.as_deref(),
+                self.display_policy_snapshot.as_ref(),
+            ) else {
+                return Err("display_request_unattested");
+            };
+            let expected_intent = self
+                .virtual_display_intent
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|_| "display_request_unattested")?;
+            if self
+                .display_request
+                .as_ref()
+                .is_some_and(|request| !valid_display_request(request))
+                || !valid_display_policy_snapshot(snapshot)
+                || token.len() != 64
+                || !token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                || !valid_name(operation)
+                || snapshot.get("virtual_display_intent") != expected_intent.as_ref()
+            {
+                return Err("display_request_unattested");
+            }
+        } else if self.display_admission_token.is_some()
+            || (self.frame_limiter_settings.is_none() && self.application_operation_id.is_some())
+            || self
+                .display_policy_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.get("virtual_display_intent").is_some())
+        {
+            return Err("display_request_unattested");
         }
         if self
             .display_policy_snapshot
@@ -863,6 +898,9 @@ impl Open {
         }
         if let Some(request) = &self.display_request {
             payload["display_request"] = request.clone();
+        }
+        if let Some(intent) = &self.virtual_display_intent {
+            payload["virtual_display_intent"] = serde_json::json!(intent);
         }
         if let Some(activity_id) = &self.history_activity_id {
             payload["history_activity_id"] = serde_json::json!(activity_id);
@@ -1146,8 +1184,28 @@ fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
     let Some(certificate_id) = snapshot["certificate_id"].as_str() else {
         return false;
     };
-    if !matches!(fields.len(), 5 | 7)
-        || (fields.len() == 7
+    let has_intent = fields.contains_key("virtual_display_intent");
+    let base_field_count = fields.len().saturating_sub(usize::from(has_intent));
+    let intent_is_valid = snapshot.get("virtual_display_intent").is_none_or(|value| {
+        serde_json::from_value::<VirtualDisplayIntent>(value.clone())
+            .is_ok_and(|intent| intent.validate().is_ok())
+    });
+    if !matches!(base_field_count, 5 | 7)
+        || !intent_is_valid
+        || fields.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "global_revision"
+                    | "global_overrides"
+                    | "catalog_revision"
+                    | "certificate_id"
+                    | "application_overrides"
+                    | "client_overrides"
+                    | "effective_overrides"
+                    | "virtual_display_intent"
+            )
+        })
+        || (base_field_count == 7
             && (snapshot
                 .get("global_revision")
                 .is_none_or(|revision| !revision.is_null() && !revision.is_u64())

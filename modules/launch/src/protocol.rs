@@ -1,3 +1,4 @@
+use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,6 +52,14 @@ pub enum Operation {
         client_frame_limiter_overrides: Option<BTreeMap<String, Value>>,
         #[serde(default)]
         application_display_overrides: Option<BTreeMap<String, Value>>,
+        #[serde(default)]
+        virtual_display_intent: Option<VirtualDisplayIntent>,
+        #[serde(default)]
+        proton_dualsense_compatibility: bool,
+        /// Complete the admission RPC after spawn/start acceptance while the
+        /// owned launch workflow continues and remains stoppable.
+        #[serde(default)]
+        return_on_admission: bool,
     },
     PrepareDisplayAdmission {
         application_operation_id: String,
@@ -62,6 +71,8 @@ pub enum Operation {
         client_display_overrides: BTreeMap<String, Value>,
         rtsp_operation_id: String,
         request_sha256: String,
+        #[serde(default)]
+        virtual_display_intent: Option<VirtualDisplayIntent>,
     },
     VerifyDisplayAdmission {
         token: String,
@@ -146,6 +157,7 @@ impl Operation {
                 client_display_overrides,
                 rtsp_operation_id,
                 request_sha256,
+                ..
             } => {
                 if !valid_operation_id(application_operation_id)
                     || !valid_operation_id(rtsp_operation_id)
@@ -189,6 +201,23 @@ impl Operation {
             && !valid_sha256(token)
         {
             return Err("invalid_request");
+        }
+        let virtual_display_intent = match self {
+            Self::LaunchExport {
+                virtual_display_intent,
+                ..
+            }
+            | Self::PrepareDisplayAdmission {
+                virtual_display_intent,
+                ..
+            } => virtual_display_intent,
+            _ => return Ok(()),
+        };
+        if virtual_display_intent
+            .as_ref()
+            .is_some_and(|intent| intent.validate().is_err())
+        {
+            return Err("invalid_virtual_display_intent");
         }
         Ok(())
     }

@@ -172,6 +172,17 @@ impl Controller {
             {
                 return Err("display_lease_unverified");
             }
+            if record
+                .config
+                .virtual_display_intent
+                .as_ref()
+                .is_some_and(amaterasu_contracts::virtual_display::VirtualDisplayIntent::active)
+                && (payload["virtual_display_ready"] != true
+                    || payload["display_applied"] != true
+                    || payload["display_state"] != "applied")
+            {
+                return Err("display_lease_unverified");
+            }
             if record.config.frame_limiter_settings.is_some()
                 && (payload.get("frame_limiter_settings")
                     != record.config.frame_limiter_settings.as_ref()
@@ -230,10 +241,13 @@ impl Controller {
                 .display_lease_ready_until
                 .unwrap_or_else(|| now.saturating_add(u64::from(record.config.ping_timeout_ms)))
                 .min(record.display_preflight_deadline.unwrap_or(u64::MAX));
-            if record.config.display_request.is_some() && expires <= now {
+            if record.config.display_admission_required() && expires <= now {
                 return Err("display_lease_expired");
             }
-            record.display_applied = record.config.display_request.is_some();
+            record.display_applied = record.config.display_request.is_some()
+                || record.config.virtual_display_intent.as_ref().is_some_and(
+                    amaterasu_contracts::virtual_display::VirtualDisplayIntent::active,
+                );
             record.state = State::Ready;
             record.expires = expires;
             Ok(())

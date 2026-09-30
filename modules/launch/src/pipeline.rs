@@ -8,8 +8,10 @@ use crate::{
     responses,
     workflow::{Step, Workflow, cleanup_budget, first_cleanup_step},
 };
+use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -37,11 +39,12 @@ fn display_policy_snapshot(
     record: &crate::records::Record,
     certificate_id: &str,
     client_overrides: &BTreeMap<String, Value>,
+    virtual_display_intent: Option<&VirtualDisplayIntent>,
 ) -> Value {
     let mut effective = global_overrides.clone();
     effective.extend(record.application_display_overrides.clone());
     effective.extend(client_overrides.clone());
-    serde_json::json!({
+    let mut snapshot = serde_json::json!({
         "global_revision":global_revision,
         "global_overrides":global_overrides,
         "catalog_revision":record.catalog_revision,
@@ -49,7 +52,21 @@ fn display_policy_snapshot(
         "application_overrides":record.application_display_overrides,
         "client_overrides":client_overrides,
         "effective_overrides":effective,
-    })
+    });
+    if let Some(intent) = virtual_display_intent {
+        snapshot["virtual_display_intent"] = serde_json::json!(intent);
+    }
+    snapshot
+}
+
+fn virtual_display_intent_sha256(intent: &VirtualDisplayIntent) -> Option<String> {
+    let bytes = serde_json::to_vec(intent).ok()?;
+    Some(
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 fn valid_frame_limiter_snapshot(snapshot: &BTreeMap<String, Value>) -> bool {
@@ -342,6 +359,25 @@ impl Pipeline {
     }
     pub fn tick(&mut self, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
         if let Some(mut job) = self.job.take() {
+            if !job.cleanup && job.request.is_none() {
+                let has_readback = match self.poll_detached_readback(&mut job, &mut send) {
+                    Ok(has_readback) => has_readback,
+                    Err(error) => {
+                        // A detached startup owns all pending dependency state even
+                        // when ingress polling or reply delivery temporarily fails.
+                        self.job = Some(job);
+                        return Err(error);
+                    }
+                };
+                if has_readback {
+                    self.ingress_since_monitor = self.ingress_since_monitor.saturating_add(1);
+                    if !job.cleanup && self.ingress_since_monitor < 8 {
+                        self.job = Some(job);
+                        return Ok(());
+                    }
+                    self.ingress_since_monitor = 0;
+                }
+            }
             if job.cleanup
                 && let Err(error) = self.poll_cleanup_readback(job.launch_id, &mut send)
             {
@@ -475,6 +511,97 @@ impl Pipeline {
         };
         complete(send, id, response)
     }
+
+    /// A launch acknowledged at admission remains owned while startup continues.
+    /// Serve safe readback and turn an owner Stop into cleanup without abandoning
+    /// the outstanding dependency call.
+    fn poll_detached_readback(
+        &mut self,
+        job: &mut Workflow,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<bool> {
+        let Response::Request {
+            id,
+            caller,
+            initiator,
+            service,
+            payload,
+            remaining_ms,
+        } = send(Command::Poll {})?
+        else {
+            return Ok(false);
+        };
+        if service != SERVICE {
+            complete(send, id, error("invalid_service"))?;
+            return Ok(true);
+        }
+        let operation = serde_json::from_value::<Operation>(payload)
+            .map_err(|_| "invalid_request")
+            .and_then(|operation| {
+                operation.validate()?;
+                Ok(operation)
+            });
+        match operation {
+            Ok(Operation::Status { launch_id }) => {
+                let response = self
+                    .records
+                    .owned(&caller, launch_id)
+                    .map(|record| record.response())
+                    .unwrap_or_else(error);
+                complete(send, id, response)?;
+            }
+            Ok(Operation::Lookup { operation_id }) => {
+                let response = self
+                    .records
+                    .owned_operation(&caller, &operation_id)
+                    .map(|record| record.response())
+                    .unwrap_or_else(error);
+                complete(send, id, response)?;
+            }
+            Ok(Operation::List { offset, limit }) => {
+                complete(send, id, self.records.list(&caller, offset, limit))?;
+            }
+            Ok(Operation::Stop { launch_id }) if launch_id == job.launch_id => {
+                let record = match self.records.owned(&caller, launch_id) {
+                    Ok(record) => record,
+                    Err(code) => {
+                        complete(send, id, error(code))?;
+                        return Ok(true);
+                    }
+                };
+                if record.state.terminal() {
+                    complete(send, id, record.response())?;
+                    return Ok(true);
+                }
+                let outcome = if record.state == State::CleanupFailed {
+                    record.cleanup_outcome
+                } else {
+                    Outcome::Completed
+                };
+                let record = self
+                    .records
+                    .values
+                    .get_mut(&launch_id)
+                    .expect("owned launch record");
+                record.display_admission = None;
+                if let Some(pending) = job.pending.take() {
+                    record.outstanding_request = Some(pending);
+                }
+                job.begin_cleanup(record, outcome, None);
+                job.request = Some(id);
+            }
+            Ok(
+                operation @ (Operation::PrepareDisplayAdmission { .. }
+                | Operation::VerifyDisplayAdmission { .. }
+                | Operation::VerifyFrameLimiterSnapshot { .. }),
+            ) => {
+                self.receive(id, &caller, &initiator, remaining_ms, operation, send)?;
+            }
+            Ok(_) => complete(send, id, error("workflow_busy"))?,
+            Err(code) => complete(send, id, error(code))?,
+        }
+        Ok(true)
+    }
     fn receive(
         &mut self,
         request: u64,
@@ -546,9 +673,22 @@ impl Pipeline {
                 frame_limiter_settings,
                 client_frame_limiter_overrides,
                 application_display_overrides,
+                virtual_display_intent,
+                proton_dualsense_compatibility,
+                return_on_admission,
             } => {
                 if application_display_overrides.is_some() && preflight_token.is_none() {
                     return complete(send, request, error("preflight_required"));
+                }
+                if (virtual_display_intent.is_some()
+                    || proton_dualsense_compatibility
+                    || return_on_admission)
+                    && preflight_token.is_none()
+                {
+                    return complete(send, request, error("preflight_required"));
+                }
+                if virtual_display_intent.is_some() && display_admission_token.is_none() {
+                    return complete(send, request, error("display_admission_denied"));
                 }
                 if application_display_overrides
                     .as_ref()
@@ -624,6 +764,9 @@ impl Pipeline {
                                 error("application_display_policy_mismatch"),
                             );
                         }
+                        if record.virtual_display_intent != virtual_display_intent {
+                            return complete(send, request, error("display_admission_denied"));
+                        }
                         match (
                             &record.display_admission,
                             display_admission_token.as_deref(),
@@ -646,6 +789,10 @@ impl Pipeline {
                             if record.frame_limiter_settings != frame_limiter_settings
                                 || record.client_frame_limiter_overrides
                                     != client_frame_limiter_overrides
+                                || record.proton_dualsense_compatibility
+                                    != proton_dualsense_compatibility
+                                || record.virtual_display_intent != virtual_display_intent
+                                || record.return_on_admission != return_on_admission
                             {
                                 return complete(send, request, error("operation_conflict"));
                             }
@@ -653,6 +800,8 @@ impl Pipeline {
                         }
                         record.frame_limiter_settings = frame_limiter_settings;
                         record.client_frame_limiter_overrides = client_frame_limiter_overrides;
+                        record.proton_dualsense_compatibility = proton_dualsense_compatibility;
+                        record.return_on_admission = return_on_admission;
                         record.launch_started = true;
                         let mut workflow = Workflow::launch(id, request, remaining_ms);
                         workflow.step = if record.lutris_source_id.is_some() {
@@ -676,6 +825,7 @@ impl Pipeline {
                 client_display_overrides,
                 rtsp_operation_id,
                 request_sha256,
+                virtual_display_intent,
             } => {
                 if caller != "amaterasu.nvhttp"
                     || (global_revision.is_none() && !global_overrides.is_empty())
@@ -691,6 +841,14 @@ impl Pipeline {
                     || record.preflight_token.is_none()
                     || record.catalog_revision != Some(catalog_revision)
                     || record.application_display_overrides != application_display_overrides
+                    || virtual_display_intent.as_ref().is_some_and(|intent| {
+                        virtual_display_intent_sha256(intent).as_deref()
+                            != Some(request_sha256.as_str())
+                    })
+                    || record
+                        .virtual_display_intent
+                        .as_ref()
+                        .is_some_and(|existing| Some(existing) != virtual_display_intent.as_ref())
                 {
                     return complete(send, request, error("display_admission_denied"));
                 }
@@ -700,6 +858,7 @@ impl Pipeline {
                     record,
                     &certificate_id,
                     &client_display_overrides,
+                    virtual_display_intent.as_ref(),
                 );
                 if !serde_json::to_vec(&snapshot).is_ok_and(|bytes| bytes.len() <= 32_768) {
                     return complete(send, request, error("display_admission_denied"));
@@ -725,6 +884,7 @@ impl Pipeline {
                         }),
                     );
                 }
+                record.virtual_display_intent = virtual_display_intent;
                 let token = match random_display_admission_token() {
                     Ok(token) => token,
                     Err(code) => return complete(send, request, error(code)),
@@ -964,7 +1124,7 @@ impl Pipeline {
         {
             return self.finish(job, send);
         }
-        if Instant::now() >= job.deadline {
+        if (job.cleanup || job.request.is_some()) && Instant::now() >= job.deadline {
             return self.dependency_failed(job, "deadline_exceeded", send);
         }
         if !job.cleanup
@@ -1007,11 +1167,14 @@ impl Pipeline {
             .sequence
             .checked_add(1)
             .ok_or("launch sequence exhausted")?;
-        let timeout_ms = job
-            .deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .clamp(1, 5_000) as u64;
+        let timeout_ms = if !job.cleanup && job.request.is_none() {
+            5_000
+        } else {
+            job.deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .clamp(1, 5_000) as u64
+        };
         let response = send(Command::Request {
             service: service.into(),
             payload,
@@ -1251,6 +1414,16 @@ impl Pipeline {
                 if job.step == Step::Spawn {
                     record.process_id = process["process_id"].as_u64();
                 }
+                if job.step == Step::Spawn
+                    && record.return_on_admission
+                    && matches!(
+                        state,
+                        ApplicationState::Preparing | ApplicationState::Running
+                    )
+                    && let Some(request) = job.request.take()
+                {
+                    complete(send, request, record.response())?;
+                }
                 match state {
                     ApplicationState::Preparing | ApplicationState::Stopping => {
                         job.step = Step::AwaitApplication;
@@ -1277,6 +1450,15 @@ impl Pipeline {
                     Err(code) => return self.dependency_failed(job, code, send),
                 };
                 record.provider_ticket = Some(provider.ticket);
+                if record.return_on_admission
+                    && matches!(
+                        provider.state,
+                        responses::ProviderState::Starting | responses::ProviderState::Running
+                    )
+                    && let Some(request) = job.request.take()
+                {
+                    complete(send, request, record.response())?;
+                }
                 match provider.state {
                     responses::ProviderState::Starting => job.step = Step::AwaitPlayniteStart,
                     responses::ProviderState::Running => job.step = Step::Activate,

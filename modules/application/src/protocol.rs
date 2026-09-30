@@ -1,6 +1,7 @@
 use crate::commands::{DetachedCommand, DetachedCommandInput};
 use crate::lifecycle::{PreparationStep, validate_environment};
 use crate::output::{deserialize_output, validate_output};
+use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -40,6 +41,11 @@ pub(crate) enum Action {
         detached: Vec<DetachedCommandInput>,
         #[serde(default)]
         preparation: Box<[PreparationStep]>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        proton_dualsense_compatibility: bool,
+        #[serde(default)]
+        virtual_display_intent: Option<Box<VirtualDisplayIntent>>,
     },
     Lookup {
         operation_id: String,
@@ -450,10 +456,31 @@ mod tests {
             "executable":"/bin/example"
         }))
         .unwrap();
-        let Action::Launch { elevated, .. } = action else {
+        let Action::Launch {
+            elevated,
+            proton_dualsense_compatibility,
+            ..
+        } = action
+        else {
             panic!("expected launch action")
         };
         assert!(!elevated);
+        assert!(!proton_dualsense_compatibility);
+        let action: Action = serde_json::from_value(serde_json::json!({
+            "action":"launch",
+            "operation_id":"new-client",
+            "executable":"/bin/example",
+            "proton_dualsense_compatibility":true
+        }))
+        .unwrap();
+        let Action::Launch {
+            proton_dualsense_compatibility,
+            ..
+        } = action
+        else {
+            panic!("expected launch action")
+        };
+        assert!(proton_dualsense_compatibility);
     }
 
     #[test]

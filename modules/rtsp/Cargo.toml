@@ -8,6 +8,7 @@ rust-version.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+amaterasu-contracts.workspace = true
 amaterasu-input-policy.workspace = true
 amaterasu-module-sdk.workspace = true
 amaterasu-gamestream.workspace = true

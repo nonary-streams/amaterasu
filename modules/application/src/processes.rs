@@ -883,7 +883,15 @@ impl ProcessManager {
                 steam_install_dir,
                 detached,
                 preparation,
+                proton_dualsense_compatibility: _,
+                virtual_display_intent,
             } => {
+                if virtual_display_intent
+                    .as_ref()
+                    .is_some_and(|intent| intent.validate().is_err())
+                {
+                    return Err("invalid_launch");
+                }
                 let detached_requests = detached
                     .into_iter()
                     .map(DetachedCommandRequest::from)

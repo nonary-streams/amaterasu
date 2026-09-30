@@ -1,5 +1,5 @@
 use super::input::TouchPort;
-use super::{Drive, rpc};
+use super::{Drive, rpc, workflow::Step};
 use crate::{
     model::{PrepareConfig, StartConfig},
     plane::Handles,
@@ -79,6 +79,7 @@ pub(super) struct Record {
     pub resources: BTreeMap<Resource, u64>,
     pub attempted: BTreeSet<Resource>,
     pub uncertain: Option<rpc::Pending>,
+    pub uncertain_step: Option<Step>,
     pub plane: Option<Box<dyn Drive>>,
     pub audio_recovery_needed: bool,
     pub prepared_until: u64,
@@ -115,6 +116,17 @@ pub(super) struct Record {
     pub display_lease: Option<String>,
     pub display_status_verified: bool,
     pub display_state: String,
+    pub display_applied: bool,
+    pub owns_display_restore: bool,
+    pub display_operation_id: Option<String>,
+    pub virtual_display_attempted: bool,
+    pub virtual_display_reference_owned: bool,
+    pub virtual_display_status_verified: bool,
+    pub virtual_display_remove_attempted: bool,
+    pub virtual_display_state: String,
+    pub virtual_display_create_error: Option<String>,
+    pub virtual_display_device_path: Option<String>,
+    pub virtual_display_next_poll_at: u64,
     pub input_request_started_at: u64,
     pub input_expires_at: u64,
     pub input_renew_at: u64,
@@ -134,6 +146,7 @@ pub(super) struct Record {
 
 impl Record {
     pub fn new(id: u64, owner: String, config: PrepareConfig, input_ttl_ms: u64) -> Self {
+        let virtual_display_state = "not_requested".to_owned();
         Self {
             id,
             history: super::history::SessionHistory::new(id, config.history_activity_id.clone()),
@@ -147,6 +160,7 @@ impl Record {
             resources: BTreeMap::new(),
             attempted: BTreeSet::new(),
             uncertain: None,
+            uncertain_step: None,
             plane: None,
             audio_recovery_needed: false,
             prepared_until: 0,
@@ -183,6 +197,17 @@ impl Record {
             display_lease: None,
             display_status_verified: false,
             display_state: "not_requested".into(),
+            display_applied: false,
+            owns_display_restore: false,
+            display_operation_id: None,
+            virtual_display_attempted: false,
+            virtual_display_reference_owned: false,
+            virtual_display_status_verified: false,
+            virtual_display_remove_attempted: false,
+            virtual_display_state,
+            virtual_display_create_error: None,
+            virtual_display_device_path: None,
+            virtual_display_next_poll_at: 0,
             input_request_started_at: 0,
             input_expires_at: 0,
             input_renew_at: 0,
@@ -210,7 +235,9 @@ impl Record {
     }
 
     pub fn display_operation(&self) -> String {
-        format!("ss-{:x}-display", self.id)
+        self.display_operation_id
+            .clone()
+            .unwrap_or_else(|| format!("ss-{:x}-display", self.id))
     }
 
     pub fn limiter_session(&self) -> String {
@@ -292,7 +319,10 @@ impl Record {
             }),
             "display_prepare_timeout_ms": self.config.display_prepare_timeout_ms,
             "display_state": self.display_state,
-            "display_applied": self.display_lease.is_some() && self.display_state == "applied",
+            "display_applied": self.display_applied && self.display_state == "applied",
+            "virtual_display_ready": self.virtual_display_reference_owned
+                && self.virtual_display_status_verified
+                && self.virtual_display_state == "ready",
             "packet_bytes": self.packet_bytes,
             "audio_encoder_layout": self.audio_encoder_layout,
             "wire_audio_bytes": self.wire_audio_bytes,

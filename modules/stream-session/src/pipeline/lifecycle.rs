@@ -27,6 +27,7 @@ impl Pipeline {
                 if let Some(mut pending) = job.pending.take() {
                     pending.cancel();
                     record.uncertain = Some(pending);
+                    record.uncertain_step = Some(job.step);
                 }
                 record.cleanup_error = Some("cleanup_deadline");
                 record.state = State::CleanupFailed;
@@ -46,6 +47,7 @@ impl Pipeline {
                         let settled = pending.shutdown(send);
                         if !settled {
                             record.uncertain = Some(pending);
+                            record.uncertain_step = Some(job.step);
                         }
                         record.limiter_state = "apply_uncertain".into();
                         job.fail(record, "frame_limiter_apply_uncertain", now);
@@ -55,12 +57,30 @@ impl Pipeline {
                         let settled = pending.shutdown(send);
                         if !settled {
                             record.uncertain = Some(pending);
+                            record.uncertain_step = Some(job.step);
                         }
                         record.display_state = "apply_uncertain".into();
                         job.fail(record, "display_apply_uncertain", now);
                         return true;
                     }
+                    if matches!(
+                        job.step,
+                        Step::CreateVirtualDisplay
+                            | Step::StatusVirtualDisplay
+                            | Step::SnapshotDisplay
+                            | Step::RemoveVirtualDisplay
+                    ) {
+                        let settled = pending.shutdown(send);
+                        if !settled {
+                            record.uncertain = Some(pending);
+                            record.uncertain_step = Some(job.step);
+                        }
+                        record.virtual_display_state = "request_uncertain".into();
+                        job.fail(record, "virtual_display_request_uncertain", now);
+                        return true;
+                    }
                     record.uncertain = Some(pending);
+                    record.uncertain_step = Some(job.step);
                     record.plane = None;
                     record.audio_recovery_needed = false;
                     record.cleanup_error = Some("request_cancellation_unconfirmed");
@@ -98,6 +118,8 @@ impl Pipeline {
                                 | Step::FindDisplay
                                 | Step::RestoreDisplay
                                 | Step::RecoverDisplay
+                                | Step::StatusVirtualDisplay
+                                | Step::RemoveVirtualDisplay
                         ) {
                             self.cleanup_rejected(record, job, send)
                         } else {
@@ -116,6 +138,16 @@ impl Pipeline {
                         } else {
                             Step::AcquireOutput
                         };
+                        return true;
+                    }
+                    if job.step == Step::CreateVirtualDisplay {
+                        record.virtual_display_create_error = Some("dependency_unavailable".into());
+                        job.step = Step::StatusVirtualDisplay;
+                        return true;
+                    }
+                    if matches!(job.step, Step::StatusVirtualDisplay | Step::SnapshotDisplay) {
+                        record.virtual_display_state = "dependency_unavailable".into();
+                        job.fail(record, "virtual_display_unavailable", now);
                         return true;
                     }
                     if matches!(job.step, Step::CheckDisplay | Step::ApplyDisplay) {
@@ -156,6 +188,10 @@ impl Pipeline {
             }
         }
         if job.cleanup {
+            if record.uncertain.is_some() {
+                return self.finish_cleanup(record, job, send);
+            }
+            self.transfer_shared_display_restore(record);
             let Some(step) = job.next_cleanup(record) else {
                 return self.finish_cleanup(record, job, send);
             };
@@ -172,6 +208,12 @@ impl Pipeline {
                 return true;
             }
         }
+        if !job.cleanup
+            && job.step == Step::StatusVirtualDisplay
+            && now < record.virtual_display_next_poll_at
+        {
+            return true;
+        }
         if let Step::Open(resource) = job.step {
             record.attempted.insert(resource);
         }
@@ -180,6 +222,15 @@ impl Pipeline {
         }
         if job.step == Step::ApplyDisplay {
             record.display_attempted = true;
+        }
+        if job.step == Step::CreateVirtualDisplay {
+            record.virtual_display_attempted = true;
+            record.virtual_display_status_verified = false;
+            record.virtual_display_state = "creating".into();
+        }
+        if job.step == Step::RemoveVirtualDisplay {
+            record.virtual_display_status_verified = false;
+            record.virtual_display_remove_attempted = true;
         }
         if job.step == Step::AcquireInput {
             record.input_attempted = true;
@@ -246,6 +297,67 @@ impl Pipeline {
             job.step = Step::AcquireOutput;
             return true;
         }
+        if job.step == Step::CreateVirtualDisplay {
+            if payload["ok"] != true {
+                record.virtual_display_create_error = payload["code"]
+                    .as_str()
+                    .or_else(|| payload["error"]["code"].as_str())
+                    .map(str::to_owned);
+            }
+            record.virtual_display_next_poll_at = now;
+            job.step = Step::StatusVirtualDisplay;
+            return true;
+        }
+        if job.step == Step::StatusVirtualDisplay {
+            match super::virtual_display::accept_status(record, &payload) {
+                super::virtual_display::ReferenceStatus::Ready => {
+                    if let Some(shared) = self.records.values().find(|other| {
+                        other.owns_display_restore
+                            && other.display_applied
+                            && other.display_lease.is_some()
+                            && other.virtual_display_reference_owned
+                            && super::virtual_display::same_shared_specification(record, other)
+                            && other.state != State::Stopping
+                    }) {
+                        record.display_applied = true;
+                        record.display_state = "applied".into();
+                        record.display_status_verified = false;
+                        record.owns_display_restore = false;
+                        record.display_lease = None;
+                        record.display_operation_id = Some(shared.display_operation());
+                        record.state = State::Prepared;
+                        record.prepared_until = now.saturating_add(u64::from(
+                            record
+                                .config
+                                .display_prepare_timeout_ms
+                                .unwrap_or(record.config.ping_timeout_ms),
+                        ));
+                        return self.deliver_success(record, job, now, send);
+                    }
+                    job.step = Step::SnapshotDisplay;
+                }
+                super::virtual_display::ReferenceStatus::Pending => {
+                    record.virtual_display_next_poll_at = now.saturating_add(100);
+                }
+                super::virtual_display::ReferenceStatus::Missing => {
+                    let code = super::virtual_display::creation_failure(record);
+                    job.fail(record, code, now);
+                }
+                super::virtual_display::ReferenceStatus::Failed => {
+                    let code = super::virtual_display::creation_failure(record);
+                    job.fail(record, code, now);
+                }
+            }
+            return true;
+        }
+        if job.step == Step::SnapshotDisplay {
+            if let Err(code) = super::virtual_display::build_display_request(record, &payload) {
+                job.fail(record, code, now);
+            } else {
+                job.step = Step::CheckDisplay;
+            }
+            return true;
+        }
         if job.step == Step::FindLimiter {
             super::limiter::accept_status(record, &payload);
             if record.limiter_lease.is_none()
@@ -257,11 +369,12 @@ impl Pipeline {
             return true;
         }
         if job.step == Step::CheckDisplay {
+            let read_only = super::virtual_display::is_read_only_policy(record);
             if payload["ok"] == true
                 && payload["state"] == "idle"
                 && payload["lease"].is_null()
                 && payload["native_supported"] == true
-                && payload["mutation_enabled"] == true
+                && (payload["mutation_enabled"] == true || read_only)
                 && !self
                     .records
                     .values()
@@ -279,6 +392,26 @@ impl Pipeline {
             return true;
         }
         if job.step == Step::ApplyDisplay {
+            if super::virtual_display::read_only_policy_is_satisfied(record, &payload) {
+                record.display_attempted = false;
+                record.display_status_verified = false;
+                // `display_applied` is the stream readiness gate, so read-only
+                // Disabled/VerifyOnly policies use its existing satisfied state
+                // while deliberately retaining no display restore lease.
+                record.display_state = "applied".into();
+                record.display_applied = true;
+                record.owns_display_restore = false;
+                record.display_lease = None;
+                record.display_operation_id = None;
+                record.state = State::Prepared;
+                record.prepared_until = now.saturating_add(u64::from(
+                    record
+                        .config
+                        .display_prepare_timeout_ms
+                        .unwrap_or(record.config.ping_timeout_ms),
+                ));
+                return self.deliver_success(record, job, now, send);
+            }
             super::display::accept_apply(record, &payload);
             if payload["ok"] == false && payload["recovery_required"] != true {
                 job.fail(record, "display_apply_rejected", now);
@@ -292,8 +425,22 @@ impl Pipeline {
             if !known {
                 record.display_state = "status_unverified".into();
             }
+            if known
+                && payload["state"] == "idle"
+                && payload["lease"].is_null()
+                && record.display_lease.is_none()
+                && super::virtual_display::is_read_only_policy(record)
+            {
+                // The provider stores no journal for a read-only policy. An
+                // idle readback confirms no display effect; replaying this
+                // verification-only Apply is safe after a lost reply.
+                record.display_attempted = false;
+                job.step = Step::ApplyDisplay;
+                return true;
+            }
             if known && record.display_status_verified && record.display_state == "leased" {
                 record.display_state = "applied".into();
+                record.display_applied = true;
                 record.state = State::Prepared;
                 record.prepared_until = now.saturating_add(u64::from(
                     record
@@ -614,7 +761,22 @@ impl Pipeline {
             }
             Resource::Control => {
                 record.control_local = Some(local_address(payload, "local")?);
-                if record.config.display_request.is_some() {
+                if let Some(intent) = &record.config.virtual_display_intent {
+                    if intent.active() {
+                        if !intent.dd_use_sunshine_virtual_display_driver {
+                            record.virtual_display_state = "unsupported_driver".into();
+                            job.fail(record, "unsupported_virtual_display_driver", now);
+                            return Ok(true);
+                        }
+                        record.virtual_display_state = "creating".into();
+                        job.step = Step::CreateVirtualDisplay;
+                        return Ok(true);
+                    }
+                    // The activation gate and disabled mode both leave explicit
+                    // settings in the signed intent but bypass all mutations.
+                    record.virtual_display_state = "not_requested".into();
+                    record.display_state = "not_requested".into();
+                } else if record.config.display_request.is_some() {
                     job.step = Step::CheckDisplay;
                     return Ok(true);
                 }
@@ -691,5 +853,38 @@ impl Pipeline {
     ) -> bool {
         job.fail(record, code, now);
         true
+    }
+
+    fn transfer_shared_display_restore(&mut self, record: &mut Record) {
+        if !record.owns_display_restore
+            || !record.display_applied
+            || record.display_lease.is_none()
+            || !record.virtual_display_reference_owned
+        {
+            return;
+        }
+        let Some(shared) = self.records.values_mut().find(|candidate| {
+            candidate.state != State::Stopping
+                && candidate.state != State::CleanupFailed
+                && candidate.virtual_display_reference_owned
+                && candidate.display_applied
+                && super::virtual_display::same_shared_specification(record, candidate)
+        }) else {
+            return;
+        };
+        shared.display_attempted = true;
+        shared.display_lease = record.display_lease.take();
+        shared.display_status_verified = record.display_status_verified;
+        shared.display_state = record.display_state.clone();
+        shared.display_applied = true;
+        shared.owns_display_restore = true;
+        shared.display_operation_id = Some(record.display_operation());
+
+        record.display_attempted = false;
+        record.display_status_verified = false;
+        record.display_state = "shared".into();
+        record.display_applied = false;
+        record.owns_display_restore = false;
+        record.display_operation_id = None;
     }
 }

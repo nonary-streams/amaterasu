@@ -2,6 +2,7 @@ use crate::protocol::{
     ApplicationConfigOverrides, LaunchTarget, LegacyPreparationCommand, Outcome, PreparationStep,
     State,
 };
+use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -71,6 +72,13 @@ pub struct Record {
     pub application_display_overrides: BTreeMap<String, Value>,
     #[serde(skip)]
     pub display_admission: Option<DisplayAdmission>,
+    /// Resolved request is private runtime state, not a public launch-status field.
+    #[serde(skip)]
+    pub virtual_display_intent: Option<VirtualDisplayIntent>,
+    #[serde(skip)]
+    pub proton_dualsense_compatibility: bool,
+    #[serde(skip)]
+    pub return_on_admission: bool,
     #[serde(skip)]
     pub preflight_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,6 +242,9 @@ impl Records {
                 client_frame_limiter_overrides: None,
                 application_display_overrides: BTreeMap::new(),
                 display_admission: None,
+                virtual_display_intent: None,
+                proton_dualsense_compatibility: false,
+                return_on_admission: false,
                 preflight_token: None,
                 catalog_revision: None,
                 preflight_ready: false,

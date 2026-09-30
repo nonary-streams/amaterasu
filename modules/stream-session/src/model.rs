@@ -1,3 +1,4 @@
+use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
 use amaterasu_module_sdk::EncoderSelection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -335,6 +336,9 @@ pub struct PrepareConfig {
     /// Complete, frozen display Apply request from the authenticated launch.
     #[serde(default)]
     pub display_request: Option<Box<DisplayRequest>>,
+    /// Launch-attested display identity/specification for this stream.
+    #[serde(default)]
+    pub virtual_display_intent: Option<VirtualDisplayIntent>,
     /// Frozen launch policy; retained with the prepared operation for retries.
     #[serde(default)]
     pub frame_limiter_settings: Option<Value>,
@@ -387,12 +391,24 @@ impl PrepareConfig {
         if let Some(request) = &self.display_request {
             request.validate()?;
         }
+        if self
+            .virtual_display_intent
+            .as_ref()
+            .is_some_and(|intent| intent.validate().is_err())
+        {
+            return Err("invalid_virtual_display_intent");
+        }
         self.validate_frame_limiter_snapshot()?;
         if self.ping_timeout_ms > i32::MAX as u32 {
             return Err("invalid_ping_timeout");
         }
         if let Some(timeout) = self.display_prepare_timeout_ms
-            && (self.display_request.is_none() || !(1..=120_000).contains(&timeout))
+            && (self.display_request.is_none()
+                && !self
+                    .virtual_display_intent
+                    .as_ref()
+                    .is_some_and(VirtualDisplayIntent::active)
+                || !(1..=120_000).contains(&timeout))
         {
             return Err("invalid_display_prepare_timeout");
         }

@@ -178,9 +178,7 @@ pub fn valid_identity(identity: &str) -> bool {
 }
 
 pub fn valid_reference_id(reference_id: &str) -> bool {
-    !reference_id.is_empty()
-        && reference_id.len() <= 128
-        && reference_id.bytes().all(|byte| byte.is_ascii_graphic())
+    amaterasu_contracts::virtual_display::valid_reference_id(reference_id)
 }
 
 pub fn display_id(caller: &str, identity: &str) -> u64 {

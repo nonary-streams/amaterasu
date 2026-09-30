@@ -104,7 +104,6 @@ impl Record {
             "history_activity_id":self.config.history_activity_id,
             "display_request":self.config.display_request,
             "display_applied":self.display_applied,
-            "display_policy_snapshot":self.config.display_policy_snapshot,
             "failure":self.failure,"cleanup_error":self.cleanup_error})
     }
 

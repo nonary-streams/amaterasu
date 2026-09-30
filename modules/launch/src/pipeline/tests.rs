@@ -946,6 +946,11 @@ fn launch_export_accepts_only_object_shaped_frame_limiter_compatibility_fields()
     let Operation::LaunchExport {
         frame_limiter_settings,
         client_frame_limiter_overrides,
+        preflight_token,
+        display_admission_token,
+        virtual_display_intent,
+        proton_dualsense_compatibility,
+        return_on_admission,
         ..
     } = legacy
     else {
@@ -953,6 +958,11 @@ fn launch_export_accepts_only_object_shaped_frame_limiter_compatibility_fields()
     };
     assert_eq!(frame_limiter_settings, None);
     assert_eq!(client_frame_limiter_overrides, None);
+    assert_eq!(preflight_token, None);
+    assert_eq!(display_admission_token, None);
+    assert_eq!(virtual_display_intent, None);
+    assert!(!proton_dualsense_compatibility);
+    assert!(!return_on_admission);
 
     let null_compatibility: Operation = serde_json::from_value(json!({
         "action":"launch_export",
@@ -2079,6 +2089,82 @@ fn expired_preflight_token_cannot_launch_or_resurrect_after_catalog_change() {
     );
     assert!(harness.sessions.is_empty());
     assert!(harness.processes.is_empty());
+}
+
+#[test]
+fn launch_export_can_acknowledge_admission_while_owned_startup_remains_stoppable() {
+    let mut harness = Harness::new();
+    harness.application_preparing_statuses = 8;
+    let mut pipeline = pipeline();
+    let operation_id = "detached-startup";
+    let preflight = harness.request_as(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        "management",
+        json!({"action":"preflight_export","operation_id":operation_id,
+            "app_id":"app-0000000000000001"}),
+    );
+    let mut launch = launch_export(operation_id);
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["frame_limiter_settings"] = frame_limiter_snapshot();
+    launch["proton_dualsense_compatibility"] = json!(true);
+    launch["return_on_admission"] = json!(true);
+    let admitted = harness.request_as(&mut pipeline, "amaterasu.nvhttp", "management", launch);
+    assert_eq!(admitted["launch"]["state"], "starting", "{admitted}");
+    assert!(
+        pipeline.job.is_some(),
+        "startup remains owned after acknowledgement"
+    );
+    for failure in ["poll", "complete"] {
+        let retained_pending = pipeline.job.as_ref().unwrap().pending;
+        let mut incoming = Some(Response::Request {
+            id: 42,
+            caller: "amaterasu.nvhttp".into(),
+            initiator: "management".into(),
+            service: SERVICE.into(),
+            payload: json!({"action":"status","launch_id":admitted["launch"]["launch_id"]}),
+            remaining_ms: 5_000,
+        });
+        let readback_error = pipeline.tick(|command| match command {
+            Command::Poll {} if failure == "poll" => {
+                Err("injected detached readback poll failure".into())
+            }
+            Command::Poll {} => Ok(incoming.take().unwrap_or(Response::Pending)),
+            Command::Complete { .. } if failure == "complete" => {
+                Err("injected detached readback reply failure".into())
+            }
+            other => panic!("failed detached readback must not advance dependencies: {other:?}"),
+        });
+        assert!(readback_error.is_err());
+        assert_eq!(pipeline.job.as_ref().unwrap().pending, retained_pending);
+        assert_eq!(pipeline.job.as_ref().unwrap().request, None);
+    }
+    let application_launch = harness
+        .commands
+        .iter()
+        .find(|(service, request, _)| {
+            service == crate::workflow::APPLICATION && request["action"] == "launch"
+        })
+        .unwrap();
+    assert_eq!(application_launch.1["proton_dualsense_compatibility"], true);
+
+    let status = harness.request_as(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        "management",
+        json!({"action":"status","launch_id":admitted["launch"]["launch_id"]}),
+    );
+    assert_eq!(status["launch"]["state"], "starting");
+    let stopped = harness.request_as(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        "management",
+        json!({"action":"stop","launch_id":admitted["launch"]["launch_id"]}),
+    );
+    assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
+    assert!(harness.sessions[0].lease.is_none());
+    assert!(harness.processes[0].child.is_none());
+    assert!(pipeline.job.is_none());
 }
 
 #[test]

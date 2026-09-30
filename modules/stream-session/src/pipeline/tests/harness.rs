@@ -116,10 +116,18 @@ pub struct Broker {
     pub display_wrong_status_operation: bool,
     pub display_restore_failures: usize,
     pub display_unavailable: bool,
+    pub display_mutation_enabled: bool,
     pub display_race_on_lost_apply: bool,
     pub display_restart_on_lost_apply: bool,
     pub display_inactive_target: Option<String>,
     pub display_active_ids: Vec<String>,
+    pub display_topology: Value,
+    pub display_saved_topology: Option<Value>,
+    pub virtual_display_specification: Option<Value>,
+    pub virtual_display_references: BTreeSet<String>,
+    pub virtual_display_pending_statuses: u8,
+    pub virtual_display_create_failure: Option<String>,
+    pub virtual_display_remove_failure: bool,
 }
 
 impl Broker {
@@ -128,6 +136,15 @@ impl Broker {
             authenticated: true,
             format_rate: 48000,
             host_metrics_available: true,
+            display_topology: json!({"displays":[
+                {"id":"desktop-primary","width":1920,"height":1080,
+                 "refresh":{"numerator":60,"denominator":1},"x":0,"y":0,
+                 "rotation":"identity","hdr_enabled":false},
+                {"id":"desktop-secondary","width":1280,"height":720,
+                 "refresh":{"numerator":60,"denominator":1},"x":1920,"y":0,
+                 "rotation":"identity","hdr_enabled":false}
+            ]}),
+            display_mutation_enabled: true,
             ..Self::default()
         }
     }
@@ -451,6 +468,9 @@ impl Broker {
         if service == "amaterasu.frame-limiter/1" {
             return self.frame_limiter(action, &call.payload);
         }
+        if service == "amaterasu.virtual-display/1" {
+            return self.virtual_display(action, &call.payload);
+        }
         if service == "amaterasu.display/1" {
             return self.display(action, &call.payload);
         }
@@ -615,15 +635,41 @@ impl Broker {
             return error("permission_denied");
         }
         match action {
-            "status" => json!({"ok":true,"native_supported":true,"mutation_enabled":true,
-            "state":if self.display_recovery_required {"recovery_required"} else if self.display_lease.is_some() {"leased"} else {"idle"},
-            "owned_by_caller":self.display_lease.is_some(),"lease":self.display_lease,
-            "operation_id":if self.display_wrong_status_operation && self.display_lease.is_some() {
-                Some("another-session-display")
-            } else {
-                self.display_operation.as_deref()
-            }}),
+            "snapshot" => json!({"ok":true,"configuration":self.display_topology,
+                "topology_revision":"0123456789abcdef0123456789abcdef"}),
+            "status" => {
+                json!({"ok":true,"native_supported":true,"mutation_enabled":self.display_mutation_enabled,
+                "state":if self.display_recovery_required {"recovery_required"} else if self.display_lease.is_some() {"leased"} else {"idle"},
+                "owned_by_caller":self.display_lease.is_some(),"lease":self.display_lease,
+                "operation_id":if self.display_wrong_status_operation && self.display_lease.is_some() {
+                    Some("another-session-display")
+                } else {
+                    self.display_operation.as_deref()
+                }})
+            }
             "apply" => {
+                match payload["mode_policy"]["configuration_option"].as_str() {
+                    Some("disabled") => {
+                        return json!({"ok":true,"applied":false,"configuration_option":"disabled"});
+                    }
+                    Some("verify_only") => {
+                        let display_id = payload["mode_policy"]["display_id"]
+                            .as_str()
+                            .expect("selected display ID");
+                        let is_active =
+                            self.display_topology["displays"]
+                                .as_array()
+                                .is_some_and(|displays| {
+                                    displays.iter().any(|display| display["id"] == display_id)
+                                });
+                        if !is_active {
+                            return error("unsupported_display");
+                        }
+                        return json!({"ok":true,"applied":false,"verified":true,
+                            "configuration_option":"verify_only"});
+                    }
+                    _ => {}
+                }
                 if self.display_apply_failure {
                     return error("invalid_configuration");
                 }
@@ -666,6 +712,8 @@ impl Broker {
                 assert!(self.display_lease.is_none(), "duplicate display Apply");
                 self.display_lease = Some("display-0000000000000001".into());
                 self.display_operation = Some(operation.into());
+                self.display_saved_topology = Some(self.display_topology.clone());
+                self.display_topology = payload["configuration"].clone();
                 if self.display_apply_recovery_reply {
                     return json!({"ok":true,"applied":false,"state":"recovery_required",
                         "lease":self.display_lease,"operation_id":self.display_operation});
@@ -687,9 +735,80 @@ impl Broker {
                 let lease = self.display_lease.take();
                 self.display_recovery_required = false;
                 self.display_operation = None;
+                if let Some(snapshot) = self.display_saved_topology.take() {
+                    self.display_topology = snapshot;
+                }
                 json!({"ok":true,"restored":true,"lease":lease})
             }
             _ => panic!("unexpected display action"),
+        }
+    }
+
+    fn virtual_display(&mut self, action: &str, payload: &Value) -> Value {
+        match action {
+            "create" => {
+                if let Some(code) = self.virtual_display_create_failure.as_deref() {
+                    return error(code);
+                }
+                let specification = json!({
+                    "identity":payload["identity"],
+                    "name":payload["name"],
+                    "width":payload["width"],
+                    "height":payload["height"],
+                    "refresh_millihz":payload["refresh_millihz"],
+                });
+                if self
+                    .virtual_display_specification
+                    .as_ref()
+                    .is_some_and(|current| current != &specification)
+                {
+                    return error("identity_conflict");
+                }
+                self.virtual_display_specification = Some(specification);
+                self.virtual_display_references.insert(
+                    payload["reference_id"]
+                        .as_str()
+                        .expect("reference ID")
+                        .to_owned(),
+                );
+                json!({"ok":true,"created":true})
+            }
+            "status" => {
+                let reference = payload["reference_id"].as_str().expect("reference ID");
+                let reference_owned = self.virtual_display_references.contains(reference);
+                let monitors = self.virtual_display_specification.as_ref().map_or_else(
+                    Vec::new,
+                    |specification| {
+                        let state = if self.virtual_display_pending_statuses > 0 {
+                            "creating"
+                        } else {
+                            "ready"
+                        };
+                        if self.virtual_display_pending_statuses > 0 {
+                            self.virtual_display_pending_statuses -= 1;
+                        }
+                        vec![json!({"specification":specification,"state":state,
+                            "ready":{"device_path":"\\\\.\\DISPLAYVDD"},"error":null})]
+                    },
+                );
+                json!({"ok":true,"monitors":monitors,"reference_owned":reference_owned})
+            }
+            "remove" => {
+                if self.virtual_display_remove_failure {
+                    return error("cleanup_pending");
+                }
+                let reference = payload["reference_id"].as_str().expect("reference ID");
+                let released = self.virtual_display_references.remove(reference);
+                let reference_owned = self.virtual_display_references.contains(reference);
+                let removed = self.virtual_display_references.is_empty();
+                if removed {
+                    self.virtual_display_specification = None;
+                }
+                json!({"ok":true,"identity":payload["identity"],
+                    "reference_released":released,"reference_owned":reference_owned,
+                    "removed":removed})
+            }
+            _ => panic!("unexpected virtual display action"),
         }
     }
 

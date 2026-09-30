@@ -157,7 +157,7 @@ impl Controller {
             rpc::complete(runtime, request, error("capacity_exceeded"));
             return;
         }
-        if config.display_request.is_some() && !verified {
+        if config.display_admission_required() && !verified {
             if self.display_cleanup.len() >= MAX_DISPLAY_CLEANUP {
                 rpc::complete(runtime, request, error("display_admission_unavailable"));
                 return;
@@ -168,7 +168,7 @@ impl Controller {
             }
             let digest = config
                 .display_request_sha256()
-                .expect("validated display request");
+                .expect("validated display admission request");
             let snapshot = config
                 .display_policy_snapshot
                 .as_ref()
@@ -255,7 +255,7 @@ impl Controller {
             record.udp_discovery.as_ref(),
             media_binds,
         );
-        if record.config.display_request.is_some() {
+        if record.config.display_admission_required() {
             // Stream-session starts its prepared timer after Apply/readback. Reserve
             // the whole Prepare budget so an orphaned lease cannot outlive Launch's
             // staged admission if this RTSP module stops before explicit cleanup.

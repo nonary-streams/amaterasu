@@ -62,6 +62,7 @@ version = "0.1.0"
 name = "amaterasu-application"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-module-sdk",
  "libc",
  "serde",
@@ -348,6 +349,7 @@ dependencies = [
 name = "amaterasu-launch"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-input-policy",
  "amaterasu-module-sdk",
  "getrandom 0.3.4",
@@ -445,6 +447,7 @@ dependencies = [
 name = "amaterasu-nvhttp"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-gamestream",
  "amaterasu-identity",
  "amaterasu-input-policy",
@@ -527,6 +530,7 @@ dependencies = [
 name = "amaterasu-rtsp"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-gamestream",
  "amaterasu-input-policy",
  "amaterasu-module-sdk",
@@ -601,6 +605,7 @@ dependencies = [
 name = "amaterasu-stream-session"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-gamestream",
  "amaterasu-input-policy",
  "amaterasu-media",
@@ -669,6 +674,7 @@ dependencies = [
 name = "amaterasu-virtual-display"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-module-sdk",
  "getrandom 0.3.4",
  "serde",

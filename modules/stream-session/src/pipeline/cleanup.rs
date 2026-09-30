@@ -30,6 +30,64 @@ impl Pipeline {
                     job.display_tried = true;
                 }
             }
+            Step::StatusVirtualDisplay => {
+                use super::virtual_display::ReferenceStatus;
+                match super::virtual_display::accept_status(record, &payload) {
+                    ReferenceStatus::Missing if record.virtual_display_status_verified => {
+                        record.virtual_display_attempted = false;
+                        record.virtual_display_remove_attempted = false;
+                        job.virtual_display_tried = true;
+                    }
+                    ReferenceStatus::Ready | ReferenceStatus::Pending | ReferenceStatus::Failed
+                        if record.virtual_display_status_verified
+                            && record.virtual_display_reference_owned =>
+                    {
+                        if record.virtual_display_remove_attempted {
+                            record.cleanup_error = Some("virtual_display_remove_unconfirmed");
+                            job.virtual_display_tried = true;
+                        } else {
+                            job.step = Step::RemoveVirtualDisplay;
+                        }
+                    }
+                    _ => {
+                        record.cleanup_error = Some("virtual_display_status_unavailable");
+                        job.virtual_display_tried = true;
+                    }
+                }
+            }
+            Step::RemoveVirtualDisplay => {
+                if super::virtual_display::accept_remove(record, &payload) {
+                    record.virtual_display_attempted = false;
+                    record.virtual_display_remove_attempted = false;
+                    job.virtual_display_tried = true;
+                } else {
+                    record.cleanup_error = Some("virtual_display_remove_failed");
+                    // The removal response may have been lost after releasing the
+                    // reference. Confirm through status before reporting cleanup.
+                    job.step = Step::StatusVirtualDisplay;
+                }
+            }
+            Step::CreateVirtualDisplay => {
+                if payload["ok"] != true {
+                    record.virtual_display_create_error = payload["code"]
+                        .as_str()
+                        .or_else(|| payload["error"]["code"].as_str())
+                        .map(str::to_owned);
+                }
+                job.step = Step::StatusVirtualDisplay;
+            }
+            Step::SnapshotDisplay => {
+                record.cleanup_error = Some("display_snapshot_unavailable");
+                job.virtual_display_tried = true;
+            }
+            Step::ApplyDisplay => {
+                super::display::accept_apply(record, &payload);
+                job.step = Step::FindDisplay;
+            }
+            Step::ApplyLimiter => {
+                super::limiter::accept_apply(record, &payload);
+                job.step = Step::FindLimiter;
+            }
             Step::FindLimiter => {
                 super::limiter::accept_status(record, &payload);
                 if record.limiter_lease.is_none() {
@@ -164,6 +222,18 @@ impl Pipeline {
                 job.display_tried = true;
                 true
             }
+            Step::StatusVirtualDisplay => {
+                record.cleanup_error = Some("virtual_display_status_unavailable");
+                job.virtual_display_tried = true;
+                true
+            }
+            Step::RemoveVirtualDisplay => {
+                record.cleanup_error = Some("virtual_display_remove_unconfirmed");
+                // Reconcile the same stable reference before declaring cleanup.
+                record.virtual_display_remove_attempted = true;
+                job.step = Step::StatusVirtualDisplay;
+                true
+            }
             Step::FindLimiter => {
                 record.cleanup_error = Some("frame_limiter_status_unavailable");
                 job.limiter_tried = true;
@@ -212,6 +282,8 @@ impl Pipeline {
             && !record.limiter_attempted
             && !record.display_attempted
             && record.display_lease.is_none()
+            && !record.virtual_display_attempted
+            && !record.virtual_display_reference_owned
         {
             record.cleanup_error = None;
             record.outcome

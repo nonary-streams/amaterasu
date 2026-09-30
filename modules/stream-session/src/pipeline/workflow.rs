@@ -11,6 +11,10 @@ pub(super) enum Step {
     MediaReady,
     ConfigureMediaVideoFormat,
     ApplyLimiter,
+    CreateVirtualDisplay,
+    StatusVirtualDisplay,
+    RemoveVirtualDisplay,
+    SnapshotDisplay,
     CheckDisplay,
     ApplyDisplay,
     FindDisplay,
@@ -54,6 +58,7 @@ pub(super) struct Job {
     pub input_tried: bool,
     pub limiter_tried: bool,
     pub display_tried: bool,
+    pub virtual_display_tried: bool,
 }
 
 impl Job {
@@ -71,6 +76,7 @@ impl Job {
             input_tried: false,
             limiter_tried: false,
             display_tried: false,
+            virtual_display_tried: false,
         }
     }
 
@@ -143,6 +149,27 @@ impl Job {
             }
             self.display_tried = true;
         }
+        // A display Apply may have committed while its reply was lost. Never
+        // release the monitor until that topology lease is verified/restored.
+        if record.virtual_display_attempted
+            && record.display_attempted
+            && (!record.display_status_verified
+                || (record.owns_display_restore && record.display_lease.is_some()))
+        {
+            return None;
+        }
+        if !self.virtual_display_tried {
+            if record.virtual_display_attempted && !record.virtual_display_status_verified {
+                return Some(Step::StatusVirtualDisplay);
+            }
+            if record.virtual_display_reference_owned {
+                return Some(Step::RemoveVirtualDisplay);
+            }
+            if record.virtual_display_attempted {
+                return Some(Step::StatusVirtualDisplay);
+            }
+            self.virtual_display_tried = true;
+        }
         if record.resources.contains_key(&Resource::Session) {
             if record
                 .attempted
@@ -195,6 +222,19 @@ impl Job {
                 "amaterasu.frame-limiter/1".into(),
                 json!({"action":"restore","version":1,"lease":record.limiter_lease}),
             ),
+            Step::CreateVirtualDisplay => (
+                "amaterasu.virtual-display/1".into(),
+                super::virtual_display::create(record),
+            ),
+            Step::StatusVirtualDisplay => (
+                "amaterasu.virtual-display/1".into(),
+                super::virtual_display::status(record),
+            ),
+            Step::RemoveVirtualDisplay => (
+                "amaterasu.virtual-display/1".into(),
+                super::virtual_display::remove(record),
+            ),
+            Step::SnapshotDisplay => ("amaterasu.display/1".into(), json!({"action":"snapshot"})),
             Step::CheckDisplay | Step::FindDisplay => {
                 ("amaterasu.display/1".into(), json!({"action":"status"}))
             }
