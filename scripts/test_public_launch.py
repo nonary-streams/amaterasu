@@ -346,7 +346,9 @@ def exercise_stream(
                 )
                 input_state = console.request(INPUT_PROBE, {"action": "status"})
                 assert input_state["fixture"], input_state
-                assert_input_overrides(input_state["requested_policy"], expected_input)
+                assert_input_overrides(
+                    input_state["requested_policy"], expected_input, require_present=True,
+                )
             wait_until(
                 lambda: media_complete(console, baseline),
                 "stream did not produce media and an IDR request",
@@ -519,15 +521,29 @@ def main():
             exercise_natural_exit(console, https, context, short_marker, short_app, 17)
             # key_id is an IV salt, not session identity. Fresh AES keys may
             # legitimately reuse it, so every session deliberately uses 17.
-            for mode in ("teardown", "cancel", "revoke"):
-                if mode == "teardown":
+            for policy_stage, mode in (
+                ("client", "teardown"),
+                ("client_empty", "teardown"),
+                ("application", "cancel"),
+                ("application_empty", "teardown"),
+                ("inherit", "revoke"),
+            ):
+                if policy_stage == "client":
                     expected_input = CLIENT_INPUT_OVERRIDES
-                elif mode == "cancel":
+                elif policy_stage == "client_empty":
+                    expected_input = {**CLIENT_INPUT_OVERRIDES, "keybindings": []}
+                    update_client_input_overrides(console, certificate_id, expected_input)
+                elif policy_stage == "application":
                     update_client_input_overrides(
                         console, certificate_id,
                         {key: None for key in CLIENT_INPUT_OVERRIDES},
                     )
                     expected_input = APPLICATION_INPUT_OVERRIDES
+                elif policy_stage == "application_empty":
+                    expected_input = {**APPLICATION_INPUT_OVERRIDES, "keybindings": []}
+                    update_application_input_overrides(
+                        console, "app-0000000000000001", expected_input,
+                    )
                 else:
                     update_application_input_overrides(
                         console, "app-0000000000000001",
@@ -552,7 +568,8 @@ def main():
         "encrypted RTSP and discovered UDP media, TEARDOWN and "
         "certificate-revocation cleanup of capture and controlled child. "
         "Scoped input lease requests preserve certificate-bound client/application "
-        "precedence, false/zero, null inheritance, and restart persistence. "
+        "precedence, false/zero, ordered keybindings and explicit empty maps, "
+        "null inheritance, and restart persistence. "
         "Hardware and full client parity remain unqualified."
     )
 

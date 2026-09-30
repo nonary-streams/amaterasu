@@ -26,6 +26,7 @@ PASSWORD = "test-password-for-local-api-only"
 PAIRING_FIXTURES = Path(__file__).resolve().parents[1] / "modules" / "pairing" / "tests" / "fixtures"
 
 CLIENT_INPUT_OVERRIDES = {
+    "keybindings": [65, 66, 65, 67, 165, 0],
     "high_resolution_scrolling": False,
     "always_send_scancodes": False,
     "key_rightalt_to_key_win": True,
@@ -33,12 +34,17 @@ CLIENT_INPUT_OVERRIDES = {
     "key_repeat_frequency": 0.0,
 }
 APPLICATION_INPUT_OVERRIDES = {
+    "keybindings": [66, 67, 16, 160],
     "high_resolution_scrolling": True,
     "always_send_scancodes": True,
     "key_rightalt_to_key_win": False,
     "key_repeat_delay": 275,
     "key_repeat_frequency": 31.25,
 }
+INVALID_KEYBINDINGS = (
+    "[]", {}, [1], [-1, 0], [0, 256], [True, 0], [1.0, 2],
+    ["16", 160], [[16, 160]], [0] * 514,
+)
 INVALID_INPUT_OVERRIDES = (
     {"controller": "false"}, {"keyboard": "false"}, {"mouse": 1},
     {"gamepad": "unknown-profile"}, {"high_resolution_scrolling": "false"},
@@ -46,11 +52,13 @@ INVALID_INPUT_OVERRIDES = (
     {"key_repeat_delay": -1}, {"key_repeat_delay": 0.5},
     {"key_repeat_delay": 2147483648}, {"key_repeat_frequency": -0.1},
     {"key_repeat_frequency": "31.25"},
-)
+) + tuple({"keybindings": value} for value in INVALID_KEYBINDINGS)
 
 
-def assert_input_overrides(overrides, expected):
+def assert_input_overrides(overrides, expected, *, require_present=False):
     for key, value in expected.items():
+        if require_present:
+            assert key in overrides, (key, overrides)
         actual = overrides.get(key)
         assert actual == value, (key, actual, value)
         if isinstance(value, bool):
@@ -58,6 +66,12 @@ def assert_input_overrides(overrides, expected):
         elif isinstance(value, (int, float)):
             assert isinstance(actual, (int, float)) and not isinstance(actual, bool), (
                 key, actual, value
+            )
+        elif isinstance(value, list):
+            assert isinstance(actual, list), (key, actual, value)
+            assert len(actual) % 2 == 0 and len(actual) <= 512, (key, actual)
+            assert all(type(byte) is int and 0 <= byte <= 255 for byte in actual), (
+                key, actual
             )
 
 
@@ -120,6 +134,17 @@ def available_moonlight_port_pair():
 
 class Api:
     def __init__(self, console):
+        # Listener availability precedes durable peer-policy readiness. The
+        # management server deliberately drops HTTP connections until that
+        # policy is loaded; wait through its signed read-only service first.
+        deadline = time.monotonic() + 20
+        while True:
+            policy = console.request("amaterasu.management/1", {"action": "product_get"})
+            assert time.monotonic() < deadline, "management durable peer policy did not load"
+            if policy.get("ok"):
+                break
+            assert policy.get("code") == "settings_unavailable", policy
+            time.sleep(0.025)
         status = console.request("amaterasu.management/1", {"action": "status"})
         assert status["ok"] and status["enabled"], status
         host, port = status["bound_address"].rsplit(":", 1)
@@ -868,6 +893,10 @@ def test_auth_and_crud(console, api):
     assert input_defaults["values"]["key_rightalt_to_key_win"] is False, input_defaults
     assert input_defaults["values"]["key_repeat_delay"] == 500, input_defaults
     assert input_defaults["values"]["key_repeat_frequency"] == 24.9, input_defaults
+    assert_input_overrides(
+        input_defaults["values"], {"keybindings": [16, 160, 17, 162, 18, 164]},
+        require_present=True,
+    )
     assert input_defaults["values"]["back_button_timeout"] == -1, input_defaults
     assert input_defaults["values"]["gamepad"] == "auto", input_defaults
     assert input_defaults["values"]["controller"] is True, input_defaults
@@ -880,6 +909,7 @@ def test_auth_and_crud(console, api):
     assert "auto" in input_status["supported_profiles"], input_status
     assert selected_gamepad in input_status["supported_profiles"], input_status
     input_policy_update = {
+        "keybindings": [65, 66, 65, 67, 165, 0],
         "keyboard": False,
         "mouse": True,
         "high_resolution_scrolling": False,
@@ -897,6 +927,9 @@ def test_auth_and_crud(console, api):
     }, administrator)
     assert status == 200 and input_updated["ok"] and input_updated["persisted"] and input_updated["applied"], input_updated
     assert input_updated["values"] == input_values and input_updated["revision"] == 1, input_updated
+    status, input_keybindings_saved, _ = api.post("/v1/input/settings_get", token=administrator)
+    assert status == 200 and input_keybindings_saved["revision"] == 1, input_keybindings_saved
+    assert_input_overrides(input_keybindings_saved["values"], input_policy_update, require_present=True)
     status, input_status, _ = api.post("/v1/input/status", token=administrator)
     assert status == 200 and input_status["gamepad"] == selected_gamepad, input_status
     assert input_status["controller_enabled"] is False, input_status
@@ -925,7 +958,7 @@ def test_auth_and_crud(console, api):
         {"gamepad": 1},
         {"controller": None},
         {"controller": "false"},
-    ]:
+    ] + [{"keybindings": value} for value in (*INVALID_KEYBINDINGS, None)]:
         invalid_status, _, _ = api.post("/v1/input/settings_update", {
             "keyboard": input_values["keyboard"],
             "mouse": input_values["mouse"],
@@ -933,7 +966,7 @@ def test_auth_and_crud(console, api):
             "expected_revision": input_updated["revision"],
         }, administrator)
         assert invalid_status == 400, invalid_repeat
-    zero_repeat = {"key_repeat_delay": 0, "key_repeat_frequency": 0}
+    zero_repeat = {"key_repeat_delay": 0, "key_repeat_frequency": 0, "keybindings": []}
     status, input_zero_repeat, _ = api.post("/v1/input/settings_update", {
         "keyboard": input_values["keyboard"],
         "mouse": input_values["mouse"],
@@ -945,7 +978,7 @@ def test_auth_and_crud(console, api):
     assert input_zero_repeat["values"] == input_values and input_zero_repeat["revision"] == 2, input_zero_repeat
     status, input_saved, _ = api.post("/v1/input/settings_get", token=administrator)
     assert status == 200 and input_saved["values"] == input_values and input_saved["revision"] == 2, input_saved
-    # A v3 client omits Right Alt, repeat, controller, Back timeout, and gamepad fields; preserve them while it
+    # An older client omits keybindings, Right Alt, repeat, controller, Back timeout, and gamepad fields; preserve them while it
     # updates the older keyboard, mouse, scrolling and scancode settings.
     status, input_legacy_updated, _ = api.post("/v1/input/settings_update", {
         "keyboard": True,
@@ -1588,7 +1621,7 @@ def main():
     print("Playnite settings CAS, refresh policy, Windows Fullscreen entry ownership and restart persistence,")
     print("session history authorization, settings CAS, status, and restart persistence,")
     print("administrator session restart persistence,")
-    print("input policy CAS, controller switch, gamepad profile/status, Right Alt, repeat and Back timeout settings, legacy field omission and restart persistence, configured diagnostic log filtering, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
+    print("input policy CAS, ordered keybindings and explicit empty replacements, controller switch, gamepad profile/status, Right Alt, repeat and Back timeout settings, legacy field omission and restart persistence, configured diagnostic log filtering, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
 
 if __name__ == "__main__":
