@@ -3,6 +3,9 @@ use amaterasu_abi::{
     AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleEntry, RuntimeApi, RuntimeEntry, STATUS_OK,
     Status,
 };
+use amaterasu_contracts::{
+    Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HostLifecycleAction, Response,
+};
 use amaterasu_package::{PackageResult, VerifiedPackage, ordered_components};
 use libloading::Library;
 use serde_json::json;
@@ -24,6 +27,7 @@ pub(crate) fn path_to_unicode_string(path: &Path) -> Result<String, String> {
 pub struct LoadedComponents {
     // Fields drop in declaration order: modules must stop before their runtime disappears.
     modules: Vec<FeatureLibrary>,
+    lifecycle_endpoint: HostApi,
     runtime: RuntimeLibrary,
 }
 
@@ -53,6 +57,11 @@ impl LoadedComponents {
         let mut runtime_config = package.runtime_config.clone();
         runtime_config.host_context.schema = 1;
         runtime_config.host_context.state_root = Some(state_root_string.clone());
+        runtime_config.host_lifecycle_control = true;
+        runtime_config.principals.insert(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(),
+            amaterasu_contracts::Grants::default(),
+        );
         if package
             .manifest
             .components
@@ -85,6 +94,7 @@ impl LoadedComponents {
             serde_json::to_vec(&runtime_config).map_err(|error| error.to_string())?;
         let mut runtime =
             RuntimeLibrary::load(&directory.join(&runtime_component.file), &configuration)?;
+        let lifecycle_endpoint = runtime.endpoint(HOST_LIFECYCLE_CONTROL_PRINCIPAL)?;
         progress(1)?;
         let mut modules = Vec::new();
 
@@ -99,7 +109,11 @@ impl LoadedComponents {
             modules.push(module);
             progress(index + 2)?;
         }
-        Ok(Self { modules, runtime })
+        Ok(Self {
+            modules,
+            lifecycle_endpoint,
+            runtime,
+        })
     }
 
     pub fn tick(&mut self) -> PackageResult<()> {
@@ -118,6 +132,20 @@ impl LoadedComponents {
 
     pub fn console_endpoint(&mut self) -> PackageResult<HostApi> {
         self.runtime.endpoint("amaterasu.console")
+    }
+
+    pub fn take_host_lifecycle_action(&self) -> PackageResult<Option<HostLifecycleAction>> {
+        let input = serde_json::to_vec(&Command::HostLifecycleDrain {})
+            .map_err(|error| error.to_string())?;
+        // SAFETY: the private endpoint belongs to this live runtime and is used
+        // only while LoadedComponents keeps the runtime alive.
+        let output = unsafe { self.lifecycle_endpoint.call(&input) }
+            .map_err(|status| format!("host lifecycle endpoint returned status {status}"))?;
+        match serde_json::from_slice(&output).map_err(|error| error.to_string())? {
+            Response::HostLifecycle { action } => Ok(action),
+            Response::Error { code, message } => Err(format!("{code}: {message}")),
+            response => Err(format!("unexpected host lifecycle response: {response:?}")),
+        }
     }
 }
 

@@ -1,4 +1,6 @@
-use amaterasu_contracts::{Grants, HookSpec, RuntimeConfig, valid_name};
+use amaterasu_contracts::{
+    Grants, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HookSpec, RuntimeConfig, valid_name,
+};
 use std::collections::BTreeSet;
 
 const MAX_PRINCIPALS: usize = 128;
@@ -11,10 +13,24 @@ pub(super) fn validate(configuration: &RuntimeConfig) -> Result<(), String> {
     }
 
     for (name, grants) in &configuration.principals {
+        if name == HOST_LIFECYCLE_CONTROL_PRINCIPAL {
+            if !configuration.host_lifecycle_control || !grants_are_empty(grants) {
+                return Err("reserved host lifecycle identity is not host-authorized".into());
+            }
+            continue;
+        }
         if !valid_name(name) {
             return Err(format!("invalid principal name: {name}"));
         }
         validate_grants(grants)?;
+    }
+
+    if configuration.host_lifecycle_control
+        != configuration
+            .principals
+            .contains_key(HOST_LIFECYCLE_CONTROL_PRINCIPAL)
+    {
+        return Err("host lifecycle endpoint identity is missing or untrusted".into());
     }
 
     for (principal, settings) in &configuration.settings {
@@ -32,6 +48,16 @@ pub(super) fn validate(configuration: &RuntimeConfig) -> Result<(), String> {
         validate_hook(name, hook, configuration)?;
     }
     Ok(())
+}
+
+fn grants_are_empty(grants: &Grants) -> bool {
+    grants.native_provide.is_empty()
+        && grants.native_use.is_empty()
+        && grants.provide.is_empty()
+        && grants.call.is_empty()
+        && grants.publish.is_empty()
+        && grants.subscribe.is_empty()
+        && grants.hook.is_empty()
 }
 
 fn validate_grants(grants: &Grants) -> Result<(), String> {

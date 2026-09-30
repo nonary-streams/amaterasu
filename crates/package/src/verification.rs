@@ -208,6 +208,8 @@ fn resolve_runtime_grants(
         // A package policy is deliberately unable to specify process-local
         // host facts. The host injects those after package verification.
         host_context: Default::default(),
+        // Package policy cannot create the reserved host lifecycle endpoint.
+        host_lifecycle_control: false,
     };
 
     for component in components.iter().filter(|component| !component.runtime) {
@@ -234,4 +236,34 @@ fn resolve_runtime_grants(
             .insert("amaterasu.console".into(), console.clone());
     }
     runtime
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_runtime_grants;
+    use crate::BootstrapConfig;
+    use amaterasu_contracts::{HOST_LIFECYCLE_CONTROL_PRINCIPAL, RuntimeConfig};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn package_policy_cannot_claim_the_host_lifecycle_identity() {
+        let bootstrap = BootstrapConfig {
+            development: false,
+            allow_unsigned: false,
+            trusted_keys: BTreeMap::new(),
+            policy: RuntimeConfig {
+                principals: [(HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Default::default())].into(),
+                host_lifecycle_control: true,
+                ..Default::default()
+            },
+        };
+
+        let runtime = resolve_runtime_grants(&bootstrap, &[]);
+        assert!(!runtime.host_lifecycle_control);
+        assert!(
+            !runtime
+                .principals
+                .contains_key(HOST_LIFECYCLE_CONTROL_PRINCIPAL)
+        );
+    }
 }

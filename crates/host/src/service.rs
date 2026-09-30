@@ -1,5 +1,5 @@
 //! Development console supervision. Never replays a dispatched command.
-use amaterasu_contracts::{Command as ControlCommand, Response};
+use amaterasu_contracts::{Command as ControlCommand, HostLifecycleAction, Response};
 use amaterasu_package::{
     ActivationState, BootstrapConfig, PackageResult, RootLock, VerificationPolicy,
     package_directory, read_json, unix_timestamp, verify_package, write_json_atomically,
@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
-const MAX_RESTARTS: usize = 3;
 const SERVICE_READY_FILE: &str = "service-ready.json";
 const OPERATIONAL_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_RESPONSE_LIMIT: usize = 24_000;
@@ -225,13 +224,24 @@ pub fn serve(root: &Path) -> PackageResult<()> {
     // process before console input is read or sent to the persistent worker.
     let digest = crate::supervisor::select_active(root)?;
     let input = crate::protocol::lines(std::io::stdin());
-    let mut restarts = 0;
+    let mut restarts = crate::protocol::RestartBudget::default();
     let mut worker = start_with_recovery(root, &digest, &mut restarts, true)?;
     loop {
-        if let Err(failure) = worker.check_idle() {
-            eprintln!("Development worker failed: {failure}");
-            drop(worker);
-            worker = restart(root, &digest, &mut restarts, true)?;
+        match worker.check_idle() {
+            Ok(Some(action)) => {
+                let Some(replacement) =
+                    apply_worker_action(action, worker, root, &digest, &mut restarts, true)?
+                else {
+                    return Ok(());
+                };
+                worker = replacement;
+            }
+            Ok(None) => {}
+            Err(failure) => {
+                eprintln!("Development worker failed: {failure}");
+                drop(worker);
+                worker = restart(root, &digest, &mut restarts, true)?;
+            }
         }
         match input.recv_timeout(Duration::from_millis(20)) {
             Ok(Ok(line)) => {
@@ -247,7 +257,25 @@ pub fn serve(root: &Path) -> PackageResult<()> {
                     continue;
                 }
                 match worker.execute(&line) {
-                    Ok(reply) => write_reply(&reply)?,
+                    Ok(WorkerEvent::Response(reply)) => write_reply(&reply)?,
+                    Ok(WorkerEvent::HostAction(action)) => {
+                        write_reply(&Response::error(
+                            "worker_unavailable",
+                            "host lifecycle action interrupted the request; outcome may be unknown; command was not replayed",
+                        ))?;
+                        let Some(replacement) = apply_worker_action(
+                            action,
+                            worker,
+                            root,
+                            &digest,
+                            &mut restarts,
+                            true,
+                        )?
+                        else {
+                            return Ok(());
+                        };
+                        worker = replacement;
+                    }
                     Err(failure) => {
                         write_reply(&Response::error(
                             "worker_unavailable",
@@ -314,15 +342,33 @@ pub(crate) fn run_managed_service(
 ) -> PackageResult<()> {
     let _lock = RootLock::acquire(root)?;
     let digest = crate::supervisor::select_active(root)?;
-    let mut restarts = 0;
+    let mut restarts = crate::protocol::RestartBudget::default();
     let mut worker = start_with_recovery(root, &digest, &mut restarts, false)?;
     publish_service_readiness(root, &digest)?;
     on_started();
 
     while !stop_requested() {
-        if worker.check_idle().is_err() {
-            drop(worker);
-            worker = restart(root, &digest, &mut restarts, false)?;
+        match worker.check_idle() {
+            Ok(Some(HostLifecycleAction::Restart)) => {
+                let Some(replacement) = apply_worker_action(
+                    HostLifecycleAction::Restart,
+                    worker,
+                    root,
+                    &digest,
+                    &mut restarts,
+                    false,
+                )?
+                else {
+                    unreachable!("restart action always creates a replacement worker")
+                };
+                worker = replacement;
+            }
+            Ok(Some(HostLifecycleAction::Quit)) => break,
+            Ok(None) => {}
+            Err(_) => {
+                drop(worker);
+                worker = restart(root, &digest, &mut restarts, false)?;
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -351,7 +397,9 @@ pub(crate) fn run_interactive_service(
     publish_service_readiness(root, &digest)?;
     on_started();
     while !stop_requested() {
-        supervisor.refresh(session_changed())?;
+        if supervisor.refresh(session_changed())? == Some(HostLifecycleAction::Quit) {
+            break;
+        }
         if !supervisor.has_ready_worker()? {
             remove_service_readiness(root);
         } else if !root
@@ -396,6 +444,11 @@ fn write_reply(value: &impl serde::Serialize) -> PackageResult<()> {
     writeln!(output)
         .and_then(|()| output.flush())
         .map_err(|error| error.to_string())
+}
+
+enum WorkerEvent {
+    Response(serde_json::Value),
+    HostAction(HostLifecycleAction),
 }
 
 struct Worker {
@@ -457,22 +510,52 @@ impl Worker {
         }
     }
 
-    fn check_process(&mut self) -> PackageResult<()> {
+    fn check_process(&mut self) -> PackageResult<Option<HostLifecycleAction>> {
         if let Some(status) = self.child.try_wait().map_err(|error| error.to_string())? {
-            return Err(format!("worker exited: {status}"));
+            let deadline = Instant::now() + Duration::from_millis(50);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!("worker exited without lifecycle action: {status}"));
+                }
+                match self.output.recv_timeout(remaining) {
+                    Ok(Ok(line)) if line == "HEARTBEAT" => {
+                        self.last_heartbeat = Instant::now();
+                    }
+                    Ok(Ok(line)) => {
+                        if let Some(action) = crate::protocol::parse_host_action(&line)? {
+                            return crate::protocol::acknowledge_host_action(
+                                action,
+                                status.success(),
+                            )
+                            .map(Some);
+                        }
+                        return Err("unexpected idle worker message".into());
+                    }
+                    Ok(Err(failure)) => return Err(failure),
+                    Err(_) => {
+                        return Err(format!("worker exited without lifecycle action: {status}"));
+                    }
+                }
+            }
         }
         if self.last_heartbeat.elapsed() >= LIVENESS_TIMEOUT {
             return Err("worker heartbeat deadline elapsed".into());
         }
-        Ok(())
+        Ok(None)
     }
 
-    fn check_idle(&mut self) -> PackageResult<()> {
+    fn check_idle(&mut self) -> PackageResult<Option<HostLifecycleAction>> {
         // Bound processing even if a faulty native module floods the pipe.
         for _ in 0..8 {
             match self.output.try_recv() {
                 Ok(Ok(line)) if line == "HEARTBEAT" => self.last_heartbeat = Instant::now(),
-                Ok(Ok(_)) => return Err("unexpected idle worker message".into()),
+                Ok(Ok(line)) => {
+                    let Some(action) = crate::protocol::parse_host_action(&line)? else {
+                        return Err("unexpected idle worker message".into());
+                    };
+                    return self.acknowledge_host_action(action).map(Some);
+                }
                 Ok(Err(failure)) => return Err(failure),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Err("worker output closed".into()),
@@ -481,7 +564,23 @@ impl Worker {
         self.check_process()
     }
 
-    fn execute(&mut self, line: &str) -> PackageResult<serde_json::Value> {
+    fn acknowledge_host_action(
+        &mut self,
+        action: HostLifecycleAction,
+    ) -> PackageResult<HostLifecycleAction> {
+        let deadline = Instant::now() + LIVENESS_TIMEOUT;
+        loop {
+            if let Some(status) = self.child.try_wait().map_err(|error| error.to_string())? {
+                return crate::protocol::acknowledge_host_action(action, status.success());
+            }
+            if Instant::now() >= deadline {
+                return Err("worker lifecycle action exit deadline elapsed".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn execute(&mut self, line: &str) -> PackageResult<WorkerEvent> {
         let mut input = self.input.take().ok_or("worker stdin closed")?;
         let line = line.to_owned();
         let (delivered, delivery) = std::sync::mpsc::sync_channel(1);
@@ -511,7 +610,7 @@ impl Worker {
             if self.input.is_some()
                 && let Some(reply) = reply.take()
             {
-                return Ok(reply);
+                return Ok(WorkerEvent::Response(reply));
             }
             if Instant::now() >= deadline {
                 return Err("worker request deadline elapsed".into());
@@ -527,12 +626,21 @@ impl Worker {
                     reply =
                         Some(serde_json::to_value(response).map_err(|error| error.to_string())?);
                 }
-                Ok(Ok(_)) => return Err("unexpected worker response".into()),
+                Ok(Ok(line)) => {
+                    let Some(action) = crate::protocol::parse_host_action(&line)? else {
+                        return Err("unexpected worker response".into());
+                    };
+                    return self
+                        .acknowledge_host_action(action)
+                        .map(WorkerEvent::HostAction);
+                }
                 Ok(Err(failure)) => return Err(failure),
                 Err(RecvTimeoutError::Disconnected) => return Err("worker output closed".into()),
                 Err(RecvTimeoutError::Timeout) => {}
             }
-            self.check_process()?;
+            if let Some(action) = self.check_process()? {
+                return Ok(WorkerEvent::HostAction(action));
+            }
         }
     }
 
@@ -565,7 +673,7 @@ impl Worker {
 fn start_with_recovery(
     root: &Path,
     digest: &str,
-    restarts: &mut usize,
+    restarts: &mut crate::protocol::RestartBudget,
     announce_ready: bool,
 ) -> PackageResult<Worker> {
     match Worker::start(root, digest, announce_ready) {
@@ -582,16 +690,34 @@ fn start_with_recovery(
 fn restart(
     root: &Path,
     digest: &str,
-    restarts: &mut usize,
+    restarts: &mut crate::protocol::RestartBudget,
     announce_ready: bool,
 ) -> PackageResult<Worker> {
-    if *restarts >= MAX_RESTARTS {
-        return Err("development worker restart budget exhausted".into());
-    }
-    let delay = Duration::from_millis(100 << *restarts);
-    *restarts += 1;
+    let delay = restarts
+        .next_delay()
+        .ok_or("development worker restart budget exhausted")?;
     std::thread::sleep(delay);
     start_with_recovery(root, digest, restarts, announce_ready)
+}
+
+fn apply_worker_action(
+    action: HostLifecycleAction,
+    mut worker: Worker,
+    root: &Path,
+    digest: &str,
+    restarts: &mut crate::protocol::RestartBudget,
+    announce_ready: bool,
+) -> PackageResult<Option<Worker>> {
+    match action {
+        HostLifecycleAction::Restart => {
+            drop(worker);
+            restart(root, digest, restarts, announce_ready).map(Some)
+        }
+        HostLifecycleAction::Quit => {
+            worker.shutdown()?;
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]

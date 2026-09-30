@@ -86,6 +86,128 @@ fn host_state_context_is_available_only_to_the_state_service() {
         Response::Error { code, .. } if code == "permission_denied"
     ));
 }
+
+#[test]
+fn host_lifecycle_requires_a_module_grant_and_the_private_host_identity_to_drain() {
+    let configuration = RuntimeConfig {
+        principals: [
+            ("tray".into(), Grants::default()),
+            (HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Grants::default()),
+        ]
+        .into(),
+        host_lifecycle_control: true,
+        ..Default::default()
+    };
+    let mut broker = Broker::new(configuration).unwrap();
+
+    assert_error_code(
+        broker.dispatch(
+            "tray",
+            Command::HostLifecycle {
+                action: HostLifecycleAction::Quit,
+            },
+        ),
+        "permission_denied",
+    );
+    assert_error_code(
+        broker.dispatch("tray", Command::HostLifecycleDrain {}),
+        "permission_denied",
+    );
+    assert!(matches!(
+        broker.dispatch(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::HostLifecycleDrain {}
+        ),
+        Response::HostLifecycle { action: None }
+    ));
+}
+
+#[test]
+fn host_lifecycle_queue_is_bounded_and_drains_each_authorized_action_once() {
+    let configuration = RuntimeConfig {
+        principals: [
+            (
+                "tray".into(),
+                Grants {
+                    call: names(&[HOST_LIFECYCLE_SERVICE]),
+                    ..Default::default()
+                },
+            ),
+            (HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Grants::default()),
+        ]
+        .into(),
+        host_lifecycle_control: true,
+        ..Default::default()
+    };
+    let mut broker = Broker::new(configuration).unwrap();
+
+    for index in 0..8 {
+        let action = if index % 2 == 0 {
+            HostLifecycleAction::Restart
+        } else {
+            HostLifecycleAction::Quit
+        };
+        assert!(matches!(
+            broker.dispatch("tray", Command::HostLifecycle { action }),
+            Response::Ok
+        ));
+    }
+    assert_error_code(
+        broker.dispatch(
+            "tray",
+            Command::HostLifecycle {
+                action: HostLifecycleAction::Restart,
+            },
+        ),
+        "capacity_exhausted",
+    );
+
+    for index in 0..8 {
+        let expected = if index % 2 == 0 {
+            HostLifecycleAction::Restart
+        } else {
+            HostLifecycleAction::Quit
+        };
+        assert!(matches!(
+            broker.dispatch(
+                HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                Command::HostLifecycleDrain {}
+            ),
+            Response::HostLifecycle { action: Some(action) } if action == expected
+        ));
+    }
+    assert!(matches!(
+        broker.dispatch(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::HostLifecycleDrain {}
+        ),
+        Response::HostLifecycle { action: None }
+    ));
+}
+
+#[test]
+fn reserved_host_lifecycle_identity_requires_host_injection_and_empty_grants() {
+    let mut package_claim = RuntimeConfig::default();
+    package_claim
+        .principals
+        .insert(HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Grants::default());
+    assert!(Broker::new(package_claim).is_err());
+
+    let widened_host = RuntimeConfig {
+        principals: [(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(),
+            Grants {
+                call: names(&[HOST_LIFECYCLE_SERVICE]),
+                ..Default::default()
+            },
+        )]
+        .into(),
+        host_lifecycle_control: true,
+        ..Default::default()
+    };
+    assert!(Broker::new(widened_host).is_err());
+}
+
 fn request(operation: &str) -> Command {
     Command::Request {
         service: "echo/1".into(),

@@ -5,6 +5,7 @@
 //! duplicated with the rights needed for process creation. No token, user
 //! environment, or service handle is passed to the worker after launch.
 
+use amaterasu_contracts::HostLifecycleAction;
 use amaterasu_package::PackageResult;
 use amaterasu_package::playnite_extension::{
     PlayniteExtensionInstall, PlayniteExtensionReceipt, finalize_playnite_extension,
@@ -18,6 +19,8 @@ const WTS_ACTIVE: i32 = 0;
 const INVALID_SESSION_ID: u32 = u32::MAX;
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
+const HOST_ACTION_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_WORKER_PROTOCOL_BUFFER: usize = 128;
 const TOKEN_ASSIGN_PRIMARY: u32 = 0x0001;
 const TOKEN_DUPLICATE: u32 = 0x0002;
 const TOKEN_QUERY: u32 = 0x0008;
@@ -183,6 +186,7 @@ unsafe extern "system" {
     ) -> *mut c_void;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+    fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
     fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
     fn CreatePipe(
         read_pipe: *mut *mut c_void,
@@ -230,6 +234,8 @@ pub(crate) struct Supervisor<'a> {
     digest: &'a str,
     worker: Option<Worker>,
     failed_starts: usize,
+    restart_budget: crate::protocol::RestartBudget,
+    restart_pending: bool,
     observed_session: Option<u32>,
 }
 
@@ -240,6 +246,8 @@ impl<'a> Supervisor<'a> {
             digest,
             worker: None,
             failed_starts: 0,
+            restart_budget: crate::protocol::RestartBudget::default(),
+            restart_pending: false,
             observed_session: None,
         };
         supervisor.refresh(true)?;
@@ -248,7 +256,10 @@ impl<'a> Supervisor<'a> {
 
     /// Stops a worker as soon as its user session is no longer active. Polling
     /// also closes the race where SCM does not deliver a session-change event.
-    pub(crate) fn refresh(&mut self, session_changed: bool) -> PackageResult<()> {
+    pub(crate) fn refresh(
+        &mut self,
+        session_changed: bool,
+    ) -> PackageResult<Option<HostLifecycleAction>> {
         let active = active_user_session()?;
         let session_changed_by_polling = active != self.observed_session;
         self.observed_session = active;
@@ -259,28 +270,58 @@ impl<'a> Supervisor<'a> {
         {
             self.worker = None;
             self.failed_starts = 0;
+            self.restart_pending = false;
         }
-        if let Some(worker) = &self.worker
-            && worker.has_exited()?
-        {
+        let (action, exited) = if let Some(worker) = self.worker.as_mut() {
+            let action = worker.take_host_action()?;
+            let exited = action.is_none() && worker.has_exited()?;
+            (action, exited)
+        } else {
+            (None, false)
+        };
+        if let Some(action) = action {
+            self.worker = None;
+            match action {
+                HostLifecycleAction::Quit => return Ok(Some(action)),
+                HostLifecycleAction::Restart => self.schedule_restart()?,
+            }
+        } else if exited {
             self.worker = None;
             self.failed_starts += 1;
+            self.schedule_restart()?;
         }
         if self.worker.is_none()
             && let Some(session_id) = active
-            && (session_changed || session_changed_by_polling || self.failed_starts > 0)
+            && (session_changed
+                || session_changed_by_polling
+                || self.failed_starts > 0
+                || self.restart_pending)
         {
             match Worker::start(self.root, self.digest, session_id) {
                 Ok(worker) => {
                     self.worker = Some(worker);
                     self.failed_starts = 0;
+                    self.restart_pending = false;
                 }
-                Err(_) => self.failed_starts += 1,
+                Err(_) => {
+                    self.failed_starts += 1;
+                    self.restart_pending = true;
+                }
             }
         }
         if self.failed_starts >= MAX_START_FAILURES {
             return Err("interactive worker restart budget exhausted".into());
         }
+        Ok(None)
+    }
+
+    fn schedule_restart(&mut self) -> PackageResult<()> {
+        let delay = self
+            .restart_budget
+            .next_delay()
+            .ok_or("interactive worker restart budget exhausted")?;
+        std::thread::sleep(delay);
+        self.restart_pending = true;
         Ok(())
     }
 
@@ -308,6 +349,7 @@ impl<'a> Supervisor<'a> {
 struct Worker {
     process: *mut c_void,
     session_id: u32,
+    readiness: ReadinessPipe,
 }
 
 impl Worker {
@@ -398,11 +440,12 @@ impl Worker {
         // handle. The retained process handle has the worker's full lifetime.
         unsafe { CloseHandle(process.thread) };
         readiness.close_write();
-        let worker = Self {
+        let mut worker = Self {
             process: process.process,
             session_id,
+            readiness,
         };
-        if let Err(error) = readiness.wait_for_ready(&worker) {
+        if let Err(error) = worker.readiness.wait_for_ready(worker.process) {
             drop(worker);
             return Err(error);
         }
@@ -423,6 +466,37 @@ impl Worker {
         }
     }
 
+    fn take_host_action(&mut self) -> PackageResult<Option<HostLifecycleAction>> {
+        let action = match self.readiness.take_host_action() {
+            Ok(action) => action,
+            // A crashed worker closes its write handle without a lifecycle
+            // message. Let the supervisor account for it as a failed restart.
+            Err(_) if self.has_exited()? => return Ok(None),
+            Err(failure) => return Err(failure),
+        };
+        let Some(action) = action else {
+            return Ok(None);
+        };
+        let deadline = std::time::Instant::now() + HOST_ACTION_EXIT_TIMEOUT;
+        loop {
+            match unsafe { WaitForSingleObject(self.process, 20) } {
+                WAIT_OBJECT_0 => {
+                    let mut exit_code = u32::MAX;
+                    // SAFETY: this wrapper owns a live process handle and the
+                    // output slot remains writable through the synchronous query.
+                    if unsafe { GetExitCodeProcess(self.process, &mut exit_code) } == 0 {
+                        return Err("interactive worker exit status is unavailable".into());
+                    }
+                    return crate::protocol::acknowledge_host_action(action, exit_code == 0)
+                        .map(Some);
+                }
+                WAIT_TIMEOUT if std::time::Instant::now() < deadline => {}
+                WAIT_TIMEOUT => return Err("interactive worker lifecycle action timed out".into()),
+                _ => return Err("interactive worker exit status is unavailable".into()),
+            }
+        }
+    }
+
     fn is_alive(&self) -> PackageResult<bool> {
         self.has_exited().map(|exited| !exited)
     }
@@ -435,6 +509,9 @@ impl Worker {
 struct ReadinessPipe {
     read: *mut c_void,
     write: *mut c_void,
+    buffer: Vec<u8>,
+    ready: bool,
+    action: Option<HostLifecycleAction>,
 }
 
 impl ReadinessPipe {
@@ -462,7 +539,13 @@ impl ReadinessPipe {
             }
             return Err("interactive worker readiness pipe could not be secured".into());
         }
-        Ok(Self { read, write })
+        Ok(Self {
+            read,
+            write,
+            buffer: Vec::new(),
+            ready: false,
+            action: None,
+        })
     }
 
     fn write_handle(&self) -> *mut c_void {
@@ -480,58 +563,88 @@ impl ReadinessPipe {
         }
     }
 
-    fn wait_for_ready(&mut self, worker: &Worker) -> PackageResult<()> {
+    fn wait_for_ready(&mut self, process: *mut c_void) -> PackageResult<()> {
         let deadline = std::time::Instant::now() + STARTUP_READY_TIMEOUT;
-        let mut message = Vec::new();
         while std::time::Instant::now() < deadline {
-            if worker.has_exited()? {
+            if unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0 {
                 return Err("interactive worker exited before readiness".into());
             }
-            let mut available = 0;
-            // SAFETY: `read` remains valid and the null buffer asks only for
-            // the available-byte count; no untrusted pointer is dereferenced.
-            if unsafe {
-                PeekNamedPipe(
-                    self.read,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    &mut available,
-                    std::ptr::null_mut(),
-                )
-            } == 0
-            {
-                return Err("interactive worker readiness pipe failed".into());
-            }
-            if available != 0 {
-                let size = available.min(64) as usize;
-                let mut bytes = vec![0; size];
-                let mut read = 0;
-                // SAFETY: `bytes` has exactly `size` writable bytes and this
-                // synchronous pipe endpoint is retained by this wrapper.
-                if unsafe {
-                    ReadFile(
-                        self.read,
-                        bytes.as_mut_ptr().cast(),
-                        size as u32,
-                        &mut read,
-                        std::ptr::null_mut(),
-                    )
-                } == 0
-                {
-                    return Err("interactive worker readiness pipe failed".into());
-                }
-                message.extend_from_slice(&bytes[..read as usize]);
-                if message == b"READY\n" {
-                    return Ok(());
-                }
-                if message.len() >= 64 || !b"READY\n".starts_with(&message) {
-                    return Err("interactive worker sent an invalid readiness proof".into());
-                }
+            self.read_available()?;
+            if self.ready {
+                return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         Err("interactive worker did not become ready".into())
+    }
+
+    fn take_host_action(&mut self) -> PackageResult<Option<HostLifecycleAction>> {
+        self.read_available()?;
+        Ok(self.action.take())
+    }
+
+    fn read_available(&mut self) -> PackageResult<()> {
+        let mut available = 0;
+        // SAFETY: `read` remains owned by this wrapper. The null buffer asks
+        // only for the available-byte count and does not dereference input.
+        if unsafe {
+            PeekNamedPipe(
+                self.read,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err("interactive worker readiness pipe failed".into());
+        }
+        if available == 0 {
+            return Ok(());
+        }
+        let size = available as usize;
+        if self.buffer.len() + size > MAX_WORKER_PROTOCOL_BUFFER {
+            return Err("interactive worker protocol exceeds its bound".into());
+        }
+        let mut bytes = vec![0; size];
+        let mut read = 0;
+        // SAFETY: `bytes` has exactly `size` writable bytes and this
+        // synchronous pipe endpoint is retained by this wrapper.
+        if unsafe {
+            ReadFile(
+                self.read,
+                bytes.as_mut_ptr().cast(),
+                size as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err("interactive worker readiness pipe failed".into());
+        }
+        self.buffer.extend_from_slice(&bytes[..read as usize]);
+        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<_> = self.buffer.drain(..=newline).collect();
+            let message = std::str::from_utf8(&line[..line.len() - 1])
+                .map_err(|_| "interactive worker protocol is not UTF-8")?;
+            if !self.ready {
+                if message != "READY" {
+                    return Err("interactive worker sent an invalid readiness proof".into());
+                }
+                self.ready = true;
+                continue;
+            }
+            let action = crate::protocol::parse_host_action(message)?
+                .ok_or("interactive worker sent an unexpected protocol message")?;
+            if self.action.replace(action).is_some() {
+                return Err("interactive worker sent duplicate lifecycle actions".into());
+            }
+        }
+        if self.buffer.len() > 64 {
+            return Err("interactive worker protocol line exceeds its bound".into());
+        }
+        Ok(())
     }
 }
 
@@ -612,11 +725,14 @@ impl Drop for StartupAttributeList {
 impl Drop for Worker {
     fn drop(&mut self) {
         if !self.process.is_null() {
-            // SAFETY: the supervisor owns this worker handle. Termination occurs
-            // only on service stop, session loss, or a user-session switch.
+            // SAFETY: the supervisor owns this worker handle. Terminate only
+            // when it is still running; an action worker has already exited
+            // cleanly and needs only its retained handle closed.
             unsafe {
-                let _ = TerminateProcess(self.process, 0);
-                let _ = WaitForSingleObject(self.process, 5_000);
+                if WaitForSingleObject(self.process, 0) == WAIT_TIMEOUT {
+                    let _ = TerminateProcess(self.process, 0);
+                    let _ = WaitForSingleObject(self.process, 5_000);
+                }
                 let _ = CloseHandle(self.process);
             }
         }
