@@ -79,6 +79,9 @@ fn applied(port: u16) -> Value {
 }
 
 fn pending(port: u16, active_port: Option<u16>) -> Value {
+    let addresses = active_port
+        .map(|port| vec![format!("127.0.0.1:{}", port + 21)])
+        .unwrap_or_default();
     json!({
         "ok":true,
         "desired_port":port,
@@ -87,7 +90,7 @@ fn pending(port: u16, active_port: Option<u16>) -> Value {
         "active_base_port":active_port,
         "active_address_family":null,
         "active_bind_address":null,
-        "rtsp_addresses":[format!("127.0.0.1:{}", active_port.unwrap_or(0) + 21)],
+        "rtsp_addresses":addresses,
         "active":false,
         "pending":true,
         "udp_binds_preflighted":false,
@@ -297,8 +300,13 @@ fn listener_success_without_udp_preflight_is_not_reported_as_applied() {
     network.tick(&runtime, port, &mut settings).unwrap();
     network.tick(&runtime, port, &mut settings).unwrap();
 
-    assert_eq!(network.active_base_port(), Some(old_port));
-    assert_eq!(settings.active_rtsp_base_port(), Some(old_port));
+    assert_eq!(network.active_base_port(), Some(port));
+    assert_eq!(settings.active_rtsp_base_port(), Some(port));
+    assert_eq!(network.active_target, None);
+    assert_eq!(
+        network.active_addresses.as_deref(),
+        Some([format!("127.0.0.1:{}", port + 21)].as_slice())
+    );
     assert_eq!(settings.rtsp_completion_request(port), None);
     let completion = settings.rtsp_completion_payload(89).unwrap();
     assert_eq!(completion["ok"], false);
@@ -334,4 +342,274 @@ fn ambiguous_request_submission_retries_the_same_idempotency_key() {
     assert_eq!(operations.len(), 2);
     assert_eq!(operations[0], operations[1]);
     assert_eq!(network.active_base_port(), Some(port));
+}
+
+fn assert_rejected_active_addresses(addresses: Option<Value>) {
+    let port = 48_000;
+    let request = 90;
+    let mut result = applied(port);
+    let fields = result.as_object_mut().unwrap();
+    match addresses {
+        Some(addresses) => {
+            fields.insert("rtsp_addresses".into(), addresses);
+        }
+        None => {
+            fields.remove("rtsp_addresses");
+        }
+    }
+    let state = Arc::new(Mutex::new(EndpointState {
+        result,
+        ..EndpointState::default()
+    }));
+    let runtime = runtime(state.clone());
+    let mut network = NetworkSettings::default();
+    let mut settings = ProductSettings::new("Bootstrap".into(), 47_989);
+    network.finish(
+        &settings.rtsp_target(),
+        ChildOutcome::Payload(applied(47_989)),
+        &mut settings,
+    );
+    network.next_retry = Instant::now();
+    settings.queue_update_completion(
+        request,
+        json!({"ok":true,"hostname":"New Host","revision":6}),
+        None,
+        Some(port),
+    );
+
+    tick_until_idle(&mut network, &runtime, port, &mut settings);
+
+    assert_eq!(network.active_base_port(), None);
+    assert_eq!(network.active_target, None);
+    assert_eq!(settings.active_rtsp_base_port(), None);
+    assert!(settings.rtsp_listener_error().is_some());
+    let completion = settings.rtsp_completion_payload(request).unwrap();
+    assert_eq!(completion["ok"], false);
+    assert_eq!(completion["persisted"], true);
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::ReleaseResult { request: 71 }))
+    );
+}
+
+#[test]
+fn missing_active_rtsp_addresses_cannot_confirm_listener_application() {
+    assert_rejected_active_addresses(None);
+}
+
+#[test]
+fn missing_active_policy_fields_cannot_confirm_listener_application() {
+    for field in ["active_address_family", "active_bind_address"] {
+        let port = 48_000;
+        let mut result = applied(port);
+        result.as_object_mut().unwrap().remove(field);
+        let state = Arc::new(Mutex::new(EndpointState {
+            result,
+            ..EndpointState::default()
+        }));
+        let runtime = runtime(state);
+        let mut network = NetworkSettings::default();
+        let mut settings = ProductSettings::new("Bootstrap".into(), port);
+
+        tick_until_idle(&mut network, &runtime, port, &mut settings);
+
+        assert_eq!(network.active_target, None, "missing {field}");
+        assert_eq!(network.active_base_port(), None, "missing {field}");
+        assert!(network.error.is_some(), "missing {field}");
+    }
+}
+
+#[test]
+fn empty_active_rtsp_addresses_cannot_confirm_listener_application() {
+    assert_rejected_active_addresses(Some(json!([])));
+}
+
+#[test]
+fn malformed_active_rtsp_addresses_cannot_confirm_listener_application() {
+    for addresses in [
+        json!(null),
+        json!("127.0.0.1:48021"),
+        json!(["not-an-endpoint"]),
+        json!([null]),
+        json!(["127.0.0.1:48021", null]),
+        json!(["127.0.0.1:48021", "not-an-endpoint"]),
+    ] {
+        assert_rejected_active_addresses(Some(addresses));
+    }
+}
+
+#[test]
+fn wrong_port_active_rtsp_addresses_cannot_confirm_listener_application() {
+    for addresses in [
+        json!(["127.0.0.1:48000"]),
+        json!(["127.0.0.1:0"]),
+        json!(["127.0.0.1:48021", "[::1]:48022"]),
+    ] {
+        assert_rejected_active_addresses(Some(addresses));
+    }
+}
+
+#[test]
+fn explicitly_lost_rtsp_endpoints_clear_cached_state_and_retry_the_old_desired_policy() {
+    let old_port = 47_989;
+    let failed_port = 48_000;
+    let state = Arc::new(Mutex::new(EndpointState {
+        result: applied(old_port),
+        ..EndpointState::default()
+    }));
+    let runtime = runtime(state.clone());
+    let mut network = NetworkSettings::default();
+    let mut settings = ProductSettings::new("Bootstrap".into(), old_port);
+    let mut old_target = settings.rtsp_target();
+    old_target.port = old_port;
+    network.finish(
+        &old_target,
+        ChildOutcome::Payload(applied(old_port)),
+        &mut settings,
+    );
+    assert_eq!(network.active_base_port(), Some(old_port));
+
+    let mut failed_target = old_target;
+    failed_target.port = failed_port;
+    let mut lost = pending(failed_port, None);
+    lost["error"] = json!("tcp_rebind_rollback_failed");
+    network.finish(&failed_target, ChildOutcome::Payload(lost), &mut settings);
+
+    assert_eq!(network.active_base_port(), None);
+    assert_eq!(network.active_target, None);
+    assert!(network.active_addresses.as_ref().is_none_or(Vec::is_empty));
+    assert_eq!(settings.active_rtsp_base_port(), None);
+
+    network.next_retry = Instant::now();
+    tick_until_idle(&mut network, &runtime, old_port, &mut settings);
+
+    let state = state.lock().unwrap();
+    let requests: Vec<_> = state
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request { payload, .. } => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(requests.len(), 1, "the old cached target must be reapplied");
+    assert_eq!(requests[0]["port"], old_port);
+    assert_eq!(network.active_base_port(), Some(old_port));
+    assert_eq!(settings.active_rtsp_base_port(), Some(old_port));
+}
+
+#[test]
+fn incomplete_same_policy_response_invalidates_cached_application_and_retries() {
+    let port = 47_989;
+    let state = Arc::new(Mutex::new(EndpointState {
+        result: applied(port),
+        ..EndpointState::default()
+    }));
+    let runtime = runtime(state.clone());
+    let mut network = NetworkSettings::default();
+    let mut settings = ProductSettings::new("Bootstrap".into(), port);
+    let target = settings.rtsp_target();
+    network.finish(&target, ChildOutcome::Payload(applied(port)), &mut settings);
+    assert_eq!(network.active_target.as_ref(), Some(&target));
+
+    network.finish(
+        &target,
+        ChildOutcome::Payload(listener_without_udp_preflight(port)),
+        &mut settings,
+    );
+
+    assert_eq!(network.active_base_port(), Some(port));
+    assert_eq!(settings.active_rtsp_base_port(), Some(port));
+    assert_eq!(network.active_target, None);
+    assert_eq!(
+        network.active_addresses.as_deref(),
+        Some([format!("127.0.0.1:{}", port + 21)].as_slice())
+    );
+    assert!(settings.rtsp_listener_error().is_some());
+
+    network.next_retry = Instant::now();
+    tick_until_idle(&mut network, &runtime, port, &mut settings);
+
+    let state = state.lock().unwrap();
+    assert_eq!(
+        state
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::Request { .. }))
+            .count(),
+        1,
+        "an incomplete observation must not trigger the active-target shortcut"
+    );
+    assert_eq!(network.active_target.as_ref(), Some(&target));
+    assert_eq!(settings.rtsp_listener_error(), None);
+}
+
+#[test]
+fn reverting_pending_policy_reconfigures_the_owner_before_qualifying_old_endpoints() {
+    let old_port = 47_989;
+    let pending_port = 48_000;
+    let state = Arc::new(Mutex::new(EndpointState {
+        result: applied(old_port),
+        ..EndpointState::default()
+    }));
+    let runtime = runtime(state.clone());
+    let mut network = NetworkSettings::default();
+    let mut settings = ProductSettings::new("Bootstrap".into(), old_port);
+    let old_target = settings.rtsp_target();
+    network.finish(
+        &old_target,
+        ChildOutcome::Payload(applied(old_port)),
+        &mut settings,
+    );
+    assert_eq!(network.active_target.as_ref(), Some(&old_target));
+
+    let mut pending_target = old_target.clone();
+    pending_target.port = pending_port;
+    network.finish(
+        &pending_target,
+        ChildOutcome::Payload(pending(pending_port, Some(old_port))),
+        &mut settings,
+    );
+
+    assert_eq!(network.active_base_port(), Some(old_port));
+    assert_eq!(settings.active_rtsp_base_port(), Some(old_port));
+    assert_eq!(
+        network.active_addresses.as_deref(),
+        Some([format!("127.0.0.1:{}", old_port + 21)].as_slice())
+    );
+    assert_eq!(network.active_target, None);
+
+    network.next_retry = Instant::now();
+    network.tick(&runtime, old_port, &mut settings).unwrap();
+    assert_eq!(network.active_target, None);
+    assert!(network.pending.is_some());
+    assert!(state.lock().unwrap().commands.is_empty());
+    network.tick(&runtime, old_port, &mut settings).unwrap();
+    assert_eq!(network.active_target, None);
+
+    {
+        let state = state.lock().unwrap();
+        let requests: Vec<_> = state
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Request { payload, .. } => Some(payload),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the owner's pending policy must be replaced"
+        );
+        assert_eq!(requests[0]["port"], old_port);
+    }
+
+    tick_until_idle(&mut network, &runtime, old_port, &mut settings);
+    assert_eq!(network.active_target.as_ref(), Some(&old_target));
+    assert_eq!(settings.rtsp_listener_error(), None);
 }

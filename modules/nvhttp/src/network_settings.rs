@@ -231,28 +231,39 @@ impl NetworkSettings {
                 let reported_active_port = payload["active_base_port"]
                     .as_u64()
                     .and_then(|value| u16::try_from(value).ok());
+                let has_reported_family = payload.get("active_address_family").is_some();
+                let has_reported_bind = payload.get("active_bind_address").is_some();
                 let reported_family =
                     serde_json::from_value(payload["active_address_family"].clone()).ok();
                 let reported_bind = payload["active_bind_address"].as_str().map(str::to_owned);
+                let reported_target = reported_active_port.map(|port| NetworkTarget {
+                    port,
+                    address_family: reported_family,
+                    bind_address: reported_bind.clone(),
+                });
+                let reported_addresses = reported_target.as_ref().and_then(|reported| {
+                    if !has_reported_family
+                        || !has_reported_bind
+                        || (!payload["active_address_family"].is_null()
+                            && reported_family.is_none())
+                        || (!payload["active_bind_address"].is_null() && reported_bind.is_none())
+                    {
+                        return None;
+                    }
+                    verified_rtsp_addresses(&payload["rtsp_addresses"], reported)
+                });
                 let fully_applied = payload["ok"] == true
                     && payload["desired_port"].as_u64() == Some(u64::from(target.port))
                     && payload["desired_address_family"] == json!(target.address_family)
                     && payload["desired_bind_address"] == json!(target.bind_address)
                     && payload["active"] == true
                     && payload["udp_binds_preflighted"] == true
-                    && reported_active_port == Some(target.port)
-                    && reported_family == target.address_family
-                    && reported_bind == target.bind_address;
+                    && reported_target.as_ref() == Some(target)
+                    && reported_addresses.is_some();
                 if fully_applied {
                     self.active_base_port = reported_active_port;
                     self.active_target = Some(target.clone());
-                    self.active_addresses = payload["rtsp_addresses"].as_array().map(|addresses| {
-                        addresses
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    });
+                    self.active_addresses = reported_addresses;
                     self.error = None;
                     self.retry_delay = INITIAL_RETRY_DELAY;
                     self.next_retry = Instant::now() + self.retry_delay;
@@ -263,8 +274,20 @@ impl NetworkSettings {
                     );
                     settings.record_rtsp_apply_success();
                 } else {
-                    if payload["active"] == false && payload["udp_binds_preflighted"] == false {
-                        self.active_base_port = reported_active_port.or(self.active_base_port);
+                    // A response is an observation of live listeners, including
+                    // loss after failed rollback. Never resurrect a cached tuple
+                    // when its returned endpoints are absent or inconsistent.
+                    if let Some(addresses) = reported_addresses {
+                        // The RTSP owner has accepted a different desired
+                        // policy. Old live sockets do not prove that reverting
+                        // NVHTTP's desired policy cancels that pending request.
+                        self.active_target = None;
+                        self.active_base_port = reported_active_port;
+                        self.active_addresses = Some(addresses);
+                    } else {
+                        self.active_target = None;
+                        self.active_base_port = None;
+                        self.active_addresses = None;
                     }
                     let message = payload["error"]
                         .as_str()
@@ -303,6 +326,49 @@ impl NetworkSettings {
         self.next_retry = Instant::now() + self.retry_delay;
         self.retry_delay = (self.retry_delay * 2).min(MAX_RETRY_DELAY);
     }
+}
+
+fn verified_rtsp_addresses(payload: &Value, target: &NetworkTarget) -> Option<Vec<String>> {
+    use crate::settings::AddressFamily;
+    use amaterasu_network_policy::{GameStreamPorts, invalid_configured_bind};
+    use std::net::{IpAddr, SocketAddr};
+    let port = GameStreamPorts::new(target.port).ok()?.rtsp();
+    let values = payload.as_array()?;
+    if values.is_empty() || values.len() > 2 {
+        return None;
+    }
+    let explicit = target
+        .bind_address
+        .as_deref()
+        .filter(|address| !address.trim().is_empty())
+        .map(|address| address.trim().parse::<IpAddr>())
+        .transpose()
+        .ok()?;
+    let mut addresses = Vec::with_capacity(values.len());
+    let mut ips = Vec::with_capacity(values.len());
+    for value in values {
+        let text = value.as_str()?;
+        let address = text.parse::<SocketAddr>().ok()?;
+        if address.port() != port
+            || invalid_configured_bind(address.ip())
+            || target
+                .address_family
+                .is_some_and(|family| family == AddressFamily::Ipv4 && !address.is_ipv4())
+            || explicit.is_some_and(|ip| ip != address.ip())
+            || ips.contains(&address.ip())
+            || ips
+                .iter()
+                .any(|ip: &IpAddr| ip.is_ipv4() == address.is_ipv4())
+        {
+            return None;
+        }
+        ips.push(address.ip());
+        addresses.push(text.to_owned());
+    }
+    if explicit.is_none() && target.address_family == Some(AddressFamily::Both) && ips.len() != 2 {
+        return None;
+    }
+    Some(addresses)
 }
 
 #[cfg(test)]
