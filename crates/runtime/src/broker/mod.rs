@@ -4,7 +4,11 @@ mod events;
 mod hooks;
 mod requests;
 
-use amaterasu_contracts::{Command, Response, RuntimeConfig};
+use amaterasu_contracts::{
+    Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LIFECYCLE_SERVICE, HostLifecycleAction,
+    Response, RuntimeConfig,
+};
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use events::EventBus;
@@ -16,7 +20,10 @@ pub struct Broker {
     requests: RequestRouter,
     events: EventBus,
     hooks: HookRegistry,
+    host_lifecycle: VecDeque<HostLifecycleAction>,
 }
+
+const HOST_LIFECYCLE_QUEUE_CAPACITY: usize = 8;
 
 impl Broker {
     pub fn new(configuration: RuntimeConfig) -> Result<Self, String> {
@@ -27,6 +34,7 @@ impl Broker {
             configuration,
             requests: RequestRouter::default(),
             events: EventBus::default(),
+            host_lifecycle: VecDeque::with_capacity(HOST_LIFECYCLE_QUEUE_CAPACITY),
         })
     }
 
@@ -37,6 +45,19 @@ impl Broker {
     pub(crate) fn dispatch_at(&mut self, caller: &str, command: Command, now: Instant) -> Response {
         self.requests.expire(now);
         self.hooks.expire(now);
+
+        if matches!(command, Command::HostLifecycleDrain {}) {
+            if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL {
+                return errors::permission_denied();
+            }
+            return Response::HostLifecycle {
+                action: self.host_lifecycle.pop_front(),
+            };
+        }
+
+        if caller == HOST_LIFECYCLE_CONTROL_PRINCIPAL {
+            return errors::permission_denied();
+        }
 
         let Some(grants) = self.configuration.principals.get(caller) else {
             return errors::permission_denied();
@@ -49,6 +70,17 @@ impl Broker {
                 "native_transport_required",
                 "native interfaces require the authenticated ABI endpoint",
             ),
+            Command::HostLifecycle { action } => {
+                if !grants.call.contains(HOST_LIFECYCLE_SERVICE) {
+                    return errors::permission_denied();
+                }
+                if self.host_lifecycle.len() >= HOST_LIFECYCLE_QUEUE_CAPACITY {
+                    return errors::host_lifecycle_capacity_exhausted();
+                }
+                self.host_lifecycle.push_back(action);
+                Response::Ok
+            }
+            Command::HostLifecycleDrain {} => unreachable!("drain handled before module dispatch"),
             Command::GetSettings {} => Response::Result {
                 payload: self
                     .configuration

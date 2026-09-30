@@ -4,6 +4,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Service name required in a module's explicit effective `call` grants before
+/// it may request that the trusted host restart or stop the selected runtime.
+pub const HOST_LIFECYCLE_SERVICE: &str = "amaterasu.host-lifecycle/1";
+
+/// Reserved runtime endpoint identity injected by the verified host. Package
+/// component identities cannot use this name because it is not a valid name.
+pub const HOST_LIFECYCLE_CONTROL_PRINCIPAL: &str = "@amaterasu.host-lifecycle";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostLifecycleAction {
+    Restart,
+    Quit,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grants {
@@ -60,6 +75,10 @@ pub struct RuntimeConfig {
     /// has been verified.
     #[serde(default)]
     pub host_context: RuntimeHostContext,
+    /// Host-only runtime bootstrap flag. Package verification leaves this false;
+    /// the host sets it after verification when creating its private control endpoint.
+    #[serde(default)]
+    pub host_lifecycle_control: bool,
 }
 
 /// Facts supplied by the trusted host for one worker process.
@@ -91,6 +110,13 @@ pub enum Command {
     NativeRelease {
         binding: u64,
     },
+    /// Queues one of the host's fixed lifecycle actions. Runtime authorization
+    /// requires the caller's explicit lifecycle service call grant.
+    HostLifecycle {
+        action: HostLifecycleAction,
+    },
+    /// Reserved for the runtime endpoint created by the verified host.
+    HostLifecycleDrain {},
     GetSettings {},
     /// Returns host-owned context only to the state service. This prevents a
     /// module policy from impersonating a host decision through `GetSettings`.
@@ -190,6 +216,10 @@ pub enum Response {
     HookResult {
         proposals: Vec<Proposal>,
     },
+    /// Returned only to the reserved host control endpoint.
+    HostLifecycle {
+        action: Option<HostLifecycleAction>,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proposal {
@@ -267,6 +297,24 @@ mod tests {
         assert!(
             serde_json::from_value::<RuntimeConfig>(json!({
                 "principals": {}, "settings": {}, "unknown": true,
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn host_lifecycle_commands_encode_only_fixed_actions() {
+        assert_eq!(
+            serde_json::to_value(Command::HostLifecycle {
+                action: HostLifecycleAction::Restart,
+            })
+            .unwrap(),
+            json!({"op":"host_lifecycle","action":"restart"})
+        );
+        assert!(
+            serde_json::from_value::<Command>(json!({
+                "op":"host_lifecycle",
+                "action":"execute"
             }))
             .is_err()
         );

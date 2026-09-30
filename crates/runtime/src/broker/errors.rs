@@ -10,6 +10,10 @@ pub(super) fn permission_denied() -> Response {
     )
 }
 
+pub(super) fn host_lifecycle_capacity_exhausted() -> Response {
+    Response::error("capacity_exhausted", "host lifecycle action queue is full")
+}
+
 pub(super) fn not_found() -> Response {
     Response::error("not_found", "unknown handle or interface")
 }

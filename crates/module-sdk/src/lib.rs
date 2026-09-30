@@ -8,7 +8,7 @@ pub use amaterasu_contracts::encoder::{
     EncoderBackend, EncoderIdentity, EncoderSelection, SOFTWARE_ENCODER_ID, SoftwareEncoderOptions,
     validate_min_threads, validate_software_options,
 };
-pub use amaterasu_contracts::{Command, Response, RuntimeHostContext};
+pub use amaterasu_contracts::{Command, HostLifecycleAction, Response, RuntimeHostContext};
 
 pub type ModuleResult<T> = Result<T, String>;
 
@@ -51,6 +51,12 @@ impl RuntimeClient {
             Response::Error { code, message } => Err(format!("{code}: {message}")),
             unexpected => Err(format!("unexpected runtime response: {unexpected:?}")),
         }
+    }
+
+    /// Requests one fixed host lifecycle action. The host honors it only when
+    /// this module's verified effective call grants include the lifecycle service.
+    pub fn request_host_lifecycle(&self, action: HostLifecycleAction) -> ModuleResult<()> {
+        self.require_success(Command::HostLifecycle { action })
     }
 
     /// Returns the state location chosen by the trusted host for this worker.

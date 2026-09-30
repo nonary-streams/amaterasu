@@ -1,6 +1,6 @@
 //! Short-lived development worker used to prove native loading and request routing.
 use amaterasu_abi::HostApi;
-use amaterasu_contracts::{Command, Response};
+use amaterasu_contracts::{Command, HostLifecycleAction, Response};
 use amaterasu_package::{
     BootstrapConfig, PackageResult, VerificationPolicy, package_directory, read_json,
     unix_timestamp, verify_package_with_progress,
@@ -201,19 +201,35 @@ pub fn serve(root: &Path, digest: &str) -> PackageResult<()> {
     loop {
         components.tick()?;
         components.health()?;
+        if let Some(action) = components.take_host_lifecycle_action()? {
+            return finish_lifecycle_action(components, action);
+        }
         pulse(&mut heartbeat)?;
         match input.recv_timeout(std::time::Duration::from_millis(10)) {
             Ok(Ok(line)) => {
-                let reply = match serde_json::from_str::<Command>(&line) {
+                let outcome = match serde_json::from_str::<Command>(&line) {
                     Ok(command) => {
                         execute_live(&mut components, &endpoint, command, &mut heartbeat)?
                     }
-                    Err(failure) => Response::error("invalid_request", failure.to_string()),
+                    Err(failure) => LiveWorkerOutput::Response(Response::error(
+                        "invalid_request",
+                        failure.to_string(),
+                    )),
                 };
-                send_line(&format!(
-                    "RESULT {}",
-                    serde_json::to_string(&reply).map_err(|error| error.to_string())?
-                ))?;
+                match outcome {
+                    LiveWorkerOutput::Response(reply) => {
+                        send_line(&format!(
+                            "RESULT {}",
+                            serde_json::to_string(&reply).map_err(|error| error.to_string())?
+                        ))?;
+                        if let Some(action) = components.take_host_lifecycle_action()? {
+                            return finish_lifecycle_action(components, action);
+                        }
+                    }
+                    LiveWorkerOutput::HostAction(action) => {
+                        return finish_lifecycle_action(components, action);
+                    }
+                }
             }
             Ok(Err(failure)) => return Err(failure),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -252,8 +268,16 @@ pub fn serve_interactive(
     loop {
         components.tick()?;
         components.health()?;
+        if let Some(action) = components.take_host_lifecycle_action()? {
+            return finish_lifecycle_action(components, action);
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+enum LiveWorkerOutput {
+    Response(Response),
+    HostAction(HostLifecycleAction),
 }
 
 fn execute_live(
@@ -261,31 +285,54 @@ fn execute_live(
     endpoint: &HostApi,
     command: Command,
     heartbeat: &mut std::time::Instant,
-) -> PackageResult<Response> {
+) -> PackageResult<LiveWorkerOutput> {
     let response = invoke(endpoint, &command)?;
     let (Command::Request { timeout_ms, .. }, Response::Accepted { id }) = (&command, &response)
     else {
-        return Ok(response);
+        return Ok(LiveWorkerOutput::Response(response));
     };
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis((*timeout_ms).min(30_000));
     loop {
         components.tick()?;
         components.health()?;
+        if let Some(action) = components.take_host_lifecycle_action()? {
+            return Ok(LiveWorkerOutput::HostAction(action));
+        }
         pulse(heartbeat)?;
         let result = invoke(endpoint, &Command::TakeResult { request: *id })?;
         if !matches!(result, Response::Pending) {
-            return Ok(result);
+            return Ok(LiveWorkerOutput::Response(result));
         }
         if std::time::Instant::now() >= deadline {
             let _ = invoke(endpoint, &Command::Cancel { request: *id });
-            return Ok(Response::error(
+            return Ok(LiveWorkerOutput::Response(Response::error(
                 "deadline_exceeded",
                 "development request deadline elapsed; reconcile before retrying mutations",
-            ));
+            )));
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+fn finish_lifecycle_action(
+    components: LoadedComponents,
+    action: HostLifecycleAction,
+) -> PackageResult<()> {
+    lifecycle_action_after_cleanup(action, move || drop(components), send_host_action)
+}
+
+fn lifecycle_action_after_cleanup(
+    action: HostLifecycleAction,
+    cleanup: impl FnOnce(),
+    emit: impl FnOnce(HostLifecycleAction) -> PackageResult<()>,
+) -> PackageResult<()> {
+    cleanup();
+    emit(action)
+}
+
+fn send_host_action(action: HostLifecycleAction) -> PackageResult<()> {
+    send_line(crate::protocol::host_action_line(action))
 }
 
 fn pulse(previous: &mut std::time::Instant) -> PackageResult<()> {
@@ -294,4 +341,25 @@ fn pulse(previous: &mut std::time::Instant) -> PackageResult<()> {
         *previous = std::time::Instant::now();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_action_is_emitted_only_after_cleanup_finishes() {
+        let events = std::cell::RefCell::new(Vec::new());
+        lifecycle_action_after_cleanup(
+            HostLifecycleAction::Restart,
+            || events.borrow_mut().push("cleanup"),
+            |action| {
+                assert_eq!(action, HostLifecycleAction::Restart);
+                events.borrow_mut().push("action acknowledged");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(events.into_inner(), ["cleanup", "action acknowledged"]);
+    }
 }
