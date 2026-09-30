@@ -1658,6 +1658,7 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
             video: true,
             audio: false,
         });
+        record.negotiated_slices_per_frame = Some(1);
         record.config.frame_limiter_settings = Some(snapshot.clone());
         record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());
         record.config.application_operation_id = Some("launch-one".into());
