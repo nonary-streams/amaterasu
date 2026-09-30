@@ -1,5 +1,5 @@
 //! Explicit native qualification. Default tests never create input devices.
-//! The exact owned controller is grabbed before any report is emitted, keeping
+//! The exact owned input device is grabbed before any report is emitted, keeping
 //! reports out of the desktop's other input consumers. No permissions change.
 
 use super::*;
@@ -40,8 +40,7 @@ struct NativeEventReader {
 }
 
 impl NativeEventReader {
-    fn open(gamepad: &UinputGamepad) -> io::Result<Self> {
-        let device = gamepad.device.as_ref().expect("created controller device");
+    fn open(device: &Device) -> io::Result<Self> {
         assert!(
             device.fake.is_none(),
             "native test cannot use a fake adapter"
@@ -67,7 +66,7 @@ impl NativeEventReader {
                 Ok((file, event_path)) => {
                     // SAFETY: EVIOCGRAB takes a scalar boolean. This fd is the
                     // exact owned uinput device's evdev node, never a physical
-                    // or unrelated controller. No report has been sent yet.
+                    // or unrelated input device. No report has been sent yet.
                     ioctl_result(unsafe { libc::ioctl(file.as_raw_fd(), EVIOCGRAB, 1) })?;
                     return Ok(Self {
                         file,
@@ -78,7 +77,7 @@ impl NativeEventReader {
                 Err(error) if Instant::now() >= deadline => {
                     return Err(io::Error::new(
                         error.kind(),
-                        format!("cannot open owned controller event node: {error}"),
+                        format!("cannot open owned input event node: {error}"),
                     ));
                 }
                 Err(_) => std::thread::sleep(Duration::from_millis(10)),
@@ -103,7 +102,7 @@ impl NativeEventReader {
         }
         if events.len() != 1 {
             return Err(io::Error::other(
-                "owned controller must have one evdev node",
+                "owned input device must have one evdev node",
             ));
         }
         let sysfs_event = &events[0];
@@ -136,21 +135,21 @@ impl NativeEventReader {
         Ok((file, event_path))
     }
 
-    fn assert_identity(&self) {
+    fn assert_identity(&self, expected_name: &str) {
         let mut name = [0_u8; 128];
         let request = libc::_IOR::<[u8; 128]>(b'E' as u32, 0x06);
         // SAFETY: EVIOCGNAME writes at most the encoded array size to this
         // initialized buffer, and retains no pointer after the live fd ioctl.
         ioctl_result(unsafe { libc::ioctl(self.file.as_raw_fd(), request, name.as_mut_ptr()) })
-            .expect("read owned controller name");
-        assert_eq!(nul_terminated_text(&name).unwrap(), "Amaterasu gamepad 0");
+            .expect("read owned input name");
+        assert_eq!(nul_terminated_text(&name).unwrap(), expected_name);
         // SAFETY: input_id contains only integer fields, and the initialized
         // record remains writable for the exact size encoded by EVIOCGID.
         let mut identity: libc::input_id = unsafe { std::mem::zeroed() };
         let request = libc::_IOR::<libc::input_id>(b'E' as u32, 0x02);
         // SAFETY: the live evdev ioctl writes only the input_id record.
         ioctl_result(unsafe { libc::ioctl(self.file.as_raw_fd(), request, &mut identity) })
-            .expect("read owned controller identity");
+            .expect("read owned input identity");
         assert_eq!(identity.bustype, 0x06, "virtual bus identity");
         assert_eq!(
             (identity.vendor, identity.product, identity.version),
@@ -260,18 +259,39 @@ impl NativeEventReader {
         }
     }
 
+    fn assert_key_state(&self, code: u16, pressed: bool) {
+        let mut keys = [0_u8; 96];
+        let request = libc::_IOR::<[u8; 96]>(b'E' as u32, 0x18);
+        // SAFETY: this exact owned evdev descriptor writes at most the encoded
+        // 96 bytes into the initialized buffer and retains no pointer.
+        ioctl_result(unsafe { libc::ioctl(self.file.as_raw_fd(), request, keys.as_mut_ptr()) })
+            .expect("read native keyboard key state");
+        let code = usize::from(code);
+        assert!(code < keys.len() * 8);
+        assert_eq!(keys[code / 8] & (1 << (code % 8)) != 0, pressed);
+    }
+
+    fn assert_quiet(&self) {
+        assert_eq!(
+            self.read_event()
+                .expect_err("unexpected native input event")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
     fn assert_disconnected(&self) {
         let deadline = Instant::now() + NATIVE_TIMEOUT;
         while self.sysfs_path.exists() || self.event_path.exists() {
             assert!(
                 Instant::now() < deadline,
-                "owned controller survived teardown"
+                "owned input device survived teardown"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
         let error = self
             .read_event()
-            .expect_err("destroyed controller cannot deliver input");
+            .expect_err("destroyed input device cannot deliver input");
         assert_eq!(error.raw_os_error(), Some(libc::ENODEV));
     }
 }
@@ -341,7 +361,9 @@ fn native_uinput_xbox_slot_reports_readback_and_teardown() {
         .apply(0, 1, state, -1, Instant::now(), |number| {
             assert_eq!(number, 0);
             let gamepad = UinputGamepad::create("/dev/uinput", number)?;
-            reader = Some(NativeEventReader::open(&gamepad).map_err(system_error)?);
+            reader = Some(
+                NativeEventReader::open(gamepad.device.as_ref().unwrap()).map_err(system_error)?,
+            );
             Ok(GrabbedGamepad(gamepad))
         })
         .expect("create and grab owned Xbox-like controller before sending reports");
@@ -349,7 +371,7 @@ fn native_uinput_xbox_slot_reports_readback_and_teardown() {
     let reader = reader
         .as_ref()
         .expect("slot creation opened its exact event node");
-    reader.assert_identity();
+    reader.assert_identity("Amaterasu gamepad 0");
     let axes = [-32768, 32767, 73, 12345, -23456, 219];
     let expected = full_report(true, axes);
     assert_frame(reader.read_report(expected.len()), expected);
@@ -388,5 +410,105 @@ fn native_uinput_xbox_slot_reports_readback_and_teardown() {
     reader.assert_disconnected();
     println!(
         "Qualified one grabbed Linux virtual Xbox-like slot: buttons/axes, kernel state, neutral report, and held-slot teardown. Game/client and Windows delivery remain unqualified."
+    );
+}
+
+fn native_key(source: u8, state: KeyState) -> Event {
+    Event::Key {
+        key: Key::MoonlightVk {
+            code: source,
+            normalized: true,
+            repeat_modifiers: 0,
+            temporary_modifier: false,
+        },
+        state,
+    }
+}
+
+#[test]
+#[ignore = "creates a real uinput keyboard; requires uinput and owned evdev access; grabs before emitting"]
+fn native_uinput_keybinding_targets_keep_source_ownership_and_teardown() {
+    FAKE_INPUT_ADAPTER.with(|adapter| assert!(adapter.borrow().is_none()));
+    // Backend drops its owned device before reader releases the grab, including
+    // panic unwinding. No other keyboard, pointer, or controller is created.
+    let reader;
+    let mut backend = LinuxBackend::new("/dev/uinput".into());
+    let device = Device::create("/dev/uinput", true).expect("create owned keyboard");
+    reader = NativeEventReader::open(&device).expect("grab exact keyboard before first report");
+    backend.keyboard = Some(device);
+    reader.assert_identity("Amaterasu keyboard");
+    let custom = KeyBindings::from_flat(vec![
+        0x41, 0x43, 0x42, 0x43, 0x43, 0x44, // A/B -> C, C -> D must not chain.
+        0x10, 0x44, 0xa0, 0x44, // Built-in generic Shift precedes custom; left is custom.
+        0xa5, 0x44, // Custom Right Alt precedes optional Windows alias.
+        0, 0x41, 255, 0x41, // Reserved source bytes resolve to supported A.
+    ])
+    .unwrap();
+    backend.set_keybindings(&custom);
+    backend
+        .inject(&native_key(0x41, KeyState::Down))
+        .expect("first source presses mapped C");
+    assert_frame(reader.read_report(1), vec![(EV_KEY, 46, 1)]);
+    backend
+        .inject(&native_key(0x42, KeyState::Down))
+        .expect("second source owns the same mapped C");
+    reader.assert_quiet();
+    reader.assert_key_state(46, true);
+    backend.set_keybindings(&KeyBindings::empty());
+    backend
+        .inject(&native_key(0x42, KeyState::Repeat))
+        .expect("repeat retains C after mapping replacement");
+    assert_frame(reader.read_report(1), vec![(EV_KEY, 46, 2)]);
+    backend
+        .inject(&native_key(0x41, KeyState::Up))
+        .expect("first source releases only its ownership");
+    reader.assert_quiet();
+    reader.assert_key_state(46, true);
+    backend
+        .inject(&native_key(0x42, KeyState::Up))
+        .expect("final source releases original C");
+    assert_frame(reader.read_report(1), vec![(EV_KEY, 46, 0)]);
+    reader.assert_key_state(46, false);
+
+    backend.set_keybindings(&custom);
+    backend.set_key_rightalt_to_key_win(true);
+    for (source, expected_evdev) in [(0x10, 42), (0xa5, 32)] {
+        backend
+            .inject(&native_key(source, KeyState::Down))
+            .expect("press priority-selected native destination");
+        assert_frame(reader.read_report(1), vec![(EV_KEY, expected_evdev, 1)]);
+        backend
+            .inject(&native_key(source, KeyState::Up))
+            .expect("release priority-selected native destination");
+        assert_frame(reader.read_report(1), vec![(EV_KEY, expected_evdev, 0)]);
+    }
+    backend
+        .inject(&native_key(0, KeyState::Down))
+        .expect("reserved zero source maps to A");
+    assert_frame(reader.read_report(1), vec![(EV_KEY, 30, 1)]);
+    backend
+        .inject(&native_key(255, KeyState::Down))
+        .expect("reserved 255 source also owns A");
+    reader.assert_quiet();
+    backend
+        .inject(&native_key(0, KeyState::Up))
+        .expect("zero source cannot release 255's ownership");
+    reader.assert_quiet();
+    reader.assert_key_state(30, true);
+    backend
+        .inject(&native_key(255, KeyState::Up))
+        .expect("255 source finally releases A");
+    assert_frame(reader.read_report(1), vec![(EV_KEY, 30, 0)]);
+    reader.assert_key_state(30, false);
+    backend
+        .inject(&native_key(0xa0, KeyState::Down))
+        .expect("leave a mapped destination held for teardown");
+    assert_frame(reader.read_report(1), vec![(EV_KEY, 32, 1)]);
+    backend
+        .stop()
+        .expect("destroy owned keyboard while grabbed");
+    reader.assert_disconnected();
+    println!(
+        "Qualified grabbed Linux keyboard mapping, target collisions, repeat/release across policy replacement, builtin/Right Alt priority, reserved source bytes, and held-device teardown. Ordinary service-account access, Windows, and game/client delivery remain unqualified."
     );
 }

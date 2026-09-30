@@ -202,8 +202,9 @@ VK_LWIN (`0x5B`) before native injection when the selected `keybindings` list ha
 no custom source `0xA5` pair. A custom pair takes priority over this alias. This
 applies to normalized and raw Moonlight packets on Windows and Linux. The backend records the native key chosen
 at key-down so a setting change cannot send key-up for a different key. Linux
-maps VK_LWIN through its existing table to `KEY_LEFTMETA`; Linux runtime behavior
-has not been exercised on this Windows host.
+maps VK_LWIN through its existing table to `KEY_LEFTMETA`. Bounded grabbed Linux
+keyboard tests inspect mapped native targets; desktop and game delivery remain
+unqualified.
 
 Key repeat belongs to the active input lease. A new key-down replaces that
 lease's current repeat key and starts the configured initial delay; the matching
@@ -215,8 +216,9 @@ The input worker ticks every 10–20 ms, so actual cadence has that scheduler
 jitter. Captured synthetic Shift/Ctrl/Alt modifiers are pulsed only when no
 equivalent real modifier is held; their markers are validated across batches and
 remain tracked for lease cleanup on native failure. Linux emits the same
-repeat-event form through uinput, but runtime typing/repeat behavior has not
-been qualified on this Windows development host.
+repeat-event form through uinput. The opt-in grabbed Linux keyboard test checks
+that form and stable release across mapping changes. Desktop typing and repeat
+cadence on Linux and Windows remain qualification gates.
 
 The `keybindings` value is an ordered flat list of source/destination virtual-key
 bytes. It accepts exact integers from 0 through 255, an even number of values,
@@ -485,12 +487,30 @@ changes no permissions. Run it explicitly with:
 cargo test -p amaterasu-input native_uinput_xbox_slot_reports_readback_and_teardown -- --ignored --nocapture
 ```
 
-The test requires access to `/dev/uinput` and to the created controller's evdev
+The ignored `native_uinput_keybinding_targets_keep_source_ownership_and_teardown`
+test creates only one virtual keyboard and grabs its exact owned evdev node
+before sending any input. Independent evdev reports and kernel key-state queries
+check single mapping, multiple source ownership of one target, held repeat and
+release after policy replacement, built-in/custom Right Alt priority, reserved
+source bytes, and destruction while a mapped key remains held. Every injection
+failure ends the test before recovery could create an ungrabbed replacement.
+Run it explicitly with:
+
+```sh
+cargo test -p amaterasu-input native_uinput_keybinding_targets_keep_source_ownership_and_teardown -- --ignored --nocapture
+```
+
+Both tests require access to `/dev/uinput` and to their exact owned device's evdev
 node. A kernel readback pass establishes this bounded native device path; it does
 not establish service-account permissions, game visibility, or client delivery.
 Native pen/touch delivery, Windows and Linux compositor behavior, and hardware device
 loss remain qualification gates. GameStream ingress and its client-to-desktop
 coordinate transform remain pending in the protocol adapter.
+
+Ordered keybinding priority and whole-list scope selection use Vibeshine commit
+`457237db7e57f9c4be21c35bb07e28d1c100eb7d` as a behavioral reference. Amaterasu's
+bounded byte-pair contract deliberately rejects wider integers accepted by that
+reference parser, without truncating them.
 
 Vibeshine commit `aa292c4cb097f22beab19d6ebf0307367f9bf449` was a behavioral
 reference, including its keyboard/mouse interfaces and history concerning
