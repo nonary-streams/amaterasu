@@ -375,10 +375,13 @@ impl Connection {
                 self.dispatch(runtime, request, operation)?
             }
             Response::Result { payload } => {
-                if payload.get("code").and_then(Value::as_str) == Some("rate_limited") {
-                    self.fail(429, "rate_limited");
-                } else {
-                    self.fail(403, "unauthorized");
+                match (
+                    payload.get("ok").and_then(Value::as_bool),
+                    payload.get("code").and_then(Value::as_str),
+                ) {
+                    (Some(false), Some("unauthorized")) => self.fail(401, "unauthorized"),
+                    (_, Some("rate_limited")) => self.fail(429, "rate_limited"),
+                    _ => self.fail(403, "unauthorized"),
                 }
             }
             _ => self.fail(503, "authentication_unavailable"),
@@ -493,9 +496,13 @@ impl Connection {
             }
         } else if request.preflight {
             self.respond(204, Value::Null);
-        } else if let Some(scope) = request_scope(&request) {
+        } else if request_scope(&request).is_some() {
+            // Verify identity and liveness first: authentication uses the same
+            // denial code for invalid identity and insufficient scope. Keep the
+            // exact route-scope check in verify_result so only invalid identity
+            // triggers the browser's 401 refresh or sign-out path.
             let payload =
-                json!({"action":"verify","bearer":request.bearer.take(),"required_scopes":[scope]});
+                json!({"action":"verify","bearer":request.bearer.take(),"required_scopes":[]});
             if let Some(request_id) = self.submit(runtime, AUTH_SERVICE, payload, operation)? {
                 self.stage = Stage::Verifying {
                     request_id,
@@ -712,7 +719,10 @@ fn authorized(payload: &Value, required_scope: Option<&str>) -> bool {
         && payload
             .get("scopes")
             .and_then(Value::as_array)
-            .is_some_and(|scopes| scopes.iter().any(|scope| scope.as_str() == required_scope))
+            .is_some_and(|scopes| {
+                scopes.iter().all(|scope| scope.as_str().is_some())
+                    && scopes.iter().any(|scope| scope.as_str() == required_scope)
+            })
 }
 
 fn service_status(payload: &Value, login: bool, operational_health: bool) -> u16 {
@@ -735,6 +745,9 @@ fn service_status(payload: &Value, login: bool, operational_health: bool) -> u16
 
 #[cfg(test)]
 mod csrf_revocation_tests;
+
+#[cfg(test)]
+mod auth_verification_tests;
 
 #[cfg(test)]
 mod tests {
