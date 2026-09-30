@@ -47,6 +47,25 @@ fn every_profile_contains_unique_providers_and_all_dependencies() {
 }
 
 #[test]
+fn host_metrics_has_the_delegated_configuration_state_grant() {
+    for profile in [
+        PackageProfile::Platform,
+        PackageProfile::StreamProbe,
+        PackageProfile::SoftwareProbe,
+        PackageProfile::LinuxProbe,
+    ] {
+        let provider = profile
+            .components()
+            .iter()
+            .find(|component| component.id == HOST_METRICS.id)
+            .unwrap();
+        assert!(provider.calls.contains(&"amaterasu.configuration/1"));
+        assert!(provider.calls.contains(&"amaterasu.state/1"));
+        assert!(provider.dependencies.contains(&"amaterasu.configuration"));
+    }
+}
+
+#[test]
 fn software_probe_uses_one_real_video_encoder_with_controlled_capture_and_audio() {
     let components = PackageProfile::SoftwareProbe.components();
     let component = |id| {

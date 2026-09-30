@@ -91,7 +91,8 @@ const HOST_METRICS: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.host-metrics",
     library: "amaterasu_host_metrics",
     provides: &["amaterasu.host-metrics/1"],
-    calls: &["amaterasu.configuration/1"],
+    // Configuration delegates durable state calls under the original caller.
+    calls: &["amaterasu.configuration/1", "amaterasu.state/1"],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
