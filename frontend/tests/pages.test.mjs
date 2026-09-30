@@ -63,7 +63,10 @@ for (const source of ["src/types.ts", "src/model.ts", "src/ui.ts", "src/pages.ts
     pageTestContext,
   );
   if (source === "src/ui.ts") {
-    vm.runInContext("Object.assign(globalThis, Amaterasu)", pageTestContext);
+    vm.runInContext(
+      "Object.assign(globalThis, Amaterasu); globalThis.renderHostMetricsDashboard = () => {}",
+      pageTestContext,
+    );
   }
 }
 

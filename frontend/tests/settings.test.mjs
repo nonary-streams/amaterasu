@@ -10,10 +10,17 @@ vm.runInContext(
   context,
 );
 vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
+context.Amaterasu.renderHostMetricsSettings = () => {};
+context.Amaterasu.renderHostMetricsDashboard = () => {};
+vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
 vm.runInContext(
   ts.transpile(readFileSync("src/settings.ts", "utf8"), {
     target: ts.ScriptTarget.ES2022,
   }),
+  context,
+);
+vm.runInContext(
+  "Amaterasu.renderHostMetricsSettings = () => {}; Amaterasu.renderHostMetricsDashboard = () => {}; Object.assign(globalThis, Amaterasu)",
   context,
 );
 vm.runInContext(
@@ -464,7 +471,12 @@ test("host logging form refreshes its revision after an ambiguous persisted save
     document: { createElement: (name) => new Element(name) } });
   for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
+    if (source === "src/settings.ts") {
+      vm.runInContext("Amaterasu.renderHostMetricsSettings = () => {}; Amaterasu.renderHostMetricsDashboard = () => {};", dom);
+    }
     vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+    vm.runInContext("globalThis.renderHostMetricsSettings = () => {}; globalThis.renderHostMetricsDashboard = () => {};", dom);
+    vm.runInContext("globalThis.renderHostMetricsSettings = () => {}; globalThis.renderHostMetricsDashboard = () => {};", dom);
   }
   dom.ApiError = class ApiError extends Error {
     constructor(code) { super("C:/private/token.log"); this.code = code; }
@@ -1010,6 +1022,7 @@ test("history form keeps retention controls visible and saves them while recordi
   for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
     vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+    vm.runInContext("globalThis.renderHostMetricsSettings = () => {}; globalThis.renderHostMetricsDashboard = () => {};", dom);
   }
   dom.ApiError = class ApiError extends Error {};
   const content = new Element("main");
@@ -1594,6 +1607,7 @@ test("input form confirms cleanup-pending save, then reloads after a revision co
       target: ts.ScriptTarget.ES2022,
     }), dom);
     vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+    vm.runInContext("globalThis.renderHostMetricsSettings = () => {}; globalThis.renderHostMetricsDashboard = () => {};", dom);
   }
   class ApiError extends Error { constructor(code) { super(code); this.code = code; } }
   dom.ApiError = ApiError;
@@ -2052,6 +2066,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
       target: ts.ScriptTarget.ES2022,
     }), dom);
     vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+    vm.runInContext("globalThis.renderHostMetricsSettings = () => {}; globalThis.renderHostMetricsDashboard = () => {};", dom);
   }
   class ApiError extends Error { constructor(code) { super(code); this.code = code; } }
   dom.ApiError = ApiError;
@@ -2110,7 +2125,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
     },
   });
   await new Promise(setImmediate);
-  const pairingArea = content.children[10];
+  const pairingArea = content.children[11];
   const fec = find(pairingArea, (node) => node.name === `fec_${"a".repeat(64)}`);
   const ds4BackClick = find(pairingArea, (node) => node.name === "ds4_back_as_touchpad_click");
   const save = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
@@ -2415,6 +2430,7 @@ test("Moonlight host form reloads its revision and listener status after a persi
       target: ts.ScriptTarget.ES2022,
     }), dom);
     vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+    vm.runInContext("globalThis.renderHostMetricsSettings = () => {}; globalThis.renderHostMetricsDashboard = () => {};", dom);
   }
   class ApiError extends Error {
     constructor(code) { super(code); this.code = code; }
@@ -2797,6 +2813,7 @@ test("Steam form reloads normalized Linux settings and explains the enabled poli
       target: ts.ScriptTarget.ES2022,
     }), dom);
     vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+    vm.runInContext("globalThis.renderHostMetricsSettings = () => {}; globalThis.renderHostMetricsDashboard = () => {};", dom);
   }
   dom.ApiError = class ApiError extends Error {};
   const content = new Element("main");
