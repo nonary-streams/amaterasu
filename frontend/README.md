@@ -86,6 +86,15 @@ browser API calls.
   disabled, and failed disk delivery; older status replies leave delivery unverified.
   Sink failures report only the operation category, without exposing disk paths.
 
+The shared input editor preserves ordered keybindings at the host, application,
+and certificate-bound client scopes. Scoped blank text inherits; `[]` clears
+lower custom mappings while retaining built-in modifiers and the optional
+Right Alt mapping. Decimal and hexadecimal text is sent as exact integer JSON
+bytes, with at most 256 pairs. This 0..255 domain is narrower than Vibeshine's
+arbitrary integer parser. The native input module applies the selected mappings
+only where its platform backend supports the destination key; browser tests and
+synthetic input probes do not qualify operating-system key delivery.
+
 All surfaces read the management principal's shared namespace; this is not a
 multi-tenant frontend. External changes can invalidate cursors and revisions;
 refresh loads current state. Most lists refresh explicitly, rather than polling

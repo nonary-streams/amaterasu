@@ -101,8 +101,34 @@ namespace Amaterasu {
     return frequency;
   }
 
+  export function validateKeybindings(value: unknown): number[] {
+    if (!Array.isArray(value) || value.length > 512 || value.length % 2 !== 0 ||
+        Array.from(value).some((byte) => typeof byte !== "number" || !Number.isInteger(byte) ||
+          byte < 0 || byte > 255))
+      throw new Error("Keybindings must contain at most 256 source/destination pairs of whole bytes from 0 to 255.");
+    return [...value];
+  }
+
+  export function parseKeybindingsOverride(value: string): number[] | null {
+    const trimmed = value.trim();
+    if (trimmed === "") return null;
+    if (!trimmed.startsWith("[") || !trimmed.endsWith("]"))
+      throw new Error("Keybindings must be a bracketed list, such as [16, 160], or blank to inherit.");
+    const contents = trimmed.slice(1, -1).trim();
+    if (contents === "") return [];
+    const tokens = contents.split(",").map((token) => token.trim());
+    if (tokens.length > 512 || tokens.some((token) => !/^(?:[0-9]+|0[xX][0-9a-fA-F]+)$/.test(token)))
+      throw new Error("Keybindings accept whole decimal or hexadecimal bytes in source/destination pairs.");
+    return validateKeybindings(tokens.map((token) => Number(token)));
+  }
+
+  export function keybindingsFormValue(current?: number[] | null): string {
+    return current == null ? "" : JSON.stringify(validateKeybindings(current));
+  }
+
   export function advancedInputOverrideFormValues(current?: AdvancedInputOverrides): Record<keyof AdvancedInputOverrides, string> {
     return {
+      keybindings: keybindingsFormValue(current?.keybindings),
       high_resolution_scrolling: current?.high_resolution_scrolling == null ? "" : String(current.high_resolution_scrolling),
       always_send_scancodes: current?.always_send_scancodes == null ? "" : String(current.always_send_scancodes),
       key_rightalt_to_key_win: current?.key_rightalt_to_key_win == null ? "" : String(current.key_rightalt_to_key_win),
@@ -114,6 +140,7 @@ namespace Amaterasu {
   export function parseAdvancedInputOverrides(data: Pick<FormData, "get">): AdvancedInputOverrides {
     const text = (name: keyof AdvancedInputOverrides) => String(data.get(name) ?? "");
     return {
+      keybindings: parseKeybindingsOverride(text("keybindings")),
       high_resolution_scrolling: parseInputBooleanOverride(text("high_resolution_scrolling"), "High-resolution scrolling"),
       always_send_scancodes: parseInputBooleanOverride(text("always_send_scancodes"), "Always send scancodes"),
       key_rightalt_to_key_win: parseInputBooleanOverride(text("key_rightalt_to_key_win"), "Right Alt as Windows key"),

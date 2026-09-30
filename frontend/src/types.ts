@@ -45,6 +45,7 @@ namespace Amaterasu {
   export type CatalogAutoVirtualFramegenMode = "enabled" | "vrr" | "legacy" | "disabled";
   export type CatalogRtssFrameLimitType = string;
   export interface AdvancedInputOverrides {
+    keybindings?: number[] | null;
     high_resolution_scrolling?: boolean | null;
     always_send_scancodes?: boolean | null;
     key_rightalt_to_key_win?: boolean | null;
@@ -323,6 +324,7 @@ namespace Amaterasu {
       high_resolution_scrolling: boolean;
       always_send_scancodes: boolean;
       key_rightalt_to_key_win: boolean;
+      keybindings: number[];
       key_repeat_delay: number;
       key_repeat_frequency: number;
       back_button_timeout: number;

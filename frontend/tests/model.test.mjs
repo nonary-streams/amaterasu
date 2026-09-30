@@ -15,7 +15,7 @@ const model = context.Amaterasu;
 const ordinary = (value) => JSON.parse(JSON.stringify(value));
 
 test("advanced scoped input editor preserves false and zero, and clears inherited values", () => {
-  const saved = { high_resolution_scrolling: false, always_send_scancodes: false,
+  const saved = { keybindings: [65, 66, 65, 67], high_resolution_scrolling: false, always_send_scancodes: false,
     key_rightalt_to_key_win: true, key_repeat_delay: 0, key_repeat_frequency: 0 };
   const form = new FormData();
   form.set("name", "Input app");
@@ -30,10 +30,45 @@ test("advanced scoped input editor preserves false and zero, and clears inherite
     key_rightalt_to_key_win: null, key_repeat_delay: null, key_repeat_frequency: null });
   for (const [key, value] of Object.entries(cleared)) form.set(key, value);
   assert.deepEqual(ordinary(model.parseAdvancedInputOverrides(form)), {
+    keybindings: null,
     high_resolution_scrolling: null, always_send_scancodes: null,
     key_rightalt_to_key_win: null, key_repeat_delay: null, key_repeat_frequency: null });
   assert.equal(Object.hasOwn(model.entryFromForm(form), "config_overrides"), false);
   assert.deepEqual(ordinary(model.advancedInputOverrideFormValues()), ordinary(cleared));
+});
+
+test("keybindings preserve order, duplicates, empty lists, and sparse inheritance", () => {
+  for (const blank of ["", "  ", "\n"]) assert.equal(model.parseKeybindingsOverride(blank), null);
+  assert.deepEqual(ordinary(model.parseKeybindingsOverride("[]")), []);
+  const ordered = [65, 66, 65, 67, 165, 0, 0, 255];
+  assert.deepEqual(ordinary(model.parseKeybindingsOverride("[0x41, 66, 65, 0X43, 165, 0, 0, 255]")), ordered);
+  assert.equal(model.keybindingsFormValue(ordered), JSON.stringify(ordered));
+  assert.equal(model.keybindingsFormValue([]), "[]");
+  assert.equal(model.keybindingsFormValue(null), "");
+  assert.equal(model.keybindingsFormValue(undefined), "");
+  assert.deepEqual(ordinary(model.parseKeybindingsOverride(JSON.stringify(Array(512).fill(255)))), Array(512).fill(255));
+  const form = new FormData();
+  form.set("name", "Input app");
+  form.set("kind", "application");
+  form.set("path", "/opt/example");
+  form.set("keybindings", "[]");
+  assert.deepEqual(ordinary(model.entryFromForm(form).config_overrides), { keybindings: [] });
+  form.set("keybindings", "");
+  assert.equal(Object.hasOwn(model.entryFromForm(form), "config_overrides"), false);
+});
+
+test("keybindings reject coercion, executable text, fractions, and out-of-domain pairs", () => {
+  for (const value of ["null", "{}", "65,66", "[65]", "[65,]", "[,65]", "[true,65]",
+    '["65",66]', "[[65,66]]", "[-1,0]", "[0,256]", "[1.0,2]", "[1e2,2]",
+    "[+1,2]", "[0x100,0]", "[0x,0]", "[Infinity,0]", "[NaN,0]",
+    "[65, (globalThis.executed = true)]", JSON.stringify(Array(514).fill(0))]) {
+    assert.throws(() => model.parseKeybindingsOverride(value), undefined, value);
+  }
+  assert.equal(context.executed, undefined);
+  for (const value of [null, undefined, "[]", {}, [true, 0], ["1", 0], [1.5, 0],
+    [0, Infinity], [0, NaN], [0, 256], [0], new Array(2), new Uint8Array([1, 2])]) {
+    assert.throws(() => model.validateKeybindings(value));
+  }
 });
 
 test("advanced scoped input editor rejects invalid repeat values and boolean coercion", () => {

@@ -157,13 +157,39 @@ namespace Amaterasu {
   }
 }
 namespace Amaterasu {
+  export function keybindingsControl(current?: number[] | null, global = false): {
+    field: HTMLElement;
+    read: () => number[] | null;
+  } {
+    const control = el("textarea");
+    control.name = global ? "input_keybindings" : "keybindings";
+    control.value = keybindingsFormValue(current);
+    control.rows = 3;
+    control.placeholder = global ? "[16,160,17,162,18,164]" : "Inherit";
+    control.required = global;
+    const scope = global
+      ? "Use [] to clear custom mappings; built-in modifiers and the optional Right Alt mapping still apply."
+      : "Blank inherits the next scope. Use [] to clear lower custom mappings; built-in modifiers and the optional Right Alt mapping still apply.";
+    return {
+      field: field("Keybindings", control,
+        `${scope} Enter up to 256 ordered source/destination byte pairs, such as [0x41, 0x42]. Generic Shift, Control, and Alt always map to their left variants. Other keys use the first mapping for their source, without chaining. A custom Right Alt mapping takes precedence over the Windows-key option.`),
+      read: () => {
+        const value = parseKeybindingsOverride(control.value);
+        if (global && value === null)
+          throw new Error("Global keybindings require a list; use [] to clear custom mappings.");
+        return value;
+      },
+    };
+  }
+
   export function advancedInputOverrideControls(current?: AdvancedInputOverrides): {
     fields: HTMLElement[];
     read: () => AdvancedInputOverrides;
   } {
     const values = advancedInputOverrideFormValues(current);
     const controls = new Map<keyof AdvancedInputOverrides, HTMLInputElement | HTMLSelectElement>();
-    const fields: HTMLElement[] = [];
+    const keybindings = keybindingsControl(current?.keybindings);
+    const fields: HTMLElement[] = [keybindings.field];
     for (const [name, label] of [
       ["high_resolution_scrolling", "High-resolution scrolling"],
       ["always_send_scancodes", "Always send scancodes"],
@@ -194,8 +220,11 @@ namespace Amaterasu {
     }
     return {
       fields,
-      read: () => parseAdvancedInputOverrides({
-        get: (name: string) => controls.get(name as keyof AdvancedInputOverrides)?.value ?? null,
+      read: () => ({
+        ...parseAdvancedInputOverrides({
+          get: (name: string) => controls.get(name as keyof AdvancedInputOverrides)?.value ?? null,
+        }),
+        keybindings: keybindings.read(),
       }),
     };
   }

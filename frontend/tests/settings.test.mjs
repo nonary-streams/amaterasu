@@ -6,6 +6,11 @@ import ts from "typescript";
 
 const context = vm.createContext({ TextEncoder, URL });
 vm.runInContext(
+  ts.transpile(readFileSync("src/model.ts", "utf8"), { target: ts.ScriptTarget.ES2022 }),
+  context,
+);
+vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
+vm.runInContext(
   ts.transpile(readFileSync("src/settings.ts", "utf8"), {
     target: ts.ScriptTarget.ES2022,
   }),
@@ -1078,6 +1083,7 @@ test("input policy editor validates key repeat settings and reports cleanup hone
     gamepad: "auto",
     controller: true,
     native_pen_touch: true,
+    keybindings: [16, 160, 17, 162, 18, 164],
   });
   assert.deepEqual(
     ordinary(parsePolicy(true, true, true, true, false, 2147483647, 31.25, 2147483647)),
@@ -1093,6 +1099,7 @@ test("input policy editor validates key repeat settings and reports cleanup hone
       gamepad: "auto",
       controller: true,
       native_pen_touch: true,
+      keybindings: [16, 160, 17, 162, 18, 164],
     },
   );
   const parseNativePenTouch = (nativePenTouch) =>
@@ -1396,6 +1403,7 @@ const inputSettingsValues = () => ({
   key_rightalt_to_key_win: false, key_repeat_delay: 500,
   key_repeat_frequency: 24.9, back_button_timeout: -1,
   gamepad: "auto", ds4_back_as_touchpad_click: false, native_pen_touch: true,
+  keybindings: [16, 160, 17, 162, 18, 164],
 });
 
 test("input policy confirms complete signed update and durable GET at revision plus one", async () => {
@@ -1441,11 +1449,34 @@ test("input policy rejects changed unrelated values, malformed replies and concu
     { ...confirmed, revision: 9 },
     { ...confirmed, values: { ...requested, controller: false } },
     { ...confirmed, values: { ...requested, ds4_back_as_touchpad_click: true } },
+    { ...confirmed, values: { ...requested, keybindings: [] } },
   ]) {
     await assert.rejects(context.Amaterasu.saveInputPolicySettings({ async post(route) {
       return route === "input/settings_update" ? confirmed : readback;
     } }, current, requested));
   }
+});
+
+test("global keybindings replies require an exact bounded byte array and confirm empty maps", async () => {
+  const current = { ok: true, persisted: true, applied: true, cleanup_required: false,
+    revision: 7, values: inputSettingsValues() };
+  for (const keybindings of [undefined, null, "[]", {}, [true, 0], ["1", 0], [1.5, 0],
+    [0, 256], [0], Array(514).fill(0)]) {
+    assert.throws(() => context.Amaterasu.parseInputPolicySettingsReply({
+      ...current, values: { ...current.values, keybindings },
+    }));
+  }
+  const requested = { ...current.values, keybindings: [] };
+  const confirmed = { ...current, revision: 8, values: requested };
+  assert.deepEqual(ordinary(await context.Amaterasu.saveInputPolicySettings({
+    async post(route, body) {
+      if (route === "input/settings_update") {
+        assert.equal(body.expected_revision, 7);
+        assert.deepEqual(ordinary(body.keybindings), []);
+      } else assert.equal(route, "input/settings_get");
+      return confirmed;
+    },
+  }, current, requested)), confirmed);
 });
 
 test("input cleanup_pending requires exact durable GET before reporting saved policy", async () => {
@@ -1602,6 +1633,13 @@ test("input form confirms cleanup-pending save, then reloads after a revision co
   const oldForm = find(inputArea, (node) => node.tagName === "form");
   assert.ok(oldForm);
   assert.equal(find(oldForm, (node) => node.name === "input_ds4_back_as_touchpad_click").checked, false);
+  const keybindings = find(oldForm, (node) => node.name === "input_keybindings");
+  assert.equal(keybindings.value, "[16,160,17,162,18,164]");
+  keybindings.value = "";
+  oldForm.fire("submit", { preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(updates, 0);
+  keybindings.value = "[0x41,0x42,0x41,0x43]";
   const gamepadProfile = find(oldForm, (node) => node.name === "input_gamepad_profile");
   assert.deepEqual(gamepadProfile.options.map((option) => option.value), ["auto"]);
   gamepadProfile.value = "xone";
@@ -1614,6 +1652,8 @@ test("input form confirms cleanup-pending save, then reloads after a revision co
   await new Promise(setImmediate);
   assert.equal(oldForm.isConnected, false);
   assert.match(inputArea.textContent, /Revision 8/);
+  assert.deepEqual(ordinary(stored.values.keybindings), [65, 66, 65, 67]);
+  assert.equal(find(inputArea, (node) => node.name === "input_keybindings").value, "[65,66,65,67]");
   assert.match(notices.at(-1), /saved and confirmed.*pending/);
   assert.match(inputArea.textContent, /Runtime status is unavailable/);
   const freshForm = find(inputArea, (node) => node.tagName === "form");
@@ -1987,6 +2027,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   content.setConnected(true);
   const notices = [];
   let stored = pairedClients();
+  stored.clients[0].config_overrides.keybindings = [65, 66, 65, 67];
   stored.clients[0].config_overrides.sw_preset = "";
   stored.clients[0].config_overrides.encoder = "software";
   let updates = 0;
@@ -2003,7 +2044,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
           updates += 1;
           if (updates === 2) {
             secondSubmittedRevision = body.expected_revision;
-            for (const key of ["high_resolution_scrolling", "always_send_scancodes", "key_rightalt_to_key_win", "key_repeat_delay", "key_repeat_frequency"])
+            for (const key of ["keybindings", "high_resolution_scrolling", "always_send_scancodes", "key_rightalt_to_key_win", "key_repeat_delay", "key_repeat_frequency"])
               assert.equal(Object.hasOwn(body.config_overrides, key), false);
             stored = { ...stored, revision: 9, clients: [
               { ...stored.clients[0], config_overrides: {
@@ -2021,6 +2062,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
           assert.equal(body.config_overrides.key_rightalt_to_key_win, true);
           assert.equal(body.config_overrides.key_repeat_delay, 0);
           assert.equal(body.config_overrides.key_repeat_frequency, 0);
+          assert.deepEqual(ordinary(body.config_overrides.keybindings), []);
           assert.equal(body.config_overrides.sw_preset, "");
           assert.equal(body.config_overrides.sw_tune, "  film,zerolatency  ");
           assert.equal(body.config_overrides.encoder, "software");
@@ -2039,6 +2081,13 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   const save = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
   assert.ok(fec);
   assert.ok(save);
+  const keybindings = find(pairingArea, (node) => node.name === "keybindings");
+  assert.equal(keybindings.value, "[65,66,65,67]");
+  keybindings.value = "[true,0]";
+  save.fire("click");
+  await new Promise(setImmediate);
+  assert.equal(updates, 0);
+  keybindings.value = "[]";
   assert.match(pairingArea.textContent, /Input and software encoding preferences/);
   const presetMode = find(pairingArea, (node) => node.name === "sw_preset_mode");
   const presetValue = find(pairingArea, (node) => node.name === "sw_preset_value");
@@ -2056,6 +2105,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   assert.equal(find(pairingArea, (node) => node.name === "encoder_backend").value, "software");
   fec.value = "35";
   find(pairingArea, (node) => node.name === "native_pen_touch").value = "true";
+  find(pairingArea, (node) => node.name === "keybindings").value = "[]";
   for (const [key, value] of Object.entries({high_resolution_scrolling: "false", always_send_scancodes: "false", key_rightalt_to_key_win: "true", key_repeat_delay: "0", key_repeat_frequency: "0"}))
     find(pairingArea, (node) => node.name === key).value = value;
   save.fire("click");
@@ -2067,7 +2117,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   assert.equal(find(pairingArea, (node) => node.name === "sw_preset_value").value, "");
   assert.equal(find(pairingArea, (node) => node.name === "sw_tune_value").value, "  film,zerolatency  ");
   const freshSave = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
-  for (const [key, value] of Object.entries({high_resolution_scrolling: "false", always_send_scancodes: "false", key_rightalt_to_key_win: "true", key_repeat_delay: "0", key_repeat_frequency: "0"})) {
+  for (const [key, value] of Object.entries({keybindings: "[]", high_resolution_scrolling: "false", always_send_scancodes: "false", key_rightalt_to_key_win: "true", key_repeat_delay: "0", key_repeat_frequency: "0"})) {
     const control = find(pairingArea, (node) => node.name === key);
     assert.equal(control.value, value);
     control.value = "";

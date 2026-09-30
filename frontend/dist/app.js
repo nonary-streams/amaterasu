@@ -107,8 +107,36 @@ var Amaterasu;
         return frequency;
     }
     Amaterasu.parseKeyRepeatFrequencyOverride = parseKeyRepeatFrequencyOverride;
+    function validateKeybindings(value) {
+        if (!Array.isArray(value) || value.length > 512 || value.length % 2 !== 0 ||
+            Array.from(value).some((byte) => typeof byte !== "number" || !Number.isInteger(byte) ||
+                byte < 0 || byte > 255))
+            throw new Error("Keybindings must contain at most 256 source/destination pairs of whole bytes from 0 to 255.");
+        return [...value];
+    }
+    Amaterasu.validateKeybindings = validateKeybindings;
+    function parseKeybindingsOverride(value) {
+        const trimmed = value.trim();
+        if (trimmed === "")
+            return null;
+        if (!trimmed.startsWith("[") || !trimmed.endsWith("]"))
+            throw new Error("Keybindings must be a bracketed list, such as [16, 160], or blank to inherit.");
+        const contents = trimmed.slice(1, -1).trim();
+        if (contents === "")
+            return [];
+        const tokens = contents.split(",").map((token) => token.trim());
+        if (tokens.length > 512 || tokens.some((token) => !/^(?:[0-9]+|0[xX][0-9a-fA-F]+)$/.test(token)))
+            throw new Error("Keybindings accept whole decimal or hexadecimal bytes in source/destination pairs.");
+        return validateKeybindings(tokens.map((token) => Number(token)));
+    }
+    Amaterasu.parseKeybindingsOverride = parseKeybindingsOverride;
+    function keybindingsFormValue(current) {
+        return current == null ? "" : JSON.stringify(validateKeybindings(current));
+    }
+    Amaterasu.keybindingsFormValue = keybindingsFormValue;
     function advancedInputOverrideFormValues(current) {
         return {
+            keybindings: keybindingsFormValue(current?.keybindings),
             high_resolution_scrolling: current?.high_resolution_scrolling == null ? "" : String(current.high_resolution_scrolling),
             always_send_scancodes: current?.always_send_scancodes == null ? "" : String(current.always_send_scancodes),
             key_rightalt_to_key_win: current?.key_rightalt_to_key_win == null ? "" : String(current.key_rightalt_to_key_win),
@@ -120,6 +148,7 @@ var Amaterasu;
     function parseAdvancedInputOverrides(data) {
         const text = (name) => String(data.get(name) ?? "");
         return {
+            keybindings: parseKeybindingsOverride(text("keybindings")),
             high_resolution_scrolling: parseInputBooleanOverride(text("high_resolution_scrolling"), "High-resolution scrolling"),
             always_send_scancodes: parseInputBooleanOverride(text("always_send_scancodes"), "Always send scancodes"),
             key_rightalt_to_key_win: parseInputBooleanOverride(text("key_rightalt_to_key_win"), "Right Alt as Windows key"),
@@ -1698,10 +1727,32 @@ var Amaterasu;
     Amaterasu.pager = pager;
 })(Amaterasu || (Amaterasu = {}));
 (function (Amaterasu) {
+    function keybindingsControl(current, global = false) {
+        const control = Amaterasu.el("textarea");
+        control.name = global ? "input_keybindings" : "keybindings";
+        control.value = Amaterasu.keybindingsFormValue(current);
+        control.rows = 3;
+        control.placeholder = global ? "[16,160,17,162,18,164]" : "Inherit";
+        control.required = global;
+        const scope = global
+            ? "Use [] to clear custom mappings; built-in modifiers and the optional Right Alt mapping still apply."
+            : "Blank inherits the next scope. Use [] to clear lower custom mappings; built-in modifiers and the optional Right Alt mapping still apply.";
+        return {
+            field: Amaterasu.field("Keybindings", control, `${scope} Enter up to 256 ordered source/destination byte pairs, such as [0x41, 0x42]. Generic Shift, Control, and Alt always map to their left variants. Other keys use the first mapping for their source, without chaining. A custom Right Alt mapping takes precedence over the Windows-key option.`),
+            read: () => {
+                const value = Amaterasu.parseKeybindingsOverride(control.value);
+                if (global && value === null)
+                    throw new Error("Global keybindings require a list; use [] to clear custom mappings.");
+                return value;
+            },
+        };
+    }
+    Amaterasu.keybindingsControl = keybindingsControl;
     function advancedInputOverrideControls(current) {
         const values = Amaterasu.advancedInputOverrideFormValues(current);
         const controls = new Map();
-        const fields = [];
+        const keybindings = keybindingsControl(current?.keybindings);
+        const fields = [keybindings.field];
         for (const [name, label] of [
             ["high_resolution_scrolling", "High-resolution scrolling"],
             ["always_send_scancodes", "Always send scancodes"],
@@ -1733,8 +1784,11 @@ var Amaterasu;
         }
         return {
             fields,
-            read: () => Amaterasu.parseAdvancedInputOverrides({
-                get: (name) => controls.get(name)?.value ?? null,
+            read: () => ({
+                ...Amaterasu.parseAdvancedInputOverrides({
+                    get: (name) => controls.get(name)?.value ?? null,
+                }),
+                keybindings: keybindings.read(),
             }),
         };
     }
@@ -2068,12 +2122,12 @@ var Amaterasu;
         fpsLimit.max = "1000";
         fpsLimit.step = "0.001";
         fpsLimit.placeholder = "Inherit";
-        const provider = catalogFrameLimiterCapabilitySelect("frame_limiter_provider", values.frame_limiter_provider, capabilities);
+        const provider = catalogFrameLimiterCapabilitySelect("frame_limiter_provider", overrides?.frame_limiter_provider, capabilities);
         const disableVsync = audioOverrideSelect("frame_limiter_disable_vsync", values.frame_limiter_disable_vsync === ""
             ? undefined
             : values.frame_limiter_disable_vsync === "true");
         const autoVirtualFramegen = catalogEnumOverrideSelect("frame_limiter_auto_virtual_framegen", values.frame_limiter_auto_virtual_framegen, catalogAutoVirtualFramegenModes);
-        const rtssFrameLimitType = catalogFrameLimiterCapabilitySelect("rtss_frame_limit_type", values.rtss_frame_limit_type, capabilities);
+        const rtssFrameLimitType = catalogFrameLimiterCapabilitySelect("rtss_frame_limit_type", overrides?.rtss_frame_limit_type, capabilities);
         const ds4BackAsTouchpadClick = audioOverrideSelect("ds4_back_as_touchpad_click", values.ds4_back_as_touchpad_click === ""
             ? undefined
             : values.ds4_back_as_touchpad_click === "true");
@@ -3292,7 +3346,7 @@ var Amaterasu;
         return `Diagnostics is using a newer host logging revision ${status.logging_configuration_revision}. Refresh the saved policy.`;
     }
     Amaterasu.diagnosticsLoggingDescription = diagnosticsLoggingDescription;
-    function parseInputPolicy(keyboard, mouse, highResolutionScrolling, alwaysSendScancodes, keyRightAltToKeyWin, keyRepeatDelay, keyRepeatFrequency, backButtonTimeout = -1, gamepadProfile = "auto", selectableGamepadProfiles = ["auto"], controllerEnabled = true, nativePenTouch = true) {
+    function parseInputPolicy(keyboard, mouse, highResolutionScrolling, alwaysSendScancodes, keyRightAltToKeyWin, keyRepeatDelay, keyRepeatFrequency, backButtonTimeout = -1, gamepadProfile = "auto", selectableGamepadProfiles = ["auto"], controllerEnabled = true, nativePenTouch = true, keybindings = [16, 160, 17, 162, 18, 164]) {
         if (typeof keyboard !== "boolean" ||
             typeof mouse !== "boolean" ||
             typeof highResolutionScrolling !== "boolean" ||
@@ -3318,6 +3372,7 @@ var Amaterasu;
             high_resolution_scrolling: highResolutionScrolling,
             always_send_scancodes: alwaysSendScancodes,
             key_rightalt_to_key_win: keyRightAltToKeyWin,
+            keybindings: Amaterasu.validateKeybindings(keybindings),
             key_repeat_delay: keyRepeatDelay,
             key_repeat_frequency: keyRepeatFrequency,
             back_button_timeout: backButtonTimeout,
@@ -3343,8 +3398,9 @@ var Amaterasu;
         const values = reply.values;
         if (typeof values.ds4_back_as_touchpad_click !== "boolean")
             throw new Error("Input policy settings reply omitted the DS4 back button policy.");
+        const keybindings = Amaterasu.validateKeybindings(values.keybindings);
         const parsed = {
-            ...parseInputPolicy(values.keyboard, values.mouse, values.high_resolution_scrolling, values.always_send_scancodes, values.key_rightalt_to_key_win, values.key_repeat_delay, values.key_repeat_frequency, values.back_button_timeout, values.gamepad, recognizedInputGamepadProfiles, values.controller, values.native_pen_touch),
+            ...parseInputPolicy(values.keyboard, values.mouse, values.high_resolution_scrolling, values.always_send_scancodes, values.key_rightalt_to_key_win, values.key_repeat_delay, values.key_repeat_frequency, values.back_button_timeout, values.gamepad, recognizedInputGamepadProfiles, values.controller, values.native_pen_touch, keybindings),
             ds4_back_as_touchpad_click: values.ds4_back_as_touchpad_click,
         };
         if (!sameConfigurationValue(values, parsed))
@@ -3506,7 +3562,7 @@ var Amaterasu;
         "frame_limiter_disable_vsync", "frame_limiter_auto_virtual_framegen",
         "rtss_frame_limit_type", "nvenc_spatial_aq", "high_resolution_scrolling",
         "always_send_scancodes", "key_rightalt_to_key_win", "key_repeat_delay",
-        "key_repeat_frequency",
+        "key_repeat_frequency", "keybindings",
     ];
     function unsupportedPairingOverrideFields(client) {
         const overrides = client.config_overrides ?? {};
@@ -3517,6 +3573,17 @@ var Amaterasu;
     }
     Amaterasu.unsupportedPairingOverrideFields = unsupportedPairingOverrideFields;
     function validStoredPairingOverride(field, value) {
+        if (field === "keybindings") {
+            if (value == null)
+                return true;
+            try {
+                Amaterasu.validateKeybindings(value);
+                return true;
+            }
+            catch {
+                return false;
+            }
+        }
         if (value === null || value === undefined)
             return false;
         if (["stream_audio", "audio_sink_capture_only", "controller", "keyboard", "mouse",
@@ -5019,6 +5086,7 @@ var Amaterasu;
                 alwaysSendScancodes.checked = settings.values.always_send_scancodes;
                 const keyRightAltToKeyWin = Amaterasu.input("input_key_rightalt_to_key_win", "", "checkbox");
                 keyRightAltToKeyWin.checked = settings.values.key_rightalt_to_key_win;
+                const keybindings = Amaterasu.keybindingsControl(settings.values.keybindings, true);
                 const keyRepeatDelay = Amaterasu.input("input_key_repeat_delay", String(settings.values.key_repeat_delay), "number");
                 keyRepeatDelay.required = true;
                 keyRepeatDelay.min = "0";
@@ -5054,7 +5122,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save input policy");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("Controller input", controller, "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue."), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick, "For the DS4 profile, maps Back to a touchpad click when that backend supports it. The preference stays saved if the selected backend cannot apply it."), Amaterasu.field("Native pen and touch policy", nativePenTouch, "Windows-only global preference. Native pen/touch event transport and platform support are not implemented; saving this value does not activate pen or touch events."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux and Windows, when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other platforms do not inject gamepads."), Amaterasu.field("Gamepad profile", gamepadProfile, "Profiles listed by input status are supported by this backend. A saved platform-recognized profile outside that list remains visible and is labeled unavailable."), gamepadStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("Controller input", controller, "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue."), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick, "For the DS4 profile, maps Back to a touchpad click when that backend supports it. The preference stays saved if the selected backend cannot apply it."), Amaterasu.field("Native pen and touch policy", nativePenTouch, "Windows-only global preference. Native pen/touch event transport and platform support are not implemented; saving this value does not activate pen or touch events."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), keybindings.field, Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux and Windows, when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other platforms do not inject gamepads."), Amaterasu.field("Gamepad profile", gamepadProfile, "Profiles listed by input status are supported by this backend. A saved platform-recognized profile outside that list remains visible and is labeled unavailable."), gamepadStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
@@ -5062,7 +5130,7 @@ var Amaterasu;
                         let saveStarted = false;
                         try {
                             const values = {
-                                ...parseInputPolicy(keyboard.checked, mouse.checked, highResolutionScrolling.checked, alwaysSendScancodes.checked, keyRightAltToKeyWin.checked, keyRepeatDelay.valueAsNumber, keyRepeatFrequency.valueAsNumber, backButtonTimeout.valueAsNumber, gamepadProfile.value, gamepadProfileChoices.map((choice) => choice.value), controller.checked, nativePenTouch.checked),
+                                ...parseInputPolicy(keyboard.checked, mouse.checked, highResolutionScrolling.checked, alwaysSendScancodes.checked, keyRightAltToKeyWin.checked, keyRepeatDelay.valueAsNumber, keyRepeatFrequency.valueAsNumber, backButtonTimeout.valueAsNumber, gamepadProfile.value, gamepadProfileChoices.map((choice) => choice.value), controller.checked, nativePenTouch.checked, keybindings.read()),
                                 ds4_back_as_touchpad_click: ds4BackAsTouchpadClick.checked,
                             };
                             saveStarted = true;

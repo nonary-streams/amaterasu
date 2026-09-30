@@ -704,6 +704,7 @@ namespace Amaterasu {
     selectableGamepadProfiles: readonly string[] = ["auto"],
     controllerEnabled: boolean = true,
     nativePenTouch: boolean = true,
+    keybindings: unknown = [16, 160, 17, 162, 18, 164],
   ): Omit<InputPolicySettings["values"], "ds4_back_as_touchpad_click"> {
     if (
       typeof keyboard !== "boolean" ||
@@ -732,6 +733,7 @@ namespace Amaterasu {
       high_resolution_scrolling: highResolutionScrolling,
       always_send_scancodes: alwaysSendScancodes,
       key_rightalt_to_key_win: keyRightAltToKeyWin,
+      keybindings: validateKeybindings(keybindings),
       key_repeat_delay: keyRepeatDelay,
       key_repeat_frequency: keyRepeatFrequency,
       back_button_timeout: backButtonTimeout,
@@ -758,6 +760,7 @@ namespace Amaterasu {
     const values = reply.values as Record<string, unknown>;
     if (typeof values.ds4_back_as_touchpad_click !== "boolean")
       throw new Error("Input policy settings reply omitted the DS4 back button policy.");
+    const keybindings = validateKeybindings(values.keybindings);
     const parsed = {
       ...parseInputPolicy(
         values.keyboard as boolean,
@@ -772,6 +775,7 @@ namespace Amaterasu {
         recognizedInputGamepadProfiles,
         values.controller as boolean,
         values.native_pen_touch as boolean,
+        keybindings,
       ),
       ds4_back_as_touchpad_click: values.ds4_back_as_touchpad_click,
     };
@@ -957,7 +961,7 @@ namespace Amaterasu {
     "frame_limiter_disable_vsync", "frame_limiter_auto_virtual_framegen",
     "rtss_frame_limit_type", "nvenc_spatial_aq", "high_resolution_scrolling",
     "always_send_scancodes", "key_rightalt_to_key_win", "key_repeat_delay",
-    "key_repeat_frequency",
+    "key_repeat_frequency", "keybindings",
   ];
 
   export function unsupportedPairingOverrideFields(client: PairingClient): string[] {
@@ -969,6 +973,10 @@ namespace Amaterasu {
   }
 
   function validStoredPairingOverride(field: string, value: unknown): boolean {
+    if (field === "keybindings") {
+      if (value == null) return true;
+      try { validateKeybindings(value); return true; } catch { return false; }
+    }
     if (value === null || value === undefined) return false;
     if (["stream_audio", "audio_sink_capture_only", "controller", "keyboard", "mouse",
       "native_pen_touch", "frame_limiter_enable", "frame_limiter_disable_vsync",
@@ -2946,6 +2954,7 @@ namespace Amaterasu {
           "checkbox",
         );
         keyRightAltToKeyWin.checked = settings.values.key_rightalt_to_key_win;
+        const keybindings = keybindingsControl(settings.values.keybindings, true);
         const keyRepeatDelay = input(
           "input_key_repeat_delay",
           String(settings.values.key_repeat_delay),
@@ -3052,6 +3061,7 @@ namespace Amaterasu {
             keyRepeatDelay,
             "Default is 500 milliseconds. Set to 0 to disable key repeat.",
           ),
+          keybindings.field,
           field(
             "Key repeat frequency (Hz)",
             keyRepeatFrequency,
@@ -3091,6 +3101,7 @@ namespace Amaterasu {
                   gamepadProfileChoices.map((choice) => choice.value),
                   controller.checked,
                   nativePenTouch.checked,
+                  keybindings.read(),
                 ),
                 ds4_back_as_touchpad_click: ds4BackAsTouchpadClick.checked,
               };

@@ -352,7 +352,7 @@ namespace Amaterasu {
     fpsLimit.placeholder = "Inherit";
     const provider = catalogFrameLimiterCapabilitySelect(
       "frame_limiter_provider",
-      values.frame_limiter_provider,
+      overrides?.frame_limiter_provider,
       capabilities,
     );
     const disableVsync = audioOverrideSelect(
@@ -368,7 +368,7 @@ namespace Amaterasu {
     );
     const rtssFrameLimitType = catalogFrameLimiterCapabilitySelect(
       "rtss_frame_limit_type",
-      values.rtss_frame_limit_type,
+      overrides?.rtss_frame_limit_type,
       capabilities,
     );
     const ds4BackAsTouchpadClick = audioOverrideSelect(
