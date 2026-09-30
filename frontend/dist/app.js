@@ -2757,6 +2757,159 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function validCsrfOrigin(origin) {
+        if (typeof origin !== "string" || origin.length > 256 || !origin.startsWith("https://"))
+            return false;
+        const authority = origin.slice(8);
+        let host;
+        let port;
+        if (authority.startsWith("[")) {
+            const match = /^\[([0-9a-fA-F:.]+)\](?::([0-9]+))?$/.exec(authority);
+            if (!match)
+                return false;
+            try {
+                new URL(origin);
+            }
+            catch {
+                return false;
+            }
+            port = match[2];
+        }
+        else {
+            const parts = authority.split(":");
+            if (parts.length > 2)
+                return false;
+            host = parts[0] ?? "";
+            port = parts[1];
+            if (/^[0-9.]+$/.test(host)) {
+                const octets = host.split(".");
+                if (octets.length !== 4 || octets.some(value => !/^(0|[1-9][0-9]{0,2})$/.test(value) || Number(value) > 255))
+                    return false;
+            }
+            else if (host.length === 0 || host.length > 253 || /^(?:[0-9]+|0[xX][0-9a-fA-F]*)$/.test(host.split(".").at(-1) ?? "") || host.split(".").some(label => label.length === 0 || label.length > 63 || !/^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(label)))
+                return false;
+        }
+        return port === undefined || (/^[0-9]+$/.test(port) && Number(port) > 0 && Number(port) <= 65535);
+    }
+    Amaterasu.validCsrfOrigin = validCsrfOrigin;
+    function csrfOrigins(value) {
+        return Array.isArray(value) && value.length <= 16 && value.every(validCsrfOrigin) && new Set(value).size === value.length;
+    }
+    function sameCsrfOrigins(left, right) {
+        return left === null || right === null ? left === right :
+            left.length === right.length && left.every((origin, index) => origin === right[index]);
+    }
+    function parseCsrfPolicyReply(value) {
+        if (value === null || typeof value !== "object" || Array.isArray(value))
+            throw new Error("CSRF origin policy reply is invalid.");
+        const reply = value;
+        if (reply.ok !== true || !Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
+            reply.values === null || typeof reply.values !== "object" || Array.isArray(reply.values))
+            throw new Error("CSRF origin policy reply is invalid.");
+        const selection = reply.values.csrf_allowed_origins;
+        if ((selection !== null && !csrfOrigins(selection)) || !csrfOrigins(reply.csrf_allowed_origins) ||
+            !sameCsrfOrigins(selection ?? [], reply.csrf_allowed_origins))
+            throw new Error("CSRF origin policy was not confirmed by the host.");
+        return { ok: true, revision: reply.revision,
+            values: { csrf_allowed_origins: selection === null ? null : [...selection] },
+            csrf_allowed_origins: [...reply.csrf_allowed_origins] };
+    }
+    Amaterasu.parseCsrfPolicyReply = parseCsrfPolicyReply;
+    async function saveCsrfPolicy(api, current, selection) {
+        if (selection !== null && !csrfOrigins(selection))
+            throw new Error("Enter at most 16 distinct HTTPS origins with no paths.");
+        if (!Number.isSafeInteger(current.revision) || current.revision < 0 || current.revision >= Number.MAX_SAFE_INTEGER)
+            throw new Error("CSRF origin policy revision cannot be updated.");
+        const update = await api.post("management_settings/update", {
+            expected_revision: current.revision, csrf_allowed_origins: selection,
+        });
+        if (update && typeof update === "object" && update.code === "revision_conflict")
+            throw new Error("Management policy changed in another editor. Refresh and try again.");
+        const confirmed = parseCsrfPolicyReply(update);
+        if (confirmed.revision !== current.revision + 1 || !sameCsrfOrigins(confirmed.values.csrf_allowed_origins, selection))
+            throw new Error("CSRF origin policy update could not be confirmed. Refresh and check the current value.");
+        const saved = parseCsrfPolicyReply(await api.post("management_settings/get"));
+        if (saved.revision !== confirmed.revision || !sameCsrfOrigins(saved.values.csrf_allowed_origins, selection))
+            throw new Error("CSRF origin policy could not be confirmed after saving. Refresh and check the current value.");
+        return saved;
+    }
+    Amaterasu.saveCsrfPolicy = saveCsrfPolicy;
+    function renderCsrfPolicy(context) {
+        const area = Amaterasu.el("div");
+        let generation = 0;
+        context.content.append(area);
+        async function load() {
+            const request = ++generation;
+            area.replaceChildren(Amaterasu.el("p", "muted", "Loading CSRF origin policy…"));
+            try {
+                const current = parseCsrfPolicyReply(await context.api.post("management_settings/get"));
+                if (!context.content.isConnected || request !== generation)
+                    return;
+                const mode = Amaterasu.el("select");
+                mode.name = "csrf_allowed_origins_mode";
+                for (const [value, label] of [["default", "Default (no exceptions)"], ["custom", "Explicit origin list"]]) {
+                    const option = Amaterasu.el("option", "", label);
+                    option.value = value ?? "";
+                    mode.append(option);
+                }
+                mode.value = current.values.csrf_allowed_origins === null ? "default" : "custom";
+                const origins = Amaterasu.el("textarea");
+                origins.name = "csrf_allowed_origins";
+                origins.rows = 4;
+                origins.value = current.csrf_allowed_origins.join("\n");
+                const form = Amaterasu.el("form", "settings-form");
+                const status = Amaterasu.el("div");
+                const save = Amaterasu.el("button", "button primary", "Save CSRF origins");
+                save.type = "submit";
+                save.disabled = !context.api.allows("configuration.write");
+                mode.disabled = save.disabled;
+                const updateAvailability = () => {
+                    origins.disabled = save.disabled || mode.value !== "custom";
+                };
+                updateAvailability();
+                mode.addEventListener("change", updateAvailability);
+                form.append(Amaterasu.field("CSRF origin exceptions", mode, "Listed origins may use signed-in cookies without the usual CSRF header. Add only trusted HTTPS origins. Sign-in and the host's separate browser access policy still apply."), Amaterasu.field("Exact HTTPS origins, one per line", origins, "Include a port when it appears in the browser origin. Paths and wildcards are rejected. An empty explicit list disables all exceptions."), save, status);
+                form.addEventListener("submit", event => {
+                    event.preventDefault();
+                    if (save.disabled || !context.api.allows("configuration.write"))
+                        return;
+                    ++generation;
+                    mode.disabled = true;
+                    origins.disabled = true;
+                    void Amaterasu.runAction(save, status, async () => {
+                        const selection = mode.value === "default" ? null : mode.value === "custom" ?
+                            origins.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean) : undefined;
+                        try {
+                            if (selection === undefined)
+                                throw new Error("Choose a valid CSRF origin policy.");
+                            await saveCsrfPolicy(context.api, current, selection);
+                            context.notify("CSRF origin policy saved.");
+                            await load();
+                        }
+                        catch (error) {
+                            await load();
+                            if (context.content.isConnected)
+                                area.append(Amaterasu.errorPanel(error));
+                            throw error;
+                        }
+                    }).finally(() => {
+                        mode.disabled = !context.api.allows("configuration.write");
+                        updateAvailability();
+                    });
+                });
+                area.replaceChildren(Amaterasu.panel("CSRF origin exceptions", Amaterasu.button("Refresh CSRF origins", load), form));
+            }
+            catch (error) {
+                if (context.content.isConnected && request === generation)
+                    area.replaceChildren(Amaterasu.errorPanel(error, load));
+            }
+        }
+        void load();
+    }
+    Amaterasu.renderCsrfPolicy = renderCsrfPolicy;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     const maxConfiguredAuthTtlSeconds = 0x7fff_ffff;
     const maxInputKeyRepeatDelayMs = 0x7fff_ffff;
     const minInputBackButtonTimeoutMs = -0x8000_0000;
@@ -4416,6 +4569,7 @@ var Amaterasu;
             void loadPairing();
         })), area, authArea, hostLoggingArea, hostArea, steamArea, lutrisArea, playniteArea, inputArea, historyArea, pairingArea);
         Amaterasu.renderManagementPolicy(context);
+        Amaterasu.renderCsrfPolicy(context);
         async function loadAuth() {
             authArea.replaceChildren(Amaterasu.el("p", "muted", "Loading authentication lifetimes…"));
             try {

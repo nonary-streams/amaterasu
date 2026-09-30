@@ -313,9 +313,18 @@ blank. Address detection and advertisement remain pending in Amaterasu, as
 does qualification of the source's unbounded text acceptance.
 
 `csrf_allowed_origins` remains pending. It is a cookie-session CSRF bypass
-allowlist in the reference. Amaterasu's HTTPS cookie routes require the CSRF
-header and exact same HTTPS Origin without that independent bypass list. Its CORS
-`allowed_origins` setting does not grant authentication.
+allowlist in the reference. Management document v2 now persists a nullable list
+of at most 16 distinct exact HTTPS origins. Omission retains it, null resets to
+no exceptions, and an explicit empty list remains distinct through CAS and
+restart readback. A listed nonmissing Origin skips only the cookie CSRF
+origin/header predicate; TLS, Host, actual socket-peer admission, the separate
+CORS `allowed_origins` policy, and authentication/route scopes remain mandatory.
+Revoked exceptions close dependent active connections on the next tick, and
+uncertain writes remove all exceptions while ingress remains closed. The signed
+editor confirms both the update and subsequent durable readback. Vibeshine's
+built-in loopback, prefix/port/path, Referer and missing-Origin exemptions,
+minted CSRF token and query fallback are not reproduced. Complete source parity
+and installed-host browser/platform qualification keep the ID pending.
 
 Per-application process lifecycle fields now preserve omitted values and apply
 explicit values at launch. `fec_percentage` resolves from the global stream

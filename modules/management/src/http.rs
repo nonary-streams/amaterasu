@@ -390,13 +390,13 @@ fn require_cookie_origin(
     // The independent transport, Host and browser-origin checks have already
     // passed. An explicit exception changes only this cookie CSRF predicate;
     // cookie parsing and service authentication/authorization still follow.
+    if fields.origin == Some(expected) && fields.csrf == Some("1") {
+        return Ok(false);
+    }
     if csrf_origins.permits(fields.origin) {
         return Ok(true);
     }
-    if fields.origin != Some(expected) || fields.csrf != Some("1") {
-        return Err(Failure::new(403, "csrf_denied"));
-    }
-    Ok(false)
+    Err(Failure::new(403, "csrf_denied"))
 }
 
 fn valid_token(value: &str) -> bool {

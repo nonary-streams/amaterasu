@@ -142,4 +142,9 @@ fn ordinary_same_origin_header_path_remains_active_without_exceptions() {
         .unwrap()
         .unwrap();
     assert!(!parsed.csrf_exception);
+    let listed: CsrfOrigins = serde_json::from_value(json!([format!("https://{HOST}")])).unwrap();
+    let parsed = parse_policy_transport(&bytes, HOST, &[], Transport::Tls, &listed)
+        .unwrap()
+        .unwrap();
+    assert!(!parsed.csrf_exception);
 }

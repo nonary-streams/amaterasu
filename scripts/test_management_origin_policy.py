@@ -77,7 +77,7 @@ def check(api, expected_revision, selection, token):
     status, result, _ = api.post("/v1/management_settings/get", token=token)
     assert status == 200 and result["ok"], result
     assert result["revision"] == expected_revision, result
-    assert result["values"] == {"origin_web_ui_allowed": selection}, result
+    assert result["values"] == {"origin_web_ui_allowed": selection,"csrf_allowed_origins":None}, result
     assert result["origin_web_ui_allowed"] == (selection or "lan"), result
     return result
 

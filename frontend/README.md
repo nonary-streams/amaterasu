@@ -72,6 +72,11 @@ browser API calls.
   information and listener ports; the HTTPS port is five below the HTTP port.
   Steam settings control bounded discovery and catalog synchronization, with
   provider status and opaque artwork readback.
+- Management access and CSRF origin exception forms share the management policy
+  revision and confirm durable readback after saving. CSRF exceptions default to
+  none; default/null and an explicit empty list remain distinct. Exact trusted
+  HTTPS origins relax only the cookie CSRF predicate, with separate browser
+  access policy, authentication and route scopes still required.
 - Session pagination, stop requests, and explicit finish-stop actions. No client
   connection or streaming state is fabricated.
 - Sessions shows signed history runtime status independently from recorded session
