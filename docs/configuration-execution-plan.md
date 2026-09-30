@@ -187,10 +187,14 @@ restart loading, refresh rotation, and expiry. Host defaults are 7,200 seconds f
 but its web settings merge shows 86,400 seconds for an unset session TTL. Its
 secure HTTP-only cookies and persisted server-side session state survive browser
 reload and host restart. Amaterasu now persists session digests in a versioned
-private sidecar and restores remembered browser sessions under a Web Locks guard.
-It still uses explicit bearer tokens instead of the reference's cookie flow;
-live multi-tab and installed-host restart qualification and the web fallback
-difference keep both IDs pending.
+private sidecar. Same-origin HTTPS now uses HttpOnly cookies, a required CSRF
+header with an exact same-origin check, and
+a Web Locks guard for refresh and remembered-session restoration. Plain HTTP
+and separate-origin development retain explicit bearer authorization. Controlled
+Linux Chromium tests qualify reload, refresh and peer sign-out; signed host tests
+separately exercise the real authentication service. Interactive installed-host
+browser/restart qualification and the web fallback difference keep both IDs
+pending.
 
 Session-history settings now use the central `amaterasu.configuration/1`
 revision for signed compare-and-swap updates. Startup migrates older SQLite
@@ -226,10 +230,15 @@ lowercase `pc|lan|wan` values, defaults to `lan`, and checks the remote peer IP
 against that maximum tier: loopback is PC; RFC1918, CGNAT, link-local, and IPv6
 ULA addresses are LAN; other addresses are WAN. This is separate from the
 browser `Origin` header, and `/welcome` is an early request-policy exception.
-Amaterasu's management service is disabled by default and accepts only loopback
-binds and peers over plain HTTP, so its effective policy is PC. Its
-`allowed_origins` setting is a separate browser-origin check. Do not expose LAN
-or WAN peers until management has TLS ingress. Vibeshine also maps its
+Amaterasu's management service is disabled by default. Plain HTTP and operational
+health remain PC-only; configured HTTPS supports trusted remote binds. A
+management-owned CAS document now persists the peer maximum and defaults to LAN.
+Admission and active connections enforce the actual peer tier; uncertain writes
+close ingress until settlement and confirmed readback. Its `allowed_origins`
+setting remains a separate browser-origin check. Signed loopback HTTPS tests
+qualify policy persistence, authorization, Host/Origin checks and restart;
+actual remote identity/trust, admission and narrowing disconnect remain gates.
+Vibeshine also maps its
 configuration UI port through UPnP only in WAN mode when UPnP is enabled;
 Amaterasu has no UPnP mapping. The pinned implementation is in `src/config.cpp`,
 `src/network.cpp`, `src/http_auth_request_policy.cpp`, and `src/upnp.cpp`.
@@ -301,8 +310,9 @@ blank. Address detection and advertisement remain pending in Amaterasu, as
 does qualification of the source's unbounded text acceptance.
 
 `csrf_allowed_origins` remains pending. It is a cookie-session CSRF bypass
-allowlist in the reference, whereas Amaterasu uses scoped bearer authorization.
-The existing CORS `allowed_origins` setting does not grant authentication.
+allowlist in the reference. Amaterasu's HTTPS cookie routes require the CSRF
+header and exact same HTTPS Origin without that independent bypass list. Its CORS
+`allowed_origins` setting does not grant authentication.
 
 Per-application process lifecycle fields now preserve omitted values and apply
 explicit values at launch. `fec_percentage` resolves from the global stream
@@ -349,24 +359,30 @@ streaming, and complete resume behavior remain pending for
 `global:virtual_sink` and its scoped overrides.
 Request-supplied client IDs are not used as authority. The editor also
 preserves explicit executable lifecycle values and preparation steps.
-Global preparation now persists as a bounded structured list in NVHTTP product
-document v16 and is copied into each admitted launch. The launch module puts
+Global preparation persists in NVHTTP product documents from v16 onward and is
+copied into each admitted launch. Structured executable/arguments and raw
+command forms are supported, with explicit elevation policy. The launch module puts
 those steps before application preparation unless the catalog entry sets
 `exclude_global_prep_cmd`. Playnite and Playnite Fullscreen launches use a
 prepare-only application lease: provider start waits for preparation, and
 provider stop is confirmed before reverse undo. A failed undo retains the
 session for retry. Vibeshine's `global_prep_cmd` accepts raw `do`/`undo` command
-strings, an `elevated` flag, and `$()` environment expansion; Amaterasu's
-structured executable/arguments form does not yet implement those semantics.
+strings, an `elevated` flag, and `$()` environment expansion. Amaterasu expands
+raw commands during execution rather than at reference configuration parsing;
+Windows elevation and the reference's timeout/output/failure semantics remain
+unqualified.
 `global:global_prep_cmd` and `per_application:exclude-global-prep-cmd` therefore
 remain pending despite the working structured lifecycle.
 The launch default for an omitted per-application `exit-timeout` now matches
 Vibeshine's 10 seconds; an explicit zero remains distinct. Structured catalog
-executable and working-directory paths now expand bounded `$()` references,
-trim matching outer quotes, and resolve bare executables through absolute PATH
-entries. Process parity still requires the reference's raw command and elevated
-launch semantics, expansion in other command fields, full Windows quote/PATHEXT
-handling, relative PATH entries, and the source undo timeout behavior.
+executable and working-directory paths expand bounded `$()` references, trim
+matching outer quotes, and resolve bare executables through absolute, relative
+and empty PATH entries against an expanded explicit working directory when
+provided, otherwise the captured host directory. Detached targets
+infer their own directory when no application directory was configured. Process
+parity still requires native elevated launch qualification, configuration-time
+raw environment expansion, full Windows quote/PATHEXT handling and the source
+undo timeout behavior.
 
 The Windows global capture output can now be selected by exact provider ID
 and persists through host restart. A launch snapshots that output into RTSP
@@ -464,10 +480,11 @@ accepts all seven keyboard, mouse, scrolling, scan-code, Right Alt, and repeat
 settings as per-application and per-client overrides, with client values taking
 precedence over application values. Amaterasu now resolves scoped `keyboard`
 and `mouse` values at input lease acquisition, preserving explicit false.
-Scrolling, scan-code, Right Alt, repeat, and the other pinned advanced input
-overrides are not yet scoped. Scroll remainder handling across policy changes,
-per-client repeat timing, and the `keybindings` precedence over the Right Alt
-alias differ as well. These seven IDs remain pending.
+Scrolling, scan-code, Right Alt and repeat are also scoped, with false and zero
+preserved through persistence and signed public lease-request tests. Those probe
+tests do not establish native delivery or effective global defaults. Keybindings
+and their precedence over the Right Alt alias remain an implementation gap;
+native input and the supported-platform matrix keep these IDs pending.
 
 ### Controller and gamepad implementation sequence
 
