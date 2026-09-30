@@ -35,6 +35,22 @@ Steam-ID launch, the primary process receives
 launch environment. Explicit values, including empty strings, take precedence.
 This sets the launched process environment; it does not inject variables into an
 already-running Steam broker. URI handoff needs a separate stream-owned hook.
+For an enabled Linux Steam-ID launch, the application service starts an
+app-ID-scoped, same-UID authenticated hook service before handing off to Steam.
+It adds a marked block to supported Proton `user_settings.py` files under the
+discovered Steam roots. The block is inert when no matching stream is active,
+sets only these two environment defaults, and preserves explicit values from
+Proton user settings and the environment Proton receives, including empty
+strings. It does not forward arbitrary per-request process variables through
+an already-running Steam broker.
+The service reference is held with the application record and stops after
+launch cleanup settles; the marked block can remain installed without changing
+later launches. Symlinks, hard links, non-user-owned files, oversized settings
+files, and modified Amaterasu markers are refused rather than replaced. If a
+Proton installation is discovered but none accepts the hook, the Steam handoff
+fails before it is started. On systems with no discovered Proton installation,
+native Steam launches can proceed and the service remains available for the
+stream lifetime.
 The optional launch field `detached_cwd` separates that policy from the primary
 process cwd: omission retains inherited cwd for existing direct callers, null
 infers each detached target's directory, and an absolute path selects a common
