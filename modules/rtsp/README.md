@@ -148,8 +148,9 @@ Software tuning remains exact through the launch snapshot: nullable `sw_preset`
 and `sw_tune` inherit defaults, while explicit empty strings are retained.
 RTSP freezes signed `min_threads` and QP with the global/application/client
 precedence before opening the stream. ANNOUNCE contributes the client slice
-count; software computes `max(videoEncoderSlicesPerFrame, min_threads)` and
-passes it to the video encoder. QP defaults to 28 and remains metadata because
+count; software requests `max(videoEncoderSlicesPerFrame, min_threads)` and
+passes it to the video encoder, subject to x264 frame-size and backend limits.
+QP defaults to 28 and remains metadata because
 x264 ABR ignores it and Amaterasu has no VAAPI CQP consumer. The backend policy
 supports `auto` and `software`, and real codec availability remains a separate
 requirement. [NVHTTP policy](../nvhttp/README.md#software-encoder-policy)

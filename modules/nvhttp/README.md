@@ -648,8 +648,9 @@ codec names at Open. Backend labels are exactly `auto` and `software`.
 Sparse application and certificate-authorized client overrides use the same
 signed 32-bit integer domain as the reference C++ parser. `min_threads` defaults
 to 2 and QP defaults to 28. ANNOUNCE supplies `videoEncoderSlicesPerFrame`; the
-software encoder uses `max(client slices, min_threads)` for x264 thread count,
-sliced threading, and slice count. Every field resolves independently, client
+software encoder requests `max(client slices, min_threads)` for x264 thread
+count, sliced threading, and slice count. x264 can cap effective threads or
+slices for frame dimensions and backend limits. Every field resolves independently, client
 before application before global. Null inherits the lower scope. NVHTTP freezes global/client values at
 admission and application values at preflight, rejects changed application
 readback, and verifies the RTSP encoder/tuning snapshot before completing launch.

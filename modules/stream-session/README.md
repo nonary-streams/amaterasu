@@ -215,8 +215,9 @@ Software tuning remains exact through the launch snapshot: nullable `sw_preset`
 and `sw_tune` inherit defaults, while explicit empty strings are retained.
 `slices_per_frame` carries Moonlight's positive negotiated H.264 slice count;
 `min_threads` carries the reference signed 32-bit lower bound (default 2). The
-software x264 backend uses their maximum for x264 thread count, sliced-thread
-mode, and slice count. QP defaults to 28 but remains metadata because x264 ABR
+software x264 backend requests their maximum for x264 thread count, sliced-thread
+mode, and slice count; x264 may cap effective values for frame dimensions and
+backend limits. QP defaults to 28 but remains metadata because x264 ABR
 does not consume it and this build has no VAAPI CQP consumer. The backend policy
 supports `auto` and `software`, and real codec availability remains a separate
 requirement. [NVHTTP policy](../nvhttp/README.md#software-encoder-policy)

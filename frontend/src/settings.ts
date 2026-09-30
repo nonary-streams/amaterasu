@@ -3663,7 +3663,7 @@ namespace Amaterasu {
         form.append(
           ...softwareEncoder.fields,
           softwareAvailability,
-          el("p", "muted", `Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software uses max(client-negotiated slices, this request). Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`),
+          el("p", "muted", `Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software requests max(client-negotiated slices, this value), subject to x264 frame-size and backend limits. Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`),
           field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."),
           field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."),
           field(

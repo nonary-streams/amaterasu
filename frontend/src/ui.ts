@@ -272,7 +272,7 @@ namespace Amaterasu {
     fields.push(field(
       "Minimum software slices",
       minThreads,
-      "For software x264, the encoder requests max(client-negotiated slices per frame, this value); nonpositive values leave the client count as the floor. x264 slice-thread count follows that result. Hardware encoders preserve this field without applying it.",
+      "For software x264, the requested lower bound is max(client-negotiated slices per frame, this value); nonpositive values leave the client count as the floor. x264 may cap effective threads or slices for frame dimensions and backend limits. Hardware encoders preserve this field without applying it.",
     ));
     const qp = input("qp", current?.qp?.toString() ?? "", "number");
     qp.min = "-2147483648";
