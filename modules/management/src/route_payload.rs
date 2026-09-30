@@ -950,8 +950,27 @@ fn catalog_entry(value: &Value) -> Result<(), &'static str> {
             "exclude_global_prep_cmd",
             "exclude-global-prep-cmd",
             "elevated",
+            "output",
+            "prep_cmd",
+            "prep-cmd",
         ],
     )?;
+    if let Some(output) = entry.get("output") {
+        match output {
+            Value::Null => {}
+            Value::String(path) if path.len() <= 1024 && !path.chars().any(char::is_control) => {}
+            _ => return Err(INVALID),
+        }
+    }
+    if entry.contains_key("prep_cmd") && entry.contains_key("prep-cmd") {
+        return Err(INVALID);
+    }
+    let raw_preparation_count = entry
+        .get("prep_cmd")
+        .or_else(|| entry.get("prep-cmd"))
+        .map(catalog_raw_preparation)
+        .transpose()?
+        .unwrap_or(0);
     if entry
         .get("elevated")
         .is_some_and(|value| value.as_bool().is_none())
@@ -1015,7 +1034,34 @@ fn catalog_entry(value: &Value) -> Result<(), &'static str> {
             return Err(INVALID);
         }
     }
-    catalog_launch(entry.get("launch").ok_or(INVALID)?)
+    catalog_launch(entry.get("launch").ok_or(INVALID)?, raw_preparation_count)
+}
+
+fn catalog_raw_preparation(value: &Value) -> Result<usize, &'static str> {
+    let steps = value.as_array().ok_or(INVALID)?;
+    if steps.len() > 8 {
+        return Err(INVALID);
+    }
+    for step in steps {
+        let step = step.as_object().ok_or(INVALID)?;
+        fields(step, &[], &["do", "undo", "elevated"])?;
+        for key in ["do", "undo"] {
+            if step.get(key).is_some_and(|value| {
+                value
+                    .as_str()
+                    .is_none_or(|command| command.len() > 2048 || command.contains('\0'))
+            }) {
+                return Err(INVALID);
+            }
+        }
+        if step
+            .get("elevated")
+            .is_some_and(|value| value.as_bool().is_none())
+        {
+            return Err(INVALID);
+        }
+    }
+    Ok(steps.len())
 }
 
 fn valid_steam_install_dir(path: &str) -> bool {
@@ -1297,7 +1343,7 @@ fn optional_input_overrides(overrides: &Object) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn catalog_launch(value: &Value) -> Result<(), &'static str> {
+fn catalog_launch(value: &Value, raw_preparation_count: usize) -> Result<(), &'static str> {
     let launch = value.as_object().ok_or(INVALID)?;
     match text(launch, "kind")? {
         "application" => {
@@ -1345,6 +1391,12 @@ fn catalog_launch(value: &Value) -> Result<(), &'static str> {
             }
             if let Some(preparation) = launch.get("preparation") {
                 catalog_preparation(preparation)?;
+                let structured_count = preparation.as_array().ok_or(INVALID)?.len();
+                if structured_count + raw_preparation_count > 8 {
+                    return Err(INVALID);
+                }
+            } else if raw_preparation_count > 8 {
+                return Err(INVALID);
             }
         }
         // Playnite identities can only be written by the trusted provider.
@@ -3371,6 +3423,134 @@ mod catalog_tests {
             }
             assert!(validate(route("create"), entry.as_object().unwrap()).is_ok());
         }
+    }
+
+    #[test]
+    fn catalog_output_matches_launch_optional_path_shape_and_bounds() {
+        for output in [
+            Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("null"),
+            serde_json::json!("logs/game.log"),
+            serde_json::json!("/var/log/game.log"),
+            serde_json::json!("x".repeat(1024)),
+        ] {
+            let payload = serde_json::json!({
+                "expected_revision": 0,
+                "entry": {
+                    "name": "Game",
+                    "launch": {"kind": "application", "path": "/game"},
+                    "output": output,
+                }
+            });
+            assert!(validate(route("create"), payload.as_object().unwrap()).is_ok());
+        }
+
+        for output in [
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!("x".repeat(1025)),
+            serde_json::json!("bad\npath"),
+        ] {
+            let payload = serde_json::json!({
+                "expected_revision": 0,
+                "entry": {
+                    "name": "Game",
+                    "launch": {"kind": "application", "path": "/game"},
+                    "output": output,
+                }
+            });
+            assert!(validate(route("create"), payload.as_object().unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn catalog_raw_preparation_matches_catalog_bounds_defaults_and_combined_limit() {
+        let create = |prep_cmd: Value, launch: Value| {
+            serde_json::json!({
+                "expected_revision": 0,
+                "entry": {"name": "Game", "launch": launch, "prep_cmd": prep_cmd}
+            })
+        };
+        let raw_step = serde_json::json!({
+            "do": "  configure --profile=one  ",
+            "undo": " restore ",
+            "elevated": true
+        });
+        let valid = create(
+            serde_json::json!([raw_step, {}, {"do": "x".repeat(2048)}]),
+            serde_json::json!({"kind": "executable", "program": "/game"}),
+        );
+        assert!(validate(route("create"), valid.as_object().unwrap()).is_ok());
+
+        let alias = serde_json::json!({
+            "expected_revision": 0,
+            "entry": {
+                "name": "Game",
+                "launch": {"kind": "application", "path": "/game"},
+                "prep-cmd": [{"do": "raw"}]
+            }
+        });
+        assert!(validate(route("create"), alias.as_object().unwrap()).is_ok());
+
+        let too_many_raw = create(
+            serde_json::json!([{}, {}, {}, {}, {}, {}, {}, {}, {}]),
+            serde_json::json!({"kind": "application", "path": "/game"}),
+        );
+        let too_long = create(
+            serde_json::json!([{"undo": "x".repeat(2049)}]),
+            serde_json::json!({"kind": "application", "path": "/game"}),
+        );
+        let nul_command = create(
+            serde_json::json!([{"do": "tool\0argument"}]),
+            serde_json::json!({"kind": "application", "path": "/game"}),
+        );
+        let wrong_types = create(
+            serde_json::json!([{"do": null}, {"elevated": "true"}]),
+            serde_json::json!({"kind": "application", "path": "/game"}),
+        );
+        let unknown_field = create(
+            serde_json::json!([{"do": "raw", "owner": "forged"}]),
+            serde_json::json!({"kind": "application", "path": "/game"}),
+        );
+        let duplicate_aliases = serde_json::json!({
+            "expected_revision": 0,
+            "entry": {
+                "name": "Game",
+                "launch": {"kind": "application", "path": "/game"},
+                "prep_cmd": [],
+                "prep-cmd": []
+            }
+        });
+        let combined_overflow = create(
+            serde_json::json!([{}, {}, {}, {}, {}, {}, {}, {}]),
+            serde_json::json!({
+                "kind": "executable",
+                "program": "/game",
+                "preparation": [{"run": {"executable": "/prepare"}}]
+            }),
+        );
+        for invalid in [
+            too_many_raw,
+            too_long,
+            nul_command,
+            wrong_types,
+            unknown_field,
+            duplicate_aliases,
+            combined_overflow,
+        ] {
+            assert!(validate(route("create"), invalid.as_object().unwrap()).is_err());
+        }
+
+        let combined_at_limit = create(
+            serde_json::json!([{}, {}, {}, {}, {}, {}, {}]),
+            serde_json::json!({
+                "kind": "executable",
+                "program": "/game",
+                "preparation": [{"run": {"executable": "/prepare"}}]
+            }),
+        );
+        assert!(validate(route("create"), combined_at_limit.as_object().unwrap()).is_ok());
     }
 
     #[test]
