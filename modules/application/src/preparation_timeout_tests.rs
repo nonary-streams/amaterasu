@@ -89,7 +89,7 @@ fn raw_undo_uses_the_exit_policy_minimum_and_remains_owned_at_timeout() {
         let timeout = Duration::from_secs(exit_timeout_seconds.max(15));
         assert_eq!(
             lifecycle.active.as_ref().unwrap().task.execution_deadline,
-            now + timeout
+            Some(now + timeout)
         );
         lifecycle.tick(now + timeout - Duration::from_millis(1));
         assert!(lifecycle.has_active_command());
@@ -122,7 +122,7 @@ fn raw_undo_uses_the_exit_policy_minimum_and_remains_owned_at_timeout() {
 }
 
 #[test]
-fn structured_undo_keeps_its_explicit_timeout_and_raw_run_keeps_its_deadline() {
+fn structured_undo_keeps_its_timeout_and_raw_run_waits_without_deadline() {
     let run: ConfiguredCommand = serde_json::from_value(json!({
         "executable":std::env::current_exe().unwrap(),
         "args":["--exact","tests::controlled_child","--ignored"],
@@ -139,7 +139,7 @@ fn structured_undo_keeps_its_explicit_timeout_and_raw_run_keeps_its_deadline() {
     lifecycle.start_next_undo(now);
     assert_eq!(
         lifecycle.active.as_ref().unwrap().task.execution_deadline,
-        now + Duration::from_millis(25)
+        Some(now + Duration::from_millis(25))
     );
     settle_cancelled_command(&mut lifecycle, now);
 
@@ -160,9 +160,12 @@ fn structured_undo_keeps_its_explicit_timeout_and_raw_run_keeps_its_deadline() {
     lifecycle.start_next_preparation(now);
     assert_eq!(
         lifecycle.active.as_ref().unwrap().task.execution_deadline,
-        now + Duration::from_secs(10)
+        None
     );
-    settle_cancelled_command(&mut lifecycle, now);
+    lifecycle.tick(now + Duration::from_secs(11));
+    assert!(lifecycle.has_active_command());
+    assert!(lifecycle.active.as_ref().unwrap().task.outcome.is_none());
+    settle_cancelled_command(&mut lifecycle, now + Duration::from_secs(11));
 }
 
 #[test]

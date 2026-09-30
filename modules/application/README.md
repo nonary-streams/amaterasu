@@ -115,20 +115,19 @@ Raw preparation uses the same bounded executable lookup as detached commands.
 Explicit relative target paths resolve against the configured preparation cwd
 or the current host directory. Both raw preparation and detached commands reject
 implicit `.bat`/`.cmd` targets; configure an interpreter explicitly instead.
-Raw `do` retains its 10-second deadline. Raw `undo` snapshots a deadline of
-`max(exit_timeout_seconds, 15)` seconds, matching the reference's undo wait
-budget. Prepare-only leases accept the same `exit_timeout_seconds` policy as
-launch (default 10, range 0 through 300); changing that policy under an existing
-operation ID conflicts. Structured commands retain their explicitly configured
-1–30,000 ms deadlines. Preparation shares the application output handles.
-Windows URL and associated-file
-launches are not resolved through shell associations. These bounded execution
-rules differ from the reference helper, which waits for raw `do` commands
-without a timeout and continues
-through undo failures. The reference detaches an undo that exceeds its deadline;
-this module terminates and reaps its contained tree before attempting an older
-undo. Cleanup attempts
-each owed undo once per pass in reverse order and continues after spawn errors,
+Raw `do` waits for the command to exit, matching the reference helper; an
+explicit stop or cancellation still begins bounded process-tree cleanup. Raw
+`undo` snapshots a deadline of `max(exit_timeout_seconds, 15)` seconds, matching
+the reference's undo wait budget. Prepare-only leases accept the same
+`exit_timeout_seconds` policy as launch (default 10, range 0 through 300);
+changing that policy under an existing operation ID conflicts. Structured
+commands retain their explicitly configured 1–30,000 ms deadlines. Preparation
+shares the application output handles. Windows URL and associated-file launches
+are not resolved through shell associations. The reference detaches an undo that
+exceeds its deadline; this module retains its contained tree and waits for it to
+settle before attempting an older undo, keeping ownership available for cleanup
+retry. Cleanup attempts each owed undo once per pass in reverse order and
+continues after spawn errors,
 nonzero exits, and timeouts whose commands have been contained and reaped. It
 retains each failed obligation and reports all failures from the pass; successful
 undos are removed. If a wait or containment error leaves an undo child unsettled,

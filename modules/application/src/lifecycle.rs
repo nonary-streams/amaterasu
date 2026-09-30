@@ -151,9 +151,9 @@ impl PreparationStep {
 }
 
 impl PreparationCommand<'_> {
-    fn execution_timeout(self, raw_timeout: Duration) -> Duration {
+    fn execution_timeout(self, raw_timeout: Option<Duration>) -> Option<Duration> {
         match self {
-            Self::Structured(command) => Duration::from_millis(command.timeout_ms),
+            Self::Structured(command) => Some(Duration::from_millis(command.timeout_ms)),
             Self::Raw { .. } => raw_timeout,
         }
     }
@@ -505,7 +505,7 @@ enum CommandPoll {
 
 struct CommandTask {
     child: ContainedChild,
-    execution_deadline: Instant,
+    execution_deadline: Option<Instant>,
     stop_requested_at: Option<Instant>,
     force_requested: bool,
     observed_exit: bool,
@@ -528,7 +528,7 @@ impl CommandTask {
         spec: PreparationCommand<'_>,
         environment: &BTreeMap<String, String>,
         application_working_directory: Option<&str>,
-        execution_timeout: Duration,
+        execution_timeout: Option<Duration>,
         output: Option<&SharedOutput>,
         now: Instant,
     ) -> Result<Self, TaskSpawnError> {
@@ -580,7 +580,7 @@ impl CommandTask {
         match ContainedChild::spawn(&mut command, elevated) {
             Ok(child) => Ok(Self {
                 child,
-                execution_deadline: now + execution_timeout,
+                execution_deadline: execution_timeout.map(|timeout| now + timeout),
                 stop_requested_at: None,
                 force_requested: false,
                 observed_exit: false,
@@ -590,7 +590,7 @@ impl CommandTask {
                 task: failure.child.map(|child| {
                     Box::new(Self {
                         child,
-                        execution_deadline: now,
+                        execution_deadline: Some(now),
                         stop_requested_at: Some(now.checked_sub(COMMAND_STOP_GRACE).unwrap_or(now)),
                         force_requested: false,
                         observed_exit: true,
@@ -614,7 +614,11 @@ impl CommandTask {
         if !self.observed_exit && self.outcome.is_none() {
             match self.child.exited() {
                 Ok(true) => self.observed_exit = true,
-                Ok(false) if now >= self.execution_deadline => {
+                Ok(false)
+                    if self
+                        .execution_deadline
+                        .is_some_and(|deadline| now >= deadline) =>
+                {
                     self.outcome = Some(CommandFailure::new(CommandFailureKind::TimedOut));
                 }
                 Ok(false) => return CommandPoll::Running,
@@ -906,7 +910,9 @@ impl ApplicationLifecycle {
                 command,
                 &self.environment,
                 self.preparation_working_directory.as_deref(),
-                command.execution_timeout(Duration::from_millis(default_command_timeout_ms())),
+                // The pinned raw preparation command waits until it exits; only
+                // structured commands carry an explicit per-command timeout.
+                command.execution_timeout(None),
                 self.output.as_ref(),
                 now,
             ) {
@@ -961,7 +967,7 @@ impl ApplicationLifecycle {
             command,
             &self.environment,
             self.preparation_working_directory.as_deref(),
-            command.execution_timeout(self.raw_undo_timeout),
+            command.execution_timeout(Some(self.raw_undo_timeout)),
             self.output.as_ref(),
             now,
         ) {
@@ -1147,7 +1153,12 @@ impl ApplicationLifecycle {
         self.pending_undo
             .iter()
             .filter_map(|index| self.steps[*index].undo_command())
-            .map(|command| command.execution_timeout(self.raw_undo_timeout) + containment_budget)
+            .map(|command| {
+                command
+                    .execution_timeout(Some(self.raw_undo_timeout))
+                    .expect("undo commands always have a bounded cleanup timeout")
+                    + containment_budget
+            })
             .sum::<Duration>()
             + containment_budget
     }
