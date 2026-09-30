@@ -42,6 +42,7 @@ members = [
     "modules/capture-dxgi",
     "modules/capture-wgc",
     "modules/capture-pipewire",
+    "modules/capture-x11",
     "modules/audio",
     "modules/audio-encode",
     "modules/media-transport",

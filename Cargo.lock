@@ -159,6 +159,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-capture-x11"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-media",
+ "amaterasu-module-sdk",
+ "cc",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-catalog"
 version = "0.1.0"
 dependencies = [
