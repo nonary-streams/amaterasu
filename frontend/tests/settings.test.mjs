@@ -3020,7 +3020,7 @@ test("software availability requires an actual software encoder identity and dis
 test("paired software overrides retain exact empty strings through canonicalization and reject unknown backends", () => {
   const client = {certificate_id:"a".repeat(64),client_id:"client",name:"Client",paired_at:1,config_overrides:{sw_preset:"",sw_tune:"film,zerolatency",encoder:"software"}};
   assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(client)),[]);
-  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields({...client,config_overrides:{sw_tune:"x".repeat(257),min_threads:257,encoder:"nvenc"}})),["sw_tune","min_threads","encoder"]);
+  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields({...client,config_overrides:{sw_tune:"x".repeat(257),min_threads:2147483648,qp:-2147483649,encoder:"nvenc"}})),["sw_tune","min_threads","qp","encoder"]);
 });
 
 test("host software save confirms exact empty/null tuning and rejects stale codec readback", async () => {

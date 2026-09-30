@@ -671,12 +671,21 @@ pub enum CaptureProvider {
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VideoConfiguration {
-    /// Minimum number of native workers requested from a software encoder.
+    /// Client-requested H.264 slices per frame from Moonlight's ANNOUNCE.
+    #[serde(
+        default = "default_slices_per_frame",
+        skip_serializing_if = "is_default_slices_per_frame"
+    )]
+    pub slices_per_frame: i32,
+    /// Minimum software slice count requested by the host settings.
     #[serde(
         default = "default_min_threads",
         skip_serializing_if = "is_default_min_threads"
     )]
-    pub min_threads: u32,
+    pub min_threads: i32,
+    /// QP remains metadata until a CQP encoder consumes it.
+    #[serde(default = "default_qp", skip_serializing_if = "is_default_qp")]
+    pub qp: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -695,12 +704,28 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
-fn default_min_threads() -> u32 {
+fn default_slices_per_frame() -> i32 {
+    1
+}
+
+fn is_default_slices_per_frame(value: &i32) -> bool {
+    *value == default_slices_per_frame()
+}
+
+fn default_min_threads() -> i32 {
     2
 }
 
-fn is_default_min_threads(value: &u32) -> bool {
+fn is_default_min_threads(value: &i32) -> bool {
     *value == default_min_threads()
+}
+
+fn default_qp() -> i32 {
+    28
+}
+
+fn is_default_qp(value: &i32) -> bool {
+    *value == default_qp()
 }
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -896,7 +921,7 @@ impl VideoConfiguration {
             && self.height.is_multiple_of(2)
             && (1..=120).contains(&self.fps)
             && (100_000..=100_000_000).contains(&self.bitrate)
-            && (1..=256).contains(&self.min_threads)
+            && self.slices_per_frame >= 1
             && self.max_reference_frames <= 1
             && amaterasu_module_sdk::validate_software_options(
                 self.sw_preset.as_deref(),

@@ -490,7 +490,9 @@ pub struct Open {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_tune: Option<String>,
     #[serde(default = "default_min_threads")]
-    pub min_threads: u32,
+    pub min_threads: i32,
+    #[serde(default = "default_qp")]
+    pub qp: i32,
     #[serde(default)]
     pub capture_sink_without_routing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -697,9 +699,6 @@ impl Open {
             self.sw_preset.as_deref(),
             self.sw_tune.as_deref(),
         )?;
-        if !(1..=256).contains(&self.min_threads) {
-            return Err("invalid_software_encoder_options");
-        }
         if self
             .device_name
             .as_deref()
@@ -874,6 +873,7 @@ impl Open {
                     "fps": self.profile.fps,
                     "bitrate": self.encoder_bitrate_kbps() * 1000,
                     "min_threads": self.min_threads,
+                    "qp": self.qp,
                     "max_reference_frames": self.profile.max_reference_frames,
                 },
             },
@@ -1251,8 +1251,12 @@ fn default_wgc_pacing_smoothing() -> bool {
     true
 }
 
-fn default_min_threads() -> u32 {
+fn default_min_threads() -> i32 {
     2
+}
+
+fn default_qp() -> i32 {
+    28
 }
 
 fn valid_minimum_fps_target(value: f64) -> bool {

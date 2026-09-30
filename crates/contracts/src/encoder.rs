@@ -60,8 +60,10 @@ pub struct SoftwareEncoderOptions {
     pub sw_preset: Option<String>,
     pub sw_tune: Option<String>,
     pub encoder: Option<EncoderBackend>,
-    /// Minimum native threads for software encoding; `None` inherits the default of two.
-    pub min_threads: Option<u16>,
+    /// Signed thread minimum request; `None` inherits the default of two.
+    /// The reference accepts any C `int`; software applies it as a lower bound
+    /// against the client's positive negotiated slices per frame.
+    pub min_threads: Option<i32>,
 }
 
 impl SoftwareEncoderOptions {
@@ -83,7 +85,7 @@ impl SoftwareEncoderOptions {
         }
     }
 
-    pub fn effective_threads(&self) -> u16 {
+    pub fn effective_threads(&self) -> i32 {
         self.min_threads.unwrap_or(2)
     }
 
@@ -110,10 +112,8 @@ pub fn validate_software_options(
     Ok(())
 }
 
-pub fn validate_min_threads(threads: Option<u16>) -> Result<(), &'static str> {
-    if threads.is_some_and(|threads| !(1..=256).contains(&threads)) {
-        return Err("invalid_software_encoder_options");
-    }
+pub fn validate_min_threads(_threads: Option<i32>) -> Result<(), &'static str> {
+    // Serde's i32 representation preserves the reference C-int domain exactly.
     Ok(())
 }
 
@@ -198,16 +198,17 @@ mod tests {
                 .is_err()
             );
         }
-        for threads in [0, 257] {
+        for threads in [i32::MIN, -1, 0, 1, 2, 256, i32::MAX] {
             let invalid: SoftwareEncoderOptions =
                 serde_json::from_value(json!({"min_threads":threads})).unwrap();
-            assert!(invalid.validate().is_err());
+            assert!(invalid.validate().is_ok());
+            assert_eq!(invalid.effective_threads(), threads);
         }
-        for threads in [1, 2, 256] {
-            let valid: SoftwareEncoderOptions =
-                serde_json::from_value(json!({"min_threads":threads})).unwrap();
-            assert!(valid.validate().is_ok());
-            assert_eq!(valid.effective_threads(), threads);
+        for threads in [i64::from(i32::MIN) - 1, i64::from(i32::MAX) + 1] {
+            assert!(
+                serde_json::from_value::<SoftwareEncoderOptions>(json!({"min_threads":threads}))
+                    .is_err()
+            );
         }
     }
 }

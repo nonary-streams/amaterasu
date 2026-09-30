@@ -40,7 +40,8 @@ const DEFAULT_WAN_ENCRYPTION_MODE: u8 = 1;
 const SOFTWARE_ENCODER_SETTINGS_VERSION: u64 = 19;
 const MIN_THREADS_SETTINGS_VERSION: u64 = 20;
 const UPNP_SETTINGS_VERSION: u64 = 21;
-const SETTINGS_VERSION: u64 = UPNP_SETTINGS_VERSION;
+const QP_SETTINGS_VERSION: u64 = 22;
+const SETTINGS_VERSION: u64 = QP_SETTINGS_VERSION;
 const DISPLAY_POLICY_KEYS: [&str; 8] = [
     "dd_mode_remapping",
     "dd_resolution_option",
@@ -81,6 +82,7 @@ pub(crate) enum AdminAction {
         minimum_fps_target: FieldUpdate<f64>,
         wgc_pacing_smoothing: FieldUpdate<bool>,
         software_encoder: SoftwareEncoderUpdate,
+        qp: FieldUpdate<i32>,
         ping_timeout_ms: FieldUpdate<i32>,
         global_preparation: FieldUpdate<Vec<PreparationStep>>,
         legacy_global_preparation: FieldUpdate<Vec<LegacyPreparationStep>>,
@@ -98,7 +100,7 @@ pub(crate) struct SoftwareEncoderUpdate {
     pub(crate) sw_preset: FieldUpdate<String>,
     pub(crate) sw_tune: FieldUpdate<String>,
     pub(crate) encoder: FieldUpdate<EncoderBackend>,
-    pub(crate) min_threads: FieldUpdate<u16>,
+    pub(crate) min_threads: FieldUpdate<i32>,
 }
 
 fn apply_software_encoder_update(
@@ -420,6 +422,7 @@ struct UpdatePurpose {
     capture: CaptureMode,
     video_max_batch_size_kb: Option<u8>,
     max_bitrate: Option<i32>,
+    qp: Option<i32>,
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
     software_encoder: SoftwareEncoderOptions,
@@ -468,6 +471,7 @@ struct ProductDocument {
     capture: CaptureMode,
     video_max_batch_size_kb: Option<u8>,
     max_bitrate: Option<i32>,
+    qp: Option<i32>,
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
     software_encoder: SoftwareEncoderOptions,
@@ -492,6 +496,7 @@ struct ProductStreamingSettings {
     capture: CaptureMode,
     video_max_batch_size_kb: Option<u8>,
     max_bitrate: Option<i32>,
+    qp: Option<i32>,
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
     software_encoder: SoftwareEncoderOptions,
@@ -549,6 +554,7 @@ pub struct ProductSettings {
     configured_capture: CaptureMode,
     configured_video_max_batch_size_kb: Option<u8>,
     configured_max_bitrate: Option<i32>,
+    configured_qp: Option<i32>,
     configured_minimum_fps_target: Option<f64>,
     configured_wgc_pacing_smoothing: Option<bool>,
     configured_software_encoder: SoftwareEncoderOptions,
@@ -659,6 +665,7 @@ impl ProductSettings {
             configured_capture: CaptureMode::Auto,
             configured_video_max_batch_size_kb: None,
             configured_max_bitrate: None,
+            configured_qp: None,
             configured_minimum_fps_target: None,
             configured_wgc_pacing_smoothing: None,
             configured_software_encoder: SoftwareEncoderOptions::default(),
@@ -775,6 +782,10 @@ impl ProductSettings {
         self.configured_max_bitrate
             .filter(|value| *value > 0)
             .map(|value| value as u32)
+    }
+
+    pub fn effective_qp(&self) -> i32 {
+        self.configured_qp.unwrap_or(28)
     }
 
     pub fn configured_minimum_fps_target(&self) -> Option<f64> {
@@ -1320,6 +1331,7 @@ impl ProductSettings {
                 capture,
                 video_max_batch_size_kb,
                 max_bitrate,
+                qp,
                 minimum_fps_target,
                 wgc_pacing_smoothing,
                 software_encoder,
@@ -1443,6 +1455,7 @@ impl ProductSettings {
                     }
                 };
                 let max_bitrate = apply_field_update(max_bitrate, self.configured_max_bitrate);
+                let qp = apply_field_update(qp, self.configured_qp);
                 let minimum_fps_target = match apply_minimum_fps_update(
                     minimum_fps_target,
                     self.configured_minimum_fps_target,
@@ -1660,6 +1673,7 @@ impl ProductSettings {
                             capture,
                             video_max_batch_size_kb,
                             max_bitrate,
+                            qp,
                             minimum_fps_target,
                             wgc_pacing_smoothing,
                             software_encoder: software_encoder.clone(),
@@ -1689,6 +1703,7 @@ impl ProductSettings {
                         capture,
                         video_max_batch_size_kb,
                         max_bitrate,
+                        qp,
                         minimum_fps_target,
                         wgc_pacing_smoothing,
                         software_encoder,
@@ -1821,6 +1836,7 @@ impl ProductSettings {
                     capture,
                     video_max_batch_size_kb,
                     max_bitrate,
+                    qp,
                     minimum_fps_target,
                     wgc_pacing_smoothing,
                     software_encoder,
@@ -1851,6 +1867,7 @@ impl ProductSettings {
                             capture,
                             video_max_batch_size_kb,
                             max_bitrate,
+                            qp,
                             minimum_fps_target,
                             wgc_pacing_smoothing,
                             software_encoder: &software_encoder,
@@ -2172,6 +2189,7 @@ impl ProductSettings {
         self.configured_capture = document.capture;
         self.configured_video_max_batch_size_kb = document.video_max_batch_size_kb;
         self.configured_max_bitrate = document.max_bitrate;
+        self.configured_qp = document.qp;
         self.configured_minimum_fps_target = document.minimum_fps_target;
         self.configured_wgc_pacing_smoothing = document.wgc_pacing_smoothing;
         self.configured_software_encoder = document.software_encoder;
@@ -2237,6 +2255,8 @@ impl ProductSettings {
                 "video_batch_size_fallback":self.video_batch_size_fallback(),
                 "configured_max_bitrate":self.configured_max_bitrate(),
                 "effective_max_bitrate_kbps":self.effective_max_bitrate_kbps(),
+                "configured_qp":self.configured_qp,
+                "effective_qp":self.configured_qp.unwrap_or(28),
                 "configured_minimum_fps_target":self.configured_minimum_fps_target(),
             }),
             json!({
@@ -2340,6 +2360,7 @@ fn product_update_payload(
         "capture":streaming.capture,
         "video_max_batch_size_kb":streaming.video_max_batch_size_kb,
         "max_bitrate":streaming.max_bitrate,
+        "qp":streaming.qp,
         "minimum_fps_target":streaming.minimum_fps_target,
         "wgc_pacing_smoothing":streaming.wgc_pacing_smoothing,
         "sw_preset":streaming.software_encoder.sw_preset,
@@ -2468,6 +2489,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             capture: CaptureMode::Auto,
             video_max_batch_size_kb: None,
             max_bitrate: None,
+            qp: None,
             minimum_fps_target: None,
             wgc_pacing_smoothing: None,
             software_encoder: SoftwareEncoderOptions::default(),
@@ -2509,6 +2531,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | SOFTWARE_ENCODER_SETTINGS_VERSION
             | MIN_THREADS_SETTINGS_VERSION
             | UPNP_SETTINGS_VERSION
+            | QP_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -2537,6 +2560,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         SOFTWARE_ENCODER_SETTINGS_VERSION => 43,
         MIN_THREADS_SETTINGS_VERSION => 44,
         UPNP_SETTINGS_VERSION => 45,
+        QP_SETTINGS_VERSION => 46,
         _ => unreachable!(),
     };
     let matches_expected_value_count = values.len() == expected_value_count
@@ -2546,6 +2570,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             .iter()
             .any(|key| !values.contains_key(*key)))
         || (version >= MIN_THREADS_SETTINGS_VERSION && !values.contains_key("min_threads"))
+        || (version >= QP_SETTINGS_VERSION && !values.contains_key("qp"))
         || !matches_expected_value_count
         || !values.contains_key("hostname")
         || (version >= PORT_SETTINGS_VERSION && !values.contains_key("port"))
@@ -2706,6 +2731,19 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
                     invalid_state("persisted max_bitrate is not a signed 32-bit integer")
                 })?,
             None => return Err(invalid_state("persisted max_bitrate is missing")),
+        }
+    } else {
+        None
+    };
+    let qp = if version >= QP_SETTINGS_VERSION {
+        match values.get("qp") {
+            Some(Value::Null) => None,
+            Some(value) => value
+                .as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .map(Some)
+                .ok_or_else(|| invalid_state("persisted qp is not a signed 32-bit integer"))?,
+            None => return Err(invalid_state("persisted qp is missing")),
         }
     } else {
         None
@@ -2875,6 +2913,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         capture,
         video_max_batch_size_kb,
         max_bitrate,
+        qp,
         minimum_fps_target,
         wgc_pacing_smoothing,
         software_encoder,
@@ -2904,6 +2943,7 @@ struct UpdateExpectation<'a> {
     capture: CaptureMode,
     video_max_batch_size_kb: Option<u8>,
     max_bitrate: Option<i32>,
+    qp: Option<i32>,
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
     software_encoder: &'a SoftwareEncoderOptions,
@@ -2925,7 +2965,7 @@ fn update_result(
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
-        return Err(invalid_state("product_update did not confirm v21 settings"));
+        return Err(invalid_state("product_update did not confirm v22 settings"));
     }
     let document = parse_document(payload)?;
     if document.hostname.as_deref() != Some(expected.hostname)
@@ -2942,6 +2982,7 @@ fn update_result(
         || document.capture != expected.capture
         || document.video_max_batch_size_kb != expected.video_max_batch_size_kb
         || document.max_bitrate != expected.max_bitrate
+        || document.qp != expected.qp
         || document.minimum_fps_target != expected.minimum_fps_target
         || document.wgc_pacing_smoothing != expected.wgc_pacing_smoothing
         || &document.software_encoder != expected.software_encoder
@@ -3321,7 +3362,7 @@ mod tests {
         for key in DISPLAY_POLICY_KEYS {
             values.entry(key.to_owned()).or_insert(Value::Null);
         }
-        for key in ["sw_preset", "sw_tune", "encoder", "min_threads"] {
+        for key in ["sw_preset", "sw_tune", "encoder", "min_threads", "qp"] {
             values.entry(key.to_owned()).or_insert(Value::Null);
         }
         payload
@@ -3346,6 +3387,7 @@ mod tests {
             capture: FieldUpdate::Omitted,
             video_max_batch_size_kb: FieldUpdate::Omitted,
             max_bitrate: FieldUpdate::Omitted,
+            qp: FieldUpdate::Omitted,
             minimum_fps_target: FieldUpdate::Omitted,
             wgc_pacing_smoothing: FieldUpdate::Omitted,
             software_encoder: SoftwareEncoderUpdate::default(),
@@ -3404,7 +3446,7 @@ mod tests {
         let pending = product.pending.take().unwrap();
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["expected_revision"], 7);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 45);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 46);
         let write = pending.payload["values"].clone();
         let response =
             json!({"ok":true,"found":true,"version":SETTINGS_VERSION,"revision":8,"values":write});
@@ -4124,6 +4166,7 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                qp: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
@@ -4170,6 +4213,7 @@ mod tests {
                     capture: FieldUpdate::Omitted,
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
+                    qp: FieldUpdate::Omitted,
                     minimum_fps_target: FieldUpdate::Omitted,
                     wgc_pacing_smoothing: FieldUpdate::Omitted,
                     ping_timeout_ms: FieldUpdate::Omitted,
@@ -4316,6 +4360,7 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                qp: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
@@ -4375,6 +4420,7 @@ mod tests {
                         capture: FieldUpdate::Omitted,
                         video_max_batch_size_kb: FieldUpdate::Omitted,
                         max_bitrate: FieldUpdate::Omitted,
+                        qp: FieldUpdate::Omitted,
                         minimum_fps_target: FieldUpdate::Omitted,
                         wgc_pacing_smoothing: update,
                         ping_timeout_ms: FieldUpdate::Omitted,
@@ -4481,6 +4527,7 @@ mod tests {
                     capture: FieldUpdate::Omitted,
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
+                    qp: FieldUpdate::Omitted,
                     minimum_fps_target: FieldUpdate::Omitted,
                     wgc_pacing_smoothing: FieldUpdate::Omitted,
                     ping_timeout_ms: FieldUpdate::Omitted,
@@ -4557,6 +4604,7 @@ mod tests {
                     capture: FieldUpdate::Omitted,
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
+                    qp: FieldUpdate::Omitted,
                     minimum_fps_target: FieldUpdate::Omitted,
                     wgc_pacing_smoothing: FieldUpdate::Omitted,
                     ping_timeout_ms: FieldUpdate::Omitted,
@@ -4632,6 +4680,7 @@ mod tests {
                         capture: FieldUpdate::Omitted,
                         video_max_batch_size_kb: FieldUpdate::Omitted,
                         max_bitrate: FieldUpdate::Omitted,
+                        qp: FieldUpdate::Omitted,
                         minimum_fps_target: update,
                         wgc_pacing_smoothing: FieldUpdate::Omitted,
                         ping_timeout_ms: FieldUpdate::Omitted,
@@ -4718,6 +4767,7 @@ mod tests {
                         capture: FieldUpdate::Omitted,
                         video_max_batch_size_kb: FieldUpdate::Omitted,
                         max_bitrate: update,
+                        qp: FieldUpdate::Omitted,
                         minimum_fps_target: FieldUpdate::Omitted,
                         wgc_pacing_smoothing: FieldUpdate::Omitted,
                         ping_timeout_ms: FieldUpdate::Omitted,
@@ -4910,6 +4960,7 @@ mod tests {
             capture: CaptureMode::Auto,
             video_max_batch_size_kb: None,
             max_bitrate: None,
+            qp: None,
             minimum_fps_target: None,
             wgc_pacing_smoothing: None,
             ping_timeout_ms: None,
@@ -5080,6 +5131,7 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                qp: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
@@ -5094,7 +5146,7 @@ mod tests {
             },
         );
         assert_eq!(update["version"], SETTINGS_VERSION);
-        assert_eq!(update["values"].as_object().unwrap().len(), 45);
+        assert_eq!(update["values"].as_object().unwrap().len(), 46);
         assert_eq!(update["values"]["nvenc_spatial_aq"], false);
         assert_eq!(
             update["values"]["global_preparation"]
@@ -5143,6 +5195,7 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                qp: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
@@ -5211,7 +5264,7 @@ mod tests {
         let mut old_v17 = reply.clone();
         old_v17["version"] = json!(GLOBAL_RAW_PREPARATION_SETTINGS_VERSION);
         old_v17["values"].as_object_mut().unwrap().remove("upnp");
-        for key in ["sw_preset", "sw_tune", "encoder", "min_threads"] {
+        for key in ["sw_preset", "sw_tune", "encoder", "min_threads", "qp"] {
             old_v17["values"].as_object_mut().unwrap().remove(key);
         }
         for key in DISPLAY_POLICY_KEYS {
@@ -5273,6 +5326,7 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                qp: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
@@ -5315,6 +5369,7 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                qp: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
@@ -5359,6 +5414,7 @@ mod tests {
                     capture: FieldUpdate::Omitted,
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
+                    qp: FieldUpdate::Omitted,
                     minimum_fps_target: FieldUpdate::Omitted,
                     wgc_pacing_smoothing: FieldUpdate::Omitted,
                     ping_timeout_ms: FieldUpdate::Omitted,
@@ -5490,6 +5546,8 @@ mod tests {
                     "configured_audio_sink":null,
                     "configured_virtual_sink":null,
                     "nvenc_spatial_aq":false,
+                    "configured_qp":null,
+                    "effective_qp":28,
                 }),
                 json!({
                     "configured_global_preparation":[],
@@ -5655,6 +5713,7 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                qp: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
@@ -5728,6 +5787,7 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                qp: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
@@ -5914,6 +5974,7 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                qp: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
@@ -6034,6 +6095,7 @@ mod tests {
                         capture: FieldUpdate::Omitted,
                         video_max_batch_size_kb: FieldUpdate::Omitted,
                         max_bitrate: FieldUpdate::Omitted,
+                        qp: FieldUpdate::Omitted,
                         minimum_fps_target: FieldUpdate::Omitted,
                         wgc_pacing_smoothing: FieldUpdate::Omitted,
                         ping_timeout_ms: FieldUpdate::Omitted,
@@ -6177,6 +6239,7 @@ mod tests {
                         capture: FieldUpdate::Omitted,
                         video_max_batch_size_kb: FieldUpdate::Omitted,
                         max_bitrate: FieldUpdate::Omitted,
+                        qp: FieldUpdate::Omitted,
                         minimum_fps_target: FieldUpdate::Omitted,
                         wgc_pacing_smoothing: FieldUpdate::Omitted,
                         ping_timeout_ms: FieldUpdate::Omitted,
@@ -6275,6 +6338,7 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                qp: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
@@ -6318,6 +6382,7 @@ mod tests {
                 capture: CaptureMode::Wgcc,
                 video_max_batch_size_kb: Some(32),
                 max_bitrate: Some(15_000),
+                qp: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: Some(false),
                 software_encoder: SoftwareEncoderOptions::default(),
@@ -6411,6 +6476,7 @@ mod tests {
                         capture: FieldUpdate::Omitted,
                         video_max_batch_size_kb: update,
                         max_bitrate: FieldUpdate::Omitted,
+                        qp: FieldUpdate::Omitted,
                         minimum_fps_target: FieldUpdate::Omitted,
                         wgc_pacing_smoothing: FieldUpdate::Omitted,
                         ping_timeout_ms: FieldUpdate::Omitted,
@@ -6491,6 +6557,7 @@ mod tests {
                     capture: FieldUpdate::Omitted,
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
+                    qp: FieldUpdate::Omitted,
                     minimum_fps_target: FieldUpdate::Omitted,
                     wgc_pacing_smoothing: FieldUpdate::Omitted,
                     ping_timeout_ms: FieldUpdate::Omitted,
@@ -6542,6 +6609,7 @@ mod tests {
                     capture: FieldUpdate::Omitted,
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
+                    qp: FieldUpdate::Omitted,
                     minimum_fps_target: FieldUpdate::Omitted,
                     wgc_pacing_smoothing: FieldUpdate::Omitted,
                     ping_timeout_ms: FieldUpdate::Omitted,
@@ -6596,6 +6664,7 @@ mod tests {
                     capture: FieldUpdate::Value(CaptureMode::Wgcc),
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
+                    qp: FieldUpdate::Omitted,
                     minimum_fps_target: FieldUpdate::Omitted,
                     wgc_pacing_smoothing: FieldUpdate::Omitted,
                     ping_timeout_ms: FieldUpdate::Omitted,
@@ -6632,7 +6701,7 @@ mod tests {
         );
     }
     #[test]
-    fn software_v20_cas_restart_reset_empty_and_readback_are_exact() {
+    fn software_v22_cas_restart_reset_empty_and_signed_values_are_exact() {
         let mut prior_version = display_v18_document(7);
         prior_version["version"] = json!(SOFTWARE_ENCODER_SETTINGS_VERSION);
         let prior_values = prior_version["values"].as_object_mut().unwrap();
@@ -6641,6 +6710,7 @@ mod tests {
         prior_values.insert("sw_tune".into(), Value::Null);
         prior_values.insert("encoder".into(), Value::Null);
         prior_values.remove("min_threads");
+        prior_values.remove("qp");
         let mut prior_settings = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
         prior_settings.apply_document(parse_document(&prior_version).unwrap());
         assert_eq!(
@@ -6653,7 +6723,7 @@ mod tests {
         let mut legacy = display_v18_document(7);
         legacy["version"] = json!(DISPLAY_POLICY_SETTINGS_VERSION);
         legacy["values"].as_object_mut().unwrap().remove("upnp");
-        for key in ["sw_preset", "sw_tune", "encoder", "min_threads"] {
+        for key in ["sw_preset", "sw_tune", "encoder", "min_threads", "qp"] {
             legacy["values"].as_object_mut().unwrap().remove(key);
         }
         let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
@@ -6677,16 +6747,21 @@ mod tests {
             sw_preset: FieldUpdate::Value("slow".into()),
             sw_tune: FieldUpdate::Value(String::new()),
             encoder: FieldUpdate::Value(EncoderBackend::Software),
-            min_threads: FieldUpdate::Value(8),
+            min_threads: FieldUpdate::Value(i32::MIN),
         };
+        if let AdminAction::Update { qp, .. } = &mut action {
+            *qp = FieldUpdate::Value(i32::MAX);
+        }
         product.enqueue(51, 5000, action).unwrap();
         product.start_next();
         let pending = product.pending.take().unwrap();
-        assert_eq!(pending.payload["version"], UPNP_SETTINGS_VERSION);
+        assert_eq!(pending.payload["version"], 22);
         assert_eq!(pending.payload["expected_revision"], 7);
+        assert_eq!(pending.payload["values"]["upnp"], false);
         assert_eq!(pending.payload["values"]["sw_tune"], "");
-        assert_eq!(pending.payload["values"]["min_threads"], 8);
-        let saved = json!({"ok":true,"found":true,"version":UPNP_SETTINGS_VERSION,"revision":8,"values":pending.payload["values"]});
+        assert_eq!(pending.payload["values"]["min_threads"], i32::MIN);
+        assert_eq!(pending.payload["values"]["qp"], i32::MAX);
+        let saved = json!({"ok":true,"found":true,"version":22,"revision":8,"values":pending.payload["values"]});
         product.finish_call(pending.purpose, CallOutcome::Payload(saved.clone()));
         assert_eq!(product.revision(), Some(8));
         let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
@@ -6695,7 +6770,11 @@ mod tests {
             restarted.software_encoder_options(),
             product.software_encoder_options()
         );
-        assert_eq!(restarted.software_encoder_options().effective_threads(), 8);
+        assert_eq!(
+            restarted.software_encoder_options().effective_threads(),
+            i32::MIN
+        );
+        assert_eq!(restarted.effective_qp(), i32::MAX);
         let mut action = display_update_action(DisplayPolicyUpdate::default(), 8);
         let AdminAction::Update {
             software_encoder, ..
@@ -6706,6 +6785,9 @@ mod tests {
         software_encoder.sw_preset = FieldUpdate::Null;
         software_encoder.encoder = FieldUpdate::Null;
         software_encoder.min_threads = FieldUpdate::Null;
+        if let AdminAction::Update { qp, .. } = &mut action {
+            *qp = FieldUpdate::Null;
+        }
         restarted.enqueue(52, 5000, action).unwrap();
         restarted.start_next();
         let pending = restarted.pending.take().unwrap();
@@ -6713,7 +6795,7 @@ mod tests {
         assert_eq!(pending.payload["values"]["sw_tune"], "");
         assert!(pending.payload["values"]["encoder"].is_null());
         assert!(pending.payload["values"]["min_threads"].is_null());
-        let mut forged = json!({"ok":true,"found":true,"version":UPNP_SETTINGS_VERSION,"revision":9,"values":pending.payload["values"]});
+        let mut forged = json!({"ok":true,"found":true,"version":22,"revision":9,"values":pending.payload["values"]});
         forged["values"]["sw_tune"] = json!("zerolatency");
         restarted.finish_call(pending.purpose, CallOutcome::Payload(forged));
         assert_eq!(restarted.revision(), None);
@@ -6726,8 +6808,8 @@ mod tests {
             ("sw_preset", json!(false)),
             ("sw_tune", json!("x".repeat(257))),
             ("encoder", json!("nvenc")),
-            ("min_threads", json!(0)),
-            ("min_threads", json!(257)),
+            ("min_threads", json!(i64::from(i32::MIN) - 1)),
+            ("qp", json!(i64::from(i32::MAX) + 1)),
         ] {
             let mut invalid = saved.clone();
             invalid["values"][field] = value;
@@ -6736,10 +6818,11 @@ mod tests {
     }
 
     #[test]
-    fn version_twenty_migrates_upnp_off_and_v21_update_persists_it() {
+    fn version_twenty_defaults_upnp_off_and_v22_preserves_v21_upnp() {
         let mut prior = display_v18_document(7);
         prior["version"] = json!(MIN_THREADS_SETTINGS_VERSION);
         prior["values"].as_object_mut().unwrap().remove("upnp");
+        prior["values"].as_object_mut().unwrap().remove("qp");
         let migrated = parse_document(&prior).unwrap();
         assert!(!migrated.upnp);
 
@@ -6753,13 +6836,14 @@ mod tests {
         product.enqueue(81, 5_000, action).unwrap();
         product.start_next();
         let pending = product.pending.take().unwrap();
-        assert_eq!(pending.payload["version"], UPNP_SETTINGS_VERSION);
+        assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["values"]["upnp"], true);
+        assert_eq!(pending.payload["values"]["qp"], Value::Null);
 
         let saved = json!({
             "ok":true,
             "found":true,
-            "version":UPNP_SETTINGS_VERSION,
+            "version":SETTINGS_VERSION,
             "revision":8,
             "values":pending.payload["values"]
         });
@@ -6770,5 +6854,25 @@ mod tests {
 
         let restarted = parse_document(&saved).unwrap();
         assert!(restarted.upnp);
+
+        let mut version_21 = saved.clone();
+        version_21["version"] = json!(UPNP_SETTINGS_VERSION);
+        version_21["values"].as_object_mut().unwrap().remove("qp");
+        let mut upgraded = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        upgraded.apply_document(parse_document(&version_21).unwrap());
+        assert!(upgraded.upnp_enabled());
+        assert_eq!(upgraded.effective_qp(), 28);
+        upgraded
+            .enqueue(
+                82,
+                5_000,
+                display_update_action(DisplayPolicyUpdate::default(), 8),
+            )
+            .unwrap();
+        upgraded.start_next();
+        let pending = upgraded.pending.take().unwrap();
+        assert_eq!(pending.payload["version"], SETTINGS_VERSION);
+        assert_eq!(pending.payload["values"]["upnp"], true);
+        assert_eq!(pending.payload["values"]["qp"], Value::Null);
     }
 }

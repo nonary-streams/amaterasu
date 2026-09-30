@@ -227,6 +227,7 @@ impl Controller {
             session: None,
             negotiation: None,
             negotiated_encryption: None,
+            negotiated_slices_per_frame: None,
             url,
             session_token,
             udp_discovery,

@@ -131,6 +131,7 @@ pub struct PeerIdentity {
     certificate_id: Option<String>,
     client_fec_percentage: Option<u8>,
     client_max_bitrate: Option<i32>,
+    client_qp: Option<i32>,
     client_minimum_fps_target: Option<f64>,
     client_video_max_batch_size_kb: Option<u8>,
     client_stream_audio: Option<bool>,
@@ -171,6 +172,7 @@ impl PeerIdentity {
             certificate_id: None,
             client_fec_percentage: None,
             client_max_bitrate: None,
+            client_qp: None,
             client_minimum_fps_target: None,
             client_video_max_batch_size_kb: None,
             client_stream_audio: None,
@@ -220,6 +222,7 @@ impl PeerIdentity {
         let ClientConfigOverrides {
             fec_percentage,
             max_bitrate,
+            qp,
             minimum_fps_target,
             video_max_batch_size_kb,
             stream_audio,
@@ -285,6 +288,7 @@ impl PeerIdentity {
         self.certificate_id = Some(certificate_id.to_ascii_lowercase());
         self.client_fec_percentage = fec_percentage;
         self.client_max_bitrate = max_bitrate;
+        self.client_qp = qp;
         self.client_minimum_fps_target = minimum_fps_target;
         self.client_video_max_batch_size_kb = video_max_batch_size_kb;
         self.client_stream_audio = stream_audio;
@@ -542,6 +546,7 @@ pub struct Controller {
     global_ping_timeout_ms: u32,
     global_video_max_batch_size_kb: u8,
     global_max_bitrate_kbps: Option<u32>,
+    global_qp: i32,
     global_minimum_fps_target: f64,
     global_wgc_pacing_smoothing: bool,
     software_encoder: SoftwareEncoderOptions,
@@ -578,6 +583,7 @@ impl Controller {
             global_ping_timeout_ms: 10_000,
             global_video_max_batch_size_kb: 64,
             global_max_bitrate_kbps: None,
+            global_qp: 28,
             global_minimum_fps_target: 20.0,
             global_wgc_pacing_smoothing: true,
             software_encoder: SoftwareEncoderOptions::default(),
@@ -658,6 +664,10 @@ impl Controller {
         self.global_max_bitrate_kbps = value;
     }
 
+    pub fn set_global_qp(&mut self, value: i32) {
+        self.global_qp = value;
+    }
+
     pub fn set_global_minimum_fps_target(&mut self, target: f64) {
         self.global_minimum_fps_target = target;
     }
@@ -724,6 +734,7 @@ impl Controller {
         let global_ping_timeout_ms = self.global_ping_timeout_ms;
         let global_video_max_batch_size_kb = self.global_video_max_batch_size_kb;
         let global_max_bitrate_kbps = self.global_max_bitrate_kbps;
+        let global_qp = self.global_qp;
         let global_minimum_fps_target = self.global_minimum_fps_target;
         let global_wgc_pacing_smoothing = self.global_wgc_pacing_smoothing;
         let startup_encoder = config.capture.encoder.clone();
@@ -798,6 +809,7 @@ impl Controller {
             global_ping_timeout_ms,
             global_video_max_batch_size_kb,
             global_max_bitrate_kbps,
+            global_qp,
             global_minimum_fps_target,
             global_wgc_pacing_smoothing,
             capture_output,
@@ -813,6 +825,8 @@ impl Controller {
         record.effective_software_encoder = self
             .software_encoder
             .with_overrides(&record.peer.client_software_encoder);
+        record.global_qp = self.global_qp;
+        record.effective_qp = record.peer.client_qp.unwrap_or(record.global_qp);
         record.selected_encoder = startup_encoder;
         record.global_display_policy = self.global_display_policy.clone();
         self.records.insert(id, record);

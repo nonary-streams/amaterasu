@@ -403,6 +403,7 @@ namespace Amaterasu {
       stream_audio: values.stream_audio,
       configured_video_max_batch_size_kb: values.video_max_batch_size_kb,
       configured_max_bitrate: values.max_bitrate,
+      configured_qp: values.qp,
       configured_minimum_fps_target: values.minimum_fps_target,
       configured_ping_timeout_ms: values.ping_timeout_ms === -1 ? null : values.ping_timeout_ms,
       configured_audio_sink: values.audio_sink,
@@ -955,7 +956,7 @@ namespace Amaterasu {
   }
 
   const forwardablePairingOverrideFields = [
-    "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "min_threads", "encoder",
+    "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "min_threads", "qp", "encoder",
     "audio_sink_capture_only", "back_button_timeout", "controller", "gamepad",
     "keyboard", "mouse", "native_pen_touch", "ds4_back_as_touchpad_click",
     "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
@@ -993,7 +994,9 @@ namespace Amaterasu {
         !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
     if (field === "encoder") return value === "auto" || value === "software";
     if (field === "min_threads")
-      return Number.isSafeInteger(value) && (value as number) >= 1 && (value as number) <= 256;
+      return Number.isSafeInteger(value) && (value as number) >= -2147483648 && (value as number) <= 2147483647;
+    if (field === "qp")
+      return Number.isSafeInteger(value) && (value as number) >= -2147483648 && (value as number) <= 2147483647;
     if (field === "gamepad")
       return typeof value === "string" && recognizedInputGamepadProfiles.includes(value);
     if (field === "frame_limiter_provider")
@@ -3640,6 +3643,7 @@ namespace Amaterasu {
           sw_preset: settings.configured_sw_preset,
           sw_tune: settings.configured_sw_tune,
           min_threads: settings.configured_min_threads,
+          qp: settings.configured_qp,
           encoder: settings.configured_encoder,
         }, true);
         const softwareAvailability = el("p", "muted", "Software x264 availability has not been checked.");
@@ -3659,7 +3663,7 @@ namespace Amaterasu {
         form.append(
           ...softwareEncoder.fields,
           softwareAvailability,
-          el("p", "muted", `Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, thread minimum request ${settings.effective_min_threads ?? 2}. The codec may use fewer threads for small frames or due to runtime constraints.`),
+          el("p", "muted", `Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software uses max(client-negotiated slices, this request). Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`),
           field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."),
           field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."),
           field(

@@ -541,15 +541,16 @@ test("page counts never claim an exact total while continuation exists", () => {
 test("software override editor preserves null versus empty, raw strings, and application serialization", () => {
   const form = new FormData();
   form.set("name","Software app");form.set("kind","executable");form.set("path","/opt/example");
-  assert.deepEqual(ordinary(model.parseSoftwareEncoderOverrides(form)), {sw_preset:null,sw_tune:null,min_threads:null,encoder:null});
+  assert.deepEqual(ordinary(model.parseSoftwareEncoderOverrides(form)), {sw_preset:null,sw_tune:null,min_threads:null,qp:null,encoder:null});
   form.set("sw_preset_mode","value");form.set("sw_preset_value","");
   form.set("sw_tune_mode","value");form.set("sw_tune_value","film,zerolatency");
   form.set("encoder_backend","software");
-  form.set("min_threads", "2");
-  assert.deepEqual(ordinary(model.entryFromForm(form).config_overrides), {sw_preset:"",sw_tune:"film,zerolatency",min_threads:2,encoder:"software"});
+  form.set("min_threads", "-2");
+  form.set("qp", "28");
+  assert.deepEqual(ordinary(model.entryFromForm(form).config_overrides), {sw_preset:"",sw_tune:"film,zerolatency",min_threads:-2,qp:28,encoder:"software"});
   form.set("sw_preset_value","  slow  ");
   assert.equal(model.parseSoftwareEncoderOverrides(form).sw_preset,"  slow  ");
-  for (const [key,value] of [["sw_preset_value","é".repeat(65)],["sw_tune_value","x".repeat(257)],["sw_tune_value","film\n"],["min_threads","0"],["min_threads","257"],["min_threads","2.5"],["min_threads","1e2"],["encoder_backend","nvenc"]]) {
+  for (const [key,value] of [["sw_preset_value","é".repeat(65)],["sw_tune_value","x".repeat(257)],["sw_tune_value","film\n"],["min_threads","2147483648"],["min_threads","2.5"],["min_threads","1e2"],["qp","-2147483649"],["encoder_backend","nvenc"]]) {
     const invalid = new FormData();invalid.set("sw_preset_mode","value");invalid.set("sw_tune_mode","value");invalid.set(key,value);
     assert.throws(()=>model.parseSoftwareEncoderOverrides(invalid));
   }

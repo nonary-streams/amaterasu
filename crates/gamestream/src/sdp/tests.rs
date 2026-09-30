@@ -37,6 +37,7 @@ fn primary_client_shape_negotiates_exact_h264_sdr_requirements() {
     );
     assert_eq!(result.video.bitrate_kbps, 16000);
     assert_eq!(result.video.configured_bitrate_kbps, Some(20000));
+    assert_eq!(result.video.slices_per_frame, 1);
     assert_eq!(result.video.color, ColorMode::Bt709Limited);
     assert_eq!(result.packet_size, 1392);
     assert_eq!(result.audio.packet_duration_ms, 5);
@@ -135,7 +136,8 @@ fn unsupported_media_modes_and_invalid_numeric_boundaries_fail() {
         ("x-nv-video[0].clientRefreshRateX100", "12000"),
         ("x-nv-video[0].packetSize", "1391"),
         ("x-nv-video[0].packetSize", "65535"),
-        ("x-nv-video[0].videoEncoderSlicesPerFrame", "2"),
+        ("x-nv-video[0].videoEncoderSlicesPerFrame", "0"),
+        ("x-nv-video[0].videoEncoderSlicesPerFrame", "2147483648"),
         ("x-nv-video[0].maxNumReferenceFrames", "2"),
         ("x-nv-video[0].encoderCscMode", "4"),
         ("x-nv-audio.surround.numChannels", "4"),
@@ -153,6 +155,19 @@ fn unsupported_media_modes_and_invalid_numeric_boundaries_fail() {
             "accepted {name}={value}"
         );
     }
+}
+
+#[test]
+fn client_slice_count_is_parsed_and_retained_as_signed_native_int() {
+    let announce =
+        parse_announce(changed("x-nv-video[0].videoEncoderSlicesPerFrame", "3").as_bytes())
+            .unwrap();
+    assert_eq!(announce.video.slices_per_frame, 3);
+    let maximum = parse_announce(
+        changed("x-nv-video[0].videoEncoderSlicesPerFrame", "2147483647").as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(maximum.video.slices_per_frame, i32::MAX);
 }
 
 #[test]

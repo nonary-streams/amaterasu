@@ -27,6 +27,7 @@ pub(super) struct Record {
     pub session: Option<u64>,
     pub negotiation: Option<Negotiation>,
     pub negotiated_encryption: Option<crate::model::EncryptionSnapshot>,
+    pub negotiated_slices_per_frame: Option<i32>,
     pub url: String,
     pub session_token: String,
     pub udp_discovery: Option<UdpDiscovery>,
@@ -65,12 +66,16 @@ impl Record {
             video: announce.encryption.video,
             audio: announce.encryption.audio,
         });
+        self.negotiated_slices_per_frame = accepted.then_some(announce.video.slices_per_frame);
         accepted
     }
 
     pub(super) fn authenticated_start_payload(&self, session: u64) -> Option<Value> {
         let encryption = self.negotiated_encryption?;
-        Some(self.config.arm_with_encryption(session, encryption))
+        let slices_per_frame = self.negotiated_slices_per_frame?;
+        let mut payload = self.config.arm_with_encryption(session, encryption);
+        payload["configuration"]["configuration"]["slices_per_frame"] = json!(slices_per_frame);
+        Some(payload)
     }
 
     pub fn operation(&self) -> String {
@@ -81,7 +86,8 @@ impl Record {
         json!({"ok":true,"ticket":self.id,"state":self.state,"local":self.local,
             "rtsp_url":self.url,"session":self.session,"stream_state":self.stream_state,
             "frame_limiter_settings":self.config.frame_limiter_settings,
-            "encoder":self.config.capture.encoder,"sw_preset":self.config.sw_preset,"sw_tune":self.config.sw_tune,"min_threads":self.config.min_threads,
+            "encoder":self.config.capture.encoder,"sw_preset":self.config.sw_preset,"sw_tune":self.config.sw_tune,"min_threads":self.config.min_threads,"qp":self.config.qp,
+            "slices_per_frame":self.negotiated_slices_per_frame,
             "frame_limiter_executable_path":self.config.frame_limiter_executable_path,
             "history_activity_id":self.config.history_activity_id,
             "display_request":self.config.display_request,

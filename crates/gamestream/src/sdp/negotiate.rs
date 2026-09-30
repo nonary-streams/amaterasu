@@ -49,7 +49,13 @@ fn video(attributes: &mut Attributes<'_>) -> Result<Video, Error> {
     attributes.require_value("x-nv-video[0].dynamicRangeMode", 0)?;
     attributes.default_value("x-ss-video[0].chromaSamplingType", 0)?;
     attributes.default_value("x-ss-video[0].intraRefresh", 0)?;
-    attributes.require_value("x-nv-video[0].videoEncoderSlicesPerFrame", 1)?;
+    const SLICES_PER_FRAME: &str = "x-nv-video[0].videoEncoderSlicesPerFrame";
+    let slices_per_frame = bounded(
+        attributes.required(SLICES_PER_FRAME)?,
+        1,
+        i32::MAX as u32,
+        SLICES_PER_FRAME,
+    )? as i32;
     attributes.require_value("x-nv-video[0].rateControlMode", 4)?;
     let width = bounded(
         attributes.required("x-nv-video[0].clientViewportWd")?,
@@ -94,6 +100,7 @@ fn video(attributes: &mut Attributes<'_>) -> Result<Video, Error> {
         refresh_rate_x100,
         bitrate_kbps,
         configured_bitrate_kbps,
+        slices_per_frame,
         color,
         max_reference_frames,
     })

@@ -97,6 +97,7 @@ namespace Amaterasu {
     sw_preset?: string | null;
     sw_tune?: string | null;
     min_threads?: number | null;
+    qp?: number | null;
     encoder?: "auto" | "software" | null;
   }
   export type RefreshRateOption = "auto" | "disabled" | "manual" | "prefer_highest";
@@ -146,6 +147,8 @@ namespace Amaterasu {
     video_batch_size_fallback: boolean;
     configured_max_bitrate: number | null;
     effective_max_bitrate_kbps: number | null;
+    configured_qp?: number | null;
+    effective_qp?: number;
     configured_minimum_fps_target: number | null;
     effective_minimum_fps_target: number;
     configured_ping_timeout_ms: number | null;

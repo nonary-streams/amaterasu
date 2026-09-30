@@ -218,6 +218,10 @@ impl Router {
         self.launches.set_global_max_bitrate_kbps(max_bitrate_kbps);
     }
 
+    pub fn set_global_qp(&mut self, qp: i32) {
+        self.launches.set_global_qp(qp);
+    }
+
     pub fn set_global_minimum_fps_target(&mut self, target: f64) {
         self.launches.set_global_minimum_fps_target(target);
     }
@@ -585,7 +589,8 @@ pub(super) struct ClientConfigOverrides {
     pub(super) sw_preset: Option<String>,
     pub(super) sw_tune: Option<String>,
     pub(super) encoder: Option<amaterasu_module_sdk::EncoderBackend>,
-    pub(super) min_threads: Option<u16>,
+    pub(super) min_threads: Option<i32>,
+    pub(super) qp: Option<i32>,
     pub(super) display_mode: Option<String>,
     pub(super) fec_percentage: Option<u8>,
     pub(super) max_bitrate: Option<i32>,

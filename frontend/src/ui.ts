@@ -264,15 +264,26 @@ namespace Amaterasu {
       );
     }
     const minThreads = input("min_threads", current?.min_threads?.toString() ?? "", "number");
-    minThreads.min = "1";
-    minThreads.max = "256";
+    minThreads.min = "-2147483648";
+    minThreads.max = "2147483647";
     minThreads.step = "1";
     minThreads.placeholder = global ? "Default request (2)" : "Inherit";
     controls.set(minThreads.name, minThreads);
     fields.push(field(
-      "Requested software thread minimum",
+      "Minimum software slices",
       minThreads,
-      "Requests a minimum thread count for software H.264 encoding. The codec may cap the effective thread count based on frame size and runtime constraints. Hardware selections preserve this request without applying it.",
+      "For software x264, the encoder requests max(client-negotiated slices per frame, this value); nonpositive values leave the client count as the floor. x264 slice-thread count follows that result. Hardware encoders preserve this field without applying it.",
+    ));
+    const qp = input("qp", current?.qp?.toString() ?? "", "number");
+    qp.min = "-2147483648";
+    qp.max = "2147483647";
+    qp.step = "1";
+    qp.placeholder = global ? "Default (28)" : "Inherit";
+    controls.set(qp.name, qp);
+    fields.push(field(
+      "QP",
+      qp,
+      "The reference uses default 28 and consumes QP for VAAPI constant-quality encoding. Amaterasu currently has no VAAPI consumer, and x264 ABR ignores this value; it is retained as configured metadata.",
     ));
     const backend = el("select");
     backend.name = "encoder_backend";

@@ -48,6 +48,8 @@ pub struct Video {
     pub refresh_rate_x100: u32,
     /// Encoder bitrate, not an adjusted total-network budget.
     pub bitrate_kbps: u32,
+    /// Client-requested slice count, bounded by the native signed C-int representation.
+    pub slices_per_frame: i32,
     /// Original user-selected network budget, when sent by Moonlight.
     pub configured_bitrate_kbps: Option<u32>,
     pub color: ColorMode,

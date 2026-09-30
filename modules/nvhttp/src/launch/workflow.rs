@@ -303,6 +303,7 @@ impl Controller {
                         "sw_preset":record.effective_software_encoder.effective_preset(),
                         "sw_tune":record.effective_software_encoder.effective_tune(),
                         "min_threads":record.effective_software_encoder.effective_threads(),
+                        "qp":record.effective_qp,
                         "frame_limiter_settings": record.executable_path.as_ref().and(record.frame_limiter_snapshot.as_ref()),
                         "frame_limiter_executable_path": record.executable_path,
                         "display_policy_snapshot": record.display_policy_snapshot,
@@ -1359,6 +1360,11 @@ fn project_application_policy(
             min_threads: application_overrides.min_threads,
         })
         .with_overrides(&record.peer.client_software_encoder);
+    record.effective_qp = record
+        .peer
+        .client_qp
+        .or(application_overrides.qp)
+        .unwrap_or(record.global_qp);
     if let Some(backend) = record.effective_software_encoder.encoder {
         record.selected_encoder = amaterasu_module_sdk::EncoderSelection::Backend(backend);
     }
@@ -1552,12 +1558,13 @@ fn application_response<'a>(
 pub(super) struct ApplicationConfigOverrides {
     fec_percentage: Option<u8>,
     max_bitrate: Option<i32>,
+    qp: Option<i32>,
     minimum_fps_target: Option<f64>,
     video_max_batch_size_kb: Option<u8>,
     sw_preset: Option<String>,
     sw_tune: Option<String>,
     encoder: Option<amaterasu_module_sdk::EncoderBackend>,
-    min_threads: Option<u16>,
+    min_threads: Option<i32>,
     dd_mode_remapping: Option<Value>,
     dd_resolution_option: Option<String>,
     dd_manual_resolution: Option<String>,
@@ -1896,6 +1903,7 @@ fn rtsp_response<'a>(
         || payload["sw_preset"] != record.effective_software_encoder.effective_preset()
         || payload["sw_tune"] != record.effective_software_encoder.effective_tune()
         || payload["min_threads"] != record.effective_software_encoder.effective_threads()
+        || payload["qp"] != record.effective_qp
         || payload.get("failure").is_none()
         || payload.get("cleanup_error").is_none()
         || payload.get("frame_limiter_settings")

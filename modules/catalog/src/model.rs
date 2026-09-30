@@ -103,7 +103,9 @@ pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder: Option<amaterasu_module_sdk::EncoderBackend>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_threads: Option<u16>,
+    pub min_threads: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qp: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec_percentage: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -343,6 +345,7 @@ impl ConfigOverrides {
             && self.sw_tune.is_none()
             && self.encoder.is_none()
             && self.min_threads.is_none()
+            && self.qp.is_none()
             && self.fec_percentage.is_none()
             && self.max_bitrate.is_none()
             && self.minimum_fps_target.is_none()
@@ -2104,21 +2107,21 @@ mod software_encoder_tests {
     use super::*;
     use serde_json::json;
     #[test]
-    fn software_fields_are_sparse_exact_and_bounded() {
+    fn software_and_qp_fields_are_sparse_exact_and_signed() {
         let absent: ConfigOverrides = serde_json::from_value(
-            json!({"sw_preset":null,"sw_tune":null,"encoder":null,"min_threads":null}),
+            json!({"sw_preset":null,"sw_tune":null,"encoder":null,"min_threads":null,"qp":null}),
         )
         .unwrap();
         assert!(absent.is_empty());
         let selected: ConfigOverrides = serde_json::from_value(
-            json!({"sw_preset":"","sw_tune":"film,zerolatency","encoder":"software","min_threads":8}),
+            json!({"sw_preset":"","sw_tune":"film,zerolatency","encoder":"software","min_threads":i32::MIN,"qp":i32::MAX}),
         )
         .unwrap();
         assert!(selected.validate().is_ok());
         assert!(!selected.is_empty());
         assert_eq!(
             serde_json::to_value(selected).unwrap(),
-            json!({"sw_preset":"","sw_tune":"film,zerolatency","encoder":"software","min_threads":8})
+            json!({"sw_preset":"","sw_tune":"film,zerolatency","encoder":"software","min_threads":i32::MIN,"qp":i32::MAX})
         );
         for invalid in [
             json!({"sw_preset":false}),
@@ -2134,15 +2137,15 @@ mod software_encoder_tests {
             let options: ConfigOverrides = serde_json::from_value(invalid).unwrap();
             assert!(options.validate().is_err());
         }
-        for threads in [1, 2, 256] {
+        for threads in [i32::MIN, -1, 0, 1, 2, i32::MAX] {
             let options: ConfigOverrides =
                 serde_json::from_value(json!({"min_threads":threads})).unwrap();
             assert!(options.validate().is_ok());
         }
-        for threads in [0, 257] {
-            let options: ConfigOverrides =
-                serde_json::from_value(json!({"min_threads":threads})).unwrap();
-            assert!(options.validate().is_err());
+        for key in ["min_threads", "qp"] {
+            for value in [i64::from(i32::MIN) - 1, i64::from(i32::MAX) + 1] {
+                assert!(serde_json::from_value::<ConfigOverrides>(json!({key:value})).is_err());
+            }
         }
     }
 }

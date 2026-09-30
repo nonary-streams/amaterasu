@@ -139,7 +139,9 @@ enum Operation {
         #[serde(default, deserialize_with = "deserialize_field_update")]
         encoder: FieldUpdate<amaterasu_module_sdk::EncoderBackend>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
-        min_threads: FieldUpdate<u16>,
+        min_threads: FieldUpdate<i32>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        qp: FieldUpdate<i32>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         ping_timeout_ms: FieldUpdate<i32>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
@@ -326,6 +328,7 @@ impl ManagedModule for NvhttpModule {
                 self.product_settings.effective_video_max_batch_size_kb(),
             );
             router.set_global_max_bitrate_kbps(self.product_settings.effective_max_bitrate_kbps());
+            router.set_global_qp(self.product_settings.effective_qp());
             router.set_global_minimum_fps_target(
                 self.product_settings.effective_minimum_fps_target(),
             );
@@ -618,6 +621,7 @@ impl NvhttpModule {
                                 sw_tune,
                                 encoder,
                                 min_threads,
+                                qp,
                                 ping_timeout_ms,
                                 global_preparation,
                                 legacy_global_preparation,
@@ -685,6 +689,7 @@ impl NvhttpModule {
                                         encoder,
                                         min_threads,
                                     },
+                                    qp,
                                     ping_timeout_ms,
                                     global_preparation,
                                     legacy_global_preparation,

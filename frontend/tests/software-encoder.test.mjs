@@ -38,17 +38,18 @@ const controls = (fields) => {
   return values;
 };
 
-test("application software editor preserves raw values and forwards its selector through the form", () => {
+test("application software editor preserves exact strings and signed integer overrides", () => {
   const editor = context.Amaterasu.softwareEncoderOverrideControls({
-    sw_preset: "  slow  ", sw_tune: "film,zerolatency", min_threads: 2, encoder: "auto",
+    sw_preset: "  slow  ", sw_tune: "film,zerolatency", min_threads: -2, qp: 28, encoder: "auto",
   });
   const fields = controls(editor.fields);
   assert.equal(fields.get("sw_preset_mode").value, "value");
   assert.equal(fields.get("sw_preset_value").value, "  slow  ");
   assert.equal(fields.get("sw_tune_value").value, "film,zerolatency");
-  assert.equal(fields.get("min_threads").value, "2");
-  assert.equal(fields.get("min_threads").min, "1");
-  assert.equal(fields.get("min_threads").max, "256");
+  assert.equal(fields.get("min_threads").value, "-2");
+  assert.equal(fields.get("min_threads").min, "-2147483648");
+  assert.equal(fields.get("min_threads").max, "2147483647");
+  assert.equal(fields.get("qp").value, "28");
   assert.equal(fields.get("encoder_backend").value, "auto");
   const form = new FormData();
   form.set("name", "Software application");
@@ -59,7 +60,7 @@ test("application software editor preserves raw values and forwards its selector
     return ordinary(context.Amaterasu.entryFromForm(form));
   };
   assert.deepEqual(readEntry().config_overrides, {
-    sw_preset: "  slow  ", sw_tune: "film,zerolatency", min_threads: 2, encoder: "auto",
+    sw_preset: "  slow  ", sw_tune: "film,zerolatency", min_threads: -2, qp: 28, encoder: "auto",
   });
   const mode = fields.get("sw_preset_mode");
   mode.value = "inherit";
@@ -71,21 +72,33 @@ test("application software editor preserves raw values and forwards its selector
   assert.equal(fields.get("sw_preset_value").disabled, false);
   assert.equal(fields.get("sw_preset_value").value, "  slow  ");
   fields.get("sw_preset_value").value = "";
-  fields.get("min_threads").value = "2";
+  fields.get("min_threads").value = "-2147483648";
+  fields.get("qp").value = "2147483647";
   fields.get("encoder_backend").value = "software";
   assert.deepEqual(readEntry().config_overrides, {
-    sw_preset: "", sw_tune: "film,zerolatency", min_threads: 2, encoder: "software",
+    sw_preset: "", sw_tune: "film,zerolatency", min_threads: -2147483648, qp: 2147483647, encoder: "software",
   });
   assert.deepEqual(ordinary(editor.read()), readEntry().config_overrides);
 });
 
-test("global software editor shows the default thread count and inherits configured values", () => {
-  const editor = context.Amaterasu.softwareEncoderOverrideControls({ min_threads: null }, true);
+test("global software editor shows defaults and preserves the complete signed C int range", () => {
+  const editor = context.Amaterasu.softwareEncoderOverrideControls({ min_threads: null, qp: null }, true);
   const fields = controls(editor.fields);
   assert.equal(fields.get("min_threads").placeholder, "Default request (2)");
   assert.equal(fields.get("min_threads").value, "");
-  fields.get("min_threads").value = "256";
-  assert.equal(editor.read().min_threads, 256);
+  assert.equal(fields.get("qp").placeholder, "Default (28)");
+  fields.get("min_threads").value = "2147483647";
+  fields.get("qp").value = "-2147483648";
+  assert.equal(editor.read().min_threads, 2147483647);
+  assert.equal(editor.read().qp, -2147483648);
   fields.get("min_threads").value = "";
   assert.equal(editor.read().min_threads, null);
+  for (const value of ["-2147483649", "2147483648", "1.5", "--1"]) {
+    fields.get("min_threads").value = value;
+    assert.throws(() => editor.read());
+  }
+  for (const value of ["-2147483649", "2147483648", "1.5"]) {
+    fields.get("qp").value = value;
+    assert.throws(() => editor.read());
+  }
 });
