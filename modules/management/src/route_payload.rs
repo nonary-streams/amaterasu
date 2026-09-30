@@ -27,6 +27,14 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.playnite/1" => playnite(route.action, object),
         "amaterasu.input/1" => input(route.action, object),
         "amaterasu.session-history/1" => history(route.action, object),
+        "amaterasu.host-metrics/1"
+            if route.action == "settings_get" || route.action == "stats_read" =>
+        {
+            fields(object, &[], &[])
+        }
+        "amaterasu.host-metrics/1" if route.action == "settings_update" => {
+            host_metrics_settings_update(object)
+        }
         "amaterasu.diagnostics/1" if route.action == "status" || route.action == "counters" => {
             fields(object, &[], &[])
         }
@@ -558,6 +566,59 @@ fn history(action: &str, object: &Object) -> Result<(), &'static str> {
         }
         _ => Err(INVALID),
     }
+}
+
+fn host_metrics_settings_update(object: &Object) -> Result<(), &'static str> {
+    fields(object, &["settings", "expected_revision"], &[])?;
+    let settings = object
+        .get("settings")
+        .and_then(Value::as_object)
+        .ok_or(INVALID)?;
+    fields(
+        settings,
+        &[
+            "enabled",
+            "poll_interval_ms",
+            "history_retention_seconds",
+            "max_history_points",
+            "pause_when_hidden",
+            "show_active_sessions",
+            "show_host_stats",
+            "show_host_charts",
+            "show_session_history",
+        ],
+        &[],
+    )?;
+    if [
+        "enabled",
+        "pause_when_hidden",
+        "show_active_sessions",
+        "show_host_stats",
+        "show_host_charts",
+        "show_session_history",
+    ]
+    .iter()
+    .any(|field| settings.get(*field).and_then(Value::as_bool).is_none())
+        || !settings
+            .get("poll_interval_ms")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| (250..=60_000).contains(&value))
+        || !settings
+            .get("history_retention_seconds")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| (30..=3_600).contains(&value))
+        || !settings
+            .get("max_history_points")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| (30..=2_000).contains(&value))
+        || object
+            .get("expected_revision")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return Err(INVALID);
+    }
+    Ok(())
 }
 
 fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
@@ -4094,5 +4155,63 @@ mod software_encoder_tests {
                 .is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod host_metrics_tests {
+    use crate::routes::{payload, resolve};
+
+    #[test]
+    fn settings_update_is_cas_versioned_strict_and_bounded() {
+        let route = resolve("/v1/host-metrics/settings_update").unwrap();
+        let valid = serde_json::json!({
+            "settings": {
+                "enabled": true,
+                "poll_interval_ms": 2000,
+                "history_retention_seconds": 300,
+                "max_history_points": 300,
+                "pause_when_hidden": true,
+                "show_active_sessions": true,
+                "show_host_stats": true,
+                "show_host_charts": true,
+                "show_session_history": true,
+            },
+            "expected_revision": 0,
+        });
+        let forwarded = payload(route, valid.to_string().as_bytes()).unwrap();
+        assert_eq!(forwarded["action"], "settings_update");
+
+        for invalid in [
+            serde_json::json!({"poll_interval_ms":249}),
+            serde_json::json!({"poll_interval_ms":60001}),
+            serde_json::json!({"history_retention_seconds":29}),
+            serde_json::json!({"max_history_points":2001}),
+            serde_json::json!({"enabled":"true"}),
+            serde_json::json!({"extra":1}),
+        ] {
+            let mut request = valid.clone();
+            request["settings"]
+                .as_object_mut()
+                .unwrap()
+                .extend(invalid.as_object().unwrap().clone());
+            assert!(
+                payload(route, request.to_string().as_bytes()).is_err(),
+                "{request}"
+            );
+        }
+        let mut missing_revision = valid;
+        missing_revision
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_revision");
+        assert!(payload(route, missing_revision.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn stats_request_is_explicitly_empty() {
+        let route = resolve("/v1/host-metrics/stats").unwrap();
+        assert_eq!(payload(route, b"{}").unwrap()["action"], "stats_read");
+        assert!(payload(route, br#"{"limit":1}"#).is_err());
     }
 }

@@ -168,6 +168,21 @@ pub fn resolve(path: &str) -> Option<Route> {
             let (action, scope) = history_action(action)?;
             ("amaterasu.session-history/1", action, Some(scope))
         }
+        ("host-metrics", "settings") => (
+            "amaterasu.host-metrics/1",
+            "settings_get",
+            Some("configuration.read"),
+        ),
+        ("host-metrics", "settings_update") => (
+            "amaterasu.host-metrics/1",
+            "settings_update",
+            Some("configuration.write"),
+        ),
+        ("host-metrics", "stats") => (
+            "amaterasu.host-metrics/1",
+            "stats_read",
+            Some("diagnostics.read"),
+        ),
         ("diagnostics", "query") => ("amaterasu.diagnostics/1", "query", Some("diagnostics.read")),
         ("diagnostics", "status") => (
             "amaterasu.diagnostics/1",
@@ -236,7 +251,9 @@ pub fn resolve(path: &str) -> Option<Route> {
         service,
         action,
         scope,
-        requires_empty_body: domain == "media" || (domain == "steam" && action == "force_sync"),
+        requires_empty_body: domain == "media"
+            || (domain == "steam" && action == "force_sync")
+            || (domain == "host-metrics" && action == "stats_read"),
     })
 }
 
@@ -407,6 +424,31 @@ mod tests {
         let detail = resolve("/v1/history/session_detail").unwrap();
         assert!(payload(detail, br#"{"session_id":"session-1"}"#).is_ok());
         assert!(payload(detail, br#"{"session_id":""}"#).is_err());
+    }
+
+    #[test]
+    fn host_metrics_routes_expose_settings_and_empty_body_stats_read() {
+        for (path, action, scope) in [
+            (
+                "/v1/host-metrics/settings",
+                "settings_get",
+                "configuration.read",
+            ),
+            (
+                "/v1/host-metrics/settings_update",
+                "settings_update",
+                "configuration.write",
+            ),
+            ("/v1/host-metrics/stats", "stats_read", "diagnostics.read"),
+        ] {
+            let route = resolve(path).unwrap();
+            assert_eq!(route.service, "amaterasu.host-metrics/1");
+            assert_eq!(route.action, action);
+            assert_eq!(route.scope, Some(scope));
+            assert_eq!(route.requires_empty_body, action == "stats_read");
+        }
+        assert!(resolve("/v1/host-metrics/stream_activity_begin").is_none());
+        assert!(resolve("/v1/host-metrics/stream_activity_end").is_none());
     }
 
     #[test]
