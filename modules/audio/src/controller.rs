@@ -569,7 +569,7 @@ impl Controller {
             let endpoint = health.active_endpoint.as_deref().unwrap_or(&stream.endpoint);
             json!({"stream":id,"endpoint":endpoint,"requested_endpoint":stream.requested_endpoint,"virtual_sink":stream.virtual_sink,"channels":stream.channels,"host_audio_enabled":stream.host_audio_enabled,"capture_sink_without_routing":stream.capture_sink_without_routing,"continuous_audio":stream.continuous_audio,"format":stream.format,"state":if failure.is_some() { "failed" } else if health.recovering { "recovering" } else { "capturing" },"failure":failure,"discontinuities":health.discontinuities,"dropped_packets":health.dropped_packets})
         }).collect();
-        json!({"ok":true,"enabled":self.enabled,"audio_route_restore_pending":platform::route_restore_pending(),"streams":streams})
+        json!({"ok":true,"enabled":self.enabled,"audio_route_restore_pending":platform::route_restore_pending(),"virtual_sink_cleanup_pending":platform::virtual_sink_cleanup_pending(),"streams":streams})
     }
 
     pub fn shutdown(&mut self) {

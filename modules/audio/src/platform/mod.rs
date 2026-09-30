@@ -1,9 +1,26 @@
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(windows)]
 mod windows;
+#[cfg(target_os = "linux")]
+pub use linux::{Capture, enumerate, route_restore_pending};
+#[cfg(target_os = "linux")]
+pub use linux::{shutdown, startup};
 #[cfg(windows)]
 pub use windows::{Capture, enumerate, route_restore_pending};
 #[cfg(windows)]
 pub use windows::{shutdown, startup};
+
+pub fn virtual_sink_cleanup_pending() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::virtual_sink_cleanup_pending()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
@@ -20,6 +37,12 @@ pub struct RecoveryConfig {
     pub preferred_valid_bits: Option<u16>,
     pub capture_sink_without_routing: bool,
     pub explicit_route: bool,
+    #[cfg(target_os = "linux")]
+    route_lease: Option<std::sync::Arc<linux::RouteLease>>,
+    #[cfg(target_os = "linux")]
+    virtual_sink_lease: Option<std::sync::Arc<linux::ManagedVirtualSink>>,
+    #[cfg(target_os = "linux")]
+    channel_positions: Vec<i32>,
 }
 
 #[cfg(any(windows, test))]
@@ -65,7 +88,7 @@ mod tests {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 mod unsupported {
     use super::RecoveryConfig;
     use crate::model::{AudioResult, Endpoint, Format, Packet};
@@ -106,11 +129,11 @@ mod unsupported {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub use unsupported::{Capture, enumerate, route_restore_pending};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn shutdown() {}
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn startup() {}

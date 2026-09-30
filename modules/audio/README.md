@@ -1,10 +1,11 @@
-# WASAPI loopback audio
+# Native audio capture
 
 `amaterasu-audio` provides `amaterasu.audio/1` control and the matching native
 `amaterasu_media::AudioCaptureApi`. Startup settings default to
 `{"enabled":false}`. Disabled enumeration returns an empty list without starting
-COM or touching audio endpoints; open returns `disabled`. On non-Windows systems,
-enabled enumeration is empty and open returns `unsupported_platform`.
+COM or connecting to the user audio server; open returns `disabled`. Windows uses
+WASAPI loopback. Linux uses libpulse recording, including servers exposed through
+PipeWire-Pulse. Other platforms return `unsupported_platform`.
 
 Strict JSON controls:
 
@@ -20,7 +21,8 @@ Strict JSON controls:
 ```
 
 Enumeration returns `{ok:true,enabled,endpoints:[{id,name,description,adapter_name,default_multimedia}]}`
-for active render endpoints. Explicit endpoint IDs come from that list. With no
+for active render endpoints. On Linux, endpoint IDs are Pulse sink names and
+capture reads their monitor sources. Explicit endpoint IDs come from that list. With no
 virtual sink selected, an empty or `default` ordinary endpoint initially selects
 the current Windows Console render default. Regular empty/default opens normally
 follow later Console default changes; capture-only opens pin the initially
@@ -118,10 +120,13 @@ selection policy. The actual selected endpoint ID shows whether automatic
 fallback was available. An omitted policy field defaults to false for existing
 callers. Format contains
 `sample_rate`, `channels`, `channel_mask`, and `format:"f32"|"i16"`. Status returns
-`{ok:true,enabled,audio_route_restore_pending,streams:[...]}` with only the
+`{ok:true,enabled,audio_route_restore_pending,virtual_sink_cleanup_pending,streams:[...]}` with only the
 caller's streams, optionally filtered by ID. The route flag reports pending
-cleanup while Windows retries restoration; it clears after restoration or when
-the roles no longer point to the selected endpoint. Each stream
+cleanup while Windows retries restoration or Linux retries its default sink;
+it clears after restoration or when the target is no longer selected. The
+virtual-sink flag reports failed Linux module unloads while the owned cleanup
+queue retries them; it clears when the module is gone or no longer belongs to
+Amaterasu. Each stream
 includes its selected/requested endpoint, format,
 `state:"capturing"|"recovering"|"failed"`, `failure`, `discontinuities`, and
 `dropped_packets`. After WASAPI reports device loss, the worker reports
@@ -225,14 +230,43 @@ releasing module-owned code. Driver activation, GetBuffer, Stop or COM teardown
 can still block indefinitely. A hung driver therefore needs external host
 supervision; no hard teardown deadline or crash recovery is claimed.
 
+Linux selects the current Pulse default sink for an empty or `default` ordinary
+selector. An explicit ordinary sink is temporarily assigned as the Pulse default
+unless `capture_sink_without_routing` is true. Concurrent routed opens share a
+lease for one sink; an open for a different sink fails while that lease is held.
+The final close restores the previous default only while the current default is
+still the routed sink, so a user's intervening choice is retained. Failed
+restoration remains pending and is retried in the background and before later
+routed opens. Opens without routing do not change the Pulse default. Regular
+default opens follow default-sink changes and recover on the new monitor; explicit
+and capture-only opens stay pinned. If the server has no previous default sink,
+Amaterasu captures without assigning a new default because it cannot restore an
+unset route.
+
+On Linux, an explicit `virtual_sink` uses the same exact endpoint-field selector
+contract as Windows and must resolve to an existing Pulse sink. With no explicit
+virtual selector, `host_audio_enabled:false` creates or shares a process-owned
+`module-null-sink` with the requested stereo, 5.1, or 7.1 layout. The final owner
+unloads a module created by Amaterasu; a pre-existing same-name sink is left
+alone. Linux capture requests 48 kHz float32 PCM from the sink monitor and reports
+estimated monotonic timestamps. This is real server-provided monitor capture;
+the private null sink itself has no producer unless an application routes audio
+to it. PipeWire-Pulse can provide the compatible server API. The module disables
+PulseAudio autospawn and does not start or restart an audio service. Failed
+module unloads retain their sink name and module index, are retried once per
+second, and set `virtual_sink_cleanup_pending`; the queue is limited to this
+process's three supported private layouts. Shutdown makes one final bounded
+cleanup attempt. If the sound server remains inaccessible at shutdown, the
+server-owned null sink can outlive the module and cannot be reported afterward.
+
 The Windows audio policy/capture behavior and audio capture contract in pinned
 Vibeshine commit `457237db7e57f9c4be21c35bb07e28d1c100eb7d` were used as
 behavioral references without copying or translating source. The selected-endpoint
 capture-only case is represented by the per-open policy above. Continuous audio
 is opt-in per open; product setting persistence, management UI, and hardware
 qualification remain unimplemented. Opus encoding, configured speaker remapping,
-resampling, process-specific loopback, microphone capture, Linux/macOS backends,
-and full streaming audio parity remain unimplemented.
+resampling, process-specific loopback, microphone capture, and full streaming
+audio parity remain unimplemented. macOS capture remains unsupported.
 
 Host tests use fake endpoint/capture backends and real native callback bindings
 for selection, ownership, idempotency, cancellation rollback, silent packets,
@@ -260,7 +294,12 @@ silence, sustained backpressure, discontinuities, and cancellation while drivers
 initialize also need hardware coverage. Automatic Steam fallback has pure
 endpoint-policy tests only; it requires an active Steam Streaming Speakers
 device, which Amaterasu does not install, and has not yet been qualified on that
-hardware. Non-Windows audio capture remains unsupported.
+hardware. An ignored Linux virtual-monitor capture test creates a private null
+sink and reads its silence; it requires an accessible per-user Pulse-compatible
+server and does not prove physical-device audio. This test has not been run where
+the user sound server is inaccessible. Linux physical input/output, route
+switching, default changes, device-loss recovery, and PipeWire-Pulse
+interoperability still need live host qualification.
 
 Primary API references:
 
@@ -268,3 +307,6 @@ Primary API references:
 - [Capturing a stream](https://learn.microsoft.com/en-us/windows/win32/coreaudio/capturing-a-stream)
 - [GetMixFormat](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-getmixformat)
 - [IAudioCaptureClient GetBuffer](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudiocaptureclient-getbuffer)
+- [PulseAudio asynchronous API](https://freedesktop.org/software/pulseaudio/doxygen/mainloop_8h.html)
+- [PulseAudio recording and stream APIs](https://freedesktop.org/software/pulseaudio/doxygen/stream_8h.html)
+- [PipeWire-Pulse null sink module](https://pipewire.pages.freedesktop.org/pipewire/page_pulse_module_null_sink.html)

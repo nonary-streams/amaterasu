@@ -24,7 +24,7 @@ pub struct Format {
 }
 
 impl Format {
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, target_os = "linux", test))]
     pub fn new(sample_rate: u32, channels: u32, format: u32) -> AudioResult<Self> {
         if !(8_000..=192_000).contains(&sample_rate) || !(1..=8).contains(&channels) {
             return Err("unsupported_format");
