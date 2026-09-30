@@ -89,8 +89,15 @@ fn verify_cookie(result: Response, cookie: char) -> (Stage, Vec<Command>) {
         peer: "127.0.0.1".parse().unwrap(),
     };
     let mut operation = 1;
+    let mut selection_owners = SelectionOwners::default();
     connection
-        .authorize(&runtime, request, &mut operation, &mut None)
+        .authorize(
+            &runtime,
+            request,
+            &mut operation,
+            &mut None,
+            &mut selection_owners,
+        )
         .unwrap();
     let Stage::Verifying {
         request_id,
@@ -101,7 +108,13 @@ fn verify_cookie(result: Response, cookie: char) -> (Stage, Vec<Command>) {
     };
     assert_eq!(request_id, 41);
     connection
-        .verify_result(&runtime, request_id, request, &mut operation)
+        .verify_result(
+            &runtime,
+            request_id,
+            request,
+            &mut operation,
+            &mut selection_owners,
+        )
         .unwrap();
     let commands = recorder.commands.into_inner().unwrap();
     let Command::Request {
@@ -199,6 +212,124 @@ fn valid_cookie_with_exact_route_scope_dispatches_only_the_resolved_action() {
     };
     assert_eq!(service, crate::SERVICE);
     assert_eq!(payload, &json!({"action":"product_get"}));
+}
+
+#[test]
+fn pipewire_selection_route_verifies_capture_scope_and_binds_the_handle_to_session() {
+    const OPERATION_ID: &str = "a12f6f1e-04cb-4a97-bdf8-f53bb9cf2dd1";
+    let auth_context_id = "a".repeat(64);
+    let recorder = VerificationRuntime {
+        result: Response::Result {
+            payload: json!({
+                "ok":true,
+                "kind":"administrator_session",
+                "subject":"admin",
+                "auth_context_id":auth_context_id,
+                "scopes":["capture.write"],
+                "expires_at":1_800_000_000
+            }),
+        },
+        commands: Mutex::new(Vec::new()),
+    };
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: std::ptr::from_ref(&recorder).cast_mut().cast(),
+        invoke,
+    };
+    // SAFETY: recorder outlives all synchronous client calls below.
+    let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let authority = listener.local_addr().unwrap().to_string();
+    let access = format!("ama_{}", "d".repeat(64));
+    let request_bytes = format!(
+        "POST /v1/capture/pipewire_selection_begin HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: 79\r\nOrigin: https://{authority}\r\nCookie: __Secure-amaterasu-access={access}\r\nX-Amaterasu-CSRF: 1\r\n\r\n{{\"source_type\":\"monitor\",\"operation_id\":\"{OPERATION_ID}\"}}"
+    );
+    let request = http::parse_policy_transport(
+        request_bytes.as_bytes(),
+        &authority,
+        &[],
+        http::Transport::Tls,
+        &CsrfOrigins::default(),
+    )
+    .unwrap()
+    .unwrap();
+    let mut connection = Connection {
+        stream,
+        tls: None,
+        tls_closing: false,
+        deadline: Instant::now() + CONNECTION_TIMEOUT,
+        origin: None,
+        csrf_exception: None,
+        stage: Stage::Closed,
+        peer: "127.0.0.1".parse().unwrap(),
+    };
+    let mut operation = 1;
+    let mut selection_owners = SelectionOwners::default();
+    connection
+        .authorize(
+            &runtime,
+            request,
+            &mut operation,
+            &mut None,
+            &mut selection_owners,
+        )
+        .unwrap();
+    let Stage::Verifying {
+        request_id,
+        request,
+    } = std::mem::replace(&mut connection.stage, Stage::Closed)
+    else {
+        panic!("capture route must verify the session before provider dispatch")
+    };
+    connection
+        .verify_result(
+            &runtime,
+            request_id,
+            request,
+            &mut operation,
+            &mut selection_owners,
+        )
+        .unwrap();
+    assert!(matches!(
+        connection.stage,
+        Stage::Dispatching {
+            request_id: 42,
+            capture: Some(CaptureDispatch {
+                action: SelectionAction::Begin,
+                ..
+            }),
+            ..
+        }
+    ));
+    let identity = format!("administrator_session:admin:{auth_context_id}");
+    assert!(selection_owners.permits(OPERATION_ID, &identity, Instant::now()));
+    let commands = recorder.commands.into_inner().unwrap();
+    let Command::Request {
+        service: auth_service,
+        payload: auth_payload,
+        ..
+    } = &commands[0]
+    else {
+        panic!("capture route must verify auth before dispatch")
+    };
+    assert_eq!(auth_service, AUTH_SERVICE);
+    assert_eq!(auth_payload["action"], "verify");
+    let Command::Request {
+        service: capture_service,
+        payload: capture_payload,
+        parent,
+        ..
+    } = &commands[3]
+    else {
+        panic!("expected PipeWire selection call")
+    };
+    assert_eq!(capture_service, "amaterasu.capture-pipewire/1");
+    assert_eq!(
+        capture_payload,
+        &json!({"action":"select_source","source_type":"monitor","operation_id":OPERATION_ID})
+    );
+    assert_eq!(*parent, None);
 }
 
 #[test]

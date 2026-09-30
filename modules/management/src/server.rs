@@ -1,5 +1,6 @@
 //! Tick-owned, nonblocking network connections and asynchronous service delegation.
 use crate::assets::Assets;
+use crate::capture_management::{self, SelectionAction, SelectionOwners};
 use crate::csrf_policy::CsrfOrigins;
 use crate::http::{BrowserAuth, RequestTarget};
 use crate::peer_policy::{self, PeerTier};
@@ -26,6 +27,7 @@ pub struct Server {
     assets: Option<Assets>,
     maximum_peer: Option<PeerTier>,
     csrf_origins: CsrfOrigins,
+    selection_owners: SelectionOwners,
 }
 
 impl Server {
@@ -64,6 +66,7 @@ impl Server {
             assets,
             maximum_peer: None,
             csrf_origins: CsrfOrigins::default(),
+            selection_owners: SelectionOwners::default(),
         })
     }
 
@@ -77,6 +80,15 @@ impl Server {
 
     pub fn tick(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
         self.accept()?;
+        let mut tick = ConnectionTick {
+            runtime,
+            authority: &self.address,
+            origins: &self.origins,
+            csrf_origins: &self.csrf_origins,
+            operation: &mut self.next_operation,
+            assets: &mut self.assets,
+            selection_owners: &mut self.selection_owners,
+        };
         for connection in &mut self.connections {
             if !peer_policy::permits(self.maximum_peer, connection.peer, connection.tls.is_some())
                 || connection
@@ -87,14 +99,7 @@ impl Server {
                 connection.expire(runtime);
                 continue;
             }
-            connection.tick(
-                runtime,
-                &self.address,
-                &self.origins,
-                &self.csrf_origins,
-                &mut self.next_operation,
-                &mut self.assets,
-            )?;
+            connection.tick(&mut tick)?;
         }
         self.connections
             .retain(|connection| !matches!(connection.stage, Stage::Closed));
@@ -185,6 +190,16 @@ struct BrowserPolicy<'a> {
     csrf_origins: &'a CsrfOrigins,
 }
 
+struct ConnectionTick<'a> {
+    runtime: &'a RuntimeClient,
+    authority: &'a str,
+    origins: &'a [String],
+    csrf_origins: &'a CsrfOrigins,
+    operation: &'a mut u64,
+    assets: &'a mut Option<Assets>,
+    selection_owners: &'a mut SelectionOwners,
+}
+
 enum Stage {
     Reading(Vec<u8>),
     Verifying {
@@ -196,6 +211,7 @@ enum Stage {
         login: bool,
         operational_health: bool,
         browser_auth: Option<BrowserAuth>,
+        capture: Option<CaptureDispatch>,
     },
     Writing {
         bytes: Vec<u8>,
@@ -204,16 +220,24 @@ enum Stage {
     Closed,
 }
 
+#[derive(Clone)]
+struct CaptureDispatch {
+    action: SelectionAction,
+    operation_id: Option<String>,
+    created: bool,
+}
+
+struct ServiceReply<'a> {
+    login: bool,
+    operational_health: bool,
+    browser_auth: Option<BrowserAuth>,
+    capture: Option<CaptureDispatch>,
+    selection_owners: &'a mut SelectionOwners,
+}
+
 impl Connection {
-    fn tick(
-        &mut self,
-        runtime: &RuntimeClient,
-        authority: &str,
-        origins: &[String],
-        csrf_origins: &CsrfOrigins,
-        operation: &mut u64,
-        assets: &mut Option<Assets>,
-    ) -> ModuleResult<()> {
+    fn tick(&mut self, context: &mut ConnectionTick<'_>) -> ModuleResult<()> {
+        let runtime = context.runtime;
         if Instant::now() >= self.deadline {
             self.expire(runtime);
             return Ok(());
@@ -227,25 +251,41 @@ impl Connection {
                 runtime,
                 bytes,
                 BrowserPolicy {
-                    authority,
-                    origins,
-                    csrf_origins,
+                    authority: context.authority,
+                    origins: context.origins,
+                    csrf_origins: context.csrf_origins,
                 },
-                operation,
-                assets,
+                context.operation,
+                context.assets,
+                context.selection_owners,
             )?,
             Stage::Verifying {
                 request_id,
                 request,
-            } => self.verify_result(runtime, request_id, request, operation)?,
+            } => self.verify_result(
+                runtime,
+                request_id,
+                request,
+                context.operation,
+                context.selection_owners,
+            )?,
             Stage::Dispatching {
                 request_id,
                 login,
                 operational_health,
                 browser_auth,
-            } => {
-                self.service_result(runtime, request_id, login, operational_health, browser_auth)?
-            }
+                capture,
+            } => self.service_result(
+                runtime,
+                request_id,
+                ServiceReply {
+                    login,
+                    operational_health,
+                    browser_auth,
+                    capture,
+                    selection_owners: context.selection_owners,
+                },
+            )?,
             Stage::Writing { bytes, offset } => self.write_response(bytes, offset),
             Stage::Closed => {}
         }
@@ -302,6 +342,7 @@ impl Connection {
         policy: BrowserPolicy<'_>,
         operation: &mut u64,
         assets: &mut Option<Assets>,
+        selection_owners: &mut SelectionOwners,
     ) -> ModuleResult<()> {
         let mut buffer = [0; 4096];
         if self.tls.as_ref().is_some_and(|tls| tls.is_handshaking()) {
@@ -348,7 +389,9 @@ impl Connection {
             transport,
             policy.csrf_origins,
         ) {
-            Ok(Some(request)) => self.authorize(runtime, request, operation, assets)?,
+            Ok(Some(request)) => {
+                self.authorize(runtime, request, operation, assets, selection_owners)?
+            }
             Ok(None) => self.stage = Stage::Reading(bytes),
             Err(failure) => self.fail(failure.status, failure.code),
         }
@@ -359,8 +402,9 @@ impl Connection {
         &mut self,
         runtime: &RuntimeClient,
         request_id: u64,
-        request: http::Request,
+        mut request: http::Request,
         operation: &mut u64,
+        selection_owners: &mut SelectionOwners,
     ) -> ModuleResult<()> {
         match runtime.send_ephemeral(Command::TakeResult {
             request: request_id,
@@ -372,7 +416,28 @@ impl Connection {
                 }
             }
             Response::Result { payload } if authorized(&payload, request_scope(&request)) => {
-                self.dispatch(runtime, request, operation)?
+                if matches!(request.target, RequestTarget::Api(route) if route.service == "amaterasu.capture-pipewire/1")
+                {
+                    request.verified_identity = capture_management::identity(
+                        payload
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        payload
+                            .get("subject")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        payload
+                            .get("auth_context_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    );
+                    if request.verified_identity.is_none() {
+                        self.fail(503, "authentication_unavailable");
+                        return Ok(());
+                    }
+                }
+                self.dispatch(runtime, request, operation, selection_owners)?
             }
             Response::Result { payload } => {
                 match (
@@ -393,10 +458,15 @@ impl Connection {
         &mut self,
         runtime: &RuntimeClient,
         request_id: u64,
-        login: bool,
-        operational_health: bool,
-        browser_auth: Option<BrowserAuth>,
+        reply: ServiceReply<'_>,
     ) -> ModuleResult<()> {
+        let ServiceReply {
+            login,
+            operational_health,
+            browser_auth,
+            capture,
+            selection_owners,
+        } = reply;
         match runtime.send_ephemeral(Command::TakeResult {
             request: request_id,
         })? {
@@ -406,11 +476,28 @@ impl Connection {
                     login,
                     operational_health,
                     browser_auth,
+                    capture,
                 }
             }
             Response::Result { payload } => match browser_auth {
                 Some(action) => self.respond_browser_auth(action, payload),
-                None => self.respond(service_status(&payload, login, operational_health), payload),
+                None => {
+                    if let Some(capture) = capture {
+                        let (status, response) =
+                            capture_management::response(capture.action, &payload);
+                        let remove_owner = capture.action == SelectionAction::Cancel
+                            && response.get("cancelled").and_then(Value::as_bool) == Some(true)
+                            || capture.action == SelectionAction::Begin
+                                && response.get("ok").and_then(Value::as_bool) != Some(true)
+                                && capture.created;
+                        if remove_owner && let Some(operation_id) = capture.operation_id {
+                            selection_owners.remove(&operation_id);
+                        }
+                        self.respond(status, response);
+                    } else {
+                        self.respond(service_status(&payload, login, operational_health), payload);
+                    }
+                }
             },
             _ => self.fail(503, "service_unavailable"),
         }
@@ -460,6 +547,7 @@ impl Connection {
         mut request: http::Request,
         operation: &mut u64,
         assets: &mut Option<Assets>,
+        selection_owners: &mut SelectionOwners,
     ) -> ModuleResult<()> {
         self.origin.clone_from(&request.origin);
         self.csrf_exception = request
@@ -492,6 +580,7 @@ impl Connection {
                     login: false,
                     operational_health: true,
                     browser_auth: None,
+                    capture: None,
                 };
             }
         } else if request.preflight {
@@ -510,7 +599,7 @@ impl Connection {
                 };
             }
         } else {
-            self.dispatch(runtime, request, operation)?;
+            self.dispatch(runtime, request, operation, selection_owners)?;
         }
         Ok(())
     }
@@ -518,10 +607,11 @@ impl Connection {
     fn dispatch(
         &mut self,
         runtime: &RuntimeClient,
-        request: http::Request,
+        mut request: http::Request,
         operation: &mut u64,
+        selection_owners: &mut SelectionOwners,
     ) -> ModuleResult<()> {
-        let RequestTarget::Api(route) = request.target else {
+        let RequestTarget::Api(route) = &request.target else {
             if let RequestTarget::BrowserAuth(action) = request.target {
                 if action == BrowserAuth::Logout && request.payload == json!({}) {
                     self.respond_browser_auth(action, json!({"ok":false,"code":"session_missing"}));
@@ -535,6 +625,7 @@ impl Connection {
                         login: true,
                         operational_health: false,
                         browser_auth: Some(action),
+                        capture: None,
                     };
                 }
                 return Ok(());
@@ -542,14 +633,131 @@ impl Connection {
             self.fail(404, "route_not_found");
             return Ok(());
         };
+        let route = *route;
+        if route.service == "amaterasu.capture-pipewire/1" {
+            self.dispatch_capture(
+                runtime,
+                &mut request,
+                route.action,
+                operation,
+                selection_owners,
+            )?;
+            return Ok(());
+        }
         if let Some(request_id) = self.submit(runtime, route.service, request.payload, operation)? {
             self.stage = Stage::Dispatching {
                 request_id,
                 login: route.scope.is_none(),
                 operational_health: false,
                 browser_auth: None,
+                capture: None,
             };
         }
+        Ok(())
+    }
+
+    fn dispatch_capture(
+        &mut self,
+        runtime: &RuntimeClient,
+        request: &mut http::Request,
+        action: &str,
+        operation: &mut u64,
+        selection_owners: &mut SelectionOwners,
+    ) -> ModuleResult<()> {
+        let identity = request.verified_identity.as_ref().map(|identity| {
+            format!(
+                "{}:{}:{}",
+                identity.kind, identity.subject, identity.auth_context_id
+            )
+        });
+        let (selection_action, payload, operation_id, created) = match action {
+            "status" => (
+                SelectionAction::Status,
+                json!({"action":"status"}),
+                None,
+                false,
+            ),
+            "select_source" => {
+                let identity = identity
+                    .as_deref()
+                    .ok_or("capture authorization identity missing")?;
+                let operation_id = request
+                    .payload
+                    .get("operation_id")
+                    .and_then(Value::as_str)
+                    .ok_or("capture operation id missing")?
+                    .to_owned();
+                let source_type = request
+                    .payload
+                    .get("source_type")
+                    .and_then(Value::as_str)
+                    .ok_or("capture source type missing")?;
+                let created = match selection_owners.begin(&operation_id, identity, Instant::now())
+                {
+                    Ok(created) => created,
+                    Err(()) => {
+                        self.fail(409, "operation_conflict_or_limit");
+                        return Ok(());
+                    }
+                };
+                (
+                    SelectionAction::Begin,
+                    json!({"action":"select_source","source_type":source_type,"operation_id":operation_id}),
+                    Some(operation_id),
+                    created,
+                )
+            }
+            "poll_selection" | "cancel_selection" => {
+                let identity = identity
+                    .as_deref()
+                    .ok_or("capture authorization identity missing")?;
+                let operation_id = request
+                    .payload
+                    .get("operation_id")
+                    .and_then(Value::as_str)
+                    .ok_or("capture operation id missing")?
+                    .to_owned();
+                if !selection_owners.permits(&operation_id, identity, Instant::now()) {
+                    self.fail(404, "selection_not_found");
+                    return Ok(());
+                }
+                let is_cancel = action == "cancel_selection";
+                (
+                    if is_cancel {
+                        SelectionAction::Cancel
+                    } else {
+                        SelectionAction::Poll
+                    },
+                    json!({"action":action,"operation_id":operation_id}),
+                    Some(operation_id),
+                    false,
+                )
+            }
+            _ => {
+                self.fail(404, "route_not_found");
+                return Ok(());
+            }
+        };
+
+        let Some(request_id) =
+            self.submit(runtime, "amaterasu.capture-pipewire/1", payload, operation)?
+        else {
+            if created && let Some(operation_id) = &operation_id {
+                selection_owners.remove(operation_id);
+            }
+            return Ok(());
+        };
+        self.stage = Stage::Dispatching {
+            request_id,
+            login: false,
+            operational_health: false,
+            browser_auth: None,
+            capture: Some(CaptureDispatch {
+                action: selection_action,
+                operation_id,
+                created,
+            }),
+        };
         Ok(())
     }
 
@@ -658,6 +866,7 @@ impl Connection {
         if let Some(object) = payload.as_object_mut() {
             object.remove("bearer");
             object.remove("refresh_token");
+            object.remove("auth_context_id");
         }
         self.stage = Stage::Writing {
             bytes: http::response_with_cookies(status, &payload, None, &cookies),
@@ -826,13 +1035,15 @@ mod tests {
         for action in [BrowserAuth::Login, BrowserAuth::Refresh] {
             let reply = browser_reply(
                 action,
-                json!({"ok":true,"bearer":access,"refresh_token":refresh,"kind":"administrator_session","subject":"admin","scopes":["configuration.read"],"expires_at":1_800_000_000,"remember_me":false}),
+                json!({"ok":true,"bearer":access,"refresh_token":refresh,"kind":"administrator_session","subject":"admin","scopes":["configuration.read"],"expires_at":1_800_000_000,"remember_me":false,"auth_context_id":"internal-session-id"}),
             );
             let (headers, body) = reply.split_once("\r\n\r\n").unwrap();
             assert!(headers.contains(&format!("Set-Cookie: __Secure-amaterasu-access={access}; Path=/v1; Secure; HttpOnly; SameSite=Strict")));
             assert!(headers.contains(&format!("Set-Cookie: __Secure-amaterasu-refresh={refresh}; Path=/v1/auth/browser; Secure; HttpOnly; SameSite=Strict")));
             assert!(!body.contains(&access));
             assert!(!body.contains(&refresh));
+            assert!(!body.contains("auth_context_id"));
+            assert!(!body.contains("internal-session-id"));
             assert!(!headers.contains("Access-Control-Allow-Credentials"));
         }
         let logout = browser_reply(BrowserAuth::Logout, json!({"ok":true}));
@@ -919,6 +1130,7 @@ mod tests {
             ),
             payload: json!({}),
             bearer: None,
+            verified_identity: None,
             origin: None,
             preflight: false,
             csrf_exception: false,

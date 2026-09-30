@@ -1100,13 +1100,13 @@ fn authorization_policy_generations_are_distinct_nonzero_and_survive_reload() {
         installer.settings["amaterasu.authentication"]["authorization_policy_generation"]
             .as_u64()
             .unwrap();
-    assert_eq!(development_generation, 2);
+    assert_eq!(development_generation, 4);
     assert_eq!(installer_generation, 3);
     assert_ne!(development_generation, 0);
     assert_ne!(installer_generation, 0);
     assert_ne!(development_generation, installer_generation);
 
-    for (policy, expected_generation) in [(development, 2), (installer, 3)] {
+    for (policy, expected_generation) in [(development, 4), (installer, 3)] {
         let serialized = serde_json::to_value(&policy).unwrap();
         assert_eq!(
             serialized["settings"]["amaterasu.authentication"]["authorization_policy_generation"],
@@ -1166,15 +1166,20 @@ fn installer_authentication_upgrade_changes_only_generation_and_lutris_scope() {
     let development_authentication = &development.settings[AUTHENTICATION.id];
     assert_eq!(
         development_authentication["authorization_policy_generation"],
-        2
+        4
     );
     assert_eq!(
         development_authentication["administrator_principals"],
         json!(["amaterasu.console", "amaterasu.management"])
     );
+    let mut development_scopes = upgraded_authentication["allowed_scopes"]
+        .as_array()
+        .unwrap()
+        .clone();
+    development_scopes.extend([json!("capture.read"), json!("capture.write")]);
     assert_eq!(
         development_authentication["allowed_scopes"],
-        upgraded_authentication["allowed_scopes"]
+        json!(development_scopes)
     );
 }
 
@@ -1359,6 +1364,12 @@ fn linux_probe_scopes_portal_capture_to_an_explicit_composition() {
         assert!(!component.calls.contains(&"amaterasu.capture-wgc/1"));
     }
     assert!(LINUX_VIDEO.calls.contains(&"amaterasu.capture-pipewire/1"));
+    assert!(
+        LINUX_MANAGEMENT
+            .calls
+            .contains(&"amaterasu.capture-pipewire/1")
+    );
+    assert!(!MANAGEMENT.calls.contains(&"amaterasu.capture-pipewire/1"));
     let root = std::env::temp_dir().join(format!(
         "amaterasu-linux-probe-profile-{}",
         std::process::id()
@@ -1368,7 +1379,7 @@ fn linux_probe_scopes_portal_capture_to_an_explicit_composition() {
     assert_eq!(development.settings[CAPTURE_PIPEWIRE.id]["enabled"], false);
     assert_eq!(
         development.settings[CAPTURE_PIPEWIRE.id]["selection_principals"],
-        json!([])
+        json!(["amaterasu.management"])
     );
     assert_eq!(
         development.settings[CAPTURE_PIPEWIRE.id]["capture_principals"],
@@ -1377,6 +1388,28 @@ fn linux_probe_scopes_portal_capture_to_an_explicit_composition() {
     assert_eq!(
         development.principals[VIDEO.id].native_use,
         VIDEO.grants().native_use
+    );
+    assert!(
+        development.principals[MANAGEMENT.id]
+            .call
+            .contains("amaterasu.capture-pipewire/1")
+    );
+    assert!(
+        !development.principals[MANAGEMENT.id]
+            .native_use
+            .contains("amaterasu.capture-pipewire/1")
+    );
+    assert!(
+        development.settings["amaterasu.authentication"]["allowed_scopes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("capture.read"))
+    );
+    assert!(
+        development.settings["amaterasu.authentication"]["allowed_scopes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("capture.write"))
     );
     for component in [NVHTTP, RTSP, STREAM_SESSION] {
         assert!(

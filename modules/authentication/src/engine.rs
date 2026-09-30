@@ -26,6 +26,7 @@ pub enum Change {
 struct Session {
     credential_digest: String,
     policy_generation: u64,
+    ownership_context_id: String,
     subject: String,
     scopes: BTreeSet<String>,
     expires_at: u64,
@@ -212,15 +213,19 @@ impl Engine {
         let scope_digest = Self::scope_digest(&self.settings.allowed_scopes);
         let original_len = session_document.sessions.len();
         let original_version = session_document.version;
-        session_document.sessions.retain(|session| {
-            Some(session.credential_digest.as_str()) == credential_digest.as_deref()
+        session_document.sessions.retain_mut(|session| {
+            let eligible = Some(session.credential_digest.as_str()) == credential_digest.as_deref()
                 && credential_document
                     .credential
                     .as_ref()
                     .is_some_and(|credential| session.subject == credential.username)
                 && session.scope_digest == scope_digest
                 && session.policy_generation == Some(self.settings.authorization_policy_generation)
-                && session.refresh_expires_at > now.max(self.latest_time)
+                && session.refresh_expires_at > now.max(self.latest_time);
+            if eligible && original_version < SESSION_DOCUMENT_VERSION {
+                session.ownership_context_id = Some(session.session_id.clone());
+            }
+            eligible
         });
         session_document.version = SESSION_DOCUMENT_VERSION;
         let removed = session_document.sessions.len() != original_len
@@ -295,6 +300,7 @@ impl Engine {
         // the authenticated identity must remain the saved administrator name.
         let subject = credential.username.clone();
         let (bearer, digest) = crypto::issue_bearer()?;
+        let (_, ownership_context_id) = crypto::issue_bearer()?;
         let (refresh_token, refresh_digest) = crypto::issue_bearer()?;
         let refresh_ttl = if remember_me {
             self.settings.remember_me_refresh_token_ttl_seconds
@@ -346,6 +352,7 @@ impl Engine {
             Session {
                 credential_digest,
                 policy_generation: self.settings.authorization_policy_generation,
+                ownership_context_id,
                 subject,
                 scopes,
                 expires_at,
@@ -458,6 +465,10 @@ impl Engine {
                     policy_generation: record
                         .policy_generation
                         .expect("session generation was validated before restoration"),
+                    ownership_context_id: record
+                        .ownership_context_id
+                        .clone()
+                        .unwrap_or_else(|| record.session_id.clone()),
                     subject: record.subject.clone(),
                     scopes: self.settings.allowed_scopes.clone(),
                     expires_at: record.expires_at,
@@ -480,6 +491,7 @@ impl Engine {
                     credential_digest: session.credential_digest.clone(),
                     scope_digest: scope_digest.to_owned(),
                     policy_generation: Some(session.policy_generation),
+                    ownership_context_id: Some(session.ownership_context_id.clone()),
                     subject: session.subject.clone(),
                     expires_at: session.expires_at,
                     refresh_expires_at: session.refresh_expires_at,
@@ -519,7 +531,7 @@ impl Engine {
             }
             self.authorize_scopes(&session.scopes, &required_scopes)?;
             return Ok(Change::Read(
-                json!({"ok":true,"kind":"administrator_session","subject":session.subject,"scopes":session.scopes,"expires_at":session.expires_at}),
+                json!({"ok":true,"kind":"administrator_session","subject":session.subject,"scopes":session.scopes,"expires_at":session.expires_at,"auth_context_id":session.ownership_context_id}),
             ));
         }
         let token = document
@@ -529,7 +541,7 @@ impl Engine {
             .ok_or("unauthorized")?;
         self.authorize_scopes(&token.scopes, &required_scopes)?;
         Ok(Change::Read(
-            json!({"ok":true,"kind":"api_token","subject":token.owner,"scopes":token.scopes,"expires_at":token.expires_at}),
+            json!({"ok":true,"kind":"api_token","subject":token.owner,"scopes":token.scopes,"expires_at":token.expires_at,"auth_context_id":token.token_id}),
         ))
     }
 

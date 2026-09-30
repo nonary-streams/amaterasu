@@ -1,5 +1,6 @@
 //! Development loopback HTTP management lives in this independently loaded module.
 mod assets;
+mod capture_management;
 mod csrf_policy;
 mod http;
 mod peer_policy;

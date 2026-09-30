@@ -210,6 +210,26 @@ pub fn resolve(path: &str) -> Option<Route> {
             let (service, action) = media_discovery(action)?;
             (service, action, Some("media.read"))
         }
+        ("capture", "pipewire_status") => (
+            "amaterasu.capture-pipewire/1",
+            "status",
+            Some("capture.read"),
+        ),
+        ("capture", "pipewire_selection_begin") => (
+            "amaterasu.capture-pipewire/1",
+            "select_source",
+            Some("capture.write"),
+        ),
+        ("capture", "pipewire_selection_poll") => (
+            "amaterasu.capture-pipewire/1",
+            "poll_selection",
+            Some("capture.read"),
+        ),
+        ("capture", "pipewire_selection_cancel") => (
+            "amaterasu.capture-pipewire/1",
+            "cancel_selection",
+            Some("capture.write"),
+        ),
         _ => return None,
     };
     Some(Route {

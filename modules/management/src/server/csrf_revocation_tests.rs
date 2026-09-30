@@ -118,6 +118,7 @@ fn origin_revocation_cancels_and_releases_verifying_and_dispatched_requests() {
                 login: false,
                 operational_health: false,
                 browser_auth: None,
+                capture: None,
             }
         } else {
             Stage::Verifying {

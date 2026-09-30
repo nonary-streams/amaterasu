@@ -30,6 +30,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.diagnostics/1" if route.action == "status" || route.action == "counters" => {
             fields(object, &[], &[])
         }
+        "amaterasu.capture-pipewire/1" => capture_pipewire(route.action, object),
         "amaterasu.diagnostics/1" if route.action == "query" => {
             fields(object, &[], &["after", "limit"])?;
             if object
@@ -55,6 +56,126 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn capture_pipewire(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "status" => fields(object, &[], &[]),
+        "select_source" => {
+            fields(object, &["source_type", "operation_id"], &[])?;
+            if !matches!(text(object, "source_type")?, "monitor" | "window")
+                || !high_entropy_operation_id(text(object, "operation_id")?)
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "poll_selection" | "cancel_selection" => {
+            fields(object, &["operation_id"], &[])?;
+            if !high_entropy_operation_id(text(object, "operation_id")?) {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        _ => Err(INVALID),
+    }
+}
+
+fn high_entropy_operation_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            [8, 13, 18, 23].contains(&index)
+                || byte.is_ascii_digit()
+                || (b'a'..=b'f').contains(byte)
+        })
+        && bytes[14] == b'4'
+        && matches!(bytes[19], b'8'..=b'b')
+}
+
+#[cfg(test)]
+mod capture_pipewire_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn capture_routes_require_exact_scopes_and_strict_payloads() {
+        for (path, action, scope) in [
+            ("/v1/capture/pipewire_status", "status", "capture.read"),
+            (
+                "/v1/capture/pipewire_selection_begin",
+                "select_source",
+                "capture.write",
+            ),
+            (
+                "/v1/capture/pipewire_selection_poll",
+                "poll_selection",
+                "capture.read",
+            ),
+            (
+                "/v1/capture/pipewire_selection_cancel",
+                "cancel_selection",
+                "capture.write",
+            ),
+        ] {
+            let route = crate::routes::resolve(path).unwrap();
+            assert_eq!(route.service, "amaterasu.capture-pipewire/1");
+            assert_eq!(route.action, action);
+            assert_eq!(route.scope, Some(scope));
+            assert!(!route.requires_empty_body);
+        }
+
+        let status = crate::routes::resolve("/v1/capture/pipewire_status").unwrap();
+        assert!(validate(status, json!({}).as_object().unwrap()).is_ok());
+        assert!(
+            validate(
+                status,
+                json!({"operation_id":"untrusted"}).as_object().unwrap()
+            )
+            .is_err()
+        );
+
+        let begin = crate::routes::resolve("/v1/capture/pipewire_selection_begin").unwrap();
+        let id = "a12f6f1e-04cb-4a97-bdf8-f53bb9cf2dd1";
+        assert!(
+            validate(
+                begin,
+                json!({"source_type":"monitor","operation_id":id})
+                    .as_object()
+                    .unwrap()
+            )
+            .is_ok()
+        );
+        for payload in [
+            json!({"source_type":"monitor","operation_id":"id"}),
+            json!({"source_type":"desktop","operation_id":id}),
+            json!({"source_type":"window","operation_id":id,"caller":"other"}),
+            json!({"source_type":"window","operation_id":"a12f6f1e-04cb-4A97-bdf8-f53bb9cf2dd1"}),
+        ] {
+            assert!(validate(begin, payload.as_object().unwrap()).is_err());
+        }
+
+        for (path, action) in [
+            ("/v1/capture/pipewire_selection_poll", "poll_selection"),
+            ("/v1/capture/pipewire_selection_cancel", "cancel_selection"),
+        ] {
+            let route = crate::routes::resolve(path).unwrap();
+            assert_eq!(route.action, action);
+            assert!(validate(route, json!({"operation_id":id}).as_object().unwrap()).is_ok());
+            assert!(
+                validate(
+                    route,
+                    json!({"operation_id":id,"subject":"other"})
+                        .as_object()
+                        .unwrap()
+                )
+                .is_err()
+            );
+        }
     }
 }
 

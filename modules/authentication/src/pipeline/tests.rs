@@ -504,6 +504,149 @@ fn durable_token_digest_scope_expiry_and_foreign_revoke() {
 }
 
 #[test]
+fn verifier_context_is_stable_across_refresh_and_distinct_for_sessions_and_tokens() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.setup(&mut pipeline);
+
+    let first = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple"}),
+        100,
+    );
+    let first_verified = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"verify","bearer":first["bearer"],"required_scopes":[]}),
+        101,
+    );
+    assert_eq!(
+        first_verified["auth_context_id"].as_str().unwrap().len(),
+        64
+    );
+
+    let refreshed = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"refresh","refresh_token":first["refresh_token"]}),
+        102,
+    );
+    let refreshed_verified = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"verify","bearer":refreshed["bearer"],"required_scopes":[]}),
+        103,
+    );
+    assert_eq!(
+        first_verified["auth_context_id"],
+        refreshed_verified["auth_context_id"]
+    );
+
+    let second = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple"}),
+        104,
+    );
+    let second_verified = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"verify","bearer":second["bearer"],"required_scopes":[]}),
+        105,
+    );
+    assert_ne!(
+        refreshed_verified["auth_context_id"],
+        second_verified["auth_context_id"]
+    );
+
+    let token = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"issue_token","scopes":["catalog.read"],"ttl_seconds":60}),
+        106,
+    );
+    let token_verified = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"verify","bearer":token["bearer"],"required_scopes":["catalog.read"]}),
+        107,
+    );
+    assert_eq!(token_verified["auth_context_id"], token["token_id"]);
+    assert_eq!(token_verified["kind"], "api_token");
+
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({"action":"logout","bearer":refreshed["bearer"]}),
+            108,
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({"action":"verify","bearer":refreshed["bearer"],"required_scopes":[]}),
+            109,
+        )["code"],
+        "unauthorized"
+    );
+}
+
+#[test]
+fn legacy_session_context_migrates_before_refresh_and_survives_reload() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.setup(&mut pipeline);
+    let login = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple"}),
+        100,
+    );
+    let legacy_context = state.session_stored.as_ref().unwrap()["sessions"][0]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let sessions = state.session_stored.as_mut().unwrap()["sessions"]
+        .as_array_mut()
+        .unwrap();
+    sessions[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("ownership_context_id");
+    state.session_stored.as_mut().unwrap()["version"] =
+        json!(crate::protocol::POLICY_GENERATION_SESSION_DOCUMENT_VERSION);
+
+    let mut restarted = Pipeline::new(settings());
+    let refreshed = state.request(
+        &mut restarted,
+        "frontend",
+        json!({"action":"refresh","refresh_token":login["refresh_token"]}),
+        101,
+    );
+    assert_eq!(refreshed["ok"], true);
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["version"],
+        SESSION_DOCUMENT_VERSION
+    );
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"][0]["ownership_context_id"],
+        legacy_context
+    );
+
+    let verified = state.request(
+        &mut restarted,
+        "frontend",
+        json!({"action":"verify","bearer":refreshed["bearer"],"required_scopes":[]}),
+        102,
+    );
+    assert_eq!(verified["auth_context_id"], legacy_context);
+}
+
+#[test]
 fn api_tokens_do_not_revive_when_an_administrator_principal_is_restored() {
     let mut state = StateHarness::new();
     let mut original_settings = settings();
@@ -941,6 +1084,14 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
     assert_eq!(state.session_revision, 1);
     let stored = state.session_stored.as_ref().unwrap();
     assert_eq!(stored["sessions"].as_array().unwrap().len(), 1);
+    let ownership_context_id = stored["sessions"][0]["ownership_context_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(
+        ownership_context_id,
+        stored["sessions"][0]["session_id"].as_str().unwrap()
+    );
     assert!(state.stored.as_ref().unwrap().get("sessions").is_none());
     assert_eq!(stored["version"], SESSION_DOCUMENT_VERSION);
     assert!(
@@ -993,6 +1144,10 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
     assert_eq!(
         state.session_stored.as_ref().unwrap()["sessions"][0]["refresh_token_digest"],
         crate::crypto::token_digest(rotated["refresh_token"].as_str().unwrap())
+    );
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"][0]["ownership_context_id"],
+        ownership_context_id
     );
 
     let mut restarted_again = Pipeline::new(lutris_settings.clone());
@@ -1607,6 +1762,10 @@ fn legacy_session_records_without_a_policy_generation_are_durably_pruned() {
     legacy_document["version"] = json!(1);
     for record in legacy_document["sessions"].as_array_mut().unwrap() {
         record.as_object_mut().unwrap().remove("policy_generation");
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("ownership_context_id");
     }
 
     let mut restarted = Pipeline::new(settings());

@@ -41,9 +41,17 @@ pub struct Request {
     pub target: RequestTarget,
     pub payload: Value,
     pub bearer: Option<String>,
+    pub verified_identity: Option<VerifiedIdentity>,
     pub origin: Option<String>,
     pub preflight: bool,
     pub csrf_exception: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedIdentity {
+    pub kind: String,
+    pub subject: String,
+    pub auth_context_id: String,
 }
 
 #[derive(Debug)]
@@ -201,6 +209,7 @@ fn asset_request(
             target: RequestTarget::OperationalHealth,
             payload: Value::Null,
             bearer: None,
+            verified_identity: None,
             origin: fields.origin.map(str::to_owned),
             preflight: false,
             csrf_exception: false,
@@ -223,6 +232,7 @@ fn asset_request(
         target: RequestTarget::Asset(path.into()),
         payload: Value::Null,
         bearer: None,
+        verified_identity: None,
         origin: fields.origin.map(str::to_owned),
         preflight: false,
         csrf_exception: false,
@@ -320,6 +330,7 @@ fn build_request(
         target: RequestTarget::Api(route),
         payload,
         bearer,
+        verified_identity: None,
         origin: fields.origin.map(str::to_owned),
         preflight,
         csrf_exception,
@@ -376,6 +387,7 @@ fn browser_request(
         target: RequestTarget::BrowserAuth(action),
         payload,
         bearer: None,
+        verified_identity: None,
         origin: fields.origin.map(str::to_owned),
         preflight: false,
         csrf_exception,

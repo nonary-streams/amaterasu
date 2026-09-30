@@ -874,6 +874,39 @@ const LINUX_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
 };
 
 const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.management/1",
+        "amaterasu.authentication/1",
+        "amaterasu.state/1",
+        "amaterasu.catalog/1",
+        "amaterasu.configuration/1",
+        "amaterasu.session/1",
+        "amaterasu.application/1",
+        "amaterasu.input/1",
+        "amaterasu.steam/1",
+        "amaterasu.playnite/1",
+        "amaterasu.lutris/1",
+        "amaterasu.diagnostics/1",
+        "amaterasu.host-configuration/1",
+        "amaterasu.pairing/1",
+        "amaterasu.display/1",
+        "amaterasu.launch/1",
+        "amaterasu.capture-dxgi/1",
+        "amaterasu.capture-wgc/1",
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.audio/1",
+        "amaterasu.audio-encode/1",
+        "amaterasu.encode/1",
+        "amaterasu.video/1",
+        "amaterasu.nvhttp/1",
+        "amaterasu.rtsp/1",
+        "amaterasu.video",
+        "amaterasu.nvhttp",
+        "amaterasu.rtsp",
+        "amaterasu.media-transport",
+        "amaterasu.control-transport",
+        "amaterasu.session-history",
+    ],
     dependencies: &[
         RUNTIME_ID,
         "amaterasu.authentication",
@@ -1090,6 +1123,14 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
     policy
         .principals
         .insert("amaterasu.console".into(), console);
+    // The development policy composes every qualification profile. Keep the
+    // PipeWire control call available there while production management remains
+    // outside that Linux-only composition.
+    if let Some(management) = policy.principals.get_mut(MANAGEMENT.id) {
+        management
+            .call
+            .insert("amaterasu.capture-pipewire/1".into());
+    }
 
     let state_directory = root.join("data").join("state");
     create_private_directory(&state_directory)?;
@@ -1120,7 +1161,7 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             "amaterasu.capture-pipewire".into(),
             json!({
                 "enabled": false,
-                "selection_principals": [],
+                "selection_principals": ["amaterasu.management"],
                 "capture_principals": []
             }),
         ),
@@ -1181,13 +1222,13 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             "amaterasu.authentication".into(),
             json!({
                 "administrator_principals": ["amaterasu.console", "amaterasu.management"],
-                "authorization_policy_generation": 2,
+                "authorization_policy_generation": 4,
                 "session_token_ttl_seconds": 7200,
                 "remember_me_refresh_token_ttl_seconds": 604800,
                 "allowed_scopes": [
                     "catalog.read", "catalog.write", "configuration.read", "configuration.write",
                     "session.read", "session.write", "application.read", "application.launch",
-                    "application.terminate", "steam.read", "steam.refresh", "lutris.read", "diagnostics.read", "diagnostics.write", "pairing.admin", "display.read", "display.write", "media.read"
+                    "application.terminate", "steam.read", "steam.refresh", "lutris.read", "diagnostics.read", "diagnostics.write", "pairing.admin", "display.read", "display.write", "media.read", "capture.read", "capture.write"
                 ]
             }),
         ),

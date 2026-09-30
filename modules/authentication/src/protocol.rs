@@ -6,7 +6,8 @@ pub const MAX_TOKENS: usize = 32;
 pub const MAX_SESSIONS: usize = 16;
 pub const MAX_SESSION_DOCUMENT_BYTES: usize = 12_000;
 pub const LEGACY_SESSION_DOCUMENT_VERSION: u32 = 1;
-pub const SESSION_DOCUMENT_VERSION: u32 = 2;
+pub const POLICY_GENERATION_SESSION_DOCUMENT_VERSION: u32 = 2;
+pub const SESSION_DOCUMENT_VERSION: u32 = 3;
 pub const MAX_SCOPES: usize = 64;
 pub const DEFAULT_SESSION_TOKEN_TTL_SECONDS: u64 = 7200;
 pub const DEFAULT_REMEMBER_ME_REFRESH_TOKEN_TTL_SECONDS: u64 = 604800;
@@ -213,6 +214,8 @@ impl Default for SessionDocument {
 #[serde(deny_unknown_fields)]
 pub struct SessionRecord {
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_context_id: Option<String>,
     pub credential_digest: String,
     pub scope_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,7 +231,9 @@ impl SessionDocument {
     pub fn validate(&self) -> Result<(), &'static str> {
         if !matches!(
             self.version,
-            LEGACY_SESSION_DOCUMENT_VERSION | SESSION_DOCUMENT_VERSION
+            LEGACY_SESSION_DOCUMENT_VERSION
+                | POLICY_GENERATION_SESSION_DOCUMENT_VERSION
+                | SESSION_DOCUMENT_VERSION
         ) || self.sessions.len() > MAX_SESSIONS
             || serde_json::to_vec(self)
                 .map_or(true, |bytes| bytes.len() > MAX_SESSION_DOCUMENT_BYTES)
@@ -236,14 +241,28 @@ impl SessionDocument {
             return Err("invalid_state");
         }
         let mut session_ids = BTreeSet::new();
+        let mut ownership_context_ids = BTreeSet::new();
         let mut refresh_token_digests = BTreeSet::new();
         for session in &self.sessions {
             let generation_matches_document = match self.version {
                 LEGACY_SESSION_DOCUMENT_VERSION => session.policy_generation.is_none(),
-                SESSION_DOCUMENT_VERSION => session.policy_generation.is_some(),
+                POLICY_GENERATION_SESSION_DOCUMENT_VERSION | SESSION_DOCUMENT_VERSION => {
+                    session.policy_generation.is_some()
+                }
+                _ => false,
+            };
+            let ownership_context_matches_document = match self.version {
+                LEGACY_SESSION_DOCUMENT_VERSION | POLICY_GENERATION_SESSION_DOCUMENT_VERSION => {
+                    session.ownership_context_id.is_none()
+                }
+                SESSION_DOCUMENT_VERSION => session
+                    .ownership_context_id
+                    .as_deref()
+                    .is_some_and(valid_digest),
                 _ => false,
             };
             if !generation_matches_document
+                || !ownership_context_matches_document
                 || !valid_digest(&session.session_id)
                 || !session_ids.insert(&session.session_id)
                 || !valid_digest(&session.credential_digest)
@@ -252,6 +271,10 @@ impl SessionDocument {
                 || session.expires_at > session.refresh_expires_at
                 || !valid_digest(&session.refresh_token_digest)
                 || !refresh_token_digests.insert(&session.refresh_token_digest)
+                || session
+                    .ownership_context_id
+                    .as_ref()
+                    .is_some_and(|context_id| !ownership_context_ids.insert(context_id))
             {
                 return Err("invalid_state");
             }
@@ -416,6 +439,7 @@ mod scope_tests {
             sessions: (0..MAX_SESSIONS)
                 .map(|index| SessionRecord {
                     session_id: format!("{index:064x}"),
+                    ownership_context_id: Some(format!("{:064x}", index + 128)),
                     credential_digest: "b".repeat(64),
                     scope_digest: scope_digest.clone(),
                     policy_generation: Some(0),
@@ -436,6 +460,7 @@ mod scope_tests {
         let mut over_capacity = session_document;
         over_capacity.sessions.push(SessionRecord {
             session_id: "f".repeat(64),
+            ownership_context_id: Some("f".repeat(64)),
             credential_digest: "b".repeat(64),
             scope_digest,
             policy_generation: Some(0),
@@ -451,7 +476,7 @@ mod scope_tests {
     #[test]
     fn session_document_rejects_bad_versions_unknown_fields_and_digests() {
         for malformed in [
-            json!({"version":3,"sessions":[]}),
+            json!({"version":4,"sessions":[]}),
             json!({"version":1,"sessions":[],"legacy":true}),
             json!({
                 "version":2,
@@ -468,6 +493,20 @@ mod scope_tests {
             }),
             json!({
                 "version":1,
+                "sessions":[{
+                    "session_id":"a".repeat(64),
+                    "credential_digest":"b".repeat(64),
+                    "scope_digest":"c".repeat(64),
+                    "policy_generation":0,
+                    "subject":"admin",
+                    "expires_at":120,
+                    "refresh_expires_at":500,
+                    "refresh_token_digest":"d".repeat(64),
+                    "remember_me":true
+                }]
+            }),
+            json!({
+                "version":3,
                 "sessions":[{
                     "session_id":"a".repeat(64),
                     "credential_digest":"b".repeat(64),
@@ -499,6 +538,23 @@ mod scope_tests {
             };
             assert!(document.validate().is_err());
         }
+
+        let prior_current_document: SessionDocument = serde_json::from_value(json!({
+            "version":POLICY_GENERATION_SESSION_DOCUMENT_VERSION,
+            "sessions":[{
+                "session_id":"a".repeat(64),
+                "credential_digest":"b".repeat(64),
+                "scope_digest":"c".repeat(64),
+                "policy_generation":0,
+                "subject":"admin",
+                "expires_at":120,
+                "refresh_expires_at":500,
+                "refresh_token_digest":"d".repeat(64),
+                "remember_me":true
+            }]
+        }))
+        .unwrap();
+        prior_current_document.validate().unwrap();
     }
 
     #[test]
