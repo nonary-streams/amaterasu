@@ -1,4 +1,4 @@
-//! Bounded GameStream H.264 Annex B packetization, with bounded Reed–Solomon parity.
+//! Bounded GameStream H.264/HEVC Annex B packetization, with Reed–Solomon parity.
 //!
 //! This is the GameStream video framing protocol, not RFC 6184 fragmentation.
 //! See `video/README.md` for receiver references and compatibility limits.
@@ -66,6 +66,14 @@ pub struct VideoPacketizer {
     stream_index: u32,
 }
 
+/// Codec selected for one Annex B access unit. The packetizer validates the
+/// codec-specific NAL header and keeps the existing GameStream frame envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodec {
+    H264,
+    Hevc,
+}
+
 impl VideoPacketizer {
     pub fn new(config: VideoConfig) -> Result<Self, VideoError> {
         if config.encrypted {
@@ -116,18 +124,30 @@ impl VideoPacketizer {
         frame_index: u32,
         timestamp_90khz: u32,
     ) -> Result<Vec<Vec<u8>>, VideoError> {
+        self.packetize_codec(VideoCodec::H264, access_unit, frame_index, timestamp_90khz)
+    }
+
+    /// Packetize one H.264 or HEVC Annex B access unit using the existing
+    /// GameStream custom frame and FEC headers.
+    pub fn packetize_codec(
+        &mut self,
+        codec: VideoCodec,
+        access_unit: &[u8],
+        frame_index: u32,
+        timestamp_90khz: u32,
+    ) -> Result<Vec<Vec<u8>>, VideoError> {
         if access_unit.len() > MAX_ACCESS_UNIT_BYTES {
             return Err(VideoError::AccessUnitTooLarge);
         }
         if self.config.fec_percentage != 0 {
-            return self.packetize_with_fec(access_unit, frame_index, timestamp_90khz);
+            return self.packetize_with_fec(codec, access_unit, frame_index, timestamp_90khz);
         }
         let total_bytes = access_unit.len() + FRAME_BYTES;
         let packet_count = total_bytes.div_ceil(self.payload_bytes);
         if packet_count > MAX_PACKETS {
             return Err(VideoError::TooManyPackets);
         }
-        let is_idr = validate_annex_b(access_unit)?;
+        let is_idr = validate_annex_b(access_unit, codec)?;
         let frame_header =
             short_frame_header(is_idr, ((total_bytes - 1) % self.payload_bytes + 1) as u16);
         let mut datagrams = Vec::with_capacity(packet_count);
@@ -198,7 +218,7 @@ fn packet_header(
 }
 
 /// Check Annex B framing and supported NAL headers, not the encoded slice syntax.
-fn validate_annex_b(bytes: &[u8]) -> Result<bool, VideoError> {
+fn validate_annex_b(bytes: &[u8], codec: VideoCodec) -> Result<bool, VideoError> {
     let mut nal_start = None;
     let mut zero_run = 0;
     let mut has_picture = false;
@@ -210,6 +230,7 @@ fn validate_annex_b(bytes: &[u8]) -> Result<bool, VideoError> {
                     bytes,
                     start,
                     index - zero_run,
+                    codec,
                     &mut has_picture,
                     &mut has_idr,
                 )?;
@@ -225,6 +246,7 @@ fn validate_annex_b(bytes: &[u8]) -> Result<bool, VideoError> {
         bytes,
         start,
         bytes.len() - zero_run,
+        codec,
         &mut has_picture,
         &mut has_idr,
     )?;
@@ -238,19 +260,43 @@ fn validate_nal(
     bytes: &[u8],
     start: usize,
     end: usize,
+    codec: VideoCodec,
     has_picture: &mut bool,
     has_idr: &mut bool,
 ) -> Result<(), VideoError> {
     if start >= end {
         return Err(VideoError::InvalidAnnexB);
     }
-    let header = bytes[start];
-    let kind = header & 0x1f;
-    if header & 0x80 != 0 || !(1..=23).contains(&kind) {
-        return Err(VideoError::InvalidAnnexB);
+    match codec {
+        VideoCodec::H264 => {
+            let header = bytes[start];
+            let kind = header & 0x1f;
+            if header & 0x80 != 0 || !(1..=23).contains(&kind) {
+                return Err(VideoError::InvalidAnnexB);
+            }
+            *has_picture |= kind == 1 || kind == 5;
+            *has_idr |= kind == 5;
+        }
+        VideoCodec::Hevc => {
+            let header = bytes
+                .get(start..start + 2)
+                .ok_or(VideoError::InvalidAnnexB)?;
+            let nal_unit_type = (header[0] >> 1) & 0x3f;
+            let layer_id = ((header[0] & 1) << 5) | (header[1] >> 3);
+            let temporal_id_plus_one = header[1] & 0x07;
+            // This path supports single-layer HEVC and the defined NAL types
+            // through suffix SEI. Reserved and unspecified types fail closed.
+            if header[0] & 0x80 != 0
+                || layer_id != 0
+                || temporal_id_plus_one == 0
+                || nal_unit_type > 40
+            {
+                return Err(VideoError::InvalidAnnexB);
+            }
+            *has_picture |= nal_unit_type <= 31;
+            *has_idr |= matches!(nal_unit_type, 19 | 20);
+        }
     }
-    *has_picture |= kind == 1 || kind == 5;
-    *has_idr |= kind == 5;
     Ok(())
 }
 

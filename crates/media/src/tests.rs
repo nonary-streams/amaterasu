@@ -124,6 +124,46 @@ fn packet_validation_distinguishes_payloads_from_end_of_stream() {
 }
 
 #[test]
+fn hevc_payload_and_eos_are_valid_while_unknown_video_codecs_fail_closed() {
+    let data = [0, 0, 0, 1, 0x26, 0x01, 0x80];
+    let packet = EncodedPacket {
+        codec: CODEC_HEVC,
+        flags: FLAG_KEYFRAME | FLAG_END_OF_ACCESS_UNIT,
+        data: data.as_ptr(),
+        len: data.len(),
+        timestamp_us: 0,
+        sequence: 1,
+    };
+    assert!(packet.validate().is_ok());
+
+    let eos = EncodedPacket {
+        flags: FLAG_END_OF_STREAM,
+        data: std::ptr::null(),
+        len: 0,
+        ..packet
+    };
+    // SAFETY: empty EOS has no allocation to borrow.
+    assert_eq!(unsafe { eos.bytes().unwrap() }, &[] as &[u8]);
+
+    assert!(
+        EncodedPacket {
+            codec: u32::MAX,
+            ..packet
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        EncodedPacket {
+            codec: u32::MAX,
+            ..eos
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[test]
 fn invalid_frame_never_invokes_sink() {
     unsafe extern "C" fn never(_: *mut c_void, _: *const CpuFrame) -> Status {
         STATUS_OK

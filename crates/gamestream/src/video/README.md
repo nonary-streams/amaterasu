@@ -1,9 +1,11 @@
-# GameStream H.264 packetization
+# GameStream H.264 and HEVC packetization
 
-`VideoPacketizer` creates complete UDP payloads from an H.264 Annex B access unit,
-with optional systematic Reed–Solomon parity. It has no sockets, encryption keys,
-encoder, pacing loop, or streaming session state. This library alone does not
-make Moonlight streaming available.
+`VideoPacketizer` creates complete UDP payloads from H.264 or single-layer HEVC
+Annex B access units, with optional systematic Reed–Solomon parity. The HEVC
+path is intended for 8-bit 4:2:0 output; this packetizer does not inspect SPS
+profile, bit depth, color range, or transfer characteristics. It has no sockets,
+encryption keys, encoder, pacing loop, or streaming session state. This library
+alone does not make Moonlight streaming available.
 
 ## Configuration and wire format
 
@@ -40,10 +42,12 @@ that space before packetization; encrypted video additionally needs its prefix
 bytes per datagram. Reservation does not validate the bitstream contents. SOF/EOF flags mark each block, while block indices distinguish actual frame
 boundaries. Only the first block contains the short frame header.
 
-The header reports IDR when a type-5 NAL is present, otherwise a normal picture,
-and leaves unknown processing latency at zero. Validation checks Annex B framing,
-NAL headers, and the presence of a picture. It is not a decoder or proof that SPS,
-PPS, slice contents, or reference dependencies are valid.
+For H.264 the frame header reports IDR for NAL type 5. For HEVC it reports IDR
+for NAL types 19 and 20. Both paths leave unknown processing latency at zero.
+Validation checks Annex B framing, codec-specific NAL headers, and the presence
+of a picture; the HEVC path rejects nonzero layer IDs. It does not decode or prove
+that parameter sets, slice contents, profile, bit depth, or reference dependencies
+are valid.
 
 ## FEC and bounds
 
@@ -60,10 +64,9 @@ value at least the requested percentage that supplies the minimum parity count.
 The generated count is always `ceil(data_shards * wire_percentage / 100)`, exactly
 matching the receiver; no rounded-down count mismatch is allowed. A minimum that
 cannot be represented for a particular frame returns `InvalidFec`. Every shard
-has the negotiated size, with zeros padding the final data shard. H.264 permits
-that trailing padding; the short header also records the actual final payload
-length. Without FEC, one block of at most 1023 data packets is supported and its
-final packet is short.
+has the negotiated size, with zeros padding the final data shard; the short frame
+header records the actual final payload length. Without FEC, one block of at most
+1023 data packets is supported and its final packet is short.
 
 Input is bounded to 8 MiB; FEC output to four blocks of at most 255 UDP datagrams.
 Scalar parity work is additionally capped at 268,435,456 bytewise field
@@ -113,6 +116,7 @@ require the separately compiled pinned C executable; they do not silently pass
 when it is missing.
 
 Actual Moonlight application streaming, the complete C queue/depacketizer,
-encrypted video, HEVC/AV1, long frame headers, and reference-invalidation signalling
-remain unqualified or unimplemented. Successful FEC recovery does not qualify the
-remaining control, transport, audio, timing, or hardware pipeline.
+encrypted video, HEVC decoding/playback, AV1, long frame headers, and
+reference-invalidation signalling remain unqualified or unimplemented. Successful
+FEC recovery does not qualify the remaining control, transport, audio, timing, or
+hardware pipeline.

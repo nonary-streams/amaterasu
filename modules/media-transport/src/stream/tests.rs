@@ -107,6 +107,57 @@ pub(crate) fn video_packet(bytes: &[u8], sequence: u64) -> EncodedPacket {
     }
 }
 
+#[test]
+fn hevc_packets_use_codec_aware_packetization_and_reject_mismatches() {
+    let (video, audio) = receivers();
+    let mut stream = Stream::open("owner", &request(&video, &audio, false)).unwrap();
+    let mut hevc = Vec::new();
+    for (nal_unit_type, payload) in [
+        (32_u8, 0x01_u8), // VPS
+        (33, 0x02),       // SPS
+        (34, 0x03),       // PPS
+        (19, 0x80),       // IDR_W_RADL
+    ] {
+        hevc.extend_from_slice(&[0, 0, 0, 1, nal_unit_type << 1, 1, payload]);
+    }
+
+    // A codec label cannot make HEVC NALs pass the H.264 parser.
+    let mismatched_payload = video_packet(&hevc, 0);
+    // SAFETY: the local access unit remains live through synchronous submit.
+    assert_eq!(
+        unsafe { stream.submit_video(&mismatched_payload) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(stream.video_codec, None);
+    assert_eq!(stream.video_sequence, None);
+
+    let hevc_packet = EncodedPacket {
+        codec: CODEC_HEVC,
+        ..video_packet(&hevc, 0)
+    };
+    assert_eq!(unsafe { stream.submit_video(&hevc_packet) }, STATUS_OK);
+    assert_eq!(stream.video_codec, Some(VideoCodec::Hevc));
+    stream.delivery.tick();
+    let datagram = receive(&video);
+    assert_eq!(datagram[35], 2); // Same GameStream IDR frame-header value.
+
+    let h264 = [0, 0, 0, 1, 0x65, 0x88];
+    let switched_codec = video_packet(&h264, 1);
+    assert_eq!(
+        unsafe { stream.submit_video(&switched_codec) },
+        STATUS_INVALID_ARGUMENT
+    );
+    let unknown_codec = EncodedPacket {
+        codec: u32::MAX,
+        ..hevc_packet
+    };
+    assert_eq!(
+        unsafe { stream.submit_video(&unknown_codec) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(stream.video_sequence, Some(0));
+}
+
 pub(crate) fn audio_packet(bytes: &[u8], sequence: u64) -> EncodedAudioPacket {
     EncodedAudioPacket {
         codec: CODEC_OPUS,

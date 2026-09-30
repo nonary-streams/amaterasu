@@ -5,7 +5,7 @@ use crate::{
 use amaterasu_gamestream::{
     audio::{AudioConfig, AudioError, AudioPacketizer},
     crypto::{AudioIvPolicy, AudioSealer, VIDEO_PREFIX_BYTES, VideoProfile, VideoSealer},
-    video::{VideoConfig, VideoPacketizer},
+    video::{VideoCodec, VideoConfig, VideoPacketizer},
 };
 use amaterasu_media::*;
 use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
@@ -26,6 +26,7 @@ pub struct Stream {
     pub audio_local: SocketAddr,
     pub delivery: Delivery,
     video: VideoPacketizer,
+    video_codec: Option<VideoCodec>,
     audio: AudioPacketizer,
     video_sealer: Option<VideoSealer>,
     audio_sealer: Option<AudioSealer>,
@@ -79,6 +80,7 @@ impl Stream {
             audio_local,
             delivery,
             video,
+            video_codec: None,
             audio,
             video_sealer,
             audio_sealer,
@@ -158,6 +160,14 @@ impl Stream {
         if let Err(status) = packet.validate() {
             return status;
         }
+        let codec = match packet.codec {
+            CODEC_H264 => VideoCodec::H264,
+            CODEC_HEVC => VideoCodec::Hevc,
+            _ => return STATUS_INVALID_ARGUMENT,
+        };
+        if self.video_codec.is_some_and(|selected| selected != codec) {
+            return STATUS_INVALID_ARGUMENT;
+        }
         if packet.flags & FLAG_END_OF_STREAM != 0 {
             self.video_ended = true;
             return STATUS_OK;
@@ -193,7 +203,10 @@ impl Stream {
         // SAFETY: caller's packet allocation is borrowed only through packetization.
         let access_unit = unsafe { packet.bytes().unwrap() };
         let clock = (u128::from(packet.timestamp_us) * 90_000 / 1_000_000) as u32;
-        let datagrams = match self.video.packetize(access_unit, frame_index, clock) {
+        let datagrams = match self
+            .video
+            .packetize_codec(codec, access_unit, frame_index, clock)
+        {
             Ok(datagrams) => datagrams,
             Err(_) => return STATUS_INVALID_ARGUMENT,
         };
@@ -202,6 +215,7 @@ impl Stream {
             Err(code) => return self.fail(code),
         };
         self.delivery.push_video(frame_index, datagrams);
+        self.video_codec = Some(codec);
         self.video_sequence = Some(packet.sequence);
         self.video_timestamp = Some(packet.timestamp_us);
         self.next_frame_index = frame_index.checked_add(1);

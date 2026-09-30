@@ -27,6 +27,9 @@ pub const CAPTURE_FRAME_FRESH: u32 = 1;
 pub const PIXEL_BGRA8: u32 = 1;
 pub const PIXEL_NV12: u32 = 2;
 pub const CODEC_H264: u32 = 1;
+/// HEVC/H.265 access units. The current capture and encoder paths produce only
+/// 8-bit 4:2:0 HEVC; this ID does not imply 10-bit or HDR support.
+pub const CODEC_HEVC: u32 = 2;
 pub const FLAG_KEYFRAME: u32 = 1;
 pub const FLAG_END_OF_STREAM: u32 = 2;
 /// Last fragment of one complete coded picture. Earlier fragments share its
@@ -132,7 +135,7 @@ pub struct EncodedPacket {
 
 impl EncodedPacket {
     pub fn validate(&self) -> Result<(), Status> {
-        if self.codec != CODEC_H264
+        if !matches!(self.codec, CODEC_H264 | CODEC_HEVC)
             || self.flags & !(FLAG_KEYFRAME | FLAG_END_OF_STREAM | FLAG_END_OF_ACCESS_UNIT) != 0
         {
             return Err(STATUS_INVALID_ARGUMENT);

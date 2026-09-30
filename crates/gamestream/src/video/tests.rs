@@ -11,6 +11,21 @@ fn packetizer(packet_size: usize) -> VideoPacketizer {
     .unwrap()
 }
 
+// Synthetic single-layer Annex B units with valid HEVC NAL headers. The
+// packetizer intentionally validates framing and headers, not RBSP decoding.
+fn hevc_access_unit(slice_type: u8) -> Vec<u8> {
+    let mut access_unit = Vec::new();
+    for (nal_unit_type, payload) in [
+        (32_u8, 0x01_u8), // VPS
+        (33, 0x02),       // SPS
+        (34, 0x03),       // PPS
+        (slice_type, 0x80),
+    ] {
+        access_unit.extend_from_slice(&[0, 0, 0, 1, nal_unit_type << 1, 1, payload]);
+    }
+    access_unit
+}
+
 // Receive-side model of the documented Moonlight layout. This deliberately uses
 // literal wire offsets and decoding operations, not the packetizer's helpers.
 fn reassemble(packets: &[Vec<u8>], negotiated_size: usize) -> Vec<u8> {
@@ -80,6 +95,55 @@ fn receiver_reassembles_fragmented_annex_b_without_nal_rewriting() {
         let packets = packetizer(size).packetize(&access_unit, 1, 90000).unwrap();
         assert_eq!(reassemble(&packets, size), access_unit);
         assert_eq!(packets[0][35], 2);
+    }
+}
+
+#[test]
+fn hevc_vps_sps_pps_and_idr_reassemble_with_the_existing_frame_header() {
+    let access_unit = hevc_access_unit(19);
+    let mut sender = packetizer(64);
+    let packets = sender
+        .packetize_codec(VideoCodec::Hevc, &access_unit, 3, 90000)
+        .unwrap();
+
+    assert_eq!(reassemble(&packets, 64), access_unit);
+    assert_eq!(packets[0][35], 2);
+
+    let predicted_picture = hevc_access_unit(1);
+    let packets = packetizer(1392)
+        .packetize_codec(VideoCodec::Hevc, &predicted_picture, 4, 120000)
+        .unwrap();
+    assert_eq!(packets[0][35], 1);
+}
+
+#[test]
+fn hevc_codec_mismatches_and_malformed_nal_headers_fail_without_advancing() {
+    let hevc = hevc_access_unit(19);
+    let h264 = [0, 0, 0, 1, 0x65, 0x88];
+    let mut sender = packetizer(1392);
+
+    assert_eq!(
+        sender.packetize(&hevc, 1, 0),
+        Err(VideoError::InvalidAnnexB)
+    );
+    assert_eq!(
+        sender.packetize_codec(VideoCodec::Hevc, &h264, 1, 0),
+        Err(VideoError::InvalidAnnexB)
+    );
+
+    for invalid in [
+        &[0, 0, 1, 0x26][..],             // Truncated two-byte header.
+        &[0, 0, 1, 0xa6, 0x01, 0x80][..], // forbidden_zero_bit.
+        &[0, 0, 1, 0x26, 0x00, 0x80][..], // temporal_id_plus1 is zero.
+        &[0, 0, 1, 0x26, 0x09, 0x80][..], // Unsupported nonzero layer ID.
+        &[0, 0, 1, 0x52, 0x01, 0x80][..], // Unspecified NAL type 41.
+        &[0, 0, 1, 0x40, 0x01, 0x80][..], // No coded picture.
+    ] {
+        assert_eq!(
+            sender.packetize_codec(VideoCodec::Hevc, invalid, 1, 0),
+            Err(VideoError::InvalidAnnexB)
+        );
+        assert_eq!(sender.stream_index, 0);
     }
 }
 
