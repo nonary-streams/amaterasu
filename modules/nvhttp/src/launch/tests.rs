@@ -1857,13 +1857,15 @@ fn opened_audio_endpoints(broker: &Broker) -> Vec<&str> {
 
 #[test]
 fn global_app_and_verified_client_fec_values_apply_in_precedence_order() {
-    for (app_fec, client_fec, expected) in [
-        (None, None, 20),
-        (Some(37), None, 37),
-        (Some(37), Some(49), 49),
+    for (global_fec, app_fec, client_fec, expected) in [
+        (None, None, None, 20),
+        (Some(31), None, None, 31),
+        (Some(31), Some(37), None, 37),
+        (Some(31), Some(37), Some(49), 49),
     ] {
         let now = Instant::now();
         let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_global_fec_percentage(global_fec);
         let mut broker = Broker {
             application_fec_percentage: app_fec,
             ..Default::default()

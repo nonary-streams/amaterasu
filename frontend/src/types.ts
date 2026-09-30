@@ -148,6 +148,10 @@ namespace Amaterasu {
     configured_address_family: "ipv4" | "both" | null;
     configured_bind_address: string | null;
     upnp: boolean;
+    upnp_status: "disabled" | "active" | "waiting_for_ipv4_listener" | "waiting_for_gateway_route" | "waiting_for_listener" | "error";
+    upnp_error: string | null;
+    configured_fec_percentage: number | null;
+    effective_fec_percentage: number;
     configured_output_name: string | null;
     effective_output_name: string | null;
     configured_capture: "auto" | "ddx" | "wgc" | "wgcc" | "pipewire";

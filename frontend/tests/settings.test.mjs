@@ -1813,6 +1813,16 @@ test("client FEC override editor preserves sparse inherit and validates bounded 
     assert.throws(() => parseFec(value));
 });
 
+test("global FEC editor preserves the startup value and validates the reference range", () => {
+  const parse = context.Amaterasu.parseGlobalFecPercentage;
+  assert.equal(parse(""), null);
+  assert.equal(parse("  "), null);
+  assert.equal(parse("1"), 1);
+  assert.equal(parse("255"), 255);
+  for (const value of ["0", "256", "1.5", "1e2", "01", "-1", "abc"])
+    assert.throws(() => parse(value));
+});
+
 test("NVHTTP network settings preserve startup null and explicit blank overrides", () => {
   const parse = context.Amaterasu.parseNvhttpNetworkOverrides;
   assert.deepEqual(ordinary(parse("startup", true, "")), {
@@ -2167,6 +2177,8 @@ function nvhttpHostSettings(revision = 8) {
     hostname: "Computer Name", configured_hostname: "",
     port: 47989, configured_address_family: null, configured_bind_address: null,
     upnp: false,
+    upnp_status: "disabled", upnp_error: null,
+    configured_fec_percentage: null, effective_fec_percentage: 20,
     configured_capture: "auto", configured_output_name: "DISPLAY1",
     stream_audio: false, configured_video_max_batch_size_kb: null,
     configured_max_bitrate: null, configured_minimum_fps_target: null,
@@ -2187,6 +2199,7 @@ function nvhttpHostUpdate() {
   return {
     hostname: "Living Room", port: 47989,
     upnp: false,
+    fec_percentage: null,
     address_family: null, bind_address: null,
     capture: "auto", output_name: "", stream_audio: true,
     video_max_batch_size_kb: null, max_bitrate: null,
@@ -2231,20 +2244,26 @@ test("Moonlight host editor confirms signed update and GET with canonical prepar
   ]);
 });
 
-test("Moonlight settings require and round-trip the persisted UPnP selection", async () => {
+test("Moonlight settings require and round-trip UPnP and global FEC selections", async () => {
   const current = nvhttpHostSettings();
-  const values = { ...nvhttpHostUpdate(), upnp: true };
-  const updated = { ...nvhttpUpdatedHost(), upnp: true };
+  const values = { ...nvhttpHostUpdate(), upnp: true, fec_percentage: 153 };
+  const updated = { ...nvhttpUpdatedHost(), upnp: true,
+    configured_fec_percentage: 153, effective_fec_percentage: 153 };
   const calls = [];
   const saved = await context.Amaterasu.saveNvhttpHostSettings({ async post(route, body = {}) {
     calls.push([route, ordinary(body)]);
     return route === "nvhttp/settings_update" ? updated : updated;
   } }, current, values);
   assert.equal(saved.upnp, true);
+  assert.equal(saved.effective_fec_percentage, 153);
   assert.deepEqual(calls[0], ["nvhttp/settings_update", { ...values, expected_revision: current.revision }]);
   const invalid = { ...current };
   delete invalid.upnp;
   assert.throws(() => context.Amaterasu.parseNvhttpSettingsReply(invalid), /reply is invalid/);
+  const invalidUpnpStatus = { ...current, upnp_status: "unknown" };
+  assert.throws(() => context.Amaterasu.parseNvhttpSettingsReply(invalidUpnpStatus), /reply is invalid/);
+  const invalidFec = { ...current, effective_fec_percentage: 256 };
+  assert.throws(() => context.Amaterasu.parseNvhttpSettingsReply(invalidFec), /reply is invalid/);
 });
 
 test("Moonlight host editor rejects mismatched configured or unrelated fields and concurrent readback", async () => {
@@ -2457,6 +2476,7 @@ test("Moonlight host form reloads its revision and listener status after a persi
   assert.equal(updates, 2);
   assert.equal(secondSubmittedRevision, 9);
   assert.equal(submittedUpdates[0].upnp, true);
+  assert.equal(submittedUpdates[0].fec_percentage, null);
   assert.equal(submittedUpdates[1].upnp, true);
 });
 

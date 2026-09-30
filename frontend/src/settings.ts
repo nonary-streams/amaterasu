@@ -363,6 +363,15 @@ namespace Amaterasu {
     if (reply.ok !== true || !Number.isSafeInteger(reply.revision) || (reply.revision as number) < 0 ||
         typeof reply.configured_hostname !== "string" ||
         typeof reply.upnp !== "boolean" ||
+        !["disabled", "active", "waiting_for_ipv4_listener", "waiting_for_gateway_route", "waiting_for_listener", "error"].includes(String(reply.upnp_status)) ||
+        !(reply.upnp_error === null || typeof reply.upnp_error === "string") ||
+        !(reply.configured_fec_percentage === null ||
+          (Number.isSafeInteger(reply.configured_fec_percentage) &&
+            (reply.configured_fec_percentage as number) >= 1 &&
+            (reply.configured_fec_percentage as number) <= 255)) ||
+        !Number.isSafeInteger(reply.effective_fec_percentage) ||
+        (reply.effective_fec_percentage as number) < 1 ||
+        (reply.effective_fec_percentage as number) > 255 ||
         !Number.isSafeInteger(reply.port) ||
         !Array.isArray(reply.configured_global_preparation))
       throw new Error("Moonlight host settings reply is invalid.");
@@ -398,6 +407,8 @@ namespace Amaterasu {
       configured_hostname: values.hostname,
       port: values.port,
       upnp: values.upnp,
+      configured_fec_percentage: values.fec_percentage,
+      effective_fec_percentage: values.fec_percentage ?? current.effective_fec_percentage,
       configured_address_family: values.address_family,
       configured_bind_address: values.bind_address,
       configured_capture: values.capture,
@@ -955,6 +966,10 @@ namespace Amaterasu {
     if (percentage > 255)
       throw new Error("FEC percentage must be a whole number from 1 to 255, or blank to inherit.");
     return { fec_percentage: percentage };
+  }
+
+  export function parseGlobalFecPercentage(value: string): number | null {
+    return parseClientFecOverride(value).fec_percentage;
   }
 
   const forwardablePairingOverrideFields = [
@@ -3433,6 +3448,17 @@ namespace Amaterasu {
         port.step = "1";
         const upnp = input("upnp", "", "checkbox");
         upnp.checked = settings.upnp;
+        const fecPercentage = input(
+          "fec_percentage",
+          settings.configured_fec_percentage === null
+            ? ""
+            : String(settings.configured_fec_percentage),
+          "number",
+        );
+        fecPercentage.min = "1";
+        fecPercentage.max = "255";
+        fecPercentage.step = "1";
+        fecPercentage.placeholder = `Startup default (${settings.effective_fec_percentage}%)`;
         const addressFamily = el("select");
         addressFamily.name = "address_family";
         const familyOptions: Array<[string, string]> = [
@@ -3671,9 +3697,19 @@ namespace Amaterasu {
           field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."),
           field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."),
           field(
+            "Global FEC percentage",
+            fecPercentage,
+            `Controls the repair percentage used for new streams unless an application or paired client overrides it. Leave blank to use the startup value (${settings.effective_fec_percentage}%). Valid values are 1–255.`,
+          ),
+          field(
             "Automatic router port mapping (UPnP)",
             upnp,
             "Requests gateway mappings for active stream listeners. The management listener is mapped only when its peer policy allows WAN access. This setting has no effect when the gateway does not support UPnP.",
+          ),
+          el(
+            "p",
+            settings.upnp_status === "error" ? "error" : "muted",
+            `UPnP status: ${settings.upnp_status.replaceAll("_", " ")}${settings.upnp_error ? ` · ${settings.upnp_error}` : ""}`,
           ),
           field(
             "Address family",
@@ -3763,6 +3799,7 @@ namespace Amaterasu {
               hostname: hostname.value,
               port: port.valueAsNumber,
               upnp: upnp.checked,
+              fec_percentage: parseGlobalFecPercentage(fecPercentage.value),
               ...network,
               capture: parseCaptureSelection(capture.value),
               output_name: parseOutputNameSelection(outputName.value),

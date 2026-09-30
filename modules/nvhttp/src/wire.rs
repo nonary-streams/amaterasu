@@ -222,6 +222,10 @@ impl Router {
         self.launches.set_global_qp(qp);
     }
 
+    pub fn set_global_fec_percentage(&mut self, fec_percentage: Option<u8>) {
+        self.launches.set_global_fec_percentage(fec_percentage);
+    }
+
     pub fn set_global_minimum_fps_target(&mut self, target: f64) {
         self.launches.set_global_minimum_fps_target(target);
     }

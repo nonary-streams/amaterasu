@@ -541,6 +541,7 @@ pub struct Controller {
     global_audio_sink_capture_only: bool,
     configured_capture: CaptureMode,
     output_settings_ready: bool,
+    global_fec_percentage: Option<u8>,
     global_stream_audio: bool,
     global_video_encryption_policy: Option<VideoEncryptionPolicySnapshot>,
     global_ping_timeout_ms: u32,
@@ -578,6 +579,7 @@ impl Controller {
             global_audio_sink_capture_only: false,
             configured_capture: CaptureMode::Auto,
             output_settings_ready: true,
+            global_fec_percentage: None,
             global_stream_audio: true,
             global_video_encryption_policy: None,
             global_ping_timeout_ms: 10_000,
@@ -640,6 +642,10 @@ impl Controller {
 
     pub fn set_global_stream_audio(&mut self, stream_audio: bool) {
         self.global_stream_audio = stream_audio;
+    }
+
+    pub fn set_global_fec_percentage(&mut self, fec_percentage: Option<u8>) {
+        self.global_fec_percentage = fec_percentage.filter(|percentage| *percentage != 0);
     }
 
     pub fn set_global_video_encryption_modes(&mut self, lan_mode: u8, wan_mode: u8) {
@@ -723,7 +729,9 @@ impl Controller {
             .filter(|name| !name.is_empty())
             .unwrap_or(&self.device_name)
             .to_owned();
-        let global_fec_percentage = config.profile.fec_percentage;
+        let global_fec_percentage = self
+            .global_fec_percentage
+            .unwrap_or(config.profile.fec_percentage);
         let global_stream_audio = self.global_stream_audio;
         let global_video_encryption_policy = self.global_video_encryption_policy;
         let global_audio_sink_capture_only = self.global_audio_sink_capture_only;

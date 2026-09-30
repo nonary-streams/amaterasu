@@ -143,6 +143,8 @@ enum Operation {
         #[serde(default, deserialize_with = "deserialize_field_update")]
         qp: FieldUpdate<i32>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
+        fec_percentage: FieldUpdate<i32>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
         ping_timeout_ms: FieldUpdate<i32>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         global_preparation: FieldUpdate<Vec<preparation::PreparationStep>>,
@@ -329,6 +331,7 @@ impl ManagedModule for NvhttpModule {
             );
             router.set_global_max_bitrate_kbps(self.product_settings.effective_max_bitrate_kbps());
             router.set_global_qp(self.product_settings.effective_qp());
+            router.set_global_fec_percentage(self.product_settings.configured_fec_percentage());
             router.set_global_minimum_fps_target(
                 self.product_settings.effective_minimum_fps_target(),
             );
@@ -622,6 +625,7 @@ impl NvhttpModule {
                                 encoder,
                                 min_threads,
                                 qp,
+                                fec_percentage,
                                 ping_timeout_ms,
                                 global_preparation,
                                 legacy_global_preparation,
@@ -690,6 +694,7 @@ impl NvhttpModule {
                                         min_threads,
                                     },
                                     qp,
+                                    fec_percentage,
                                     ping_timeout_ms,
                                     global_preparation,
                                     legacy_global_preparation,
