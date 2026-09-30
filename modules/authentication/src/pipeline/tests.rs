@@ -23,6 +23,8 @@ struct StateHarness {
     revision: u64,
     session_stored: Option<Value>,
     session_revision: u64,
+    legacy_stored: Option<Value>,
+    legacy_revision: u64,
     state_response: Option<Response>,
     product_response: Option<Response>,
     incoming: Option<Response>,
@@ -44,6 +46,8 @@ impl StateHarness {
             revision: 0,
             session_stored: None,
             session_revision: 0,
+            legacy_stored: None,
+            legacy_revision: 0,
             state_response: None,
             product_response: None,
             incoming: None,
@@ -86,8 +90,7 @@ impl StateHarness {
                                 json!({"ok":true,"revision":self.revision})
                             }
                         }
-                    } else {
-                        assert_eq!(key, SESSION_STATE_KEY);
+                    } else if key == SESSION_STATE_KEY {
                         if payload["action"] == "get" {
                             json!({"ok":true,"revision":self.revision,"found":self.session_stored.is_some(),"value":self.session_stored})
                         } else {
@@ -100,6 +103,23 @@ impl StateHarness {
                                 self.session_stored = Some(payload["value"].clone());
                                 self.revision += 1;
                                 self.session_revision += 1;
+                                json!({"ok":true,"revision":self.revision})
+                            }
+                        }
+                    } else {
+                        assert_eq!(key, LEGACY_API_TOKEN_STATE_KEY);
+                        if payload["action"] == "get" {
+                            json!({"ok":true,"revision":self.revision,"found":self.legacy_stored.is_some(),"value":self.legacy_stored})
+                        } else {
+                            assert_eq!(payload["action"], "set");
+                            assert_eq!(payload["expected_revision"], self.revision);
+                            self.writes += 1;
+                            if self.fail_write {
+                                json!({"ok":false,"error":{"code":"io_error","message":"sensitive transport failure"}})
+                            } else {
+                                self.legacy_stored = Some(payload["value"].clone());
+                                self.revision += 1;
+                                self.legacy_revision += 1;
                                 json!({"ok":true,"revision":self.revision})
                             }
                         }
@@ -774,6 +794,112 @@ fn api_tokens_without_a_policy_generation_are_not_trusted_after_restart() {
         true
     );
     assert_eq!(state.stored.as_ref().unwrap()["tokens"], json!([]));
+}
+
+fn seeded_legacy_api_token_store(bearer: &str) -> Value {
+    json!({
+        "version": 1,
+        "tokens": [{
+            "token_id": crate::crypto::token_digest(bearer),
+            "record_version": 1,
+            "owner": "legacy-admin",
+            "created_at": 1_700_000_000i64,
+            "scopes": [{"path":"/v1/apps/[0-9]+","methods":["POST"]}]
+        }]
+    })
+}
+
+#[test]
+fn legacy_api_tokens_need_both_route_and_named_policy_proofs_before_upgrade() {
+    const LEGACY_BEARER: &str = "0123456789abcdefghijklmnopqrstuv";
+    let verify = |path: &str| {
+        json!({
+            "action":"verify",
+            "bearer":LEGACY_BEARER,
+            "required_scopes":["catalog.read"],
+            "legacy_request":{"path":path,"method":"post"}
+        })
+    };
+
+    let mut wrong_path_state = StateHarness::new();
+    wrong_path_state.revision = 1;
+    wrong_path_state.legacy_stored = Some(seeded_legacy_api_token_store(LEGACY_BEARER));
+    let mut pipeline = Pipeline::new(settings());
+    assert_eq!(
+        wrong_path_state.request(&mut pipeline, "console", verify("/v1/apps/42/extra"), 100),
+        error("unauthorized")
+    );
+    assert_eq!(wrong_path_state.writes, 0);
+    assert_eq!(
+        wrong_path_state.legacy_stored.as_ref().unwrap()["version"],
+        1
+    );
+
+    let mut policy_state = StateHarness::new();
+    policy_state.revision = 1;
+    policy_state.legacy_stored = Some(seeded_legacy_api_token_store(LEGACY_BEARER));
+    let mut policy_without_route_scope = settings();
+    policy_without_route_scope
+        .allowed_scopes
+        .remove("catalog.read");
+    let mut pipeline = Pipeline::new(policy_without_route_scope);
+    assert_eq!(
+        policy_state.request(&mut pipeline, "console", verify("/v1/apps/42"), 100),
+        error("unauthorized")
+    );
+    assert_eq!(policy_state.writes, 0);
+    assert_eq!(policy_state.legacy_stored.as_ref().unwrap()["version"], 1);
+
+    let mut accepted_state = StateHarness::new();
+    accepted_state.revision = 1;
+    accepted_state.legacy_stored = Some(seeded_legacy_api_token_store(LEGACY_BEARER));
+    let mut pipeline = Pipeline::new(settings());
+    let accepted = accepted_state.request(&mut pipeline, "console", verify("/v1/apps/42"), 100);
+    assert_eq!(accepted["ok"], true);
+    assert_eq!(accepted["kind"], "api_token");
+    assert_eq!(accepted["scopes"], json!(["catalog.read"]));
+    assert!(accepted["expires_at"].is_null());
+    assert_eq!(accepted_state.writes, 1);
+    assert_eq!(accepted_state.legacy_stored.as_ref().unwrap()["version"], 2);
+    assert_eq!(
+        accepted_state.legacy_stored.as_ref().unwrap()["tokens"][0]["record_version"],
+        2
+    );
+
+    let listed = accepted_state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"list_tokens"}),
+        101,
+    );
+    assert_eq!(listed["ok"], true);
+    assert_eq!(listed["legacy_tokens"][0]["expires_at"], Value::Null);
+    assert!(listed["legacy_tokens"][0].get("scopes").is_none());
+    assert!(listed["legacy_tokens"][0].get("path").is_none());
+}
+
+#[test]
+fn legacy_api_token_without_route_context_cannot_authorize() {
+    const LEGACY_BEARER: &str = "0123456789abcdefghijklmnopqrstuv";
+    let mut state = StateHarness::new();
+    state.revision = 1;
+    state.legacy_stored = Some(seeded_legacy_api_token_store(LEGACY_BEARER));
+    let mut pipeline = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "console",
+            json!({
+                "action":"verify",
+                "bearer":LEGACY_BEARER,
+                "required_scopes":["catalog.read"]
+            }),
+            100
+        ),
+        error("unauthorized")
+    );
+    assert_eq!(state.writes, 0);
+    assert_eq!(state.legacy_stored.as_ref().unwrap()["version"], 1);
 }
 
 #[test]

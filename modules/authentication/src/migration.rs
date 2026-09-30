@@ -1,6 +1,10 @@
 //! Strict, one-way migration of a legacy web-login verifier.
 
-use crate::protocol::{Credential, Document, SessionDocument};
+use crate::legacy_tokens::{
+    LegacyApiToken, LegacyApiTokenScope, LegacyApiTokenStore, MAX_LEGACY_API_TOKEN_METHODS,
+    MAX_LEGACY_API_TOKEN_SCOPES, MAX_LEGACY_API_TOKENS,
+};
+use crate::protocol::{Credential, Document, SessionDocument, valid_digest};
 use amaterasu_storage::{RootLock, create_private_directory, read_bounded, write_json_atomically};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,11 +21,13 @@ const PRIMARY_STATE_FILES: &[&str] = &["apollo_state.json", "sunshine_state.json
 const PRINCIPAL: &str = "amaterasu.authentication";
 const STATE_KEY: &str = "authentication/v1";
 const SESSION_STATE_KEY: &str = "authentication/sessions/v1";
+const LEGACY_API_TOKEN_STATE_KEY: &str = "authentication/api-tokens/v1";
 
 /// A validated predecessor verifier. It intentionally has no `Debug` impl so
 /// callers cannot accidentally log the retained password verifier.
 pub struct LegacyAuthenticationImport {
     document: Document,
+    legacy_api_tokens: LegacyApiTokenStore,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,21 +47,23 @@ pub fn import_legacy_authentication(
         }
     }
     let mut documents = Vec::new();
+    let mut legacy_api_tokens = None;
     for path in candidates {
         let bytes = read_bounded(&path, 1024 * 1024).map_err(|_| "legacy_authentication_layout")?;
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "legacy_authentication_invalid_credential")?;
-        reject_unsupported_api_tokens(&value)?;
         if !["username", "password", "salt"]
             .iter()
             .any(|key| value.get(key).is_some())
         {
+            reject_unpaired_api_tokens(&value)?;
             continue;
         }
         let legacy: LegacyCredential = serde_json::from_value(value)
             .map_err(|_| "legacy_authentication_invalid_credential")?;
-        if legacy.api_tokens_present() {
-            return Err("legacy_authentication_tokens_unsupported");
+        let tokens = parse_legacy_api_tokens(&legacy)?;
+        if legacy_api_tokens.replace(tokens).is_some() {
+            return Err("legacy_authentication_credential_ambiguous");
         }
         let document = Document {
             credential: Some(Credential {
@@ -76,6 +84,7 @@ pub fn import_legacy_authentication(
     }
     Ok(LegacyAuthenticationImport {
         document: documents.pop().expect("one document"),
+        legacy_api_tokens: legacy_api_tokens.unwrap_or_default(),
     })
 }
 
@@ -87,14 +96,22 @@ pub fn seed_authentication_state(
         .document
         .validate()
         .map_err(|_| "legacy_authentication_invalid_credential")?;
+    import
+        .legacy_api_tokens
+        .validate()
+        .map_err(|_| "legacy_authentication_invalid_credential")?;
     create_private_directory(state_root).map_err(|_| "legacy_authentication_state_unavailable")?;
     let _lock = RootLock::acquire(state_root).map_err(|_| "legacy_authentication_state_busy")?;
     let path = namespace_path(state_root);
     let mut namespace = read_namespace(&path)?;
     validate_existing_session_sidecar(&namespace)?;
+    validate_existing_legacy_api_token_sidecar(&namespace)?;
     if let Some(value) = namespace.values.get(STATE_KEY) {
         validate_existing_authentication(value, namespace.revision)?;
         return Ok(AuthenticationSeedOutcome::ExistingAmaterasuState);
+    }
+    if namespace.values.contains_key(LEGACY_API_TOKEN_STATE_KEY) {
+        return Err("legacy_authentication_existing_state_invalid");
     }
     namespace.revision = namespace
         .revision
@@ -103,6 +120,11 @@ pub fn seed_authentication_state(
     namespace.values.insert(
         STATE_KEY.into(),
         serde_json::to_value(&import.document)
+            .map_err(|_| "legacy_authentication_state_unavailable")?,
+    );
+    namespace.values.insert(
+        LEGACY_API_TOKEN_STATE_KEY.into(),
+        serde_json::to_value(&import.legacy_api_tokens)
             .map_err(|_| "legacy_authentication_state_unavailable")?,
     );
     let directory = path
@@ -143,6 +165,20 @@ fn validate_existing_session_sidecar(namespace: &Namespace) -> Result<(), &'stat
         .map_err(|_| "legacy_authentication_existing_state_invalid")
 }
 
+fn validate_existing_legacy_api_token_sidecar(namespace: &Namespace) -> Result<(), &'static str> {
+    let Some(value) = namespace.values.get(LEGACY_API_TOKEN_STATE_KEY) else {
+        return Ok(());
+    };
+    if namespace.revision == 0 {
+        return Err("legacy_authentication_existing_state_invalid");
+    }
+    let document: LegacyApiTokenStore = serde_json::from_value(value.clone())
+        .map_err(|_| "legacy_authentication_existing_state_invalid")?;
+    document
+        .validate()
+        .map_err(|_| "legacy_authentication_existing_state_invalid")
+}
+
 #[derive(Deserialize)]
 struct LegacyCredential {
     username: String,
@@ -159,11 +195,69 @@ struct LegacyRoot {
 }
 
 impl LegacyCredential {
-    fn api_tokens_present(&self) -> bool {
+    fn api_tokens(&self) -> &[Value] {
         self.root
             .as_ref()
-            .is_some_and(|root| !root.api_tokens.is_empty())
+            .map_or(&[], |root| root.api_tokens.as_slice())
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyApiTokenRecord {
+    hash: String,
+    username: String,
+    created_at: i64,
+    scopes: Vec<LegacyApiTokenScopeRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyApiTokenScopeRecord {
+    path: String,
+    methods: Vec<String>,
+}
+
+fn parse_legacy_api_tokens(
+    credential: &LegacyCredential,
+) -> Result<LegacyApiTokenStore, &'static str> {
+    let values = credential.api_tokens();
+    if values.len() > MAX_LEGACY_API_TOKENS {
+        return Err("legacy_authentication_tokens_unsupported");
+    }
+    let mut tokens = Vec::with_capacity(values.len());
+    for value in values {
+        let token: LegacyApiTokenRecord = serde_json::from_value(value.clone())
+            .map_err(|_| "legacy_authentication_tokens_unsupported")?;
+        if !valid_digest(&token.hash)
+            || token.scopes.len() > MAX_LEGACY_API_TOKEN_SCOPES
+            || token
+                .scopes
+                .iter()
+                .any(|scope| scope.methods.len() > MAX_LEGACY_API_TOKEN_METHODS)
+        {
+            return Err("legacy_authentication_tokens_unsupported");
+        }
+        tokens.push(LegacyApiToken {
+            token_id: token.hash,
+            record_version: 1,
+            owner: token.username,
+            created_at: token.created_at,
+            scopes: token
+                .scopes
+                .into_iter()
+                .map(|scope| LegacyApiTokenScope {
+                    path: scope.path,
+                    methods: scope.methods.into_iter().collect(),
+                })
+                .collect(),
+        });
+    }
+    let store = LegacyApiTokenStore::from_legacy_tokens(tokens);
+    store
+        .validate()
+        .map_err(|_| "legacy_authentication_tokens_unsupported")?;
+    Ok(store)
 }
 
 fn credential_candidates(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
@@ -236,6 +330,14 @@ fn reject_unsupported_api_tokens(value: &Value) -> Result<(), &'static str> {
         return Err("legacy_authentication_tokens_unsupported");
     }
     Ok(())
+}
+
+fn reject_unpaired_api_tokens(value: &Value) -> Result<(), &'static str> {
+    match value.pointer("/root/api_tokens") {
+        None => Ok(()),
+        Some(Value::Array(tokens)) if tokens.is_empty() => Ok(()),
+        Some(_) => Err("legacy_authentication_tokens_unsupported"),
+    }
 }
 
 fn reject_unsupported_api_tokens_in_file(path: &Path) -> Result<(), &'static str> {
@@ -584,6 +686,167 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(source);
         let _ = std::fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn imports_hash_only_api_tokens_to_a_separate_versioned_sidecar() {
+        const LEGACY_BEARER: &str = "0123456789abcdefghijklmnopqrstuv";
+        let source = temporary_directory("hash-only-api-token-source");
+        let state = temporary_directory("hash-only-api-token-state");
+        let salt = "AbCdEfGhIjKlMnOp";
+        let password = "correct horse battery staple";
+        let credential_hash = format!(
+            "{:x}",
+            Sha256::digest(format!("{password}{salt}").as_bytes())
+        );
+        let token_hash = crate::crypto::token_digest(LEGACY_BEARER);
+        std::fs::write(
+            source.join("sunshine_state.json"),
+            serde_json::json!({
+                "username":"Admin",
+                "password":credential_hash,
+                "salt":salt,
+                "root":{"api_tokens":[{
+                    "hash":token_hash,
+                    "username":"ApiAdmin",
+                    "created_at":1_700_000_000i64,
+                    "scopes":[{"path":"/v1/apps/[0-9]+","methods":["POST","get"]}]
+                }]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let imported = import_legacy_authentication(&source).unwrap();
+        assert_eq!(
+            imported.legacy_api_tokens.version,
+            crate::legacy_tokens::LEGACY_API_TOKEN_STORE_VERSION
+        );
+        assert_eq!(imported.legacy_api_tokens.tokens.len(), 1);
+        assert_eq!(imported.legacy_api_tokens.tokens[0].owner, "ApiAdmin");
+        assert_eq!(
+            imported.legacy_api_tokens.tokens[0].created_at,
+            1_700_000_000
+        );
+        assert_eq!(
+            imported.legacy_api_tokens.tokens[0].scopes[0].path,
+            "/v1/apps/[0-9]+"
+        );
+        assert!(
+            imported.legacy_api_tokens.tokens[0].scopes[0]
+                .methods
+                .contains("get")
+        );
+
+        assert_eq!(
+            seed_authentication_state(&state, &imported).unwrap(),
+            AuthenticationSeedOutcome::Seeded
+        );
+        let namespace: Namespace =
+            serde_json::from_slice(&std::fs::read(namespace_path(&state)).unwrap()).unwrap();
+        let stored = &namespace.values[LEGACY_API_TOKEN_STATE_KEY];
+        assert_eq!(stored["version"], 1);
+        assert_eq!(stored["tokens"][0]["record_version"], 1);
+        assert!(stored["tokens"][0].get("expires_at").is_none());
+        assert!(
+            stored["tokens"][0]["token_id"]
+                .as_str()
+                .is_some_and(|digest| digest == crate::crypto::token_digest(LEGACY_BEARER))
+        );
+        assert!(!stored.to_string().contains(LEGACY_BEARER));
+
+        std::fs::remove_dir_all(source).unwrap();
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn token_records_with_plaintext_or_unknown_fields_are_rejected() {
+        let source = temporary_directory("plaintext-api-token-source");
+        let salt = "AbCdEfGhIjKlMnOp";
+        let password = "correct horse battery staple";
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(format!("{password}{salt}").as_bytes())
+        );
+        std::fs::write(
+            source.join("sunshine_state.json"),
+            serde_json::json!({
+                "username":"Admin",
+                "password":hash,
+                "salt":salt,
+                "root":{"api_tokens":[{
+                    "token":"never-import-plaintext",
+                    "username":"ApiAdmin",
+                    "created_at":1,
+                    "scopes":[]
+                }]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_tokens_unsupported")
+        ));
+        std::fs::remove_dir_all(source).unwrap();
+    }
+
+    #[test]
+    fn token_records_without_a_credential_source_are_not_silently_ignored() {
+        let source = temporary_directory("unpaired-api-token-source");
+        std::fs::write(
+            source.join("sunshine_state.json"),
+            serde_json::json!({
+                "root":{"api_tokens":[{
+                    "hash":"a".repeat(64),
+                    "username":"ApiAdmin",
+                    "created_at":1,
+                    "scopes":[]
+                }]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_tokens_unsupported")
+        ));
+        std::fs::remove_dir_all(source).unwrap();
+    }
+
+    #[test]
+    fn orphan_legacy_token_sidecars_are_validated_and_never_overwritten() {
+        let source = temporary_directory("orphan-token-sidecar-source");
+        let state = temporary_directory("orphan-token-sidecar-state");
+        std::fs::write(
+            source.join("sunshine_state.json"),
+            credential_record("Admin", "correct password", "CredentialSalt12"),
+        )
+        .unwrap();
+        let imported = import_legacy_authentication(&source).unwrap();
+        let path = namespace_path(&state);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        for sidecar in [
+            serde_json::json!({"version":2,"tokens":[]}),
+            serde_json::json!({"version":999,"tokens":[]}),
+        ] {
+            let namespace = Namespace {
+                format_version: 1,
+                revision: 1,
+                values: BTreeMap::from([(LEGACY_API_TOKEN_STATE_KEY.into(), sidecar)]),
+            };
+            std::fs::write(&path, serde_json::to_vec(&namespace).unwrap()).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            assert!(matches!(
+                seed_authentication_state(&state, &imported),
+                Err("legacy_authentication_existing_state_invalid")
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+
+        std::fs::remove_dir_all(source).unwrap();
+        std::fs::remove_dir_all(state).unwrap();
     }
 
     #[test]

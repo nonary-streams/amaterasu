@@ -1,4 +1,5 @@
 use crate::crypto;
+use crate::legacy_tokens::LegacyApiTokenStore;
 use crate::product_settings::TokenLifetimes;
 use crate::protocol::*;
 use serde_json::{Value, json};
@@ -13,6 +14,10 @@ pub enum Change {
     },
     WriteSessions {
         document: SessionDocument,
+        response: Value,
+    },
+    WriteLegacyApiTokens {
+        document: LegacyApiTokenStore,
         response: Value,
     },
     WriteBoth {
@@ -79,7 +84,14 @@ impl Engine {
         now: u64,
     ) -> Result<(), &'static str> {
         operation.validate()?;
-        if operation.requires_administrator()
+        if (operation.requires_administrator()
+            || matches!(
+                operation,
+                Operation::Verify {
+                    legacy_request: Some(_),
+                    ..
+                }
+            ))
             && !self.settings.administrator_principals.contains(caller)
         {
             return Err("forbidden");
@@ -123,10 +135,12 @@ impl Engine {
         operation: Operation,
         document: Document,
         session_document: SessionDocument,
+        mut legacy_api_tokens: LegacyApiTokenStore,
         now: u64,
     ) -> Result<Change, &'static str> {
         document.validate()?;
         session_document.validate()?;
+        legacy_api_tokens.validate()?;
         let now = self.observe_time(now);
         let credential_digest = document
             .credential
@@ -165,7 +179,15 @@ impl Engine {
             Operation::Verify {
                 bearer,
                 required_scopes,
-            } => self.verify(&document, bearer, required_scopes, now),
+                legacy_request,
+            } => self.verify(
+                &document,
+                &mut legacy_api_tokens,
+                bearer,
+                required_scopes,
+                legacy_request,
+                now,
+            ),
             Operation::Logout {
                 bearer,
                 refresh_token,
@@ -191,10 +213,19 @@ impl Engine {
                 scopes,
                 ttl_seconds,
             } => self.issue_token(document, caller, scopes, ttl_seconds, now),
-            Operation::RevokeToken { token_id } => Self::revoke_token(document, caller, token_id),
-            Operation::ListTokens {} => Ok(Change::Read(
-                json!({"ok":true,"tokens":document.tokens.iter().filter(|token| token.owner == caller && self.token_is_active(token, now)).collect::<Vec<_>>()}),
-            )),
+            Operation::RevokeToken { token_id } => {
+                Self::revoke_token(document, legacy_api_tokens, caller, token_id)
+            }
+            Operation::ListTokens {} => Ok(Change::Read(json!({
+                "ok":true,
+                "tokens":document.tokens.iter().filter(|token| token.owner == caller && self.token_is_active(token, now)).collect::<Vec<_>>(),
+                "legacy_tokens":legacy_api_tokens.tokens.iter().map(|token| json!({
+                    "token_id":token.token_id,
+                    "owner":token.owner,
+                    "created_at":token.created_at,
+                    "expires_at":null
+                })).collect::<Vec<_>>()
+            }))),
         }
     }
 
@@ -520,8 +551,10 @@ impl Engine {
     fn verify(
         &self,
         document: &Document,
+        legacy_api_tokens: &mut LegacyApiTokenStore,
         bearer: String,
         required_scopes: BTreeSet<String>,
+        legacy_request: Option<LegacyRequestContext>,
         now: u64,
     ) -> Result<Change, &'static str> {
         let digest = crypto::token_digest(&bearer);
@@ -534,15 +567,44 @@ impl Engine {
                 json!({"ok":true,"kind":"administrator_session","subject":session.subject,"scopes":session.scopes,"expires_at":session.expires_at,"auth_context_id":session.ownership_context_id}),
             ));
         }
-        let token = document
+        if let Some(token) = document
             .tokens
             .iter()
             .find(|token| token.token_id == digest && self.token_is_active(token, now))
+        {
+            self.authorize_scopes(&token.scopes, &required_scopes)?;
+            return Ok(Change::Read(json!({
+                "ok":true,
+                "kind":"api_token",
+                "subject":token.owner,
+                "scopes":token.scopes,
+                "expires_at":token.expires_at,
+                "auth_context_id":token.token_id
+            })));
+        }
+
+        let Some(legacy_request) = legacy_request else {
+            return Err("unauthorized");
+        };
+        if required_scopes.is_empty() || !required_scopes.is_subset(&self.settings.allowed_scopes) {
+            return Err("unauthorized");
+        }
+        let verification = legacy_api_tokens
+            .verify_route(&bearer, &legacy_request.path, &legacy_request.method)?
             .ok_or("unauthorized")?;
-        self.authorize_scopes(&token.scopes, &required_scopes)?;
-        Ok(Change::Read(
-            json!({"ok":true,"kind":"api_token","subject":token.owner,"scopes":token.scopes,"expires_at":token.expires_at,"auth_context_id":token.token_id}),
-        ))
+        let response = json!({
+            "ok":true,
+            "kind":"api_token",
+            "subject":verification.owner,
+            "scopes":required_scopes,
+            "expires_at":null,
+            "auth_context_id":verification.token_id
+        });
+        if let Some(document) = verification.upgraded_store {
+            Ok(Change::WriteLegacyApiTokens { document, response })
+        } else {
+            Ok(Change::Read(response))
+        }
     }
 
     fn issue_token(
@@ -579,19 +641,30 @@ impl Engine {
 
     fn revoke_token(
         mut document: Document,
+        mut legacy_api_tokens: LegacyApiTokenStore,
         caller: &str,
         token_id: String,
     ) -> Result<Change, &'static str> {
-        let token = document
+        if let Some(token) = document
             .tokens
             .iter()
             .find(|token| token.token_id == token_id)
-            .ok_or("token_not_found")?;
-        if token.owner != caller {
+        {
+            if token.owner != caller {
+                return Err("token_not_found");
+            }
+            document.tokens.retain(|token| token.token_id != token_id);
+            return Self::write(document, json!({"ok":true}));
+        }
+
+        if !legacy_api_tokens.revoke(&token_id) {
             return Err("token_not_found");
         }
-        document.tokens.retain(|token| token.token_id != token_id);
-        Self::write(document, json!({"ok":true}))
+        legacy_api_tokens.validate().map_err(|_| "resource_limit")?;
+        Ok(Change::WriteLegacyApiTokens {
+            document: legacy_api_tokens,
+            response: json!({"ok":true}),
+        })
     }
 
     pub fn clear_sessions(&mut self) {

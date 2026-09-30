@@ -100,14 +100,35 @@ sessions by merely presenting a login bearer.
 
 `amaterasu-authentication-import.exe` accepts only the current legacy
 `username`, `password`, and 16-character alphanumeric `salt` record, where
-`password` is lowercase SHA-256 hex of password followed by salt. It rejects
-ambiguous, external, malformed, or API-token-bearing records. Its `seed` mode
-writes the credential only when `authentication/v1` is absent, preserving other
-authentication namespace values such as a stale session sidecar. The retained
-legacy verifier is constant-time checked at login and, after the first successful
-password proof, is replaced in the same durable write with the native Argon2id
-credential. Passwords and verifier values are never printed. The installer must
-call `validate` before takeover and call `seed` only on the copied
+`password` is lowercase SHA-256 hex of password followed by salt. It also accepts
+the pinned legacy `root.api_tokens` records only when they contain a lowercase
+SHA-256 `hash`, `username`, integer `created_at`, and path/method scopes. Plaintext
+token fields and unknown token-record fields are rejected. Ambiguous, external,
+or malformed credential and token records are rejected. Token-bearing state files
+outside the selected credential source still fail closed.
+
+Its `seed` mode writes the credential and a separate versioned
+`authentication/api-tokens/v1` sidecar in one atomic namespace update. The
+sidecar retains the source hash, owner, creation time, and path/method scopes; it
+never stores a bearer or invents an expiry. Legacy API tokens therefore have no
+expiry and continue to be checked against their exact method and path grants, plus
+the current named scope configured for the route. The sidecar is bounded to 128
+tokens, 64 scopes per token, 32 methods per scope, 2,048 bytes per path expression,
+and 64 KiB total; larger imports fail closed. Matching uses an anchored full
+path regex and case-insensitive method comparison. Expressions use Rust regex
+syntax with Unicode mode disabled; this is not a full translation of C++
+`std::regex`. The linear-time engine supports the safe common subset, while
+malformed or unsupported expressions (including backreferences and lookaround)
+remain stored but deny access. On the first request that proves the bearer and
+passes both route and named-scope checks, the record's format version advances
+durably. The digest is already lowercase SHA-256, so this does not rehash the
+token or change its grants. Administrator token listings show only legacy token
+metadata and omit path/method scopes.
+
+The retained password verifier is constant-time checked at login and, after the
+first successful password proof, is replaced in the same durable write with the
+native Argon2id credential. Passwords and verifier values are never printed. The
+installer must call `validate` before takeover and call `seed` only on the copied
 `DATA_ROOT/legacy-imports/PRODUCT` source.
 
 Successful login returns `ok`, access `bearer`, `refresh_token`,

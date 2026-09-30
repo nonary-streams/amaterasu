@@ -101,6 +101,8 @@ pub enum Operation {
     Verify {
         bearer: String,
         required_scopes: BTreeSet<String>,
+        #[serde(default)]
+        legacy_request: Option<LegacyRequestContext>,
     },
     Logout {
         #[serde(default)]
@@ -145,7 +147,14 @@ impl Operation {
             Self::Verify {
                 bearer,
                 required_scopes,
-            } => valid_bearer(bearer) && valid_scopes(required_scopes),
+                legacy_request,
+            } => {
+                (valid_bearer(bearer) || crate::crypto::valid_legacy_api_token(bearer))
+                    && legacy_request
+                        .as_ref()
+                        .is_none_or(valid_legacy_request_context)
+                    && valid_scopes(required_scopes)
+            }
             Self::Logout {
                 bearer,
                 refresh_token,
@@ -185,6 +194,37 @@ impl Operation {
                 | Self::ListTokens {}
         )
     }
+
+    pub fn requires_legacy_api_token_store(&self) -> bool {
+        match self {
+            Self::Verify { bearer, .. } => crate::crypto::valid_legacy_api_token(bearer),
+            Self::RevokeToken { .. } | Self::ListTokens {} => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyRequestContext {
+    pub path: String,
+    pub method: String,
+}
+
+fn valid_legacy_request_context(context: &LegacyRequestContext) -> bool {
+    !context.path.is_empty()
+        && context.path.len() <= crate::legacy_tokens::MAX_LEGACY_API_TOKEN_PATH_BYTES
+        && context
+            .path
+            .bytes()
+            .all(|byte| (b'!'..=b'~').contains(&byte))
+        && !context.method.is_empty()
+        && context.method.len() <= crate::legacy_tokens::MAX_LEGACY_API_TOKEN_METHOD_BYTES
+        && context.method.bytes().all(http_token_byte)
+}
+
+fn http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 #[derive(Default, Deserialize, Serialize)]

@@ -87,6 +87,26 @@ pub fn token_digest(bearer: &str) -> String {
     hexadecimal(&Sha256::digest(bearer.as_bytes()))
 }
 
+/// Checks the predecessor API-token format supported by the pinned reference:
+/// 32 ASCII alphanumeric characters whose stored verifier is SHA-256 hex.
+pub fn valid_legacy_api_token(bearer: &str) -> bool {
+    bearer.len() == 32 && bearer.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Verifies a predecessor token against its stored hash without retaining the
+/// bearer. The production reference and current token store both use lowercase
+/// SHA-256 hex, so this digest is already in the current canonical format.
+pub fn verify_legacy_api_token(bearer: &str, expected_digest: &str) -> bool {
+    if !valid_legacy_api_token(bearer) || !valid_legacy_password_hash(expected_digest) {
+        return false;
+    }
+
+    token_digest(bearer)
+        .as_bytes()
+        .ct_eq(expected_digest.as_bytes())
+        .into()
+}
+
 fn hexadecimal(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut result = String::with_capacity(bytes.len() * 2);
@@ -95,4 +115,30 @@ fn hexadecimal(bytes: &[u8]) -> String {
         result.push(HEX[(byte & 15) as usize] as char);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_api_tokens_use_the_current_sha256_digest_without_retaining_the_bearer() {
+        let bearer = "0123456789abcdefghijklmnopqrstuv";
+        let digest = token_digest(bearer);
+
+        assert!(valid_legacy_api_token(bearer));
+        assert!(verify_legacy_api_token(bearer, &digest));
+        assert!(!verify_legacy_api_token(
+            "0123456789abcdefghijklmnopqrstu",
+            &digest
+        ));
+        assert!(!verify_legacy_api_token(
+            "0123456789abcdefghijklmnopqrst!v",
+            &digest
+        ));
+        assert!(!verify_legacy_api_token(
+            bearer,
+            &digest.to_ascii_uppercase()
+        ));
+    }
 }

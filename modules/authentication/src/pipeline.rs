@@ -1,4 +1,5 @@
 use crate::engine::{Change, Engine};
+use crate::legacy_tokens::LegacyApiTokenStore;
 use crate::product_settings::{CONFIGURATION_SERVICE, TokenLifetimes};
 use crate::protocol::{Document, Operation, SessionDocument, Settings, error};
 use crate::{SERVICE, STATE_SERVICE};
@@ -8,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STATE_KEY: &str = "authentication/v1";
 const SESSION_STATE_KEY: &str = "authentication/sessions/v1";
+const LEGACY_API_TOKEN_STATE_KEY: &str = "authentication/api-tokens/v1";
 
 type Transport = ModuleResult<Response>;
 
@@ -44,6 +46,13 @@ enum Stage {
         document: Document,
         document_revision: u64,
         after_prune: bool,
+    },
+    LoadingLegacyApiTokens {
+        operation: Operation,
+        document: Document,
+        session_document: SessionDocument,
+        document_revision: u64,
+        session_revision: u64,
     },
     PruningSessions {
         operation: Operation,
@@ -243,6 +252,104 @@ impl Pipeline {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn apply_loaded_operation(
+        &mut self,
+        request: Request,
+        operation: Operation,
+        document: Document,
+        session_document: SessionDocument,
+        legacy_api_tokens: LegacyApiTokenStore,
+        document_revision: u64,
+        session_revision: u64,
+        legacy_api_token_revision: Option<u64>,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        let result = self.engine.apply(
+            &request.caller,
+            operation,
+            document,
+            session_document,
+            legacy_api_tokens,
+            now,
+        );
+        match result {
+            Ok(Change::Read(response)) => complete(send, request.id, response),
+            Ok(Change::WriteDocument {
+                document,
+                response,
+                invalidate_sessions,
+            }) => self.submit_state_mutation(
+                request,
+                StateMutation {
+                    key: STATE_KEY,
+                    expected_revision: document_revision,
+                    value: json!(document),
+                    operation_id_suffix: "save",
+                },
+                response,
+                invalidate_sessions,
+                None,
+                send,
+            ),
+            Ok(Change::WriteSessions { document, response }) => self.submit_state_mutation(
+                request,
+                StateMutation {
+                    key: SESSION_STATE_KEY,
+                    expected_revision: session_revision,
+                    value: json!(document),
+                    operation_id_suffix: "save-sessions",
+                },
+                response,
+                false,
+                None,
+                send,
+            ),
+            Ok(Change::WriteBoth {
+                document,
+                sessions,
+                response,
+            }) => self.submit_state_mutation(
+                request,
+                StateMutation {
+                    key: STATE_KEY,
+                    expected_revision: document_revision,
+                    value: json!(document),
+                    operation_id_suffix: "save",
+                },
+                response,
+                false,
+                Some(StateMutation {
+                    key: SESSION_STATE_KEY,
+                    expected_revision: session_revision,
+                    value: json!(sessions),
+                    operation_id_suffix: "save-sessions",
+                }),
+                send,
+            ),
+            Ok(Change::WriteLegacyApiTokens { document, response }) => {
+                let Some(expected_revision) = legacy_api_token_revision else {
+                    return complete(send, request.id, error("state_unavailable"));
+                };
+                self.submit_state_mutation(
+                    request,
+                    StateMutation {
+                        key: LEGACY_API_TOKEN_STATE_KEY,
+                        expected_revision,
+                        value: json!(document),
+                        operation_id_suffix: "save-legacy-api-tokens",
+                    },
+                    response,
+                    false,
+                    None,
+                    send,
+                )
+            }
+            Err(code) => complete(send, request.id, error(code)),
+        }
+    }
+
     fn advance(
         &mut self,
         mut pending: Pending,
@@ -409,68 +516,63 @@ impl Pipeline {
                         send,
                     );
                 }
-                match self.engine.apply(
-                    &pending.request.caller,
+                if operation.requires_legacy_api_token_store() {
+                    self.submit(
+                        pending.request,
+                        Stage::LoadingLegacyApiTokens {
+                            operation,
+                            document,
+                            session_document,
+                            document_revision,
+                            session_revision,
+                        },
+                        STATE_SERVICE,
+                        "load-legacy-api-tokens",
+                        json!({"action":"get","key":LEGACY_API_TOKEN_STATE_KEY}),
+                        send,
+                    )
+                } else {
+                    self.apply_loaded_operation(
+                        pending.request,
+                        operation,
+                        document,
+                        session_document,
+                        LegacyApiTokenStore::default(),
+                        document_revision,
+                        session_revision,
+                        None,
+                        now,
+                        send,
+                    )
+                }
+            }
+            Stage::LoadingLegacyApiTokens {
+                operation,
+                document,
+                session_document,
+                document_revision,
+                session_revision,
+            } => {
+                if Instant::now() >= pending.request.deadline {
+                    return complete(send, pending.request.id, error("deadline_exceeded"));
+                }
+                let (legacy_api_tokens, legacy_api_token_revision) =
+                    match read_legacy_api_token_store(&payload) {
+                        Ok(store) => store,
+                        Err(code) => return complete(send, pending.request.id, error(code)),
+                    };
+                self.apply_loaded_operation(
+                    pending.request,
                     operation,
                     document,
                     session_document,
+                    legacy_api_tokens,
+                    document_revision,
+                    session_revision,
+                    Some(legacy_api_token_revision),
                     now,
-                ) {
-                    Ok(Change::Read(response)) => complete(send, pending.request.id, response),
-                    Ok(Change::WriteDocument {
-                        document,
-                        response,
-                        invalidate_sessions,
-                    }) => self.submit_state_mutation(
-                        pending.request,
-                        StateMutation {
-                            key: STATE_KEY,
-                            expected_revision: document_revision,
-                            value: json!(document),
-                            operation_id_suffix: "save",
-                        },
-                        response,
-                        invalidate_sessions,
-                        None,
-                        send,
-                    ),
-                    Ok(Change::WriteSessions { document, response }) => self.submit_state_mutation(
-                        pending.request,
-                        StateMutation {
-                            key: SESSION_STATE_KEY,
-                            expected_revision: session_revision,
-                            value: json!(document),
-                            operation_id_suffix: "save-sessions",
-                        },
-                        response,
-                        false,
-                        None,
-                        send,
-                    ),
-                    Ok(Change::WriteBoth {
-                        document,
-                        sessions,
-                        response,
-                    }) => self.submit_state_mutation(
-                        pending.request,
-                        StateMutation {
-                            key: STATE_KEY,
-                            expected_revision: document_revision,
-                            value: json!(document),
-                            operation_id_suffix: "save",
-                        },
-                        response,
-                        false,
-                        Some(StateMutation {
-                            key: SESSION_STATE_KEY,
-                            expected_revision: session_revision,
-                            value: json!(sessions),
-                            operation_id_suffix: "save-sessions",
-                        }),
-                        send,
-                    ),
-                    Err(code) => complete(send, pending.request.id, error(code)),
-                }
+                    send,
+                )
             }
             Stage::PruningSessions {
                 operation,
@@ -604,6 +706,7 @@ fn failure_for_stage(stage: &Stage, code: &str) -> Value {
         Stage::Loading(_)
         | Stage::LoadingAfterPrune(_)
         | Stage::LoadingSessions { .. }
+        | Stage::LoadingLegacyApiTokens { .. }
         | Stage::PruningSessions { .. }
         | Stage::Saving { .. } => error("state_unavailable"),
     }
@@ -637,6 +740,29 @@ fn read_session_document(payload: &Value) -> Result<(SessionDocument, u64), &'st
             if revision == 0 {
                 return Err("invalid_state");
             }
+            Ok((document, revision))
+        }
+        None => Err("invalid_state"),
+    }
+}
+
+fn read_legacy_api_token_store(
+    payload: &Value,
+) -> Result<(LegacyApiTokenStore, u64), &'static str> {
+    let revision = payload["revision"].as_u64().ok_or("invalid_state")?;
+    match payload["found"].as_bool() {
+        Some(false) => Ok((LegacyApiTokenStore::default(), revision)),
+        Some(true) => {
+            if revision == 0
+                || serde_json::to_vec(&payload["value"]).map_or(true, |bytes| {
+                    bytes.len() > crate::legacy_tokens::MAX_LEGACY_API_TOKEN_STORE_BYTES
+                })
+            {
+                return Err("invalid_state");
+            }
+            let document: LegacyApiTokenStore =
+                serde_json::from_value(payload["value"].clone()).map_err(|_| "invalid_state")?;
+            document.validate()?;
             Ok((document, revision))
         }
         None => Err("invalid_state"),

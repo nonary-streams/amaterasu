@@ -111,7 +111,7 @@ fn verify_cookie(result: Response, cookie: char) -> (Stage, Vec<Command>) {
         .verify_result(
             &runtime,
             request_id,
-            request,
+            *request,
             &mut operation,
             &mut selection_owners,
         )
@@ -286,7 +286,7 @@ fn pipewire_selection_route_verifies_capture_scope_and_binds_the_handle_to_sessi
         .verify_result(
             &runtime,
             request_id,
-            request,
+            *request,
             &mut operation,
             &mut selection_owners,
         )

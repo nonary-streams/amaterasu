@@ -123,7 +123,7 @@ fn origin_revocation_cancels_and_releases_verifying_and_dispatched_requests() {
         } else {
             Stage::Verifying {
                 request_id: 41,
-                request,
+                request: Box::new(request),
             }
         };
 
@@ -172,7 +172,7 @@ fn narrowing_exception_list_does_not_cancel_explicit_bearer_authorization() {
     server.connections[0].origin = request.origin.clone();
     server.connections[0].stage = Stage::Verifying {
         request_id: 42,
-        request,
+        request: Box::new(request),
     };
     server.set_csrf_policy(CsrfOrigins::default());
     server.tick(&runtime).unwrap();

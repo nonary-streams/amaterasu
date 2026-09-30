@@ -1,6 +1,7 @@
 //! Credential and bearer-token authority for trusted native modules.
 mod crypto;
 mod engine;
+mod legacy_tokens;
 pub mod migration;
 mod pipeline;
 mod product_settings;

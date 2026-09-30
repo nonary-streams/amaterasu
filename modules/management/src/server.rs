@@ -204,7 +204,7 @@ enum Stage {
     Reading(Vec<u8>),
     Verifying {
         request_id: u64,
-        request: http::Request,
+        request: Box<http::Request>,
     },
     Dispatching {
         request_id: u64,
@@ -265,7 +265,7 @@ impl Connection {
             } => self.verify_result(
                 runtime,
                 request_id,
-                request,
+                *request,
                 context.operation,
                 context.selection_owners,
             )?,
@@ -412,7 +412,7 @@ impl Connection {
             Response::Pending => {
                 self.stage = Stage::Verifying {
                     request_id,
-                    request,
+                    request: Box::new(request),
                 }
             }
             Response::Result { payload } if authorized(&payload, request_scope(&request)) => {
@@ -586,16 +586,15 @@ impl Connection {
         } else if request.preflight {
             self.respond(204, Value::Null);
         } else if request_scope(&request).is_some() {
-            // Verify identity and liveness first: authentication uses the same
-            // denial code for invalid identity and insufficient scope. Keep the
-            // exact route-scope check in verify_result so only invalid identity
-            // triggers the browser's 401 refresh or sign-out path.
-            let payload =
-                json!({"action":"verify","bearer":request.bearer.take(),"required_scopes":[]});
+            // Keep the returned-scope check for current tokens so route denial
+            // retains its existing response behavior. For predecessor tokens,
+            // also send the route's current named scope with its exact HTTP
+            // context so a broad legacy path regex cannot bypass policy.
+            let payload = verification_payload(&mut request);
             if let Some(request_id) = self.submit(runtime, AUTH_SERVICE, payload, operation)? {
                 self.stage = Stage::Verifying {
                     request_id,
-                    request,
+                    request: Box::new(request),
                 };
             }
         } else {
@@ -922,6 +921,31 @@ fn request_scope(request: &http::Request) -> Option<&'static str> {
     }
 }
 
+fn valid_legacy_api_bearer(bearer: &str) -> bool {
+    bearer.len() == 32 && bearer.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn verification_payload(request: &mut http::Request) -> Value {
+    let legacy_request = request
+        .bearer
+        .as_deref()
+        .filter(|bearer| valid_legacy_api_bearer(bearer))
+        .and(request.api_request.as_ref());
+    let required_scopes = legacy_request
+        .and_then(|_| request_scope(request))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut payload = json!({
+        "action":"verify",
+        "bearer":request.bearer.take(),
+        "required_scopes":required_scopes
+    });
+    if let Some(context) = legacy_request {
+        payload["legacy_request"] = json!({"path":context.path,"method":context.method});
+    }
+    payload
+}
+
 fn authorized(payload: &Value, required_scope: Option<&str>) -> bool {
     required_scope.is_some()
         && payload.get("ok").and_then(Value::as_bool) == Some(true)
@@ -1123,6 +1147,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_verification_keeps_route_context_and_named_scope_together() {
+        let route = crate::routes::resolve("/v1/catalog/list").unwrap();
+        let mut legacy_request = http::Request {
+            target: RequestTarget::Api(route),
+            payload: json!({}),
+            bearer: Some("0123456789abcdefghijklmnopqrstuv".into()),
+            verified_identity: None,
+            origin: None,
+            preflight: false,
+            csrf_exception: false,
+            api_request: Some(http::ApiRequestContext {
+                path: "/v1/catalog/list".into(),
+                method: "POST".into(),
+            }),
+        };
+        assert_eq!(
+            verification_payload(&mut legacy_request),
+            json!({
+                "action":"verify",
+                "bearer":"0123456789abcdefghijklmnopqrstuv",
+                "required_scopes":["catalog.read"],
+                "legacy_request":{"path":"/v1/catalog/list","method":"POST"}
+            })
+        );
+
+        let mut current_request = http::Request {
+            target: RequestTarget::Api(route),
+            payload: json!({}),
+            bearer: Some(format!("ama_{}", "a".repeat(64))),
+            verified_identity: None,
+            origin: None,
+            preflight: false,
+            csrf_exception: false,
+            api_request: Some(http::ApiRequestContext {
+                path: "/v1/catalog/list".into(),
+                method: "POST".into(),
+            }),
+        };
+        let current_payload = verification_payload(&mut current_request);
+        assert_eq!(current_payload["required_scopes"], json!([]));
+        assert!(current_payload.get("legacy_request").is_none());
+    }
+
+    #[test]
     fn lutris_artwork_scope_cannot_be_satisfied_by_configuration_or_steam_read() {
         let scope = request_scope(&http::Request {
             target: http::RequestTarget::Api(
@@ -1134,6 +1202,7 @@ mod tests {
             origin: None,
             preflight: false,
             csrf_exception: false,
+            api_request: None,
         });
         assert_eq!(scope, Some("lutris.read"));
         for granted in ["configuration.read", "steam.read", "catalog.read", "*"] {

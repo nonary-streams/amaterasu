@@ -16,6 +16,7 @@ amaterasu-module-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+regex.workspace = true
 getrandom.workspace = true
 amaterasu-storage.workspace = true
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }

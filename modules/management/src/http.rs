@@ -45,6 +45,13 @@ pub struct Request {
     pub origin: Option<String>,
     pub preflight: bool,
     pub csrf_exception: bool,
+    pub api_request: Option<ApiRequestContext>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiRequestContext {
+    pub path: String,
+    pub method: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +170,10 @@ pub(crate) fn parse_policy_transport(
         )
         .map(Some);
     }
+    let api_request = ApiRequestContext {
+        path: path.to_owned(),
+        method: request.method.unwrap_or_default().to_owned(),
+    };
     build_request(
         route.expect("ordinary route resolved"),
         &fields,
@@ -170,6 +181,7 @@ pub(crate) fn parse_policy_transport(
         &bytes[header_end..],
         transport,
         csrf_origins,
+        api_request,
     )
     .map(Some)
 }
@@ -213,6 +225,7 @@ fn asset_request(
             origin: fields.origin.map(str::to_owned),
             preflight: false,
             csrf_exception: false,
+            api_request: None,
         });
     }
     if path.starts_with("/v1/") {
@@ -236,6 +249,7 @@ fn asset_request(
         origin: fields.origin.map(str::to_owned),
         preflight: false,
         csrf_exception: false,
+        api_request: None,
     })
 }
 
@@ -290,6 +304,7 @@ fn build_request(
     body: &[u8],
     transport: Transport,
     csrf_origins: &CsrfOrigins,
+    api_request: ApiRequestContext,
 ) -> Result<Request, Failure> {
     let mut csrf_exception = false;
     let bearer = if !preflight && route.scope.is_some() {
@@ -326,6 +341,7 @@ fn build_request(
     } else {
         routes::payload(route, body).map_err(|_| Failure::new(400, "invalid_json_body"))?
     };
+    let has_route_scope = route.scope.is_some();
     Ok(Request {
         target: RequestTarget::Api(route),
         payload,
@@ -334,6 +350,7 @@ fn build_request(
         origin: fields.origin.map(str::to_owned),
         preflight,
         csrf_exception,
+        api_request: (has_route_scope && !preflight).then_some(api_request),
     })
 }
 
@@ -391,6 +408,7 @@ fn browser_request(
         origin: fields.origin.map(str::to_owned),
         preflight: false,
         csrf_exception,
+        api_request: None,
     })
 }
 
@@ -586,6 +604,13 @@ mod tests {
         let authorized = request("Authorization: Bearer test-token\r\n", &body);
         let parsed = parse(authorized.as_bytes(), HOST, &[]).unwrap().unwrap();
         assert_eq!(parsed.bearer.as_deref(), Some("test-token"));
+        assert_eq!(
+            parsed
+                .api_request
+                .as_ref()
+                .map(|context| (context.path.as_str(), context.method.as_str())),
+            Some(("/v1/lutris/artwork_read", "POST"))
+        );
         assert!(matches!(
             parsed.target,
             RequestTarget::Api(Route {
