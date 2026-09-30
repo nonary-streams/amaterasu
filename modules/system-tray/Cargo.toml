@@ -1,0 +1,18 @@
+[package]
+name = "amaterasu-system-tray"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+amaterasu-module-sdk.workspace = true
+ldtray = "=0.1.2"
+serde.workspace = true
+serde_json.workspace = true
+url = "2"
+
+[lints]
+workspace = true
