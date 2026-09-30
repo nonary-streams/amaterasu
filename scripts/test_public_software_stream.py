@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Public encrypted software stream from controlled NV12 through real system x264.
+"""Public encrypted Auto or software stream from controlled NV12 through x264.
 
-The explicitly selected signed probe has genuine video/encoder/transport modules
-and test-only capture/audio sources. FFmpeg independently decodes the H.264 UDP
-payload. This does not qualify desktop capture, a game, performance, packaging or
-Moonlight playback. Default encoder artifacts remain feature-disabled.
+The signed probe has genuine video/encoder/transport modules and test-only
+capture/audio sources. Auto mode qualifies selection of the sole software x264
+candidate; the explicit software mode remains available for comparison. FFmpeg
+independently decodes the H.264 UDP payload. This does not qualify desktop
+capture, a game, performance, packaging or Moonlight playback. Default encoder
+artifacts remain feature-disabled.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -104,7 +107,7 @@ def configure(harness):
     harness.stage(package)
 
 
-def initialize(console):
+def initialize(console, encoder_selector):
     imported = console.request("amaterasu.pairing/1", {
         "action": "import_identity",
         "certificate_pem": (FIXTURES / "host-cert.pem").read_text(),
@@ -125,15 +128,16 @@ def initialize(console):
     settings = checked(api, "/v1/nvhttp/settings_update", {
         "hostname": settings["hostname"], "port": settings["port"],
         "expected_revision": settings["revision"], "lan_encryption_mode": 2,
-        "sw_preset": "superfast", "sw_tune": "zerolatency", "encoder": "software",
+        "sw_preset": "superfast", "sw_tune": "zerolatency", "encoder": encoder_selector,
     }, bearer)
     assert (settings["effective_sw_preset"], settings["effective_sw_tune"],
-            settings["configured_encoder"]) == ("superfast", "zerolatency", "software"), settings
+            settings["configured_encoder"]) == ("superfast", "zerolatency", encoder_selector), settings
     encoders = checked(api, "/v1/media/encoders", bearer=bearer)
     assert encoders["software_encoder"]["available"], encoders
-    software = [entry for entry in encoders["encoders"]
-                if entry["identity"]["clsid"] == "amaterasu.software.x264"]
-    assert len(software) == 1 and software[0]["hardware"] is False, encoders
+    candidates = encoders["encoders"]
+    assert len(candidates) == 1, candidates
+    assert candidates[0]["identity"]["clsid"] == "amaterasu.software.x264", candidates
+    assert candidates[0]["hardware"] is False, candidates
     pair(console, http)
     return https, tls_context()
 
@@ -302,6 +306,9 @@ def exercise(console, https, context, oracle, directory):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--encoder", choices=("auto", "software"), default="auto")
+    arguments = parser.parse_args()
     oracle = Path(os.environ["AMATERASU_ENET_CLIENT_ORACLE"]).resolve(strict=True)
     # Use a dedicated target directory: enabling x264 must not overwrite default artifacts.
     target = Path(os.environ["CARGO_TARGET_DIR"])
@@ -314,7 +321,7 @@ def main():
         configure(harness)
         console = Console(harness)
         try:
-            https, context = initialize(console)
+            https, context = initialize(console, arguments.encoder)
             evidence = exercise(console, https, context, oracle, directory)
             console.eof()
         except BaseException:
@@ -322,7 +329,7 @@ def main():
             raise
         finally:
             console.close()
-    print("Passed: signed paired public HTTPS launch, encrypted RTSP/ENet/video, real NV12 video/x264, independent FFmpeg decode, post-activation IDR, FEC, graceful drain and owned-source cleanup.")
+    print(f"Passed: public {arguments.encoder} selection, signed paired HTTPS launch, encrypted RTSP/ENet/video, real NV12 video/x264, independent FFmpeg decode, post-activation IDR, FEC, graceful drain and owned-source cleanup.")
     print(json.dumps(evidence, sort_keys=True))
     print("Not qualified: desktop capture, game/client playback, performance, Windows runtime or production x264 distribution; configuration parity IDs remain pending.")
 
