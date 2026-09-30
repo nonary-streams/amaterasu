@@ -33,6 +33,8 @@ pub(crate) enum Action {
         #[serde(default)]
         steam_id: Option<String>,
         #[serde(default)]
+        proton_dualsense_compatibility: bool,
+        #[serde(default)]
         steam_install_dir: Option<String>,
         #[serde(default)]
         detached: Vec<DetachedCommandInput>,
@@ -186,6 +188,7 @@ pub(crate) struct LaunchSpec {
     pub wait_all: bool,
     pub exit_timeout_seconds: u64,
     pub steam_id: Option<String>,
+    pub proton_dualsense_compatibility: bool,
     pub steam_install_dir: Option<String>,
     pub detached: Vec<DetachedCommand>,
     pub preparation: Vec<PreparationStep>,
@@ -368,6 +371,7 @@ mod tests {
             wait_all: false,
             exit_timeout_seconds: 10,
             steam_id: steam_id.map(str::to_owned),
+            proton_dualsense_compatibility: false,
             steam_install_dir: install_directory.map(str::to_owned),
             detached: Vec::new(),
             preparation: Vec::new(),
@@ -450,6 +454,40 @@ mod tests {
             panic!("expected launch action")
         };
         assert!(!elevated);
+    }
+
+    #[test]
+    fn proton_dualsense_compatibility_defaults_off_for_legacy_launches() {
+        let action: Action = serde_json::from_value(serde_json::json!({
+            "action":"launch",
+            "operation_id":"legacy-proton-policy",
+            "executable":"/bin/example"
+        }))
+        .unwrap();
+        let Action::Launch {
+            proton_dualsense_compatibility,
+            ..
+        } = action
+        else {
+            panic!("expected launch action")
+        };
+        assert!(!proton_dualsense_compatibility);
+
+        let action: Action = serde_json::from_value(serde_json::json!({
+            "action":"launch",
+            "operation_id":"proton-policy-enabled",
+            "executable":"/bin/example",
+            "proton_dualsense_compatibility":true
+        }))
+        .unwrap();
+        let Action::Launch {
+            proton_dualsense_compatibility,
+            ..
+        } = action
+        else {
+            panic!("expected launch action")
+        };
+        assert!(proton_dualsense_compatibility);
     }
 
     #[test]

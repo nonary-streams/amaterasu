@@ -28,6 +28,13 @@ after `wait_all` is satisfied. A zero exit timeout skips graceful shutdown.
 Detached command strings use platform argv quoting, run best-effort before the
 primary executable, and are not attached to its process group or termination
 lifecycle. They inherit the app's explicit environment and working directory.
+On Linux, `proton_dualsense_compatibility` defaults to `false`; when enabled on a
+Steam-ID launch, the primary process receives
+`PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE=1` and
+`PROTON_SONY_WINDOWS_DEVICE_NAMES=1` only for keys absent from the explicit
+launch environment. Explicit values, including empty strings, take precedence.
+This sets the launched process environment; it does not inject variables into an
+already-running Steam broker. URI handoff needs a separate stream-owned hook.
 The optional launch field `detached_cwd` separates that policy from the primary
 process cwd: omission retains inherited cwd for existing direct callers, null
 infers each detached target's directory, and an absolute path selects a common

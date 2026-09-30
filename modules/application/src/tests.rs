@@ -124,6 +124,19 @@ fn controlled_child() {
             let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
             std::fs::write(marker, format!("{value}|{}", cwd.display())).unwrap();
         }
+        "proton-environment" => {
+            let marker = std::env::var("AMATERASU_TEST_MARKER").unwrap();
+            let value = |name| std::env::var(name).unwrap_or_else(|_| "<unset>".into());
+            std::fs::write(
+                marker,
+                format!(
+                    "{}|{}",
+                    value("PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE"),
+                    value("PROTON_SONY_WINDOWS_DEVICE_NAMES")
+                ),
+            )
+            .unwrap();
+        }
         "tree" | "tree_exit" | "branch" | "leaf" => tree_child(),
         "trace" | "trace_fail" | "trace_sleep" | "trace_fail_once" => trace_child(),
         #[cfg(unix)]
@@ -782,6 +795,113 @@ fn wait_for_state(manager: &mut ProcessManager, caller: &str, id: u64, expected:
 
 fn wait_for_exit(manager: &mut ProcessManager, id: u64) -> Value {
     wait_for_state(manager, "alice", id, "exited")
+}
+
+#[cfg(target_os = "linux")]
+fn proton_environment_for_launch(
+    manager: &mut ProcessManager,
+    operation_id: &str,
+    marker: &std::path::Path,
+    steam_id: Option<&str>,
+    compatibility: Option<bool>,
+    overrides: &[(&str, &str)],
+) -> String {
+    let mut request = launch(operation_id, "proton-environment");
+    request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker.to_string_lossy().into_owned());
+    if let Some(steam_id) = steam_id {
+        request["steam_id"] = json!(steam_id);
+    }
+    if let Some(compatibility) = compatibility {
+        request["proton_dualsense_compatibility"] = json!(compatibility);
+    }
+    for (name, value) in overrides {
+        request["environment"][*name] = json!(value);
+    }
+
+    let started = manager.handle("alice", request);
+    assert_eq!(started["ok"], true, "{started}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        manager.reap_exited().unwrap();
+        if let Ok(value) = std::fs::read_to_string(marker)
+            && value.contains('|')
+        {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "child did not write {marker:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn proton_dualsense_environment_is_opt_in_for_steam_launches_and_preserves_overrides() {
+    let directory = test_directory("proton-dualsense-environment");
+    let mut manager = ProcessManager::default();
+
+    assert_eq!(
+        proton_environment_for_launch(
+            &mut manager,
+            "proton-defaults",
+            &directory.join("defaults"),
+            Some("42"),
+            Some(true),
+            &[],
+        ),
+        "1|1"
+    );
+    assert_eq!(
+        proton_environment_for_launch(
+            &mut manager,
+            "proton-overrides",
+            &directory.join("overrides"),
+            Some("42"),
+            Some(true),
+            &[
+                ("PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE", "0"),
+                ("PROTON_SONY_WINDOWS_DEVICE_NAMES", "custom"),
+            ],
+        ),
+        "0|custom"
+    );
+    assert_eq!(
+        proton_environment_for_launch(
+            &mut manager,
+            "proton-empty-override",
+            &directory.join("empty-override"),
+            Some("42"),
+            Some(true),
+            &[("PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE", "")],
+        ),
+        "|1"
+    );
+    assert_eq!(
+        proton_environment_for_launch(
+            &mut manager,
+            "proton-legacy-default",
+            &directory.join("legacy-default"),
+            Some("42"),
+            None,
+            &[],
+        ),
+        "<unset>|<unset>"
+    );
+    assert_eq!(
+        proton_environment_for_launch(
+            &mut manager,
+            "proton-non-steam",
+            &directory.join("non-steam"),
+            None,
+            Some(true),
+            &[],
+        ),
+        "<unset>|<unset>"
+    );
+
+    std::thread::sleep(Duration::from_millis(100));
+    manager.reap_exited().unwrap();
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

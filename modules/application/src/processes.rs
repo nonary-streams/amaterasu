@@ -230,6 +230,17 @@ impl ProcessRecord {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        #[cfg(target_os = "linux")]
+        if self.spec.proton_dualsense_compatibility && self.spec.steam_id.is_some() {
+            for key in [
+                "PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE",
+                "PROTON_SONY_WINDOWS_DEVICE_NAMES",
+            ] {
+                if !self.spec.environment.contains_key(key) {
+                    command.env(key, "1");
+                }
+            }
+        }
         let working_directory = self.spec.cwd.as_deref().map(Path::new).unwrap_or_else(|| {
             Path::new(&self.spec.executable)
                 .parent()
@@ -845,6 +856,7 @@ impl ProcessManager {
                 wait_all,
                 exit_timeout_seconds,
                 steam_id,
+                proton_dualsense_compatibility,
                 steam_install_dir,
                 detached,
                 preparation,
@@ -884,6 +896,7 @@ impl ProcessManager {
                     wait_all,
                     exit_timeout_seconds,
                     steam_id,
+                    proton_dualsense_compatibility,
                     steam_install_dir,
                     detached,
                     preparation: preparation.into_vec(),
@@ -1369,6 +1382,7 @@ mod detached_elevation_tests {
             wait_all: true,
             exit_timeout_seconds: 10,
             steam_id: None,
+            proton_dualsense_compatibility: false,
             steam_install_dir: None,
             detached: policies
                 .iter()
