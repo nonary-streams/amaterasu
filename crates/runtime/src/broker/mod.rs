@@ -5,8 +5,8 @@ mod hooks;
 mod requests;
 
 use amaterasu_contracts::{
-    Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LIFECYCLE_SERVICE, HostLifecycleAction,
-    Response, RuntimeConfig,
+    Command, DIAGNOSTICS_COMPONENT, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LIFECYCLE_SERVICE,
+    HostLifecycleAction, HostLogEvent, Response, RuntimeConfig,
 };
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -21,9 +21,18 @@ pub struct Broker {
     events: EventBus,
     hooks: HookRegistry,
     host_lifecycle: VecDeque<HostLifecycleAction>,
+    log_events: VecDeque<HostLogEvent>,
+    dropped_log_records: u64,
+    logging_revision: u64,
+    logging_policy_received: bool,
 }
 
 const HOST_LIFECYCLE_QUEUE_CAPACITY: usize = 8;
+const LOG_EVENT_QUEUE_CAPACITY: usize = 512;
+const LOG_DRAIN_BATCH_CAPACITY: usize = 16;
+const MAX_LOG_TARGET_BYTES: usize = 128;
+const MAX_LOG_MESSAGE_BYTES: usize = 7_500;
+const MAX_LOG_PATH_BYTES: usize = 4096;
 
 impl Broker {
     pub fn new(configuration: RuntimeConfig) -> Result<Self, String> {
@@ -35,6 +44,10 @@ impl Broker {
             requests: RequestRouter::default(),
             events: EventBus::default(),
             host_lifecycle: VecDeque::with_capacity(HOST_LIFECYCLE_QUEUE_CAPACITY),
+            log_events: VecDeque::with_capacity(LOG_EVENT_QUEUE_CAPACITY),
+            dropped_log_records: 0,
+            logging_revision: 0,
+            logging_policy_received: false,
         })
     }
 
@@ -52,6 +65,19 @@ impl Broker {
             }
             return Response::HostLifecycle {
                 action: self.host_lifecycle.pop_front(),
+            };
+        }
+
+        if matches!(command, Command::DrainLogEvents {}) {
+            if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL {
+                return errors::permission_denied();
+            }
+            let events = (0..LOG_DRAIN_BATCH_CAPACITY)
+                .filter_map(|_| self.log_events.pop_front())
+                .collect();
+            return Response::LogEvents {
+                events,
+                dropped_records: std::mem::take(&mut self.dropped_log_records),
             };
         }
 
@@ -81,6 +107,17 @@ impl Broker {
                 Response::Ok
             }
             Command::HostLifecycleDrain {} => unreachable!("drain handled before module dispatch"),
+            Command::DrainLogEvents {} => unreachable!("log drain handled before module dispatch"),
+            Command::Log {
+                level,
+                target,
+                message,
+            } => self.enqueue_log(caller, level, target, message),
+            Command::LoggingPolicyChanged {
+                revision,
+                minimum_level,
+                log_path,
+            } => self.update_logging_policy(caller, revision, minimum_level, log_path),
             Command::GetSettings {} => Response::Result {
                 payload: self
                     .configuration
@@ -144,5 +181,83 @@ impl Broker {
                     .advance(caller, grants, invocation, now, &mut self.requests)
             }
         }
+    }
+
+    fn enqueue_log(
+        &mut self,
+        caller: &str,
+        level: u8,
+        target: String,
+        message: String,
+    ) -> Response {
+        if level > 5
+            || target.is_empty()
+            || target.len() > MAX_LOG_TARGET_BYTES
+            || target.chars().any(char::is_control)
+            || message.len() > MAX_LOG_MESSAGE_BYTES
+            || message.chars().any(|character| character == '\0')
+        {
+            return Response::error("invalid_log_record", "log record is invalid");
+        }
+        let target = format!("{caller}::{target}");
+        if target.len() > MAX_LOG_TARGET_BYTES {
+            return Response::error("invalid_log_record", "log record is invalid");
+        }
+        if self.log_events.len() >= LOG_EVENT_QUEUE_CAPACITY {
+            self.dropped_log_records = self.dropped_log_records.saturating_add(1);
+            return Response::Ok;
+        }
+        self.log_events.push_back(HostLogEvent::Record {
+            level,
+            target,
+            message,
+        });
+        Response::Ok
+    }
+
+    fn update_logging_policy(
+        &mut self,
+        caller: &str,
+        revision: u64,
+        minimum_level: u8,
+        log_path: String,
+    ) -> Response {
+        if caller != DIAGNOSTICS_COMPONENT {
+            return errors::permission_denied();
+        }
+        if minimum_level > 6
+            || log_path.is_empty()
+            || log_path.len() > MAX_LOG_PATH_BYTES
+            || log_path.chars().any(char::is_control)
+        {
+            return Response::error("invalid_logging_policy", "logging policy is invalid");
+        }
+        if revision < self.logging_revision {
+            return Response::error("stale_revision", "logging policy revision is stale");
+        }
+        if self.logging_policy_received && revision == self.logging_revision {
+            return Response::Ok;
+        }
+
+        if self.log_events.len() >= LOG_EVENT_QUEUE_CAPACITY {
+            if let Some(record_index) = self
+                .log_events
+                .iter()
+                .position(|event| matches!(event, HostLogEvent::Record { .. }))
+            {
+                self.log_events.remove(record_index);
+                self.dropped_log_records = self.dropped_log_records.saturating_add(1);
+            } else {
+                return Response::error("capacity_exhausted", "host log event queue is full");
+            }
+        }
+        self.log_events.push_back(HostLogEvent::Policy {
+            revision,
+            minimum_level,
+            log_path,
+        });
+        self.logging_revision = revision;
+        self.logging_policy_received = true;
+        Response::Ok
     }
 }

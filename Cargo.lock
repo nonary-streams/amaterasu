@@ -47,6 +47,7 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
+ "amaterasu-logging",
  "amaterasu-package",
  "libloading",
  "serde",
@@ -202,6 +203,7 @@ dependencies = [
 name = "amaterasu-diagnostics"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-logging",
  "amaterasu-module-sdk",
  "serde",
  "serde_json",
@@ -328,6 +330,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "amaterasu-logging"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
 ]
 
 [[package]]

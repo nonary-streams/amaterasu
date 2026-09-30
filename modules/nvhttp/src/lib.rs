@@ -18,7 +18,9 @@ mod wire;
 pub use product_settings::{default_document, validate_document};
 pub use settings::Settings;
 
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{
+    Command, LogLevel, ManagedModule, ModuleResult, Response, RuntimeClient,
+};
 use launch::CaptureMode;
 use network_settings::NetworkSettings;
 use preparation::LegacyPreparationStep;
@@ -293,6 +295,13 @@ impl ManagedModule for NvhttpModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        // Host filtering and file policy are applied downstream. Keep this
+        // lifecycle event free of configured addresses and request contents.
+        let _ = runtime.log(
+            LogLevel::Info,
+            "nvhttp",
+            "control and pairing module initialized",
+        );
         Ok(Self {
             runtime,
             startup_settings: settings,

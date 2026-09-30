@@ -1,5 +1,6 @@
 //! Bounded session log output for accepted diagnostics records.
 use crate::protocol::Record;
+use amaterasu_logging::{LoggingPolicy, MinimumLevel};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -19,6 +20,8 @@ const SINK_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 #[serde(deny_unknown_fields)]
 struct RawSettings {
     #[serde(default)]
+    global: Option<Value>,
+    #[serde(default)]
     min_log_level: Option<u8>,
     #[serde(default)]
     log_path: Option<String>,
@@ -37,6 +40,22 @@ impl LoggingSettings {
     pub(crate) fn from_value(value: serde_json::Value) -> Result<Self, String> {
         let raw: RawSettings = serde_json::from_value(value)
             .map_err(|error| format!("invalid host logging settings: {error}"))?;
+        let state_root = raw
+            .state_root
+            .map(|path| validate_state_root(Path::new(&path)).map_err(|error| error.to_string()))
+            .transpose()?;
+        if let Some(global) = raw.global {
+            let root = state_root
+                .as_deref()
+                .ok_or("global logging settings are missing the trusted state root")?;
+            let policy = LoggingPolicy::from_global(0, Some(&global), root.to_path_buf())?;
+            return Ok(Self {
+                minimum_level: policy.minimum_level.value(),
+                log_path: Some(policy.log_path),
+                state_root,
+            });
+        }
+
         let minimum_level = raw
             .min_log_level
             .unwrap_or_else(|| default_minimum_level(env!("CARGO_PKG_VERSION_PRE")));
@@ -46,10 +65,6 @@ impl LoggingSettings {
         let log_path = raw
             .log_path
             .map(|path| validate_configured_path(&path).map(|()| PathBuf::from(path)))
-            .transpose()?;
-        let state_root = raw
-            .state_root
-            .map(|path| validate_state_root(Path::new(&path)).map_err(|error| error.to_string()))
             .transpose()?;
         if log_path.is_some() && state_root.is_none() {
             return Err("host logging settings are missing the trusted state root".into());
@@ -85,20 +100,15 @@ impl LoggingSettings {
             .get("effective")
             .and_then(Value::as_object)
             .ok_or("host configuration effective values are not an object")?;
-        let minimum_level = match effective
-            .get("min_log_level")
-            .and_then(Value::as_str)
-            .ok_or("host configuration omitted effective min_log_level")?
-        {
-            "verbose" => 0,
-            "debug" => 1,
-            "info" => 2,
-            "warning" => 3,
-            "error" => 4,
-            "fatal" => 5,
-            "none" => 6,
-            _ => return Err("host configuration returned an unknown minimum log level".into()),
-        };
+        let default_level = MinimumLevel::default_for_version(env!("CARGO_PKG_VERSION"));
+        let minimum_level = MinimumLevel::parse_checked(
+            effective
+                .get("min_log_level")
+                .and_then(Value::as_str)
+                .ok_or("host configuration omitted effective min_log_level")?,
+            default_level,
+        )?
+        .value();
         let state_root = state_root
             .ok_or("diagnostics settings are missing the trusted state root")?
             .to_string_lossy();
@@ -112,16 +122,7 @@ impl LoggingSettings {
 }
 
 fn default_minimum_level(prerelease: &str) -> u8 {
-    if is_prerelease_channel(prerelease) {
-        1
-    } else {
-        2
-    }
-}
-
-fn is_prerelease_channel(prerelease: &str) -> bool {
-    let first_identifier = prerelease.split(['.', '+']).next().unwrap_or_default();
-    !first_identifier.is_empty() && !first_identifier.eq_ignore_ascii_case("stable")
+    MinimumLevel::default_for_prerelease(prerelease).value()
 }
 
 #[derive(Default)]

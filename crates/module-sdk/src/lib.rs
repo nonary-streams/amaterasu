@@ -11,8 +11,26 @@ pub use amaterasu_contracts::encoder::{
     validate_software_options,
 };
 pub use amaterasu_contracts::{Command, HostLifecycleAction, Response, RuntimeHostContext};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+
+const LOG_EMITTER_CAPACITY: usize = 128;
+const LOG_FLUSH_BATCH: usize = 16;
+const LOG_TARGET_LIMIT: usize = 128;
+const LOG_MESSAGE_LIMIT: usize = 7_500;
 
 pub type ModuleResult<T> = Result<T, String>;
+
+/// Generic wire severity accepted by the host log transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum LogLevel {
+    Verbose = 0,
+    Debug = 1,
+    Info = 2,
+    Warning = 3,
+    Error = 4,
+    Fatal = 5,
+}
 
 pub struct RuntimeClient {
     endpoint: abi::HostApi,
@@ -53,6 +71,39 @@ impl RuntimeClient {
             Response::Error { code, message } => Err(format!("{code}: {message}")),
             unexpected => Err(format!("unexpected runtime response: {unexpected:?}")),
         }
+    }
+
+    /// Emits a bounded product log record through the host's trusted transport.
+    /// Messages must omit credentials, secret values, and request payloads.
+    pub fn log(&self, level: LogLevel, target: &str, message: &str) -> ModuleResult<()> {
+        validate_log_record(target, message)?;
+        self.require_success(Command::Log {
+            level: level as u8,
+            target: target.to_owned(),
+            message: message.to_owned(),
+        })
+    }
+
+    /// Forwards an accepted persisted logging revision to the trusted host.
+    /// Runtime authorization permits this update only for Diagnostics.
+    pub fn apply_logging_policy(
+        &self,
+        revision: u64,
+        minimum_level: u8,
+        log_path: &str,
+    ) -> ModuleResult<()> {
+        self.require_success(Command::LoggingPolicyChanged {
+            revision,
+            minimum_level,
+            log_path: log_path.to_owned(),
+        })
+    }
+
+    /// Creates a bounded nonblocking logger for native workers and its module-
+    /// thread drain. Host transport work never runs in the callback.
+    pub fn log_emitter(&self) -> (LogEmitter, LogQueue) {
+        let (sender, receiver) = mpsc::sync_channel(LOG_EMITTER_CAPACITY);
+        (LogEmitter { sender }, LogQueue { receiver })
     }
 
     /// Requests one fixed host lifecycle action. The host honors it only when
@@ -99,6 +150,65 @@ impl RuntimeClient {
     }
 }
 
+/// Thread-safe, bounded producer for logs from module-owned native workers.
+#[derive(Clone)]
+pub struct LogEmitter {
+    sender: SyncSender<PendingLog>,
+}
+
+impl LogEmitter {
+    pub fn emit(&self, level: LogLevel, target: &str, message: &str) -> ModuleResult<()> {
+        validate_log_record(target, message)?;
+        self.sender
+            .try_send(PendingLog {
+                level,
+                target: target.to_owned(),
+                message: message.to_owned(),
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => "native log queue is full".into(),
+                TrySendError::Disconnected(_) => "native log queue is unavailable".into(),
+            })
+    }
+}
+
+fn validate_log_record(target: &str, message: &str) -> ModuleResult<()> {
+    if target.is_empty()
+        || target.len() > LOG_TARGET_LIMIT
+        || target.chars().any(char::is_control)
+        || message.len() > LOG_MESSAGE_LIMIT
+        || message.contains('\0')
+    {
+        return Err("log record is invalid".into());
+    }
+    Ok(())
+}
+
+struct PendingLog {
+    level: LogLevel,
+    target: String,
+    message: String,
+}
+
+/// Module-thread consumer paired with `LogEmitter`; it sends a bounded number
+/// of events per tick through the generic runtime transport.
+pub struct LogQueue {
+    receiver: Receiver<PendingLog>,
+}
+
+impl LogQueue {
+    pub fn flush(&mut self, runtime: &RuntimeClient) {
+        for _ in 0..LOG_FLUSH_BATCH {
+            match self.receiver.try_recv() {
+                Ok(record) => {
+                    let _ = runtime.log(record.level, &record.target, &record.message);
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+}
+
 pub trait ManagedModule: Sized {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self>;
     fn tick(&mut self) -> ModuleResult<()>;
@@ -124,4 +234,27 @@ macro_rules! export_module {
             &API
         }
     };
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::{LogLevel, validate_log_record};
+
+    #[test]
+    fn severity_values_match_the_generic_host_transport() {
+        assert_eq!(LogLevel::Verbose as u8, 0);
+        assert_eq!(LogLevel::Debug as u8, 1);
+        assert_eq!(LogLevel::Info as u8, 2);
+        assert_eq!(LogLevel::Warning as u8, 3);
+        assert_eq!(LogLevel::Error as u8, 4);
+        assert_eq!(LogLevel::Fatal as u8, 5);
+    }
+
+    #[test]
+    fn direct_and_native_log_records_share_transport_bounds() {
+        assert!(validate_log_record("module.target", "ready").is_ok());
+        assert!(validate_log_record("bad\ntarget", "ready").is_err());
+        assert!(validate_log_record("module.target", &"x".repeat(7_501)).is_err());
+        assert!(validate_log_record("module.target", "private\0credential").is_err());
+    }
 }

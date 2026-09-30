@@ -1,4 +1,5 @@
 use super::Broker;
+use amaterasu_abi::MAX_MESSAGE;
 use amaterasu_contracts::*;
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -59,6 +60,215 @@ fn test_broker() -> Broker {
         },
     );
     broker
+}
+
+fn logging_broker() -> Broker {
+    let configuration = RuntimeConfig {
+        principals: [
+            ("producer".into(), Grants::default()),
+            (DIAGNOSTICS_COMPONENT.into(), Grants::default()),
+            (HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Grants::default()),
+        ]
+        .into(),
+        host_lifecycle_control: true,
+        ..Default::default()
+    };
+    Broker::new(configuration).unwrap()
+}
+
+#[test]
+fn product_log_events_are_capped_scoped_and_host_drained() {
+    let mut broker = logging_broker();
+    assert!(matches!(
+        broker.dispatch(
+            "producer",
+            Command::Log {
+                level: 3,
+                target: "server".into(),
+                message: "listener ready\nnext line".into(),
+            }
+        ),
+        Response::Ok
+    ));
+    assert_error_code(
+        broker.dispatch("producer", Command::DrainLogEvents {}),
+        "permission_denied",
+    );
+    assert_error_code(
+        broker.dispatch(
+            "producer",
+            Command::Log {
+                level: 6,
+                target: "server".into(),
+                message: "bad level".into(),
+            },
+        ),
+        "invalid_log_record",
+    );
+    assert_error_code(
+        broker.dispatch(
+            "producer",
+            Command::Log {
+                level: 2,
+                target: "server".into(),
+                message: "x".repeat(7_501),
+            },
+        ),
+        "invalid_log_record",
+    );
+
+    assert!(matches!(
+        broker.dispatch(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::DrainLogEvents {}
+        ),
+        Response::LogEvents {
+            events,
+            dropped_records: 0
+        } if events == vec![HostLogEvent::Record {
+            level: 3,
+            target: "producer::server".into(),
+            message: "listener ready\nnext line".into(),
+        }]
+    ));
+}
+
+#[test]
+fn escaped_log_drain_batch_stays_within_the_runtime_abi_limit() {
+    let mut broker = logging_broker();
+    for _ in 0..16 {
+        assert!(matches!(
+            broker.dispatch(
+                "producer",
+                Command::Log {
+                    level: 2,
+                    target: "t".repeat(118),
+                    message: "\u{1}".repeat(7_500),
+                }
+            ),
+            Response::Ok
+        ));
+    }
+
+    let response = broker.dispatch(HOST_LIFECYCLE_CONTROL_PRINCIPAL, Command::DrainLogEvents {});
+    let encoded = serde_json::to_vec(&response).unwrap();
+    assert!(encoded.len() < MAX_MESSAGE, "{} bytes", encoded.len());
+}
+
+#[test]
+fn only_diagnostics_can_queue_revisioned_logging_policy_updates() {
+    let mut broker = logging_broker();
+    let update = |revision, log_path: &str| Command::LoggingPolicyChanged {
+        revision,
+        minimum_level: 2,
+        log_path: log_path.into(),
+    };
+    assert_error_code(
+        broker.dispatch("producer", update(1, "logs/first.log")),
+        "permission_denied",
+    );
+    assert!(matches!(
+        broker.dispatch(DIAGNOSTICS_COMPONENT, update(0, "logs/bootstrap.log")),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch(DIAGNOSTICS_COMPONENT, update(0, "logs/ignored.log")),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch(DIAGNOSTICS_COMPONENT, update(1, "logs/first.log")),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch(DIAGNOSTICS_COMPONENT, update(1, "logs/ignored.log")),
+        Response::Ok
+    ));
+    assert_error_code(
+        broker.dispatch(DIAGNOSTICS_COMPONENT, update(0, "logs/older.log")),
+        "stale_revision",
+    );
+    assert_error_code(
+        broker.dispatch(
+            DIAGNOSTICS_COMPONENT,
+            Command::LoggingPolicyChanged {
+                revision: 2,
+                minimum_level: 7,
+                log_path: "logs/invalid.log".into(),
+            },
+        ),
+        "invalid_logging_policy",
+    );
+    assert!(matches!(
+        broker.dispatch(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::DrainLogEvents {}
+        ),
+        Response::LogEvents { events, .. }
+            if events == vec![
+                HostLogEvent::Policy {
+                    revision: 0,
+                    minimum_level: 2,
+                    log_path: "logs/bootstrap.log".into(),
+                },
+                HostLogEvent::Policy {
+                    revision: 1,
+                    minimum_level: 2,
+                    log_path: "logs/first.log".into(),
+                }
+            ]
+    ));
+}
+
+#[test]
+fn bounded_log_queue_drops_records_before_rejecting_a_policy_update() {
+    let mut broker = logging_broker();
+    for index in 0..512 {
+        assert!(matches!(
+            broker.dispatch(
+                "producer",
+                Command::Log {
+                    level: 2,
+                    target: "server".into(),
+                    message: format!("record {index}"),
+                }
+            ),
+            Response::Ok
+        ));
+    }
+    assert!(matches!(
+        broker.dispatch(
+            DIAGNOSTICS_COMPONENT,
+            Command::LoggingPolicyChanged {
+                revision: 1,
+                minimum_level: 3,
+                log_path: "logs/current.log".into(),
+            }
+        ),
+        Response::Ok
+    ));
+    let mut events = Vec::new();
+    let mut dropped_records = 0;
+    loop {
+        let Response::LogEvents {
+            events: batch,
+            dropped_records: batch_drops,
+        } = broker.dispatch(HOST_LIFECYCLE_CONTROL_PRINCIPAL, Command::DrainLogEvents {})
+        else {
+            panic!("host log drain returned the wrong response");
+        };
+        assert!(batch.len() <= 16);
+        dropped_records += batch_drops;
+        if batch.is_empty() {
+            break;
+        }
+        events.extend(batch);
+    }
+    assert_eq!(events.len(), 512);
+    assert_eq!(dropped_records, 1);
+    assert!(matches!(
+        events.last(),
+        Some(HostLogEvent::Policy { revision: 1, .. })
+    ));
 }
 
 #[test]

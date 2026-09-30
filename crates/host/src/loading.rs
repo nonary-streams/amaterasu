@@ -4,8 +4,9 @@ use amaterasu_abi::{
     Status,
 };
 use amaterasu_contracts::{
-    Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HostLifecycleAction, Response,
+    Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HostLifecycleAction, HostLogEvent, Response,
 };
+use amaterasu_logging::{LoggerError, ProductLogger};
 use amaterasu_package::{PackageResult, VerifiedPackage, ordered_components};
 use libloading::Library;
 use serde_json::json;
@@ -27,6 +28,8 @@ pub(crate) fn path_to_unicode_string(path: &Path) -> Result<String, String> {
 pub struct LoadedComponents {
     // Fields drop in declaration order: modules must stop before their runtime disappears.
     modules: Vec<FeatureLibrary>,
+    product_logger: Option<ProductLogger>,
+    pending_log_policy: Option<HostLogEvent>,
     lifecycle_endpoint: HostApi,
     runtime: RuntimeLibrary,
 }
@@ -44,6 +47,7 @@ impl LoadedComponents {
         directory: &Path,
         package: &VerifiedPackage,
         state_root: &Path,
+        product_logger: Option<ProductLogger>,
         progress: &mut dyn FnMut(usize) -> PackageResult<()>,
     ) -> PackageResult<Self> {
         let runtime_component = package
@@ -111,6 +115,8 @@ impl LoadedComponents {
         }
         Ok(Self {
             modules,
+            product_logger,
+            pending_log_policy: None,
             lifecycle_endpoint,
             runtime,
         })
@@ -120,7 +126,100 @@ impl LoadedComponents {
         for module in &mut self.modules {
             module.tick()?;
         }
+        self.drain_log_events();
         Ok(())
+    }
+
+    /// Pulls a bounded batch through the generic host transport. File I/O and
+    /// filtering stay on the product logger's worker thread; unavailable or
+    /// saturated logging only drops records and never delays module ticks.
+    fn drain_log_events(&mut self) {
+        let Ok(input) = serde_json::to_vec(&Command::DrainLogEvents {}) else {
+            return;
+        };
+        // SAFETY: the reserved endpoint belongs to this live runtime; the ABI
+        // copies its bounded response before returning.
+        let Ok(output) = (unsafe { self.lifecycle_endpoint.call(&input) }) else {
+            return;
+        };
+        let Ok(Response::LogEvents { events, .. }) = serde_json::from_slice(&output) else {
+            return;
+        };
+        let Some(logger) = &self.product_logger else {
+            return;
+        };
+        let mut pending_policy = self.pending_log_policy.take();
+        if let Some(HostLogEvent::Policy {
+            revision,
+            minimum_level,
+            log_path,
+        }) = pending_policy.take()
+        {
+            match logger.update_policy(revision, minimum_level, &log_path) {
+                Err(LoggerError::QueueFull) => {
+                    pending_policy = Some(HostLogEvent::Policy {
+                        revision,
+                        minimum_level,
+                        log_path,
+                    });
+                }
+                Ok(())
+                | Err(
+                    LoggerError::InvalidRecord
+                    | LoggerError::InvalidPolicy
+                    | LoggerError::WorkerUnavailable,
+                ) => {}
+            }
+        }
+        let mut policy_queue_blocked = pending_policy.is_some();
+        for event in events {
+            match event {
+                HostLogEvent::Record {
+                    level,
+                    target,
+                    message,
+                } => {
+                    if !policy_queue_blocked {
+                        let _ = logger.emit(level, &target, &message);
+                    }
+                }
+                HostLogEvent::Policy {
+                    revision,
+                    minimum_level,
+                    log_path,
+                } => {
+                    let newer_than_pending = pending_policy.as_ref().is_none_or(|event| {
+                        matches!(event, HostLogEvent::Policy { revision: current, .. } if revision > *current)
+                    });
+                    if !newer_than_pending {
+                        continue;
+                    }
+                    match logger.update_policy(revision, minimum_level, &log_path) {
+                        Ok(()) => {
+                            pending_policy = None;
+                            policy_queue_blocked = false;
+                        }
+                        Err(LoggerError::QueueFull) => {
+                            pending_policy = Some(HostLogEvent::Policy {
+                                revision,
+                                minimum_level,
+                                log_path,
+                            });
+                            policy_queue_blocked = true;
+                        }
+                        Err(
+                            LoggerError::InvalidRecord
+                            | LoggerError::InvalidPolicy
+                            | LoggerError::WorkerUnavailable,
+                        ) => {
+                            pending_policy = None;
+                            policy_queue_blocked = false;
+                        }
+                    }
+                }
+            }
+        }
+        self.pending_log_policy = pending_policy;
     }
 
     pub fn health(&self) -> PackageResult<()> {

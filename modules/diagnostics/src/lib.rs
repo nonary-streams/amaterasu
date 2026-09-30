@@ -37,6 +37,24 @@ pub struct DiagnosticsModule {
     host_logging: HostLoggingConfigurationReader,
     bootstrap_logging: Option<logging::LoggingSettings>,
     logging_state_root: Option<PathBuf>,
+    pending_product_policy: Option<ProductLoggingPolicy>,
+}
+
+#[derive(Clone)]
+struct ProductLoggingPolicy {
+    revision: u64,
+    minimum_level: u8,
+    log_path: String,
+}
+
+impl ProductLoggingPolicy {
+    fn from_settings(revision: u64, settings: &logging::LoggingSettings) -> Option<Self> {
+        Some(Self {
+            revision,
+            minimum_level: settings.minimum_level,
+            log_path: settings.log_path.as_deref()?.to_string_lossy().into_owned(),
+        })
+    }
 }
 
 impl ManagedModule for DiagnosticsModule {
@@ -51,6 +69,7 @@ impl ManagedModule for DiagnosticsModule {
                 .unwrap_or_else(|| serde_json::json!({})),
         )?;
         let logging_state_root = logging_settings.state_root.clone();
+        let pending_product_policy = ProductLoggingPolicy::from_settings(0, &logging_settings);
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -60,6 +79,7 @@ impl ManagedModule for DiagnosticsModule {
             host_logging: HostLoggingConfigurationReader::default(),
             bootstrap_logging: Some(logging_settings),
             logging_state_root,
+            pending_product_policy,
         })
     }
 
@@ -71,9 +91,19 @@ impl ManagedModule for DiagnosticsModule {
         {
             match persisted_logging_settings(&configuration, self.logging_state_root.as_deref()) {
                 Ok((settings, revision)) => {
+                    let product_policy =
+                        settings
+                            .log_path
+                            .as_deref()
+                            .map(|path| ProductLoggingPolicy {
+                                revision,
+                                minimum_level: settings.minimum_level,
+                                log_path: path.to_string_lossy().into_owned(),
+                            });
                     match self.journal.apply_persisted_logging(settings, revision) {
                         Ok(()) => {
                             self.host_logging.adopt_configuration(revision);
+                            self.pending_product_policy = product_policy;
                             self.bootstrap_logging = None;
                         }
                         Err(warning) => {
@@ -102,6 +132,7 @@ impl ManagedModule for DiagnosticsModule {
         }
 
         self.journal.recover_logging_if_due(now);
+        self.forward_product_logging_policy();
 
         match self.runtime.send(Command::Poll {})? {
             Response::Request {
@@ -110,7 +141,12 @@ impl ManagedModule for DiagnosticsModule {
                 payload,
                 ..
             } => {
-                let payload = handle_request(
+                let product_policy_update = product_policy_from_host_update(
+                    &caller,
+                    &payload,
+                    self.logging_state_root.as_deref(),
+                );
+                let response = handle_request(
                     &mut self.journal,
                     &mut self.host_logging,
                     &caller,
@@ -118,10 +154,15 @@ impl ManagedModule for DiagnosticsModule {
                     now,
                     self.logging_state_root.as_deref(),
                 );
+                if response.get("ok").and_then(Value::as_bool) == Some(true)
+                    && let Some(policy) = product_policy_update
+                {
+                    self.pending_product_policy = Some(policy);
+                }
                 // A cancellation after dispatch does not undo an accepted record/counter.
                 match self.runtime.send(Command::Complete {
                     request: id,
-                    payload,
+                    payload: response,
                 })? {
                     Response::Ok => Ok(()),
                     Response::Error { code, .. }
@@ -134,6 +175,21 @@ impl ManagedModule for DiagnosticsModule {
             }
             Response::Pending => Ok(()),
             response => Err(format!("unexpected diagnostics poll: {response:?}")),
+        }
+    }
+}
+
+impl DiagnosticsModule {
+    fn forward_product_logging_policy(&mut self) {
+        let Some(policy) = self.pending_product_policy.as_ref() else {
+            return;
+        };
+        if self
+            .runtime
+            .apply_logging_policy(policy.revision, policy.minimum_level, &policy.log_path)
+            .is_ok()
+        {
+            self.pending_product_policy = None;
         }
     }
 }
@@ -212,6 +268,22 @@ fn apply_host_logging(
     }
     host_logging.adopt_configuration(revision);
     json!({"ok":true,"applied_revision":revision})
+}
+
+fn product_policy_from_host_update(
+    caller: &str,
+    payload: &Value,
+    state_root: Option<&Path>,
+) -> Option<ProductLoggingPolicy> {
+    if caller != HOST_CONFIGURATION_CALLER
+        || payload.get("action").and_then(Value::as_str) != Some("apply_host_logging")
+    {
+        return None;
+    }
+    let request = serde_json::from_value::<ApplyHostLoggingRequest>(payload.clone()).ok()?;
+    let (settings, revision) =
+        persisted_logging_settings(&request.configuration, state_root).ok()?;
+    ProductLoggingPolicy::from_settings(revision, &settings)
 }
 
 fn persisted_logging_settings(

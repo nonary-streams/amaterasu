@@ -151,7 +151,14 @@ fn load_components(
     if !bootstrap.development && package.manifest.host_context_schema != 1 {
         return Err("production package has an incompatible host context ABI".into());
     }
-    LoadedComponents::load(&directory, &package, state_root, &mut loaded)
+    let product_logger = logging.start_product_logger();
+    LoadedComponents::load(
+        &directory,
+        &package,
+        state_root,
+        product_logger,
+        &mut loaded,
+    )
 }
 
 /// Console and probe modes retain an isolated development root. Production

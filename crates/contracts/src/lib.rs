@@ -11,6 +11,7 @@ pub const HOST_LIFECYCLE_SERVICE: &str = "amaterasu.host-lifecycle/1";
 /// Reserved runtime endpoint identity injected by the verified host. Package
 /// component identities cannot use this name because it is not a valid name.
 pub const HOST_LIFECYCLE_CONTROL_PRINCIPAL: &str = "@amaterasu.host-lifecycle";
+pub const DIAGNOSTICS_COMPONENT: &str = "amaterasu.diagnostics";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,8 +116,23 @@ pub enum Command {
     HostLifecycle {
         action: HostLifecycleAction,
     },
+    /// Emits one bounded product log record through the trusted host transport.
+    Log {
+        level: u8,
+        target: String,
+        message: String,
+    },
+    /// Applies a settings revision to the host-owned product logger. Only
+    /// Diagnostics may submit this trusted policy update.
+    LoggingPolicyChanged {
+        revision: u64,
+        minimum_level: u8,
+        log_path: String,
+    },
     /// Reserved for the runtime endpoint created by the verified host.
     HostLifecycleDrain {},
+    /// Reserved for the host endpoint; returns pending product log events.
+    DrainLogEvents {},
     GetSettings {},
     /// Returns host-owned context only to the state service. This prevents a
     /// module policy from impersonating a host decision through `GetSettings`.
@@ -219,6 +235,26 @@ pub enum Response {
     /// Returned only to the reserved host control endpoint.
     HostLifecycle {
         action: Option<HostLifecycleAction>,
+    },
+    /// Returned only to the reserved host control endpoint.
+    LogEvents {
+        events: Vec<HostLogEvent>,
+        dropped_records: u64,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HostLogEvent {
+    Record {
+        level: u8,
+        target: String,
+        message: String,
+    },
+    Policy {
+        revision: u64,
+        minimum_level: u8,
+        log_path: String,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
