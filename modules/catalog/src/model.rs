@@ -183,6 +183,12 @@ pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossless_scaling_framegen: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lossless_scaling_target_fps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_generation_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_generation_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtss_frame_limit_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ds4_back_as_touchpad_click: Option<bool>,
@@ -281,6 +287,12 @@ impl ConfigOverrides {
             return Err("frame_limiter_fps_limit must be 0..=1000 with at most 3 decimals");
         }
         if self
+            .lossless_scaling_target_fps
+            .is_some_and(|fps| !(1..=1000).contains(&fps))
+        {
+            return Err("lossless_scaling_target_fps must be between 1 and 1000");
+        }
+        if self
             .frame_limiter_provider
             .as_deref()
             .is_some_and(|provider| !valid_frame_limiter_provider(provider))
@@ -293,6 +305,17 @@ impl ConfigOverrides {
             .is_some_and(|mode| !matches!(mode, "enabled" | "vrr" | "legacy" | "disabled"))
         {
             return Err("frame_limiter_auto_virtual_framegen has an invalid mode");
+        }
+        if self
+            .frame_generation_provider
+            .as_deref()
+            .is_some_and(|provider| !valid_frame_generation_provider(provider))
+            || self
+                .frame_generation_mode
+                .as_deref()
+                .is_some_and(|mode| !valid_frame_generation_mode(mode))
+        {
+            return Err("frame generation provider or mode is invalid");
         }
         if self
             .rtss_frame_limit_type
@@ -384,10 +407,24 @@ impl ConfigOverrides {
             && self.frame_limiter_disable_vsync.is_none()
             && self.frame_limiter_auto_virtual_framegen.is_none()
             && self.lossless_scaling_framegen.is_none()
+            && self.lossless_scaling_target_fps.is_none()
+            && self.frame_generation_provider.is_none()
+            && self.frame_generation_mode.is_none()
             && self.rtss_frame_limit_type.is_none()
             && self.ds4_back_as_touchpad_click.is_none()
             && self.native_pen_touch.is_none()
     }
+}
+
+fn valid_frame_generation_provider(provider: &str) -> bool {
+    matches!(
+        provider,
+        "lossless-scaling" | "game-provided" | "nvidia-smooth-motion"
+    )
+}
+
+fn valid_frame_generation_mode(mode: &str) -> bool {
+    mode == "off" || valid_frame_generation_provider(mode)
 }
 
 fn valid_display_overrides(
@@ -1240,6 +1277,76 @@ mod tests {
             serde_json::to_value(disabled).unwrap(),
             json!({"fec_percentage":37,"stream_audio":false})
         );
+    }
+
+    #[test]
+    fn frame_generation_provider_and_mode_preserve_sparse_canonical_values() {
+        for value in [json!({}), json!({"frame_generation_provider": null})] {
+            let overrides: ConfigOverrides = serde_json::from_value(value).unwrap();
+            assert_eq!(overrides.frame_generation_provider, None);
+            assert!(overrides.is_empty());
+            assert_eq!(serde_json::to_value(overrides).unwrap(), json!({}));
+        }
+
+        for (field, values) in [
+            (
+                "frame_generation_provider",
+                &["lossless-scaling", "game-provided", "nvidia-smooth-motion"][..],
+            ),
+            (
+                "frame_generation_mode",
+                &[
+                    "off",
+                    "lossless-scaling",
+                    "game-provided",
+                    "nvidia-smooth-motion",
+                ][..],
+            ),
+        ] {
+            for value in values {
+                let overrides: ConfigOverrides =
+                    serde_json::from_value(json!({(field): value})).unwrap();
+                overrides.validate().unwrap();
+                assert!(!overrides.is_empty());
+                assert_eq!(
+                    serde_json::to_value(overrides).unwrap(),
+                    json!({(field): value})
+                );
+            }
+            for value in ["unknown", "disabled", "none"] {
+                let overrides: ConfigOverrides =
+                    serde_json::from_value(json!({(field): value})).unwrap();
+                assert!(overrides.validate().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn lossless_scaling_target_fps_is_sparse_positive_and_bounded() {
+        for value in [json!({}), json!({"lossless_scaling_target_fps": null})] {
+            let overrides: ConfigOverrides = serde_json::from_value(value).unwrap();
+            assert_eq!(overrides.lossless_scaling_target_fps, None);
+            assert!(overrides.is_empty());
+            assert_eq!(serde_json::to_value(overrides).unwrap(), json!({}));
+        }
+
+        for fps in [1, 60, 1000] {
+            let overrides: ConfigOverrides =
+                serde_json::from_value(json!({"lossless_scaling_target_fps": fps})).unwrap();
+            overrides.validate().unwrap();
+            assert_eq!(overrides.lossless_scaling_target_fps, Some(fps));
+            assert_eq!(
+                serde_json::to_value(overrides).unwrap(),
+                json!({"lossless_scaling_target_fps": fps})
+            );
+        }
+
+        for value in [json!(0), json!(1001), json!("60"), json!(60.0)] {
+            let parsed = serde_json::from_value::<ConfigOverrides>(json!({
+                "lossless_scaling_target_fps": value
+            }));
+            assert!(parsed.is_err() || parsed.unwrap().validate().is_err());
+        }
     }
 
     #[test]

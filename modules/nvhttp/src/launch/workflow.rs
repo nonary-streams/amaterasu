@@ -1590,6 +1590,9 @@ pub(super) struct ApplicationConfigOverrides {
     frame_limiter_disable_vsync: Option<bool>,
     frame_limiter_auto_virtual_framegen: Option<String>,
     lossless_scaling_framegen: Option<bool>,
+    lossless_scaling_target_fps: Option<u32>,
+    frame_generation_provider: Option<String>,
+    frame_generation_mode: Option<String>,
     rtss_frame_limit_type: Option<String>,
     high_resolution_scrolling: Option<bool>,
     always_send_scancodes: Option<bool>,
@@ -1621,13 +1624,41 @@ fn resolved_virtual_sink(
         .map(str::to_owned)
 }
 
+pub(super) fn lossless_scaling_target_fps_millihz(target_fps: u32) -> Option<u32> {
+    if !(1..=1000).contains(&target_fps) {
+        return None;
+    }
+    target_fps.checked_mul(1_000)
+}
+
 impl ApplicationConfigOverrides {
-    fn game_frame_generation_mode(&self) -> &'static str {
-        if self.lossless_scaling_framegen == Some(true) {
-            "lossless-scaling"
-        } else {
-            "none"
+    fn game_frame_generation_mode(&self) -> Option<&'static str> {
+        if let Some(mode) = self.frame_generation_mode.as_deref() {
+            return Some(match mode {
+                "off" => "none",
+                "lossless-scaling" => "lossless-scaling",
+                "game-provided" => "game-provided",
+                "nvidia-smooth-motion" => "nvidia-smooth-motion",
+                _ => unreachable!("frame generation mode is validated during preflight"),
+            });
         }
+
+        if let Some(provider) = self.frame_generation_provider.as_deref() {
+            return match provider {
+                "lossless-scaling" => self
+                    .lossless_scaling_framegen
+                    .map(|enabled| if enabled { "lossless-scaling" } else { "none" }),
+                "game-provided" => Some("game-provided"),
+                "nvidia-smooth-motion" => Some("nvidia-smooth-motion"),
+                _ => unreachable!("frame generation provider is validated during preflight"),
+            };
+        }
+
+        self.lossless_scaling_framegen.map(
+            |enabled| {
+                if enabled { "lossless-scaling" } else { "none" }
+            },
+        )
     }
 
     pub(super) fn frame_limiter_settings(&self) -> FrameLimiterSettings {
@@ -1810,6 +1841,27 @@ pub(super) fn parse_application_config_overrides(
             .dd_hdr_request_override
             .as_deref()
             .is_some_and(|value| !matches!(value, "auto" | "force_on" | "force_off"))
+        || config_overrides
+            .frame_generation_provider
+            .as_deref()
+            .is_some_and(|provider| {
+                !matches!(
+                    provider,
+                    "lossless-scaling" | "game-provided" | "nvidia-smooth-motion"
+                )
+            })
+        || config_overrides
+            .frame_generation_mode
+            .as_deref()
+            .is_some_and(|mode| {
+                !matches!(
+                    mode,
+                    "off" | "lossless-scaling" | "game-provided" | "nvidia-smooth-motion"
+                )
+            })
+        || config_overrides
+            .lossless_scaling_target_fps
+            .is_some_and(|fps| !(1..=1000).contains(&fps))
         || config_overrides
             .minimum_fps_target
             .is_some_and(|target| !target.is_finite() || !(0.0..=1000.0).contains(&target))
@@ -1994,14 +2046,26 @@ fn frame_limiter_launch_snapshot(record: &Record) -> Value {
         .application_preflight_overrides
         .as_ref()
         .map(ApplicationConfigOverrides::game_frame_generation_mode)
-        .unwrap_or("none");
+        .unwrap_or(None);
+    let lossless_scaling_limit_millihz = if game_frame_generation_mode == Some("lossless-scaling") {
+        match record
+            .application_preflight_overrides
+            .as_ref()
+            .and_then(|application| application.lossless_scaling_target_fps)
+        {
+            Some(target_fps) => lossless_scaling_target_fps_millihz(target_fps),
+            None => Some(requested_stream_fps_millihz),
+        }
+    } else {
+        None
+    };
 
     json!({
         "version":1,
         "settings":settings.effective(),
         "requested_stream_fps_millihz":requested_stream_fps_millihz,
         "client_display_mode_override_millihz":record.peer.client_display_mode.map(|mode| mode.refresh_millihz),
-        "lossless_scaling_limit_millihz":null,
+        "lossless_scaling_limit_millihz":lossless_scaling_limit_millihz,
         "virtual_display_active":null,
         "physical_framegen_capture":null,
         "game_frame_generation_mode":game_frame_generation_mode,

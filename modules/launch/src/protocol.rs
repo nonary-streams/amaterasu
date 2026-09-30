@@ -1183,6 +1183,12 @@ pub struct ApplicationConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossless_scaling_framegen: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lossless_scaling_target_fps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_generation_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_generation_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtss_frame_limit_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ds4_back_as_touchpad_click: Option<bool>,
@@ -1267,6 +1273,30 @@ impl ApplicationConfigOverrides {
             return Err("invalid_catalog_response");
         }
         if self
+            .lossless_scaling_target_fps
+            .is_some_and(|fps| !(1..=1000).contains(&fps))
+        {
+            return Err("invalid_catalog_response");
+        }
+        if self
+            .frame_generation_provider
+            .as_deref()
+            .is_some_and(|provider| {
+                !matches!(
+                    provider,
+                    "lossless-scaling" | "game-provided" | "nvidia-smooth-motion"
+                )
+            })
+            || self.frame_generation_mode.as_deref().is_some_and(|mode| {
+                !matches!(
+                    mode,
+                    "off" | "lossless-scaling" | "game-provided" | "nvidia-smooth-motion"
+                )
+            })
+        {
+            return Err("invalid_catalog_response");
+        }
+        if self
             .audio_sink
             .as_deref()
             .is_some_and(|endpoint| endpoint.len() > 4096 || endpoint.chars().any(char::is_control))
@@ -1330,6 +1360,9 @@ impl ApplicationConfigOverrides {
             && self.frame_limiter_disable_vsync.is_none()
             && self.frame_limiter_auto_virtual_framegen.is_none()
             && self.lossless_scaling_framegen.is_none()
+            && self.lossless_scaling_target_fps.is_none()
+            && self.frame_generation_provider.is_none()
+            && self.frame_generation_mode.is_none()
             && self.rtss_frame_limit_type.is_none()
             && self.ds4_back_as_touchpad_click.is_none()
     }
@@ -2210,6 +2243,9 @@ mod tests {
             "frame_limiter_disable_vsync":null,
             "frame_limiter_auto_virtual_framegen":null,
             "lossless_scaling_framegen":null,
+            "lossless_scaling_target_fps":null,
+            "frame_generation_provider":null,
+            "frame_generation_mode":null,
             "rtss_frame_limit_type":null,
             "ds4_back_as_touchpad_click":null,
         }))
@@ -2224,6 +2260,9 @@ mod tests {
             "frame_limiter_disable_vsync":false,
             "frame_limiter_auto_virtual_framegen":true,
             "lossless_scaling_framegen":false,
+            "lossless_scaling_target_fps":60,
+            "frame_generation_provider":"game-provided",
+            "frame_generation_mode":"nvidia-smooth-motion",
             "ds4_back_as_touchpad_click":false,
         }))
         .unwrap();
@@ -2237,6 +2276,15 @@ mod tests {
             Some("enabled")
         );
         assert_eq!(configured.lossless_scaling_framegen, Some(false));
+        assert_eq!(configured.lossless_scaling_target_fps, Some(60));
+        assert_eq!(
+            configured.frame_generation_provider.as_deref(),
+            Some("game-provided")
+        );
+        assert_eq!(
+            configured.frame_generation_mode.as_deref(),
+            Some("nvidia-smooth-motion")
+        );
         assert_eq!(configured.ds4_back_as_touchpad_click, Some(false));
         assert_eq!(
             serde_json::to_value(configured).unwrap(),
@@ -2247,6 +2295,9 @@ mod tests {
                 "frame_limiter_disable_vsync":false,
                 "frame_limiter_auto_virtual_framegen":"enabled",
                 "lossless_scaling_framegen":false,
+                "lossless_scaling_target_fps":60,
+                "frame_generation_provider":"game-provided",
+                "frame_generation_mode":"nvidia-smooth-motion",
                 "ds4_back_as_touchpad_click":false,
             })
         );
@@ -2273,6 +2324,20 @@ mod tests {
             );
         }
 
+        for (field, invalid) in [
+            ("frame_generation_provider", json!("unknown")),
+            ("frame_generation_provider", json!(false)),
+            ("frame_generation_mode", json!("disabled")),
+            ("frame_generation_mode", json!(0)),
+        ] {
+            let parsed =
+                serde_json::from_value::<ApplicationConfigOverrides>(json!({(field):invalid}));
+            assert!(
+                parsed.is_err() || parsed.unwrap().validate().is_err(),
+                "accepted invalid {field} value {invalid}"
+            );
+        }
+
         for fps_limit in [0.0, 1.234, 1000.0] {
             ApplicationConfigOverrides {
                 frame_limiter_fps_limit: Some(fps_limit),
@@ -2280,6 +2345,16 @@ mod tests {
             }
             .validate()
             .unwrap();
+        }
+        for target_fps in [0, 1001] {
+            assert!(
+                ApplicationConfigOverrides {
+                    lossless_scaling_target_fps: Some(target_fps),
+                    ..ApplicationConfigOverrides::default()
+                }
+                .validate()
+                .is_err()
+            );
         }
         for fps_limit in [-0.001, 1.2345, 1000.001, f64::NAN, f64::INFINITY] {
             assert_eq!(

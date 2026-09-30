@@ -43,6 +43,11 @@ namespace Amaterasu {
   }
   export type CatalogFrameLimiterProvider = string;
   export type CatalogAutoVirtualFramegenMode = "enabled" | "vrr" | "legacy" | "disabled";
+  export type CatalogFrameGenerationProvider =
+    | "lossless-scaling"
+    | "game-provided"
+    | "nvidia-smooth-motion";
+  export type CatalogFrameGenerationMode = "off" | CatalogFrameGenerationProvider;
   export type CatalogRtssFrameLimitType = string;
   export interface AdvancedInputOverrides {
     keybindings?: number[] | null;
@@ -83,6 +88,9 @@ namespace Amaterasu {
       frame_limiter_disable_vsync?: boolean | null;
       frame_limiter_auto_virtual_framegen?: CatalogAutoVirtualFramegenMode | null;
       lossless_scaling_framegen?: boolean | null;
+      lossless_scaling_target_fps?: number | null;
+      frame_generation_provider?: CatalogFrameGenerationProvider | null;
+      frame_generation_mode?: CatalogFrameGenerationMode | null;
       rtss_frame_limit_type?: CatalogRtssFrameLimitType | null;
       ds4_back_as_touchpad_click?: boolean | null;
       dd_refresh_rate_option?: RefreshRateOption | null;

@@ -181,6 +181,15 @@ namespace Amaterasu {
 
   const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"] as const;
   const catalogAutoVirtualFramegenModes = ["enabled", "vrr", "legacy", "disabled"] as const;
+  const catalogFrameGenerationProviders = [
+    "lossless-scaling",
+    "game-provided",
+    "nvidia-smooth-motion",
+  ] as const satisfies readonly CatalogFrameGenerationProvider[];
+  const catalogFrameGenerationModes = [
+    "off",
+    ...catalogFrameGenerationProviders,
+  ] as const satisfies readonly CatalogFrameGenerationMode[];
 
   export type CatalogFrameLimiterCapabilityName =
     | "frame_limiter_provider"
@@ -296,6 +305,9 @@ namespace Amaterasu {
     | "frame_limiter_disable_vsync"
     | "frame_limiter_auto_virtual_framegen"
     | "lossless_scaling_framegen"
+    | "lossless_scaling_target_fps"
+    | "frame_generation_provider"
+    | "frame_generation_mode"
     | "rtss_frame_limit_type"
     | "ds4_back_as_touchpad_click"
   >;
@@ -333,6 +345,9 @@ namespace Amaterasu {
       frame_limiter_disable_vsync: text(overrides?.frame_limiter_disable_vsync),
       frame_limiter_auto_virtual_framegen: text(overrides?.frame_limiter_auto_virtual_framegen),
       lossless_scaling_framegen: text(overrides?.lossless_scaling_framegen),
+      lossless_scaling_target_fps: text(overrides?.lossless_scaling_target_fps),
+      frame_generation_provider: text(overrides?.frame_generation_provider),
+      frame_generation_mode: text(overrides?.frame_generation_mode),
       rtss_frame_limit_type: text(overrides?.rtss_frame_limit_type),
       ds4_back_as_touchpad_click: text(overrides?.ds4_back_as_touchpad_click),
     };
@@ -353,6 +368,25 @@ namespace Amaterasu {
         ? undefined
         : values.lossless_scaling_framegen === "true",
     );
+    const frameGenerationProvider = catalogEnumOverrideSelect(
+      "frame_generation_provider",
+      values.frame_generation_provider,
+      catalogFrameGenerationProviders,
+    );
+    const frameGenerationMode = catalogEnumOverrideSelect(
+      "frame_generation_mode",
+      values.frame_generation_mode,
+      catalogFrameGenerationModes,
+    );
+    const losslessScalingTargetFps = input(
+      "lossless_scaling_target_fps",
+      values.lossless_scaling_target_fps,
+      "number",
+    );
+    losslessScalingTargetFps.min = "1";
+    losslessScalingTargetFps.max = "1000";
+    losslessScalingTargetFps.step = "1";
+    losslessScalingTargetFps.placeholder = "Stream FPS";
     const fpsLimit = input("frame_limiter_fps_limit", values.frame_limiter_fps_limit, "number");
     fpsLimit.min = "0";
     fpsLimit.max = "1000";
@@ -390,7 +424,22 @@ namespace Amaterasu {
       field(
         "Lossless Scaling frame generation",
         losslessScalingFramegen,
-        "Enable when this application's Lossless Scaling frame generation is active. Blank defaults off.",
+        "Enable Lossless Scaling when its provider is active. Blank keeps the mode unresolved unless another setting supplies it.",
+      ),
+      field(
+        "Frame generation provider",
+        frameGenerationProvider,
+        "Blank inherits. Select the active game's frame generation provider; Lossless Scaling also requires its framegen toggle.",
+      ),
+      field(
+        "Frame generation mode",
+        frameGenerationMode,
+        "Blank inherits. An explicit mode takes precedence over provider and Lossless Scaling settings.",
+      ),
+      field(
+        "Lossless Scaling target FPS",
+        losslessScalingTargetFps,
+        "Blank uses the active stream FPS when Lossless Scaling mode is selected; explicit targets must be 1–1000 FPS.",
       ),
       field("Frame limiter FPS limit", fpsLimit, "Blank inherits. Use 0–1000 Hz in 0.001 Hz steps."),
       catalogFrameLimiterOverrideField(
@@ -457,6 +506,17 @@ namespace Amaterasu {
     return fpsLimit;
   }
 
+  function parseCatalogLosslessScalingTargetFps(value: string): number | null {
+    const trimmed = value.trim();
+    if (trimmed === "") return null;
+    if (!/^[0-9]+$/.test(trimmed))
+      throw new Error("Lossless Scaling target FPS must be an integer from 1 to 1000.");
+    const targetFps = Number(trimmed);
+    if (!Number.isSafeInteger(targetFps) || targetFps < 1 || targetFps > 1000)
+      throw new Error("Lossless Scaling target FPS must be an integer from 1 to 1000.");
+    return targetFps;
+  }
+
   export function parseCatalogFrameLimiterOverrides(
     data: FormData,
     capabilities: CatalogConfigOverrideCapabilities,
@@ -485,6 +545,21 @@ namespace Amaterasu {
       lossless_scaling_framegen: Amaterasu.parseInputBooleanOverride(
         text("lossless_scaling_framegen"),
         "Lossless Scaling frame generation",
+      ),
+      lossless_scaling_target_fps: parseCatalogLosslessScalingTargetFps(
+        text("lossless_scaling_target_fps"),
+      ),
+      frame_generation_provider: parseCatalogFrameLimiterEnum(
+        text("frame_generation_provider"),
+        catalogFrameGenerationProviders,
+        currentOverrides?.frame_generation_provider,
+        "Frame generation provider",
+      ),
+      frame_generation_mode: parseCatalogFrameLimiterEnum(
+        text("frame_generation_mode"),
+        catalogFrameGenerationModes,
+        currentOverrides?.frame_generation_mode,
+        "Frame generation mode",
       ),
       frame_limiter_auto_virtual_framegen: parseCatalogFrameLimiterEnum(
         text("frame_limiter_auto_virtual_framegen"),

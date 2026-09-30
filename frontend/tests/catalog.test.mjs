@@ -113,6 +113,9 @@ test("Catalog frame limiter editor round-trips inherited values, explicit false,
     frame_limiter_disable_vsync: "",
     frame_limiter_auto_virtual_framegen: "",
     lossless_scaling_framegen: "",
+    lossless_scaling_target_fps: "",
+    frame_generation_provider: "",
+    frame_generation_mode: "",
     rtss_frame_limit_type: "",
     ds4_back_as_touchpad_click: "",
   });
@@ -124,6 +127,9 @@ test("Catalog frame limiter editor round-trips inherited values, explicit false,
     frame_limiter_disable_vsync: null,
     frame_limiter_auto_virtual_framegen: null,
     lossless_scaling_framegen: false,
+    lossless_scaling_target_fps: 90,
+    frame_generation_provider: "game-provided",
+    frame_generation_mode: "off",
     rtss_frame_limit_type: null,
     ds4_back_as_touchpad_click: false,
   };
@@ -135,6 +141,9 @@ test("Catalog frame limiter editor round-trips inherited values, explicit false,
     frame_limiter_disable_vsync: "",
     frame_limiter_auto_virtual_framegen: "",
     lossless_scaling_framegen: "false",
+    lossless_scaling_target_fps: "90",
+    frame_generation_provider: "game-provided",
+    frame_generation_mode: "off",
     rtss_frame_limit_type: "",
     ds4_back_as_touchpad_click: "false",
   });
@@ -149,6 +158,9 @@ test("Catalog frame limiter editor round-trips inherited values, explicit false,
     frame_limiter_disable_vsync: null,
     frame_limiter_auto_virtual_framegen: null,
     lossless_scaling_framegen: false,
+    lossless_scaling_target_fps: 90,
+    frame_generation_provider: "game-provided",
+    frame_generation_mode: "off",
     rtss_frame_limit_type: null,
     ds4_back_as_touchpad_click: false,
   });
@@ -167,6 +179,9 @@ test("Catalog frame limiter controls enforce the current override types and doma
     frame_limiter_disable_vsync: null,
     frame_limiter_auto_virtual_framegen: null,
     lossless_scaling_framegen: null,
+    lossless_scaling_target_fps: null,
+    frame_generation_provider: null,
+    frame_generation_mode: null,
     rtss_frame_limit_type: null,
     ds4_back_as_touchpad_click: null,
   });
@@ -174,6 +189,21 @@ test("Catalog frame limiter controls enforce the current override types and doma
   for (const provider of windowsCapabilities.frame_limiter_provider) {
     fields.set("frame_limiter_provider", provider);
     assert.equal(parse(fields, windowsCapabilities).frame_limiter_provider, provider);
+  }
+  for (const provider of ["lossless-scaling", "game-provided", "nvidia-smooth-motion"]) {
+    fields.set("frame_generation_provider", provider);
+    assert.equal(parse(fields, windowsCapabilities).frame_generation_provider, provider);
+  }
+  for (const mode of ["off", "lossless-scaling", "game-provided", "nvidia-smooth-motion"]) {
+    fields.set("frame_generation_mode", mode);
+    assert.equal(parse(fields, windowsCapabilities).frame_generation_mode, mode);
+  }
+  for (const targetFps of ["1", "60", "1000"]) {
+    fields.set("lossless_scaling_target_fps", targetFps);
+    assert.equal(
+      parse(fields, windowsCapabilities).lossless_scaling_target_fps,
+      Number(targetFps),
+    );
   }
   for (const name of [
     "frame_limiter_enable",
@@ -208,6 +238,10 @@ test("Catalog frame limiter controls enforce the current override types and doma
     ["frame_limiter_enable", "yes"],
     ["frame_limiter_disable_vsync", "0"],
     ["lossless_scaling_framegen", "yes"],
+    ["lossless_scaling_target_fps", "0"],
+    ["lossless_scaling_target_fps", "1001"],
+    ["lossless_scaling_target_fps", "60.5"],
+    ["lossless_scaling_target_fps", "60fps"],
     ["ds4_back_as_touchpad_click", "FALSE"],
     ["frame_limiter_fps_limit", "1.0001"],
     ["frame_limiter_fps_limit", "1.2345"],
@@ -215,6 +249,8 @@ test("Catalog frame limiter controls enforce the current override types and doma
     ["frame_limiter_fps_limit", "-0.001"],
     ["frame_limiter_fps_limit", "60hz"],
     ["frame_limiter_provider", "unknown"],
+    ["frame_generation_provider", "unknown"],
+    ["frame_generation_mode", "disabled"],
     ["frame_limiter_auto_virtual_framegen", "true"],
     ["frame_limiter_auto_virtual_framegen", "automatic"],
     ["rtss_frame_limit_type", "invalid"],
@@ -223,7 +259,7 @@ test("Catalog frame limiter controls enforce the current override types and doma
     invalidFields.set(name, value);
     assert.throws(
       () => parse(invalidFields, windowsCapabilities),
-      /Frame limiter|Lossless Scaling|VSync|DS4 Back|Auto virtual|RTSS frame limit/,
+      /Frame limiter|Lossless Scaling|Frame generation|VSync|DS4 Back|Auto virtual|RTSS frame limit/,
     );
   }
 });

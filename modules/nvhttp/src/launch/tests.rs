@@ -2553,7 +2553,7 @@ fn launch_export_includes_admitted_frame_limiter_settings_and_context() {
         "lossless_scaling_limit_millihz":null,
         "virtual_display_active":null,
         "physical_framegen_capture":null,
-        "game_frame_generation_mode":"none",
+        "game_frame_generation_mode":null,
         "rtss_frame_limit_type_explicit_override":null
     });
 
@@ -2703,6 +2703,13 @@ fn application_frame_limiter_values_decode_sparsely_and_reject_malformed_values(
         json!({"frame_limiter_disable_vsync":1}),
         json!({"frame_limiter_auto_virtual_framegen":"invalid"}),
         json!({"lossless_scaling_framegen":"true"}),
+        json!({"lossless_scaling_target_fps":0}),
+        json!({"lossless_scaling_target_fps":1001}),
+        json!({"lossless_scaling_target_fps":"60"}),
+        json!({"frame_generation_provider":"unknown"}),
+        json!({"frame_generation_provider":false}),
+        json!({"frame_generation_mode":"disabled"}),
+        json!({"frame_generation_mode":0}),
         json!({"rtss_frame_limit_type":false}),
         json!({"ds4_back_as_touchpad_click":"false"}),
         json!({"unrecognized_override":true}),
@@ -2738,15 +2745,80 @@ fn application_frame_limiter_values_decode_sparsely_and_reject_malformed_values(
 
 #[test]
 fn application_lossless_scaling_framegen_projects_into_the_frozen_launch_snapshot() {
-    for (offset, application_overrides, expected_mode) in [
-        (0, None, "none"),
-        (1, Some(json!({})), "none"),
-        (2, Some(json!({"lossless_scaling_framegen":null})), "none"),
-        (3, Some(json!({"lossless_scaling_framegen":false})), "none"),
+    for (offset, application_overrides, expected_mode, expected_limit) in [
+        (0, None, json!(null), json!(null)),
+        (1, Some(json!({})), json!(null), json!(null)),
+        (
+            2,
+            Some(json!({"lossless_scaling_framegen":null})),
+            json!(null),
+            json!(null),
+        ),
+        (
+            3,
+            Some(json!({"lossless_scaling_framegen":false})),
+            json!("none"),
+            json!(null),
+        ),
         (
             4,
             Some(json!({"lossless_scaling_framegen":true})),
-            "lossless-scaling",
+            json!("lossless-scaling"),
+            json!(60_000),
+        ),
+        (
+            5,
+            Some(json!({"frame_generation_provider":"game-provided","lossless_scaling_framegen":false})),
+            json!("game-provided"),
+            json!(null),
+        ),
+        (
+            6,
+            Some(json!({"frame_generation_provider":"nvidia-smooth-motion","lossless_scaling_framegen":false})),
+            json!("nvidia-smooth-motion"),
+            json!(null),
+        ),
+        (
+            7,
+            Some(json!({"frame_generation_provider":"lossless-scaling"})),
+            json!(null),
+            json!(null),
+        ),
+        (
+            8,
+            Some(json!({"frame_generation_provider":"lossless-scaling","lossless_scaling_framegen":false})),
+            json!("none"),
+            json!(null),
+        ),
+        (
+            9,
+            Some(json!({"frame_generation_mode":"off","frame_generation_provider":"game-provided","lossless_scaling_framegen":true})),
+            json!("none"),
+            json!(null),
+        ),
+        (
+            10,
+            Some(json!({"frame_generation_mode":"nvidia-smooth-motion","frame_generation_provider":"game-provided","lossless_scaling_framegen":false})),
+            json!("nvidia-smooth-motion"),
+            json!(null),
+        ),
+        (
+            11,
+            Some(json!({"frame_generation_mode":"game-provided","lossless_scaling_framegen":false})),
+            json!("game-provided"),
+            json!(null),
+        ),
+        (
+            12,
+            Some(json!({"frame_generation_mode":"lossless-scaling","lossless_scaling_framegen":false,"lossless_scaling_target_fps":144})),
+            json!("lossless-scaling"),
+            json!(144_000),
+        ),
+        (
+            13,
+            Some(json!({"frame_generation_mode":"game-provided","lossless_scaling_target_fps":144})),
+            json!("game-provided"),
+            json!(null),
         ),
     ] {
         let now = Instant::now();
@@ -2781,7 +2853,36 @@ fn application_lossless_scaling_framegen_projects_into_the_frozen_launch_snapsho
             expected_mode,
             "application override case {offset}"
         );
+        assert_eq!(
+            launch_payload["frame_limiter_settings"]["lossless_scaling_limit_millihz"],
+            expected_limit,
+            "application override case {offset}"
+        );
     }
+}
+
+#[test]
+fn lossless_scaling_target_fps_uses_checked_millihertz_conversion() {
+    assert_eq!(
+        super::workflow::lossless_scaling_target_fps_millihz(60),
+        Some(60_000)
+    );
+    assert_eq!(
+        super::workflow::lossless_scaling_target_fps_millihz(1000),
+        Some(1_000_000)
+    );
+    assert_eq!(
+        super::workflow::lossless_scaling_target_fps_millihz(0),
+        None
+    );
+    assert_eq!(
+        super::workflow::lossless_scaling_target_fps_millihz(1001),
+        None
+    );
+    assert_eq!(
+        super::workflow::lossless_scaling_target_fps_millihz(u32::MAX),
+        None
+    );
 }
 
 #[cfg(windows)]

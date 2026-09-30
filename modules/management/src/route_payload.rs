@@ -1252,6 +1252,9 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
             "frame_limiter_disable_vsync",
             "frame_limiter_auto_virtual_framegen",
             "lossless_scaling_framegen",
+            "lossless_scaling_target_fps",
+            "frame_generation_provider",
+            "frame_generation_mode",
             "rtss_frame_limit_type",
             "ds4_back_as_touchpad_click",
         ],
@@ -1295,6 +1298,15 @@ fn optional_catalog_frame_limiter_overrides(overrides: &Object) -> Result<(), &'
     }
 
     if overrides
+        .get("lossless_scaling_target_fps")
+        .is_some_and(|value| {
+            !value.is_null() && !value.as_u64().is_some_and(|fps| (1..=1000).contains(&fps))
+        })
+    {
+        return Err(INVALID);
+    }
+
+    if overrides
         .get("frame_limiter_fps_limit")
         .is_some_and(|value| {
             !value.is_null()
@@ -1323,6 +1335,26 @@ fn optional_catalog_frame_limiter_overrides(overrides: &Object) -> Result<(), &'
                         _ => true,
                     }
             })
+        || overrides
+            .get("frame_generation_provider")
+            .is_some_and(|value| {
+                !value.is_null()
+                    && value.as_str().is_none_or(|provider| {
+                        !matches!(
+                            provider,
+                            "lossless-scaling" | "game-provided" | "nvidia-smooth-motion"
+                        )
+                    })
+            })
+        || overrides.get("frame_generation_mode").is_some_and(|value| {
+            !value.is_null()
+                && value.as_str().is_none_or(|mode| {
+                    !matches!(
+                        mode,
+                        "off" | "lossless-scaling" | "game-provided" | "nvidia-smooth-motion"
+                    )
+                })
+        })
         || overrides.get("rtss_frame_limit_type").is_some_and(|value| {
             !value.is_null()
                 && (!cfg!(windows)
@@ -3788,6 +3820,9 @@ mod catalog_tests {
             "frame_limiter_disable_vsync",
             "frame_limiter_auto_virtual_framegen",
             "lossless_scaling_framegen",
+            "lossless_scaling_target_fps",
+            "frame_generation_provider",
+            "frame_generation_mode",
             "rtss_frame_limit_type",
             "ds4_back_as_touchpad_click",
         ] {
@@ -3835,6 +3870,11 @@ mod catalog_tests {
             Some(true)
         );
 
+        for fps in [1, 60, 1000] {
+            let overrides = serde_json::json!({"lossless_scaling_target_fps": fps});
+            assert!(catalog_config_overrides(&overrides).is_ok());
+        }
+
         let valid_providers = {
             let mut providers = vec!["auto"];
             if cfg!(windows) {
@@ -3853,6 +3893,19 @@ mod catalog_tests {
         }
         for mode in ["enabled", "vrr", "legacy", "disabled", "true", "false"] {
             let overrides = serde_json::json!({"frame_limiter_auto_virtual_framegen": mode});
+            assert!(catalog_config_overrides(&overrides).is_ok());
+        }
+        for provider in ["lossless-scaling", "game-provided", "nvidia-smooth-motion"] {
+            let overrides = serde_json::json!({"frame_generation_provider": provider});
+            assert!(catalog_config_overrides(&overrides).is_ok());
+        }
+        for mode in [
+            "off",
+            "lossless-scaling",
+            "game-provided",
+            "nvidia-smooth-motion",
+        ] {
+            let overrides = serde_json::json!({"frame_generation_mode": mode});
             assert!(catalog_config_overrides(&overrides).is_ok());
         }
         for enabled in [true, false] {
@@ -3895,6 +3948,13 @@ mod catalog_tests {
             serde_json::json!({"frame_limiter_disable_vsync":0}),
             serde_json::json!({"lossless_scaling_framegen":"true"}),
             serde_json::json!({"lossless_scaling_framegen":0}),
+            serde_json::json!({"lossless_scaling_target_fps":0}),
+            serde_json::json!({"lossless_scaling_target_fps":1001}),
+            serde_json::json!({"lossless_scaling_target_fps":"60"}),
+            serde_json::json!({"frame_generation_provider":"unknown"}),
+            serde_json::json!({"frame_generation_provider":false}),
+            serde_json::json!({"frame_generation_mode":"disabled"}),
+            serde_json::json!({"frame_generation_mode":0}),
             serde_json::json!({"frame_limiter_auto_virtual_framegen":"vrrr"}),
             serde_json::json!({"frame_limiter_auto_virtual_framegen":1}),
             serde_json::json!({"frame_limiter_auto_virtual_framegen":[]}),
