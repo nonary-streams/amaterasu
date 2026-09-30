@@ -86,6 +86,10 @@ pub struct Broker {
     pub history_events: Vec<Value>,
     pub history_activities: BTreeSet<String>,
     pub history_activity_ends: Vec<Value>,
+    pub host_metrics_available: bool,
+    pub host_metrics_activities: BTreeSet<String>,
+    pub host_metrics_activity_begins: Vec<Value>,
+    pub host_metrics_activity_ends: Vec<Value>,
     pub limiter_unavailable: bool,
     pub limiter_admission_unavailable: bool,
     pub limiter_restore_failures: usize,
@@ -114,6 +118,7 @@ impl Broker {
         Self {
             authenticated: true,
             format_rate: 48000,
+            host_metrics_available: true,
             ..Self::default()
         }
     }
@@ -184,6 +189,12 @@ impl Broker {
                 ..
             } => {
                 if service == "amaterasu.session-history/1" && !self.history_available {
+                    return Ok(Response::Error {
+                        code: "service_unavailable".into(),
+                        message: String::new(),
+                    });
+                }
+                if service == "amaterasu.host-metrics/1" && !self.host_metrics_available {
                     return Ok(Response::Error {
                         code: "service_unavailable".into(),
                         message: String::new(),
@@ -316,6 +327,23 @@ impl Broker {
     fn execute(&mut self, call: &Call) -> Value {
         let action = call.payload["action"].as_str().unwrap();
         let service = call.service.as_str();
+        if service == "amaterasu.host-metrics/1" {
+            return match action {
+                "stream_activity_begin" => {
+                    self.host_metrics_activity_begins.push(call.payload.clone());
+                    let id = call.payload["session_id"].as_str().unwrap().to_owned();
+                    self.host_metrics_activities.insert(id);
+                    json!({"ok":true,"active":true})
+                }
+                "stream_activity_end" => {
+                    self.host_metrics_activity_ends.push(call.payload.clone());
+                    self.host_metrics_activities
+                        .remove(call.payload["session_id"].as_str().unwrap());
+                    json!({"ok":true,"active":false})
+                }
+                _ => panic!("unexpected host metrics action"),
+            };
+        }
         if service == "amaterasu.session-history/1" {
             return match action {
                 "stream_activity_begin" => {

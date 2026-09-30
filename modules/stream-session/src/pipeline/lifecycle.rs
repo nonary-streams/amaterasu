@@ -409,6 +409,7 @@ impl Pipeline {
                 } else {
                     record.state = State::Active;
                     record.history.activated(now);
+                    record.host_metrics.activated(record.id);
                     Ok(self.deliver_success(record, job, now, send))
                 }
             }
@@ -416,6 +417,7 @@ impl Pipeline {
                 accept_input_lease(record, &payload, now)?;
                 record.state = State::Active;
                 record.history.activated(now);
+                record.host_metrics.activated(record.id);
                 Ok(self.deliver_success(record, job, now, send))
             }
             Step::RenewInput => {

@@ -126,6 +126,7 @@ impl Pipeline {
                     _ => ("failed", record.error),
                 };
                 record.history.teardown_confirmed(now, outcome, reason);
+                record.host_metrics.teardown_confirmed(record.id);
                 record.resources.remove(&Resource::Session);
                 record.attempted.remove(&Resource::Session);
             }

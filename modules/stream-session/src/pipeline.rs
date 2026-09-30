@@ -3,6 +3,7 @@ mod cleanup;
 mod display;
 mod history;
 mod history_activity;
+mod host_metrics_activity;
 mod input;
 mod lifecycle;
 mod limiter;
@@ -138,6 +139,8 @@ impl Pipeline {
         for record in self.records.values_mut() {
             record.plane = None;
             settled &= record.history.shutdown(send);
+            let now = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            settled &= record.host_metrics.shutdown(record.id, now, send);
             if let Some(pending) = record.uncertain.as_mut() {
                 settled &= pending.shutdown(send);
             }
@@ -177,6 +180,7 @@ impl Pipeline {
             job.step = Step::RecoverAudio;
         }
         self.progress_history(now, send);
+        self.progress_host_metrics(now, send);
         if let Some(mut job) = self.job.take() {
             let mut record = self
                 .records
@@ -268,6 +272,12 @@ impl Pipeline {
             .expect("selected history record")
             .history
             .progress(queued, now, send);
+    }
+
+    fn progress_host_metrics(&mut self, now: u64, send: &mut Send<'_>) {
+        for record in self.records.values_mut() {
+            record.host_metrics.progress(record.id, now, send);
+        }
     }
 
     fn schedule_control(&mut self, now: u64) -> bool {

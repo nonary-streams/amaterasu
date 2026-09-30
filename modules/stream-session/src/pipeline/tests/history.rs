@@ -65,6 +65,12 @@ fn reserved_activity_binds_signed_prepare_and_history_session_id() {
         host.broker.history_begins[0]["metadata"]["session_id"],
         "launch-activity"
     );
+    assert_eq!(host.broker.host_metrics_activities.len(), 1);
+    assert!(
+        host.broker
+            .host_metrics_activities
+            .contains(&format!("stream-session-{session:016x}"))
+    );
     assert_eq!(
         host.response_from(
             10,
@@ -75,6 +81,9 @@ fn reserved_activity_binds_signed_prepare_and_history_session_id() {
     );
     host.idle();
     assert_eq!(host.broker.history_ends[0]["session_id"], "launch-activity");
+    assert!(host.broker.host_metrics_activities.is_empty());
+    assert_eq!(host.broker.host_metrics_activity_begins.len(), 1);
+    assert_eq!(host.broker.host_metrics_activity_ends.len(), 1);
     let release = json!({"action":"release_history_activity", "activity_id":"launch-activity",
         "rtsp_operation_id":"launch-activity"});
     assert_eq!(
@@ -86,6 +95,47 @@ fn reserved_activity_binds_signed_prepare_and_history_session_id() {
         false
     );
     assert!(host.broker.history_activities.is_empty());
+}
+
+#[test]
+fn host_metrics_consumer_tracks_only_activated_sessions_and_is_best_effort() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let session = prepared["session"].as_u64().unwrap();
+    assert!(host.broker.host_metrics_activity_begins.is_empty());
+
+    host.broker.host_metrics_available = false;
+    assert_eq!(host.response(2, start(session))["state"], "active");
+    host.idle();
+    assert!(host.broker.host_metrics_activity_begins.is_empty());
+    assert!(host.broker.host_metrics_activities.is_empty());
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":session}))["state"],
+        "stopped"
+    );
+    host.idle();
+    assert!(host.broker.host_metrics_activity_ends.is_empty());
+}
+
+#[test]
+fn host_metrics_lease_is_released_during_stream_session_shutdown() {
+    let mut host = Harness::new();
+    let session = prepare_and_start(&mut host);
+    host.idle();
+    assert_eq!(host.broker.host_metrics_activities.len(), 1);
+
+    let settled = {
+        let (pipeline, broker) = (&mut host.pipeline, &mut host.broker);
+        pipeline.shutdown_with(&mut |command| broker.send(command))
+    };
+
+    assert!(settled);
+    assert!(host.broker.host_metrics_activities.is_empty());
+    assert_eq!(host.broker.host_metrics_activity_ends.len(), 1);
+    assert_eq!(
+        host.broker.host_metrics_activity_ends[0]["session_id"],
+        format!("stream-session-{session:016x}")
+    );
 }
 
 #[test]

@@ -69,6 +69,7 @@ impl Resource {
 pub(super) struct Record {
     pub id: u64,
     pub history: super::history::SessionHistory,
+    pub host_metrics: super::host_metrics_activity::HostMetricsActivity,
     pub owner: String,
     pub config: PrepareConfig,
     pub start: Option<StartConfig>,
@@ -133,6 +134,7 @@ impl Record {
         Self {
             id,
             history: super::history::SessionHistory::new(id, config.history_activity_id.clone()),
+            host_metrics: super::host_metrics_activity::HostMetricsActivity::new(id),
             owner,
             config,
             start: None,
