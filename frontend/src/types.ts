@@ -150,6 +150,8 @@ namespace Amaterasu {
     upnp: boolean;
     upnp_status: "disabled" | "active" | "waiting_for_ipv4_listener" | "waiting_for_gateway_route" | "waiting_for_listener" | "error";
     upnp_error: string | null;
+    lan_encryption_mode: 0 | 1 | 2;
+    wan_encryption_mode: 0 | 1 | 2;
     configured_fec_percentage: number | null;
     effective_fec_percentage: number;
     configured_output_name: string | null;
