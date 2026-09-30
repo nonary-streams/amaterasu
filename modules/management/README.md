@@ -282,8 +282,8 @@ cookie routes retain their separate same-origin CSRF checks.
 
 ## Remaining release gates
 
-Plain HTTP remains a loopback development surface. Actual remote HTTPS
-certificate identity, installed service/platform behavior, legacy
+Plain HTTP remains a loopback development surface. Physical remote HTTPS
+reachability, installed certificate/service provisioning, supported-platform behavior, legacy
 Sunshine/Vibeshine HTTP compatibility, real-client pairing and production
 load/abuse qualification remain release gates. Scoped launch authority
 can execute trusted native applications and is intentionally powerful.
@@ -297,6 +297,26 @@ A sandbox must permit loopback listening for that integration test.
 and browser TLS identity on loopback: scoped policy CAS, null/omitted updates,
 Host/Origin checks, generic schema isolation and restart persistence. Pure unit
 tests cover every remote CIDR boundary without opening remote listeners.
+
+The Linux gate `signed_private_network_peer_admission_and_narrowing` is ignored
+by default because it opens non-loopback test listeners. Its launcher requires
+a normal user, creates disposable user/network namespaces, and verifies that
+only the private loopback interface exists before assigning test addresses.
+It changes no host interface, route or firewall rule. With built workspace
+artifacts, Python `cryptography`, `unshare` and `iproute2` available, run:
+
+```sh
+cargo build --workspace --locked
+AMATERASU_PYTHON=/path/to/python-with-cryptography cargo test -p amaterasu-management \
+  signed_private_network_peer_admission_and_narrowing -- --ignored
+```
+
+The signed host uses a fresh trusted certificate with the actual listener IP
+SAN. The gate rejects untrusted/mismatched TLS identity, exercises actual
+PC/LAN/WAN socket peers, checks authorization and PC-only health, disconnects
+previously admitted peers on narrowing, and checks restart persistence. This
+qualifies the Linux admission path in a controlled private network; physical
+LAN/WAN reachability and installed TLS/service provisioning remain release gates.
 
 Verified static frontend bundles are optional; see [web bundles](../../docs/web-bundles.md).
 GET assets bypass API authentication and expose only signed public frontend bytes.

@@ -8,10 +8,13 @@ than separate `codex exec` processes. This overrides the CLI launcher and model
 tiers below. Keep six logical feature assignments, their build-enabled worktrees,
 independent target directories, review evidence, and continuous landing policy.
 
-The native API permits three child threads and counts completed threads against
-that limit. Reuse those threads for successive feature assignments; synchronize
-only an idle, clean destination worktree before changing assignments. Do not
-launch external Codex sessions to bypass this limit. The current Linux host has
+The initial native API permitted three child threads, so those threads were
+reused across six logical assignments. After daemon recovery the API exposes
+19 concurrent slots. Restore six feature coordinators with up to three workers
+each, sharing at most twelve active worker slots alongside the root and six
+coordinators. Workers do not delegate. Synchronize only idle, clean worktrees;
+preserve interrupted work before resuming. Do not launch external Codex sessions
+to bypass native capacity. The current Linux host has
 16 logical processors and approximately 62 GiB RAM; each build uses two Cargo
 jobs. Host-global device and service checks remain serialized.
 
