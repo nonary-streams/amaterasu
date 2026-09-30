@@ -362,6 +362,7 @@ namespace Amaterasu {
     const reply = value as Record<string, unknown>;
     if (reply.ok !== true || !Number.isSafeInteger(reply.revision) || (reply.revision as number) < 0 ||
         typeof reply.configured_hostname !== "string" ||
+        typeof reply.upnp !== "boolean" ||
         !Number.isSafeInteger(reply.port) ||
         !Array.isArray(reply.configured_global_preparation))
       throw new Error("Moonlight host settings reply is invalid.");
@@ -396,6 +397,7 @@ namespace Amaterasu {
     Object.assign(expected, {
       configured_hostname: values.hostname,
       port: values.port,
+      upnp: values.upnp,
       configured_address_family: values.address_family,
       configured_bind_address: values.bind_address,
       configured_capture: values.capture,
@@ -3429,6 +3431,8 @@ namespace Amaterasu {
         port.min = "1029";
         port.max = "65514";
         port.step = "1";
+        const upnp = input("upnp", "", "checkbox");
+        upnp.checked = settings.upnp;
         const addressFamily = el("select");
         addressFamily.name = "address_family";
         const familyOptions: Array<[string, string]> = [
@@ -3667,6 +3671,11 @@ namespace Amaterasu {
           field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."),
           field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."),
           field(
+            "Automatic router port mapping (UPnP)",
+            upnp,
+            "Requests gateway mappings for active stream listeners. The management listener is mapped only when its peer policy allows WAN access. This setting has no effect when the gateway does not support UPnP.",
+          ),
+          field(
             "Address family",
             addressFamily,
             "Choose IPv4 only, both families, or retain the startup policy.",
@@ -3753,6 +3762,7 @@ namespace Amaterasu {
             const values: Payload = {
               hostname: hostname.value,
               port: port.valueAsNumber,
+              upnp: upnp.checked,
               ...network,
               capture: parseCaptureSelection(capture.value),
               output_name: parseOutputNameSelection(outputName.value),

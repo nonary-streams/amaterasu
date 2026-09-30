@@ -147,6 +147,7 @@ namespace Amaterasu {
     bind_address: string;
     configured_address_family: "ipv4" | "both" | null;
     configured_bind_address: string | null;
+    upnp: boolean;
     configured_output_name: string | null;
     effective_output_name: string | null;
     configured_capture: "auto" | "ddx" | "wgc" | "wgcc" | "pipewire";

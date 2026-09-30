@@ -2166,6 +2166,7 @@ function nvhttpHostSettings(revision = 8) {
     ok: true, revision,
     hostname: "Computer Name", configured_hostname: "",
     port: 47989, configured_address_family: null, configured_bind_address: null,
+    upnp: false,
     configured_capture: "auto", configured_output_name: "DISPLAY1",
     stream_audio: false, configured_video_max_batch_size_kb: null,
     configured_max_bitrate: null, configured_minimum_fps_target: null,
@@ -2185,6 +2186,7 @@ function nvhttpHostSettings(revision = 8) {
 function nvhttpHostUpdate() {
   return {
     hostname: "Living Room", port: 47989,
+    upnp: false,
     address_family: null, bind_address: null,
     capture: "auto", output_name: "", stream_audio: true,
     video_max_batch_size_kb: null, max_bitrate: null,
@@ -2227,6 +2229,22 @@ test("Moonlight host editor confirms signed update and GET with canonical prepar
     ["nvhttp/settings_update", { ...values, expected_revision: 8 }],
     ["nvhttp/settings", {}],
   ]);
+});
+
+test("Moonlight settings require and round-trip the persisted UPnP selection", async () => {
+  const current = nvhttpHostSettings();
+  const values = { ...nvhttpHostUpdate(), upnp: true };
+  const updated = { ...nvhttpUpdatedHost(), upnp: true };
+  const calls = [];
+  const saved = await context.Amaterasu.saveNvhttpHostSettings({ async post(route, body = {}) {
+    calls.push([route, ordinary(body)]);
+    return route === "nvhttp/settings_update" ? updated : updated;
+  } }, current, values);
+  assert.equal(saved.upnp, true);
+  assert.deepEqual(calls[0], ["nvhttp/settings_update", { ...values, expected_revision: current.revision }]);
+  const invalid = { ...current };
+  delete invalid.upnp;
+  assert.throws(() => context.Amaterasu.parseNvhttpSettingsReply(invalid), /reply is invalid/);
 });
 
 test("Moonlight host editor rejects mismatched configured or unrelated fields and concurrent readback", async () => {
@@ -2388,6 +2406,7 @@ test("Moonlight host form reloads its revision and listener status after a persi
   const notices = [];
   let stored = nvhttpHostSettings();
   const routes = [];
+  const submittedUpdates = [];
   let updates = 0;
   let secondSubmittedRevision;
   dom.Amaterasu.renderSettings({
@@ -2399,12 +2418,13 @@ test("Moonlight host form reloads its revision and listener status after a persi
         routes.push(route);
         if (route === "nvhttp/settings") return stored;
         if (route === "nvhttp/settings_update") {
+          submittedUpdates.push(ordinary(body));
           updates += 1;
           if (updates === 2) {
             secondSubmittedRevision = body.expected_revision;
             throw new Error("second update intentionally rejected");
           }
-          stored = { ...nvhttpUpdatedHost(), active_http_port: null, active_rtsp_port: null,
+          stored = { ...nvhttpUpdatedHost(), upnp: body.upnp, active_http_port: null, active_rtsp_port: null,
             listener_error: "listener disabled" };
           throw new ApiError("listener_not_active");
         }
@@ -2416,6 +2436,10 @@ test("Moonlight host form reloads its revision and listener status after a persi
   const hostArea = content.children[4];
   const oldForm = find(hostArea, (node) => node.tagName === "form");
   assert.ok(oldForm);
+  const upnp = find(oldForm, (node) => node.name === "upnp");
+  assert.ok(upnp);
+  assert.equal(upnp.checked, false);
+  upnp.checked = true;
   assert.match(hostArea.textContent, /Revision 8/);
   oldForm.fire("submit", { preventDefault() {} });
   await new Promise(setImmediate);
@@ -2432,6 +2456,8 @@ test("Moonlight host form reloads its revision and listener status after a persi
   await new Promise(setImmediate);
   assert.equal(updates, 2);
   assert.equal(secondSubmittedRevision, 9);
+  assert.equal(submittedUpdates[0].upnp, true);
+  assert.equal(submittedUpdates[1].upnp, true);
 });
 
 test("capture output selection preserves exact IDs and automatic reset", () => {
