@@ -1,9 +1,12 @@
 use crate::engine::{Change, Engine};
-use crate::identity::{ConfiguredIdentity, Shared, Snapshot};
+use crate::identity::{
+    ConfiguredIdentity, IMPORTED_IDENTITY_MIGRATION_KEY, ImportedIdentityReconciliation, Shared,
+    Snapshot,
+};
 use crate::protocol::{Document, Operation, Settings, error};
 use crate::{SERVICE, STATE_SERVICE};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,6 +32,17 @@ struct DeferredImport {
     response: Response,
     deadline: Instant,
 }
+struct EffectiveIdentityPaths {
+    provider_revision: u64,
+    certificate_path: String,
+    private_key_path: String,
+}
+struct PairingStateSnapshot {
+    paths: EffectiveIdentityPaths,
+    revision: Option<u64>,
+    cursor: Option<Value>,
+    values: Map<String, Value>,
+}
 enum Stage {
     Loading(Box<Operation>),
     Saving {
@@ -46,6 +60,7 @@ pub struct Pipeline {
     host_configuration: HostConfigurationState,
     refresh_identity: Option<Arc<ConfiguredIdentity>>,
     host_configuration_retry_seconds: u64,
+    identity_migration_checked: bool,
 }
 
 enum HostConfigurationState {
@@ -53,6 +68,15 @@ enum HostConfigurationState {
     Start,
     WaitingReadiness(u64),
     WaitingGet(u64),
+    WaitingPairingState {
+        request: u64,
+        snapshot: PairingStateSnapshot,
+    },
+    WaitingMigrationMarkerDelete {
+        request: u64,
+        paths: EffectiveIdentityPaths,
+        expected_revision: u64,
+    },
     Ready {
         identity: Arc<ConfiguredIdentity>,
         refresh_at: u64,
@@ -91,6 +115,7 @@ impl Pipeline {
             host_configuration,
             refresh_identity: None,
             host_configuration_retry_seconds: 1,
+            identity_migration_checked: false,
         }
     }
 
@@ -140,6 +165,13 @@ impl Pipeline {
         now: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<bool> {
+        if matches!(
+            &self.host_configuration,
+            HostConfigurationState::WaitingPairingState { .. }
+                | HostConfigurationState::WaitingMigrationMarkerDelete { .. }
+        ) {
+            return self.advance_imported_identity_migration(now, send);
+        }
         match &self.host_configuration {
             HostConfigurationState::Disabled => return Ok(true),
             HostConfigurationState::Ready { refresh_at, .. }
@@ -157,6 +189,8 @@ impl Pipeline {
             }
             HostConfigurationState::WaitingReadiness(_) | HostConfigurationState::WaitingGet(_) => {
             }
+            HostConfigurationState::WaitingPairingState { .. }
+            | HostConfigurationState::WaitingMigrationMarkerDelete { .. } => return Ok(false),
             HostConfigurationState::Start => {}
         }
         if matches!(&self.host_configuration, HostConfigurationState::Start) {
@@ -219,33 +253,15 @@ impl Pipeline {
                     self.fail_host_configuration(now);
                     return Ok(false);
                 };
-                match ConfiguredIdentity::load(certificate_path, private_key_path, revision, now) {
-                    Ok(identity) => {
-                        let configured_identity = match self.refresh_identity.take() {
-                            Some(previous)
-                                if previous.provider_revision == identity.provider_revision
-                                    && previous.certificate_pem == identity.certificate_pem
-                                    && previous.private_key_pem == identity.private_key_pem =>
-                            {
-                                previous
-                            }
-                            Some(_) => {
-                                self.identity.invalidate();
-                                Arc::new(identity)
-                            }
-                            None => Arc::new(identity),
-                        };
-                        self.host_configuration = HostConfigurationState::Ready {
-                            identity: configured_identity,
-                            refresh_at: now.saturating_add(HOST_CONFIGURATION_REFRESH_SECONDS),
-                        };
-                        self.host_configuration_retry_seconds = 1;
-                        Ok(true)
-                    }
-                    Err(_) => {
-                        self.fail_host_configuration(now);
-                        Ok(false)
-                    }
+                let paths = EffectiveIdentityPaths {
+                    provider_revision: revision,
+                    certificate_path: certificate_path.to_owned(),
+                    private_key_path: private_key_path.to_owned(),
+                };
+                if self.identity_migration_checked {
+                    self.load_configured_identity(paths, now)
+                } else {
+                    self.begin_imported_identity_migration(paths, now, send)
                 }
             }
             _ => {
@@ -253,6 +269,276 @@ impl Pipeline {
                 Ok(false)
             }
         }
+    }
+
+    fn load_configured_identity(
+        &mut self,
+        paths: EffectiveIdentityPaths,
+        now: u64,
+    ) -> ModuleResult<bool> {
+        match ConfiguredIdentity::load(
+            &paths.certificate_path,
+            &paths.private_key_path,
+            paths.provider_revision,
+            now,
+        ) {
+            Ok(identity) => {
+                let configured_identity = match self.refresh_identity.take() {
+                    Some(previous)
+                        if previous.provider_revision == identity.provider_revision
+                            && previous.certificate_pem == identity.certificate_pem
+                            && previous.private_key_pem == identity.private_key_pem =>
+                    {
+                        previous
+                    }
+                    Some(_) => {
+                        self.identity.invalidate();
+                        Arc::new(identity)
+                    }
+                    None => Arc::new(identity),
+                };
+                self.host_configuration = HostConfigurationState::Ready {
+                    identity: configured_identity,
+                    refresh_at: now.saturating_add(HOST_CONFIGURATION_REFRESH_SECONDS),
+                };
+                self.host_configuration_retry_seconds = 1;
+                Ok(true)
+            }
+            Err(_) => {
+                self.fail_host_configuration(now);
+                Ok(false)
+            }
+        }
+    }
+
+    fn begin_imported_identity_migration(
+        &mut self,
+        paths: EffectiveIdentityPaths,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<bool> {
+        let snapshot = PairingStateSnapshot {
+            paths,
+            revision: None,
+            cursor: None,
+            values: Map::new(),
+        };
+        match self.request_pairing_state_snapshot(&snapshot, send) {
+            Ok(Some(request)) => {
+                self.host_configuration =
+                    HostConfigurationState::WaitingPairingState { request, snapshot };
+                Ok(false)
+            }
+            _ => {
+                self.fail_host_configuration(now);
+                Ok(false)
+            }
+        }
+    }
+
+    fn request_pairing_state_snapshot(
+        &mut self,
+        snapshot: &PairingStateSnapshot,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<Option<u64>> {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|_| "pairing state entropy unavailable")?;
+        let mut payload = json!({"action":"snapshot"});
+        if let Some(cursor) = &snapshot.cursor {
+            payload["cursor"] = cursor.clone();
+        }
+        match send(Command::Request {
+            service: STATE_SERVICE.into(),
+            payload,
+            timeout_ms: HOST_CONFIGURATION_TIMEOUT_MS,
+            operation_id: format!("pairing.imported-identity.{}", u128::from_le_bytes(nonce)),
+            parent: None,
+        })? {
+            Response::Accepted { id } => Ok(Some(id)),
+            _ => Ok(None),
+        }
+    }
+
+    fn advance_imported_identity_migration(
+        &mut self,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<bool> {
+        let (request, deleting_marker) = match &self.host_configuration {
+            HostConfigurationState::WaitingPairingState { request, .. } => (*request, false),
+            HostConfigurationState::WaitingMigrationMarkerDelete { request, .. } => {
+                (*request, true)
+            }
+            _ => return Ok(false),
+        };
+        match send(Command::TakeResult { request }) {
+            Ok(Response::Pending) => Ok(false),
+            Ok(Response::Result { payload }) if deleting_marker => {
+                self.finish_imported_identity_marker_delete(payload, now)
+            }
+            Ok(Response::Result { payload }) => {
+                self.consume_pairing_state_snapshot_page(payload, now, send)
+            }
+            _ => {
+                self.fail_host_configuration(now);
+                Ok(false)
+            }
+        }
+    }
+
+    fn consume_pairing_state_snapshot_page(
+        &mut self,
+        payload: Value,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<bool> {
+        let HostConfigurationState::WaitingPairingState {
+            snapshot: mut state_snapshot,
+            ..
+        } = std::mem::replace(&mut self.host_configuration, HostConfigurationState::Start)
+        else {
+            return Ok(false);
+        };
+        let Some(revision) = payload["revision"]
+            .as_u64()
+            .filter(|_| payload["ok"] == true)
+        else {
+            self.fail_host_configuration(now);
+            return Ok(false);
+        };
+        if state_snapshot
+            .revision
+            .is_some_and(|previous| previous != revision)
+        {
+            self.fail_host_configuration(now);
+            return Ok(false);
+        }
+        let Some(values) = payload["values"].as_object() else {
+            self.fail_host_configuration(now);
+            return Ok(false);
+        };
+        state_snapshot.revision = Some(revision);
+        state_snapshot.values.extend(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        state_snapshot.cursor = payload
+            .get("next_cursor")
+            .filter(|cursor| !cursor.is_null())
+            .cloned();
+
+        let has_pairing = state_snapshot.values.contains_key(STATE_KEY);
+        let has_marker = state_snapshot
+            .values
+            .contains_key(IMPORTED_IDENTITY_MIGRATION_KEY);
+        if !(has_pairing && has_marker) && state_snapshot.cursor.is_some() {
+            match self.request_pairing_state_snapshot(&state_snapshot, send) {
+                Ok(Some(request)) => {
+                    self.host_configuration = HostConfigurationState::WaitingPairingState {
+                        request,
+                        snapshot: state_snapshot,
+                    };
+                    return Ok(false);
+                }
+                _ => {
+                    self.fail_host_configuration(now);
+                    return Ok(false);
+                }
+            }
+        }
+
+        let values = Value::Object(state_snapshot.values.clone());
+        let reconciliation = match crate::identity::reconcile_imported_identity(
+            &values,
+            &state_snapshot.paths.certificate_path,
+            &state_snapshot.paths.private_key_path,
+            now,
+        ) {
+            Ok(reconciliation) => reconciliation,
+            Err(_) => {
+                self.fail_host_configuration(now);
+                return Ok(false);
+            }
+        };
+        match reconciliation {
+            ImportedIdentityReconciliation::NotPending => {
+                self.identity_migration_checked = true;
+                self.load_configured_identity(state_snapshot.paths, now)
+            }
+            ImportedIdentityReconciliation::Reconciled
+            | ImportedIdentityReconciliation::Superseded => {
+                let Some(expected_revision) = state_snapshot.revision else {
+                    self.fail_host_configuration(now);
+                    return Ok(false);
+                };
+                match self.request_imported_identity_marker_delete(expected_revision, send) {
+                    Ok(Some(request)) => {
+                        self.host_configuration =
+                            HostConfigurationState::WaitingMigrationMarkerDelete {
+                                request,
+                                paths: state_snapshot.paths,
+                                expected_revision,
+                            };
+                        Ok(false)
+                    }
+                    _ => {
+                        self.fail_host_configuration(now);
+                        Ok(false)
+                    }
+                }
+            }
+        }
+    }
+
+    fn request_imported_identity_marker_delete(
+        &mut self,
+        expected_revision: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<Option<u64>> {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|_| "pairing state entropy unavailable")?;
+        match send(Command::Request {
+            service: STATE_SERVICE.into(),
+            payload: json!({
+                "action":"delete",
+                "key":IMPORTED_IDENTITY_MIGRATION_KEY,
+                "expected_revision":expected_revision
+            }),
+            timeout_ms: HOST_CONFIGURATION_TIMEOUT_MS,
+            operation_id: format!(
+                "pairing.imported-identity.consume.{}",
+                u128::from_le_bytes(nonce)
+            ),
+            parent: None,
+        })? {
+            Response::Accepted { id } => Ok(Some(id)),
+            _ => Ok(None),
+        }
+    }
+
+    fn finish_imported_identity_marker_delete(
+        &mut self,
+        payload: Value,
+        now: u64,
+    ) -> ModuleResult<bool> {
+        let HostConfigurationState::WaitingMigrationMarkerDelete {
+            paths,
+            expected_revision,
+            ..
+        } = std::mem::replace(&mut self.host_configuration, HostConfigurationState::Start)
+        else {
+            return Ok(false);
+        };
+        if payload["ok"] != true
+            || payload["deleted"] != true
+            || payload["revision"].as_u64() != expected_revision.checked_add(1)
+        {
+            self.fail_host_configuration(now);
+            return Ok(false);
+        }
+        self.identity_migration_checked = true;
+        self.load_configured_identity(paths, now)
     }
 
     fn fail_host_configuration(&mut self, now: u64) {

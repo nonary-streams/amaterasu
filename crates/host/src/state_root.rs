@@ -887,79 +887,6 @@ mod tests {
     use std::ffi::{OsStr, c_void};
     use std::fs;
 
-    const HOST_CERTIFICATE: &str =
-        include_str!("../../../modules/pairing/tests/fixtures/host-cert.pem");
-    const HOST_PRIVATE_KEY: &str =
-        include_str!("../../../modules/pairing/tests/fixtures/host-key.pem");
-    const CLIENT_CERTIFICATE: &str =
-        include_str!("../../../modules/pairing/tests/fixtures/client-cert.pem");
-    const CLIENT_PRIVATE_KEY: &str =
-        include_str!("../../../modules/pairing/tests/fixtures/client-key.pem");
-
-    fn namespace_path(root: &std::path::Path, principal: &str) -> std::path::PathBuf {
-        let encoded: String = principal
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        root.join("namespaces").join(encoded).join("state.json")
-    }
-
-    fn write_namespace_value(root: &std::path::Path, principal: &str, key: &str, value: Value) {
-        let path = namespace_path(root, principal);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut values = BTreeMap::new();
-        values.insert(key.to_owned(), value);
-        let namespace = SeedNamespace {
-            format_version: 1,
-            revision: 1,
-            values,
-        };
-        amaterasu_package::write_json_atomically(&path, &namespace).unwrap();
-    }
-
-    fn write_pairing_identity_seed(root: &std::path::Path) -> Value {
-        let pairing = serde_json::json!({
-            "identity": {
-                "host_id": "12345678-1234-4234-8234-123456789abc",
-                "certificate_pem": HOST_CERTIFICATE,
-                "private_key_pem": HOST_PRIVATE_KEY
-            },
-            "clients": [{
-                "certificate_id": "fixture-client",
-                "client_id": "87654321-1234-4234-8234-123456789abc",
-                "name": "Migrated device",
-                "certificate_pem": CLIENT_CERTIFICATE,
-                "paired_at": 1,
-                "config_overrides": {}
-            }]
-        });
-        write_namespace_value(root, "amaterasu.pairing", "pairing/v1", pairing.clone());
-        fs::create_dir_all(root.join("credentials")).unwrap();
-        fs::write(root.join("credentials/cacert.pem"), HOST_CERTIFICATE).unwrap();
-        fs::write(root.join("credentials/cakey.pem"), HOST_PRIVATE_KEY).unwrap();
-        pairing
-    }
-
-    fn write_host_tls_settings(root: &std::path::Path, cert: &str, pkey: &str) {
-        write_namespace_value(
-            root,
-            "amaterasu.host-configuration",
-            "global/amaterasu.host-configuration",
-            serde_json::json!({
-                "version": 1,
-                "revision": 1,
-                "file_state": "sunshine_state.json",
-                "vibeshine_file_state": "vibeshine_state.json",
-                "credentials_file": "",
-                "pkey": pkey,
-                "cert": cert,
-                "log_path": "amaterasu.log",
-                "min_log_level": "product_default"
-            }),
-        );
-    }
-
     fn current_sid() -> String {
         let mut token = std::ptr::null_mut();
         // SAFETY: the pseudo process handle is valid and OpenProcessToken writes one handle.
@@ -1095,20 +1022,11 @@ mod tests {
         // A later validated import added pairing after the first worker exited
         // before applying its stage.
         fs::create_dir_all(machine.join(pairing_relative.parent().unwrap())).unwrap();
-        let imported_pairing = serde_json::json!({
-            "identity": {
-                "host_id": "12345678-1234-4234-8234-123456789abc",
-                "certificate_pem": HOST_CERTIFICATE,
-                "private_key_pem": HOST_PRIVATE_KEY
-            },
-            "clients": []
-        });
-        write_namespace_value(
-            &machine,
-            "amaterasu.pairing",
-            "pairing/v1",
-            imported_pairing,
-        );
+        fs::write(
+            machine.join(&pairing_relative),
+            br#"{"format_version":1,"revision":1,"values":{"pairing/v1":{"identity":"new"}}}"#,
+        )
+        .unwrap();
         assert_eq!(
             stage_seed_snapshot(&machine, &container, &sid).unwrap(),
             staged
@@ -1119,10 +1037,7 @@ mod tests {
         assert_eq!(result.values["authentication/v1"]["credential"], "current");
         assert_eq!(result.revision, 7);
         let pairing = read_seed_namespace(&user.join(&pairing_relative)).unwrap();
-        assert_eq!(
-            pairing.values["pairing/v1"]["identity"]["host_id"],
-            "12345678-1234-4234-8234-123456789abc"
-        );
+        assert_eq!(pairing.values["pairing/v1"]["identity"], "new");
         assert!(user.join(".migration-seed-applied").exists());
 
         // A later validated import refreshes the service snapshot. The same
@@ -1248,143 +1163,6 @@ mod tests {
             read_seed_namespace(&user.join("namespaces").join(namespace).join("state.json"))
                 .unwrap();
         assert_eq!(imported.revision, 3);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn imported_pairing_identity_is_materialized_at_existing_user_tls_paths() {
-        let root = std::env::temp_dir().join(format!(
-            "amaterasu-state-root-imported-tls-custom-{}-{}",
-            std::process::id(),
-            amaterasu_package::random_identifier().unwrap()
-        ));
-        let seed = root.join("seed");
-        let user = root.join("user");
-        fs::create_dir_all(&seed).unwrap();
-        fs::create_dir_all(&user).unwrap();
-        let imported_pairing = write_pairing_identity_seed(&seed);
-        write_host_tls_settings(&user, "tls/host-cert.pem", "tls/host-key.pem");
-        fs::create_dir(user.join("tls")).unwrap();
-        let certificate_path = user.join("tls/host-cert.pem");
-        let private_key_path = user.join("tls/host-key.pem");
-        let sentinel = b"preexisting certificate file";
-        fs::write(&certificate_path, sentinel).unwrap();
-
-        assert!(super::apply_pending_seed(&seed, &user).is_err());
-        assert!(fs::read(&certificate_path).unwrap() == sentinel);
-        assert!(!user.join(".migration-seed-applied").exists());
-        fs::remove_file(&certificate_path).unwrap();
-
-        super::apply_pending_seed(&seed, &user).unwrap();
-        assert!(fs::read(&certificate_path).unwrap() == HOST_CERTIFICATE.as_bytes());
-        assert!(fs::read(&private_key_path).unwrap() == HOST_PRIVATE_KEY.as_bytes());
-        let namespace = read_seed_namespace(&namespace_path(&user, "amaterasu.pairing")).unwrap();
-        assert_eq!(namespace.values["pairing/v1"], imported_pairing);
-        assert_eq!(
-            namespace.values["pairing/v1"]["clients"][0]["certificate_pem"],
-            CLIENT_CERTIFICATE
-        );
-        let sid = current_sid();
-        let expected_dacl = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})");
-        validate_dacl(&certificate_path, &expected_dacl).unwrap();
-        validate_dacl(&private_key_path, &expected_dacl).unwrap();
-
-        // The same staged seed on a fresh worker start preserves the imported
-        // identity and the paired-client document.
-        super::apply_pending_seed(&seed, &user).unwrap();
-        assert!(fs::read(&certificate_path).unwrap() == HOST_CERTIFICATE.as_bytes());
-        assert!(fs::read(&private_key_path).unwrap() == HOST_PRIVATE_KEY.as_bytes());
-        let namespace = read_seed_namespace(&namespace_path(&user, "amaterasu.pairing")).unwrap();
-        assert_eq!(namespace.values["pairing/v1"], imported_pairing);
-        assert!(user.join(".migration-seed-applied").exists());
-
-        // A refreshed seed fingerprint replays into the same user root. Even
-        // though pairing/v1 already exists, its exact imported value wins and
-        // the configured identity is restored before completion is recorded.
-        fs::write(seed.join("updated-seed-marker"), b"updated").unwrap();
-        fs::remove_file(&certificate_path).unwrap();
-        fs::remove_file(&private_key_path).unwrap();
-        super::apply_pending_seed(&seed, &user).unwrap();
-        assert!(fs::read(&certificate_path).unwrap() == HOST_CERTIFICATE.as_bytes());
-        assert!(fs::read(&private_key_path).unwrap() == HOST_PRIVATE_KEY.as_bytes());
-        assert_eq!(
-            read_seed_namespace(&namespace_path(&user, "amaterasu.pairing"))
-                .unwrap()
-                .values["pairing/v1"],
-            imported_pairing
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn imported_pairing_identity_keeps_default_tls_paths() {
-        let root = std::env::temp_dir().join(format!(
-            "amaterasu-state-root-imported-tls-default-{}-{}",
-            std::process::id(),
-            amaterasu_package::random_identifier().unwrap()
-        ));
-        let seed = root.join("seed");
-        let user = root.join("user");
-        fs::create_dir_all(&seed).unwrap();
-        fs::create_dir_all(&user).unwrap();
-        let imported_pairing = write_pairing_identity_seed(&seed);
-
-        super::apply_pending_seed(&seed, &user).unwrap();
-        assert!(
-            fs::read(user.join("credentials/cacert.pem")).unwrap() == HOST_CERTIFICATE.as_bytes()
-        );
-        assert!(
-            fs::read(user.join("credentials/cakey.pem")).unwrap() == HOST_PRIVATE_KEY.as_bytes()
-        );
-        let namespace = read_seed_namespace(&namespace_path(&user, "amaterasu.pairing")).unwrap();
-        assert_eq!(namespace.values["pairing/v1"], imported_pairing);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn destination_pairing_and_custom_tls_identity_remain_authoritative() {
-        let root = std::env::temp_dir().join(format!(
-            "amaterasu-state-root-destination-pairing-{}-{}",
-            std::process::id(),
-            amaterasu_package::random_identifier().unwrap()
-        ));
-        let seed = root.join("seed");
-        let user = root.join("user");
-        fs::create_dir_all(&seed).unwrap();
-        fs::create_dir_all(&user).unwrap();
-        let seeded_pairing = write_pairing_identity_seed(&seed);
-        write_host_tls_settings(&seed, "credentials/./cacert.pem", "credentials/./cakey.pem");
-        let current_pairing = serde_json::json!({
-            "identity": {
-                "host_id": "87654321-1234-4234-8234-123456789abc",
-                "certificate_pem": CLIENT_CERTIFICATE,
-                "private_key_pem": CLIENT_PRIVATE_KEY
-            },
-            "clients": []
-        });
-        write_namespace_value(
-            &user,
-            "amaterasu.pairing",
-            "pairing/v1",
-            current_pairing.clone(),
-        );
-        write_host_tls_settings(&user, "tls/current-cert.pem", "tls/current-key.pem");
-        fs::create_dir(user.join("tls")).unwrap();
-        let certificate_path = user.join("tls/current-cert.pem");
-        let private_key_path = user.join("tls/current-key.pem");
-        fs::write(&certificate_path, CLIENT_CERTIFICATE).unwrap();
-        fs::write(&private_key_path, CLIENT_PRIVATE_KEY).unwrap();
-
-        super::apply_pending_seed(&seed, &user).unwrap();
-
-        let namespace = read_seed_namespace(&namespace_path(&user, "amaterasu.pairing")).unwrap();
-        assert_eq!(namespace.values["pairing/v1"], current_pairing);
-        assert_ne!(namespace.values["pairing/v1"], seeded_pairing);
-        assert!(fs::read(&certificate_path).unwrap() == CLIENT_CERTIFICATE.as_bytes());
-        assert!(fs::read(&private_key_path).unwrap() == CLIENT_PRIVATE_KEY.as_bytes());
-        assert!(!user.join("credentials/cacert.pem").exists());
-        assert!(!user.join("credentials/cakey.pem").exists());
-        assert!(user.join(".migration-seed-applied").exists());
         let _ = fs::remove_dir_all(root);
     }
 

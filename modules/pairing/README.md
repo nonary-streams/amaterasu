@@ -297,9 +297,17 @@ or over-capacity sources fail closed.
 
 `seed_pairing_state` holds the normal state-root lock and writes the pairing
 module's ordinary caller namespace in the same versioned format as the state
-module. It writes only an empty namespace and leaves any existing Amaterasu
-pairing state untouched. Its errors are fixed codes; neither API exposes
-legacy key, certificate, or credential contents.
+module. Beside `pairing/v1`, it stores a digest-only continuity marker; seeding
+does not materialize PEM or private-key files. At startup, the pairing module
+checks the marker and pairing document from one state snapshot. If the imported
+document is still authoritative, it validates and provisions that identity at
+the effective configured certificate and key paths before normal initialization
+can generate a first-run identity. It consumes the marker only after successful
+provisioning. A destination pairing document remains authoritative, and partial
+or conflicting target files fail closed. The seeder writes only an empty
+namespace and leaves any existing Amaterasu pairing state untouched. Its errors
+are fixed codes; neither API exposes legacy key, certificate, or credential
+contents.
 
 The installer process boundary is the sibling executable
 `amaterasu-pairing-import.exe`: `validate --source SOURCE` performs no writes,

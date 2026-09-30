@@ -1,5 +1,6 @@
 //! First-run provisioning for the host-configured TLS identity files.
 use crate::{crypto, protocol::Identity};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -116,6 +117,34 @@ pub(super) fn materialize_imported_identity_pair(
         }
         _ => Err("identity_file_conflict"),
     }
+}
+
+/// A generic user-state merge may copy the imported files even when a newer
+/// destination pairing document wins. Do not let those losing files become
+/// the effective TLS identity; leave them untouched and fail readiness.
+pub(super) fn reject_imported_identity_files(
+    certificate_value: &str,
+    private_key_value: &str,
+    certificate_sha256: &str,
+    private_key_sha256: &str,
+) -> Result<(), &'static str> {
+    let certificate_matches = identity_file_matches_digest(certificate_value, certificate_sha256)?;
+    let private_key_matches = identity_file_matches_digest(private_key_value, private_key_sha256)?;
+    if certificate_matches || private_key_matches {
+        return Err("identity_file_conflict");
+    }
+    Ok(())
+}
+
+fn identity_file_matches_digest(path_value: &str, expected: &str) -> Result<bool, &'static str> {
+    let path = Path::new(path_value);
+    if inspect_target(path)? == TargetState::Missing {
+        return Ok(false);
+    }
+    let contents = super::snapshot::read_identity_file(path_value)?;
+    let digest = Sha256::digest(contents.as_bytes());
+    let actual: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(actual == expected)
 }
 
 fn current_time() -> Result<u64, &'static str> {
@@ -320,38 +349,74 @@ fn create_private_file(path: &Path, bytes: &[u8]) -> Result<File, &'static str> 
 }
 
 fn remove_created_file_if_same(path: &Path, file: File) {
-    let Ok(created_metadata) = file.metadata() else {
-        return;
-    };
-    drop(file);
     let Ok(current_metadata) = fs::symlink_metadata(path) else {
         return;
     };
-    if is_reparse_or_symlink(&current_metadata) || !same_file(&created_metadata, &current_metadata)
-    {
+    if is_reparse_or_symlink(&current_metadata) {
         return;
     }
-    let _ = fs::remove_file(path);
-}
-
-#[cfg(unix)]
-fn same_file(created: &fs::Metadata, current: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    created.dev() == current.dev() && created.ino() == current.ino()
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(created) = file.metadata() else {
+            return;
+        };
+        drop(file);
+        let Ok(current) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if is_reparse_or_symlink(&current)
+            || created.dev() != current.dev()
+            || created.ino() != current.ino()
+        {
+            return;
+        }
+        let _ = fs::remove_file(path);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let Some(created_identity) = windows_file_identity(&file) else {
+            return;
+        };
+        drop(file);
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let Ok(current) = options.open(path) else {
+            return;
+        };
+        if windows_file_identity(&current) != Some(created_identity) {
+            return;
+        }
+        let _ = fs::remove_file(path);
+        drop(current);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        drop(file);
+    }
 }
 
 #[cfg(windows)]
-fn same_file(created: &fs::Metadata, current: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    created.volume_serial_number().is_some()
-        && created.volume_serial_number() == current.volume_serial_number()
-        && created.file_index().is_some()
-        && created.file_index() == current.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file(_created: &fs::Metadata, _current: &fs::Metadata) -> bool {
-    false
+fn windows_file_identity(file: &File) -> Option<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+    };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the borrowed file handle is live and the API writes one complete
+    // BY_HANDLE_FILE_INFORMATION value into this initialized output buffer.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) } == 0
+    {
+        return None;
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Some((information.dwVolumeSerialNumber, file_index))
 }
 
 fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {

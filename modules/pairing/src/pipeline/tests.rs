@@ -1375,9 +1375,17 @@ struct HostConfigurationHarness {
     incoming: Option<Response>,
     output: Option<Value>,
     state_document: Option<Value>,
+    migration_marker: Option<Value>,
     state_revision: u64,
     state_requests: usize,
     state_writes: usize,
+    migration_state_requests: usize,
+    migration_state_writes: usize,
+    pending_migration_delete_revision: Option<u64>,
+    fail_marker_delete_once: bool,
+    snapshot_prior_page: bool,
+    snapshot_page_count: usize,
+    snapshot_revision_conflict: bool,
     state_save_pending: bool,
     polls: usize,
 }
@@ -1394,9 +1402,17 @@ impl HostConfigurationHarness {
             incoming: None,
             output: None,
             state_document: None,
+            migration_marker: None,
             state_revision: 0,
             state_requests: 0,
             state_writes: 0,
+            migration_state_requests: 0,
+            migration_state_writes: 0,
+            pending_migration_delete_revision: None,
+            fail_marker_delete_once: false,
+            snapshot_prior_page: false,
+            snapshot_page_count: 0,
+            snapshot_revision_conflict: false,
             state_save_pending: false,
             polls: 0,
         }
@@ -1426,7 +1442,7 @@ impl HostConfigurationHarness {
         time: u64,
     ) -> Value {
         self.enqueue(caller, payload);
-        for _ in 0..6 {
+        for _ in 0..12 {
             pipeline
                 .tick_at(time, |command| self.send(command))
                 .unwrap();
@@ -1470,21 +1486,33 @@ impl HostConfigurationHarness {
             },
             Command::Request {
                 service, payload, ..
-            } if service == STATE_SERVICE => {
-                assert_eq!(payload["key"], STATE_KEY);
-                self.state_requests += 1;
-                match payload["action"].as_str() {
-                    Some("get") => Response::Accepted { id: 72 },
-                    Some("set") => {
-                        assert_eq!(payload["expected_revision"], self.state_revision);
-                        self.state_writes += 1;
-                        self.state_document = Some(payload["value"].clone());
-                        self.state_revision += 1;
-                        Response::Accepted { id: 73 }
-                    }
-                    _ => panic!("unexpected pairing state operation"),
+            } if service == STATE_SERVICE => match payload["action"].as_str() {
+                Some("snapshot") => {
+                    self.migration_state_requests += 1;
+                    Response::Accepted { id: 74 }
                 }
-            }
+                Some("delete") => {
+                    assert_eq!(payload["key"], IMPORTED_IDENTITY_MIGRATION_KEY);
+                    self.migration_state_writes += 1;
+                    self.pending_migration_delete_revision = payload["expected_revision"].as_u64();
+                    Response::Accepted { id: 75 }
+                }
+                Some("get") => {
+                    assert_eq!(payload["key"], STATE_KEY);
+                    self.state_requests += 1;
+                    Response::Accepted { id: 72 }
+                }
+                Some("set") => {
+                    assert_eq!(payload["key"], STATE_KEY);
+                    self.state_requests += 1;
+                    assert_eq!(payload["expected_revision"], self.state_revision);
+                    self.state_writes += 1;
+                    self.state_document = Some(payload["value"].clone());
+                    self.state_revision += 1;
+                    Response::Accepted { id: 73 }
+                }
+                _ => panic!("unexpected pairing state operation"),
+            },
             Command::TakeResult { request: 72 } => Response::Result {
                 payload: json!({
                     "ok":true,
@@ -1493,6 +1521,78 @@ impl HostConfigurationHarness {
                     "value":self.state_document.clone()
                 }),
             },
+            Command::TakeResult { request: 74 } => {
+                if self.snapshot_prior_page && self.snapshot_page_count == 0 {
+                    self.snapshot_page_count += 1;
+                    return Ok(Response::Result {
+                        payload: json!({
+                            "ok":true,
+                            "revision":self.state_revision,
+                            "values":{"before-pairing":1},
+                            "next_cursor":{"revision":self.state_revision,"after":"before-pairing"}
+                        }),
+                    });
+                }
+                if self.snapshot_revision_conflict && self.snapshot_page_count == 1 {
+                    self.snapshot_page_count += 1;
+                    self.state_revision += 1;
+                    return Ok(Response::Result {
+                        payload: json!({
+                            "ok":false,
+                            "error":{"code":"revision_conflict"},
+                            "revision":self.state_revision
+                        }),
+                    });
+                }
+                self.snapshot_page_count += 1;
+                let mut values = Map::new();
+                if let Some(document) = &self.state_document {
+                    values.insert(STATE_KEY.into(), document.clone());
+                }
+                if let Some(marker) = &self.migration_marker {
+                    values.insert(IMPORTED_IDENTITY_MIGRATION_KEY.into(), marker.clone());
+                }
+                Response::Result {
+                    payload: json!({
+                        "ok":true,
+                        "revision":self.state_revision,
+                        "values":values,
+                        "next_cursor":null
+                    }),
+                }
+            }
+            Command::TakeResult { request: 75 } => {
+                let expected_revision = self.pending_migration_delete_revision.take().unwrap();
+                if self.fail_marker_delete_once {
+                    self.fail_marker_delete_once = false;
+                    self.state_revision += 1;
+                    Response::Result {
+                        payload: json!({
+                            "ok":false,
+                            "error":{"code":"revision_conflict"},
+                            "revision":self.state_revision
+                        }),
+                    }
+                } else if expected_revision != self.state_revision {
+                    Response::Result {
+                        payload: json!({
+                            "ok":false,
+                            "error":{"code":"revision_conflict"},
+                            "revision":self.state_revision
+                        }),
+                    }
+                } else {
+                    let deleted = self.migration_marker.take().is_some();
+                    self.state_revision += 1;
+                    Response::Result {
+                        payload: json!({
+                            "ok":true,
+                            "deleted":deleted,
+                            "revision":self.state_revision
+                        }),
+                    }
+                }
+            }
             Command::TakeResult { request: 73 } if self.state_save_pending => Response::Pending,
             Command::TakeResult { request: 73 } => Response::Result {
                 payload: json!({"ok":true,"revision":self.state_revision}),
@@ -1587,6 +1687,11 @@ fn stored_document_with_fixture_identity(clients: Value) -> Value {
     })
 }
 
+fn imported_identity_marker(document: &Value) -> Value {
+    let document = serde_json::from_value(document.clone()).unwrap();
+    crate::identity::imported_identity_migration_marker(&document).unwrap()
+}
+
 #[test]
 fn configured_pipeline_calls_readiness_then_get_once_before_pairing_state() {
     let (directory, effective) = configured_fixture_files();
@@ -1616,6 +1721,305 @@ fn configured_pipeline_calls_readiness_then_get_once_before_pairing_state() {
     );
     assert_eq!(list_clients["code"], "not_initialized");
     assert_eq!(harness.actions, ["readiness", "get"]);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn imported_pairing_identity_materializes_before_generation_and_survives_restart() {
+    let document = stored_document_with_fixture_identity(paired_fixture_client());
+    let marker = imported_identity_marker(&document);
+    let (directory, effective) = configured_identity_files(HOST_CERT, HOST_KEY);
+    let certificate_path = effective["cert"].as_str().unwrap().to_owned();
+    let private_key_path = effective["pkey"].as_str().unwrap().to_owned();
+    std::fs::remove_file(&certificate_path).unwrap();
+    std::fs::remove_file(&private_key_path).unwrap();
+    let mut harness = HostConfigurationHarness::new(effective.clone());
+    harness.state_document = Some(document.clone());
+    harness.migration_marker = Some(marker);
+    harness.state_revision = 6;
+    let mut pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+    let time = now();
+
+    let response = harness.request(&mut pipeline, "console", json!({"action":"identity"}), time);
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["certificate_pem"], HOST_CERT);
+    assert_eq!(response["host_id"], document["identity"]["host_id"]);
+    assert_eq!(
+        std::fs::read(certificate_path).unwrap(),
+        HOST_CERT.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(private_key_path).unwrap(),
+        HOST_KEY.as_bytes()
+    );
+    assert!(harness.migration_marker.is_none());
+    assert_eq!(harness.migration_state_writes, 1);
+    let first = pipeline.identity.get(time).unwrap();
+    let fingerprint = crate::crypto::parse_certificate(HOST_CERT, Some(time))
+        .unwrap()
+        .fingerprint;
+    assert_eq!(first.certificate(), crypto_certificate_der(HOST_CERT));
+    assert!(first.verify_client(&crypto_certificate_der(CLIENT_CERT), time));
+
+    // Restart sees the durable files and client list after the one-shot marker
+    // was consumed; it keeps the same TLS fingerprint and paired-client trust.
+    let mut restarted_harness = HostConfigurationHarness::new(effective);
+    restarted_harness.state_document = Some(document);
+    restarted_harness.state_revision = harness.state_revision;
+    let mut restarted =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+    let restarted_response = restarted_harness.request(
+        &mut restarted,
+        "console",
+        json!({"action":"identity"}),
+        time,
+    );
+    assert_eq!(restarted_response["certificate_pem"], HOST_CERT);
+    assert_eq!(
+        crate::crypto::parse_certificate(
+            restarted_response["certificate_pem"].as_str().unwrap(),
+            Some(time)
+        )
+        .unwrap()
+        .fingerprint,
+        fingerprint
+    );
+    let restarted_snapshot = restarted.identity.get(time).unwrap();
+    assert!(restarted_snapshot.verify_client(&crypto_certificate_der(CLIENT_CERT), time));
+    assert_eq!(restarted_harness.migration_state_writes, 0);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn imported_identity_materialization_retries_after_marker_delete_conflict() {
+    let document = stored_document_with_fixture_identity(paired_fixture_client());
+    let marker = imported_identity_marker(&document);
+    let (directory, effective) = configured_identity_files(HOST_CERT, HOST_KEY);
+    let certificate_path = effective["cert"].as_str().unwrap();
+    let private_key_path = effective["pkey"].as_str().unwrap();
+    std::fs::remove_file(certificate_path).unwrap();
+    std::fs::remove_file(private_key_path).unwrap();
+    let mut first_harness = HostConfigurationHarness::new(effective.clone());
+    first_harness.state_document = Some(document.clone());
+    first_harness.migration_marker = Some(marker.clone());
+    first_harness.state_revision = 6;
+    first_harness.fail_marker_delete_once = true;
+    let mut first_pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+    let failure = first_harness.request(
+        &mut first_pipeline,
+        "console",
+        json!({"action":"identity"}),
+        now(),
+    );
+    assert_eq!(failure["code"], "host_configuration_unavailable");
+    assert_eq!(first_harness.migration_marker, Some(marker.clone()));
+    assert_eq!(
+        std::fs::read(certificate_path).unwrap(),
+        HOST_CERT.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(private_key_path).unwrap(),
+        HOST_KEY.as_bytes()
+    );
+
+    // The exact pair already exists after the interrupted attempt. A new
+    // process validates/protects it, retries the marker CAS, and becomes ready.
+    let mut retry_harness = HostConfigurationHarness::new(effective);
+    retry_harness.state_document = Some(document);
+    retry_harness.migration_marker = Some(marker);
+    retry_harness.state_revision = first_harness.state_revision;
+    let mut retry_pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+    let retried = retry_harness.request(
+        &mut retry_pipeline,
+        "console",
+        json!({"action":"identity"}),
+        now(),
+    );
+    assert_eq!(retried["certificate_pem"], HOST_CERT);
+    assert!(retry_harness.migration_marker.is_none());
+    assert!(
+        retry_pipeline
+            .identity
+            .get(now())
+            .unwrap()
+            .verify_client(&crypto_certificate_der(CLIENT_CERT), now())
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn imported_identity_state_snapshot_follows_pages_at_one_revision() {
+    let document = stored_document_with_fixture_identity(paired_fixture_client());
+    let marker = imported_identity_marker(&document);
+    let (directory, effective) = configured_identity_files(HOST_CERT, HOST_KEY);
+    let certificate_path = effective["cert"].as_str().unwrap();
+    let private_key_path = effective["pkey"].as_str().unwrap();
+    std::fs::remove_file(certificate_path).unwrap();
+    std::fs::remove_file(private_key_path).unwrap();
+    let mut harness = HostConfigurationHarness::new(effective.clone());
+    harness.state_document = Some(document.clone());
+    harness.migration_marker = Some(marker.clone());
+    harness.state_revision = 6;
+    harness.snapshot_prior_page = true;
+    let mut pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+
+    let response = harness.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"identity"}),
+        now(),
+    );
+    assert_eq!(response["certificate_pem"], HOST_CERT);
+    assert_eq!(harness.snapshot_page_count, 2);
+    assert!(harness.migration_marker.is_none());
+    std::fs::remove_dir_all(directory).unwrap();
+
+    let (directory, effective) = configured_identity_files(HOST_CERT, HOST_KEY);
+    let certificate_path = effective["cert"].as_str().unwrap().to_owned();
+    let private_key_path = effective["pkey"].as_str().unwrap().to_owned();
+    std::fs::remove_file(&certificate_path).unwrap();
+    std::fs::remove_file(&private_key_path).unwrap();
+    let mut conflicted = HostConfigurationHarness::new(effective);
+    conflicted.state_document = Some(document);
+    conflicted.migration_marker = Some(marker);
+    conflicted.state_revision = 6;
+    conflicted.snapshot_prior_page = true;
+    conflicted.snapshot_revision_conflict = true;
+    let mut conflicted_pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+    let failure = conflicted.request(
+        &mut conflicted_pipeline,
+        "console",
+        json!({"action":"identity"}),
+        now(),
+    );
+    assert_eq!(failure["code"], "host_configuration_unavailable");
+    assert!(conflicted.migration_marker.is_some());
+    assert!(!std::path::Path::new(&certificate_path).exists());
+    assert!(!std::path::Path::new(&private_key_path).exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_existing_imported_pair_is_tightened_before_marker_consumption() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let document = stored_document_with_fixture_identity(paired_fixture_client());
+    let marker = imported_identity_marker(&document);
+    let (directory, effective) = configured_identity_files(HOST_CERT, HOST_KEY);
+    let certificate_path = effective["cert"].as_str().unwrap().to_owned();
+    let private_key_path = effective["pkey"].as_str().unwrap().to_owned();
+    std::fs::set_permissions(&certificate_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(&private_key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut harness = HostConfigurationHarness::new(effective);
+    harness.state_document = Some(document);
+    harness.migration_marker = Some(marker);
+    harness.state_revision = 2;
+    let mut pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+
+    let response = harness.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"identity"}),
+        now(),
+    );
+    assert_eq!(response["certificate_pem"], HOST_CERT);
+    assert_eq!(
+        std::fs::metadata(&certificate_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(&private_key_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(harness.migration_marker.is_none());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn destination_tls_files_remain_authoritative_when_imported_pairing_value_loses() {
+    let imported_document = stored_document_with_fixture_identity(json!([]));
+    let marker = imported_identity_marker(&imported_document);
+    let destination_identity = crate::crypto::generate_identity().unwrap();
+    let destination_document = json!({
+        "identity": destination_identity,
+        "clients": []
+    });
+    let (directory, effective) = configured_identity_files(CLIENT_CERT, CLIENT_KEY);
+    let mut harness = HostConfigurationHarness::new(effective);
+    harness.state_document = Some(destination_document.clone());
+    harness.migration_marker = Some(marker);
+    harness.state_revision = 3;
+    let mut pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+
+    let response = harness.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"identity"}),
+        now(),
+    );
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["certificate_pem"], CLIENT_CERT);
+    assert_eq!(
+        response["host_id"],
+        destination_document["identity"]["host_id"]
+    );
+    assert!(harness.migration_marker.is_none());
+    assert_eq!(
+        std::fs::read_to_string(harness.effective["cert"].as_str().unwrap()).unwrap(),
+        CLIENT_CERT
+    );
+    assert_eq!(
+        std::fs::read_to_string(harness.effective["pkey"].as_str().unwrap()).unwrap(),
+        CLIENT_KEY
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn exact_import_with_partial_or_conflicting_files_fails_without_repair() {
+    let document = stored_document_with_fixture_identity(json!([]));
+    let marker = imported_identity_marker(&document);
+    let (directory, effective) = configured_identity_files(HOST_CERT, HOST_KEY);
+    let certificate_path = effective["cert"].as_str().unwrap().to_owned();
+    let private_key_path = effective["pkey"].as_str().unwrap().to_owned();
+    std::fs::write(&certificate_path, b"destination certificate").unwrap();
+    std::fs::remove_file(&private_key_path).unwrap();
+    let mut harness = HostConfigurationHarness::new(effective);
+    harness.state_document = Some(document);
+    harness.migration_marker = Some(marker);
+    harness.state_revision = 3;
+    let mut pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+
+    let response = harness.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"identity"}),
+        now(),
+    );
+    assert_eq!(response["code"], "host_configuration_unavailable");
+    assert!(harness.migration_marker.is_some());
+    assert_eq!(
+        std::fs::read(&certificate_path).unwrap(),
+        b"destination certificate"
+    );
+    assert!(!std::path::Path::new(&private_key_path).exists());
     std::fs::remove_dir_all(directory).unwrap();
 }
 
