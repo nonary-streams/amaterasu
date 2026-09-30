@@ -41,7 +41,10 @@ XDG directories and profile stay in a private temporary directory.
 
 This gate exercises actual UI remembered login and page reload, HttpOnly cookie
 secrecy, CSRF denial, native refresh rotation and administrative revocation,
-policy save and stale-revision conflict, native host restart persistence, and
+policy save and stale-revision conflict, native host restart persistence, and a
+cold Chromium process restart with the same profile. Before closing Chromium,
+the gate removes the session-only access cookie and confirms that the persistent
+remembered cookie restores the signed-in UI in the new process. It also checks
 peer-tab sign-out. An injected post-admission failure also checks browser helper
 cleanup through retained process descriptors. Chromium receives a certificate
 exception for only the newly generated SPKI key; an unrelated untrusted key

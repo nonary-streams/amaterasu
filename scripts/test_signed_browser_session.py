@@ -128,18 +128,18 @@ class OwnedBrowser:
 
     marker_name = b"AMATERASU_SIGNED_BROWSER_FIXTURE"
 
-    def __init__(self, directory, executable, spki):
+    def __init__(self, directory, executable, spki, reuse_profile=False):
         self.directory = directory
-        self.directory.mkdir(mode=0o700)
+        self.directory.mkdir(mode=0o700, exist_ok=reuse_profile)
         self.profile = directory / "profile"
-        self.profile.mkdir(mode=0o700)
+        self.profile.mkdir(mode=0o700, exist_ok=reuse_profile)
         self.executable = executable
         self.spki = spki
         self.child = None
         self.descriptors = {}
         self.marker = secrets.token_hex(32).encode("ascii")
-        self.errors = (directory / "browser.stderr").open("w")
-        (directory / "browser.stderr").chmod(0o600)
+        self.errors = (directory / f"browser-{time.time_ns()}.stderr").open("w")
+        Path(self.errors.name).chmod(0o600)
 
     def belongs(self, process):
         if process.stat().st_uid != os.geteuid():
@@ -361,17 +361,21 @@ class BrowserDriver:
         return reply["result"]
 
     def close(self):
+        forced = False
         if not self.child.stdin.closed:
             self.child.stdin.close()
         try:
             self.child.wait(timeout=15)
         except subprocess.TimeoutExpired:
+            forced = True
             self.child.terminate()
             try:
                 self.child.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.child.kill()
                 self.child.wait(timeout=3)
+        assert not forced, "browser driver required forced termination instead of orderly shutdown"
+        assert self.child.returncode == 0, "browser driver did not exit cleanly"
 
 
 def sessions(console):
@@ -443,7 +447,28 @@ def exercise(directory, executable):
         driver.phase("after_restart")
         current = sessions(console)
         assert len(current) == 1 and current[0]["session_id"] == rotated[0]["session_id"], "native restart lost remembered session identity"
-        revoked = console.request("amaterasu.authentication/1", {"action": "revoke_session", "session_id": current[0]["session_id"]})
+        # Restart Chromium itself with the same private profile. The remembered
+        # refresh cookie must restore browser authority in a fresh process after
+        # the native host has independently restarted.
+        profile = browser.profile
+        browser_owner_directory = browser.directory
+        prior_identity = next(identity for identity in browser.descriptors if identity[0] == browser.child.pid)
+        driver.phase("prepare_cold_restart")
+        driver.close()
+        driver = None
+        browser.close()
+        browser = None
+        browser = OwnedBrowser(browser_owner_directory, executable, spki, reuse_profile=True)
+        assert browser.profile == profile, "cold browser restart changed the private profile"
+        debugger = browser.start()
+        next_identity = next(identity for identity in browser.descriptors if identity[0] == browser.child.pid)
+        assert next_identity != prior_identity, "cold browser restart reused the prior process identity"
+        driver = BrowserDriver()
+        driver.phase("cold_restart", debugger=debugger, origin=origin, profile=str(profile), spki=spki)
+        cold_sessions = sessions(console)
+        assert len(cold_sessions) == 1 and cold_sessions[0]["session_id"] != rotated[0]["session_id"], "cold browser restart did not rotate the native session"
+        assert cold_sessions[0]["refresh_expires_at"] == rotated[0]["refresh_expires_at"], "cold browser refresh extended the remembered session deadline"
+        revoked = console.request("amaterasu.authentication/1", {"action": "revoke_session", "session_id": cold_sessions[0]["session_id"]})
         assert revoked.get("ok"), "trusted-console session revocation failed"
         assert sessions(console) == [], "trusted-console revocation did not remove the native session"
         driver.phase("revoked")
@@ -481,7 +506,7 @@ def main():
         run("npm", "--prefix", WORKSPACE / "frontend", "run", "build")
     with tempfile.TemporaryDirectory(prefix="amaterasu-signed-browser-") as temporary:
         exercise(Path(temporary), executable)
-    print("Passed: actual Chromium with signed native HTTPS/frontend, remembered UI login/reload, HttpOnly cookie secrecy, exact CSRF checks, native refresh/revocation, UI CAS/stale editor, host restart and peer signout; SPKI-key exception negative control and owned browser abort cleanup.")
+    print("Passed: actual Chromium with signed native HTTPS/frontend, remembered UI login/reload and cold-process restoration from the persistent cookie, HttpOnly cookie secrecy, exact CSRF checks, native refresh/revocation, UI CAS/stale editor, host restart and peer signout; SPKI-key exception negative control and owned browser abort cleanup.")
     print("Unqualified: installed CA/service TLS provisioning, physical remote browsers, Windows/macOS and game-visible streaming.")
 
 

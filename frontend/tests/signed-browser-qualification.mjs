@@ -276,6 +276,44 @@ async function afterRestart() {
   return { restored: true };
 }
 
+async function prepareColdRestart() {
+  // Remove the session-only access cookie before closing Chromium. A later
+  // process can restore authority only from the persistent remembered cookie.
+  await debuggerClient.command("Network.deleteCookies", { name: accessName, url: `${origin}/v1` }, first.sessionId);
+  const { cookies } = await debuggerClient.command("Storage.getCookies");
+  check(!cookies.some((cookie) => cookie.name === accessName) &&
+    cookies.some((cookie) => cookie.name === refreshName && !cookie.session),
+  "cold restart did not leave only the persistent remembered cookie");
+  return { refresh_cookie_retained: true };
+}
+
+async function coldRestart(options) {
+  origin = options.origin;
+  check(new URL(origin).hostname === "127.0.0.1" && new URL(origin).protocol === "https:",
+    "native origin must be loopback HTTPS");
+  debuggerClient = new Debugger();
+  await debuggerClient.connect(options.debugger);
+  const command = await debuggerClient.command("Browser.getBrowserCommandLine");
+  check(command.arguments.includes(`--user-data-dir=${options.profile}`) &&
+    command.arguments.includes(`--ignore-certificate-errors-spki-list=${options.spki}`),
+  "cold browser profile/SPKI selection differs");
+  check(!command.arguments.some((argument) => ["--ignore-certificate-errors", "--disable-web-security", "--no-sandbox"].includes(argument.split("=", 1)[0])),
+    "cold browser enabled a broad security bypass");
+  first = await page(`${origin}/#settings`);
+  await signedIn(first);
+  await policyReady(first);
+  peer = await page(`${origin}/#settings`);
+  await signedIn(peer);
+  await policyReady(peer);
+  const restored = await policy(first);
+  check(restored.ok && restored.revision === 1 && restored.selection === "pc",
+    "persistent remembered cookie did not restore the signed management session");
+  await cookieState();
+  check(observed.some((request) => request.path === "/v1/auth/browser/refresh" && request.status === 200),
+    "cold browser process did not restore through native remembered-cookie refresh");
+  return { restored: true, remembered_cookie_refresh: true };
+}
+
 async function revoked() {
   await button(first, "Refresh policy");
   await signedOut(first);
@@ -301,8 +339,8 @@ async function logout(options) {
   await signedOut(first);
   const cookieRequests = observed.filter((request) => request.method === "POST" && request.path.startsWith("/v1/auth/browser/"));
   check(cookieRequests.every((request) => request.csrf && !request.authorization), "production browser auth omitted CSRF or used a bearer");
-  check(observed.filter((request) => request.path === "/v1/auth/browser/login" && request.status === 200).length === 2,
-    "reload/restart unexpectedly required credential login");
+  check(observed.filter((request) => request.path === "/v1/auth/browser/login" && request.status === 200).length === 1,
+    "cold restore or post-logout reload unexpectedly required credential login");
   return { peer_signed_out: true };
 }
 
@@ -311,7 +349,8 @@ try {
   for await (const line of commands) {
     const request = JSON.parse(line);
     try {
-      const handlers = { initial, refresh, after_restart: afterRestart, revoked, logout };
+      const handlers = { initial, refresh, after_restart: afterRestart, prepare_cold_restart: prepareColdRestart,
+        cold_restart: coldRestart, revoked, logout };
       check(Object.hasOwn(handlers, request.action), "unknown browser qualification phase");
       const result = await handlers[request.action](request);
       process.stdout.write(JSON.stringify({ ok: true, result }) + "\n");
