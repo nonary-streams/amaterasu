@@ -2,6 +2,7 @@
 #![recursion_limit = "256"]
 
 mod frame_limiter;
+pub mod global_flags;
 mod launch;
 mod network_settings;
 mod preparation;
