@@ -883,7 +883,6 @@ impl ProcessManager {
                 steam_install_dir,
                 detached,
                 preparation,
-                proton_dualsense_compatibility: _,
                 virtual_display_intent,
             } => {
                 if virtual_display_intent

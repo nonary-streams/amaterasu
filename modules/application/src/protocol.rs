@@ -42,9 +42,6 @@ pub(crate) enum Action {
         #[serde(default)]
         preparation: Box<[PreparationStep]>,
         #[serde(default)]
-        #[allow(dead_code)]
-        proton_dualsense_compatibility: bool,
-        #[serde(default)]
         virtual_display_intent: Option<Box<VirtualDisplayIntent>>,
     },
     Lookup {
