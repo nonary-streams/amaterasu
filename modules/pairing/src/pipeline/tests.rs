@@ -1130,6 +1130,220 @@ fn read_refresh_is_atomic_and_failed_load_or_save_suspends_native_identity() {
     assert!(pipeline.identity.get(now()).is_err());
 }
 
+fn paired_native_client() -> (Pipeline, Harness, String) {
+    let mut pipeline = Pipeline::new(settings());
+    let mut harness = Harness::new();
+    harness.initialize(&mut pipeline);
+    let result = harness.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action":"import_client",
+            "client_id":"native-client",
+            "name":"Native client",
+            "certificate_pem":CLIENT_CERT
+        }),
+        now(),
+    );
+    assert_eq!(result["ok"], true);
+    let certificate_id = crate::crypto::parse_certificate(CLIENT_CERT, None)
+        .unwrap()
+        .fingerprint;
+    (pipeline, harness, certificate_id)
+}
+
+#[test]
+fn client_configuration_cas_preserves_confirmed_trust_until_atomic_acknowledgement() {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    let client = crypto_certificate_der(CLIENT_CERT);
+    let confirmed = pipeline.identity.get(now()).unwrap();
+    let base_revision = harness.revision;
+    harness.enqueue(
+        "console",
+        json!({
+            "action":"update_client_config_overrides",
+            "certificate_id":certificate_id,
+            "expected_revision":base_revision,
+            "config_overrides":{"sw_preset":"","sw_tune":"  film,zerolatency  "}
+        }),
+    );
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert!(pipeline.identity.current(&confirmed, now()));
+    assert!(confirmed.verify_client(&client, now()));
+
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert_eq!(harness.revision, base_revision + 1);
+    assert!(pipeline.identity.current(&confirmed, now()));
+    let acknowledgement = harness.state_reply.take();
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert!(pipeline.identity.current(&confirmed, now()));
+    harness.state_reply = acknowledgement;
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+
+    assert_eq!(harness.output.as_ref().unwrap()["ok"], true);
+    let committed = pipeline.identity.get(now()).unwrap();
+    assert!(committed.verify_client(&client, now()));
+    assert!(!pipeline.identity.current(&confirmed, now()));
+    let readback = harness.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"check_client_certificate","certificate_pem":CLIENT_CERT}),
+        now(),
+    );
+    assert_eq!(readback["config_overrides"]["sw_preset"], "");
+    assert_eq!(
+        readback["config_overrides"]["sw_tune"],
+        "  film,zerolatency  "
+    );
+    assert!(pipeline.identity.current(&committed, now()));
+}
+
+#[test]
+fn client_configuration_uncertain_load_or_commit_invalidates_native_authority() {
+    for failure in ["load", "save", "conflict", "ack_revision"] {
+        let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+        let confirmed = pipeline.identity.get(now()).unwrap();
+        let base_revision = harness.revision;
+        harness.fail_write = failure == "save";
+        harness.conflict_next_write = failure == "conflict";
+        harness.enqueue(
+            "console",
+            json!({
+                "action":"update_client_config_overrides",
+                "certificate_id":certificate_id,
+                "expected_revision":base_revision,
+                "config_overrides":{"sw_preset":"fast"}
+            }),
+        );
+        pipeline
+            .tick_at(now(), |command| harness.send(command))
+            .unwrap();
+        assert!(pipeline.identity.current(&confirmed, now()), "{failure}");
+        if failure == "load" {
+            harness.state_reply = Some(Response::Result {
+                payload: json!({"ok":true,"revision":base_revision,"found":true,"value":null}),
+            });
+        }
+        pipeline
+            .tick_at(now(), |command| harness.send(command))
+            .unwrap();
+        if failure != "load" {
+            assert!(pipeline.identity.current(&confirmed, now()), "{failure}");
+            if failure == "ack_revision" {
+                harness.state_reply = Some(Response::Result {
+                    payload: json!({"ok":true,"revision":base_revision + 2}),
+                });
+            }
+            pipeline
+                .tick_at(now(), |command| harness.send(command))
+                .unwrap();
+        }
+        assert!(pipeline.identity.get(now()).is_err(), "{failure}");
+        assert!(!pipeline.identity.current(&confirmed, now()), "{failure}");
+        let output = harness.output.as_ref().unwrap();
+        assert_eq!(output["ok"], false, "{failure}");
+        if failure == "ack_revision" {
+            assert_eq!(output["code"], "state_unavailable");
+        }
+    }
+}
+
+#[test]
+fn stale_client_configuration_revision_preserves_trust_without_writing() {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    let confirmed = pipeline.identity.get(now()).unwrap();
+    let writes = harness.writes;
+    let result = harness.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action":"update_client_config_overrides",
+            "certificate_id":certificate_id,
+            "expected_revision":harness.revision - 1,
+            "config_overrides":{"sw_preset":"fast"}
+        }),
+        now(),
+    );
+    assert_eq!(result["code"], "revision_conflict");
+    assert_eq!(harness.writes, writes);
+    assert!(pipeline.identity.current(&confirmed, now()));
+}
+
+#[test]
+fn abandoned_client_configuration_load_cannot_retain_unvalidated_authority() {
+    for expired in [false, true] {
+        let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+        let confirmed = pipeline.identity.get(now()).unwrap();
+        let writes = harness.writes;
+        harness.enqueue(
+            "console",
+            json!({
+                "action":"update_client_config_overrides",
+                "certificate_id":certificate_id,
+                "expected_revision":harness.revision,
+                "config_overrides":{"sw_preset":"fast"}
+            }),
+        );
+        pipeline
+            .tick_at(now(), |command| harness.send(command))
+            .unwrap();
+        assert!(pipeline.identity.current(&confirmed, now()));
+        // The returned durable state has not been validated when the parent
+        // deadline/cancellation guard stops this request.
+        harness.state_reply = Some(Response::Result {
+            payload: json!({"ok":true,"revision":harness.revision + 1,"found":true,"value":null}),
+        });
+        if expired {
+            pipeline.pending.as_mut().unwrap().request.deadline = Instant::now();
+        } else {
+            harness.check_cancelled = true;
+        }
+        pipeline
+            .tick_at(now(), |command| harness.send(command))
+            .unwrap();
+        assert!(pipeline.identity.get(now()).is_err());
+        assert!(!pipeline.identity.current(&confirmed, now()));
+        assert_eq!(harness.writes, writes);
+        assert_eq!(
+            harness.output.as_ref().unwrap()["code"],
+            if expired {
+                "deadline_exceeded"
+            } else {
+                "request_ended"
+            }
+        );
+    }
+}
+
+#[test]
+fn revision_exhaustion_cannot_submit_or_publish_client_configuration() {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    harness.revision = u64::MAX;
+    let writes = harness.writes;
+    let result = harness.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action":"update_client_config_overrides",
+            "certificate_id":certificate_id,
+            "expected_revision":u64::MAX,
+            "config_overrides":{"sw_preset":"fast"}
+        }),
+        now(),
+    );
+    assert_eq!(result["code"], "state_unavailable");
+    assert_eq!(harness.writes, writes);
+    assert!(pipeline.identity.get(now()).is_err());
+}
+
 fn crypto_certificate_der(pem: &str) -> Vec<u8> {
     crate::crypto::parse_certificate(pem, None)
         .unwrap()

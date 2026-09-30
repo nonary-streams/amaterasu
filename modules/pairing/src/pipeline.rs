@@ -34,6 +34,7 @@ enum Stage {
     Saving {
         response: Value,
         snapshot: Option<Arc<Snapshot>>,
+        expected_ack_revision: u64,
     },
 }
 
@@ -398,7 +399,7 @@ impl Pipeline {
                         error("identity_managed_by_host_configuration"),
                     );
                 }
-                if operation.may_write() {
+                if operation.may_write() && !is_client_configuration_update(&operation) {
                     self.identity.invalidate();
                 }
                 let request = Request {
@@ -474,12 +475,23 @@ impl Pipeline {
                 if payload["ok"] == true && payload["revision"].as_u64().is_some() =>
             {
                 match pending.stage {
-                    Stage::Saving { response, snapshot } => {
-                        self.publish_identity(payload["revision"].as_u64().unwrap(), snapshot)?;
+                    Stage::Saving {
+                        response,
+                        snapshot,
+                        expected_ack_revision,
+                    } => {
+                        if payload["revision"].as_u64() != Some(expected_ack_revision) {
+                            self.identity.invalidate();
+                            return complete(send, pending.request.id, error("state_unavailable"));
+                        }
+                        self.publish_identity(expected_ack_revision, snapshot)?;
                         complete(send, pending.request.id, response)
                     }
                     Stage::Loading(operation) => {
                         if Instant::now() >= pending.request.deadline {
+                            if is_client_configuration_update(&operation) {
+                                self.identity.invalidate();
+                            }
                             return complete(send, pending.request.id, error("deadline_exceeded"));
                         }
                         if !matches!(
@@ -488,6 +500,9 @@ impl Pipeline {
                             })?,
                             Response::Ok
                         ) {
+                            if is_client_configuration_update(&operation) {
+                                self.identity.invalidate();
+                            }
                             return complete(send, pending.request.id, error("request_ended"));
                         }
                         let configured_identity = self.configured_identity();
@@ -550,6 +565,13 @@ impl Pipeline {
                 return complete(send, request.id, error(code));
             }
         };
+        // Only this operation replaces configuration on an existing certificate.
+        // Publish the validated durable base while its CAS is pending; trust and
+        // identity mutations retain their fail-closed invalidation boundary.
+        let configuration_only = is_client_configuration_update(&operation);
+        if configuration_only {
+            self.publish_identity(revision, loaded.clone())?;
+        }
         if self.configured_identity().is_some()
             && document.identity.is_none()
             && !matches!(
@@ -618,6 +640,9 @@ impl Pipeline {
                 }
                 if let Some(document) = initialized_document {
                     self.identity.invalidate();
+                    let Some(expected_ack_revision) = revision.checked_add(1) else {
+                        return complete(send, request.id, error("state_unavailable"));
+                    };
                     let snapshot = match self.prepare_snapshot(&document, engine_now) {
                         Ok(snapshot) => snapshot,
                         Err(code) => {
@@ -626,7 +651,11 @@ impl Pipeline {
                     };
                     return self.submit(
                         request,
-                        Stage::Saving { response, snapshot },
+                        Stage::Saving {
+                            response,
+                            snapshot,
+                            expected_ack_revision,
+                        },
                         json!({
                             "action":"set",
                             "key":STATE_KEY,
@@ -648,14 +677,35 @@ impl Pipeline {
                     // durable pairing document keeps its original host PEMs.
                     document.identity = Some(identity);
                 }
-                self.identity.invalidate();
+                if !configuration_only {
+                    self.identity.invalidate();
+                }
+                let Some(expected_ack_revision) = revision.checked_add(1) else {
+                    self.identity.invalidate();
+                    return complete(send, request.id, error("state_unavailable"));
+                };
                 let snapshot = match self.prepare_snapshot(&document, now) {
                     Ok(snapshot) => snapshot,
                     Err(code) => {
+                        self.identity.invalidate();
                         return complete(send, request.id, error(code));
                     }
                 };
-                self.submit(request,Stage::Saving {response,snapshot},json!({"action":"set","key":STATE_KEY,"expected_revision":revision,"value":document}),send)
+                self.submit(
+                    request,
+                    Stage::Saving {
+                        response,
+                        snapshot,
+                        expected_ack_revision,
+                    },
+                    json!({
+                        "action":"set",
+                        "key":STATE_KEY,
+                        "expected_revision":revision,
+                        "value":document
+                    }),
+                    send,
+                )
             }
             Err(code) => {
                 self.publish_identity(revision, loaded)?;
@@ -709,6 +759,10 @@ impl Pipeline {
             snapshot,
         )
     }
+}
+
+fn is_client_configuration_update(operation: &Operation) -> bool {
+    matches!(operation, Operation::UpdateClientConfigOverrides { .. })
 }
 
 fn read_document(
