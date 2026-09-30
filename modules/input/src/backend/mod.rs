@@ -1,5 +1,6 @@
 use crate::gamepad_profile::GamepadProfile;
 use crate::model::{Event, InputResult, PenTouchDevice};
+use amaterasu_input_policy::KeyBindings;
 use std::time::Instant;
 
 pub trait Backend {
@@ -35,6 +36,9 @@ pub trait Backend {
     /// Maps the host's right-Alt virtual key to the left Windows key. Backends
     /// preserve the selected mapping for matching key-up events.
     fn set_key_rightalt_to_key_win(&mut self, _enabled: bool) {}
+    /// Selects an ordered whole keybinding list. Held native plans remain owned
+    /// until matching source key-up or cleanup, even when this policy changes.
+    fn set_keybindings(&mut self, _keybindings: &KeyBindings) {}
     /// Advances native timers that need service even when the client sends no packet.
     fn advance(&mut self, _now: Instant) -> InputResult<()> {
         Ok(())
@@ -62,6 +66,8 @@ pub use windows::WindowsBackend as NativeBackend;
 mod linux;
 #[cfg(any(target_os = "linux", test))]
 mod owned_devices;
+#[cfg(any(windows, target_os = "linux", test))]
+mod owned_keys;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend as NativeBackend;
 #[cfg(not(any(windows, target_os = "linux")))]

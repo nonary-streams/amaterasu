@@ -131,53 +131,6 @@ impl Key {
             Self::MoonlightVk { .. } => KeyEncoding::MoonlightVk,
         }
     }
-
-    pub fn canonical(&self) -> Self {
-        match self {
-            Self::MoonlightVk {
-                code: 0x10,
-                normalized,
-                repeat_modifiers,
-                temporary_modifier,
-            } => Self::MoonlightVk {
-                code: 0xa0,
-                normalized: *normalized,
-                repeat_modifiers: *repeat_modifiers,
-                temporary_modifier: *temporary_modifier,
-            },
-            Self::MoonlightVk {
-                code: 0x11,
-                normalized,
-                repeat_modifiers,
-                temporary_modifier,
-            } => Self::MoonlightVk {
-                code: 0xa2,
-                normalized: *normalized,
-                repeat_modifiers: *repeat_modifiers,
-                temporary_modifier: *temporary_modifier,
-            },
-            Self::MoonlightVk {
-                code: 0x12,
-                normalized,
-                repeat_modifiers,
-                temporary_modifier,
-            } => Self::MoonlightVk {
-                code: 0xa4,
-                normalized: *normalized,
-                repeat_modifiers: *repeat_modifiers,
-                temporary_modifier: *temporary_modifier,
-            },
-            key => key.clone(),
-        }
-    }
-}
-
-pub(crate) const fn effective_virtual_key(code: u8, key_rightalt_to_key_win: bool) -> u8 {
-    if key_rightalt_to_key_win && code == 0xa5 {
-        0x5b
-    } else {
-        code
-    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -353,20 +306,6 @@ impl Event {
                 "invalid_event",
                 "evdev keyboard codes must be 1..248 excluding KEY_UNKNOWN",
             )),
-            Self::Key {
-                key:
-                    Key::MoonlightVk {
-                        code,
-                        normalized: true,
-                        ..
-                    },
-                ..
-            } if amaterasu_gamestream::control::virtual_key_mapping(*code).is_none() => {
-                Err(InputError::new(
-                    "invalid_event",
-                    "unsupported normalized Moonlight virtual key",
-                ))
-            }
             Self::Relative { dx, dy } if dx.abs_diff(0) > 32_767 || dy.abs_diff(0) > 32_767 => {
                 Err(InputError::new(
                     "invalid_event",
@@ -577,18 +516,9 @@ fn key_identity_eq(left: &Key, right: &Key) -> bool {
         ) => left_code == right_code && left_extended == right_extended,
         (Key::LinuxEvdev { code: left }, Key::LinuxEvdev { code: right }) => left == right,
         (Key::MoonlightVk { code: left, .. }, Key::MoonlightVk { code: right, .. }) => {
-            canonical_virtual_key(*left) == canonical_virtual_key(*right)
+            left == right
         }
         _ => false,
-    }
-}
-
-const fn canonical_virtual_key(code: u8) -> u8 {
-    match code {
-        0x10 => 0xa0,
-        0x11 => 0xa2,
-        0x12 => 0xa4,
-        code => code,
     }
 }
 
@@ -828,12 +758,22 @@ mod tests {
 
     #[test]
     fn right_alt_remapping_uses_left_windows_virtual_key() {
-        assert_eq!(effective_virtual_key(0xa5, true), 0x5b);
-        assert_eq!(effective_virtual_key(0xa5, false), 0xa5);
-        assert_eq!(effective_virtual_key(0xa4, true), 0xa4);
-        let mapping =
-            amaterasu_gamestream::control::virtual_key_mapping(effective_virtual_key(0xa5, true))
-                .expect("left Windows key has a Linux mapping");
+        assert_eq!(
+            amaterasu_input_policy::KeyBindings::default().resolve(0xa5, true),
+            0x5b
+        );
+        assert_eq!(
+            amaterasu_input_policy::KeyBindings::default().resolve(0xa5, false),
+            0xa5
+        );
+        assert_eq!(
+            amaterasu_input_policy::KeyBindings::default().resolve(0xa4, true),
+            0xa4
+        );
+        let mapping = amaterasu_gamestream::control::virtual_key_mapping(
+            amaterasu_input_policy::KeyBindings::default().resolve(0xa5, true),
+        )
+        .expect("left Windows key has a Linux mapping");
         assert_eq!(mapping.linux_evdev_code, 125); // KEY_LEFTMETA
     }
 

@@ -183,10 +183,10 @@ impl InputTranslator {
             return Err(TranslationError::UnsupportedKeyboardEncoding);
         }
         let incoming_key = key_code as u8;
-        let key_index = canonical_virtual_key(incoming_key);
-        if normalized && virtual_key_mapping(key_index).is_none() {
-            return Err(TranslationError::UnsupportedKey);
-        }
+        // Preserve the original byte until the input consumer applies the
+        // selected keybindings exactly once. Backend validation checks the
+        // resolved destination; a remapped source need not have a native key.
+        let key_index = incoming_key;
         let held = self.held_keys[usize::from(key_index)];
         if !pressed {
             let Some(held) = held else {
@@ -208,7 +208,7 @@ impl InputTranslator {
             return Ok(Vec::new());
         }
         let held_key = held.unwrap_or(HeldKey {
-            virtual_key: if normalized { key_index } else { incoming_key },
+            virtual_key: incoming_key,
             normalized,
         });
         let mut synthetic = Vec::new();
@@ -265,7 +265,7 @@ impl InputTranslator {
             _ => return false,
         };
         keys.iter()
-            .any(|key| self.held_keys[usize::from(canonical_virtual_key(*key))].is_some())
+            .any(|key| self.held_keys[usize::from(*key)].is_some())
     }
 
     fn button(
@@ -337,15 +337,6 @@ fn is_modifier(key: u8) -> bool {
         key,
         0x10 | 0x11 | 0x12 | 0x5b | 0x5c | 0xa0 | 0xa1 | 0xa2 | 0xa3 | 0xa4 | 0xa5
     )
-}
-
-fn canonical_virtual_key(key: u8) -> u8 {
-    match key {
-        0x10 => 0xa0,
-        0x11 => 0xa2,
-        0x12 => 0xa4,
-        _ => key,
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -539,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_and_left_modifier_packets_share_one_logical_key() {
+    fn generic_and_left_modifier_packets_retain_distinct_source_ownership() {
         let mut translator = InputTranslator::default();
         let down = translator
             .translate(Input::Keyboard {
@@ -553,14 +544,14 @@ mod tests {
         assert_eq!(
             down.events()[0],
             InputEvent::Key {
-                virtual_key: 0xa0,
+                virtual_key: 0x10,
                 normalized: true,
                 repeat_modifiers: 0,
                 temporary_modifier: false,
                 state: KeyState::Down,
             }
         );
-        assert!(
+        assert_eq!(
             translator
                 .translate(Input::Keyboard {
                     pressed: true,
@@ -569,8 +560,14 @@ mod tests {
                     flags: 0,
                 })
                 .unwrap()
-                .events()
-                .is_empty()
+                .events(),
+            &[InputEvent::Key {
+                virtual_key: 0xa0,
+                normalized: true,
+                repeat_modifiers: 0,
+                temporary_modifier: false,
+                state: KeyState::Down,
+            }]
         );
         assert_eq!(
             translator
@@ -583,11 +580,29 @@ mod tests {
                 .unwrap()
                 .events(),
             &[InputEvent::Key {
-                virtual_key: 0xa0,
+                virtual_key: 0x10,
                 normalized: true,
                 repeat_modifiers: 0,
                 temporary_modifier: false,
                 state: KeyState::Up,
+            }]
+        );
+        assert_eq!(
+            translator
+                .translate(Input::Keyboard {
+                    pressed: false,
+                    key_code: 0x80a0,
+                    modifiers: 0,
+                    flags: 0
+                })
+                .unwrap()
+                .events(),
+            &[InputEvent::Key {
+                virtual_key: 0xa0,
+                normalized: true,
+                repeat_modifiers: 0,
+                temporary_modifier: false,
+                state: KeyState::Up
             }]
         );
     }
@@ -681,7 +696,7 @@ mod tests {
     #[test]
     fn ambiguous_keyboard_encodings_and_unsupported_input_never_map_to_events() {
         let mut translator = InputTranslator::default();
-        for (key_code, flags) in [(0x0041, 0), (0x80ff, 0)] {
+        for (key_code, flags) in [(0x0041, 0), (0x8041, 2), (0x8041, 3)] {
             assert!(
                 translator
                     .translate(Input::Keyboard {
@@ -691,6 +706,28 @@ mod tests {
                         flags,
                     })
                     .is_err()
+            );
+        }
+        // Native support depends on the resolved destination in the lease's
+        // keybindings. Even reserved source bytes may map to a supported key.
+        for byte in [0_u8, 255] {
+            let translated = translator
+                .translate(Input::Keyboard {
+                    pressed: true,
+                    key_code: 0x8000 | u16::from(byte),
+                    modifiers: 0,
+                    flags: 0,
+                })
+                .unwrap();
+            assert_eq!(
+                translated.events(),
+                &[InputEvent::Key {
+                    virtual_key: byte,
+                    normalized: true,
+                    repeat_modifiers: 0,
+                    temporary_modifier: false,
+                    state: KeyState::Down,
+                }]
             );
         }
         assert_eq!(

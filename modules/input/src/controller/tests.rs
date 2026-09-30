@@ -1960,12 +1960,12 @@ fn failed_releases_remain_tracked_block_new_leases_and_retry() {
     assert_eq!(controller.backend.stops, 1);
 }
 #[test]
-fn modifier_alias_release_failure_preserves_owner_until_recovery() {
+fn original_modifier_release_failure_preserves_owner_until_recovery() {
     let mut controller = Controller::new(FakeBackend::default(), true);
     let now = Instant::now();
     let token = acquire(&mut controller, now);
     let down = moonlight_key(0x10, KeyState::Down, 0, false);
-    let up = moonlight_key(0xa0, KeyState::Up, 0, false);
+    let up = moonlight_key(0x10, KeyState::Up, 0, false);
     assert_eq!(
         batch(&mut controller, &token, vec![down.clone()])["ok"],
         true
@@ -2325,7 +2325,7 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
 }
 
 #[test]
-fn moonlight_modifier_aliases_share_ownership_and_native_encodings_cannot_mix() {
+fn moonlight_modifier_sources_are_distinct_and_native_encodings_cannot_mix() {
     let mut controller = Controller::new(FakeBackend::default(), true);
     let token = acquire(&mut controller, Instant::now());
     let generic_shift = Event::Key {
@@ -2346,11 +2346,31 @@ fn moonlight_modifier_aliases_share_ownership_and_native_encodings_cannot_mix() 
         },
         state: KeyState::Up,
     };
+    let rejected = batch(
+        &mut controller,
+        &token,
+        vec![generic_shift.clone(), left_shift_up.clone()],
+    );
+    assert_eq!(rejected["error"]["code"], "invalid_sequence");
+    assert!(controller.pressed.is_empty());
+
     assert_eq!(
         batch(
             &mut controller,
             &token,
-            vec![generic_shift.clone(), left_shift_up.clone()]
+            vec![
+                generic_shift.clone(),
+                moonlight_key(0xa0, KeyState::Down, 0, false)
+            ]
+        )["ok"],
+        true
+    );
+    assert_eq!(controller.pressed.len(), 2);
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![left_shift_up, moonlight_key(0x10, KeyState::Up, 0, false)]
         )["ok"],
         true
     );

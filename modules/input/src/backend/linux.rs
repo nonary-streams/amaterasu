@@ -1,22 +1,20 @@
 use super::Backend;
 use super::owned_devices::{acquire_input_pair, recover_input_device, release_input_pair};
+use super::owned_keys::{HeldKeyPlans, OwnedKeyPlan};
 use crate::gamepad::{
     ControllerSnapshot, GAMEPAD_ABSOLUTE_AXES, GamepadDevice, GamepadSlots, NativeGamepadEvent,
     controller_state_events, gamepad_key_codes, possible_controller_state_after_write_failure,
     release_owned_device, replace_failed_device,
 };
 use crate::gamepad_profile::GamepadProfile;
-use crate::model::{
-    Axis, Button, Event, InputError, InputResult, Key, KeyState, PenTouchDevice,
-    effective_virtual_key,
-};
+use crate::model::{Axis, Button, Event, InputError, InputResult, Key, KeyState, PenTouchDevice};
+use amaterasu_input_policy::KeyBindings;
 #[path = "linux_pen_touch.rs"]
 mod linux_pen_touch;
 use linux_pen_touch::LinuxPenTouch;
 #[cfg(test)]
 #[path = "linux_native_tests.rs"]
 mod native_tests;
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
@@ -442,7 +440,8 @@ pub struct LinuxBackend {
     keyboard_recovery_required: bool,
     pointer_recovery_required: bool,
     key_rightalt_to_key_win: bool,
-    held_virtual_keycodes: HashMap<u8, u16>,
+    keybindings: KeyBindings,
+    held_virtual_keycodes: HeldKeyPlans<u16>,
     keyboard_retired: bool,
     pointer_retired: bool,
     vertical_scroll_remainder: i32,
@@ -465,7 +464,8 @@ impl LinuxBackend {
             keyboard_recovery_required: false,
             pointer_recovery_required: false,
             key_rightalt_to_key_win: false,
-            held_virtual_keycodes: HashMap::new(),
+            keybindings: KeyBindings::default(),
+            held_virtual_keycodes: HeldKeyPlans::new(),
             keyboard_retired: false,
             pointer_retired: false,
             vertical_scroll_remainder: 0,
@@ -715,29 +715,34 @@ impl Backend for LinuxBackend {
                 Key::MoonlightVk { code, .. } => Some(*code),
                 _ => None,
             };
-            if let Some(identity) = identity
-                && *state == KeyState::Down
-            {
-                // Retain the plan before the write; a failed write can have an
-                // uncertain outcome and a later cleanup must use this mapping.
-                self.held_virtual_keycodes.insert(identity, code);
-            }
-            let result = keyboard.emit(&[(
-                EV_KEY,
-                code,
-                match state {
-                    KeyState::Up => 0,
-                    KeyState::Down => 1,
-                    KeyState::Repeat => 2,
-                },
-            )]);
+            let emit = |code| {
+                keyboard.emit(&[(
+                    EV_KEY,
+                    code,
+                    match state {
+                        KeyState::Up => 0,
+                        KeyState::Down => 1,
+                        KeyState::Repeat => 2,
+                    },
+                )])
+            };
+            let result = if let Some(identity) = identity {
+                self.held_virtual_keycodes.apply(
+                    identity,
+                    *state,
+                    OwnedKeyPlan {
+                        target: code,
+                        native: code,
+                    },
+                    emit,
+                )
+            } else {
+                emit(code)
+            };
             if result.is_err() {
                 self.keyboard_recovery_required = true;
             }
             result?;
-            if let (Some(identity), KeyState::Up) = (identity, state) {
-                self.held_virtual_keycodes.remove(&identity);
-            }
             return Ok(());
         }
         if self.pointer_retired {
@@ -838,6 +843,10 @@ impl Backend for LinuxBackend {
 
     fn set_key_rightalt_to_key_win(&mut self, enabled: bool) {
         self.key_rightalt_to_key_win = enabled;
+    }
+
+    fn set_keybindings(&mut self, keybindings: &KeyBindings) {
+        self.keybindings = keybindings.clone();
     }
 
     fn advance(&mut self, now: std::time::Instant) -> InputResult<()> {
@@ -945,17 +954,66 @@ mod profile_tests {
         assert!(backend.pointer_recovery_required);
         assert!(backend.pointer.is_none());
     }
+
+    #[test]
+    fn keybindings_apply_once_and_reserved_sources_require_supported_destinations() {
+        let mut backend = LinuxBackend::new("/missing/uinput".into());
+        let custom: KeyBindings = serde_json::from_value(serde_json::json!([
+            0x10, 0x41, 0xa0, 0x45, 0x41, 0x42, 0x42, 0x43, 0xa5, 0x44, 0, 0x41, 255, 0x41,
+        ]))
+        .unwrap();
+        backend.set_keybindings(&custom);
+        backend.set_key_rightalt_to_key_win(true);
+        assert_eq!(
+            backend.event_virtual_keycode(0x10, true, KeyState::Down),
+            Some(42)
+        );
+        assert_eq!(
+            backend.event_virtual_keycode(0xa0, true, KeyState::Down),
+            Some(18)
+        );
+        assert_eq!(
+            backend.event_virtual_keycode(0x41, true, KeyState::Down),
+            Some(48)
+        );
+        assert_eq!(
+            backend.event_virtual_keycode(0xa5, true, KeyState::Down),
+            Some(32)
+        );
+        assert_eq!(
+            backend.event_virtual_keycode(0, true, KeyState::Down),
+            Some(30)
+        );
+        assert_eq!(
+            backend.event_virtual_keycode(255, true, KeyState::Down),
+            Some(30)
+        );
+        backend.set_keybindings(
+            &serde_json::from_value(serde_json::json!([0x41, 0, 0x42, 255])).unwrap(),
+        );
+        assert_eq!(
+            backend.event_virtual_keycode(0x41, true, KeyState::Down),
+            None
+        );
+        assert_eq!(
+            backend.event_virtual_keycode(0x42, false, KeyState::Down),
+            None
+        );
+    }
 }
 
 impl LinuxBackend {
-    fn event_virtual_keycode(&self, code: u8, normalized: bool, state: KeyState) -> Option<u16> {
+    fn event_virtual_keycode(&self, code: u8, normalized: bool, _state: KeyState) -> Option<u16> {
         let identity = code;
-        if matches!(state, KeyState::Up | KeyState::Repeat)
-            && let Some(keycode) = self.held_virtual_keycodes.get(&identity)
-        {
-            return Some(*keycode);
+        if let Some(plan) = self.held_virtual_keycodes.held(identity) {
+            return Some(plan.native);
         }
-        code_for_virtual_key(code, normalized, self.key_rightalt_to_key_win)
+        code_for_virtual_key(
+            code,
+            normalized,
+            self.key_rightalt_to_key_win,
+            &self.keybindings,
+        )
     }
 
     fn scroll_units(&mut self, axis: Axis, amount: i16) -> InputResult<()> {
@@ -974,8 +1032,13 @@ impl LinuxBackend {
     }
 }
 
-fn code_for_virtual_key(code: u8, _normalized: bool, key_rightalt_to_key_win: bool) -> Option<u16> {
-    let host_code = effective_virtual_key(code, key_rightalt_to_key_win);
+fn code_for_virtual_key(
+    code: u8,
+    _normalized: bool,
+    key_rightalt_to_key_win: bool,
+    keybindings: &KeyBindings,
+) -> Option<u16> {
+    let host_code = keybindings.resolve(code, key_rightalt_to_key_win);
     amaterasu_gamestream::control::virtual_key_mapping(host_code)
         .map(|mapping| mapping.linux_evdev_code)
 }
@@ -1062,6 +1125,40 @@ mod tests {
 
     fn pointer_button(button: Button, pressed: bool) -> Event {
         Event::Button { button, pressed }
+    }
+
+    #[test]
+    fn remapped_sources_keep_target_ownership_until_final_release() {
+        let adapter = FakeAdapterGuard::install();
+        let _guard = FakeAdapterGuard;
+        let mut backend = LinuxBackend::new("/missing/uinput".into());
+        backend.set_gamepad_profile(GamepadProfile::Ds4);
+        backend.start().unwrap();
+        backend.set_keybindings(
+            &serde_json::from_value(serde_json::json!([0x41, 0x43, 0x42, 0x43])).unwrap(),
+        );
+        backend
+            .inject(&moonlight_key(0x41, KeyState::Down))
+            .unwrap();
+        backend
+            .inject(&moonlight_key(0x42, KeyState::Down))
+            .unwrap();
+        assert_eq!(adapter.borrow().writes, [1]);
+        assert_eq!(backend.held_virtual_keycodes.get(&0x41), Some(&46));
+        assert_eq!(backend.held_virtual_keycodes.get(&0x42), Some(&46));
+        backend.set_keybindings(
+            &serde_json::from_value(serde_json::json!([0x41, 0x44, 0x42, 0x45])).unwrap(),
+        );
+        backend
+            .inject(&moonlight_key(0x42, KeyState::Repeat))
+            .unwrap();
+        backend.inject(&moonlight_key(0x41, KeyState::Up)).unwrap();
+        assert_eq!(adapter.borrow().writes, [1, 1]);
+        assert_eq!(backend.held_virtual_keycodes.get(&0x42), Some(&46));
+        backend.inject(&moonlight_key(0x42, KeyState::Up)).unwrap();
+        assert_eq!(adapter.borrow().writes, [1, 1, 1]);
+        assert!(backend.held_virtual_keycodes.is_empty());
+        backend.stop().unwrap();
     }
 
     fn acquire_fake_lease(controller: &mut Controller<LinuxBackend>) -> String {
@@ -1523,9 +1620,19 @@ mod tests {
         let right_alt = amaterasu_gamestream::control::virtual_key_mapping(0xa5)
             .expect("right Alt has an evdev mapping")
             .linux_evdev_code;
-        assert_eq!(code_for_virtual_key(0xa5, true, true), Some(left_meta));
-        assert_eq!(code_for_virtual_key(0xa5, false, true), Some(left_meta));
-        assert_eq!(code_for_virtual_key(0xa5, true, false), Some(right_alt));
+        let bindings = KeyBindings::default();
+        assert_eq!(
+            code_for_virtual_key(0xa5, true, true, &bindings),
+            Some(left_meta)
+        );
+        assert_eq!(
+            code_for_virtual_key(0xa5, false, true, &bindings),
+            Some(left_meta)
+        );
+        assert_eq!(
+            code_for_virtual_key(0xa5, true, false, &bindings),
+            Some(right_alt)
+        );
 
         let mut backend = LinuxBackend::new(String::new());
         backend.set_key_rightalt_to_key_win(true);
@@ -1533,7 +1640,13 @@ mod tests {
             .event_virtual_keycode(0xa5, true, KeyState::Down)
             .unwrap();
         assert_eq!(down, left_meta);
-        backend.held_virtual_keycodes.insert(0xa5, down);
+        backend.held_virtual_keycodes.insert(
+            0xa5,
+            OwnedKeyPlan {
+                target: down,
+                native: down,
+            },
+        );
 
         backend.set_key_rightalt_to_key_win(false);
         assert_eq!(

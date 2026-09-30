@@ -152,7 +152,8 @@ pub struct Controller<B: Backend> {
     terminal_acquires: VecDeque<TerminalAcquire>,
 }
 impl<B: Backend> Controller<B> {
-    pub fn new(backend: B, enabled: bool) -> Self {
+    pub fn new(mut backend: B, enabled: bool) -> Self {
+        backend.set_keybindings(&amaterasu_input_policy::KeyBindings::default());
         Self {
             backend,
             enabled,
@@ -963,7 +964,7 @@ impl<B: Backend> Controller<B> {
                         }
                     }
                     KeyState::Up => {
-                        let identity = Pressed::Key(key.canonical());
+                        let identity = Pressed::Key(key.clone());
                         let Some(Pressed::Key(held_key)) =
                             pressed.iter().find(|held| **held == identity)
                         else {
@@ -996,7 +997,7 @@ impl<B: Backend> Controller<B> {
                 key,
                 state: KeyState::Repeat,
             } = event
-                && !pressed.contains(&Pressed::Key(key.canonical()))
+                && !pressed.contains(&Pressed::Key(key.clone()))
             {
                 return Err(InputError::new(
                     "invalid_sequence",
@@ -1179,11 +1180,11 @@ impl<B: Backend> Controller<B> {
                 });
             }
             KeyState::Up => {
-                let released = Pressed::Key(key.canonical());
+                let released = Pressed::Key(key.clone());
                 if self
                     .repeating_key
                     .as_ref()
-                    .is_some_and(|repeat| Pressed::Key(repeat.key.canonical()) == released)
+                    .is_some_and(|repeat| Pressed::Key(repeat.key.clone()) == released)
                 {
                     self.repeating_key = None;
                 }
@@ -1206,7 +1207,7 @@ impl<B: Backend> Controller<B> {
             next_due: repeating.next_due,
             period: repeating.period,
         };
-        if !self.pressed.contains(&Pressed::Key(repeat.key.canonical())) {
+        if !self.pressed.contains(&Pressed::Key(repeat.key.clone())) {
             self.repeating_key = None;
             return Ok(());
         }
