@@ -2460,6 +2460,8 @@ test("PipeWire chooser replies validate only safe status and describe availabili
     "Monitor source selected (1920 × 1080).");
   assert.equal(describe(parse({ availability: "available", selection_state: "denied" })),
     "Source selection was denied.");
+  const projected = parse({ availability: "available", selection_state: "ready", operation_id: "another-owner-handle" });
+  assert.equal(Object.hasOwn(projected, "operation_id"), false);
   for (const invalid of [
     { availability: "available", selection_state: "ready", width: 0, height: 1080 },
     { availability: "available", selection_state: "ready", source_type: "screen" },
@@ -2486,6 +2488,28 @@ test("PipeWire chooser polls until a terminal state and cancels on close or time
   assert.deepEqual(cancelCalls, [["capture/pipewire_selection_cancel", { operation_id: "private-handle" }]]);
   await assert.rejects(context.Amaterasu.waitForPipewireSelection(cancelApi, "expired-handle", () => true, () => {}, 1, 0), /timed out and was cancelled/);
   assert.equal(cancelCalls.at(-1)[0], "capture/pipewire_selection_cancel");
+});
+
+test("PipeWire chooser cancellation can be sent while the final status request is pending", async () => {
+  let completePoll;
+  const poll = new Promise((resolve) => { completePoll = resolve; });
+  let cancellationCount = 0;
+  const api = {
+    async post(route) {
+      assert.equal(route, "capture/pipewire_selection_poll");
+      return poll;
+    },
+  };
+  let active = true;
+  const waiting = context.Amaterasu.waitForPipewireSelection(
+    api, "selection-handle", () => active, () => {}, 1, 500,
+    async () => { cancellationCount += 1; },
+  );
+  await new Promise(setTimeout);
+  active = false;
+  await completePoll({ availability: "available", selection_state: "ready" });
+  await waiting;
+  assert.equal(cancellationCount, 1);
 });
 
 test("video batch size editor preserves default and bounded reference values", () => {

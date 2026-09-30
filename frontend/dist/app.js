@@ -4088,8 +4088,6 @@ var Amaterasu;
             if (reply[dimension] !== undefined && (!Number.isSafeInteger(reply[dimension]) || reply[dimension] < 1 || reply[dimension] > 32768))
                 throw new Error("PipeWire capture status is invalid.");
         }
-        if (reply.operation_id !== undefined && typeof reply.operation_id !== "string")
-            throw new Error("PipeWire capture status is invalid.");
         return {
             availability: reply.availability,
             selection_state: reply.selection_state,
@@ -4097,7 +4095,6 @@ var Amaterasu;
             ...(reply.source_type === undefined ? {} : { source_type: reply.source_type }),
             ...(reply.width === undefined ? {} : { width: reply.width }),
             ...(reply.height === undefined ? {} : { height: reply.height }),
-            ...(reply.operation_id === undefined ? {} : { operation_id: reply.operation_id }),
         };
     }
     Amaterasu.parsePipewireCaptureReply = parsePipewireCaptureReply;
@@ -4127,7 +4124,7 @@ var Amaterasu;
         }
     }
     Amaterasu.pipewireSelectionDescription = pipewireSelectionDescription;
-    async function waitForPipewireSelection(api, operationId, isActive, onState, pollIntervalMs = 400, timeoutMs = 15_000) {
+    async function waitForPipewireSelection(api, operationId, isActive, onState, pollIntervalMs = 400, timeoutMs = 15_000, cancelSelection = () => api.post("capture/pipewire_selection_cancel", { operation_id: operationId }).then(() => undefined)) {
         const deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline && isActive()) {
             await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
@@ -4149,11 +4146,15 @@ var Amaterasu;
                     clearTimeout(timeout);
             }
             const reply = parsePipewireCaptureReply(rawReply);
+            if (!isActive()) {
+                await cancelSelection();
+                return;
+            }
             onState(reply);
             if (reply.selection_state !== "selecting" && reply.selection_state !== "permission_required")
                 return;
         }
-        await api.post("capture/pipewire_selection_cancel", { operation_id: operationId });
+        await cancelSelection();
         if (isActive())
             throw new Error("Source selection timed out and was cancelled.");
     }
@@ -4802,41 +4803,67 @@ var Amaterasu;
             if (windowSource)
                 windowSource.disabled = true;
             let cancelled = false;
+            let beginPending = true;
+            let operationId = null;
+            let cancellation = null;
+            const requestCancel = () => {
+                if (operationId === null)
+                    return Promise.resolve(false);
+                if (cancellation === null) {
+                    cancellation = context.api.post("capture/pipewire_selection_cancel", { operation_id: operationId })
+                        .then(() => true, () => false);
+                    const request = cancellation;
+                    void request.then((confirmed) => {
+                        if (!confirmed && cancellation === request)
+                            cancellation = null;
+                    });
+                }
+                return cancellation;
+            };
+            const cancelSelection = async () => { await requestCancel(); };
             const cancel = Amaterasu.button("Cancel selection", () => {
                 cancelled = true;
                 cancel.disabled = true;
                 status.textContent = "Cancelling source selection…";
+                if (!beginPending)
+                    void requestCancel();
             }, "secondary");
             const cancelOperation = Amaterasu.el("div", "actions", cancel);
             pipewireArea.append(cancelOperation);
             status.textContent = "Opening the desktop source chooser…";
-            let operationId = null;
             try {
                 const requestedId = crypto.randomUUID();
+                operationId = requestedId;
                 parsePipewireCaptureReply(await context.api.post("capture/pipewire_selection_begin", {
                     source_type: sourceType,
                     operation_id: requestedId,
                 }));
-                operationId = requestedId;
+                beginPending = false;
                 const active = () => pipewireArea.isConnected && pipewireOperation === operation && !cancelled;
+                if (cancelled)
+                    await requestCancel();
                 await waitForPipewireSelection(context.api, operationId, active, (reply) => {
                     if (active())
                         status.textContent = pipewireSelectionDescription(reply);
-                });
+                }, 400, 15_000, cancelSelection);
                 if (pipewireArea.isConnected && pipewireOperation === operation) {
                     const finalStatus = parsePipewireCaptureReply(await context.api.post("capture/pipewire_selection_poll", { operation_id: operationId }));
-                    status.textContent = pipewireSelectionDescription(finalStatus);
+                    if (cancelled || !pipewireArea.isConnected || pipewireOperation !== operation) {
+                        const confirmed = await requestCancel();
+                        if (pipewireArea.isConnected && pipewireOperation === operation)
+                            status.textContent = confirmed
+                                ? "Source selection was cancelled."
+                                : "Cancellation could not be confirmed. Refresh to check the current status.";
+                    }
+                    else {
+                        status.textContent = pipewireSelectionDescription(finalStatus);
+                    }
                 }
             }
             catch (error) {
-                if (operationId !== null) {
-                    if (!(error instanceof Error && error.message === "Source selection timed out and was cancelled.")) {
-                        try {
-                            await context.api.post("capture/pipewire_selection_cancel", { operation_id: operationId });
-                        }
-                        catch { }
-                    }
-                }
+                beginPending = false;
+                if (operationId !== null && !(error instanceof Error && error.message === "Source selection timed out and was cancelled."))
+                    await requestCancel();
                 if (pipewireArea.isConnected && pipewireOperation === operation)
                     status.textContent = error instanceof Amaterasu.ApiError && error.code === "forbidden"
                         ? "PipeWire source selection requires capture.write."
