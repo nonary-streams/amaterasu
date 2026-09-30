@@ -452,6 +452,15 @@ fn native_input_with_plan(event: &Event, plan: KeyboardPlan) -> InputResult<INPU
                 "Windows SendInput does not create virtual gamepads",
             ));
         }
+        Event::ControllerArrival { .. }
+        | Event::ControllerTouch { .. }
+        | Event::ControllerMotion { .. }
+        | Event::ControllerBattery { .. } => {
+            return Err(InputError::new(
+                "unsupported_event",
+                "Windows SendInput does not create virtual gamepads",
+            ));
+        }
         Event::PenTouch { .. } => {
             return Err(InputError::new(
                 "unsupported_event",

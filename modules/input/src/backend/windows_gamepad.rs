@@ -727,17 +727,17 @@ impl VigemGamepad {
 
     fn send_current_ds4_report(&mut self, now: Instant) -> InputResult<()> {
         let target = self.target()?;
-        let connection = self.connection()?;
-        if connection.supports_ds4_extended() {
+        if self.connection()?.supports_ds4_extended() {
             let elapsed = now.saturating_duration_since(self.last_report_at);
             let timestamp = self
                 .extended_report
                 .timestamp()
                 .wrapping_add((elapsed.as_nanos() / 5_333) as u16);
             self.extended_report.set_timestamp(timestamp);
-            connection.update_ds4_extended(target, self.extended_report)?;
+            self.connection()?
+                .update_ds4_extended(target, self.extended_report)?;
         } else {
-            connection.update_ds4(
+            self.connection()?.update_ds4(
                 target,
                 self.controller_state,
                 self.ds4_back_as_touchpad_click,
