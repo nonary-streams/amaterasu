@@ -123,6 +123,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-capture-kms"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-media",
+ "amaterasu-module-sdk",
+ "cc",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-capture-pipewire"
 version = "0.1.0"
 dependencies = [

@@ -115,6 +115,12 @@ pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_max_batch_size_kb: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<String>,
+    /// Sparse stream-scoped display policy additions. The legacy fields below
+    /// remain flat so existing catalog clients can continue to read them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_policy: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dd_mode_remapping: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dd_resolution_option: Option<String>,
@@ -376,6 +382,21 @@ impl ConfigOverrides {
         if self.video_max_batch_size_kb.is_some_and(|size| size > 64) {
             return Err("video_max_batch_size_kb must be between 0 and 64");
         }
+        if self.capture.as_deref().is_some_and(|capture| {
+            !matches!(
+                capture,
+                "auto" | "ddx" | "wgc" | "wgcc" | "pipewire" | "x11" | "kms"
+            )
+        }) {
+            return Err("capture must select a supported provider");
+        }
+        if self
+            .display_policy
+            .as_ref()
+            .is_some_and(|policy| !valid_display_policy_override(policy))
+        {
+            return Err("display_policy contains an invalid or unsupported override");
+        }
         if self
             .audio_sink
             .as_deref()
@@ -418,6 +439,8 @@ impl ConfigOverrides {
             && self.max_bitrate.is_none()
             && self.minimum_fps_target.is_none()
             && self.video_max_batch_size_kb.is_none()
+            && self.capture.is_none()
+            && self.display_policy.is_none()
             && self.dd_mode_remapping.is_none()
             && self.dd_resolution_option.is_none()
             && self.dd_manual_resolution.is_none()
@@ -556,6 +579,134 @@ fn valid_display_overrides(
                     })
                 })
         })
+    })
+}
+
+fn valid_display_policy_override(policy: &serde_json::Value) -> bool {
+    const ALLOWED: &[&str] = &[
+        "adapter_name",
+        "adapter_pnp_id",
+        "virtual_display_mode",
+        "virtual_display_layout",
+        "dd_mode_remapping",
+        "dd_resolution_option",
+        "dd_manual_resolution",
+        "dd_refresh_rate_option",
+        "dd_manual_refresh_rate",
+        "dd_hdr_option",
+        "dd_configuration_option",
+        "dd_hdr_request_override",
+        "dd_config_revert_delay",
+        "dd_config_revert_on_disconnect",
+        "dd_paused_virtual_display_timeout_secs",
+        "dd_always_restore_from_golden",
+        "dd_display_helper_engine",
+        "dd_snapshot_restore_hotkey",
+        "dd_snapshot_restore_hotkey_modifiers",
+        "dd_use_sunshine_virtual_display_driver",
+        "dd_activate_virtual_display",
+        "dd_virtual_display_scale",
+        "dd_virtual_display_permanent_count",
+        "virtual_display_outputs",
+        "dd_snapshot_exclude_devices",
+        "dd_wa_dummy_plug_hdr10",
+    ];
+    let Some(fields) = policy.as_object() else {
+        return false;
+    };
+    if fields.len() > ALLOWED.len() || fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+        return false;
+    }
+    fields.iter().all(|(key, value)| {
+        if value.is_null() {
+            return true;
+        }
+        match key.as_str() {
+            "adapter_name" => value.as_str().is_some_and(|text| bounded_text(text, 1024)),
+            "adapter_pnp_id" => value.as_str().is_some_and(|text| bounded_text(text, 256)),
+            "virtual_display_mode" => value
+                .as_str()
+                .is_some_and(|mode| matches!(mode, "disabled" | "per_client" | "shared")),
+            "virtual_display_layout" => value.as_str().is_some_and(|layout| {
+                matches!(
+                    layout,
+                    "exclusive"
+                        | "extended"
+                        | "extended_primary"
+                        | "extended_isolated"
+                        | "extended_primary_isolated"
+                )
+            }),
+            "dd_mode_remapping" => {
+                valid_display_overrides(Some(value), None, None, None, None, None)
+            }
+            "dd_resolution_option" => value
+                .as_str()
+                .is_some_and(|option| matches!(option, "auto" | "disabled" | "manual")),
+            "dd_manual_resolution" => value.as_str().is_some_and(|resolution| {
+                bounded_text(resolution, 32)
+                    && (resolution.is_empty() || valid_remapping_resolution(resolution))
+            }),
+            "dd_refresh_rate_option" => value.as_str().is_some_and(|option| {
+                matches!(option, "auto" | "disabled" | "manual" | "prefer_highest")
+            }),
+            "dd_manual_refresh_rate" => value.as_str().is_some_and(|rate| {
+                bounded_text(rate, 64) && (rate.is_empty() || valid_manual_refresh_rate(rate))
+            }),
+            "dd_hdr_option" => value
+                .as_str()
+                .is_some_and(|option| matches!(option, "auto" | "disabled")),
+            "dd_configuration_option" => value.as_str().is_some_and(|option| {
+                matches!(
+                    option,
+                    "disabled"
+                        | "verify_only"
+                        | "ensure_active"
+                        | "ensure_primary"
+                        | "ensure_only_display"
+                )
+            }),
+            "dd_hdr_request_override" => value
+                .as_str()
+                .is_some_and(|mode| matches!(mode, "auto" | "force_on" | "force_off")),
+            "dd_config_revert_delay" | "dd_paused_virtual_display_timeout_secs" => value
+                .as_u64()
+                .is_some_and(|number| number <= i32::MAX as u64),
+            "dd_config_revert_on_disconnect"
+            | "dd_always_restore_from_golden"
+            | "dd_use_sunshine_virtual_display_driver"
+            | "dd_activate_virtual_display"
+            | "dd_wa_dummy_plug_hdr10" => value.is_boolean(),
+            "dd_display_helper_engine" => value
+                .as_str()
+                .is_some_and(|engine| matches!(engine, "auto" | "v2" | "legacy")),
+            "dd_snapshot_restore_hotkey" => value
+                .as_str()
+                .is_some_and(|hotkey| hotkey.len() <= 64 && !hotkey.chars().any(char::is_control)),
+            "dd_snapshot_restore_hotkey_modifiers" => value.as_str().is_some_and(|modifiers| {
+                modifiers.len() <= 128 && !modifiers.chars().any(char::is_control)
+            }),
+            "dd_virtual_display_scale" => value.as_i64().is_some_and(|scale| {
+                matches!(
+                    scale,
+                    -1 | 0 | 100 | 125 | 150 | 175 | 200 | 225 | 250 | 300 | 350 | 400 | 450 | 500
+                )
+            }),
+            "dd_virtual_display_permanent_count" => value.as_u64().is_some_and(|count| count <= 4),
+            "virtual_display_outputs" => valid_string_array(value, 32, 512),
+            "dd_snapshot_exclude_devices" => valid_string_array(value, 256, 1024),
+            _ => false,
+        }
+    })
+}
+
+fn valid_string_array(value: &serde_json::Value, count: usize, item_bytes: usize) -> bool {
+    value.as_array().is_some_and(|items| {
+        items.len() <= count
+            && items.iter().all(|item| {
+                item.as_str()
+                    .is_some_and(|text| !text.is_empty() && bounded_text(text, item_bytes))
+            })
     })
 }
 
@@ -1496,6 +1647,79 @@ mod tests {
                 "accepted non-string mode {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn capture_override_is_sparse_and_rejects_unknown_modes() {
+        let parsed: ConfigOverrides =
+            serde_json::from_value(json!({"capture":"pipewire"})).unwrap();
+        assert_eq!(parsed.capture.as_deref(), Some("pipewire"));
+        parsed.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            json!({"capture":"pipewire"})
+        );
+
+        for invalid in ["fallback", "dxgi", "PIPEWIRE"] {
+            let parsed: ConfigOverrides =
+                serde_json::from_value(json!({"capture":invalid})).unwrap();
+            assert!(parsed.validate().is_err());
+        }
+        assert!(serde_json::from_value::<ConfigOverrides>(json!({"capture":7})).is_err());
+    }
+
+    #[test]
+    fn display_policy_override_is_sparse_typed_and_scope_limited() {
+        let parsed: ConfigOverrides = serde_json::from_value(json!({
+            "display_policy":{
+                "adapter_name":"/dev/dri/renderD128",
+                "virtual_display_layout":"extended_primary",
+                "dd_activate_virtual_display":true,
+                "dd_resolution_option":"manual",
+                "dd_manual_resolution":"1920x1080",
+                "dd_refresh_rate_option":"manual",
+                "dd_manual_refresh_rate":"59.94",
+                "dd_virtual_display_permanent_count":2,
+                "virtual_display_outputs":["Vibeshine-1"]
+            }
+        }))
+        .unwrap();
+        parsed.validate().unwrap();
+        assert!(!parsed.is_empty());
+        assert_eq!(
+            serde_json::to_value(parsed).unwrap(),
+            json!({"display_policy":{
+                "adapter_name":"/dev/dri/renderD128",
+                "virtual_display_layout":"extended_primary",
+                "dd_activate_virtual_display":true,
+                "dd_resolution_option":"manual",
+                "dd_manual_resolution":"1920x1080",
+                "dd_refresh_rate_option":"manual",
+                "dd_manual_refresh_rate":"59.94",
+                "dd_virtual_display_permanent_count":2,
+                "virtual_display_outputs":["Vibeshine-1"]
+            }})
+        );
+
+        for policy in [
+            json!({"dd_virtual_display_permanent_count":5}),
+            json!({"dd_virtual_display_scale":275}),
+            json!({"dd_config_revert_delay":-1}),
+            json!({"vulkan_hdr_layer":true}),
+            json!({"adapter_name":false}),
+        ] {
+            let invalid: ConfigOverrides =
+                serde_json::from_value(json!({"display_policy":policy})).unwrap();
+            assert!(invalid.validate().is_err(), "{policy}");
+        }
+        assert!(
+            serde_json::from_value::<ConfigOverrides>(json!({
+                "display_policy":{"unknown_display_key":true}
+            }))
+            .unwrap()
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

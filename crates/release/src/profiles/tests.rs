@@ -1494,6 +1494,11 @@ fn linux_probe_scopes_portal_capture_to_an_explicit_composition() {
     assert!(
         components
             .iter()
+            .any(|component| component.id == CAPTURE_X11.id)
+    );
+    assert!(
+        components
+            .iter()
             .any(|component| component.id == LINUX_VIDEO.id && component.library == VIDEO.library)
     );
     assert!(
@@ -1506,20 +1511,31 @@ fn linux_probe_scopes_portal_capture_to_an_explicit_composition() {
     }));
     assert_eq!(
         LINUX_VIDEO.native_uses,
-        &["amaterasu.capture-pipewire/1", "amaterasu.encode/1"]
+        &[
+            "amaterasu.capture-pipewire/1",
+            "amaterasu.capture-x11/1",
+            "amaterasu.capture-kms/1",
+            "amaterasu.encode/1"
+        ]
     );
     assert!(LINUX_STREAM_SESSION.dependencies.contains(&LINUX_VIDEO.id));
     for component in [LINUX_NVHTTP, LINUX_RTSP, LINUX_STREAM_SESSION] {
         assert!(!component.calls.contains(&"amaterasu.capture-pipewire/1"));
         assert!(!component.calls.contains(&"amaterasu.capture-dxgi/1"));
         assert!(!component.calls.contains(&"amaterasu.capture-wgc/1"));
+        assert!(!component.calls.contains(&"amaterasu.capture-x11/1"));
+        assert!(!component.calls.contains(&"amaterasu.capture-kms/1"));
     }
     assert!(LINUX_VIDEO.calls.contains(&"amaterasu.capture-pipewire/1"));
+    assert!(LINUX_VIDEO.calls.contains(&"amaterasu.capture-x11/1"));
+    assert!(LINUX_VIDEO.calls.contains(&"amaterasu.capture-kms/1"));
     assert!(
         LINUX_MANAGEMENT
             .calls
             .contains(&"amaterasu.capture-pipewire/1")
     );
+    assert!(LINUX_MANAGEMENT.calls.contains(&"amaterasu.capture-x11/1"));
+    assert!(LINUX_MANAGEMENT.calls.contains(&"amaterasu.capture-kms/1"));
     assert!(!MANAGEMENT.calls.contains(&"amaterasu.capture-pipewire/1"));
     let root = std::env::temp_dir().join(format!(
         "amaterasu-linux-probe-profile-{}",
@@ -1528,6 +1544,8 @@ fn linux_probe_scopes_portal_capture_to_an_explicit_composition() {
     let development = development_policy(&root).unwrap();
     std::fs::remove_dir_all(root).unwrap();
     assert_eq!(development.settings[CAPTURE_PIPEWIRE.id]["enabled"], false);
+    assert_eq!(development.settings[CAPTURE_X11.id]["enabled"], true);
+    assert_eq!(development.settings[CAPTURE_KMS.id]["enabled"], true);
     assert_eq!(
         development.settings[CAPTURE_PIPEWIRE.id]["selection_principals"],
         json!(["amaterasu.management"])

@@ -86,6 +86,7 @@ pub struct DesktopGeometry {
     pub capture: CaptureGeometry,
 }
 
+#[cfg(any(amaterasu_x11, test))]
 pub fn frame_layout(width: u32, height: u32) -> CaptureResult<(u32, usize)> {
     let stride = width.checked_mul(4).ok_or_else(invalid_frame)?;
     let length = (stride as usize)
@@ -98,6 +99,7 @@ pub fn frame_layout(width: u32, height: u32) -> CaptureResult<(u32, usize)> {
     Ok((stride, length))
 }
 
+#[cfg(any(amaterasu_x11, test))]
 fn invalid_frame() -> CaptureError {
     CaptureError::new(
         "invalid_frame",

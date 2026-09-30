@@ -117,6 +117,7 @@ mod tests {
             "kms:card0/conn=+1/crtc=2/plane=3",
             "kms:card0/conn=4294967296/crtc=2/plane=3",
             "kms:card00/conn=1/crtc=2/plane=3",
+            "kms:card0/conn=01/crtc=2/plane=3",
         ] {
             let malformed = CString::new(value).expect("test output ID has no embedded NUL");
             let mut error = 0;

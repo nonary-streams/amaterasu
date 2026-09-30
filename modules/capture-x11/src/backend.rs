@@ -1,13 +1,19 @@
+#[cfg(amaterasu_x11)]
+use crate::model::MAX_OUTPUTS;
+#[cfg(any(amaterasu_x11, test))]
+use crate::model::frame_layout;
 use crate::model::{
-    CaptureError, CaptureResult, DesktopGeometry, Frame, MAX_OUTPUTS, NativeAvailability, Output,
-    frame_layout,
+    CaptureError, CaptureResult, DesktopGeometry, Frame, NativeAvailability, Output,
 };
-use amaterasu_media::{CaptureGeometry, DesktopRect};
-use std::{
-    ffi::{CString, c_char, c_void},
-    time::Instant,
-};
+#[cfg(amaterasu_x11)]
+use amaterasu_media::CaptureGeometry;
+use amaterasu_media::DesktopRect;
+#[cfg(amaterasu_x11)]
+use std::ffi::{CString, c_char, c_void};
+#[cfg(amaterasu_x11)]
+use std::time::Instant;
 
+#[cfg(amaterasu_x11)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NativeOutput {
@@ -20,6 +26,7 @@ struct NativeOutput {
     name: [c_char; 128],
 }
 
+#[cfg(amaterasu_x11)]
 impl Default for NativeOutput {
     fn default() -> Self {
         Self {
@@ -34,6 +41,7 @@ impl Default for NativeOutput {
     }
 }
 
+#[cfg(amaterasu_x11)]
 #[repr(C)]
 #[derive(Default)]
 struct NativeInfo {
@@ -43,6 +51,7 @@ struct NativeInfo {
     error: u32,
 }
 
+#[cfg(amaterasu_x11)]
 unsafe extern "C" {
     fn am_x11_probe(display: *const c_char, output: *mut NativeInfo) -> i32;
     fn am_x11_enumerate(
@@ -77,8 +86,8 @@ unsafe extern "C" {
 
 #[derive(Clone)]
 pub struct NativeBackend {
+    #[cfg(amaterasu_x11)]
     display: Option<CString>,
-    availability: NativeAvailability,
 }
 
 impl NativeBackend {
@@ -93,43 +102,12 @@ impl NativeBackend {
                 .as_deref()
                 .filter(|display| !display.is_empty())
                 .and_then(|display| CString::new(display.as_bytes()).ok());
-            let mut info = NativeInfo::default();
-            let error = display.as_ref().map_or(1, |display| {
-                // SAFETY: the adapter borrows a NUL-terminated display name and
-                // writes only the fixed-size initialized information record.
-                unsafe { am_x11_probe(display.as_ptr(), &mut info) }
-            });
-            let reason = if display.is_none() {
-                Some("display_not_configured")
-            } else if info.available != 0 {
-                None
-            } else {
-                Some(error_reason(error as u32))
-            };
-            Self {
-                display,
-                availability: NativeAvailability {
-                    native_supported: true,
-                    available: reason.is_none(),
-                    reason,
-                },
-            }
+            Self { display }
         }
         #[cfg(not(amaterasu_x11))]
         {
             let _ = display;
-            Self {
-                display: None,
-                availability: NativeAvailability {
-                    native_supported: false,
-                    available: false,
-                    reason: Some(if cfg!(target_os = "linux") {
-                        "native_dependencies_unavailable"
-                    } else {
-                        "unsupported_platform"
-                    }),
-                },
-            }
+            Self {}
         }
     }
 }
@@ -142,7 +120,42 @@ pub trait Backend: Send + Sync {
 
 impl Backend for NativeBackend {
     fn availability(&self) -> NativeAvailability {
-        self.availability
+        #[cfg(amaterasu_x11)]
+        {
+            let Some(display) = &self.display else {
+                return NativeAvailability {
+                    native_supported: true,
+                    available: false,
+                    reason: Some("display_not_configured"),
+                };
+            };
+            let mut info = NativeInfo::default();
+            // SAFETY: the NUL-terminated display name is borrowed synchronously;
+            // the adapter only initializes the fixed-size information record.
+            let error = unsafe { am_x11_probe(display.as_ptr(), &mut info) };
+            let reason = if info.available != 0 {
+                None
+            } else {
+                Some(error_reason(error as u32))
+            };
+            NativeAvailability {
+                native_supported: true,
+                available: reason.is_none(),
+                reason,
+            }
+        }
+        #[cfg(not(amaterasu_x11))]
+        {
+            NativeAvailability {
+                native_supported: false,
+                available: false,
+                reason: Some(if cfg!(target_os = "linux") {
+                    "native_dependencies_unavailable"
+                } else {
+                    "unsupported_platform"
+                }),
+            }
+        }
     }
 
     fn enumerate(&self) -> CaptureResult<(Vec<Output>, DesktopRect)> {
@@ -203,8 +216,9 @@ impl Backend for NativeBackend {
         }
         #[cfg(not(amaterasu_x11))]
         {
+            let availability = self.availability();
             Err(CaptureError::new(
-                self.availability.reason.unwrap_or("unsupported_platform"),
+                availability.reason.unwrap_or("unsupported_platform"),
                 "X11 capture is unavailable on this build",
             ))
         }
@@ -266,8 +280,9 @@ impl Backend for NativeBackend {
         #[cfg(not(amaterasu_x11))]
         {
             let _ = output;
+            let availability = self.availability();
             Err(CaptureError::new(
-                self.availability.reason.unwrap_or("unsupported_platform"),
+                availability.reason.unwrap_or("unsupported_platform"),
                 "X11 capture is unavailable on this build",
             ))
         }
@@ -403,6 +418,7 @@ fn invalid_output_id() -> CaptureError {
     CaptureError::new("invalid_output", "selected X11 output ID is invalid")
 }
 
+#[cfg(amaterasu_x11)]
 fn error_reason(error: u32) -> &'static str {
     match error {
         1 => "display_not_configured",
@@ -416,6 +432,7 @@ fn error_reason(error: u32) -> &'static str {
     }
 }
 
+#[cfg(amaterasu_x11)]
 fn native_error(error: u32) -> CaptureError {
     let code = match error {
         1 => "display_not_configured",
@@ -435,6 +452,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(amaterasu_x11)]
     fn missing_display_is_an_explicit_unavailable_state() {
         let backend = NativeBackend::with_display(None);
         assert!(!backend.availability().available);
@@ -445,21 +463,35 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(amaterasu_x11))]
+    fn missing_native_dependencies_are_an_explicit_unavailable_state() {
+        let backend = NativeBackend::new();
+        assert!(!backend.availability().native_supported);
+        assert!(!backend.availability().available);
+        assert_eq!(
+            backend.availability().reason,
+            Some(if cfg!(target_os = "linux") {
+                "native_dependencies_unavailable"
+            } else {
+                "unsupported_platform"
+            })
+        );
+    }
+
+    #[cfg(amaterasu_x11)]
+    #[test]
     fn selected_output_id_requires_name_and_fixed_hex_server_id() {
-        #[cfg(amaterasu_x11)]
-        {
-            assert_eq!(
-                parse_output_id("x11:DP-1/000000a4").unwrap(),
-                ("DP-1", 0xa4)
-            );
-            for invalid in [
-                "DP-1/000000a4",
-                "x11:/000000a4",
-                "x11:DP-1/a4",
-                "x11:DP-1/000000ag",
-            ] {
-                assert!(parse_output_id(invalid).is_err(), "{invalid}");
-            }
+        assert_eq!(
+            parse_output_id("x11:DP-1/000000a4").unwrap(),
+            ("DP-1", 0xa4)
+        );
+        for invalid in [
+            "DP-1/000000a4",
+            "x11:/000000a4",
+            "x11:DP-1/a4",
+            "x11:DP-1/000000ag",
+        ] {
+            assert!(parse_output_id(invalid).is_err(), "{invalid}");
         }
     }
 

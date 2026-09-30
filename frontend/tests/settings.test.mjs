@@ -34,6 +34,30 @@ const parse = context.Amaterasu.parseSteamExclusions;
 const ordinary = (value) => JSON.parse(JSON.stringify(value));
 const diagnosticsResult = (status) => ({ status, error: null });
 
+test("display policy editor keeps platform-specific inheritance and scoped static-count overrides", () => {
+  const parseDisplayPolicy = context.Amaterasu.parseDisplayPolicyOverrideMap;
+  assert.deepEqual(ordinary(parseDisplayPolicy("", "global")).dd_virtual_display_permanent_count, null);
+  assert.deepEqual(ordinary(parseDisplayPolicy(
+    JSON.stringify({ dd_virtual_display_permanent_count: 2, virtual_display_outputs: ["DP-3"] }),
+    "application",
+  )), {
+    dd_virtual_display_permanent_count: 2,
+    virtual_display_outputs: ["DP-3"],
+  });
+  assert.deepEqual(ordinary(parseDisplayPolicy(
+    JSON.stringify({ dd_virtual_display_permanent_count: null }),
+    "client",
+  )), { dd_virtual_display_permanent_count: null });
+  assert.throws(() => parseDisplayPolicy(
+    JSON.stringify({ dd_virtual_display_permanent_count: 5 }),
+    "application",
+  ), /invalid/);
+  assert.throws(() => parseDisplayPolicy(
+    JSON.stringify({ wayland_hdr_compatibility: true }),
+    "application",
+  ), /unavailable/);
+});
+
 test("authentication lifetime editor accepts bounded whole seconds", () => {
   const parseAuth = context.Amaterasu.parseAuthTokenLifetimes;
   assert.deepEqual(ordinary(parseAuth(7200, 604800)), {
@@ -2712,9 +2736,9 @@ test("capture output selection preserves exact IDs and automatic reset", () => {
     assert.throws(() => parse(invalid));
 });
 
-test("capture backend selection accepts supported modes including PipeWire", () => {
+test("capture backend selection accepts supported modes including PipeWire, X11 and KMS", () => {
   const parse = context.Amaterasu.parseCaptureSelection;
-  for (const mode of ["auto", "ddx", "wgc", "wgcc", "pipewire"])
+  for (const mode of ["auto", "ddx", "wgc", "wgcc", "pipewire", "x11", "kms"])
     assert.equal(parse(mode), mode);
   for (const invalid of ["", "dxgi", "WGC", "wgcc ", "other"])
     assert.throws(() => parse(invalid));

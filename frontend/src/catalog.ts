@@ -1233,6 +1233,11 @@ namespace Amaterasu {
       const refreshRateOptionFields = catalogRefreshRateOptionFields(
         row.entry.config_overrides?.dd_refresh_rate_option,
       );
+      const displayPolicy = el("textarea");
+      displayPolicy.name = "display_policy";
+      displayPolicy.rows = 12;
+      displayPolicy.spellcheck = false;
+      displayPolicy.value = JSON.stringify(row.entry.config_overrides?.display_policy ?? {}, null, 2);
       const form = el(
         "form",
         "editor-form",
@@ -1243,6 +1248,7 @@ namespace Amaterasu {
         ),
         ...frameLimiterFields,
         ...refreshRateOptionFields,
+        field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null/empty to inherit the next scope; global-only keys are rejected."),
         field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."),
         audioSink.controls,
         virtualSink.controls,
@@ -1279,7 +1285,10 @@ namespace Amaterasu {
             ),
             parseCatalogNvencSettingsOverrides(new FormData(form)),
             parseCatalogInputCompatibilityOverrides(new FormData(form)),
-            { dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)) },
+            {
+              dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
+              display_policy: parseDisplayPolicyOverrideMap(displayPolicy.value, "application"),
+            },
           );
           try {
             const reply = await api.post<{
@@ -1297,6 +1306,7 @@ namespace Amaterasu {
                 keyboard?: boolean;
                 mouse?: boolean;
                 dd_refresh_rate_option?: RefreshRateOption | null;
+                display_policy?: Record<string, unknown> | null;
               } & CatalogFrameLimiterOverrides & CatalogNvencSettingsOverrides & CatalogInputCompatibilityOverrides;
               changed: boolean;
               replayed: boolean;
@@ -1554,6 +1564,11 @@ namespace Amaterasu {
     const refreshRateOptionFields = catalogRefreshRateOptionFields(
       entry?.config_overrides?.dd_refresh_rate_option,
     );
+    const displayPolicy = el("textarea");
+    displayPolicy.name = "display_policy";
+    displayPolicy.rows = 12;
+    displayPolicy.spellcheck = false;
+    displayPolicy.value = JSON.stringify(entry?.config_overrides?.display_policy ?? {}, null, 2);
     const prefer10BitSdr = audioOverrideSelect(
       "prefer_10bit_sdr",
       catalogPrefer10BitSdrOverrideValue(entry?.config_overrides?.prefer_10bit_sdr) ?? undefined,
@@ -1627,6 +1642,7 @@ namespace Amaterasu {
       field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
       ...frameLimiterFields,
       ...refreshRateOptionFields,
+      field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null/empty to inherit the next scope; global-only keys are rejected."),
       field(
         "10-bit SDR preference",
         prefer10BitSdr,

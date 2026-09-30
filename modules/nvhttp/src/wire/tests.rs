@@ -19,6 +19,17 @@ fn paired_client_display_mode_decodes_only_as_optional_string() {
     );
 }
 
+#[test]
+fn paired_client_capture_mode_decodes_only_as_a_supported_capture_mode() {
+    let parsed: ClientConfigOverrides =
+        serde_json::from_value(json!({"capture":"pipewire"})).unwrap();
+    assert_eq!(parsed.capture, Some(crate::launch::CaptureMode::PipeWire));
+    assert!(
+        serde_json::from_value::<ClientConfigOverrides>(json!({"capture":"fallback"})).is_err()
+    );
+    assert!(serde_json::from_value::<ClientConfigOverrides>(json!({"capture":7})).is_err());
+}
+
 #[derive(Default)]
 struct Broker {
     next: u64,

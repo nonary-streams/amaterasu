@@ -136,6 +136,7 @@ pub struct PeerIdentity {
     client_qp: Option<i32>,
     client_minimum_fps_target: Option<f64>,
     client_video_max_batch_size_kb: Option<u8>,
+    client_capture: Option<CaptureMode>,
     client_stream_audio: Option<bool>,
     client_audio_sink: Option<String>,
     client_virtual_sink: Option<String>,
@@ -183,6 +184,7 @@ impl PeerIdentity {
             client_qp: None,
             client_minimum_fps_target: None,
             client_video_max_batch_size_kb: None,
+            client_capture: None,
             client_stream_audio: None,
             client_audio_sink: None,
             client_virtual_sink: None,
@@ -244,6 +246,7 @@ impl PeerIdentity {
         client_software_encoder
             .validate()
             .map_err(|_| "invalid_paired_identity")?;
+        let client_capture = config_overrides.capture;
         let client_display_mode = match config_overrides.display_mode.as_deref() {
             Some(mode) => Some(PhysicalDisplayMode::parse(mode).ok_or("invalid_paired_identity")?),
             None => None,
@@ -324,6 +327,7 @@ impl PeerIdentity {
         self.client_qp = qp;
         self.client_minimum_fps_target = minimum_fps_target;
         self.client_video_max_batch_size_kb = video_max_batch_size_kb;
+        self.client_capture = client_capture;
         self.client_stream_audio = stream_audio;
         self.client_audio_sink = audio_sink;
         self.client_virtual_sink = virtual_sink;
@@ -480,6 +484,10 @@ pub enum CaptureMode {
     Ddx,
     Wgc,
     Wgcc,
+    #[serde(rename = "pipewire")]
+    PipeWire,
+    X11,
+    Kms,
 }
 
 impl CaptureMode {
@@ -489,6 +497,9 @@ impl CaptureMode {
             Self::Ddx => (CaptureProvider::Dxgi, false),
             Self::Wgc => (CaptureProvider::Wgc, false),
             Self::Wgcc => (CaptureProvider::Wgc, true),
+            Self::PipeWire => (CaptureProvider::PipeWire, false),
+            Self::X11 => (CaptureProvider::X11, false),
+            Self::Kms => (CaptureProvider::Kms, false),
         }
     }
 
@@ -498,6 +509,9 @@ impl CaptureMode {
             Self::Ddx => "ddx",
             Self::Wgc => "wgc",
             Self::Wgcc => "wgcc",
+            Self::PipeWire => "pipewire",
+            Self::X11 => "x11",
+            Self::Kms => "kms",
         }
     }
 }
@@ -510,6 +524,8 @@ pub enum CaptureProvider {
     /// An explicitly selected current-user portal source.
     #[serde(rename = "pipewire")]
     PipeWire,
+    X11,
+    Kms,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -809,9 +825,11 @@ impl Controller {
             .unwrap_or(&config.capture.audio_endpoint)
             .to_owned();
         let bootstrap_audio_endpoint = config.capture.audio_endpoint.clone();
-        let (capture_provider, constant_rate) = self
-            .configured_capture
-            .resolve(config.capture.capture_provider);
+        let bootstrap_capture_provider = config.capture.capture_provider;
+        let global_capture_mode = self.configured_capture;
+        let selected_capture_mode = peer.client_capture.unwrap_or(global_capture_mode);
+        let (capture_provider, constant_rate) =
+            selected_capture_mode.resolve(bootstrap_capture_provider);
 
         if let Some(record) = self
             .records
@@ -872,6 +890,8 @@ impl Controller {
             global_minimum_fps_target,
             global_wgc_pacing_smoothing,
             capture_output,
+            bootstrap_capture_provider,
+            global_capture_mode,
             audio_endpoint,
             bootstrap_audio_endpoint,
             capture_provider,

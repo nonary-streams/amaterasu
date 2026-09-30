@@ -142,6 +142,8 @@ mod tests {
             "kms:card0/conn=1/crtc=0/plane=3",
             "kms:card0/conn=1/plane=3/crtc=2/extra=4",
             "kms:card../conn=1/crtc=2/plane=3",
+            "kms:card00/conn=1/crtc=2/plane=3",
+            "kms:card0/conn=01/crtc=2/plane=3",
         ] {
             assert!(validate_output_id(invalid).is_err(), "accepted {invalid}");
         }

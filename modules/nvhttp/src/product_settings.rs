@@ -45,8 +45,10 @@ const QP_SETTINGS_VERSION: u64 = 22;
 const FEC_SETTINGS_VERSION: u64 = 23;
 const NVENC_SETTINGS_VERSION: u64 = 24;
 const STEAM_AUDIO_DRIVER_SETTINGS_VERSION: u64 = 25;
-const SETTINGS_VERSION: u64 = STEAM_AUDIO_DRIVER_SETTINGS_VERSION;
-const DISPLAY_POLICY_KEYS: [&str; 8] = [
+const FULL_DISPLAY_POLICY_SETTINGS_VERSION: u64 = 26;
+const LEGACY_PERMANENT_MONITOR_COUNT_KEY: &str = "dd_vdd_static_monitor_count";
+const SETTINGS_VERSION: u64 = FULL_DISPLAY_POLICY_SETTINGS_VERSION;
+const LEGACY_DISPLAY_POLICY_KEYS: [&str; 8] = [
     "dd_mode_remapping",
     "dd_resolution_option",
     "dd_manual_resolution",
@@ -55,6 +57,38 @@ const DISPLAY_POLICY_KEYS: [&str; 8] = [
     "dd_hdr_option",
     "dd_configuration_option",
     "dd_hdr_request_override",
+];
+const DISPLAY_POLICY_KEYS: [&str; 30] = [
+    "adapter_name",
+    "adapter_pnp_id",
+    "virtual_display_mode",
+    "virtual_display_layout",
+    "dd_mode_remapping",
+    "dd_resolution_option",
+    "dd_manual_resolution",
+    "dd_refresh_rate_option",
+    "dd_manual_refresh_rate",
+    "dd_hdr_option",
+    "dd_configuration_option",
+    "dd_hdr_request_override",
+    "dd_config_revert_delay",
+    "dd_config_revert_on_disconnect",
+    "dd_paused_virtual_display_timeout_secs",
+    "dd_always_restore_from_golden",
+    "dd_display_helper_engine",
+    "dd_snapshot_restore_hotkey",
+    "dd_snapshot_restore_hotkey_modifiers",
+    "dd_use_sunshine_virtual_display_driver",
+    "dd_activate_virtual_display",
+    "dd_virtual_display_scale",
+    "dd_virtual_display_permanent_count",
+    "virtual_display_outputs",
+    "dd_snapshot_exclude_devices",
+    "dd_wa_dummy_plug_hdr10",
+    "dd_wa_hdr_toggle",
+    "dd_wa_hdr_toggle_delay",
+    "vulkan_hdr_layer",
+    "wayland_hdr_compatibility",
 ];
 const DEFAULT_MINIMUM_FPS_TARGET: f64 = 20.0;
 const DEFAULT_FEC_PERCENTAGE: u8 = 20;
@@ -260,9 +294,12 @@ pub(crate) struct DisplayPolicyUpdate {
     pub(crate) dd_hdr_option: FieldUpdate<String>,
     pub(crate) dd_configuration_option: FieldUpdate<String>,
     pub(crate) dd_hdr_request_override: FieldUpdate<String>,
+    /// Sparse update for the extended display/capture policy object. Existing
+    /// flat fields above remain accepted for older settings clients.
+    pub(crate) additional: FieldUpdate<Value>,
 }
 
-fn empty_display_policy() -> Value {
+pub(crate) fn empty_display_policy() -> Value {
     let mut policy = serde_json::Map::new();
     for key in DISPLAY_POLICY_KEYS {
         policy.insert(key.into(), Value::Null);
@@ -309,6 +346,23 @@ fn apply_display_policy_update(
     apply!(dd_hdr_option);
     apply!(dd_configuration_option);
     apply!(dd_hdr_request_override);
+    match update.additional {
+        FieldUpdate::Omitted => {}
+        FieldUpdate::Null => {
+            for key in DISPLAY_POLICY_KEYS {
+                fields.insert(key.into(), Value::Null);
+            }
+        }
+        FieldUpdate::Value(value) => {
+            let additional = value.as_object().ok_or("invalid_display_policy")?;
+            for (key, value) in additional {
+                if !DISPLAY_POLICY_KEYS.contains(&key.as_str()) {
+                    return Err("invalid_display_policy");
+                }
+                fields.insert(key.clone(), value.clone());
+            }
+        }
+    }
     validate_display_policy_values(&policy)?;
     Ok(policy)
 }
@@ -380,6 +434,80 @@ fn valid_manual_refresh(value: &str) -> bool {
         && numerator <= 1000 * denominator
 }
 
+fn valid_bounded_text(value: &Value, maximum_bytes: usize) -> bool {
+    value
+        .as_str()
+        .is_some_and(|text| text.len() <= maximum_bytes && !text.chars().any(char::is_control))
+}
+
+fn valid_string_list(value: &Value, maximum_count: usize, maximum_item_bytes: usize) -> bool {
+    value.as_array().is_some_and(|items| {
+        items.len() <= maximum_count
+            && items.iter().all(|item| {
+                item.as_str().is_some_and(|text| {
+                    !text.is_empty()
+                        && text.len() <= maximum_item_bytes
+                        && !text.chars().any(char::is_control)
+                })
+            })
+    })
+}
+
+fn valid_snapshot_hotkey(value: &Value) -> bool {
+    let Some(raw) = value.as_str() else {
+        return false;
+    };
+    let raw = raw.trim();
+    if raw.is_empty()
+        || matches!(
+            raw.to_ascii_lowercase().as_str(),
+            "disabled" | "none" | "off"
+        )
+    {
+        return raw.len() <= 64;
+    }
+    let normalized = raw.to_ascii_lowercase();
+    let key = normalized.strip_prefix("vk_").unwrap_or(&normalized);
+    if let Some(hex) = key.strip_prefix("0x") {
+        return !hex.is_empty()
+            && hex.len() <= 2
+            && u8::from_str_radix(hex, 16).is_ok_and(|code| code != 0);
+    }
+    if let Some(function) = key.strip_prefix('f')
+        && let Ok(number) = function.parse::<u8>()
+    {
+        return (1..=24).contains(&number);
+    }
+    key.len() == 1 && key.as_bytes()[0].is_ascii_alphanumeric()
+}
+
+fn valid_snapshot_modifiers(value: &Value) -> bool {
+    let Some(raw) = value.as_str() else {
+        return false;
+    };
+    if raw.len() > 128 || raw.chars().any(char::is_control) {
+        return false;
+    }
+    raw.split(['+', '|', ',', ';'])
+        .filter(|part| !part.trim().is_empty())
+        .all(|part| {
+            matches!(
+                part.trim().to_ascii_lowercase().as_str(),
+                "ctrl"
+                    | "control"
+                    | "alt"
+                    | "shift"
+                    | "win"
+                    | "windows"
+                    | "meta"
+                    | "none"
+                    | "off"
+                    | "disabled"
+                    | "default"
+            )
+        })
+}
+
 fn valid_display_remapping(value: &Value) -> bool {
     value.as_object().is_some_and(|groups| {
         groups.iter().all(|(kind, entries)| {
@@ -432,7 +560,7 @@ fn valid_display_rule(kind: &str, rule: &Value) -> bool {
         || (uses_refresh && !final_refresh_rate.is_empty())
 }
 
-fn validate_display_policy_values(policy: &Value) -> Result<(), &'static str> {
+pub(crate) fn validate_display_policy_values(policy: &Value) -> Result<(), &'static str> {
     let fields = policy.as_object().ok_or("invalid_display_policy")?;
     if fields.len() != DISPLAY_POLICY_KEYS.len()
         || DISPLAY_POLICY_KEYS
@@ -477,6 +605,87 @@ fn validate_display_policy_values(policy: &Value) -> Result<(), &'static str> {
                 .is_some_and(valid_manual_refresh))
         || (!fields["dd_mode_remapping"].is_null()
             && !valid_display_remapping(&fields["dd_mode_remapping"]))
+        || (!fields["adapter_name"].is_null() && !valid_bounded_text(&fields["adapter_name"], 1024))
+        || (!fields["adapter_pnp_id"].is_null()
+            && !valid_bounded_text(&fields["adapter_pnp_id"], 256))
+        || (fields["adapter_pnp_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+            && fields["adapter_name"].as_str().is_none_or(str::is_empty))
+        || !valid_choice(
+            "virtual_display_mode",
+            &["disabled", "per_client", "shared"],
+        )
+        || !valid_choice(
+            "virtual_display_layout",
+            &[
+                "exclusive",
+                "extended",
+                "extended_primary",
+                "extended_isolated",
+                "extended_primary_isolated",
+            ],
+        )
+        || !valid_choice("dd_display_helper_engine", &["auto", "v2", "legacy"])
+        || (!fields["dd_config_revert_delay"].is_null()
+            && !fields["dd_config_revert_delay"]
+                .as_u64()
+                .is_some_and(|value| value <= i32::MAX as u64))
+        || (!fields["dd_paused_virtual_display_timeout_secs"].is_null()
+            && !fields["dd_paused_virtual_display_timeout_secs"]
+                .as_u64()
+                .is_some_and(|value| value <= i32::MAX as u64))
+        || (!fields["dd_snapshot_restore_hotkey"].is_null()
+            && !valid_snapshot_hotkey(&fields["dd_snapshot_restore_hotkey"]))
+        || (!fields["dd_snapshot_restore_hotkey_modifiers"].is_null()
+            && !valid_snapshot_modifiers(&fields["dd_snapshot_restore_hotkey_modifiers"]))
+        || (!fields["dd_virtual_display_scale"].is_null()
+            && !fields["dd_virtual_display_scale"]
+                .as_i64()
+                .is_some_and(|scale| {
+                    matches!(
+                        scale,
+                        -1 | 0
+                            | 100
+                            | 125
+                            | 150
+                            | 175
+                            | 200
+                            | 225
+                            | 250
+                            | 300
+                            | 350
+                            | 400
+                            | 450
+                            | 500
+                    )
+                }))
+        || (!fields["dd_virtual_display_permanent_count"].is_null()
+            && !fields["dd_virtual_display_permanent_count"]
+                .as_u64()
+                .is_some_and(|value| value <= 4))
+        || (!fields["virtual_display_outputs"].is_null()
+            && !valid_string_list(&fields["virtual_display_outputs"], 32, 512))
+        || (!fields["dd_snapshot_exclude_devices"].is_null()
+            && !valid_string_list(&fields["dd_snapshot_exclude_devices"], 256, 1024))
+        || (!fields["dd_config_revert_on_disconnect"].is_null()
+            && !fields["dd_config_revert_on_disconnect"].is_boolean())
+        || (!fields["dd_always_restore_from_golden"].is_null()
+            && !fields["dd_always_restore_from_golden"].is_boolean())
+        || (!fields["dd_use_sunshine_virtual_display_driver"].is_null()
+            && !fields["dd_use_sunshine_virtual_display_driver"].is_boolean())
+        || (!fields["dd_activate_virtual_display"].is_null()
+            && !fields["dd_activate_virtual_display"].is_boolean())
+        || (!fields["dd_wa_dummy_plug_hdr10"].is_null()
+            && !fields["dd_wa_dummy_plug_hdr10"].is_boolean())
+        || (!fields["dd_wa_hdr_toggle"].is_null() && !fields["dd_wa_hdr_toggle"].is_boolean())
+        || (!fields["dd_wa_hdr_toggle_delay"].is_null()
+            && !fields["dd_wa_hdr_toggle_delay"]
+                .as_u64()
+                .is_some_and(|value| value <= 3000))
+        || (!fields["vulkan_hdr_layer"].is_null() && !fields["vulkan_hdr_layer"].is_boolean())
+        || (!fields["wayland_hdr_compatibility"].is_null()
+            && !fields["wayland_hdr_compatibility"].is_boolean())
     {
         return Err("invalid_display_policy");
     }
@@ -1025,6 +1234,8 @@ impl ProductSettings {
                 crate::launch::CaptureProvider::Dxgi => "dxgi",
                 crate::launch::CaptureProvider::Wgc => "wgc",
                 crate::launch::CaptureProvider::PipeWire => "pipewire",
+                crate::launch::CaptureProvider::X11 => "x11",
+                crate::launch::CaptureProvider::Kms => "kms",
             }
         })
     }
@@ -2875,12 +3086,21 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | FEC_SETTINGS_VERSION
             | NVENC_SETTINGS_VERSION
             | STEAM_AUDIO_DRIVER_SETTINGS_VERSION
+            | FULL_DISPLAY_POLICY_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
             "product settings version or revision is unsupported",
         ));
     }
+    let mut migrated_values = values.clone();
+    if version >= FULL_DISPLAY_POLICY_SETTINGS_VERSION
+        && let Some(legacy_count) = migrated_values.remove(LEGACY_PERMANENT_MONITOR_COUNT_KEY)
+        && !migrated_values.contains_key("dd_virtual_display_permanent_count")
+    {
+        migrated_values.insert("dd_virtual_display_permanent_count".into(), legacy_count);
+    }
+    let values = &migrated_values;
     let expected_value_count = match version {
         LEGACY_SETTINGS_VERSION => 1,
         PORT_SETTINGS_VERSION => 2,
@@ -2907,6 +3127,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         FEC_SETTINGS_VERSION => 47,
         NVENC_SETTINGS_VERSION => 56,
         STEAM_AUDIO_DRIVER_SETTINGS_VERSION => 57,
+        FULL_DISPLAY_POLICY_SETTINGS_VERSION => 79,
         _ => unreachable!(),
     };
     let matches_expected_value_count = values.len() == expected_value_count
@@ -2954,6 +3175,10 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             && (!values.contains_key("lan_encryption_mode")
                 || !values.contains_key("wan_encryption_mode")))
         || (version >= DISPLAY_POLICY_SETTINGS_VERSION
+            && LEGACY_DISPLAY_POLICY_KEYS
+                .iter()
+                .any(|key| !values.contains_key(*key)))
+        || (version >= FULL_DISPLAY_POLICY_SETTINGS_VERSION
             && DISPLAY_POLICY_KEYS
                 .iter()
                 .any(|key| !values.contains_key(*key)))
@@ -3247,7 +3472,14 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     let display_policy = if version >= DISPLAY_POLICY_SETTINGS_VERSION {
         let mut policy = serde_json::Map::new();
         for key in DISPLAY_POLICY_KEYS {
-            policy.insert(key.to_owned(), values[key].clone());
+            let value = values.get(key).cloned().unwrap_or(Value::Null);
+            if version < FULL_DISPLAY_POLICY_SETTINGS_VERSION
+                && !LEGACY_DISPLAY_POLICY_KEYS.contains(&key)
+            {
+                policy.insert(key.to_owned(), Value::Null);
+            } else {
+                policy.insert(key.to_owned(), value);
+            }
         }
         let policy = Value::Object(policy);
         validate_display_policy_values(&policy)
@@ -3350,7 +3582,9 @@ fn update_result(
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
-        return Err(invalid_state("product_update did not confirm v25 settings"));
+        return Err(invalid_state(
+            "product_update did not confirm current settings",
+        ));
     }
     let document = parse_document(payload)?;
     if document.hostname.as_deref() != Some(expected.hostname)
@@ -3742,10 +3976,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_document_helpers_use_canonical_v25_defaults_and_legacy_migration() {
+    fn public_document_helpers_use_canonical_v26_defaults_and_legacy_migration() {
         let mut current = default_document(&Settings::default()).unwrap();
         assert_eq!(current["version"], SETTINGS_VERSION);
-        assert_eq!(current["values"].as_object().unwrap().len(), 57);
+        assert_eq!(current["values"].as_object().unwrap().len(), 79);
         assert_eq!(current["values"]["install_steam_audio_drivers"], true);
         assert_eq!(current["values"]["nvenc_preset"], 1);
         assert_eq!(current["values"]["vaapi_strict_rc_buffer"], false);
@@ -3753,6 +3987,7 @@ mod tests {
 
         let mut v24 = current.clone();
         v24["version"] = json!(NVENC_SETTINGS_VERSION);
+        remove_extended_display_policy_fields(&mut v24);
         v24["values"]
             .as_object_mut()
             .unwrap()
@@ -3765,6 +4000,7 @@ mod tests {
 
         let mut legacy = current.clone();
         legacy["version"] = json!(FEC_SETTINGS_VERSION);
+        remove_extended_display_policy_fields(&mut legacy);
         for key in NVENC_SETTINGS_KEYS {
             legacy["values"].as_object_mut().unwrap().remove(key);
         }
@@ -3786,6 +4022,7 @@ mod tests {
     fn steam_audio_driver_policy_migrates_v24_defaults_true_and_persists_globally() {
         let mut v24 = default_document(&Settings::default()).unwrap();
         v24["version"] = json!(NVENC_SETTINGS_VERSION);
+        remove_extended_display_policy_fields(&mut v24);
         v24["values"]
             .as_object_mut()
             .unwrap()
@@ -3825,7 +4062,7 @@ mod tests {
         product.start_next();
         let pending = product.pending.take().expect("Steam driver policy update");
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 57);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 79);
         assert_eq!(
             pending.payload["values"]["install_steam_audio_drivers"],
             false
@@ -3909,6 +4146,16 @@ mod tests {
         }
     }
 
+    fn remove_extended_display_policy_fields(document: &mut Value) {
+        if let Some(values) = document["values"].as_object_mut() {
+            for key in DISPLAY_POLICY_KEYS {
+                if !LEGACY_DISPLAY_POLICY_KEYS.contains(&key) {
+                    values.remove(key);
+                }
+            }
+        }
+    }
+
     fn display_update_action(
         display_policy: DisplayPolicyUpdate,
         expected_revision: u64,
@@ -3962,7 +4209,45 @@ mod tests {
     }
 
     #[test]
-    fn global_display_fields_use_v18_cas_and_survive_restart() {
+    fn legacy_static_monitor_alias_migrates_to_canonical_without_losing_zero_or_precedence() {
+        let absent = display_v18_document(7);
+        assert!(
+            parse_document(&absent).unwrap().display_policy["dd_virtual_display_permanent_count"]
+                .is_null()
+        );
+
+        let mut legacy_zero = display_v18_document(7);
+        legacy_zero["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dd_virtual_display_permanent_count");
+        legacy_zero["values"][LEGACY_PERMANENT_MONITOR_COUNT_KEY] = json!(0);
+        assert_eq!(
+            parse_document(&legacy_zero).unwrap().display_policy["dd_virtual_display_permanent_count"],
+            0
+        );
+
+        for (canonical, legacy) in [(json!(2), json!(3)), (Value::Null, json!(3))] {
+            let mut both = display_v18_document(7);
+            both["values"]["dd_virtual_display_permanent_count"] = canonical.clone();
+            both["values"][LEGACY_PERMANENT_MONITOR_COUNT_KEY] = legacy;
+            assert_eq!(
+                parse_document(&both).unwrap().display_policy["dd_virtual_display_permanent_count"],
+                canonical
+            );
+        }
+
+        let mut invalid = display_v18_document(7);
+        invalid["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dd_virtual_display_permanent_count");
+        invalid["values"][LEGACY_PERMANENT_MONITOR_COUNT_KEY] = json!(5);
+        assert!(parse_document(&invalid).is_err());
+    }
+
+    #[test]
+    fn global_display_fields_upgrade_v18_to_v26_and_survive_restart() {
         let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
         product.apply_document(parse_document(&display_v18_document(7)).unwrap());
         product
@@ -3981,6 +4266,18 @@ mod tests {
                         dd_mode_remapping: FieldUpdate::Value(json!({"mixed":[{
                             "final_resolution":"1280x720","final_refresh_rate":"60"
                         }]})),
+                        additional: FieldUpdate::Value(json!({
+                            "adapter_name":"/dev/dri/renderD128",
+                            "adapter_pnp_id":"PCI\\VEN_10DE&DEV_2684",
+                            "virtual_display_mode":"disabled",
+                            "virtual_display_layout":"exclusive",
+                            "dd_virtual_display_scale":-1,
+                            "dd_virtual_display_permanent_count":2,
+                            "virtual_display_outputs":["Vibeshine-1"],
+                            "dd_snapshot_exclude_devices":["DISPLAY\\VIBESHINE"],
+                            "vulkan_hdr_layer":true,
+                            "wayland_hdr_compatibility":false
+                        })),
                     },
                     7,
                 ),
@@ -3990,7 +4287,7 @@ mod tests {
         let pending = product.pending.take().unwrap();
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["expected_revision"], 7);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 57);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 79);
         let write = pending.payload["values"].clone();
         let response =
             json!({"ok":true,"found":true,"version":SETTINGS_VERSION,"revision":8,"values":write});
@@ -3999,6 +4296,10 @@ mod tests {
         assert_eq!(
             product.settings_payload()["configured_display_policy"]["dd_manual_refresh_rate"],
             "59.94"
+        );
+        assert_eq!(
+            product.settings_payload()["configured_display_policy"]["adapter_name"],
+            "/dev/dri/renderD128"
         );
         let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
         restarted.apply_document(parse_document(&response).unwrap());
@@ -5417,6 +5718,8 @@ mod tests {
             (CaptureMode::Ddx, "dxgi"),
             (CaptureMode::Wgc, "wgc"),
             (CaptureMode::Wgcc, "wgc"),
+            (CaptureMode::X11, "x11"),
+            (CaptureMode::Kms, "kms"),
         ] {
             let document = json!({
                 "ok":true,"found":true,"version":6,"revision":3,
@@ -5720,7 +6023,7 @@ mod tests {
             },
         );
         assert_eq!(update["version"], SETTINGS_VERSION);
-        assert_eq!(update["values"].as_object().unwrap().len(), 57);
+        assert_eq!(update["values"].as_object().unwrap().len(), 79);
         assert_eq!(update["values"]["nvenc_spatial_aq"], false);
         assert_eq!(
             update["values"]["global_preparation"]
@@ -7053,7 +7356,13 @@ mod tests {
 
     #[test]
     fn capture_update_omission_preserves_and_null_resets_to_auto() {
-        for mode in [CaptureMode::Ddx, CaptureMode::Wgc, CaptureMode::Wgcc] {
+        for mode in [
+            CaptureMode::Ddx,
+            CaptureMode::Wgc,
+            CaptureMode::Wgcc,
+            CaptureMode::X11,
+            CaptureMode::Kms,
+        ] {
             assert_eq!(apply_capture_update(FieldUpdate::Omitted, mode), mode);
             assert_eq!(
                 apply_capture_update(FieldUpdate::Null, mode),
@@ -7344,8 +7653,14 @@ mod tests {
     fn software_v23_cas_restart_reset_empty_and_signed_values_are_exact() {
         let mut prior_version = display_v18_document(7);
         prior_version["version"] = json!(SOFTWARE_ENCODER_SETTINGS_VERSION);
+        remove_extended_display_policy_fields(&mut prior_version);
         remove_nvenc_settings(&mut prior_version);
         let prior_values = prior_version["values"].as_object_mut().unwrap();
+        for key in DISPLAY_POLICY_KEYS {
+            if !LEGACY_DISPLAY_POLICY_KEYS.contains(&key) {
+                prior_values.remove(key);
+            }
+        }
         prior_values.remove("upnp");
         prior_values.remove("fec_percentage");
         prior_values.remove("install_steam_audio_drivers");
@@ -7366,15 +7681,14 @@ mod tests {
         let mut legacy = display_v18_document(7);
         legacy["version"] = json!(DISPLAY_POLICY_SETTINGS_VERSION);
         remove_nvenc_settings(&mut legacy);
-        legacy["values"].as_object_mut().unwrap().remove("upnp");
-        legacy["values"]
-            .as_object_mut()
-            .unwrap()
-            .remove("fec_percentage");
-        legacy["values"]
-            .as_object_mut()
-            .unwrap()
-            .remove("install_steam_audio_drivers");
+        for key in DISPLAY_POLICY_KEYS {
+            if !LEGACY_DISPLAY_POLICY_KEYS.contains(&key) {
+                legacy["values"].as_object_mut().unwrap().remove(key);
+            }
+        }
+        for key in ["upnp", "fec_percentage", "install_steam_audio_drivers"] {
+            legacy["values"].as_object_mut().unwrap().remove(key);
+        }
         for key in ["sw_preset", "sw_tune", "encoder", "min_threads", "qp"] {
             legacy["values"].as_object_mut().unwrap().remove(key);
         }
@@ -7473,6 +7787,7 @@ mod tests {
     fn version_twenty_two_migrates_with_prior_upnp_and_qp_values_preserved() {
         let mut prior = display_v18_document(7);
         prior["version"] = json!(MIN_THREADS_SETTINGS_VERSION);
+        remove_extended_display_policy_fields(&mut prior);
         remove_nvenc_settings(&mut prior);
         prior["values"].as_object_mut().unwrap().remove("upnp");
         prior["values"].as_object_mut().unwrap().remove("qp");
@@ -7519,6 +7834,7 @@ mod tests {
 
         let mut version_21 = saved.clone();
         version_21["version"] = json!(UPNP_SETTINGS_VERSION);
+        remove_extended_display_policy_fields(&mut version_21);
         remove_nvenc_settings(&mut version_21);
         version_21["values"].as_object_mut().unwrap().remove("qp");
         version_21["values"]
@@ -7549,6 +7865,7 @@ mod tests {
 
         let mut version_22 = saved;
         version_22["version"] = json!(QP_SETTINGS_VERSION);
+        remove_extended_display_policy_fields(&mut version_22);
         remove_nvenc_settings(&mut version_22);
         version_22["values"]["qp"] = json!(41);
         version_22["values"]
@@ -7634,9 +7951,10 @@ mod tests {
     }
 
     #[test]
-    fn nvenc_v23_migration_defaults_v25_cas_roundtrip_and_validation() {
+    fn nvenc_v23_migration_defaults_v26_cas_roundtrip_and_validation() {
         let mut version_23 = display_v18_document(7);
         version_23["version"] = json!(FEC_SETTINGS_VERSION);
+        remove_extended_display_policy_fields(&mut version_23);
         remove_nvenc_settings(&mut version_23);
         version_23["values"]
             .as_object_mut()
@@ -7666,7 +7984,7 @@ mod tests {
         product.start_next();
         let pending = product.pending.take().expect("NVENC settings update");
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 57);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 79);
         assert_eq!(pending.payload["values"]["nvenc_preset"], 7);
         assert_eq!(pending.payload["values"]["nvenc_twopass"], "full_res");
         assert_eq!(pending.payload["values"]["nvenc_split_encode"], "disabled");

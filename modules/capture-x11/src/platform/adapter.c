@@ -232,8 +232,13 @@ int am_x11_probe(const char *display, struct am_x11_info *output) {
     }
     xcb_screen_t *screen = screen_for(connection, screen_number);
     size_t count = 0;
-    int result = screen == NULL ? AM_X11_CONNECT_FAILED
-                                : enumerate_connection(connection, screen, NULL, 0, &count);
+    struct am_x11_format format = {0};
+    int result = screen == NULL
+                     ? AM_X11_CONNECT_FAILED
+                     : root_format(connection, screen, &format);
+    if (result == AM_X11_OK) {
+        result = enumerate_connection(connection, screen, NULL, 0, &count);
+    }
     output->root_width = screen == NULL ? 0 : screen->width_in_pixels;
     output->root_height = screen == NULL ? 0 : screen->height_in_pixels;
     output->available = result == AM_X11_BUFFER_TOO_SMALL || (result == AM_X11_OK && count > 0);
@@ -398,7 +403,8 @@ static unsigned int mask_shift(uint32_t mask) {
 static uint8_t channel(uint32_t pixel, uint32_t mask) {
     unsigned int shift = mask_shift(mask);
     uint32_t maximum = mask >> shift;
-    return (uint8_t)((((pixel & mask) >> shift) * 255U + maximum / 2U) / maximum);
+    uint64_t value = (pixel & mask) >> shift;
+    return (uint8_t)((value * 255U + maximum / 2U) / maximum);
 }
 
 int am_x11_read(struct am_x11_session *session, uint8_t *destination,

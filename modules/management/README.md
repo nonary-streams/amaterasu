@@ -351,9 +351,10 @@ API POST requests from the exact bound HTTP origin are automatically permitted;
 other browser origins require the configured allowlist. Bearer/scope checks still
 apply. Connection reads remain 4 KiB per tick; response writes are now 16 KiB.
 
-Media discovery uses `POST /v1/media/dxgi_outputs`, `wgc_outputs`, `audio_endpoints`,
-`audio_driver_status`, `encoders`, `audio_encoders`, and `video_status`, each with
-an empty JSON object and the `media.read` scope. These routes pin their provider/action and reject additional fields. They
+Media discovery uses `POST /v1/media/dxgi_outputs`, `wgc_outputs`, `x11_outputs`,
+`kms_outputs`, `audio_endpoints`, `audio_driver_status`, `encoders`, `audio_encoders`,
+and `video_status`, each with an empty JSON object and the `media.read` scope. These
+routes pin their provider/action and reject additional fields. They
 expose no native pointers, arbitrary service forwarding, or capture/open controls.
 Device enumeration can report an unsupported platform; default-disabled audio and
 encoding return empty capability lists without starting capture or encoding.

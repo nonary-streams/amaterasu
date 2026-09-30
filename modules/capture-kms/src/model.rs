@@ -127,6 +127,7 @@ pub fn validate_output_id(id: &str) -> CaptureResult<()> {
     let card_number = card.strip_prefix("card").ok_or_else(invalid_output_id)?;
     if card_number.is_empty()
         || !card_number.bytes().all(|byte| byte.is_ascii_digit())
+        || (card_number.len() > 1 && card_number.starts_with('0'))
         || card.len() > 63
         || identity.chars().any(char::is_control)
     {
@@ -158,7 +159,10 @@ pub fn validate_output_id(id: &str) -> CaptureResult<()> {
 }
 
 fn parse_nonzero_id(value: &str) -> Option<u32> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
         return None;
     }
     value.parse::<u32>().ok().filter(|value| *value != 0)

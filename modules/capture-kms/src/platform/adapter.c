@@ -493,27 +493,6 @@ static bool plane_geometry_supported(int fd, uint32_t plane_id,
     return false;
 }
 
-static bool only_selected_plane_is_active(drmModePlaneResPtr planes, int fd,
-                                          uint32_t crtc_id, uint32_t selected_plane_id) {
-    if (planes == NULL || fd < 0 || crtc_id == 0 || selected_plane_id == 0) {
-        return false;
-    }
-    for (uint32_t index = 0; index < planes->count_planes; ++index) {
-        drmModePlanePtr plane = drmModeGetPlane(fd, planes->planes[index]);
-        if (plane == NULL) {
-            continue;
-        }
-        bool unsupported_active_plane = plane->crtc_id == crtc_id &&
-                                        plane->fb_id != 0 &&
-                                        plane->plane_id != selected_plane_id;
-        drmModeFreePlane(plane);
-        if (unsupported_active_plane) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static int append_output(struct am_kms_output outputs[AM_KMS_MAX_OUTPUTS],
                          size_t *count, const struct am_kms_output *output) {
     if (*count >= AM_KMS_MAX_OUTPUTS) {
@@ -575,9 +554,7 @@ static int scan_card(const char *path,
         struct am_kms_framebuffer framebuffer;
         int framebuffer_status = export_framebuffer(card.fd, plane->fb_id, &framebuffer);
         if (framebuffer_status == AM_KMS_OK &&
-            (!plane_geometry_supported(card.fd, plane->plane_id, &framebuffer, crtc) ||
-             !only_selected_plane_is_active(planes, card.fd, plane->crtc_id,
-                                            plane->plane_id))) {
+            !plane_geometry_supported(card.fd, plane->plane_id, &framebuffer, crtc)) {
             framebuffer_status = AM_KMS_UNSUPPORTED;
         }
         struct am_kms_output output;
@@ -931,10 +908,6 @@ static int refresh_image(struct am_kms_session *session) {
                                                   &connector_id, name) &&
                           connector_id == session->connector_id;
     drmModeFreeResources(resources);
-    drmModePlaneResPtr planes = drmModeGetPlaneResources(session->card.fd);
-    bool plane_layout_live = only_selected_plane_is_active(
-        planes, session->card.fd, session->crtc_id, session->plane_id);
-    drmModeFreePlaneResources(planes);
     drmModeCrtcPtr crtc = drmModeGetCrtc(session->card.fd, session->crtc_id);
     bool mode_live = crtc != NULL && crtc->mode_valid != 0 &&
                      crtc->width == session->output.width &&
@@ -944,7 +917,8 @@ static int refresh_image(struct am_kms_session *session) {
         drmModeFreePlane(plane);
         return AM_KMS_OUTPUT_LOST;
     }
-    if (!plane_layout_live) {
+    if (!plane_geometry_supported(session->card.fd, session->plane_id,
+                                  &session->framebuffer, crtc)) {
         drmModeFreeCrtc(crtc);
         drmModeFreePlane(plane);
         return AM_KMS_UNSUPPORTED;

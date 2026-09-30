@@ -296,6 +296,8 @@ pub enum CaptureProvider {
     /// An explicitly selected current-user portal source.
     #[serde(rename = "pipewire")]
     PipeWire,
+    X11,
+    Kms,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -492,12 +494,16 @@ pub struct Open {
     pub sw_tune: Option<String>,
     #[serde(default = "default_min_threads")]
     pub min_threads: i32,
-    #[serde(default = "default_qp")]
+    #[serde(default)]
     pub qp: i32,
     #[serde(default)]
     pub nvenc_settings: amaterasu_module_sdk::NvencSettings,
     #[serde(default)]
     pub nvenc_spatial_aq: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_pnp_id: Option<String>,
     #[serde(default)]
     pub capture_sink_without_routing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -732,6 +738,20 @@ impl Open {
         if !valid_minimum_fps_target(self.minimum_fps_target) {
             return Err("invalid_minimum_fps_target");
         }
+        if self
+            .adapter_name
+            .as_deref()
+            .is_some_and(|name| name.len() > 1024 || name.chars().any(char::is_control))
+            || self
+                .adapter_pnp_id
+                .as_deref()
+                .is_some_and(|id| id.len() > 256 || id.chars().any(char::is_control))
+            || self.adapter_pnp_id.as_deref().is_some_and(|id| {
+                !id.is_empty() && self.adapter_name.as_deref().is_none_or(str::is_empty)
+            })
+        {
+            return Err("invalid_adapter_selection");
+        }
         if self.capture.constant_rate && self.capture.capture_provider != CaptureProvider::Wgc {
             return Err("constant_rate_requires_wgc");
         }
@@ -891,6 +911,8 @@ impl Open {
                     "bitrate": self.encoder_bitrate_kbps() * 1000,
                     "min_threads": self.min_threads,
                     "qp": self.qp,
+                    "adapter_name": self.adapter_name,
+                    "adapter_pnp_id": self.adapter_pnp_id,
                     "max_reference_frames": self.profile.max_reference_frames,
                     "nvenc_settings": self.nvenc_settings,
                     "nvenc_spatial_aq": self.nvenc_spatial_aq,
@@ -1145,7 +1167,11 @@ fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
             .any(|key| {
                 !matches!(
                     key.as_str(),
-                    "dd_mode_remapping"
+                    "adapter_name"
+                        | "adapter_pnp_id"
+                        | "virtual_display_mode"
+                        | "virtual_display_layout"
+                        | "dd_mode_remapping"
                         | "dd_resolution_option"
                         | "dd_manual_resolution"
                         | "dd_refresh_rate_option"
@@ -1153,6 +1179,24 @@ fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
                         | "dd_hdr_option"
                         | "dd_configuration_option"
                         | "dd_hdr_request_override"
+                        | "dd_config_revert_delay"
+                        | "dd_config_revert_on_disconnect"
+                        | "dd_paused_virtual_display_timeout_secs"
+                        | "dd_always_restore_from_golden"
+                        | "dd_display_helper_engine"
+                        | "dd_snapshot_restore_hotkey"
+                        | "dd_snapshot_restore_hotkey_modifiers"
+                        | "dd_use_sunshine_virtual_display_driver"
+                        | "dd_activate_virtual_display"
+                        | "dd_virtual_display_scale"
+                        | "dd_virtual_display_permanent_count"
+                        | "virtual_display_outputs"
+                        | "dd_snapshot_exclude_devices"
+                        | "dd_wa_dummy_plug_hdr10"
+                        | "dd_wa_hdr_toggle"
+                        | "dd_wa_hdr_toggle_delay"
+                        | "vulkan_hdr_layer"
+                        | "wayland_hdr_compatibility"
                 )
             })
     {
@@ -2805,6 +2849,37 @@ mod tests {
         let configuration = &request.arm(41)["configuration"];
         assert_eq!(configuration["capture_provider"], "pipewire");
         assert_eq!(configuration["output"], "portal-selected-session-source");
+        assert_eq!(configuration["constant_rate"], false);
+        request.capture.constant_rate = true;
+        assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
+    }
+
+    #[test]
+    fn selected_x11_output_reaches_session_without_windows_capture_flags() {
+        let mut request = open();
+        request.capture.capture_provider = CaptureProvider::X11;
+        request.capture.output = "x11:DP-1/000000a4".into();
+        assert!(request.validate(false).is_ok());
+        let configuration = &request.arm(41)["configuration"];
+        assert_eq!(configuration["capture_provider"], "x11");
+        assert_eq!(configuration["output"], "x11:DP-1/000000a4");
+        assert_eq!(configuration["constant_rate"], false);
+        request.capture.constant_rate = true;
+        assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
+    }
+
+    #[test]
+    fn selected_kms_output_reaches_session_without_windows_capture_flags() {
+        let mut request = open();
+        request.capture.capture_provider = CaptureProvider::Kms;
+        request.capture.output = "kms:card1/conn=34/crtc=56/plane=78".into();
+        assert!(request.validate(false).is_ok());
+        let configuration = &request.arm(42)["configuration"];
+        assert_eq!(configuration["capture_provider"], "kms");
+        assert_eq!(
+            configuration["output"],
+            "kms:card1/conn=34/crtc=56/plane=78"
+        );
         assert_eq!(configuration["constant_rate"], false);
         request.capture.constant_rate = true;
         assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));

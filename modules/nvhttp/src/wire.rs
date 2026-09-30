@@ -7,7 +7,7 @@ mod streaming;
 pub(crate) mod xml;
 
 use crate::{
-    launch::{Controller as LaunchController, LaunchRequest, PeerIdentity},
+    launch::{CaptureMode, Controller as LaunchController, LaunchRequest, PeerIdentity},
     preparation::PreparationStep,
 };
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
@@ -603,6 +603,7 @@ pub(super) struct ClientConfigOverrides {
     pub(super) encoder: Option<amaterasu_module_sdk::EncoderBackend>,
     pub(super) min_threads: Option<i32>,
     pub(super) qp: Option<i32>,
+    pub(super) capture: Option<CaptureMode>,
     pub(super) display_mode: Option<String>,
     pub(super) fec_percentage: Option<u8>,
     pub(super) max_bitrate: Option<i32>,
@@ -619,6 +620,8 @@ pub(super) struct ClientConfigOverrides {
     pub(super) nvenc_latency_over_power: Option<bool>,
     pub(super) vaapi_strict_rc_buffer: Option<bool>,
     pub(super) nvenc_spatial_aq: Option<bool>,
+    #[serde(default)]
+    pub(super) display_policy: Option<serde_json::Value>,
     pub(super) dd_mode_remapping: Option<serde_json::Value>,
     pub(super) dd_resolution_option: Option<String>,
     pub(super) dd_manual_resolution: Option<String>,
@@ -672,6 +675,11 @@ impl ClientConfigOverrides {
             .as_object_mut()
             .expect("display overrides object")
             .retain(|_, value| !value.is_null());
+        if let Some(additional) = &self.display_policy
+            && let Some(target) = fields.as_object_mut()
+        {
+            target.insert("display_policy".into(), additional.clone());
+        }
         fields
     }
 }

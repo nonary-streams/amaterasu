@@ -42,6 +42,7 @@ namespace Amaterasu {
     timeout_ms?: number;
   }
   export type CatalogFrameLimiterProvider = string;
+  export type CaptureSelection = "auto" | "ddx" | "wgc" | "wgcc" | "pipewire" | "x11" | "kms";
   export type CatalogAutoVirtualFramegenMode = "enabled" | "vrr" | "legacy" | "disabled";
   export type CatalogFrameGenerationProvider =
     | "lossless-scaling"
@@ -73,6 +74,8 @@ namespace Amaterasu {
     elevated?: boolean;
     config_overrides?: AdvancedInputOverrides & SoftwareEncoderOverrides & NvencSettingsOverrides & {
       fec_percentage?: number;
+      capture?: CaptureSelection;
+      display_policy?: Record<string, unknown> | null;
       stream_audio?: boolean;
       audio_sink?: string;
       virtual_sink?: string;
@@ -173,8 +176,9 @@ namespace Amaterasu {
     effective_fec_percentage: number;
     configured_output_name: string | null;
     effective_output_name: string | null;
-    configured_capture: "auto" | "ddx" | "wgc" | "wgcc" | "pipewire";
-    capture_provider: "dxgi" | "wgc" | null;
+    configured_capture: CaptureSelection;
+    configured_display_policy?: Record<string, unknown>;
+    capture_provider: "dxgi" | "wgc" | "pipewire" | "x11" | "kms" | null;
     configured_video_max_batch_size_kb: number | null;
     effective_video_max_batch_size_kb: number;
     video_batch_size_fallback: boolean;
@@ -366,6 +370,8 @@ namespace Amaterasu {
     paired_at: number;
     config_overrides?: AdvancedInputOverrides & SoftwareEncoderOverrides & NvencSettingsOverrides & {
       fec_percentage?: number;
+      capture?: CaptureSelection;
+      display_policy?: Record<string, unknown> | null;
       stream_audio?: boolean;
       audio_sink?: string;
       virtual_sink?: string;

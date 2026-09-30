@@ -283,6 +283,8 @@ fn media_discovery(action: &str) -> Option<(&'static str, &'static str)> {
     match action {
         "dxgi_outputs" => Some(("amaterasu.capture-dxgi/1", "enumerate")),
         "wgc_outputs" => Some(("amaterasu.capture-wgc/1", "enumerate")),
+        "x11_outputs" => Some(("amaterasu.capture-x11/1", "enumerate")),
+        "kms_outputs" => Some(("amaterasu.capture-kms/1", "enumerate")),
         "audio_endpoints" => Some(("amaterasu.audio/1", "enumerate")),
         "audio_driver_status" => Some(("amaterasu.audio/1", "status")),
         "encoders" => Some(("amaterasu.encode/1", "enumerate")),
@@ -588,6 +590,8 @@ mod tests {
         for action in [
             "dxgi_outputs",
             "wgc_outputs",
+            "x11_outputs",
+            "kms_outputs",
             "audio_endpoints",
             "audio_driver_status",
             "encoders",

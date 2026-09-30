@@ -418,6 +418,26 @@ const CAPTURE_WGC: ComponentDefinition = ComponentDefinition {
     native_uses: &[],
     dependencies: &[RUNTIME_ID],
 };
+const CAPTURE_X11: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.capture-x11",
+    library: "amaterasu_capture_x11",
+    provides: &["amaterasu.capture-x11/1"],
+    calls: &[],
+    publishes: &[],
+    native_provides: &["amaterasu.capture-x11/1"],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
+};
+const CAPTURE_KMS: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.capture-kms",
+    library: "amaterasu_capture_kms",
+    provides: &["amaterasu.capture-kms/1"],
+    calls: &[],
+    publishes: &[],
+    native_provides: &["amaterasu.capture-kms/1"],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
+};
 const AUDIO: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.audio",
     library: "amaterasu_audio",
@@ -468,8 +488,31 @@ const VIDEO: ComponentDefinition = ComponentDefinition {
         RUNTIME_ID,
         "amaterasu.capture-dxgi",
         "amaterasu.capture-wgc",
+        "amaterasu.capture-x11",
         "amaterasu.encode",
     ],
+};
+const X11_VIDEO: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.capture-dxgi/1",
+        "amaterasu.capture-wgc/1",
+        "amaterasu.capture-x11/1",
+        "amaterasu.encode/1",
+    ],
+    native_uses: &[
+        "amaterasu.capture-dxgi/1",
+        "amaterasu.capture-wgc/1",
+        "amaterasu.capture-x11/1",
+        "amaterasu.encode/1",
+    ],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.capture-dxgi",
+        "amaterasu.capture-wgc",
+        "amaterasu.capture-x11",
+        "amaterasu.encode",
+    ],
+    ..VIDEO
 };
 const MEDIA_TRANSPORT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.media-transport",
@@ -666,6 +709,7 @@ const MEDIA_PROBE: ComponentDefinition = ComponentDefinition {
     provides: &["test.media-probe/1"],
     calls: &[
         "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-x11/1",
         "amaterasu.capture-dxgi/1",
         "amaterasu.capture-wgc/1",
         "amaterasu.audio-encode/1",
@@ -680,6 +724,7 @@ const MEDIA_PROBE: ComponentDefinition = ComponentDefinition {
         "amaterasu.capture-pipewire/1",
         "amaterasu.capture-dxgi/1",
         "amaterasu.capture-wgc/1",
+        "amaterasu.capture-x11/1",
         "amaterasu.audio/1",
         "amaterasu.audio-encode/1",
         "amaterasu.encode/1",
@@ -690,6 +735,7 @@ const MEDIA_PROBE: ComponentDefinition = ComponentDefinition {
     dependencies: &[
         RUNTIME_ID,
         "amaterasu.capture-pipewire",
+        "amaterasu.capture-x11",
         "amaterasu.capture-dxgi",
         "amaterasu.capture-wgc",
         "amaterasu.audio",
@@ -726,6 +772,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.launch/1",
         "amaterasu.capture-dxgi/1",
         "amaterasu.capture-wgc/1",
+        "amaterasu.capture-x11/1",
         "amaterasu.audio/1",
         "amaterasu.audio-encode/1",
         "amaterasu.encode/1",
@@ -764,6 +811,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.launch",
         "amaterasu.capture-dxgi",
         "amaterasu.capture-wgc",
+        "amaterasu.capture-x11",
         "amaterasu.audio",
         "amaterasu.audio-encode",
         "amaterasu.encode",
@@ -861,9 +909,25 @@ const CAPTURE_PIPEWIRE: ComponentDefinition = ComponentDefinition {
 
 const LINUX_VIDEO: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.linux-probe-video",
-    calls: &["amaterasu.capture-pipewire/1", "amaterasu.encode/1"],
-    native_uses: &["amaterasu.capture-pipewire/1", "amaterasu.encode/1"],
-    dependencies: &[RUNTIME_ID, "amaterasu.capture-pipewire", "amaterasu.encode"],
+    calls: &[
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-x11/1",
+        "amaterasu.capture-kms/1",
+        "amaterasu.encode/1",
+    ],
+    native_uses: &[
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-x11/1",
+        "amaterasu.capture-kms/1",
+        "amaterasu.encode/1",
+    ],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.capture-pipewire",
+        "amaterasu.capture-x11",
+        "amaterasu.capture-kms",
+        "amaterasu.encode",
+    ],
     ..VIDEO
 };
 
@@ -964,7 +1028,9 @@ const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.launch/1",
         "amaterasu.capture-dxgi/1",
         "amaterasu.capture-wgc/1",
+        "amaterasu.capture-x11/1",
         "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-kms/1",
         "amaterasu.audio/1",
         "amaterasu.audio-encode/1",
         "amaterasu.encode/1",
@@ -1000,6 +1066,8 @@ const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.display",
         "amaterasu.launch",
         "amaterasu.capture-pipewire",
+        "amaterasu.capture-x11",
+        "amaterasu.capture-kms",
         "amaterasu.software-probe-audio",
         "amaterasu.audio-encode",
         "amaterasu.encode",
@@ -1025,6 +1093,7 @@ impl PackageProfile {
                 CAPTURE_PIPEWIRE,
                 CAPTURE_DXGI,
                 CAPTURE_WGC,
+                CAPTURE_X11,
                 AUDIO,
                 AUDIO_ENCODE,
                 ENCODE,
@@ -1121,6 +1190,8 @@ impl PackageProfile {
                 UPDATER,
                 SYSTEM_TRAY,
                 CAPTURE_PIPEWIRE,
+                CAPTURE_X11,
+                CAPTURE_KMS,
                 SOFTWARE_AUDIO_SOURCE,
                 INPUT_PROBE,
                 AUDIO_ENCODE,
@@ -1158,10 +1229,11 @@ impl PackageProfile {
                 VIRTUAL_DISPLAY,
                 CAPTURE_DXGI,
                 CAPTURE_WGC,
+                CAPTURE_X11,
                 AUDIO,
                 AUDIO_ENCODE,
                 ENCODE,
-                VIDEO,
+                X11_VIDEO,
                 MEDIA_TRANSPORT,
                 CONTROL_TRANSPORT,
                 FRAME_LIMITER,
@@ -1242,10 +1314,13 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             "amaterasu.stream-session".into(),
             json!({"enabled":false,"allow_remote":false,"allowed_principals":[]}),
         ),
-        ("amaterasu.video".into(), json!({"enabled": false})),
+        (
+            "amaterasu.video".into(),
+            json!({"enabled": false, "capture_providers": ["dxgi", "wgc", "x11"]}),
+        ),
         (
             "amaterasu.linux-probe-video".into(),
-            json!({"enabled": false}),
+            json!({"enabled": false, "capture_providers": ["pipewire", "x11", "kms"]}),
         ),
         (
             "amaterasu.capture-pipewire".into(),
@@ -1260,6 +1335,8 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             json!({"enabled": false, "allow_remote": false, "allowed_principals": []}),
         ),
         ("amaterasu.capture-dxgi".into(), json!({"enabled": false})),
+        ("amaterasu.capture-x11".into(), json!({"enabled": true})),
+        ("amaterasu.capture-kms".into(), json!({"enabled": true})),
         ("amaterasu.encode".into(), json!({"enabled": false})),
         ("amaterasu.capture-wgc".into(), json!({"enabled": false})),
         ("amaterasu.audio".into(), json!({"enabled": false})),
@@ -1415,10 +1492,14 @@ pub fn installer_policy(
         ),
         ("amaterasu.capture-dxgi".into(), json!({"enabled": false})),
         ("amaterasu.capture-wgc".into(), json!({"enabled": false})),
+        ("amaterasu.capture-x11".into(), json!({"enabled": true})),
         ("amaterasu.audio".into(), json!({"enabled": false})),
         ("amaterasu.audio-encode".into(), json!({"enabled": false})),
         ("amaterasu.encode".into(), json!({"enabled": false})),
-        ("amaterasu.video".into(), json!({"enabled": false})),
+        (
+            "amaterasu.video".into(),
+            json!({"enabled": false, "capture_providers": ["dxgi", "wgc", "x11"]}),
+        ),
         (
             "amaterasu.media-transport".into(),
             json!({"enabled": false, "allow_remote": false, "allowed_principals": []}),

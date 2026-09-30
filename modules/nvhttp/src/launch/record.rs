@@ -1,5 +1,5 @@
 use super::{
-    CaptureProvider, LaunchRequest, PeerIdentity, PhysicalDisplayMode,
+    CaptureMode, CaptureProvider, LaunchRequest, PeerIdentity, PhysicalDisplayMode,
     VideoEncryptionPolicySnapshot,
 };
 use crate::frame_limiter::FrameLimiterSettings;
@@ -142,6 +142,9 @@ pub struct Record {
     pub application_stream_audio: Option<bool>,
     pub effective_stream_audio: bool,
     pub capture_output: String,
+    /// Frozen platform-selected provider used when the configured capture mode is auto.
+    pub bootstrap_capture_provider: CaptureProvider,
+    pub global_capture_mode: CaptureMode,
     pub audio_endpoint: String,
     pub bootstrap_audio_endpoint: String,
     pub capture_provider: CaptureProvider,
@@ -200,6 +203,8 @@ impl Record {
         global_minimum_fps_target: f64,
         global_wgc_pacing_smoothing: bool,
         capture_output: String,
+        bootstrap_capture_provider: CaptureProvider,
+        global_capture_mode: CaptureMode,
         audio_endpoint: String,
         bootstrap_audio_endpoint: String,
         capture_provider: CaptureProvider,
@@ -293,6 +298,8 @@ impl Record {
             application_stream_audio: None,
             effective_stream_audio: global_stream_audio,
             capture_output,
+            bootstrap_capture_provider,
+            global_capture_mode,
             audio_endpoint,
             bootstrap_audio_endpoint,
             capture_provider,

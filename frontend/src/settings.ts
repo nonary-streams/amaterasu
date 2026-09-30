@@ -433,8 +433,18 @@ namespace Amaterasu {
         typeof reply.configured_nvenc_opengl_vulkan_on_dxgi !== "boolean" ||
         typeof reply.configured_nvenc_latency_over_power !== "boolean" ||
         typeof reply.configured_vaapi_strict_rc_buffer !== "boolean" ||
-        !Array.isArray(reply.configured_global_preparation))
+        !Array.isArray(reply.configured_global_preparation) ||
+        (reply.configured_display_policy !== undefined &&
+          (!reply.configured_display_policy || typeof reply.configured_display_policy !== "object" ||
+            Array.isArray(reply.configured_display_policy))))
       throw new Error("Moonlight host settings reply is invalid.");
+    if (reply.configured_display_policy !== undefined) {
+      try {
+        parseDisplayPolicyOverrideMap(JSON.stringify(reply.configured_display_policy), "global");
+      } catch {
+        throw new Error("Moonlight host display policy reply is invalid.");
+      }
+    }
     return reply as unknown as NvhttpSettings;
   }
 
@@ -594,6 +604,12 @@ namespace Amaterasu {
     }));
   }
 
+  function sparseDisplayPolicy(value: unknown): Record<string, unknown> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .filter(([, fieldValue]) => fieldValue !== null && fieldValue !== undefined));
+  }
+
   export async function saveNvhttpHostSettings(
     api: Pick<Api, "post">,
     current: NvhttpSettings,
@@ -639,6 +655,8 @@ namespace Amaterasu {
       configured_nvenc_latency_over_power: values.nvenc_latency_over_power,
       configured_vaapi_strict_rc_buffer: values.vaapi_strict_rc_buffer,
     });
+    if (Object.hasOwn(current, "configured_display_policy"))
+      expected.configured_display_policy = sparseDisplayPolicy(values.display_policy);
     for (const key of ["sw_preset", "sw_tune", "encoder"])
       if (Object.prototype.hasOwnProperty.call(values, key)) expected[`configured_${key}`] = values[key];
     if (Object.prototype.hasOwnProperty.call(current, "configured_min_threads"))
@@ -1212,6 +1230,11 @@ namespace Amaterasu {
     throw new Error("Encryption mode must be disabled, optional, or required.");
   }
 
+  export function parseClientCaptureOverride(value: string): CaptureSelection | null {
+    if (value === "") return null;
+    return parseCaptureSelection(value);
+  }
+
   const forwardablePairingOverrideFields = [
     "fec_percentage", "stream_audio", "audio_sink", "virtual_sink", "sw_preset", "sw_tune", "min_threads", "qp", "encoder",
     "audio_sink_capture_only", "back_button_timeout", "controller", "gamepad",
@@ -1224,9 +1247,9 @@ namespace Amaterasu {
     "rtss_frame_limit_type", "nvenc_spatial_aq", "nvenc_preset", "nvenc_h264_cavlc",
     "nvenc_twopass", "nvenc_vbv_increase", "nvenc_split_encode", "nvenc_realtime_hags",
     "nvenc_opengl_vulkan_on_dxgi", "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
-    "high_resolution_scrolling",
+    "high_resolution_scrolling", "capture",
     "always_send_scancodes", "key_rightalt_to_key_win", "key_repeat_delay",
-    "key_repeat_frequency", "keybindings",
+    "key_repeat_frequency", "keybindings", "display_policy",
   ];
 
   export function unsupportedPairingOverrideFields(client: PairingClient): string[] {
@@ -1238,6 +1261,10 @@ namespace Amaterasu {
   }
 
   function validStoredPairingOverride(field: string, value: unknown): boolean {
+    if (field === "display_policy") {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      try { parseDisplayPolicyOverrideMap(JSON.stringify(value), "client"); return true; } catch { return false; }
+    }
     if (field === "keybindings") {
       if (value == null) return true;
       try { validateKeybindings(value); return true; } catch { return false; }
@@ -1262,6 +1289,7 @@ namespace Amaterasu {
         new TextEncoder().encode(value).length <= (field === "sw_preset" ? 128 : 256) &&
         !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
     if (field === "encoder") return value === "auto" || value === "software";
+    if (field === "capture") return ["auto", "ddx", "wgc", "wgcc", "pipewire", "x11", "kms"].includes(value as string);
     if (field === "min_threads")
       return Number.isSafeInteger(value) && (value as number) >= -2147483648 && (value as number) <= 2147483647;
     if (field === "qp")
@@ -1424,6 +1452,28 @@ namespace Amaterasu {
     return select;
   }
 
+  function sparseCaptureOverrideSelect(current: CaptureSelection | undefined): HTMLSelectElement {
+    const select = el("select");
+    select.setAttribute("aria-label", "Capture provider override");
+    const choices: Array<[string, string]> = [
+      ["", "Inherit"],
+      ["auto", "Automatic host provider"],
+      ["ddx", "Desktop Duplication"],
+      ["wgc", "Windows Graphics Capture"],
+      ["wgcc", "Windows Graphics Capture, constant rate"],
+      ["pipewire", "PipeWire portal capture"],
+      ["x11", "X11 / XWayland root readback"],
+      ["kms", "DRM/KMS active primary plane readback"],
+    ];
+    for (const [value, label] of choices) {
+      const option = el("option", "", label);
+      option.value = value;
+      select.append(option);
+    }
+    select.value = current ?? "";
+    return select;
+  }
+
   export function inputPolicyStatusDescription(
     settings: InputPolicySettings,
   ): string {
@@ -1528,9 +1578,9 @@ namespace Amaterasu {
   }
 
   export function parseCaptureSelection(value: string): NvhttpSettings["configured_capture"] {
-    if (value === "auto" || value === "ddx" || value === "wgc" || value === "wgcc" || value === "pipewire")
+    if (value === "auto" || value === "ddx" || value === "wgc" || value === "wgcc" || value === "pipewire" || value === "x11" || value === "kms")
       return value;
-    throw new Error("Choose Automatic, Desktop Duplication, a Windows Graphics Capture mode, or PipeWire.");
+    throw new Error("Choose Automatic, a supported Windows capture mode, PipeWire, X11, or DRM/KMS.");
   }
 
   type PipewireSourceType = "monitor" | "window";
@@ -3381,6 +3431,11 @@ namespace Amaterasu {
           captureOnly.value = client.config_overrides?.audio_sink_capture_only === undefined
             ? ""
             : String(client.config_overrides.audio_sink_capture_only);
+          const capture = sparseCaptureOverrideSelect(client.config_overrides?.capture);
+          const displayPolicy = el("textarea");
+          displayPolicy.rows = 12;
+          displayPolicy.spellcheck = false;
+          displayPolicy.value = JSON.stringify(client.config_overrides?.display_policy ?? {}, null, 2);
           const status = el("div");
           const unsupported = unsupportedPairingOverrideFields(client);
           const save = button(
@@ -3399,6 +3454,8 @@ namespace Amaterasu {
                   audio_sink: parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
                   virtual_sink: parseVirtualSinkOverride(virtualSinkMode.value, virtualSinkSelector.value),
                   audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(captureOnly.value),
+                  capture: parseClientCaptureOverride(capture.value),
+                  display_policy: parseDisplayPolicyOverrideMap(displayPolicy.value, "client"),
                   controller: parseInputBooleanOverride(controller.value, "Controller input"),
                   gamepad: parseGamepadProfileOverride(
                     gamepad.value,
@@ -3445,9 +3502,9 @@ namespace Amaterasu {
             el("strong", "", settingsTextLiteral(client.name)),
             el("small", "muted", settingsTextLiteral(`${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`)),
           );
-          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, motionAsDs4, touchpadAsDs4, ds5InputtinoRandomizeMac, protonDualsenseCompatibility, el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields), el("div", "", save, status)];
+          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, capture, field("Display and adapter policy (JSON)", displayPolicy, "Sparse per-client overrides. Use null/empty to inherit the application or host value; global-only keys are rejected."), controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, motionAsDs4, touchpadAsDs4, ds5InputtinoRandomizeMac, protonDualsenseCompatibility, el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields), el("div", "", save, status)];
         });
-        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "DS4 Back as touchpad click", "Motion selects DS4", "Touchpad selects DS4", "DS5 random MAC", "Proton DualSense compatibility", "Input and software encoding preferences", ""], rows);
+        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Capture provider", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "DS4 Back as touchpad click", "Motion selects DS4", "Touchpad selects DS4", "DS5 random MAC", "Proton DualSense compatibility", "Input and software encoding preferences", ""], rows);
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
@@ -3859,20 +3916,31 @@ namespace Amaterasu {
         useStartupBindAddress.addEventListener("change", () => {
           bindAddress.disabled = useStartupBindAddress.checked;
         });
-        const capture = el("select");
+    const capture = el("select");
         capture.name = "capture";
         const captureChoices: Array<[NvhttpSettings["configured_capture"], string]> = [
           ["auto", "Automatic (startup capture backend)"],
           ["ddx", "Desktop Duplication"],
           ["wgc", "Windows Graphics Capture"],
           ["wgcc", "Windows Graphics Capture, constant rate"],
+          ["pipewire", "PipeWire portal selection (Linux)"],
+          ["x11", "X11 / XWayland root readback (Linux)"],
+          ["kms", "DRM/KMS active primary plane readback (Linux)"],
         ];
         for (const [value, label] of captureChoices) {
           const option = el("option", "", label);
           option.value = value;
-          capture.append(option);
-        }
-        capture.value = settings.configured_capture;
+        capture.append(option);
+      }
+      capture.value = settings.configured_capture;
+      const displayPolicy = el("textarea");
+      displayPolicy.name = "display_policy";
+      displayPolicy.rows = 18;
+      displayPolicy.spellcheck = false;
+      displayPolicy.value = JSON.stringify({
+        ...Object.fromEntries(displayPolicyKeys.map((key) => [key, null])),
+        ...(settings.configured_display_policy ?? {}),
+      }, null, 2);
         const outputName = el("select");
         outputName.name = "output_name";
         const automaticOutput = el("option", "", "Automatic (startup output)");
@@ -4172,7 +4240,12 @@ namespace Amaterasu {
           field(
             "Capture backend",
             capture,
-            settingsTextLiteral(`Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`),
+            settingsTextLiteral(`Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit providers fail if unavailable. X11 requires the host process's authorized DISPLAY and reads output pixels through the X server. DRM/KMS reads only an active primary plane and omits cursor/overlay planes and the CRTC color pipeline; it does not capture managed virtual displays. Save and reopen settings to list outputs for a new backend.`),
+          ),
+          field(
+            "Display and adapter policy (JSON)",
+            displayPolicy,
+            "Use the listed setting names and typed JSON values. This editor saves a full policy snapshot: omitted keys reset to the product default. Per-application and paired-client values may override stream-scoped settings. Native support remains platform/provider-specific and unsupported changes fail closed.",
           ),
           field(
             "Capture output",
@@ -4258,6 +4331,7 @@ namespace Amaterasu {
               fec_percentage: parseGlobalFecPercentage(fecPercentage.value),
               ...network,
               capture: parseCaptureSelection(capture.value),
+              display_policy: parseDisplayPolicyOverrideMap(displayPolicy.value, "global"),
               output_name: parseOutputNameSelection(outputName.value),
               stream_audio: streamAudio.checked,
               nvenc_preset: nvencPreset.valueAsNumber,

@@ -309,6 +309,8 @@ impl Controller {
                         "qp":record.effective_qp,
                         "nvenc_settings":record.effective_nvenc_settings,
                         "nvenc_spatial_aq":record.effective_nvenc_spatial_aq,
+                        "adapter_name":resolved_adapter_setting(record, "adapter_name"),
+                        "adapter_pnp_id":resolved_adapter_setting(record, "adapter_pnp_id"),
                         "frame_limiter_settings": record.executable_path.as_ref().and(record.frame_limiter_snapshot.as_ref()),
                         "frame_limiter_executable_path": record.executable_path,
                         "display_policy_snapshot": record.display_policy_snapshot,
@@ -428,6 +430,13 @@ impl Controller {
                     executable_path,
                     cleanup_budget_ms,
                 }) if record.state == State::Starting => {
+                    let selected_capture_mode = record
+                        .peer
+                        .client_capture
+                        .or(application_overrides.capture)
+                        .unwrap_or(record.global_capture_mode);
+                    (record.capture_provider, record.constant_rate) =
+                        selected_capture_mode.resolve(record.bootstrap_capture_provider);
                     record.application_preflight_token = Some(token);
                     record.application_catalog_revision = Some(catalog_revision);
                     record.application_cleanup_budget_ms = Some(cleanup_budget_ms);
@@ -1230,9 +1239,35 @@ fn display_admission_response(record: &Record, payload: &Value) -> Result<String
 }
 
 fn capture_source(record: &Record) -> Result<&str, &'static str> {
-    let output = record.capture_output.as_str();
-    let source = match record.capture_provider {
+    capture_source_for(record.capture_provider, &record.capture_output)
+}
+
+fn capture_source_for(
+    provider: super::CaptureProvider,
+    output: &str,
+) -> Result<&str, &'static str> {
+    let source = match provider {
         super::CaptureProvider::Wgc => output,
+        super::CaptureProvider::X11 => {
+            let selection = output
+                .strip_prefix("x11:")
+                .ok_or("invalid_capture_output")?;
+            let (name, output_id) = selection.rsplit_once('/').ok_or("invalid_capture_output")?;
+            if name.is_empty()
+                || name.len() > 127
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+                || output_id.len() != 8
+                || !output_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("invalid_capture_output");
+            }
+            name
+        }
+        // Physical DRM identities do not have a display-source alias in the
+        // Windows-oriented display management contract.
+        super::CaptureProvider::Kms => return Err("capture_display_mapping_unsupported"),
         // Portal source IDs cannot identify physical Windows display topology.
         super::CaptureProvider::PipeWire => return Err("capture_display_mapping_unsupported"),
         super::CaptureProvider::Dxgi => {
@@ -1256,6 +1291,45 @@ fn capture_source(record: &Record) -> Result<&str, &'static str> {
         return Err("invalid_capture_output");
     }
     Ok(source)
+}
+
+#[cfg(test)]
+mod capture_source_tests {
+    use super::capture_source_for;
+
+    #[test]
+    fn x11_source_uses_validated_connector_name_without_exposing_xid() {
+        assert_eq!(
+            capture_source_for(super::super::CaptureProvider::X11, "x11:DP-1/0000002a"),
+            Ok("DP-1")
+        );
+    }
+
+    #[test]
+    fn x11_source_rejects_malformed_connector_identifiers() {
+        for output in [
+            "x11:/0000002a",
+            "x11:DP 1/0000002a",
+            "x11:DP-1/not-an-xid",
+            "x11:DP-1/0000002a/extra",
+        ] {
+            assert_eq!(
+                capture_source_for(super::super::CaptureProvider::X11, output),
+                Err("invalid_capture_output")
+            );
+        }
+    }
+
+    #[test]
+    fn kms_source_does_not_claim_a_windows_display_mapping() {
+        assert_eq!(
+            capture_source_for(
+                super::super::CaptureProvider::Kms,
+                "kms:card1/conn=34/crtc=56/plane=78"
+            ),
+            Err("capture_display_mapping_unsupported")
+        );
+    }
 }
 
 fn display_enumeration(
@@ -1598,6 +1672,8 @@ pub(super) struct ApplicationConfigOverrides {
     qp: Option<i32>,
     minimum_fps_target: Option<f64>,
     video_max_batch_size_kb: Option<u8>,
+    capture: Option<super::CaptureMode>,
+    display_policy: Option<Value>,
     sw_preset: Option<String>,
     sw_tune: Option<String>,
     encoder: Option<amaterasu_module_sdk::EncoderBackend>,
@@ -1737,6 +1813,10 @@ pub(super) fn application_config_overrides(
 }
 
 const APPLICATION_DISPLAY_KEYS: &[&str] = &[
+    "adapter_name",
+    "adapter_pnp_id",
+    "virtual_display_mode",
+    "virtual_display_layout",
     "dd_mode_remapping",
     "dd_resolution_option",
     "dd_manual_resolution",
@@ -1745,6 +1825,20 @@ const APPLICATION_DISPLAY_KEYS: &[&str] = &[
     "dd_hdr_option",
     "dd_configuration_option",
     "dd_hdr_request_override",
+    "dd_config_revert_delay",
+    "dd_config_revert_on_disconnect",
+    "dd_paused_virtual_display_timeout_secs",
+    "dd_always_restore_from_golden",
+    "dd_display_helper_engine",
+    "dd_snapshot_restore_hotkey",
+    "dd_snapshot_restore_hotkey_modifiers",
+    "dd_use_sunshine_virtual_display_driver",
+    "dd_activate_virtual_display",
+    "dd_virtual_display_scale",
+    "dd_virtual_display_permanent_count",
+    "virtual_display_outputs",
+    "dd_snapshot_exclude_devices",
+    "dd_wa_dummy_plug_hdr10",
 ];
 
 pub(super) fn application_display_overrides(config_overrides: Option<&Value>) -> Value {
@@ -1756,7 +1850,45 @@ pub(super) fn application_display_overrides(config_overrides: Option<&Value>) ->
             display.insert((*key).to_owned(), value.clone());
         }
     }
+    if let Some(additional) = config_overrides
+        .and_then(|overrides| overrides.get("display_policy"))
+        .and_then(Value::as_object)
+    {
+        for (key, value) in additional {
+            if APPLICATION_DISPLAY_KEYS.contains(&key.as_str()) && !value.is_null() {
+                display.insert(key.clone(), value.clone());
+            }
+        }
+    }
     Value::Object(display)
+}
+
+fn valid_application_display_policy(policy: &Value) -> bool {
+    let Some(fields) = policy.as_object() else {
+        return false;
+    };
+    if fields
+        .keys()
+        .any(|key| !APPLICATION_DISPLAY_KEYS.contains(&key.as_str()))
+    {
+        return false;
+    }
+    let mut complete = crate::product_settings::empty_display_policy();
+    let complete_fields = complete.as_object_mut().expect("display policy object");
+    complete_fields.extend(
+        fields
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    // A PnP selector may inherit the render-device path from a lower scope.
+    if !fields.contains_key("adapter_name")
+        && fields
+            .get("adapter_pnp_id")
+            .is_some_and(|value| !value.is_null())
+    {
+        complete_fields.insert("adapter_name".into(), Value::String("inherited".into()));
+    }
+    crate::product_settings::validate_display_policy_values(&complete).is_ok()
 }
 
 fn display_policy_snapshot(record: &Record) -> Value {
@@ -1764,7 +1896,7 @@ fn display_policy_snapshot(record: &Record) -> Value {
         .application_display_overrides
         .as_ref()
         .expect("display overrides captured at preflight");
-    let client = &record.peer.client_display_overrides;
+    let client = application_display_overrides(Some(&record.peer.client_display_overrides));
     let mut effective = record
         .global_display_policy
         .as_object()
@@ -1786,6 +1918,17 @@ fn display_policy_snapshot(record: &Record) -> Value {
         "client_overrides":client,
         "effective_overrides":effective,
     })
+}
+
+fn resolved_adapter_setting(record: &Record, name: &str) -> Option<String> {
+    record
+        .display_policy_snapshot
+        .as_ref()?
+        .get("effective_overrides")?
+        .get(name)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn application_cleanup_budget_ms(value: &Value) -> Option<u64> {
@@ -1944,6 +2087,13 @@ pub(super) fn parse_application_config_overrides(
         .virtual_sink
         .as_deref()
         .is_some_and(|value| value.len() > 4096 || value.chars().any(char::is_control))
+    {
+        return Err("invalid_application_response");
+    }
+    if config_overrides
+        .display_policy
+        .as_ref()
+        .is_some_and(|policy| !valid_application_display_policy(policy))
     {
         return Err("invalid_application_response");
     }

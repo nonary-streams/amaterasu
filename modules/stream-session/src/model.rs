@@ -666,6 +666,8 @@ pub enum CaptureProvider {
     /// An explicitly selected current-user portal source.
     #[serde(rename = "pipewire")]
     PipeWire,
+    X11,
+    Kms,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -696,6 +698,12 @@ pub struct VideoConfiguration {
     pub sw_preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_tune: Option<String>,
+    /// Encoder adapter filters resolved from the host/application/client
+    /// settings snapshot. An absent value leaves adapter selection automatic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_pnp_id: Option<String>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -968,6 +976,21 @@ impl VideoConfiguration {
                 self.sw_tune.as_deref(),
             )
             .is_ok()
+            && self
+                .adapter_name
+                .as_deref()
+                .is_none_or(|name| name.len() <= 1024 && !name.chars().any(char::is_control))
+            && self
+                .adapter_pnp_id
+                .as_deref()
+                .is_none_or(|id| id.len() <= 256 && !id.chars().any(char::is_control))
+            && self.adapter_pnp_id.as_deref().is_none_or(|id| {
+                id.is_empty()
+                    || self
+                        .adapter_name
+                        .as_deref()
+                        .is_some_and(|name| !name.is_empty())
+            })
     }
 }
 
@@ -1051,6 +1074,36 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&start).unwrap()["capture_provider"],
             "pipewire"
+        );
+        start.constant_rate = true;
+        assert_eq!(start.validate(false), Err("constant_rate_requires_wgc"));
+    }
+
+    #[test]
+    fn selected_x11_output_is_valid_without_windows_capture_flags() {
+        let mut request = start_json();
+        request["capture_provider"] = json!("x11");
+        request["output"] = json!("x11:DP-1/000000a4");
+        let mut start: StartConfig = serde_json::from_value(request).unwrap();
+        assert!(start.validate(false).is_ok());
+        assert_eq!(
+            serde_json::to_value(&start).unwrap()["capture_provider"],
+            "x11"
+        );
+        start.constant_rate = true;
+        assert_eq!(start.validate(false), Err("constant_rate_requires_wgc"));
+    }
+
+    #[test]
+    fn selected_kms_output_is_valid_without_windows_capture_flags() {
+        let mut request = start_json();
+        request["capture_provider"] = json!("kms");
+        request["output"] = json!("kms:card1/conn=34/crtc=56/plane=78");
+        let mut start: StartConfig = serde_json::from_value(request).unwrap();
+        assert!(start.validate(false).is_ok());
+        assert_eq!(
+            serde_json::to_value(&start).unwrap()["capture_provider"],
+            "kms"
         );
         start.constant_rate = true;
         assert_eq!(start.validate(false), Err("constant_rate_requires_wgc"));

@@ -58,6 +58,99 @@ namespace Amaterasu {
     return parseInputBooleanOverride(value, "10-bit SDR preference");
   }
 
+  export const displayPolicyKeys = [
+    "adapter_name", "adapter_pnp_id", "virtual_display_mode", "virtual_display_layout",
+    "dd_mode_remapping", "dd_resolution_option", "dd_manual_resolution",
+    "dd_refresh_rate_option", "dd_manual_refresh_rate", "dd_hdr_option",
+    "dd_configuration_option", "dd_hdr_request_override", "dd_config_revert_delay",
+    "dd_config_revert_on_disconnect", "dd_paused_virtual_display_timeout_secs",
+    "dd_always_restore_from_golden", "dd_display_helper_engine",
+    "dd_snapshot_restore_hotkey", "dd_snapshot_restore_hotkey_modifiers",
+    "dd_use_sunshine_virtual_display_driver", "dd_activate_virtual_display",
+    "dd_virtual_display_scale", "dd_virtual_display_permanent_count", "virtual_display_outputs",
+    "dd_snapshot_exclude_devices", "dd_wa_dummy_plug_hdr10", "dd_wa_hdr_toggle",
+    "dd_wa_hdr_toggle_delay", "vulkan_hdr_layer", "wayland_hdr_compatibility",
+  ] as const;
+
+  const scopedDisplayPolicyKeys = [
+    "adapter_name", "adapter_pnp_id", "virtual_display_mode", "virtual_display_layout",
+    "dd_mode_remapping", "dd_resolution_option", "dd_manual_resolution",
+    "dd_refresh_rate_option", "dd_manual_refresh_rate", "dd_hdr_option",
+    "dd_configuration_option", "dd_hdr_request_override", "dd_config_revert_delay",
+    "dd_config_revert_on_disconnect", "dd_paused_virtual_display_timeout_secs",
+    "dd_always_restore_from_golden", "dd_display_helper_engine",
+    "dd_snapshot_restore_hotkey", "dd_snapshot_restore_hotkey_modifiers",
+    "dd_use_sunshine_virtual_display_driver", "dd_activate_virtual_display",
+    "dd_virtual_display_scale", "dd_virtual_display_permanent_count", "virtual_display_outputs",
+    "dd_snapshot_exclude_devices", "dd_wa_dummy_plug_hdr10",
+  ] as const;
+
+  function validDisplayPolicyValue(key: string, value: unknown): boolean {
+    if (value === null) return true;
+    if (key === "adapter_name")
+      return typeof value === "string" && new TextEncoder().encode(value).length <= 1024 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+    if (key === "adapter_pnp_id")
+      return typeof value === "string" && new TextEncoder().encode(value).length <= 256 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+    if (key === "virtual_display_mode") return ["disabled", "per_client", "shared"].includes(value as string);
+    if (key === "virtual_display_layout") return ["exclusive", "extended", "extended_primary", "extended_isolated", "extended_primary_isolated"].includes(value as string);
+    if (key === "dd_resolution_option") return ["auto", "disabled", "manual"].includes(value as string);
+    if (key === "dd_refresh_rate_option") return ["auto", "disabled", "manual", "prefer_highest"].includes(value as string);
+    if (key === "dd_hdr_option") return ["auto", "disabled"].includes(value as string);
+    if (key === "dd_configuration_option") return ["disabled", "verify_only", "ensure_active", "ensure_primary", "ensure_only_display"].includes(value as string);
+    if (key === "dd_hdr_request_override") return ["auto", "force_on", "force_off"].includes(value as string);
+    if (key === "dd_display_helper_engine") return ["auto", "v2", "legacy"].includes(value as string);
+    if (["dd_config_revert_on_disconnect", "dd_always_restore_from_golden", "dd_use_sunshine_virtual_display_driver", "dd_activate_virtual_display", "dd_wa_dummy_plug_hdr10", "dd_wa_hdr_toggle", "vulkan_hdr_layer", "wayland_hdr_compatibility"].includes(key))
+      return typeof value === "boolean";
+    if (["dd_config_revert_delay", "dd_paused_virtual_display_timeout_secs", "dd_virtual_display_permanent_count", "dd_wa_hdr_toggle_delay"].includes(key))
+      return Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= (key === "dd_virtual_display_permanent_count" ? 4 : key === "dd_wa_hdr_toggle_delay" ? 3000 : 0x7fff_ffff);
+    if (key === "dd_virtual_display_scale")
+      return Number.isSafeInteger(value) && [-1, 0, 100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500].includes(value as number);
+    if (key === "virtual_display_outputs" || key === "dd_snapshot_exclude_devices") {
+      const maximum = key === "virtual_display_outputs" ? 32 : 256;
+      const maximumBytes = key === "virtual_display_outputs" ? 512 : 1024;
+      return Array.isArray(value) && value.length <= maximum && value.every((item) =>
+        typeof item === "string" && item.length > 0 && new TextEncoder().encode(item).length <= maximumBytes && !/[\u0000-\u001f\u007f-\u009f]/u.test(item));
+    }
+    if (key === "dd_snapshot_restore_hotkey")
+      return typeof value === "string" && value.length <= 64 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+    if (key === "dd_snapshot_restore_hotkey_modifiers")
+      return typeof value === "string" && value.length <= 128 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+    if (key === "dd_mode_remapping")
+      return !!value && typeof value === "object" && !Array.isArray(value);
+    if (key === "dd_manual_resolution")
+      return typeof value === "string" && value.length <= 32 && (value === "" || /^\d+[x×]\d+$/.test(value));
+    if (key === "dd_manual_refresh_rate")
+      return typeof value === "string" && value.length <= 64 && (value === "" || /^\d+(\.\d+)?$/.test(value));
+    return false;
+  }
+
+  export function parseDisplayPolicyOverrideMap(
+    raw: string,
+    scope: "global" | "application" | "client",
+  ): Record<string, unknown> | null {
+    if (typeof raw !== "string") throw new Error("Display policy must be JSON text.");
+    const allowed = scope === "global" ? displayPolicyKeys : scopedDisplayPolicyKeys;
+    const allowedSet = new Set<string>(allowed);
+    const parsed: unknown = raw.trim() === "" ? {} : JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      throw new Error("Display policy must be a JSON object.");
+    const source = parsed as Record<string, unknown>;
+    if (Object.keys(source).some((key) => !allowedSet.has(key)))
+      throw new Error(`Display policy contains a key unavailable at ${scope} scope.`);
+    const result: Record<string, unknown> = scope === "global"
+      ? Object.fromEntries(displayPolicyKeys.map((key) => [key, null]))
+      : {};
+    for (const [key, value] of Object.entries(source)) {
+      if (!validDisplayPolicyValue(key, value))
+        throw new Error(`Display policy value for ${key} is invalid.`);
+      result[key] = value;
+    }
+    if (scope === "global" && typeof result.adapter_pnp_id === "string" && result.adapter_pnp_id !== "" &&
+        (typeof result.adapter_name !== "string" || result.adapter_name === ""))
+      throw new Error("adapter_pnp_id requires a non-empty adapter_name at global scope.");
+    return scope === "global" || Object.keys(result).length > 0 ? result : null;
+  }
+
   export function usesManualRefreshRateCompanion(value: string | null | undefined): boolean {
     return value === "manual";
   }
@@ -499,6 +592,10 @@ namespace Amaterasu {
     const refreshRateOption = parseRefreshRateOptionOverride(
       String(data.get("dd_refresh_rate_option") ?? ""),
     );
+    const displayPolicy = parseDisplayPolicyOverrideMap(
+      String(data.get("display_policy") ?? ""),
+      "application",
+    );
     const prefer10BitSdr = parsePrefer10BitSdrOverride(
       String(data.get("prefer_10bit_sdr") ?? ""),
     );
@@ -517,6 +614,7 @@ namespace Amaterasu {
       mouse === null &&
       Object.keys(advancedInput).length === 0 &&
       refreshRateOption === null &&
+      displayPolicy === null &&
       prefer10BitSdr === null
         ? undefined
         : {
@@ -532,6 +630,7 @@ namespace Amaterasu {
             ...(mouse === null ? {} : { mouse }),
             ...advancedInput,
             ...(refreshRateOption === null ? {} : { dd_refresh_rate_option: refreshRateOption }),
+            ...(displayPolicy === null ? {} : { display_policy: displayPolicy }),
             ...(prefer10BitSdr === null ? {} : { prefer_10bit_sdr: prefer10BitSdr }),
           };
     const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;

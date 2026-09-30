@@ -2484,6 +2484,24 @@ fn global_capture_modes_reach_rtsp_open_and_are_snapshotted_at_admission() {
             CaptureProvider::Wgc,
             true,
         ),
+        (
+            CaptureMode::PipeWire,
+            CaptureProvider::Dxgi,
+            CaptureProvider::PipeWire,
+            false,
+        ),
+        (
+            CaptureMode::X11,
+            CaptureProvider::Dxgi,
+            CaptureProvider::X11,
+            false,
+        ),
+        (
+            CaptureMode::Kms,
+            CaptureProvider::Dxgi,
+            CaptureProvider::Kms,
+            false,
+        ),
     ] {
         let now = Instant::now();
         let mut stream_config = config();
@@ -2512,6 +2530,87 @@ fn global_capture_modes_reach_rtsp_open_and_are_snapshotted_at_admission() {
         );
         assert_eq!(
             rtsp_open["capture"]["constant_rate"],
+            expected_constant_rate
+        );
+    }
+}
+
+#[test]
+fn scoped_capture_selection_prefers_client_then_application_then_global() {
+    let cases = [
+        (
+            CaptureMode::Kms,
+            Some(CaptureMode::X11),
+            Some(CaptureMode::Kms),
+            CaptureProvider::Kms,
+            false,
+        ),
+        (
+            CaptureMode::X11,
+            Some(CaptureMode::PipeWire),
+            Some(CaptureMode::X11),
+            CaptureProvider::X11,
+            false,
+        ),
+        (
+            CaptureMode::X11,
+            Some(CaptureMode::PipeWire),
+            None,
+            CaptureProvider::PipeWire,
+            false,
+        ),
+        (
+            CaptureMode::Wgcc,
+            None,
+            None,
+            CaptureProvider::Wgc,
+            true,
+        ),
+    ];
+
+    for (global, application, client, expected_provider, expected_constant_rate) in cases {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_capture_mode(global);
+        let peer = client.map_or_else(
+            || peer(91),
+            |capture| {
+                let certificate = vec![91; 32];
+                PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+                    .unwrap()
+                    .with_paired_identity(
+                        "capture-client".into(),
+                        fingerprint(&certificate),
+                        ClientConfigOverrides {
+                            capture: Some(capture),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            },
+        );
+        let mut broker = Broker {
+            application_input_overrides: application.map(|capture| json!({"capture":capture})),
+            ..Broker::default()
+        };
+
+        assert!(controller.launch(10, request(1), peer, now).is_none());
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+        let open = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .expect("RTSP open request");
+        assert_eq!(open["capture"]["capture_provider"], json!(expected_provider));
+        assert_eq!(
+            open["capture"]["constant_rate"],
             expected_constant_rate
         );
     }
@@ -3357,20 +3456,22 @@ fn sparse_application_display_fields_are_frozen_before_launch_and_checked_on_rea
     let mut broker = Broker {
         application_input_overrides: Some(json!({
             "dd_refresh_rate_option":"prefer_highest",
-            "dd_hdr_request_override":"force_off"
+            "dd_hdr_request_override":"force_off",
+            "display_policy":{"dd_virtual_display_permanent_count":2}
         })),
         ..Broker::default()
     };
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
-    assert_eq!(reply.status, 200);
+    assert_eq!(reply.status, 200, "{}", String::from_utf8_lossy(&reply.body));
     let record = controller.records.values().next().unwrap();
     assert_eq!(record.application_catalog_revision, Some(1));
     assert_eq!(
         record.application_display_overrides,
         Some(json!({
             "dd_refresh_rate_option":"prefer_highest",
-            "dd_hdr_request_override":"force_off"
+            "dd_hdr_request_override":"force_off",
+            "dd_virtual_display_permanent_count":2
         }))
     );
     assert!(

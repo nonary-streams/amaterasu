@@ -118,6 +118,8 @@ enum Operation {
         #[serde(default, deserialize_with = "deserialize_field_update")]
         dd_hdr_request_override: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
+        display_policy: FieldUpdate<Value>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
         audio_sink: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         virtual_sink: FieldUpdate<String>,
@@ -659,6 +661,7 @@ impl NvhttpModule {
                                 dd_hdr_option,
                                 dd_configuration_option,
                                 dd_hdr_request_override,
+                                display_policy,
                                 audio_sink,
                                 virtual_sink,
                                 audio_sink_capture_only,
@@ -735,6 +738,7 @@ impl NvhttpModule {
                                         dd_hdr_option,
                                         dd_configuration_option,
                                         dd_hdr_request_override,
+                                        additional: display_policy,
                                     },
                                     audio_sink,
                                     virtual_sink,
