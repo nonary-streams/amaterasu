@@ -2104,6 +2104,105 @@ var Amaterasu;
         select.value = current === undefined ? "" : String(current);
         return select;
     }
+    function mergeCatalogConfigOverrides(saved, renderedFields, ...edited) {
+        const merged = Object.assign({}, saved, ...edited.filter((source) => source != null));
+        for (const name of renderedFields) {
+            if (!edited.some((source) => source != null && Object.hasOwn(source, name)))
+                delete merged[name];
+        }
+        return merged;
+    }
+    Amaterasu.mergeCatalogConfigOverrides = mergeCatalogConfigOverrides;
+    function catalogNvencSettingsOverrideFormValues(overrides) {
+        const text = (value) => value == null ? "" : String(value);
+        return {
+            nvenc_preset: text(overrides?.nvenc_preset),
+            nvenc_h264_cavlc: text(overrides?.nvenc_h264_cavlc),
+            nvenc_twopass: text(overrides?.nvenc_twopass),
+            nvenc_vbv_increase: text(overrides?.nvenc_vbv_increase),
+            nvenc_split_encode: text(overrides?.nvenc_split_encode),
+            nvenc_realtime_hags: text(overrides?.nvenc_realtime_hags),
+            nvenc_opengl_vulkan_on_dxgi: text(overrides?.nvenc_opengl_vulkan_on_dxgi),
+            nvenc_latency_over_power: text(overrides?.nvenc_latency_over_power),
+            vaapi_strict_rc_buffer: text(overrides?.vaapi_strict_rc_buffer),
+        };
+    }
+    Amaterasu.catalogNvencSettingsOverrideFormValues = catalogNvencSettingsOverrideFormValues;
+    function catalogNvencSettingsOverrideFields(overrides) {
+        const values = catalogNvencSettingsOverrideFormValues(overrides);
+        const preset = Amaterasu.input("nvenc_preset", values.nvenc_preset, "number");
+        preset.min = "1";
+        preset.max = "7";
+        preset.step = "1";
+        preset.placeholder = "Inherit";
+        const cavlc = audioOverrideSelect("nvenc_h264_cavlc", values.nvenc_h264_cavlc === "" ? undefined : values.nvenc_h264_cavlc === "true");
+        const twopass = catalogEnumOverrideSelect("nvenc_twopass", values.nvenc_twopass, ["disabled", "quarter_res", "full_res"]);
+        const vbvIncrease = Amaterasu.input("nvenc_vbv_increase", values.nvenc_vbv_increase, "number");
+        vbvIncrease.min = "0";
+        vbvIncrease.max = "400";
+        vbvIncrease.step = "1";
+        vbvIncrease.placeholder = "Inherit";
+        const splitEncode = catalogEnumOverrideSelect("nvenc_split_encode", values.nvenc_split_encode, ["auto", "enabled", "disabled"]);
+        const realtimeHags = audioOverrideSelect("nvenc_realtime_hags", values.nvenc_realtime_hags === "" ? undefined : values.nvenc_realtime_hags === "true");
+        const openglVulkanOnDxgi = audioOverrideSelect("nvenc_opengl_vulkan_on_dxgi", values.nvenc_opengl_vulkan_on_dxgi === "" ? undefined : values.nvenc_opengl_vulkan_on_dxgi === "true");
+        const latencyOverPower = audioOverrideSelect("nvenc_latency_over_power", values.nvenc_latency_over_power === "" ? undefined : values.nvenc_latency_over_power === "true");
+        const vaapiStrictRcBuffer = audioOverrideSelect("vaapi_strict_rc_buffer", values.vaapi_strict_rc_buffer === "" ? undefined : values.vaapi_strict_rc_buffer === "true");
+        return [
+            Amaterasu.field("NVENC preset", preset, "Inherit or choose P1 through P7."),
+            Amaterasu.field("NVENC H.264 CAVLC", cavlc, "Inherit the next scope or set CAVLC on or off."),
+            Amaterasu.field("NVENC two-pass mode", twopass, "Inherit or choose disabled, quarter resolution, or full resolution."),
+            Amaterasu.field("NVENC VBV increase (%)", vbvIncrease, "Inherit or set an integer from 0 to 400."),
+            Amaterasu.field("NVENC split encode", splitEncode, "Inherit or choose automatic, enabled, or disabled."),
+            Amaterasu.field("NVENC real-time HAGS", realtimeHags, "Inherit the next scope or set the real-time HAGS option."),
+            Amaterasu.field("NVENC OpenGL/Vulkan on DXGI", openglVulkanOnDxgi, "Inherit the next scope or set this DXGI capture option."),
+            Amaterasu.field("NVENC latency over power", latencyOverPower, "Inherit the next scope or prefer latency over power."),
+            Amaterasu.field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Inherit the next scope or set strict rate-control buffer behavior."),
+        ];
+    }
+    function parseCatalogNvencSettingsOverrides(data) {
+        const text = (name) => String(data.get(name) ?? "").trim();
+        const integer = (name, minimum, maximum) => {
+            const value = text(name);
+            if (value === "")
+                return null;
+            if (!/^[0-9]+$/.test(value))
+                throw new Error(`${name} must be an integer from ${minimum} to ${maximum}, or blank to inherit.`);
+            const number = Number(value);
+            if (!Number.isSafeInteger(number) || number < minimum || number > maximum)
+                throw new Error(`${name} must be an integer from ${minimum} to ${maximum}, or blank to inherit.`);
+            return number;
+        };
+        const boolean = (name) => {
+            const value = text(name);
+            if (value === "")
+                return null;
+            if (value === "true")
+                return true;
+            if (value === "false")
+                return false;
+            throw new Error(`${name} must be enabled, disabled, or inherited.`);
+        };
+        const enumeration = (name, choices) => {
+            const value = text(name);
+            if (value === "")
+                return null;
+            if (choices.includes(value))
+                return value;
+            throw new Error(`${name} has an unsupported value.`);
+        };
+        return {
+            nvenc_preset: integer("nvenc_preset", 1, 7),
+            nvenc_h264_cavlc: boolean("nvenc_h264_cavlc"),
+            nvenc_twopass: enumeration("nvenc_twopass", ["disabled", "quarter_res", "full_res"]),
+            nvenc_vbv_increase: integer("nvenc_vbv_increase", 0, 400),
+            nvenc_split_encode: enumeration("nvenc_split_encode", ["auto", "enabled", "disabled"]),
+            nvenc_realtime_hags: boolean("nvenc_realtime_hags"),
+            nvenc_opengl_vulkan_on_dxgi: boolean("nvenc_opengl_vulkan_on_dxgi"),
+            nvenc_latency_over_power: boolean("nvenc_latency_over_power"),
+            vaapi_strict_rc_buffer: boolean("vaapi_strict_rc_buffer"),
+        };
+    }
+    Amaterasu.parseCatalogNvencSettingsOverrides = parseCatalogNvencSettingsOverrides;
     const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"];
     const catalogAutoVirtualFramegenModes = ["enabled", "vrr", "legacy", "disabled"];
     const catalogFrameGenerationProviders = [
@@ -2557,6 +2656,7 @@ var Amaterasu;
             fec.placeholder = "Inherit";
             fec.setAttribute("aria-label", `FEC percentage override for ${row.entry.name}`);
             const frameLimiterFields = catalogFrameLimiterOverrideFields(row.entry.config_overrides, capabilities);
+            const nvencSettingsFields = catalogNvencSettingsOverrideFields(row.entry.config_overrides);
             const streamAudio = audioOverrideSelect("stream_audio", row.entry.config_overrides?.stream_audio);
             const audioSink = audioSinkOverrideControls(row.entry.config_overrides?.audio_sink);
             const virtualSink = virtualSinkOverrideControls(row.entry.config_overrides?.virtual_sink);
@@ -2574,7 +2674,7 @@ var Amaterasu;
             const advancedInput = Amaterasu.advancedInputOverrideControls(row.entry.config_overrides);
             const softwareEncoder = Amaterasu.softwareEncoderOverrideControls(row.entry.config_overrides);
             const refreshRateOptionFields = catalogRefreshRateOptionFields(row.entry.config_overrides?.dd_refresh_rate_option);
-            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields, ...softwareEncoder.fields);
+            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettingsFields);
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
             save.type = "submit";
@@ -2585,13 +2685,7 @@ var Amaterasu;
                 if (!form.reportValidity())
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
-                    const config_overrides = {
-                        ...advancedInput.read(),
-                        ...softwareEncoder.read(),
-                        ...Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
-                        ...parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row.entry.config_overrides),
-                        dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
-                    };
+                    const config_overrides = mergeCatalogConfigOverrides(row.entry.config_overrides, new FormData(form).keys(), advancedInput.read(), softwareEncoder.read(), Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles), parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form)), { dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)) });
                     try {
                         const reply = await api.post("catalog/update_provider_overrides", {
                             id: row.id,
@@ -2642,10 +2736,7 @@ var Amaterasu;
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
                     const entry = Amaterasu.entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
-                    entry.config_overrides = {
-                        ...(entry.config_overrides ?? {}),
-                        ...parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row?.entry.config_overrides),
-                    };
+                    entry.config_overrides = mergeCatalogConfigOverrides(row?.entry.config_overrides, new FormData(form).keys(), entry.config_overrides, parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row?.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form)));
                     await api.post(row ? "catalog/update" : "catalog/create", {
                         ...(row ? { id: row.id } : {}),
                         entry,
@@ -2744,6 +2835,7 @@ var Amaterasu;
         fec.max = "255";
         fec.step = "1";
         const frameLimiterFields = catalogFrameLimiterOverrideFields(entry?.config_overrides, capabilities);
+        const nvencSettingsFields = catalogNvencSettingsOverrideFields(entry?.config_overrides);
         const streamAudio = audioOverrideSelect("stream_audio", entry?.config_overrides?.stream_audio);
         const audioSink = audioSinkOverrideControls(entry?.config_overrides?.audio_sink);
         const virtualSink = virtualSinkOverrideControls(entry?.config_overrides?.virtual_sink);
@@ -2791,7 +2883,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields, ...softwareEncoder.fields, steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettingsFields, steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }
@@ -3385,11 +3477,119 @@ var Amaterasu;
             reply.effective_fec_percentage < 1 ||
             reply.effective_fec_percentage > 255 ||
             !Number.isSafeInteger(reply.port) ||
+            !Number.isSafeInteger(reply.configured_nvenc_preset) ||
+            reply.configured_nvenc_preset < 1 ||
+            reply.configured_nvenc_preset > 7 ||
+            typeof reply.configured_nvenc_h264_cavlc !== "boolean" ||
+            !["disabled", "quarter_res", "full_res"].includes(String(reply.configured_nvenc_twopass)) ||
+            !Number.isSafeInteger(reply.configured_nvenc_vbv_increase) ||
+            reply.configured_nvenc_vbv_increase < 0 ||
+            reply.configured_nvenc_vbv_increase > 400 ||
+            !["auto", "enabled", "disabled"].includes(String(reply.configured_nvenc_split_encode)) ||
+            typeof reply.configured_nvenc_realtime_hags !== "boolean" ||
+            typeof reply.configured_nvenc_opengl_vulkan_on_dxgi !== "boolean" ||
+            typeof reply.configured_nvenc_latency_over_power !== "boolean" ||
+            typeof reply.configured_vaapi_strict_rc_buffer !== "boolean" ||
             !Array.isArray(reply.configured_global_preparation))
             throw new Error("Moonlight host settings reply is invalid.");
         return reply;
     }
     Amaterasu.parseNvhttpSettingsReply = parseNvhttpSettingsReply;
+    function nvencSparseBooleanSelect(name, value) {
+        const select = Amaterasu.el("select");
+        select.name = name;
+        for (const [optionValue, label] of [["", "Inherit"], ["true", "Enabled"], ["false", "Disabled"]]) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = optionValue;
+            select.append(option);
+        }
+        select.value = value == null ? "" : String(value);
+        return select;
+    }
+    function nvencSettingsOverrideControls(overrides) {
+        const preset = Amaterasu.input("nvenc_preset", overrides?.nvenc_preset == null ? "" : String(overrides.nvenc_preset), "number");
+        preset.min = "1";
+        preset.max = "7";
+        preset.step = "1";
+        preset.placeholder = "Inherit";
+        const cavlc = nvencSparseBooleanSelect("nvenc_h264_cavlc", overrides?.nvenc_h264_cavlc);
+        const twopass = Amaterasu.el("select");
+        twopass.name = "nvenc_twopass";
+        for (const [value, label] of [["", "Inherit"], ["disabled", "Disabled"], ["quarter_res", "Quarter resolution"], ["full_res", "Full resolution"]]) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = value;
+            twopass.append(option);
+        }
+        twopass.value = overrides?.nvenc_twopass ?? "";
+        const vbvIncrease = Amaterasu.input("nvenc_vbv_increase", overrides?.nvenc_vbv_increase == null ? "" : String(overrides.nvenc_vbv_increase), "number");
+        vbvIncrease.min = "0";
+        vbvIncrease.max = "400";
+        vbvIncrease.step = "1";
+        vbvIncrease.placeholder = "Inherit";
+        const splitEncode = Amaterasu.el("select");
+        splitEncode.name = "nvenc_split_encode";
+        for (const [value, label] of [["", "Inherit"], ["auto", "Automatic"], ["enabled", "Enabled"], ["disabled", "Disabled"]]) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = value;
+            splitEncode.append(option);
+        }
+        splitEncode.value = overrides?.nvenc_split_encode ?? "";
+        const realtimeHags = nvencSparseBooleanSelect("nvenc_realtime_hags", overrides?.nvenc_realtime_hags);
+        const openglVulkanOnDxgi = nvencSparseBooleanSelect("nvenc_opengl_vulkan_on_dxgi", overrides?.nvenc_opengl_vulkan_on_dxgi);
+        const latencyOverPower = nvencSparseBooleanSelect("nvenc_latency_over_power", overrides?.nvenc_latency_over_power);
+        const vaapiStrictRcBuffer = nvencSparseBooleanSelect("vaapi_strict_rc_buffer", overrides?.vaapi_strict_rc_buffer);
+        const booleanValue = (select, name) => {
+            if (select.value === "")
+                return null;
+            if (select.value === "true")
+                return true;
+            if (select.value === "false")
+                return false;
+            throw new Error(`${name} must be enabled, disabled, or inherited.`);
+        };
+        const integerValue = (control, name, minimum, maximum) => {
+            const value = control.value.trim();
+            if (value === "")
+                return null;
+            if (!/^[0-9]+$/.test(value))
+                throw new Error(`${name} must be a whole number from ${minimum} to ${maximum}, or blank to inherit.`);
+            const number = Number(value);
+            if (!Number.isSafeInteger(number) || number < minimum || number > maximum)
+                throw new Error(`${name} must be a whole number from ${minimum} to ${maximum}, or blank to inherit.`);
+            return number;
+        };
+        const enumValue = (select, choices, name) => {
+            if (select.value === "")
+                return null;
+            if (choices.includes(select.value))
+                return select.value;
+            throw new Error(`${name} has an unsupported value.`);
+        };
+        return {
+            fields: [
+                Amaterasu.field("NVENC preset", preset, "Inherit or choose P1 through P7."),
+                Amaterasu.field("NVENC H.264 CAVLC", cavlc, "Inherit or set CAVLC on or off."),
+                Amaterasu.field("NVENC two-pass mode", twopass, "Inherit or choose disabled, quarter resolution, or full resolution."),
+                Amaterasu.field("NVENC VBV increase (%)", vbvIncrease, "Inherit or set an integer from 0 to 400."),
+                Amaterasu.field("NVENC split encode", splitEncode, "Inherit or choose automatic, enabled, or disabled."),
+                Amaterasu.field("NVENC real-time HAGS", realtimeHags, "Inherit or set the real-time HAGS option."),
+                Amaterasu.field("NVENC OpenGL/Vulkan on DXGI", openglVulkanOnDxgi, "Inherit or set this DXGI capture option."),
+                Amaterasu.field("NVENC latency over power", latencyOverPower, "Inherit or prefer latency over power."),
+                Amaterasu.field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Inherit or set strict rate-control buffer behavior."),
+            ],
+            read: () => ({
+                nvenc_preset: integerValue(preset, "NVENC preset", 1, 7),
+                nvenc_h264_cavlc: booleanValue(cavlc, "NVENC H.264 CAVLC"),
+                nvenc_twopass: enumValue(twopass, ["disabled", "quarter_res", "full_res"], "NVENC two-pass mode"),
+                nvenc_vbv_increase: integerValue(vbvIncrease, "NVENC VBV increase", 0, 400),
+                nvenc_split_encode: enumValue(splitEncode, ["auto", "enabled", "disabled"], "NVENC split encode"),
+                nvenc_realtime_hags: booleanValue(realtimeHags, "NVENC real-time HAGS"),
+                nvenc_opengl_vulkan_on_dxgi: booleanValue(openglVulkanOnDxgi, "NVENC OpenGL/Vulkan on DXGI"),
+                nvenc_latency_over_power: booleanValue(latencyOverPower, "NVENC latency over power"),
+                vaapi_strict_rc_buffer: booleanValue(vaapiStrictRcBuffer, "VAAPI strict rate-control buffer"),
+            }),
+        };
+    }
     function normalizedPreparationSteps(value) {
         if (!Array.isArray(value))
             return value;
@@ -3436,6 +3636,15 @@ var Amaterasu;
             configured_external_ip: values.external_ip,
             configured_wgc_pacing_smoothing: values.wgc_pacing_smoothing,
             configured_global_preparation: normalizedPreparationSteps(values.global_preparation),
+            configured_nvenc_preset: values.nvenc_preset,
+            configured_nvenc_h264_cavlc: values.nvenc_h264_cavlc,
+            configured_nvenc_twopass: values.nvenc_twopass,
+            configured_nvenc_vbv_increase: values.nvenc_vbv_increase,
+            configured_nvenc_split_encode: values.nvenc_split_encode,
+            configured_nvenc_realtime_hags: values.nvenc_realtime_hags,
+            configured_nvenc_opengl_vulkan_on_dxgi: values.nvenc_opengl_vulkan_on_dxgi,
+            configured_nvenc_latency_over_power: values.nvenc_latency_over_power,
+            configured_vaapi_strict_rc_buffer: values.vaapi_strict_rc_buffer,
         });
         for (const key of ["sw_preset", "sw_tune", "encoder"])
             if (Object.prototype.hasOwnProperty.call(values, key))
@@ -3899,7 +4108,10 @@ var Amaterasu;
         "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
         "frame_limiter_fps_limit", "frame_limiter_enable", "frame_limiter_provider",
         "frame_limiter_disable_vsync", "frame_limiter_auto_virtual_framegen",
-        "rtss_frame_limit_type", "nvenc_spatial_aq", "high_resolution_scrolling",
+        "rtss_frame_limit_type", "nvenc_spatial_aq", "nvenc_preset", "nvenc_h264_cavlc",
+        "nvenc_twopass", "nvenc_vbv_increase", "nvenc_split_encode", "nvenc_realtime_hags",
+        "nvenc_opengl_vulkan_on_dxgi", "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
+        "high_resolution_scrolling",
         "always_send_scancodes", "key_rightalt_to_key_win", "key_repeat_delay",
         "key_repeat_frequency", "keybindings",
     ];
@@ -3927,7 +4139,9 @@ var Amaterasu;
             return false;
         if (["stream_audio", "audio_sink_capture_only", "controller", "keyboard", "mouse",
             "native_pen_touch", "ds4_back_as_touchpad_click", "frame_limiter_enable", "frame_limiter_disable_vsync",
-            "nvenc_spatial_aq", "high_resolution_scrolling", "always_send_scancodes",
+            "nvenc_spatial_aq", "nvenc_h264_cavlc", "nvenc_realtime_hags",
+            "nvenc_opengl_vulkan_on_dxgi", "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
+            "high_resolution_scrolling", "always_send_scancodes",
             "key_rightalt_to_key_win"].includes(field))
             return typeof value === "boolean";
         if (field === "audio_sink" || field === "virtual_sink")
@@ -3953,6 +4167,14 @@ var Amaterasu;
         if (field === "rtss_frame_limit_type")
             return typeof value === "string" && ["async", "front edge sync", "back edge sync",
                 "nvidia reflex"].includes(value);
+        if (field === "nvenc_twopass")
+            return value === "disabled" || value === "quarter_res" || value === "full_res";
+        if (field === "nvenc_split_encode")
+            return value === "auto" || value === "enabled" || value === "disabled";
+        if (field === "nvenc_preset")
+            return Number.isSafeInteger(value) && value >= 1 && value <= 7;
+        if (field === "nvenc_vbv_increase")
+            return Number.isSafeInteger(value) && value >= 0 && value <= 400;
         if (field === "fec_percentage")
             return Number.isSafeInteger(value) && value >= 1 && value <= 255;
         if (field === "video_max_batch_size_kb")
@@ -5499,6 +5721,7 @@ var Amaterasu;
                     ds4BackAsTouchpadClick.setAttribute("aria-label", `DS4 Back as touchpad click override for ${client.name}`);
                     const advancedInput = Amaterasu.advancedInputOverrideControls(client.config_overrides);
                     const softwareEncoder = Amaterasu.softwareEncoderOverrideControls(client.config_overrides);
+                    const nvencSettings = nvencSettingsOverrideControls(client.config_overrides);
                     const streamAudio = Amaterasu.el("select");
                     streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
                     const audioChoices = [
@@ -5577,6 +5800,7 @@ var Amaterasu;
                             const values = {
                                 ...advancedInput.read(),
                                 ...softwareEncoder.read(),
+                                ...nvencSettings.read(),
                                 ...parseClientFecOverride(fec.value),
                                 back_button_timeout: Amaterasu.parseBackButtonTimeoutOverride(backButtonTimeout.value),
                                 stream_audio: Amaterasu.parseStreamAudioOverride(streamAudio.value),
@@ -5610,7 +5834,7 @@ var Amaterasu;
                     if (unsupported.length > 0)
                         status.textContent = `Save unavailable: this client has stored overrides this editor cannot preserve (${unsupported.join(", ")}).`;
                     const identity = Amaterasu.el("div", "", Amaterasu.el("strong", "", client.name), Amaterasu.el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`));
-                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, Amaterasu.el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields), Amaterasu.el("div", "", save, status)];
+                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, Amaterasu.el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields), Amaterasu.el("div", "", save, status)];
                 });
                 const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "DS4 Back as touchpad click", "Input and software encoding preferences", ""], rows);
                 pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save confirms the stored pairing revision. Input preferences apply when the next stream acquires its input lease."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
@@ -5883,6 +6107,40 @@ var Amaterasu;
                 outputName.value = settings.configured_output_name ?? "";
                 const streamAudio = Amaterasu.input("stream_audio", "", "checkbox");
                 streamAudio.checked = settings.stream_audio;
+                const nvencPreset = Amaterasu.input("nvenc_preset", String(settings.configured_nvenc_preset), "number");
+                nvencPreset.min = "1";
+                nvencPreset.max = "7";
+                nvencPreset.step = "1";
+                const nvencH264Cavlc = Amaterasu.input("nvenc_h264_cavlc", "", "checkbox");
+                nvencH264Cavlc.checked = settings.configured_nvenc_h264_cavlc;
+                const nvencTwoPass = Amaterasu.el("select");
+                nvencTwoPass.name = "nvenc_twopass";
+                for (const [value, label] of [["disabled", "Disabled"], ["quarter_res", "Quarter resolution"], ["full_res", "Full resolution"]]) {
+                    const option = Amaterasu.el("option", "", label);
+                    option.value = value;
+                    nvencTwoPass.append(option);
+                }
+                nvencTwoPass.value = settings.configured_nvenc_twopass;
+                const nvencVbvIncrease = Amaterasu.input("nvenc_vbv_increase", String(settings.configured_nvenc_vbv_increase), "number");
+                nvencVbvIncrease.min = "0";
+                nvencVbvIncrease.max = "400";
+                nvencVbvIncrease.step = "1";
+                const nvencSplitEncode = Amaterasu.el("select");
+                nvencSplitEncode.name = "nvenc_split_encode";
+                for (const [value, label] of [["auto", "Automatic"], ["enabled", "Enabled"], ["disabled", "Disabled"]]) {
+                    const option = Amaterasu.el("option", "", label);
+                    option.value = value;
+                    nvencSplitEncode.append(option);
+                }
+                nvencSplitEncode.value = settings.configured_nvenc_split_encode;
+                const nvencRealtimeHags = Amaterasu.input("nvenc_realtime_hags", "", "checkbox");
+                nvencRealtimeHags.checked = settings.configured_nvenc_realtime_hags;
+                const nvencOpenGlVulkanOnDxgi = Amaterasu.input("nvenc_opengl_vulkan_on_dxgi", "", "checkbox");
+                nvencOpenGlVulkanOnDxgi.checked = settings.configured_nvenc_opengl_vulkan_on_dxgi;
+                const nvencLatencyOverPower = Amaterasu.input("nvenc_latency_over_power", "", "checkbox");
+                nvencLatencyOverPower.checked = settings.configured_nvenc_latency_over_power;
+                const vaapiStrictRcBuffer = Amaterasu.input("vaapi_strict_rc_buffer", "", "checkbox");
+                vaapiStrictRcBuffer.checked = settings.configured_vaapi_strict_rc_buffer;
                 const wgcPacing = Amaterasu.el("select");
                 wgcPacing.name = "wgc_pacing_smoothing";
                 for (const [value, label] of [
@@ -6037,7 +6295,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(...softwareEncoder.fields, softwareAvailability, Amaterasu.el("p", "muted", `Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software requests max(client-negotiated slices, this value), subject to x264 frame-size and backend limits. Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`), Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Global FEC percentage", fecPercentage, `Controls the repair percentage used for new streams unless an application or paired client overrides it. Leave blank to use the startup value (${settings.effective_fec_percentage}%). Valid values are 1–255.`), Amaterasu.field("Automatic router port mapping (UPnP)", upnp, "Requests gateway mappings for active stream listeners. The management listener is mapped only when its peer policy allows WAN access. This setting has no effect when the gateway does not support UPnP."), Amaterasu.el("p", settings.upnp_status === "error" ? "error" : "muted", `UPnP status: ${settings.upnp_status.replaceAll("_", " ")}${settings.upnp_error ? ` · ${settings.upnp_error}` : ""}`), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation, Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("LAN video encryption", lanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for LAN peers. Applies to new streams."), Amaterasu.field("WAN video encryption", wanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for WAN peers. Applies to new streams."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), ...(settings.rtsp_listener_error ? [Amaterasu.el("p", "error", settings.rtsp_listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(...softwareEncoder.fields, softwareAvailability, Amaterasu.el("p", "muted", `Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software requests max(client-negotiated slices, this value), subject to x264 frame-size and backend limits. Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`), Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Global FEC percentage", fecPercentage, `Controls the repair percentage used for new streams unless an application or paired client overrides it. Leave blank to use the startup value (${settings.effective_fec_percentage}%). Valid values are 1–255.`), Amaterasu.field("Automatic router port mapping (UPnP)", upnp, "Requests gateway mappings for active stream listeners. The management listener is mapped only when its peer policy allows WAN access. This setting has no effect when the gateway does not support UPnP."), Amaterasu.el("p", settings.upnp_status === "error" ? "error" : "muted", `UPnP status: ${settings.upnp_status.replaceAll("_", " ")}${settings.upnp_error ? ` · ${settings.upnp_error}` : ""}`), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("NVENC preset", nvencPreset, "Select NVENC preset P1 through P7 for future streams."), Amaterasu.field("NVENC H.264 CAVLC", nvencH264Cavlc, "Request CAVLC entropy coding for NVENC H.264."), Amaterasu.field("NVENC two-pass mode", nvencTwoPass, "Choose disabled, quarter-resolution, or full-resolution two-pass encoding."), Amaterasu.field("NVENC VBV increase (%)", nvencVbvIncrease, "Increase NVENC VBV buffer size by 0–400 percent."), Amaterasu.field("NVENC split encode", nvencSplitEncode, "Choose automatic driver selection or explicitly enable or disable split encoding."), Amaterasu.field("NVENC real-time HAGS", nvencRealtimeHags, "Configure the NVENC real-time scheduling hint for systems using hardware-accelerated GPU scheduling."), Amaterasu.field("NVENC OpenGL/Vulkan on DXGI", nvencOpenGlVulkanOnDxgi, "Configure NVENC handling for OpenGL and Vulkan capture through DXGI."), Amaterasu.field("NVENC latency over power", nvencLatencyOverPower, "Prefer encoding latency over power efficiency."), Amaterasu.field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Use strict rate-control buffer behavior for VAAPI."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation, Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("LAN video encryption", lanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for LAN peers. Applies to new streams."), Amaterasu.field("WAN video encryption", wanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for WAN peers. Applies to new streams."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), ...(settings.rtsp_listener_error ? [Amaterasu.el("p", "error", settings.rtsp_listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     if (!form.reportValidity())
@@ -6053,6 +6311,15 @@ var Amaterasu;
                             capture: parseCaptureSelection(capture.value),
                             output_name: parseOutputNameSelection(outputName.value),
                             stream_audio: streamAudio.checked,
+                            nvenc_preset: nvencPreset.valueAsNumber,
+                            nvenc_h264_cavlc: nvencH264Cavlc.checked,
+                            nvenc_twopass: nvencTwoPass.value,
+                            nvenc_vbv_increase: nvencVbvIncrease.valueAsNumber,
+                            nvenc_split_encode: nvencSplitEncode.value,
+                            nvenc_realtime_hags: nvencRealtimeHags.checked,
+                            nvenc_opengl_vulkan_on_dxgi: nvencOpenGlVulkanOnDxgi.checked,
+                            nvenc_latency_over_power: nvencLatencyOverPower.checked,
+                            vaapi_strict_rc_buffer: vaapiStrictRcBuffer.checked,
                             video_max_batch_size_kb: parseVideoMaxBatchSize(videoBatchSize.value),
                             max_bitrate: parseMaxBitrate(maxBitrate.value),
                             minimum_fps_target: parseMinimumFpsTarget(minimumFpsTarget.value),
