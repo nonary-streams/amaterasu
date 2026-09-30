@@ -1,6 +1,158 @@
 use super::*;
 use std::collections::VecDeque;
 
+#[test]
+fn version_one_migrates_without_activating_origin_exceptions() {
+    let mut settings = ProductSettings::default();
+    load(
+        &mut settings,
+        &mut Transport::default(),
+        Response::Result {
+            payload: json!({"ok":true,"found":true,"version":1,"revision":4,"values":{"origin_web_ui_allowed":"wan"}}),
+        },
+    );
+    assert_eq!(settings.maximum_peer(), Some(PeerTier::Wan));
+    assert!(settings.csrf_origins().as_slice().is_empty());
+    assert_eq!(
+        settings.payload()["values"]["csrf_allowed_origins"],
+        Value::Null
+    );
+    assert_eq!(settings.payload()["csrf_allowed_origins"], json!([]));
+    assert!(parse_document(&json!({"ok":true,"found":true,"version":1,"revision":4,"values":{"origin_web_ui_allowed":"wan","csrf_allowed_origins":["https://trusted.example"]}})).is_none());
+}
+
+#[test]
+fn csrf_omission_null_and_empty_preserve_distinct_durable_selections() {
+    let original = json!(["https://trusted.example:47990"]);
+    for selection in [
+        None,
+        Some(Value::Null),
+        Some(json!([])),
+        Some(json!(["https://other.example"])),
+    ] {
+        let mut settings = ProductSettings::default();
+        let mut transport = Transport::default();
+        load(
+            &mut settings,
+            &mut transport,
+            Response::Result {
+                payload: json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"origin_web_ui_allowed":"pc","csrf_allowed_origins":original}}),
+            },
+        );
+        let mut payload = json!({"action":"product_update","expected_revision":1});
+        if let Some(value) = &selection {
+            payload["csrf_allowed_origins"] = value.clone();
+        }
+        let expected = selection.unwrap_or_else(|| original.clone());
+        transport.push([Response::Accepted { id: 20 }]);
+        settings
+            .receive("amaterasu.management", 7, 2000, payload, &mut |command| {
+                transport.send(command)
+            })
+            .unwrap();
+        assert_eq!(
+            settings.csrf_origins().as_slice(),
+            &["https://trusted.example:47990"]
+        );
+        let Command::Request { payload, .. } = &transport.commands[3] else {
+            panic!()
+        };
+        assert_eq!(payload["version"], 2);
+        assert_eq!(payload["values"]["csrf_allowed_origins"], expected);
+        assert_eq!(payload["values"]["origin_web_ui_allowed"], "pc");
+        let persisted = json!({"ok":true,"found":true,"version":2,"revision":2,"values":{"origin_web_ui_allowed":"pc","csrf_allowed_origins":expected}});
+        transport.push([
+            Response::Ok,
+            Response::Result {
+                payload: persisted.clone(),
+            },
+            Response::Ok,
+            Response::Ok,
+        ]);
+        settings
+            .tick(Instant::now(), &mut |command| transport.send(command))
+            .unwrap();
+        assert_eq!(
+            settings.payload()["values"]["csrf_allowed_origins"],
+            expected
+        );
+        assert_eq!(
+            settings.payload()["csrf_allowed_origins"],
+            if expected.is_null() {
+                json!([])
+            } else {
+                expected.clone()
+            }
+        );
+        let mut restarted = ProductSettings::default();
+        load(
+            &mut restarted,
+            &mut Transport::default(),
+            Response::Result { payload: persisted },
+        );
+        assert_eq!(restarted.payload(), settings.payload());
+    }
+}
+
+#[test]
+fn malformed_csrf_updates_and_documents_never_activate_an_exception() {
+    for origins in [
+        json!("https://trusted.example"),
+        json!(["http://trusted.example"]),
+        json!(["https://trusted.example/path"]),
+        json!(["https://trusted.example", "https://trusted.example"]),
+        json!(vec!["https://trusted.example"; 17]),
+    ] {
+        let mut settings = ProductSettings::default();
+        let mut transport = Transport::default();
+        load(&mut settings, &mut transport, stored(1, None));
+        transport.push([Response::Ok]);
+        settings.receive("amaterasu.management", 7, 2000, json!({"action":"product_update","expected_revision":1,"csrf_allowed_origins":origins}), &mut |command| transport.send(command)).unwrap();
+        let Command::Complete { payload, .. } = transport.commands.last().unwrap() else {
+            panic!()
+        };
+        assert_eq!(payload["code"], "invalid_request");
+        assert_eq!(transport.commands.len(), 4);
+        assert!(parse_document(&json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"csrf_allowed_origins":origins}})).is_none());
+    }
+}
+
+#[test]
+fn ambiguous_csrf_write_removes_exceptions_until_durable_reload() {
+    let mut settings = ProductSettings::default();
+    let mut transport = Transport::default();
+    load(
+        &mut settings,
+        &mut transport,
+        Response::Result {
+            payload: json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"csrf_allowed_origins":["https://trusted.example"]}}),
+        },
+    );
+    assert!(
+        settings
+            .csrf_origins()
+            .permits(Some("https://trusted.example"))
+    );
+    transport
+        .responses
+        .push_back(Err("lost admission reply".into()));
+    settings
+        .receive(
+            "amaterasu.management",
+            7,
+            2000,
+            json!({"action":"product_update","expected_revision":1,"csrf_allowed_origins":[]}),
+            &mut |command| transport.send(command),
+        )
+        .unwrap();
+    assert_eq!(settings.maximum_peer(), None);
+    assert!(
+        !settings
+            .csrf_origins()
+            .permits(Some("https://trusted.example"))
+    );
+}
+
 #[derive(Default)]
 struct Transport {
     responses: VecDeque<ModuleResult<Response>>,
@@ -22,7 +174,7 @@ impl Transport {
 
 fn stored(revision: u64, tier: Option<PeerTier>) -> Response {
     Response::Result {
-        payload: json!({"ok":true,"found":true,"version":1,"revision":revision,"values":{"origin_web_ui_allowed":tier}}),
+        payload: json!({"ok":true,"found":true,"version":2,"revision":revision,"values":{"origin_web_ui_allowed":tier,"csrf_allowed_origins":null}}),
     }
 }
 
@@ -99,7 +251,7 @@ fn stored_policy_restores_each_selection_on_restart() {
 fn malformed_or_future_documents_keep_ingress_closed() {
     for payload in [
         json!({"ok":false}),
-        json!({"ok":true,"found":true,"version":2,"revision":1,"values":{}}),
+        json!({"ok":true,"found":true,"version":3,"revision":1,"values":{}}),
         json!({"ok":true,"found":true,"version":1,"revision":0,"values":{}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"origin_web_ui_allowed":"WAN"}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"owner":"other"}}),
@@ -137,7 +289,7 @@ fn update_delegates_under_parent_authority_and_applies_only_confirmed_cas_values
     assert_eq!(*timeout_ms, 1900);
     assert_eq!(
         payload,
-        &json!({"action":"product_update","expected_revision":1,"version":1,"values":{"origin_web_ui_allowed":"wan"}})
+        &json!({"action":"product_update","expected_revision":1,"version":2,"values":{"origin_web_ui_allowed":"wan","csrf_allowed_origins":null}})
     );
     transport.push([
         Response::Ok,

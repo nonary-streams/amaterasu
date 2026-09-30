@@ -62,13 +62,22 @@ fn management_settings(action: &str, object: &Object) -> Result<(), &'static str
     match action {
         "product_get" => fields(object, &[], &[]),
         "product_update" => {
-            fields(object, &["expected_revision"], &["origin_web_ui_allowed"])?;
+            fields(
+                object,
+                &["expected_revision"],
+                &["origin_web_ui_allowed", "csrf_allowed_origins"],
+            )?;
             if object
                 .get("expected_revision")
                 .and_then(Value::as_u64)
                 .is_none()
                 || object.get("origin_web_ui_allowed").is_some_and(|value| {
                     !value.is_null() && !matches!(value.as_str(), Some("pc" | "lan" | "wan"))
+                })
+                || object.get("csrf_allowed_origins").is_some_and(|value| {
+                    !value.is_null()
+                        && serde_json::from_value::<crate::csrf_policy::CsrfOrigins>(value.clone())
+                            .is_err()
                 })
             {
                 return Err(INVALID);
@@ -105,6 +114,21 @@ mod management_policy_tests {
             );
         }
         assert!(validate(update, json!({"expected_revision":0}).as_object().unwrap()).is_ok());
+        for origins in [
+            Value::Null,
+            json!([]),
+            json!(["https://trusted.example:47990"]),
+        ] {
+            assert!(
+                validate(
+                    update,
+                    json!({"expected_revision":0,"csrf_allowed_origins":origins})
+                        .as_object()
+                        .unwrap()
+                )
+                .is_ok()
+            );
+        }
         for payload in [
             json!({}),
             json!({"expected_revision":-1}),
@@ -112,6 +136,10 @@ mod management_policy_tests {
             json!({"expected_revision":0,"origin_web_ui_allowed":"WAN"}),
             json!({"expected_revision":0,"origin_web_ui_allowed":false}),
             json!({"expected_revision":0,"origin_web_ui_allowed":"wan","caller":"other"}),
+            json!({"expected_revision":0,"csrf_allowed_origins":"https://trusted.example"}),
+            json!({"expected_revision":0,"csrf_allowed_origins":["http://trusted.example"]}),
+            json!({"expected_revision":0,"csrf_allowed_origins":["https://trusted.example/path"]}),
+            json!({"expected_revision":0,"csrf_allowed_origins":["https://trusted.example","https://trusted.example"]}),
         ] {
             assert!(validate(update, payload.as_object().unwrap()).is_err());
         }

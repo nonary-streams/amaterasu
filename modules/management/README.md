@@ -47,14 +47,41 @@ headers, browser Origin, cookies and credentials cannot change its source tier.
 
 The Settings page reads `/v1/management_settings/get` and writes
 `/v1/management_settings/update` with `expected_revision` and an optional
-`origin_web_ui_allowed`. Omission retains the selection; null resets to the
-source default `lan`. The management module owns a separate version-1 product
+`origin_web_ui_allowed` and `csrf_allowed_origins`. Omission retains each selection;
+null resets the peer maximum to the source default `lan` and CSRF exceptions to
+the empty default. The management module owns a separate version-2 product
 document in configuration's caller-scoped namespace, leaving its generic user
 schema intact. Writes require the immutable management runtime principal after
 HTTP scope verification. Confirmed CAS values apply to new and existing
 connections and survive restart. Ingress stays closed until the durable document
 loads, and during ambiguous writes or unresolved child-result cleanup. Narrowing
 access can disconnect a browser whose peer no longer qualifies.
+
+`csrf_allowed_origins` is an explicitly selected list of at most 16 distinct
+HTTPS origins, each no longer than 256 bytes. Origins contain an ASCII DNS name,
+IPv4 address, or bracketed IPv6 address and an optional nonzero port; paths,
+credentials, wildcards, fragments, queries, and ambiguous numeric host spellings
+are rejected. Exact strings are preserved and matched against `Origin`, including
+the port. Use the origin serialized by the browser. Null selects the empty default;
+an explicit `[]` remains distinct in durable readback. Version-1 documents migrate
+to no exceptions. No origin is implicitly exempted, including loopback.
+
+On HTTPS, a listed nonmissing `Origin` may skip the cookie CSRF origin/header
+predicate. Unlisted requests retain exact same-origin plus
+`X-Amaterasu-CSRF: 1` checks. An exception grants no authentication: the host-only
+Secure/HttpOnly/SameSite=Strict cookie still contains a verified access or refresh
+credential, and protected routes still verify the exact scope. Host, socket-peer
+admission, and the separate startup `allowed_origins` browser policy remain
+mandatory. Listing a different origin does not add it to CORS or enable
+credentialed cross-origin browser access. Browser-auth preflight remains denied.
+Removing an exception closes its active dependent connections on the next tick;
+effects already completed before removal cannot be undone.
+
+This is a bounded subset of pinned Vibeshine's CSRF policy. Its built-in loopback
+exceptions, prefix/port/path matches, Referer and missing-Origin exceptions,
+minted `X-CSRF-Token` tokens, and `csrf_token` query fallback are not reproduced.
+`global:csrf_allowed_origins` remains pending complete parity and installed-host
+browser/platform qualification.
 
 ## Authentication and routes
 

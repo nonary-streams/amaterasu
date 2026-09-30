@@ -1,5 +1,6 @@
 //! Tick-owned, nonblocking network connections and asynchronous service delegation.
 use crate::assets::Assets;
+use crate::csrf_policy::CsrfOrigins;
 use crate::http::{BrowserAuth, RequestTarget};
 use crate::peer_policy::{self, PeerTier};
 use crate::{AUTH_SERVICE, http};
@@ -24,6 +25,7 @@ pub struct Server {
     next_operation: u64,
     assets: Option<Assets>,
     maximum_peer: Option<PeerTier>,
+    csrf_origins: CsrfOrigins,
 }
 
 impl Server {
@@ -61,6 +63,7 @@ impl Server {
             next_operation: 1,
             assets,
             maximum_peer: None,
+            csrf_origins: CsrfOrigins::default(),
         })
     }
 
@@ -75,7 +78,12 @@ impl Server {
     pub fn tick(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
         self.accept()?;
         for connection in &mut self.connections {
-            if !peer_policy::permits(self.maximum_peer, connection.peer, connection.tls.is_some()) {
+            if !peer_policy::permits(self.maximum_peer, connection.peer, connection.tls.is_some())
+                || connection
+                    .csrf_exception
+                    .as_deref()
+                    .is_some_and(|origin| !self.csrf_origins.permits(Some(origin)))
+            {
                 connection.expire(runtime);
                 continue;
             }
@@ -83,6 +91,7 @@ impl Server {
                 runtime,
                 &self.address,
                 &self.origins,
+                &self.csrf_origins,
                 &mut self.next_operation,
                 &mut self.assets,
             )?;
@@ -94,6 +103,10 @@ impl Server {
 
     pub(crate) fn set_peer_policy(&mut self, maximum: Option<PeerTier>) {
         self.maximum_peer = maximum;
+    }
+
+    pub(crate) fn set_csrf_policy(&mut self, origins: CsrfOrigins) {
+        self.csrf_origins = origins;
     }
 
     fn accept(&mut self) -> ModuleResult<()> {
@@ -140,6 +153,7 @@ impl Server {
                             deadline: Instant::now() + CONNECTION_TIMEOUT,
                             stage: Stage::Reading(Vec::new()),
                             origin: None,
+                            csrf_exception: None,
                             peer: peer.ip(),
                         });
                     }
@@ -160,8 +174,15 @@ struct Connection {
     tls_closing: bool,
     deadline: Instant,
     origin: Option<String>,
+    csrf_exception: Option<String>,
     stage: Stage,
     peer: IpAddr,
+}
+
+struct BrowserPolicy<'a> {
+    authority: &'a str,
+    origins: &'a [String],
+    csrf_origins: &'a CsrfOrigins,
 }
 
 enum Stage {
@@ -189,6 +210,7 @@ impl Connection {
         runtime: &RuntimeClient,
         authority: &str,
         origins: &[String],
+        csrf_origins: &CsrfOrigins,
         operation: &mut u64,
         assets: &mut Option<Assets>,
     ) -> ModuleResult<()> {
@@ -201,9 +223,17 @@ impl Connection {
             return Ok(());
         }
         match std::mem::replace(&mut self.stage, Stage::Closed) {
-            Stage::Reading(bytes) => {
-                self.read_request(runtime, bytes, authority, origins, operation, assets)?
-            }
+            Stage::Reading(bytes) => self.read_request(
+                runtime,
+                bytes,
+                BrowserPolicy {
+                    authority,
+                    origins,
+                    csrf_origins,
+                },
+                operation,
+                assets,
+            )?,
             Stage::Verifying {
                 request_id,
                 request,
@@ -269,8 +299,7 @@ impl Connection {
         &mut self,
         runtime: &RuntimeClient,
         mut bytes: Vec<u8>,
-        authority: &str,
-        origins: &[String],
+        policy: BrowserPolicy<'_>,
         operation: &mut u64,
         assets: &mut Option<Assets>,
     ) -> ModuleResult<()> {
@@ -310,9 +339,15 @@ impl Connection {
                 .map_err(|_| "management TLS address unavailable")?
                 .to_string()
         } else {
-            authority.to_owned()
+            policy.authority.to_owned()
         };
-        match http::parse_transport(&bytes, &authority, origins, transport) {
+        match http::parse_policy_transport(
+            &bytes,
+            &authority,
+            policy.origins,
+            transport,
+            policy.csrf_origins,
+        ) {
             Ok(Some(request)) => self.authorize(runtime, request, operation, assets)?,
             Ok(None) => self.stage = Stage::Reading(bytes),
             Err(failure) => self.fail(failure.status, failure.code),
@@ -424,6 +459,10 @@ impl Connection {
         assets: &mut Option<Assets>,
     ) -> ModuleResult<()> {
         self.origin.clone_from(&request.origin);
+        self.csrf_exception = request
+            .csrf_exception
+            .then(|| request.origin.clone())
+            .flatten();
         if let RequestTarget::Asset(path) = &request.target {
             self.stage = Stage::Writing {
                 bytes: assets.as_mut().map_or_else(
@@ -753,6 +792,7 @@ mod tests {
             tls_closing: false,
             deadline: Instant::now() + CONNECTION_TIMEOUT,
             origin: None,
+            csrf_exception: None,
             stage: Stage::Closed,
             peer: "127.0.0.1".parse().unwrap(),
         };
@@ -829,6 +869,7 @@ mod tests {
             tls_closing: false,
             deadline: Instant::now() + CONNECTION_TIMEOUT,
             origin: None,
+            csrf_exception: None,
             stage: Stage::Closed,
             peer: "127.0.0.1".parse().unwrap(),
         };
@@ -864,6 +905,7 @@ mod tests {
             bearer: None,
             origin: None,
             preflight: false,
+            csrf_exception: false,
         });
         assert_eq!(scope, Some("lutris.read"));
         for granted in ["configuration.read", "steam.read", "catalog.read", "*"] {

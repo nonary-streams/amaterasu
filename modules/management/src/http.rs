@@ -1,7 +1,11 @@
 //! Strict HTTP/1.1 framing and browser boundary validation.
+use crate::csrf_policy::CsrfOrigins;
 use crate::routes::{self, Route};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+
+#[cfg(test)]
+mod csrf_tests;
 
 pub const MAX_HEADERS: usize = 8192;
 pub const MAX_BODY: usize = 12_000;
@@ -39,6 +43,7 @@ pub struct Request {
     pub bearer: Option<String>,
     pub origin: Option<String>,
     pub preflight: bool,
+    pub csrf_exception: bool,
 }
 
 #[derive(Debug)]
@@ -62,11 +67,28 @@ pub fn parse(
     parse_transport(bytes, authority, origins, Transport::Plaintext)
 }
 
+#[cfg(test)]
 pub fn parse_transport(
     bytes: &[u8],
     authority: &str,
     origins: &[String],
     transport: Transport,
+) -> Result<Option<Request>, Failure> {
+    parse_policy_transport(
+        bytes,
+        authority,
+        origins,
+        transport,
+        &CsrfOrigins::default(),
+    )
+}
+
+pub(crate) fn parse_policy_transport(
+    bytes: &[u8],
+    authority: &str,
+    origins: &[String],
+    transport: Transport,
+    csrf_origins: &CsrfOrigins,
 ) -> Result<Option<Request>, Failure> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut request = httparse::Request::new(&mut headers);
@@ -123,8 +145,15 @@ pub fn parse_transport(
         return Err(Failure::new(400, "pipelining_forbidden"));
     }
     if let Some(action) = browser_auth {
-        return browser_request(action, &fields, preflight, &bytes[header_end..], authority)
-            .map(Some);
+        return browser_request(
+            action,
+            &fields,
+            preflight,
+            &bytes[header_end..],
+            authority,
+            csrf_origins,
+        )
+        .map(Some);
     }
     build_request(
         route.expect("ordinary route resolved"),
@@ -132,6 +161,7 @@ pub fn parse_transport(
         preflight,
         &bytes[header_end..],
         transport,
+        csrf_origins,
     )
     .map(Some)
 }
@@ -173,6 +203,7 @@ fn asset_request(
             bearer: None,
             origin: fields.origin.map(str::to_owned),
             preflight: false,
+            csrf_exception: false,
         });
     }
     if path.starts_with("/v1/") {
@@ -194,6 +225,7 @@ fn asset_request(
         bearer: None,
         origin: fields.origin.map(str::to_owned),
         preflight: false,
+        csrf_exception: false,
     })
 }
 
@@ -247,7 +279,9 @@ fn build_request(
     preflight: bool,
     body: &[u8],
     transport: Transport,
+    csrf_origins: &CsrfOrigins,
 ) -> Result<Request, Failure> {
+    let mut csrf_exception = false;
     let bearer = if !preflight && route.scope.is_some() {
         let validate = |value: &str| {
             !value.is_empty()
@@ -262,9 +296,10 @@ fn build_request(
             let access = cookie(fields.cookie, "__Secure-amaterasu-access")
                 .filter(|value| valid_token(value));
             if access.is_some() {
-                require_cookie_origin(
+                csrf_exception = require_cookie_origin(
                     fields,
                     &format!("https://{}", fields.host.unwrap_or_default()),
+                    csrf_origins,
                 )?;
             }
             access
@@ -287,6 +322,7 @@ fn build_request(
         bearer,
         origin: fields.origin.map(str::to_owned),
         preflight,
+        csrf_exception,
     })
 }
 
@@ -296,11 +332,13 @@ fn browser_request(
     preflight: bool,
     body: &[u8],
     authority: &str,
+    csrf_origins: &CsrfOrigins,
 ) -> Result<Request, Failure> {
     if preflight {
         return Err(Failure::new(403, "preflight_denied"));
     }
-    require_cookie_origin(fields, &format!("https://{authority}"))?;
+    let csrf_exception =
+        require_cookie_origin(fields, &format!("https://{authority}"), csrf_origins)?;
     let route = match action {
         BrowserAuth::Login => routes::resolve("/v1/auth/login"),
         BrowserAuth::Refresh => routes::resolve("/v1/auth/refresh"),
@@ -340,14 +378,25 @@ fn browser_request(
         bearer: None,
         origin: fields.origin.map(str::to_owned),
         preflight: false,
+        csrf_exception,
     })
 }
 
-fn require_cookie_origin(fields: &Fields<'_>, expected: &str) -> Result<(), Failure> {
+fn require_cookie_origin(
+    fields: &Fields<'_>,
+    expected: &str,
+    csrf_origins: &CsrfOrigins,
+) -> Result<bool, Failure> {
+    // The independent transport, Host and browser-origin checks have already
+    // passed. An explicit exception changes only this cookie CSRF predicate;
+    // cookie parsing and service authentication/authorization still follow.
+    if csrf_origins.permits(fields.origin) {
+        return Ok(true);
+    }
     if fields.origin != Some(expected) || fields.csrf != Some("1") {
         return Err(Failure::new(403, "csrf_denied"));
     }
-    Ok(())
+    Ok(false)
 }
 
 fn valid_token(value: &str) -> bool {

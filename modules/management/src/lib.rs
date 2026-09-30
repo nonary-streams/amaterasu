@@ -1,5 +1,6 @@
 //! Development loopback HTTP management lives in this independently loaded module.
 mod assets;
+mod csrf_policy;
 mod http;
 mod peer_policy;
 mod product_settings;
@@ -102,6 +103,7 @@ impl ManagedModule for ManagementModule {
         self.advance_operational_health()?;
         if let Some(server) = &mut self.server {
             server.set_peer_policy(self.product_settings.maximum_peer());
+            server.set_csrf_policy(self.product_settings.csrf_origins());
             server.tick(&self.runtime)?;
         }
         match self.runtime.send(Command::Poll {})? {

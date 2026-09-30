@@ -1,4 +1,5 @@
-//! Management owns peer policy; configuration owns its caller-scoped durable CAS document.
+//! Management owns ingress policy; configuration owns its caller-scoped durable CAS document.
+use crate::csrf_policy::CsrfOrigins;
 use crate::peer_policy::PeerTier;
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -6,7 +7,7 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 const CONFIGURATION: &str = "amaterasu.configuration/1";
-const DOCUMENT_VERSION: u32 = 1;
+const DOCUMENT_VERSION: u32 = 2;
 const CALL_TIMEOUT: Duration = Duration::from_secs(3);
 const RETRY_DELAY: Duration = Duration::from_millis(250);
 
@@ -15,6 +16,8 @@ const RETRY_DELAY: Duration = Duration::from_millis(250);
 struct Values {
     #[serde(default)]
     origin_web_ui_allowed: Option<PeerTier>,
+    #[serde(default)]
+    csrf_allowed_origins: Option<CsrfOrigins>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -33,6 +36,8 @@ enum Operation {
         expected_revision: u64,
         #[serde(default)]
         origin_web_ui_allowed: SelectionUpdate,
+        #[serde(default)]
+        csrf_allowed_origins: OriginsUpdate,
     },
 }
 
@@ -46,6 +51,19 @@ enum SelectionUpdate {
 impl<'de> Deserialize<'de> for SelectionUpdate {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Option::<PeerTier>::deserialize(deserializer).map(Self::Selected)
+    }
+}
+
+#[derive(Default)]
+enum OriginsUpdate {
+    #[default]
+    Omitted,
+    Selected(Option<CsrfOrigins>),
+}
+
+impl<'de> Deserialize<'de> for OriginsUpdate {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Option::<CsrfOrigins>::deserialize(deserializer).map(Self::Selected)
     }
 }
 
@@ -91,6 +109,13 @@ impl ProductSettings {
             Some(document) => document_payload(document),
             None => failure("settings_unavailable"),
         }
+    }
+
+    pub(crate) fn csrf_origins(&self) -> CsrfOrigins {
+        self.document
+            .as_ref()
+            .and_then(|document| document.values.csrf_allowed_origins.clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn tick(
@@ -141,6 +166,7 @@ impl ProductSettings {
         let Operation::Update {
             expected_revision,
             origin_web_ui_allowed,
+            csrf_allowed_origins,
         } = operation
         else {
             return complete(send, parent, self.payload());
@@ -171,6 +197,9 @@ impl ProductSettings {
         desired.revision = revision;
         if let SelectionUpdate::Selected(selection) = origin_web_ui_allowed {
             desired.values.origin_web_ui_allowed = selection;
+        }
+        if let OriginsUpdate::Selected(origins) = csrf_allowed_origins {
+            desired.values.csrf_allowed_origins = origins;
         }
         let payload = json!({"action":"product_update","expected_revision":expected_revision,"version":DOCUMENT_VERSION,"values":desired.values});
         self.submit(
@@ -365,7 +394,8 @@ impl ProductSettings {
                 self.retry_at = self.document.is_none().then_some(now + RETRY_DELAY);
             }
             Purpose::Update { parent, desired } => {
-                if document.as_ref() == Some(desired) {
+                let current_format = matches!(&result, Response::Result { payload } if payload["version"].as_u64() == Some(u64::from(DOCUMENT_VERSION)));
+                if current_format && document.as_ref() == Some(desired) {
                     self.document = document;
                     complete(send, *parent, self.payload())?;
                 } else {
@@ -399,17 +429,24 @@ fn parse_document(payload: &Value) -> Option<Document> {
             && payload.get("values")?.as_object()?.is_empty())
         .then(Document::default);
     }
-    if payload.get("version")?.as_u64()? != u64::from(DOCUMENT_VERSION) || revision == 0 {
+    let version = payload.get("version")?.as_u64()?;
+    if !matches!(version, 1 | 2) || revision == 0 {
+        return None;
+    }
+    let values = payload.get("values")?;
+    // Version 1 never carried CSRF exceptions. Do not activate an unknown field
+    // injected into an older document while migrating its peer selection.
+    if version == 1 && values.as_object()?.contains_key("csrf_allowed_origins") {
         return None;
     }
     Some(Document {
         revision,
-        values: serde_json::from_value(payload.get("values")?.clone()).ok()?,
+        values: serde_json::from_value(values.clone()).ok()?,
     })
 }
 
 fn document_payload(document: &Document) -> Value {
-    json!({"ok":true,"revision":document.revision,"values":document.values,"origin_web_ui_allowed":document.values.origin_web_ui_allowed.unwrap_or_default()})
+    json!({"ok":true,"revision":document.revision,"values":document.values,"origin_web_ui_allowed":document.values.origin_web_ui_allowed.unwrap_or_default(),"csrf_allowed_origins":document.values.csrf_allowed_origins.as_ref().map(CsrfOrigins::as_slice).unwrap_or_default()})
 }
 
 fn failure(code: &str) -> Value {
