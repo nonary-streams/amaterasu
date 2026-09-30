@@ -684,6 +684,42 @@ fn catalog_elevated(entry: &Value) -> Result<bool, &'static str> {
     }
 }
 
+/// Output is resolved once for the retained launch before any session or child
+/// mutation. Relative filenames use the host directory, as the reference's
+/// append-open does, independently of the application's working directory.
+pub(crate) fn resolve_catalog_output(
+    entry: &Value,
+    environment: &BTreeMap<String, String>,
+) -> Result<Option<String>, &'static str> {
+    let Some(configured) = entry.get("output").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let configured = configured.as_str().ok_or("invalid_catalog_response")?;
+    if configured.len() > 1_024 || configured.chars().any(char::is_control) {
+        return Err("invalid_catalog_response");
+    }
+    let expanded = expand_environment_references(configured, environment)?;
+    if expanded.is_empty() || expanded == "null" {
+        return Ok(None);
+    }
+    if expanded.chars().any(char::is_control) {
+        return Err("unsupported_launch_spec");
+    }
+    let path = std::path::Path::new(&expanded);
+    let resolved = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| "unsupported_launch_spec")?
+            .join(path)
+    };
+    let resolved = resolved.to_str().ok_or("unsupported_launch_spec")?;
+    if resolved.len() > 1_024 || resolved.chars().any(char::is_control) {
+        return Err("unsupported_launch_spec");
+    }
+    Ok(Some(resolved.to_owned()))
+}
+
 fn catalog_working_directory(
     launch: &Value,
     environment: &BTreeMap<String, String>,
@@ -2950,6 +2986,92 @@ mod tests {
             expand_environment_references("$(ROOT)", &oversized_environment),
             Err("unsupported_launch_spec")
         );
+    }
+
+    #[test]
+    fn catalog_output_relative_path_uses_host_directory_without_app_cwd_or_text_trimming() {
+        let host_directory = std::env::current_dir().unwrap();
+        let application_directory = host_directory.join("different-application-directory");
+        let entry = json!({
+            "output":" logs/$$(LITERAL)-capture é.log ",
+            "launch":{
+                "kind":"executable",
+                "program":std::env::current_exe().unwrap(),
+                "working_directory":application_directory,
+            },
+        });
+        let filename = " logs/$(LITERAL)-capture é.log ";
+        let expected = host_directory.join(filename);
+        assert_eq!(
+            resolve_catalog_output(&entry, &BTreeMap::new()),
+            Ok(Some(expected.to_str().unwrap().to_owned()))
+        );
+        assert_ne!(expected, application_directory.join(filename));
+    }
+
+    #[test]
+    fn catalog_output_absence_and_discard_values_normalize_after_expansion() {
+        let environment = BTreeMap::from([
+            ("EMPTY_OUTPUT".to_owned(), String::new()),
+            ("NULL_OUTPUT".to_owned(), "null".to_owned()),
+        ]);
+        assert_eq!(resolve_catalog_output(&json!({}), &environment), Ok(None));
+        for output in [
+            Value::Null,
+            json!(""),
+            json!("null"),
+            json!("$(EMPTY_OUTPUT)"),
+            json!("$(NULL_OUTPUT)"),
+        ] {
+            assert_eq!(
+                resolve_catalog_output(&json!({"output":output}), &environment),
+                Ok(None)
+            );
+        }
+        let expected = std::env::current_dir().unwrap().join(" null ");
+        assert_eq!(
+            resolve_catalog_output(&json!({"output":" null "}), &environment),
+            Ok(Some(expected.to_str().unwrap().to_owned()))
+        );
+    }
+
+    #[test]
+    fn catalog_output_rejects_expanded_control_characters() {
+        for expanded in ["bad\0path", "bad\npath", "bad\u{85}path"] {
+            let environment = BTreeMap::from([("OUTPUT_PATH".to_owned(), expanded.to_owned())]);
+            assert_eq!(
+                resolve_catalog_output(&json!({"output":"$(OUTPUT_PATH)"}), &environment),
+                Err("unsupported_launch_spec")
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_output_enforces_utf8_byte_bounds_before_and_after_absolute_resolution() {
+        let host_directory = std::env::current_dir().unwrap();
+        let prefix = format!(
+            "{}{}",
+            host_directory.to_str().unwrap(),
+            std::path::MAIN_SEPARATOR
+        );
+        let remaining_bytes = 1_024 - prefix.len();
+        let mut boundary = prefix + &"é".repeat(remaining_bytes / 2);
+        if remaining_bytes % 2 == 1 {
+            boundary.push('x');
+        }
+        assert_eq!(boundary.len(), 1_024);
+        let mut environment = BTreeMap::from([("OUTPUT_PATH".to_owned(), boundary.clone())]);
+        assert_eq!(
+            resolve_catalog_output(&json!({"output":"$(OUTPUT_PATH)"}), &environment),
+            Ok(Some(boundary.clone()))
+        );
+        for overflow in [boundary + "é", "é".repeat(512)] {
+            environment.insert("OUTPUT_PATH".to_owned(), overflow);
+            assert_eq!(
+                resolve_catalog_output(&json!({"output":"$(OUTPUT_PATH)"}), &environment),
+                Err("unsupported_launch_spec")
+            );
+        }
     }
 
     #[test]

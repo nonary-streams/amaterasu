@@ -4,7 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 
-const context = vm.createContext({ atob, Blob, Error });
+const context = vm.createContext({ atob, Blob, Error, TextEncoder });
 for (const source of ["src/model.ts", "src/catalog.ts"]) {
   vm.runInContext(
     ts.transpile(readFileSync(source, "utf8"), {
@@ -26,6 +26,46 @@ const windowsCapabilities = {
     "nvidia reflex",
   ],
 };
+
+test("catalog output edits preserve raw preparation, keybindings, and sparse frame limiter controls", () => {
+  const model = context.Amaterasu;
+  const rawPreparation = [{ do: " prepare $(PROFILE) ", undo: " restore ", elevated: true }];
+  const overrides = { keybindings: [65, 66, 65, 67], frame_limiter_enable: false,
+    frame_limiter_fps_limit: 0, frame_limiter_provider: "auto" };
+  for (const output of [undefined, null, "", "null", " logs/$(APP).log "]) {
+    const fields = new FormData();
+    fields.set("name", "Output application");
+    fields.set("description", "Keep this description");
+    fields.set("tags", "arcade, streaming");
+    fields.set("kind", "executable");
+    fields.set("path", "/opt/game");
+    fields.set("arguments", '["--fullscreen"]');
+    fields.set("prep_cmd", JSON.stringify(rawPreparation));
+    fields.set("exclude_global_prep_cmd", "on");
+    fields.set("elevated", "on");
+    fields.set("keybindings", JSON.stringify(overrides.keybindings));
+    for (const [name, value] of Object.entries(model.applicationOutputFormValues(output)))
+      fields.set(name, value);
+    for (const [name, value] of Object.entries(model.catalogFrameLimiterOverrideFormValues(overrides)))
+      fields.set(name, value);
+    const saved = model.entryFromForm(fields);
+    saved.config_overrides = { ...saved.config_overrides,
+      ...model.parseCatalogFrameLimiterOverrides(fields, windowsCapabilities, overrides) };
+    const ordinary = JSON.parse(JSON.stringify(saved));
+    assert.deepEqual(ordinary.prep_cmd, rawPreparation);
+    assert.deepEqual(ordinary.config_overrides.keybindings, overrides.keybindings);
+    assert.equal(ordinary.config_overrides.frame_limiter_enable, false);
+    assert.equal(ordinary.config_overrides.frame_limiter_fps_limit, 0);
+    assert.equal(ordinary.config_overrides.frame_limiter_provider, "auto");
+    assert.equal(ordinary.description, "Keep this description");
+    assert.deepEqual(ordinary.tags, ["arcade", "streaming"]);
+    assert.deepEqual(ordinary.launch.arguments, ["--fullscreen"]);
+    assert.equal(ordinary.exclude_global_prep_cmd, true);
+    assert.equal(ordinary.elevated, true);
+    if (output == null) assert.equal(Object.hasOwn(ordinary, "output"), false);
+    else assert.equal(ordinary.output, output);
+  }
+});
 
 test("application refresh rate option editor reads back and writes sparse exact tokens", () => {
   const parse = context.Amaterasu.parseCatalogRefreshRateOptionOverride;

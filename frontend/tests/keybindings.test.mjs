@@ -70,7 +70,7 @@ class EditorFormData extends FormData {
 const ordinary = (value) => JSON.parse(JSON.stringify(value));
 const settle = () => new Promise(setImmediate);
 
-test("application DOM saves ordered keybindings, empty replacement, then inheritance using catalog revisions", async () => {
+test("application DOM saves output and keybindings while preserving raw preparation and sparse controls", async () => {
   const context = vm.createContext({
     FormData: EditorFormData, TextEncoder, URL, Error,
     HTMLSelectElement: SelectElement,
@@ -85,10 +85,13 @@ test("application DOM saves ordered keybindings, empty replacement, then inherit
   const content = new Element("main");
   content.setConnected(true);
   let revision = 7;
+  const rawPreparation = [{ do: " prepare $(PROFILE) ", undo: " restore ", elevated: true }];
   let entry = {
     name: "Mapped application", description: "", tags: [],
     launch: { kind: "application", path: "/opt/game" },
-    config_overrides: { keybindings: [65, 66, 65, 67] },
+    output: " logs/$(APP).log ",
+    prep_cmd: rawPreparation,
+    config_overrides: { keybindings: [65, 66, 65, 67], frame_limiter_enable: false, frame_limiter_fps_limit: 0 },
   };
   const updates = [];
   context.Amaterasu.renderCatalog({
@@ -115,11 +118,16 @@ test("application DOM saves ordered keybindings, empty replacement, then inherit
   });
   await settle();
   let expectedUpdates = 0;
-  for (const [text, expected] of [["[0x41,0x44,0x41,0x45]", [65, 68, 65, 69]], ["[]", []], ["", undefined]]) {
+  for (const [text, expected, output] of [["[0x41,0x44,0x41,0x45]", [65, 68, 65, 69], ""], ["[]", [], "null"], ["", undefined, undefined]]) {
     find(content, (node) => node.tagName === "button" && node.textContent === "Edit").fire("click");
     await settle();
     const form = find(content, (node) => node.className === "editor-form");
     const control = find(form, (node) => node.name === "keybindings");
+    const outputMode = find(form, (node) => node.name === "output_mode");
+    const outputValue = find(form, (node) => node.name === "output_value");
+    assert.equal(outputMode.value, entry.output == null ? "unset" : "value");
+    assert.equal(outputValue.value, entry.output ?? "");
+    assert.equal(find(form, (node) => node.name === "prep_cmd").value, JSON.stringify(rawPreparation));
     assert.equal(control.value, JSON.stringify(entry.config_overrides?.keybindings) ?? "");
     if (updates.length === 0) {
       control.value = "[0,256]";
@@ -128,6 +136,10 @@ test("application DOM saves ordered keybindings, empty replacement, then inherit
       assert.equal(updates.length, 0, "invalid byte map reached a catalog mutation");
     }
     control.value = text;
+    outputMode.value = output === undefined ? "unset" : "value";
+    outputMode.fire("change");
+    assert.equal(outputValue.disabled, output === undefined);
+    outputValue.value = output ?? "";
     form.fire("submit");
     await settle();
     expectedUpdates += 1;
@@ -135,6 +147,11 @@ test("application DOM saves ordered keybindings, empty replacement, then inherit
     assert.equal(form.isConnected, false, form.textContent);
     assert.deepEqual(entry.config_overrides.keybindings, expected);
     assert.equal(Object.hasOwn(entry.config_overrides, "keybindings"), expected !== undefined);
+    assert.equal(entry.output, output);
+    assert.equal(Object.hasOwn(entry, "output"), output !== undefined);
+    assert.deepEqual(entry.prep_cmd, rawPreparation);
+    assert.equal(entry.config_overrides.frame_limiter_enable, false);
+    assert.equal(entry.config_overrides.frame_limiter_fps_limit, 0);
   }
   assert.deepEqual(updates.map((update) => update.expected_revision), [7, 8, 9]);
 });

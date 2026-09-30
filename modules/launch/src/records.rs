@@ -49,6 +49,8 @@ pub struct Record {
     pub resource: Option<String>,
     #[serde(skip)]
     pub target: Option<LaunchTarget>,
+    #[serde(skip)]
+    pub output: Option<String>,
     /// Launch-time global preparation snapshot retained for idempotency and retries.
     #[serde(skip)]
     pub global_preparation: Vec<PreparationStep>,
@@ -219,6 +221,7 @@ impl Records {
                 preparation_operation: format!("{key}.preparation"),
                 resource,
                 target: None,
+                output: None,
                 global_preparation,
                 legacy_global_preparation,
                 provider_ticket: None,

@@ -45,6 +45,15 @@ fn wait_for_preparation_state(
 #[ignore = "subprocess entry point invoked by process lifecycle tests"]
 fn controlled_child() {
     let arguments = std::env::args().collect::<Vec<_>>();
+    if let Some(label) = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--application-output="))
+    {
+        use std::io::Write;
+        writeln!(std::io::stdout(), "OUT-{label}").unwrap();
+        writeln!(std::io::stderr(), "ERR-{label}").unwrap();
+        return;
+    }
     if let Some(argument_index) = arguments
         .iter()
         .position(|argument| argument == "--detached-arguments")
@@ -99,6 +108,15 @@ fn controlled_child() {
             let value = std::env::var("AMATERASU_TEST_VALUE").unwrap();
             writeln!(std::io::stdout(), "OUT-{value}").unwrap();
             writeln!(std::io::stderr(), "ERR-{value}").unwrap();
+        }
+        "application-output-main" => {
+            use std::io::Write;
+            writeln!(std::io::stdout(), "OUT-main").unwrap();
+            writeln!(std::io::stderr(), "ERR-main").unwrap();
+            if let Ok(marker) = std::env::var("AMATERASU_TEST_MARKER") {
+                std::fs::write(marker, b"main-started").unwrap();
+            }
+            std::thread::sleep(Duration::from_secs(30));
         }
         "capture-env-cwd" => {
             let marker = std::env::var("AMATERASU_TEST_MARKER").unwrap();
@@ -354,6 +372,8 @@ fn trace_child() {
         .unwrap();
     writeln!(output, "{event}").unwrap();
     drop(output);
+    writeln!(std::io::stdout(), "OUT-{event}").unwrap();
+    writeln!(std::io::stderr(), "ERR-{event}").unwrap();
 
     if mode == "trace_sleep" {
         std::thread::sleep(Duration::from_secs(30));
@@ -414,6 +434,291 @@ fn raw_test_command(argument: &str) -> String {
         "{} {argument}",
         quote_raw_command_argument("$(AMATERASU_RAW_PREPARATION_TEST_EXE)")
     )
+}
+
+fn output_command(label: &str) -> Value {
+    json!({
+        "executable":std::env::current_exe().unwrap(),
+        "args":["--exact","tests::controlled_child","--ignored","--",format!("--application-output={label}")],
+        "timeout_ms":5_000,
+    })
+}
+
+fn wait_for_output(path: &std::path::Path, marker: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = std::fs::read_to_string(path).unwrap_or_default();
+        if output.contains(marker) {
+            return output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "command output marker missing: {marker}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn application_output_appends_all_command_phases_and_detached_overrides_take_precedence() {
+    let directory = test_directory("shared-application-output");
+    let log = directory.join("application.log");
+    let child_out = directory.join("child.out");
+    let child_err = directory.join("child.err");
+    std::fs::write(&log, "existing-output\n").unwrap();
+    let mut request = launch("shared-application-output", "application-output-main");
+    request["output"] = json!(log);
+    request["exit_timeout_seconds"] = json!(0);
+    request["environment"]["AMATERASU_RAW_PREPARATION_TEST_EXE"] =
+        json!(std::env::current_exe().unwrap());
+    request["preparation"] = json!([
+        {"run":output_command("prepare-structured"),"undo":output_command("undo-structured")},
+        {"do":raw_test_command("--exact tests::controlled_child --ignored -- --application-output=prepare-raw"),
+         "undo":raw_test_command("--exact tests::controlled_child --ignored -- --application-output=undo-raw")},
+    ]);
+    let detached = format!(
+        "{} --exact tests::controlled_child --ignored",
+        quote_raw_command_argument(std::env::current_exe().unwrap().to_str().unwrap())
+    );
+    request["detached"] = json!([
+        {"command":detached,"environment":{"AMATERASU_TEST_CHILD":"detached-output","AMATERASU_TEST_VALUE":"default-detached"}},
+        {"command":detached,"environment":{"AMATERASU_TEST_CHILD":"detached-output","AMATERASU_TEST_VALUE":"overridden"},"stdout":child_out,"stderr":child_err},
+        {"command":detached,"environment":{"AMATERASU_TEST_CHILD":"detached-output","AMATERASU_TEST_VALUE":"partial"},"stdout":child_out},
+    ]);
+
+    let mut manager = ProcessManager::default();
+    let started = manager.handle("alice", request.clone());
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    wait_for_state(&mut manager, "alice", id, "running");
+    wait_for_output(&log, "ERR-main");
+    wait_for_output(&log, "ERR-default-detached");
+    wait_for_output(&log, "ERR-partial");
+    wait_for_output(&child_out, "OUT-overridden");
+    wait_for_output(&child_out, "OUT-partial");
+    wait_for_output(&child_err, "ERR-overridden");
+    manager.handle("alice", json!({"action":"terminate","process_id":id}));
+    let complete = wait_for_state(&mut manager, "alice", id, "cancelled");
+    let output = std::fs::read_to_string(&log).unwrap();
+    assert!(output.starts_with("existing-output\n"));
+    for label in [
+        "prepare-structured",
+        "prepare-raw",
+        "default-detached",
+        "main",
+        "undo-raw",
+        "undo-structured",
+    ] {
+        assert!(output.contains(&format!("OUT-{label}")), "{output}");
+        assert!(output.contains(&format!("ERR-{label}")), "{output}");
+    }
+    assert!(output.find("OUT-prepare-structured") < output.find("OUT-prepare-raw"));
+    assert!(output.find("OUT-prepare-raw") < output.find("OUT-main"));
+    assert!(output.find("OUT-main") < output.find("OUT-undo-raw"));
+    assert!(output.find("OUT-undo-raw") < output.find("OUT-undo-structured"));
+    assert!(!output.contains("OUT-overridden") && !output.contains("ERR-overridden"));
+    assert!(!output.contains("OUT-partial"));
+    assert!(
+        !serde_json::to_string(&complete)
+            .unwrap()
+            .contains("prepare-structured")
+    );
+    assert_eq!(
+        manager.handle("alice", request)["process"]["state"],
+        "cancelled"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        output,
+        "replay appended output"
+    );
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn output_open_failure_is_retained_before_any_command_has_effects() {
+    let directory = test_directory("failed-application-output");
+    let missing_log = directory.join("missing-parent").join("output.log");
+    let marker = directory.join("ran");
+    let mut request = launch("failed-application-output", "exit");
+    request["output"] = json!(missing_log);
+    request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker);
+    request["preparation"] = json!([{"run":lifecycle_command(&marker,"prepare","trace")}]);
+    request["detached"] = json!([format!(
+        "{} --exact tests::controlled_child --ignored",
+        quote_raw_command_argument(std::env::current_exe().unwrap().to_str().unwrap())
+    )]);
+    let mut manager = ProcessManager::default();
+    let failed = manager.handle("alice", request.clone());
+    assert_eq!(failed["process"]["state"], "launch_failed", "{failed}");
+    assert_eq!(failed["process"]["pid"], Value::Null);
+    assert_eq!(
+        failed["process"]["preparation"]["failure"]["kind"],
+        "output_open_failed"
+    );
+    assert!(!marker.exists());
+    std::fs::create_dir(missing_log.parent().unwrap()).unwrap();
+    assert_eq!(manager.handle("alice", request), failed);
+    assert!(!missing_log.exists(), "retry reopened failed output");
+
+    let prepare = json!({"action":"prepare","operation_id":"failed-prepare-output","output":directory,"preparation":[{"run":lifecycle_command(&marker,"prepare-only","trace")}]});
+    let failed_lease = manager.handle("alice", prepare.clone());
+    assert_eq!(failed_lease["preparation"]["state"], "preparation_failed");
+    assert_eq!(
+        failed_lease["preparation"]["preparation"]["failure"]["kind"],
+        "output_open_failed"
+    );
+    assert_eq!(manager.handle("alice", prepare), failed_lease);
+    assert!(!marker.exists());
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn prepare_output_keeps_the_opened_file_through_failed_undo_and_retry() {
+    let directory = test_directory("prepare-output-owned-file");
+    let log = directory.join("output.log");
+    let rotated = directory.join("opened-output.log");
+    let trace = directory.join("events");
+    let request = json!({
+        "action":"prepare",
+        "operation_id":"prepare-output-owned-file",
+        "output":log,
+        "preparation":[{
+            "run":lifecycle_command(&trace,"prepare","trace"),
+            "undo":lifecycle_command(&trace,"undo-attempt","trace_fail_once"),
+        }],
+    });
+    let mut manager = ProcessManager::default();
+    assert_eq!(manager.handle("alice", request.clone())["ok"], true);
+    wait_for_preparation_state(&mut manager, "alice", "prepare-output-owned-file", "ready");
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("OUT-prepare")
+    );
+    std::fs::rename(&log, &rotated).unwrap();
+    std::fs::write(&log, "replacement-file\n").unwrap();
+    manager.handle(
+        "alice",
+        json!({"action":"preparation_stop","operation_id":"prepare-output-owned-file"}),
+    );
+    let failed = wait_for_preparation_state(
+        &mut manager,
+        "alice",
+        "prepare-output-owned-file",
+        "cleanup_failed",
+    );
+    assert_eq!(failed["preparation"]["cleanup"]["remaining"], 1);
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "replacement-file\n");
+    assert_eq!(
+        std::fs::read_to_string(&rotated)
+            .unwrap()
+            .matches("OUT-undo-attempt")
+            .count(),
+        1
+    );
+    manager.handle(
+        "alice",
+        json!({"action":"preparation_retry","operation_id":"prepare-output-owned-file"}),
+    );
+    let complete = wait_for_preparation_state(
+        &mut manager,
+        "alice",
+        "prepare-output-owned-file",
+        "complete",
+    );
+    assert_eq!(complete["preparation"]["cleanup"]["remaining"], 0);
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "replacement-file\n");
+    assert_eq!(
+        std::fs::read_to_string(&rotated)
+            .unwrap()
+            .matches("OUT-undo-attempt")
+            .count(),
+        2
+    );
+    assert_eq!(manager.handle("alice", request), complete);
+    #[cfg(target_os = "linux")]
+    {
+        let retained = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .any(|entry| {
+                std::fs::read_link(entry.path()).ok().as_deref() == Some(rotated.as_path())
+            });
+        assert!(
+            !retained,
+            "completed preparation retained its output handle"
+        );
+    }
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn null_output_normalizes_without_redirecting_or_changing_retry_identity() {
+    let mut manager = ProcessManager::default();
+    let request = launch("null-application-output", "exit");
+    let started = manager.handle("alice", request.clone());
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    let exited = wait_for_exit(&mut manager, id);
+    for output in [Value::Null, json!(""), json!("null")] {
+        let mut retry = request.clone();
+        retry["output"] = output;
+        assert_eq!(manager.handle("alice", retry), exited);
+    }
+    let directory = test_directory("invalid-application-output");
+    for output in [
+        json!("relative.log"),
+        json!(format!("{}\n", directory.display())),
+        json!(directory.join("x".repeat(1025))),
+    ] {
+        let mut invalid = launch("invalid-application-output", "exit");
+        invalid["output"] = output;
+        assert_eq!(manager.handle("alice", invalid)["code"], "invalid_launch");
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn output_only_provider_lease_opens_once_and_closes_after_stop() {
+    let directory = test_directory("output-only-provider-lease");
+    let log = directory.join("provider.log");
+    let request =
+        json!({"action":"prepare","operation_id":"output-only-provider-lease","output":log});
+    let mut manager = ProcessManager::default();
+    assert_eq!(manager.handle("alice", request.clone())["ok"], true);
+    assert!(log.exists());
+    let ready =
+        wait_for_preparation_state(&mut manager, "alice", "output-only-provider-lease", "ready");
+    assert_eq!(ready["preparation"]["preparation"]["completed"], 0);
+    assert!(
+        manager.handle("alice", json!({"action":"list"}))["processes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    manager.handle(
+        "alice",
+        json!({"action":"preparation_stop","operation_id":"output-only-provider-lease"}),
+    );
+    let complete = wait_for_preparation_state(
+        &mut manager,
+        "alice",
+        "output-only-provider-lease",
+        "complete",
+    );
+    assert_eq!(manager.handle("alice", request), complete);
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+    #[cfg(target_os = "linux")]
+    assert!(
+        !std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .any(|entry| std::fs::read_link(entry.path()).ok().as_deref() == Some(log.as_path())),
+        "completed output-only lease retained a file handle"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 fn test_directory(name: &str) -> std::path::PathBuf {

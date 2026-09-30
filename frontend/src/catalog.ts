@@ -1076,6 +1076,28 @@ namespace Amaterasu {
     description.maxLength = 1024;
     description.rows = 2;
     const tags = input("tags", entry?.tags?.join(", ") ?? "");
+    const outputValues = applicationOutputFormValues(entry?.output);
+    const outputMode = el("select");
+    outputMode.name = "output_mode";
+    for (const [value, label] of [["unset", "Use default"], ["value", "Set output"]] as const) {
+      const option = el("option", "", label);
+      option.value = value;
+      outputMode.append(option);
+    }
+    outputMode.value = outputValues.output_mode;
+    const outputValue = input("output_value", outputValues.output_value);
+    outputValue.maxLength = 1024;
+    const outputFile = field(
+      "Command output file",
+      outputValue,
+      "Append application, preparation, and detached command output here. External provider game output is unavailable. Relative paths use the host working directory. Empty text or null discards output.",
+    );
+    const showOutput = () => {
+      outputValue.disabled = outputMode.value !== "value";
+      outputFile.hidden = outputValue.disabled;
+    };
+    outputMode.addEventListener("change", showOutput);
+    showOutput();
     const excludeGlobalPreparation = el("input");
     excludeGlobalPreparation.type = "checkbox";
     excludeGlobalPreparation.name = "exclude_global_prep_cmd";
@@ -1134,6 +1156,7 @@ namespace Amaterasu {
       JSON.stringify(executableLaunch?.preparation ?? []),
       "hidden",
     );
+    const rawPreparation = input("prep_cmd", JSON.stringify(entry?.prep_cmd ?? []), "hidden");
     const fec = input(
       "fec_percentage",
       entry?.config_overrides?.fec_percentage?.toString() ?? "",
@@ -1235,6 +1258,9 @@ namespace Amaterasu {
       el("div", "form-grid", field("Name", name), field("Launch type", kind)),
       field("Description", description),
       field("Tags", tags, "Separate tags with commas."),
+      field("Command output", outputMode, "Use default discards command output without saving an output value."),
+      outputFile,
+      rawPreparation,
       field(
         "Skip global preparation commands",
         excludeGlobalPreparation,

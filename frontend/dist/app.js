@@ -1,6 +1,51 @@
 "use strict";
 var Amaterasu;
 (function (Amaterasu) {
+    function applicationOutputFormValues(value) {
+        return {
+            output_mode: value == null ? "unset" : "value",
+            output_value: value ?? "",
+        };
+    }
+    Amaterasu.applicationOutputFormValues = applicationOutputFormValues;
+    function parseApplicationOutput(data) {
+        const mode = String(data.get("output_mode") ?? "unset");
+        if (mode === "unset")
+            return null;
+        const value = String(data.get("output_value") ?? "");
+        if (mode !== "value" || new TextEncoder().encode(value).length > 1_024 ||
+            /[\u0000-\u001f\u007f-\u009f]/u.test(value))
+            throw new Error("Command output must contain at most 1024 UTF-8 bytes without control characters.");
+        return value;
+    }
+    Amaterasu.parseApplicationOutput = parseApplicationOutput;
+    function parseRawPreparation(value) {
+        let parsed;
+        try {
+            parsed = JSON.parse(value || "[]");
+        }
+        catch {
+            throw new Error("Existing raw preparation commands must be a valid JSON array.");
+        }
+        if (!Array.isArray(parsed) || parsed.length > 8)
+            throw new Error("Existing raw preparation commands must contain at most 8 steps.");
+        for (const step of parsed) {
+            if (step === null || Array.isArray(step) || typeof step !== "object" ||
+                Object.keys(step).some((key) => !["do", "undo", "elevated"].includes(key)))
+                throw new Error("Existing raw preparation commands contain unsupported fields.");
+            const command = step;
+            for (const key of ["do", "undo"]) {
+                const text = command[key];
+                if (text !== undefined && (typeof text !== "string" ||
+                    new TextEncoder().encode(text).length > 2_048 || text.includes("\0")))
+                    throw new Error("Existing raw preparation commands exceed 2048 UTF-8 bytes or contain NUL.");
+            }
+            if (command.elevated !== undefined && typeof command.elevated !== "boolean")
+                throw new Error("Existing raw preparation elevation must be a boolean.");
+        }
+        return parsed;
+    }
+    Amaterasu.parseRawPreparation = parseRawPreparation;
     const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"];
     function parseRefreshRateOptionOverride(value) {
         if (value === "")
@@ -384,6 +429,8 @@ var Amaterasu;
     }
     function entryFromForm(data, recognizedGamepadProfiles = ["auto"]) {
         const text = (name) => String(data.get(name) ?? "").trim();
+        const output = parseApplicationOutput(data);
+        const rawPreparation = parseRawPreparation(String(data.get("prep_cmd") ?? "[]"));
         const kind = text("kind") === "executable"
             ? "executable"
             : text("kind") === "playnite_fullscreen"
@@ -439,6 +486,8 @@ var Amaterasu;
         const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
         const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];
         const preparation = kind === "executable" ? parsePreparation(text("preparation")) : [];
+        if (preparation.length + rawPreparation.length > 8)
+            throw new Error("An application can contain at most 8 preparation steps.");
         const launch = kind === "playnite_fullscreen"
             ? { kind, exit_timeout_seconds: parseExitTimeout(text("fullscreen_exit_timeout_seconds")) ?? 10 }
             : kind === "application"
@@ -468,6 +517,8 @@ var Amaterasu;
             launch,
             ...(steamId === null ? {} : { steam_id: steamId }),
             ...(steamInstallDir === null ? {} : { steam_install_dir: steamInstallDir }),
+            ...(output === null ? {} : { output }),
+            ...(rawPreparation.length ? { prep_cmd: rawPreparation } : {}),
             ...(configOverrides ? { config_overrides: configOverrides } : {}),
         };
     }
@@ -2541,6 +2592,24 @@ var Amaterasu;
         description.maxLength = 1024;
         description.rows = 2;
         const tags = Amaterasu.input("tags", entry?.tags?.join(", ") ?? "");
+        const outputValues = Amaterasu.applicationOutputFormValues(entry?.output);
+        const outputMode = Amaterasu.el("select");
+        outputMode.name = "output_mode";
+        for (const [value, label] of [["unset", "Use default"], ["value", "Set output"]]) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = value;
+            outputMode.append(option);
+        }
+        outputMode.value = outputValues.output_mode;
+        const outputValue = Amaterasu.input("output_value", outputValues.output_value);
+        outputValue.maxLength = 1024;
+        const outputFile = Amaterasu.field("Command output file", outputValue, "Append application, preparation, and detached command output here. External provider game output is unavailable. Relative paths use the host working directory. Empty text or null discards output.");
+        const showOutput = () => {
+            outputValue.disabled = outputMode.value !== "value";
+            outputFile.hidden = outputValue.disabled;
+        };
+        outputMode.addEventListener("change", showOutput);
+        showOutput();
         const excludeGlobalPreparation = Amaterasu.el("input");
         excludeGlobalPreparation.type = "checkbox";
         excludeGlobalPreparation.name = "exclude_global_prep_cmd";
@@ -2587,6 +2656,7 @@ var Amaterasu;
         detached.rows = 3;
         detached.value = executableLaunch?.detached?.join("\n") ?? "";
         const preparation = Amaterasu.input("preparation", JSON.stringify(executableLaunch?.preparation ?? []), "hidden");
+        const rawPreparation = Amaterasu.input("prep_cmd", JSON.stringify(entry?.prep_cmd ?? []), "hidden");
         const fec = Amaterasu.input("fec_percentage", entry?.config_overrides?.fec_percentage?.toString() ?? "", "number");
         fec.min = "1";
         fec.max = "255";
@@ -2639,7 +2709,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields, ...softwareEncoder.fields, steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...advancedInput.fields, ...softwareEncoder.fields, steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }

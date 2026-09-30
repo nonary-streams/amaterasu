@@ -1,5 +1,60 @@
 use super::*;
 
+#[test]
+fn output_defaults_preserve_exact_text_and_validate_utf8_bounds() {
+    let legacy = entry("Legacy output");
+    assert!(legacy.output.is_none());
+    assert!(
+        serde_json::to_value(&legacy)
+            .unwrap()
+            .get("output")
+            .is_none()
+    );
+
+    for output in [
+        "",
+        "null",
+        " logs/$(APP).log ",
+        "C:\\Logs\\game.log",
+        &"é".repeat(512),
+    ] {
+        let mut configured = serde_json::to_value(&legacy).unwrap();
+        configured["output"] = json!(output);
+        let configured: Entry = serde_json::from_value(configured).unwrap();
+        configured.validate().unwrap();
+        assert_eq!(configured.output.as_deref(), Some(output));
+        assert_eq!(serde_json::to_value(configured).unwrap()["output"], output);
+    }
+
+    let mut null_output = serde_json::to_value(&legacy).unwrap();
+    null_output["output"] = Value::Null;
+    let null_output: Entry = serde_json::from_value(null_output).unwrap();
+    assert!(null_output.output.is_none());
+    assert!(
+        serde_json::to_value(null_output)
+            .unwrap()
+            .get("output")
+            .is_none()
+    );
+
+    for output in [
+        "x".repeat(1_025),
+        "é".repeat(513),
+        "log\0path".into(),
+        "log\npath".into(),
+        "log\u{0085}path".into(),
+    ] {
+        let mut invalid = legacy.clone();
+        invalid.output = Some(output);
+        assert!(invalid.validate().is_err());
+    }
+    for output in [json!(true), json!(42), json!([]), json!({})] {
+        let mut invalid = serde_json::to_value(&legacy).unwrap();
+        invalid["output"] = output;
+        assert!(serde_json::from_value::<Entry>(invalid).is_err());
+    }
+}
+
 fn entry(name: &str) -> Entry {
     serde_json::from_value(json!({
         "name": name,

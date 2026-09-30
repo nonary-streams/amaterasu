@@ -91,6 +91,21 @@ Executable launches also forward this explicit directory separately for detached
 commands. When no app directory is configured, the application provider infers
 each detached target's own directory, even when the main executable has an
 inferred cwd. Typed per-command cwd overrides retain precedence.
+The catalog's optional top-level `output` is command-log policy. At catalog
+resolution, launch expands bounded `$(NAME)` references and `$$` using the same
+retained launch environment/path parser. Empty text or the exact string `null`
+selects null output. A relative filename resolves against the captured host cwd,
+independently of an app's working directory. The resolved absolute path is stored
+on the launch record before any session or child mutation and forwarded to the
+application or provider preparation lease. Preflight callbacks, catalog edits,
+changed environment, and operation retries do not re-resolve the retained path.
+The application owns one append-open handle through reverse undo and failed
+cleanup retries; typed detached stream paths retain precedence. Provider output
+without commands still opens an output-only preparation lease, so its file
+open/support failure prevents provider start. External Playnite game stdout and
+stderr remain outside the current provider ABI. Output text is never forwarded
+in API reports. The reference's configuration-parse expansion timing and native
+Windows SYSTEM output behavior remain qualification gaps.
 
 Typed `playnite_fullscreen` catalog targets carry only a bounded exit timeout
 (default 10 seconds, maximum 300); they contain no request-controlled path or

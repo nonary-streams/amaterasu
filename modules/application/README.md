@@ -57,7 +57,9 @@ the expanded string still goes through the host platform's argv parser and
 existing count, length, and argument limits. All overrides are validated before
 any command starts. Optional stdout/stderr paths append child output without a
 shell; omitted streams remain null. Each detached command opens only its own
-files, so sibling and primary output stay separate. A Windows SYSTEM host
+files; an explicit stream path overrides the shared application output for that
+stream. Omitted streams inherit shared output when configured, and otherwise
+remain null. A Windows SYSTEM host
 rejects redirected launches with `detached_output_unsupported` before any child
 starts. Its `CreateProcessAsUserW` path cannot safely pass output handles across
 sessions, and temporary inheritable handles could leak to concurrent host
@@ -96,7 +98,8 @@ raw compatibility form used by catalog launchers:
 ```
 
 Structured commands use literal argv, a cleared explicit environment, optional
-absolute `cwd`, and null standard handles, just like the application. They have
+absolute `cwd`, and the application output destination, just like the primary
+application. They have
 no `elevated` field and are spawned with `elevated` set to false. Raw steps
 accept exact `do` and `undo` command strings (both default empty) and an
 `elevated` flag (default false). Raw strings are split with the host platform's
@@ -117,14 +120,14 @@ Raw `do` retains its 10-second deadline. Raw `undo` snapshots a deadline of
 budget. Prepare-only leases accept the same `exit_timeout_seconds` policy as
 launch (default 10, range 0 through 300); changing that policy under an existing
 operation ID conflicts. Structured commands retain their explicitly configured
-1–30,000 ms deadlines. All preparation output still uses null standard handles.
+1–30,000 ms deadlines. Preparation shares the application output handles.
 Windows URL and associated-file
 launches are not resolved through shell associations. These bounded execution
 rules differ from the reference helper, which waits for raw `do` commands
-without a timeout, sends their output to its configured pipe, and continues
+without a timeout and continues
 through undo failures. The reference detaches an undo that exceeds its deadline;
 this module terminates and reaps its contained tree before attempting an older
-undo. Preparation output is discarded here. Cleanup attempts
+undo. Cleanup attempts
 each owed undo once per pass in reverse order and continues after spawn errors,
 nonzero exits, and timeouts whose commands have been contained and reaped. It
 retains each failed obligation and reports all failures from the pass; successful
@@ -148,9 +151,10 @@ Use an absolute native executable path appropriate to the host. `args` and
 directory.
 The environment is cleared before applying the supplied map; host secrets and
 PATH are not inherited. Supply any platform/application-required variables
-explicitly. Stdin, stdout, and stderr are null handles. Main executables and
+explicitly. Stdin is null; stdout and stderr are null unless shared output is
+configured. Main executables and
 preparation commands use structured argv with no command-string splitting or
-implicit shell. There is no output capture or executable allowlist. The launch-level
+implicit shell. There is no executable allowlist. The launch-level
 `elevated` flag defaults to false and is passed to the primary application and
 detached children; Unix spawning ignores it.
 `.bat` and `.cmd` executable extensions are rejected case-insensitively on every
@@ -158,6 +162,40 @@ platform because Windows may otherwise invoke a shell implicitly. A trusted
 caller can explicitly choose an interpreter and pass arguments to it. Arguments
 follow `std::process::Command` platform conventions, including Windows argument
 encoding; this is not a universal argument parser for unusual Windows programs.
+
+Launch and prepare-only requests accept `output`, an absolute path of at most
+1,024 UTF-8 bytes without control characters. Omission, JSON null, an empty
+string, and the exact string `"null"` retain null output and normalize to the
+same retry identity. Configured output opens a regular file once in append mode before any
+preparation, detached, or primary process starts. Its owned handle supplies both
+stdout and stderr for structured/raw preparation, the primary process, default
+detached streams, and reverse undo. Existing data is preserved. File duplication
+uses the original opened file, so rotation, path replacement, and failed undo
+retry cannot redirect later output to a different file. Explicit typed detached
+stdout/stderr paths retain their per-stream precedence. Detached children may
+retain their inherited handle after the application's own output owner closes.
+
+The output owner remains held while cleanup is pending or failed, and closes
+after all owed undo settles successfully. Prepare-only output leases may contain
+no commands; they open before the external provider starts and close after it
+stops. They capture their preparation and undo, while external Playnite game
+output is not attached through the current provider ABI. File-open failure
+creates a retained failed launch or preparation lease with no child effects;
+prepared reports identify `output_open_failed`. Unlike the reference's silent
+null fallback when opening fails, this service reports the error. Retrying the
+same operation never reopens its file. No output transcript or command/environment
+text is exposed in process reports, and no rotation or size quota is imposed.
+The trusted administrator selects and manages the destination file. Directories,
+devices, sockets, and FIFOs are rejected; Unix opens are nonblocking so replacing
+a pathname with a FIFO cannot stall the module before command deadlines begin.
+This deliberately narrows the reference's unrestricted append-open destination.
+
+Configured shared output fails preflight with `application_output_unsupported`
+on a Windows SYSTEM host because its native user-session creation path cannot
+safely inherit these handles. Failure to obtain the user token reports
+`application_output_unavailable`. No command starts in either case. Ordinary
+Windows and Unix use native inherited file handles; live Windows and macOS
+qualification remains pending on the current Linux host.
 
 Launch/status/terminate return `{"ok":true,"process":{...}}`. Records contain
 `process_id` (monotonic u64 starting at 1), `operation_id`, `pid`, and `state`.
@@ -243,6 +281,7 @@ Limits, measured in UTF-8 bytes unless otherwise stated:
 Errors use `{"ok":false,"code":"..."}`. Codes are `invalid_caller`,
 `request_too_large`, `invalid_request`, `invalid_launch`, `invalid_limit`,
 `detached_output_unsupported`, `detached_output_unavailable`,
+`application_output_unsupported`, `application_output_unavailable`,
 `operation_conflict`, `process_limit`, `process_not_found`, `process_wait_failed`,
 `process_kill_failed`, and `process_wait_timeout`. `response_too_large` protects
 a list from an individually oversized record. Missing and foreign process IDs share
@@ -314,8 +353,8 @@ and [Toolhelp snapshots](https://learn.microsoft.com/en-us/windows/win32/toolhel
 
 Vibeshine's `docs/app_examples.md` was used only as a behavioral reference for
 application launch and working-directory requirements. Source was not copied.
-Detached launchers are a bounded argv-only subset: output capture or rotation
-remain parity gaps. Desktop pseudo-apps, URI
+Detached launchers are a bounded argv-only subset; automatic output rotation
+remains unimplemented. Desktop pseudo-apps, URI
 launch, and launcher-specific behavior also remain unimplemented.
 
 Tests invoke a controlled Rust test subprocess to verify actual launch, natural

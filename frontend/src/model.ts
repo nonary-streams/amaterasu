@@ -1,4 +1,50 @@
 namespace Amaterasu {
+  export function applicationOutputFormValues(value: string | null | undefined): {
+    output_mode: "unset" | "value";
+    output_value: string;
+  } {
+    return {
+      output_mode: value == null ? "unset" : "value",
+      output_value: value ?? "",
+    };
+  }
+
+  export function parseApplicationOutput(data: Pick<FormData, "get">): string | null {
+    const mode = String(data.get("output_mode") ?? "unset");
+    if (mode === "unset") return null;
+    const value = String(data.get("output_value") ?? "");
+    if (mode !== "value" || new TextEncoder().encode(value).length > 1_024 ||
+        /[\u0000-\u001f\u007f-\u009f]/u.test(value))
+      throw new Error("Command output must contain at most 1024 UTF-8 bytes without control characters.");
+    return value;
+  }
+
+  export function parseRawPreparation(value: string): RawPreparationCommand[] {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(value || "[]");
+    } catch {
+      throw new Error("Existing raw preparation commands must be a valid JSON array.");
+    }
+    if (!Array.isArray(parsed) || parsed.length > 8)
+      throw new Error("Existing raw preparation commands must contain at most 8 steps.");
+    for (const step of parsed) {
+      if (step === null || Array.isArray(step) || typeof step !== "object" ||
+          Object.keys(step).some((key) => !["do", "undo", "elevated"].includes(key)))
+        throw new Error("Existing raw preparation commands contain unsupported fields.");
+      const command = step as Record<string, unknown>;
+      for (const key of ["do", "undo"]) {
+        const text = command[key];
+        if (text !== undefined && (typeof text !== "string" ||
+            new TextEncoder().encode(text).length > 2_048 || text.includes("\0")))
+          throw new Error("Existing raw preparation commands exceed 2048 UTF-8 bytes or contain NUL.");
+      }
+      if (command.elevated !== undefined && typeof command.elevated !== "boolean")
+        throw new Error("Existing raw preparation elevation must be a boolean.");
+    }
+    return parsed as RawPreparationCommand[];
+  }
+
   const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"] as const;
 
   export function parseRefreshRateOptionOverride(value: string): RefreshRateOption | null {
@@ -403,6 +449,8 @@ namespace Amaterasu {
 
   export function entryFromForm(data: FormData, recognizedGamepadProfiles: readonly string[] = ["auto"]): Entry {
     const text = (name: string) => String(data.get(name) ?? "").trim();
+    const output = parseApplicationOutput(data);
+    const rawPreparation = parseRawPreparation(String(data.get("prep_cmd") ?? "[]"));
     const kind = text("kind") === "executable"
       ? "executable"
       : text("kind") === "playnite_fullscreen"
@@ -465,6 +513,8 @@ namespace Amaterasu {
     const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
     const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];
     const preparation = kind === "executable" ? parsePreparation(text("preparation")) : [];
+    if (preparation.length + rawPreparation.length > 8)
+      throw new Error("An application can contain at most 8 preparation steps.");
     const launch: Launch = kind === "playnite_fullscreen"
       ? { kind, exit_timeout_seconds: parseExitTimeout(text("fullscreen_exit_timeout_seconds")) ?? 10 }
       : kind === "application"
@@ -494,6 +544,8 @@ namespace Amaterasu {
       launch,
       ...(steamId === null ? {} : { steam_id: steamId }),
       ...(steamInstallDir === null ? {} : { steam_install_dir: steamInstallDir }),
+      ...(output === null ? {} : { output }),
+      ...(rawPreparation.length ? { prep_cmd: rawPreparation } : {}),
       ...(configOverrides ? { config_overrides: configOverrides } : {}),
     };
   }

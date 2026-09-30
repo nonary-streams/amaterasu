@@ -41,6 +41,19 @@ an explicit `auto` remains an application override. Catalog validates, stores,
 and returns this token unchanged; it does not resolve global or client policy.
 Existing entries omit the field, so no catalog migration is needed.
 
+Entries may also include a top-level `output` command-log destination. Catalog
+stores the exact string, including whitespace, `$()` references, and relative
+paths; it does not expand or open it. Values are limited to 1,024 UTF-8 bytes
+without control characters. Empty text and the literal string `"null"` are
+preserved as distinct values and both request discarded command output.
+Omission or JSON null canonicalizes to an absent field. Because `update`
+replaces the whole entry, either clears a previously saved destination. Existing
+entries remain compatible without a document or provider-marker version bump.
+The launch owner resolves a saved file destination when it snapshots the entry;
+catalog readback and restart preserve the original text.
+The log destination covers owned application, preparation, and detached
+commands. It does not route output from an externally provider-owned game.
+
 The optional `dd_hdr_request_override` string accepts exactly `auto`,
 `force_on`, or `force_off` (case-sensitive). Omit it or set it to null to
 inherit; an explicit `auto` remains an application override. Catalog validates,

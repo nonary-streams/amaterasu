@@ -166,6 +166,125 @@ fn entry(name: &str) -> Value {
     json!({"name":name,"launch":{"kind":"application","path":"/Applications/Game.app"}})
 }
 
+#[test]
+fn management_output_updates_survive_reload_and_preserve_other_application_fields() {
+    for output in ["", "null", " logs/$(APP).log ", "é.log"] {
+        let mut backend = Backend::default();
+        let original = json!({
+            "name":"Output destination",
+            "description":"Preserved description",
+            "tags":["game"],
+            "output":output,
+            "prep_cmd":[{"do":" prepare $(PROFILE) ","undo":" restore ","elevated":true}],
+            "exclude_global_prep_cmd":true,
+            "config_overrides":{"keybindings":[65,66,65,67],"frame_limiter_enable":false,"frame_limiter_fps_limit":0.0},
+            "launch":{"kind":"executable","program":std::env::current_exe().unwrap(),"auto_detach":false,"wait_all":false,"exit_timeout_seconds":0},
+        });
+        let created = backend.run_for(
+            &mut Pipeline::default(),
+            json!({"action":"create","expected_revision":0,"entry":original}),
+            "amaterasu.management",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        let id = created["id"].as_str().unwrap();
+        let stored = backend.entries[id].clone();
+        assert_eq!(stored["output"], output);
+        for action in ["get", "resolve_launch"] {
+            let caller = if action == "resolve_launch" {
+                "amaterasu.launch"
+            } else {
+                "amaterasu.management"
+            };
+            let reloaded = backend.run_for(
+                &mut Pipeline::new_with_steam_id_export_principals(
+                    BTreeSet::from(["amaterasu.launch".into()]),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ),
+                json!({"action":action,"id":id}),
+                caller,
+                "amaterasu.management",
+                "amaterasu.management",
+            );
+            assert_eq!(reloaded["ok"], true, "{reloaded}");
+            assert_eq!(reloaded["entry"], stored);
+            assert_eq!(reloaded["revision"], 1);
+        }
+
+        let mut replacement = stored.clone();
+        replacement["output"] = json!("updated/$(APP).log");
+        let stale = backend.run_for(
+            &mut Pipeline::default(),
+            json!({"action":"update","id":id,"expected_revision":0,"entry":replacement}),
+            "amaterasu.management",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(stale["error"]["code"], "revision_conflict");
+        assert_eq!(backend.entries[id], stored);
+        let updated = backend.run_for(
+            &mut Pipeline::default(),
+            json!({"action":"update","id":id,"expected_revision":1,"entry":replacement}),
+            "amaterasu.management",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(updated["ok"], true, "{updated}");
+        let reloaded = backend.run_for(
+            &mut Pipeline::default(),
+            json!({"action":"get","id":id}),
+            "amaterasu.management",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(reloaded["entry"], replacement);
+        assert_eq!(backend.entries[id], replacement);
+        assert_eq!(reloaded["revision"], 2);
+    }
+}
+
+#[test]
+fn omitted_and_json_null_output_clear_replacement_updates_without_side_effects_on_rejection() {
+    for explicit_null in [false, true] {
+        let mut backend = Backend::default();
+        let mut configured = entry("Reset output");
+        configured["output"] = json!("logs/game.log");
+        let created = backend.run(
+            &mut Pipeline::default(),
+            json!({"action":"create","expected_revision":0,"entry":configured}),
+        );
+        let id = created["id"].as_str().unwrap();
+        let mut replacement = created["entry"].clone();
+        if explicit_null {
+            replacement["output"] = Value::Null;
+        } else {
+            replacement.as_object_mut().unwrap().remove("output");
+        }
+        let cleared = backend.run(
+            &mut Pipeline::default(),
+            json!({"action":"update","id":id,"expected_revision":1,"entry":replacement}),
+        );
+        assert_eq!(cleared["ok"], true, "{cleared}");
+        let reloaded = backend.run(&mut Pipeline::default(), json!({"action":"get","id":id}));
+        assert!(reloaded["entry"].get("output").is_none());
+        assert!(backend.entries[id].get("output").is_none());
+
+        let saved = backend.entries[id].clone();
+        let mut invalid = saved.clone();
+        invalid["output"] = json!("logs\ninvalid.log");
+        let rejected = backend.run(
+            &mut Pipeline::default(),
+            json!({"action":"update","id":id,"expected_revision":2,"entry":invalid}),
+        );
+        assert_eq!(rejected["error"]["code"], "invalid_entry");
+        assert_eq!(backend.revision, 2);
+        assert_eq!(backend.entries[id], saved);
+    }
+}
+
 fn steam_importer() -> Pipeline {
     Pipeline::new_with_steam_id_export_principals(
         BTreeSet::new(),

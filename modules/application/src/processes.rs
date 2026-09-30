@@ -2,6 +2,7 @@ use crate::command_paths::resolve_command_executable;
 use crate::commands::{DetachedCommandRequest, prepare_detached_requests};
 use crate::containment::{ContainedChild, DetachedChild};
 use crate::lifecycle::ApplicationLifecycle;
+use crate::output::{SharedOutput, check_output_support};
 use crate::protocol::{
     Action, LaunchSpec, MAX_EXIT_TIMEOUT_SECONDS, PreparationSpec, ProcessState, TerminalOutcome,
 };
@@ -18,6 +19,7 @@ const MAX_PAYLOAD_BYTES: usize = 16_384;
 
 fn spawn_detached_commands_with(
     spec: &LaunchSpec,
+    output: Option<&SharedOutput>,
     mut spawn: impl FnMut(
         &mut Command,
         bool,
@@ -46,6 +48,11 @@ fn spawn_detached_commands_with(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(output) = output
+            && output.attach(&mut command).is_err()
+        {
+            continue;
+        }
         if let Some(cwd) = working_directory {
             command.current_dir(cwd);
         } else if let Some(cwd) = executable
@@ -132,6 +139,8 @@ struct ProcessRecord {
     #[serde(skip)]
     spec: LaunchSpec,
     #[serde(skip)]
+    output: Option<SharedOutput>,
+    #[serde(skip)]
     detached_requests: Vec<DetachedCommandRequest>,
     #[serde(skip)]
     child: Option<ContainedChild>,
@@ -175,6 +184,7 @@ impl ProcessRecord {
             lifecycle,
             owner: caller.into(),
             spec,
+            output: None,
             detached_requests,
             child: None,
             stop_deadline: None,
@@ -186,6 +196,23 @@ impl ProcessRecord {
             steam_tracker: None,
             steam_game_liveness: None,
         };
+        match SharedOutput::open(record.spec.output.as_deref()) {
+            Ok(output) => {
+                if let Some(lifecycle) = &mut record.lifecycle {
+                    lifecycle.set_output(output.clone());
+                }
+                record.output = output;
+            }
+            Err(error) => {
+                if let Some(lifecycle) = &mut record.lifecycle {
+                    lifecycle.output_open_failed(&error);
+                }
+                record.state = ProcessState::LaunchFailed {
+                    os_error: error.raw_os_error(),
+                };
+                return record;
+            }
+        }
         if record.lifecycle.is_none() {
             record.spawn_application();
         }
@@ -209,6 +236,14 @@ impl ProcessRecord {
                 .expect("validated absolute executable path has a parent")
         });
         command.current_dir(working_directory);
+        if let Some(output) = &self.output
+            && let Err(error) = output.attach(&mut command)
+        {
+            self.complete_or_clean(Completion::LaunchFailed {
+                os_error: error.raw_os_error(),
+            });
+            return;
+        }
         if self.is_steam_metadata_launch() {
             self.steam_tracker = self
                 .spec
@@ -260,6 +295,7 @@ impl ProcessRecord {
     fn spawn_detached_commands(&mut self) {
         self.detached_children.extend(spawn_detached_commands_with(
             &self.spec,
+            self.output.as_ref(),
             DetachedChild::spawn_with_output,
         ));
     }
@@ -284,6 +320,7 @@ impl ProcessRecord {
             self.reconcile_lifecycle();
         } else {
             self.state = completion.into_state();
+            self.output = None;
         }
     }
 
@@ -443,6 +480,7 @@ impl ProcessRecord {
                 .take()
                 .expect("stopping without lifecycle has an outcome");
             self.state = completion.into_state();
+            self.output = None;
         }
     }
 
@@ -458,6 +496,7 @@ impl ProcessRecord {
                 .take()
                 .expect("completed cleanup has an outcome");
             self.state = completion.into_state();
+            self.output = None;
         }
     }
 
@@ -662,13 +701,16 @@ enum PreparationAction {
 
 impl PreparationLease {
     fn new(caller: &str, operation_id: String, spec: PreparationSpec) -> Self {
-        let lifecycle = ApplicationLifecycle::new_with_context(
+        let mut lifecycle = ApplicationLifecycle::new_lease_with_context(
             spec.preparation.clone(),
             spec.environment.clone(),
             spec.cwd.clone(),
             spec.exit_timeout_seconds,
-        )
-        .expect("validated preparation lease is nonempty");
+        );
+        match SharedOutput::open(spec.output.as_deref()) {
+            Ok(output) => lifecycle.set_output(output),
+            Err(error) => lifecycle.output_open_failed(&error),
+        }
         Self {
             operation_id,
             owner: caller.into(),
@@ -791,6 +833,7 @@ impl ProcessManager {
         match action {
             Action::Launch {
                 operation_id,
+                output,
                 executable,
                 args,
                 environment,
@@ -829,6 +872,7 @@ impl ProcessManager {
                     .map_err(|_| "invalid_launch")?,
                 };
                 let spec = LaunchSpec {
+                    output,
                     executable,
                     args,
                     environment,
@@ -850,6 +894,7 @@ impl ProcessManager {
                     .values()
                     .any(|record| record.owner == caller && record.operation_id == operation_id)
                 {
+                    check_output_support(spec.output.as_deref(), spec.elevated)?;
                     check_detached_output_support(
                         &spec,
                         DetachedChild::output_redirection_supported,
@@ -868,12 +913,14 @@ impl ProcessManager {
             }
             Action::Prepare {
                 operation_id,
+                output,
                 environment,
                 cwd,
                 exit_timeout_seconds,
                 preparation,
             } => {
                 let spec = PreparationSpec {
+                    output,
                     preparation: preparation.into_vec(),
                     environment,
                     cwd,
@@ -965,6 +1012,7 @@ impl ProcessManager {
             lease.advance();
             return Ok(lease.response());
         }
+        check_output_support(spec.output.as_deref(), false)?;
         if self
             .records
             .values()
@@ -1309,6 +1357,7 @@ mod detached_elevation_tests {
 
     fn launch_spec(elevated: bool, policies: &[Option<bool>]) -> LaunchSpec {
         LaunchSpec {
+            output: None,
             executable: "primary".into(),
             args: Vec::new(),
             environment: BTreeMap::new(),
@@ -1344,7 +1393,7 @@ mod detached_elevation_tests {
     fn detached_spawner_receives_inherited_and_explicit_elevation_per_child() {
         let spec = launch_spec(true, &[None, Some(false), Some(true)]);
         let mut forwarded = Vec::new();
-        let children = spawn_detached_commands_with(&spec, |_, elevated, _, _| {
+        let children = spawn_detached_commands_with(&spec, None, |_, elevated, _, _| {
             forwarded.push(elevated);
             Err(std::io::Error::other("mock spawn"))
         });
@@ -1355,6 +1404,7 @@ mod detached_elevation_tests {
         let mut forwarded = Vec::new();
         spawn_detached_commands_with(
             &launch_spec(false, &[None, Some(true)]),
+            None,
             |_, elevated, _, _| {
                 forwarded.push(elevated);
                 Err(std::io::Error::other("mock spawn"))

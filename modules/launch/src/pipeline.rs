@@ -1024,6 +1024,10 @@ impl Pipeline {
                     }
                     CatalogSelection::Initiator => {}
                 }
+                record.output = match resolve_catalog_output(&payload["entry"], &self.environment) {
+                    Ok(output) => output,
+                    Err(code) => return self.dependency_failed(job, code, send),
+                };
                 match LaunchTarget::from_catalog_entry_with_preparations(
                     &payload["entry"],
                     &record.global_preparation,
@@ -1141,7 +1145,7 @@ impl Pipeline {
                     Some(LaunchTarget::Executable(_)) => Step::Spawn,
                     Some(LaunchTarget::Playnite { preparation, .. })
                     | Some(LaunchTarget::PlayniteFullscreen { preparation, .. })
-                        if !preparation.is_empty() =>
+                        if !preparation.is_empty() || record.output.is_some() =>
                     {
                         Step::PreparePlaynite
                     }

@@ -2964,6 +2964,7 @@ fn playnite_fullscreen_entry(config_overrides: ConfigOverrides) -> Entry {
         artwork: None,
         steam_id: None,
         steam_install_dir: None,
+        output: None,
         config_overrides,
         exclude_global_prep_cmd: false,
         prep_cmd: Vec::new(),

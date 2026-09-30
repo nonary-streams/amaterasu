@@ -62,6 +62,8 @@ namespace Amaterasu {
       | { provider: "lutris"; game_id: number; revision: string };
     steam_id?: string;
     steam_install_dir?: string;
+    output?: string | null;
+    prep_cmd?: RawPreparationCommand[];
     exclude_global_prep_cmd?: boolean;
     elevated?: boolean;
     config_overrides?: AdvancedInputOverrides & SoftwareEncoderOverrides & {
@@ -85,6 +87,11 @@ namespace Amaterasu {
       dd_refresh_rate_option?: RefreshRateOption | null;
       prefer_10bit_sdr?: boolean | null;
     };
+  }
+  export interface RawPreparationCommand {
+    do?: string;
+    undo?: string;
+    elevated?: boolean;
   }
   export interface SoftwareEncoderOverrides {
     sw_preset?: string | null;

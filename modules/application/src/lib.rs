@@ -3,6 +3,7 @@ mod command_paths;
 mod commands;
 mod containment;
 mod lifecycle;
+mod output;
 mod processes;
 mod protocol;
 mod steam_tracking;

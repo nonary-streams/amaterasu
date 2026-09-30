@@ -117,7 +117,7 @@ impl Workflow {
                 };
                 (
                     APPLICATION,
-                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"preparation_cwd":executable.preparation_working_directory,"detached_cwd":executable.preparation_working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"steam_id":executable.steam_id,"steam_install_dir":executable.steam_install_dir,"elevated":executable.elevated,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
+                    json!({"action":"launch","operation_id":record.process_operation,"output":record.output,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"preparation_cwd":executable.preparation_working_directory,"detached_cwd":executable.preparation_working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"steam_id":executable.steam_id,"steam_install_dir":executable.steam_install_dir,"elevated":executable.elevated,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
                 )
             }
             Step::StartPlaynite => match record.target.as_ref() {
@@ -149,7 +149,7 @@ impl Workflow {
                     };
                 (
                     APPLICATION,
-                    json!({"action":"prepare","operation_id":record.preparation_operation,"environment":environment,"cwd":working_directory,"exit_timeout_seconds":exit_timeout_seconds,"preparation":preparation}),
+                    json!({"action":"prepare","operation_id":record.preparation_operation,"output":record.output,"environment":environment,"cwd":working_directory,"exit_timeout_seconds":exit_timeout_seconds,"preparation":preparation}),
                 )
             }
             Step::AwaitPreparation => (

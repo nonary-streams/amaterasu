@@ -60,6 +60,7 @@ struct Harness {
     released: usize,
     catalog_preparation: Option<Value>,
     catalog_raw_preparation: Option<Value>,
+    catalog_output: Option<Value>,
     catalog_exclude_global_prep_cmd: Option<bool>,
     catalog_config_overrides: Option<Value>,
     catalog_working_directory: Option<String>,
@@ -125,6 +126,7 @@ impl Harness {
             released: 0,
             catalog_preparation: None,
             catalog_raw_preparation: None,
+            catalog_output: None,
             catalog_exclude_global_prep_cmd: None,
             catalog_config_overrides: None,
             catalog_working_directory: None,
@@ -634,6 +636,9 @@ impl Harness {
                         }
                         if let Some(preparation) = &self.catalog_raw_preparation {
                             reply["entry"]["prep_cmd"] = preparation.clone();
+                        }
+                        if let Some(output) = &self.catalog_output {
+                            reply["entry"]["output"] = output.clone();
                         }
                         if let Some(exclude) = self.catalog_exclude_global_prep_cmd {
                             reply["entry"]["exclude_global_prep_cmd"] = json!(exclude);
@@ -2196,6 +2201,107 @@ fn canonical_catalog_preparation_is_forwarded_and_launch_waits_until_running() {
         .rposition(|(_, payload, _)| payload["action"] == "status")
         .unwrap();
     assert!(activate > last_status);
+}
+
+#[test]
+fn output_path_is_snapshotted_at_preflight_and_forwarded_unchanged_on_replay() {
+    let mut harness = Harness::new();
+    harness.catalog_output = Some(json!("$(OUTPUT_ROOT)/application.log"));
+    let original_root = std::env::temp_dir().to_string_lossy().into_owned();
+    let mut pipeline = Pipeline::new(BTreeMap::from([(
+        "OUTPUT_ROOT".into(),
+        original_root.clone(),
+    )]))
+    .unwrap();
+    let preflight_request = json!({"action":"preflight_export","operation_id":"output-snapshot","app_id":"app-0000000000000001"});
+    let preflight = harness.request(&mut pipeline, "amaterasu.nvhttp", preflight_request.clone());
+    assert_eq!(preflight["ok"], true, "{preflight}");
+    assert!(harness.sessions.is_empty() && harness.processes.is_empty());
+    let expected = std::path::Path::new(&original_root).join("application.log");
+    pipeline
+        .environment
+        .insert("OUTPUT_ROOT".into(), "changed-after-preflight".into());
+    harness.catalog_output = Some(json!("different-output.log"));
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", preflight_request)["preflight_token"],
+        preflight["preflight_token"]
+    );
+    let mut request = launch_export("output-snapshot");
+    request["preflight_token"] = preflight["preflight_token"].clone();
+    request["frame_limiter_settings"] = frame_limiter_snapshot();
+    let launched = harness.request(&mut pipeline, "amaterasu.nvhttp", request.clone());
+    assert_eq!(launched["launch"]["state"], "active", "{launched}");
+    let application: Vec<_> = harness
+        .commands
+        .iter()
+        .filter(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "launch"
+        })
+        .map(|(_, payload, _)| payload)
+        .collect();
+    assert_eq!(application.len(), 1);
+    assert_eq!(application[0]["output"], json!(expected));
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", request)["launch"]["state"],
+        "active"
+    );
+    assert_eq!(
+        harness
+            .commands
+            .iter()
+            .filter(
+                |(service, payload, _)| service == crate::workflow::APPLICATION
+                    && payload["action"] == "launch"
+            )
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn provider_output_creates_a_preparation_lease_even_without_commands() {
+    let mut harness = playnite_catalog("a1b2c3d4-1234-5678-9abc-0123456789ab", 10);
+    let path = std::env::temp_dir().join("provider-command-output.log");
+    harness.catalog_output = Some(json!(path));
+    let mut pipeline = pipeline();
+    let launched = harness.request(&mut pipeline, "alice", launch("provider-output-only"));
+    assert_eq!(launched["launch"]["state"], "active", "{launched}");
+    let prepare = harness
+        .commands
+        .iter()
+        .find(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "prepare"
+        })
+        .unwrap();
+    assert_eq!(prepare.1["output"], json!(path));
+    assert_eq!(prepare.1["preparation"], json!([]));
+    let stopped = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":1}),
+    );
+    assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
+    assert!(harness.commands.iter().any(|(service, payload, _)| service
+        == crate::workflow::APPLICATION
+        && payload["action"] == "preparation_stop"));
+}
+
+#[test]
+fn invalid_catalog_output_is_rejected_before_session_or_command_effects() {
+    for output in [
+        json!(42),
+        json!("bad\npath"),
+        json!("$(UNCLOSED"),
+        json!("x".repeat(1_025)),
+    ] {
+        let mut harness = Harness::new();
+        harness.catalog_output = Some(output);
+        let mut pipeline = pipeline();
+        let response = harness.request(&mut pipeline, "alice", launch("invalid-output"));
+        assert_ne!(response["launch"]["state"], "active", "{response}");
+        assert!(harness.sessions.is_empty() && harness.processes.is_empty());
+        assert!(harness.preparations.is_empty());
+    }
 }
 
 #[test]

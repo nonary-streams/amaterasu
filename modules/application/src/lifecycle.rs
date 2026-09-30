@@ -3,6 +3,7 @@
 use crate::command_paths::resolve_command_executable;
 use crate::commands::parse_detached_commands;
 use crate::containment::ContainedChild;
+use crate::output::SharedOutput;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -438,6 +439,7 @@ pub(crate) fn validate_environment(
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CommandFailureKind {
+    OutputOpenFailed,
     Cancelled,
     SpawnFailed,
     ExitFailed,
@@ -527,6 +529,7 @@ impl CommandTask {
         environment: &BTreeMap<String, String>,
         application_working_directory: Option<&str>,
         execution_timeout: Duration,
+        output: Option<&SharedOutput>,
         now: Instant,
     ) -> Result<Self, TaskSpawnError> {
         let (mut command, elevated) = match spec {
@@ -571,6 +574,9 @@ impl CommandTask {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(output) = output {
+            output.attach(&mut command)?;
+        }
         match ContainedChild::spawn(&mut command, elevated) {
             Ok(child) => Ok(Self {
                 child,
@@ -765,6 +771,8 @@ pub(crate) struct ApplicationLifecycle {
     #[serde(skip)]
     raw_undo_timeout: Duration,
     #[serde(skip)]
+    output: Option<SharedOutput>,
+    #[serde(skip)]
     next_preparation: usize,
     #[serde(skip)]
     pending_undo: Vec<usize>,
@@ -788,7 +796,23 @@ impl ApplicationLifecycle {
         preparation_working_directory: Option<String>,
         exit_timeout_seconds: u64,
     ) -> Option<Self> {
-        (!steps.is_empty()).then_some(Self {
+        (!steps.is_empty()).then(|| {
+            Self::new_lease_with_context(
+                steps,
+                environment,
+                preparation_working_directory,
+                exit_timeout_seconds,
+            )
+        })
+    }
+
+    pub(crate) fn new_lease_with_context(
+        steps: Vec<PreparationStep>,
+        environment: BTreeMap<String, String>,
+        preparation_working_directory: Option<String>,
+        exit_timeout_seconds: u64,
+    ) -> Self {
+        Self {
             preparation: PreparationReport {
                 completed: 0,
                 last_command: None,
@@ -804,12 +828,13 @@ impl ApplicationLifecycle {
             environment,
             preparation_working_directory,
             raw_undo_timeout: Duration::from_secs(exit_timeout_seconds.max(15)),
+            output: None,
             next_preparation: 0,
             pending_undo: Vec::new(),
             attempted_undo: Vec::new(),
             active: None,
             phase: Phase::Preparing,
-        })
+        }
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -882,6 +907,7 @@ impl ApplicationLifecycle {
                 &self.environment,
                 self.preparation_working_directory.as_deref(),
                 command.execution_timeout(Duration::from_millis(default_command_timeout_ms())),
+                self.output.as_ref(),
                 now,
             ) {
                 Ok(task) => {
@@ -936,6 +962,7 @@ impl ApplicationLifecycle {
             &self.environment,
             self.preparation_working_directory.as_deref(),
             command.execution_timeout(self.raw_undo_timeout),
+            self.output.as_ref(),
             now,
         ) {
             Ok(task) => {
@@ -1037,6 +1064,7 @@ impl ApplicationLifecycle {
             self.phase = Phase::Complete;
             self.cleanup.state = CleanupState::Complete;
             self.cleanup.remaining = 0;
+            self.output = None;
         } else {
             self.phase = Phase::CleanupFailed;
             self.cleanup.state = CleanupState::Failed;
@@ -1093,6 +1121,23 @@ impl ApplicationLifecycle {
 
     pub(crate) fn has_active_command(&self) -> bool {
         self.active.is_some()
+    }
+
+    pub(crate) fn set_output(&mut self, output: Option<SharedOutput>) {
+        self.output = output;
+    }
+
+    pub(crate) fn output_open_failed(&mut self, error: &std::io::Error) {
+        self.preparation.failure = Some(CommandFailure {
+            phase: "output",
+            step: 0,
+            kind: CommandFailureKind::OutputOpenFailed,
+            exit_code: None,
+            os_error: error.raw_os_error(),
+        });
+        self.cleanup.state = CleanupState::Complete;
+        self.phase = Phase::Complete;
+        self.output = None;
     }
 
     /// Budget only owed work. Shutdown cancels an active preparation command,

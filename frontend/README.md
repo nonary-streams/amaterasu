@@ -63,6 +63,13 @@ browser API calls.
   catalog revisions; conflicts require refresh and are never retried silently.
   Application/executable paths, literal JSON argument arrays, description and tags
   are editable. Catalog operations do not launch applications.
+  Command output uses an unset/value choice so empty strings and the literal
+  `null` remain distinct from an omitted destination. Saved text is not trimmed;
+  relative paths and environment references are retained for launch-time
+  resolution. Existing raw preparation commands are carried through manual edits
+  as bounded, validated hidden metadata without changing their command text.
+  The destination covers application, preparation, and detached commands;
+  externally provider-owned game output is not routed through this setting.
 - Settings forms use the registered schema's boolean, integer, decimal, string,
   enum, list, and object fields; updates include expected revision. List and object
   values use JSON editors, with server-side nested validation. Empty/unregistered

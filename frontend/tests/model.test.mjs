@@ -14,6 +14,42 @@ vm.runInContext(
 const model = context.Amaterasu;
 const ordinary = (value) => JSON.parse(JSON.stringify(value));
 
+test("command output form preserves unset, empty, literal null, and exact UTF-8 paths", () => {
+  for (const value of [undefined, null, "", "null", " logs/$(APP).log ", "é".repeat(512)]) {
+    const fields = new FormData();
+    for (const [name, fieldValue] of Object.entries(model.applicationOutputFormValues(value)))
+      fields.set(name, fieldValue);
+    assert.equal(model.parseApplicationOutput(fields), value ?? null);
+    const saved = ordinary(model.entryFromForm(fields));
+    if (value == null) assert.equal(Object.hasOwn(saved, "output"), false);
+    else assert.equal(saved.output, value);
+  }
+  for (const value of ["x".repeat(1025), "é".repeat(513), "logs\nfile", "logs\0file", "logs\u0085file"]) {
+    const fields = new FormData();
+    fields.set("output_mode", "value");
+    fields.set("output_value", value);
+    assert.throws(() => model.entryFromForm(fields), /Command output/);
+  }
+  const invalidMode = new FormData();
+  invalidMode.set("output_mode", "unknown");
+  assert.throws(() => model.entryFromForm(invalidMode), /Command output/);
+});
+
+test("raw preparation carry-through preserves command text and strictly validates hidden metadata", () => {
+  const steps = [{ do: " configure $(PROFILE) ", undo: " restore --exact ", elevated: true }, {}];
+  assert.deepEqual(ordinary(model.parseRawPreparation(JSON.stringify(steps))), steps);
+  for (const value of ["{", "null", "{}", JSON.stringify([{ do: null }]),
+    JSON.stringify([{ elevated: "true" }]), JSON.stringify([{ unknown: "value" }]),
+    JSON.stringify([{ do: "é".repeat(1025) }]), JSON.stringify([{ undo: "restore\0" }]),
+    JSON.stringify(Array(9).fill({}))])
+    assert.throws(() => model.parseRawPreparation(value), /raw preparation/);
+  const fields = new FormData();
+  fields.set("kind", "executable");
+  fields.set("prep_cmd", JSON.stringify(Array(8).fill({ do: "prepare" })));
+  fields.set("preparation", JSON.stringify([{ run: { executable: "/opt/prepare" } }]));
+  assert.throws(() => model.entryFromForm(fields), /at most 8 preparation steps/);
+});
+
 test("advanced scoped input editor preserves false and zero, and clears inherited values", () => {
   const saved = { keybindings: [65, 66, 65, 67], high_resolution_scrolling: false, always_send_scancodes: false,
     key_rightalt_to_key_win: true, key_repeat_delay: 0, key_repeat_frequency: 0 };

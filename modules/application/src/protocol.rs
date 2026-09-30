@@ -1,5 +1,6 @@
 use crate::commands::{DetachedCommand, DetachedCommandInput};
 use crate::lifecycle::{PreparationStep, validate_environment};
+use crate::output::{deserialize_output, validate_output};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -9,6 +10,8 @@ use std::path::Path;
 pub(crate) enum Action {
     Launch {
         operation_id: String,
+        #[serde(default, deserialize_with = "deserialize_output")]
+        output: Option<String>,
         executable: String,
         #[serde(default)]
         args: Vec<String>,
@@ -41,6 +44,8 @@ pub(crate) enum Action {
     },
     Prepare {
         operation_id: String,
+        #[serde(default, deserialize_with = "deserialize_output")]
+        output: Option<String>,
         #[serde(default)]
         environment: BTreeMap<String, String>,
         #[serde(default)]
@@ -76,6 +81,7 @@ pub(crate) enum Action {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreparationSpec {
+    pub output: Option<String>,
     pub preparation: Vec<PreparationStep>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
@@ -92,13 +98,14 @@ impl PreparationSpec {
         {
             return Err("invalid operation id");
         }
-        if self.preparation.is_empty() {
-            return Err("preparation must contain at least one step");
+        if self.preparation.is_empty() && self.output.is_none() {
+            return Err("preparation must contain a step or an output lease");
         }
         if self.exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
             return Err("exit timeout exceeds bounds");
         }
         validate_environment(&self.environment)?;
+        validate_output(self.output.as_deref())?;
         if self.cwd.as_deref().is_some_and(|cwd| !valid_path(cwd)) {
             return Err("cwd must be an absolute path");
         }
@@ -167,6 +174,7 @@ impl DetachedWorkingDirectory {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct LaunchSpec {
+    pub output: Option<String>,
     pub executable: String,
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
@@ -195,6 +203,7 @@ impl LaunchSpec {
             return Err("exit timeout exceeds bounds");
         }
         self.detached_cwd.validate()?;
+        validate_output(self.output.as_deref())?;
         if self
             .steam_id
             .as_deref()
@@ -344,6 +353,7 @@ mod tests {
 
     fn spec(steam_id: Option<&str>, install_directory: Option<&str>) -> LaunchSpec {
         LaunchSpec {
+            output: None,
             executable: std::env::current_exe()
                 .unwrap()
                 .to_string_lossy()
@@ -497,6 +507,7 @@ mod tests {
         };
         assert!(matches!(&preparation[0], PreparationStep::Raw(_)));
         PreparationSpec {
+            output: None,
             preparation: preparation.into_vec(),
             environment: BTreeMap::new(),
             cwd: None,

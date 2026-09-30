@@ -23,6 +23,8 @@ pub struct Entry {
     pub steam_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steam_install_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
     #[serde(default, skip_serializing_if = "ConfigOverrides::is_empty")]
     pub config_overrides: ConfigOverrides,
     #[serde(
@@ -822,6 +824,13 @@ impl Entry {
         }
         if let Some(install_directory) = &self.steam_install_dir {
             validate_steam_install_directory(install_directory)?;
+        }
+        if self
+            .output
+            .as_deref()
+            .is_some_and(|output| !bounded_text(output, 1_024))
+        {
+            return Err("output exceeds 1024 bytes or contains control characters");
         }
         self.config_overrides.validate()?;
         validate_raw_preparation(&self.prep_cmd)?;
