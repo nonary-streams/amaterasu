@@ -185,6 +185,8 @@ impl Encryption {
 pub struct Open {
     pub peer_ip: IpAddr,
     #[serde(default)]
+    pub video_stream_format: Option<amaterasu_module_sdk::VideoStreamFormat>,
+    #[serde(default)]
     pub video_encryption_policy: Option<Box<VideoEncryptionPolicySnapshot>>,
     #[serde(default)]
     pub video_port: Option<u16>,
@@ -211,6 +213,9 @@ pub struct Open {
 
 impl Open {
     pub fn validate(&self, allow_remote: bool) -> TransportResult<()> {
+        if let Some(format) = self.video_stream_format {
+            validate_video_stream_format(format)?;
+        }
         self.validate_video_encryption_policy()?;
         validate_ping_timeout_ms(self.ping_timeout_ms)?;
         if !valid_peer(self.peer_ip) {
@@ -316,6 +321,19 @@ impl Open {
     }
 }
 
+pub(crate) fn validate_video_stream_format(
+    format: amaterasu_module_sdk::VideoStreamFormat,
+) -> TransportResult<()> {
+    use amaterasu_module_sdk::{DynamicRange, VideoCodec};
+
+    match (format.codec, format.bit_depth, format.dynamic_range) {
+        (VideoCodec::H264, 8, DynamicRange::Sdr) | (VideoCodec::Hevc, 8, DynamicRange::Sdr) => {
+            Ok(())
+        }
+        _ => Err("unsupported_video_format"),
+    }
+}
+
 pub fn validate_ping_timeout_ms(value: i64) -> TransportResult<u64> {
     if !(0..=MAX_PING_TIMEOUT_MS).contains(&value) {
         return Err("invalid_ping_timeout");
@@ -327,9 +345,19 @@ pub fn validate_ping_timeout_ms(value: i64) -> TransportResult<u64> {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Open(Open),
-    Lookup { operation_id: String },
-    Close { stream: u64 },
-    Status { stream: Option<u64> },
+    ConfigureVideoFormat {
+        stream: u64,
+        video_stream_format: amaterasu_module_sdk::VideoStreamFormat,
+    },
+    Lookup {
+        operation_id: String,
+    },
+    Close {
+        stream: u64,
+    },
+    Status {
+        stream: Option<u64>,
+    },
 }
 
 pub fn validate_operation(operation: &str) -> TransportResult<()> {

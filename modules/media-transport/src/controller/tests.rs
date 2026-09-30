@@ -1,6 +1,6 @@
 use super::*;
 use crate::stream::tests::{receivers, request, video_packet};
-use amaterasu_module_sdk::abi::STATUS_OK;
+use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK};
 
 fn controller() -> Controller {
     Controller::new(Settings {
@@ -80,6 +80,62 @@ fn ping_timeout_defaults_to_ten_seconds_and_validates_the_signed_integer_range()
         request.ping_timeout_ms = value;
         assert_eq!(request.validate(false), Err("invalid_ping_timeout"));
     }
+}
+
+#[test]
+fn authenticated_video_format_selection_rejects_mismatched_packets_before_queueing() {
+    let (video, audio) = receivers();
+    let mut stream_controller = controller();
+    let opened = stream_controller
+        .handle("owner", Operation::Open(request(&video, &audio, false)))
+        .unwrap();
+    let id = opened.created.unwrap();
+    let hevc = amaterasu_module_sdk::VideoStreamFormat {
+        codec: amaterasu_module_sdk::VideoCodec::Hevc,
+        bit_depth: 8,
+        dynamic_range: amaterasu_module_sdk::DynamicRange::Sdr,
+    };
+    let configured = stream_controller
+        .handle(
+            "owner",
+            Operation::ConfigureVideoFormat {
+                stream: id,
+                video_stream_format: hevc,
+            },
+        )
+        .unwrap();
+    assert_eq!(configured.payload["video_stream_format"], json!(hevc));
+
+    let h264 = [0, 0, 0, 1, 0x65, 1];
+    // SAFETY: the fixture access unit stays live for the synchronous admission call.
+    assert_eq!(
+        unsafe { stream_controller.submit_video("owner", id, &video_packet(&h264, 0)) },
+        STATUS_INVALID_ARGUMENT
+    );
+    let hevc_payload = [0, 0, 0, 1, 0x26, 1, 0x80];
+    let packet = EncodedPacket {
+        codec: amaterasu_media::CODEC_HEVC,
+        ..video_packet(&hevc_payload, 0)
+    };
+    // SAFETY: the fixture access unit stays live for the synchronous admission call.
+    assert_eq!(
+        unsafe { stream_controller.submit_video("owner", id, &packet) },
+        STATUS_OK
+    );
+
+    let mut wrong_owner = controller();
+    assert_eq!(
+        wrong_owner
+            .handle(
+                "foreign",
+                Operation::ConfigureVideoFormat {
+                    stream: id,
+                    video_stream_format: hevc,
+                }
+            )
+            .err(),
+        Some("stream_not_found")
+    );
 }
 
 #[test]

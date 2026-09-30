@@ -15,6 +15,7 @@ pub(crate) fn receivers() -> (UdpSocket, UdpSocket) {
 pub(crate) fn request(video: &UdpSocket, audio: &UdpSocket, encrypted: bool) -> Open {
     Open {
         peer_ip: "127.0.0.1".parse().unwrap(),
+        video_stream_format: None,
         video_encryption_policy: None,
         video_port: Some(video.local_addr().unwrap().port()),
         audio_port: Some(audio.local_addr().unwrap().port()),
@@ -110,7 +111,13 @@ pub(crate) fn video_packet(bytes: &[u8], sequence: u64) -> EncodedPacket {
 #[test]
 fn hevc_packets_use_codec_aware_packetization_and_reject_mismatches() {
     let (video, audio) = receivers();
-    let mut stream = Stream::open("owner", &request(&video, &audio, false)).unwrap();
+    let request = request(&video, &audio, false);
+    let hevc_format = amaterasu_module_sdk::VideoStreamFormat {
+        codec: amaterasu_module_sdk::VideoCodec::Hevc,
+        bit_depth: 8,
+        dynamic_range: amaterasu_module_sdk::DynamicRange::Sdr,
+    };
+    let mut stream = Stream::open("owner", &request).unwrap();
     let mut hevc = Vec::new();
     for (nal_unit_type, payload) in [
         (32_u8, 0x01_u8), // VPS
@@ -121,27 +128,34 @@ fn hevc_packets_use_codec_aware_packetization_and_reject_mismatches() {
         hevc.extend_from_slice(&[0, 0, 0, 1, nal_unit_type << 1, 1, payload]);
     }
 
-    // A codec label cannot make HEVC NALs pass the H.264 parser.
-    let mismatched_payload = video_packet(&hevc, 0);
-    // SAFETY: the local access unit remains live through synchronous submit.
+    let h264 = [0, 0, 0, 1, 0x65, 1];
+    let mismatched_payload = video_packet(&h264, 0);
+
+    let hevc_packet = EncodedPacket {
+        codec: CODEC_HEVC,
+        ..video_packet(&hevc, 0)
+    };
+    // Legacy Open without an explicit format remains H.264 until the
+    // authenticated post-ANNOUNCE configuration freezes the negotiated codec.
+    assert_eq!(
+        unsafe { stream.submit_video(&hevc_packet) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(stream.video_sequence, None);
+    stream.configure_video_format(hevc_format).unwrap();
+    // An H.264 payload cannot pass after authenticated negotiation selected HEVC.
     assert_eq!(
         unsafe { stream.submit_video(&mismatched_payload) },
         STATUS_INVALID_ARGUMENT
     );
     assert_eq!(stream.video_codec, None);
     assert_eq!(stream.video_sequence, None);
-
-    let hevc_packet = EncodedPacket {
-        codec: CODEC_HEVC,
-        ..video_packet(&hevc, 0)
-    };
     assert_eq!(unsafe { stream.submit_video(&hevc_packet) }, STATUS_OK);
     assert_eq!(stream.video_codec, Some(VideoCodec::Hevc));
     stream.delivery.tick();
     let datagram = receive(&video);
     assert_eq!(datagram[35], 2); // Same GameStream IDR frame-header value.
 
-    let h264 = [0, 0, 0, 1, 0x65, 0x88];
     let switched_codec = video_packet(&h264, 1);
     assert_eq!(
         unsafe { stream.submit_video(&switched_codec) },

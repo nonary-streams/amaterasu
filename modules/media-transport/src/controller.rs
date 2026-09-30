@@ -39,6 +39,13 @@ impl Controller {
     pub fn handle(&mut self, owner: &str, operation: Operation) -> TransportResult<ControlReply> {
         let (payload, created) = match operation {
             Operation::Open(request) => self.open(owner, request)?,
+            Operation::ConfigureVideoFormat {
+                stream,
+                video_stream_format,
+            } => (
+                self.configure_video_format(owner, stream, video_stream_format)?,
+                None,
+            ),
             Operation::Lookup { operation_id } => {
                 validate_operation(&operation_id)?;
                 let record = self
@@ -242,6 +249,17 @@ impl Controller {
     pub fn drain(&mut self, owner: &str, id: u64) -> Status {
         self.owned_mut(owner, id)
             .map_or(MEDIA_CLOSED, Stream::drain)
+    }
+
+    fn configure_video_format(
+        &mut self,
+        owner: &str,
+        id: u64,
+        format: amaterasu_module_sdk::VideoStreamFormat,
+    ) -> TransportResult<Value> {
+        let stream = self.owned_mut(owner, id).ok_or("stream_not_found")?;
+        stream.configure_video_format(format)?;
+        Ok(json!({"ok":true,"stream":id,"video_stream_format":format}))
     }
 }
 

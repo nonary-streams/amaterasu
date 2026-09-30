@@ -9,6 +9,7 @@ pub(super) enum Step {
     Open(Resource),
     Authenticate,
     MediaReady,
+    ConfigureMediaVideoFormat,
     ApplyLimiter,
     CheckDisplay,
     ApplyDisplay,
@@ -170,6 +171,18 @@ impl Job {
                 Resource::Media.service(),
                 json!({"action":"status","stream":record.resources[&Resource::Media]}),
             ),
+            Step::ConfigureMediaVideoFormat => {
+                let start = record
+                    .start
+                    .as_ref()
+                    .expect("validated start configuration");
+                (
+                    Resource::Media.service(),
+                    json!({"action":"configure_video_format",
+                        "stream":record.resources[&Resource::Media],
+                        "video_stream_format":start.configuration.video_stream_format}),
+                )
+            }
             Step::ApplyLimiter => (
                 "amaterasu.frame-limiter/1".into(),
                 super::limiter::apply(record),

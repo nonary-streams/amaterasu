@@ -26,6 +26,8 @@ pub struct Stream {
     pub audio_local: SocketAddr,
     pub delivery: Delivery,
     video: VideoPacketizer,
+    expected_video_codec: VideoCodec,
+    video_format_locked: bool,
     video_codec: Option<VideoCodec>,
     audio: AudioPacketizer,
     video_sealer: Option<VideoSealer>,
@@ -42,6 +44,9 @@ pub struct Stream {
 
 impl Stream {
     pub fn open(owner: &str, request: &Open) -> TransportResult<Self> {
+        if let Some(format) = request.video_stream_format {
+            validate_video_stream_format(format)?;
+        }
         request.validate_video_encryption_policy()?;
         let ping_timeout_ms = validate_ping_timeout_ms(request.ping_timeout_ms)?;
         let (video, audio) = packetizers(request)?;
@@ -80,6 +85,16 @@ impl Stream {
             audio_local,
             delivery,
             video,
+            expected_video_codec: request
+                .video_stream_format
+                .map_or(VideoCodec::H264, |format| match format.codec {
+                    amaterasu_module_sdk::VideoCodec::H264 => VideoCodec::H264,
+                    amaterasu_module_sdk::VideoCodec::Hevc => VideoCodec::Hevc,
+                    amaterasu_module_sdk::VideoCodec::Av1 => {
+                        unreachable!("video format validation rejects AV1 for this transport")
+                    }
+                }),
+            video_format_locked: request.video_stream_format.is_some(),
             video_codec: None,
             audio,
             video_sealer,
@@ -145,6 +160,29 @@ impl Stream {
         STATUS_OK
     }
 
+    pub fn configure_video_format(
+        &mut self,
+        format: amaterasu_module_sdk::VideoStreamFormat,
+    ) -> TransportResult<()> {
+        validate_video_stream_format(format)?;
+        if self.video_sequence.is_some() || self.video_ended {
+            return Err("video_format_already_in_use");
+        }
+        let codec = match format.codec {
+            amaterasu_module_sdk::VideoCodec::H264 => VideoCodec::H264,
+            amaterasu_module_sdk::VideoCodec::Hevc => VideoCodec::Hevc,
+            amaterasu_module_sdk::VideoCodec::Av1 => {
+                return Err("unsupported_video_format");
+            }
+        };
+        if self.video_format_locked && self.expected_video_codec != codec {
+            return Err("video_format_conflict");
+        }
+        self.expected_video_codec = codec;
+        self.video_format_locked = true;
+        Ok(())
+    }
+
     /// # Safety
     /// The packet and its initialized immutable bytes live through this call.
     pub unsafe fn submit_video(&mut self, packet: &EncodedPacket) -> Status {
@@ -165,6 +203,9 @@ impl Stream {
             CODEC_HEVC => VideoCodec::Hevc,
             _ => return STATUS_INVALID_ARGUMENT,
         };
+        if self.expected_video_codec != codec {
+            return STATUS_INVALID_ARGUMENT;
+        }
         if self.video_codec.is_some_and(|selected| selected != codec) {
             return STATUS_INVALID_ARGUMENT;
         }

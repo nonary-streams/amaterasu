@@ -379,13 +379,7 @@ impl Pipeline {
                     {
                         return Err("display_lease_missing");
                     }
-                    job.step = if record.config.frame_limiter_settings.is_some()
-                        && !record.limiter_attempted
-                    {
-                        Step::ApplyLimiter
-                    } else {
-                        Step::AcquireOutput
-                    };
+                    job.step = Step::ConfigureMediaVideoFormat;
                     Ok(true)
                 } else if status["state"] == "discovering" {
                     if record.state == State::Armed {
@@ -404,6 +398,24 @@ impl Pipeline {
             Step::AcquireOutput => {
                 require_lease(record, &payload, false)?;
                 job.step = Step::Open(Resource::Video);
+                Ok(true)
+            }
+            Step::ConfigureMediaVideoFormat => {
+                let start = record.start.as_ref().ok_or("invalid_start_configuration")?;
+                if payload["ok"] != true
+                    || payload["stream"] != record.resources[&Resource::Media]
+                    || payload["video_stream_format"]
+                        != json!(start.configuration.video_stream_format)
+                {
+                    return Err("video_format_configuration_mismatch");
+                }
+                job.step = if record.config.frame_limiter_settings.is_some()
+                    && !record.limiter_attempted
+                {
+                    Step::ApplyLimiter
+                } else {
+                    Step::AcquireOutput
+                };
                 Ok(true)
             }
             Step::AcquireAudio => {

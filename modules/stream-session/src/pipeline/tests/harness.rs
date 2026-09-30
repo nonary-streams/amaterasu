@@ -56,6 +56,7 @@ pub struct Broker {
     pub discovered_video_port: Option<u16>,
     pub discovered_audio_port: Option<u16>,
     pub media_failure: bool,
+    pub wrong_media_video_format_response: bool,
     pub desktop_geometry: Option<Value>,
     pub touch_port: Option<Value>,
     pub input_operation: Option<String>,
@@ -524,6 +525,12 @@ impl Broker {
         else {
             return error("not_found");
         };
+        if service == "amaterasu.media-transport/1" && action == "configure_video_format" {
+            let allocation = self.allocations.get_mut(&key).unwrap();
+            allocation.request["video_stream_format"] = call.payload["video_stream_format"].clone();
+            return json!({"ok":true,"stream":if self.wrong_media_video_format_response {id + 1} else {id},
+                "video_stream_format":call.payload["video_stream_format"]});
+        }
         if action == "close" {
             if self.fail_close.as_deref() == Some(service) {
                 return error("close_failed");

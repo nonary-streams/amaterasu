@@ -418,6 +418,41 @@ fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
     let active = host.response(2, start(id));
     assert_eq!(active["state"], "active");
     assert_eq!(host.broker.leases(), 2);
+    let media_open_index = host
+        .broker
+        .calls
+        .iter()
+        .position(|call| {
+            call.service == Resource::Media.service() && call.payload["action"] == "open"
+        })
+        .unwrap();
+    let configure_format_index = host
+        .broker
+        .calls
+        .iter()
+        .position(|call| {
+            call.service == Resource::Media.service()
+                && call.payload["action"] == "configure_video_format"
+        })
+        .expect("authenticated start configures expected video format");
+    let configure_format = &host.broker.calls[configure_format_index];
+    assert!(configure_format_index > media_open_index);
+    assert!(configure_format.payload["stream"].as_u64().is_some());
+    assert_eq!(
+        configure_format.payload["video_stream_format"],
+        json!({
+            "codec":"h264","bit_depth":8,"dynamic_range":"sdr"
+        })
+    );
+    let video_open_index = host
+        .broker
+        .calls
+        .iter()
+        .position(|call| {
+            call.service == Resource::Video.service() && call.payload["action"] == "open"
+        })
+        .unwrap();
+    assert!(configure_format_index < video_open_index);
     let record = &host.pipeline.records[&id];
     let audio_open = host
         .broker
@@ -470,6 +505,26 @@ fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
         .position(|call| call.payload["action"] == "finish_stop")
         .unwrap();
     assert!(release > final_lookup);
+}
+
+#[test]
+fn rejected_media_video_format_configuration_skips_video_open_and_cleans_up() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    host.broker.wrong_media_video_format_response = true;
+
+    let reply = host.response(2, start(id));
+
+    assert_eq!(reply["state"], "failed");
+    assert_eq!(reply["error"], "video_format_configuration_mismatch");
+    assert!(!host.broker.calls.iter().any(|call| {
+        call.service == Resource::Video.service() && call.payload["action"] == "open"
+    }));
+    assert!(host.broker.calls.iter().any(|call| {
+        call.service == Resource::Media.service() && call.payload["action"] == "close"
+    }));
+    assert_eq!(host.broker.live_components(), 0);
+    assert_eq!(host.broker.leases(), 0);
 }
 
 #[test]
