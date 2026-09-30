@@ -15,8 +15,10 @@ use crate::{
 use amaterasu_media::{
     AUDIO_DISCONTINUITY, AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, PCM_F32, PCM_I16,
 };
+use serde_json::{Value, json};
 use std::{
     ffi::c_void,
+    os::windows::ffi::OsStrExt,
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -27,7 +29,8 @@ use std::{
 use windows::{
     Win32::{
         Devices::FunctionDiscovery::{
-            PKEY_Device_DeviceDesc, PKEY_Device_FriendlyName, PKEY_DeviceInterface_FriendlyName,
+            PKEY_Device_DeviceDesc, PKEY_Device_DriverDesc, PKEY_Device_DriverProvider,
+            PKEY_Device_FriendlyName, PKEY_DeviceInterface_FriendlyName,
         },
         Media::{
             Audio::*, KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM,
@@ -44,6 +47,12 @@ const HRESULT_NOT_FOUND: HRESULT = HRESULT(0x80070490u32 as i32);
 const DEFAULT_ENDPOINT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const BUFFER_ERROR_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const ROUTE_RESTORE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const STEAM_DRIVER_DESCRIPTION: &str = "Steam Streaming Speakers";
+const STEAM_DRIVER_PROVIDER: &str = "Valve Corporation";
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_PATH_NOT_FOUND: u32 = 3;
 
 static ROUTE_POLICY: OnceLock<Mutex<RoutePolicy>> = OnceLock::new();
 static VIRTUAL_FORMAT_POLICY: OnceLock<Mutex<VirtualFormatPolicy>> = OnceLock::new();
@@ -51,6 +60,65 @@ static ROUTE_RESTORE_WORKER: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = O
 static ROUTE_RESTORE_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static ROUTE_RESTORE_LIFECYCLE: Mutex<RouteRestoreLifecycle> =
     Mutex::new(RouteRestoreLifecycle { active_modules: 0 });
+static STEAM_DRIVER_INSTALL: OnceLock<Mutex<SteamDriverInstallManager>> = OnceLock::new();
+
+#[derive(Clone)]
+struct SteamDriverInstallStatus {
+    enabled: bool,
+    revision: Option<u64>,
+    state: &'static str,
+    error_code: Option<&'static str>,
+    native_error: Option<u32>,
+    endpoint: Option<String>,
+    restored_roles: Vec<&'static str>,
+    restore_failures: Vec<Value>,
+}
+
+impl Default for SteamDriverInstallStatus {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            revision: None,
+            state: "awaiting_configuration",
+            error_code: None,
+            native_error: None,
+            endpoint: None,
+            restored_roles: Vec::new(),
+            restore_failures: Vec::new(),
+        }
+    }
+}
+
+impl SteamDriverInstallStatus {
+    fn payload(&self) -> Value {
+        json!({
+            "enabled": self.enabled,
+            "revision": self.revision,
+            "state": self.state,
+            "error_code": self.error_code,
+            "native_error": self.native_error,
+            "endpoint": self.endpoint,
+            "restored_roles": self.restored_roles,
+            "restore_failures": self.restore_failures,
+        })
+    }
+}
+
+struct SteamDriverInstallManager {
+    status: SteamDriverInstallStatus,
+    attempted: bool,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Default for SteamDriverInstallManager {
+    fn default() -> Self {
+        Self {
+            status: SteamDriverInstallStatus::default(),
+            attempted: false,
+            worker: None,
+        }
+    }
+}
 
 struct RouteRestoreLifecycle {
     active_modules: usize,
@@ -552,6 +620,7 @@ fn stop_route_restore_lifecycle(
 }
 
 pub fn startup() {
+    reset_steam_driver_install_state();
     start_route_restore_lifecycle(
         &ROUTE_RESTORE_LIFECYCLE,
         &ROUTE_RESTORE_SHUTTING_DOWN,
@@ -561,6 +630,7 @@ pub fn startup() {
 }
 
 pub fn shutdown() {
+    shutdown_steam_driver_install();
     stop_route_restore_lifecycle(
         &ROUTE_RESTORE_LIFECYCLE,
         &ROUTE_RESTORE_SHUTTING_DOWN,
@@ -587,6 +657,382 @@ pub fn shutdown() {
             });
         },
     );
+}
+
+pub fn configure_steam_driver_install(enabled: bool, revision: u64) -> Value {
+    let manager =
+        STEAM_DRIVER_INSTALL.get_or_init(|| Mutex::new(SteamDriverInstallManager::default()));
+    let mut completed_worker = None;
+    let payload = {
+        let mut manager = manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if manager
+            .worker
+            .as_ref()
+            .is_some_and(thread::JoinHandle::is_finished)
+        {
+            completed_worker = manager.worker.take();
+        }
+
+        let was_enabled = manager.status.enabled;
+        manager.status.enabled = enabled;
+        manager.status.revision = Some(revision);
+        if !enabled {
+            manager.status.state = "disabled";
+            manager.status.error_code = None;
+            manager.status.native_error = None;
+            manager.status.endpoint = None;
+            manager.status.restored_roles.clear();
+            manager.status.restore_failures.clear();
+            manager.attempted = false;
+        } else if !was_enabled || !manager.attempted {
+            manager.attempted = true;
+            manager.status.state = "checking";
+            manager.status.error_code = None;
+            manager.status.native_error = None;
+            manager.status.endpoint = None;
+            manager.status.restored_roles.clear();
+            manager.status.restore_failures.clear();
+            if manager.worker.is_none() {
+                let spawn = thread::Builder::new()
+                    .name("steam-audio-driver-install".into())
+                    .spawn(move || run_steam_driver_install());
+                match spawn {
+                    Ok(worker) => manager.worker = Some(worker),
+                    Err(_) => {
+                        manager.status.state = "error";
+                        manager.status.error_code = Some("steam_driver_worker_unavailable");
+                    }
+                }
+            }
+        }
+        manager.status.payload()
+    };
+    if let Some(worker) = completed_worker {
+        let _ = worker.join();
+    }
+    payload
+}
+
+pub fn steam_driver_install_status() -> Value {
+    STEAM_DRIVER_INSTALL
+        .get_or_init(|| Mutex::new(SteamDriverInstallManager::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .status
+        .payload()
+}
+
+fn reset_steam_driver_install_state() {
+    let mut manager = STEAM_DRIVER_INSTALL
+        .get_or_init(|| Mutex::new(SteamDriverInstallManager::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    manager.status = SteamDriverInstallStatus::default();
+    manager.attempted = false;
+}
+
+fn shutdown_steam_driver_install() {
+    let worker = {
+        let manager =
+            STEAM_DRIVER_INSTALL.get_or_init(|| Mutex::new(SteamDriverInstallManager::default()));
+        let mut manager = manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        manager.status.enabled = false;
+        manager.status.state = "disabled";
+        manager.worker.take()
+    };
+    if let Some(worker) = worker {
+        let _ = worker.join();
+    }
+}
+
+fn run_steam_driver_install() {
+    let result = (|| {
+        let _apartment = Apartment::start()
+            .map_err(|_| crate::steam_driver::DriverFailure::new("steam_driver_com_unavailable"))?;
+        let mut backend = WindowsSteamDriverBackend;
+        crate::steam_driver::ensure_steam_driver(&mut backend)
+    })();
+    let mut manager = STEAM_DRIVER_INSTALL
+        .get_or_init(|| Mutex::new(SteamDriverInstallManager::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !manager.status.enabled {
+        return;
+    }
+    match result {
+        Ok(crate::steam_driver::InstallOutcome::AlreadyPresent { endpoint }) => {
+            manager.status.state = "already_present";
+            manager.status.endpoint = Some(endpoint);
+        }
+        Ok(crate::steam_driver::InstallOutcome::Installed {
+            endpoint,
+            restored_roles,
+            restore_failures,
+        }) => {
+            manager.status.state = if restore_failures.is_empty() {
+                "installed"
+            } else {
+                "installed_with_route_restore_errors"
+            };
+            manager.status.endpoint = Some(endpoint);
+            manager.status.restored_roles = restored_roles
+                .into_iter()
+                .map(crate::steam_driver::DefaultRole::name)
+                .collect();
+            manager.status.restore_failures = restore_failures
+                .into_iter()
+                .map(|failure| {
+                    json!({
+                        "role": failure.role.name(),
+                        "error_code": failure.failure.code,
+                        "native_error": failure.failure.native_code,
+                    })
+                })
+                .collect();
+        }
+        Ok(crate::steam_driver::InstallOutcome::InstalledEndpointUnavailable {
+            restored_roles,
+            restore_failures,
+        }) => {
+            manager.status.state = "installed_endpoint_unavailable";
+            manager.status.restored_roles = restored_roles
+                .into_iter()
+                .map(crate::steam_driver::DefaultRole::name)
+                .collect();
+            manager.status.restore_failures = restore_failures
+                .into_iter()
+                .map(|failure| {
+                    json!({
+                        "role": failure.role.name(),
+                        "error_code": failure.failure.code,
+                        "native_error": failure.failure.native_code,
+                    })
+                })
+                .collect();
+        }
+        Err(failure) => {
+            manager.status.state = "error";
+            manager.status.error_code = Some(failure.code);
+            manager.status.native_error = failure.native_code;
+        }
+    }
+}
+
+struct WindowsSteamDriverBackend;
+
+fn steam_driver_route_role(role: crate::steam_driver::DefaultRole) -> DefaultRole {
+    match role {
+        crate::steam_driver::DefaultRole::Console => DefaultRole::Console,
+        crate::steam_driver::DefaultRole::Multimedia => DefaultRole::Multimedia,
+        crate::steam_driver::DefaultRole::Communications => DefaultRole::Communications,
+    }
+}
+
+fn steam_speaker_device_identity(
+    enumerator: &IMMDeviceEnumerator,
+    endpoint: &str,
+) -> Result<bool, &'static str> {
+    let wide: Vec<u16> = endpoint.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: the endpoint ID remains live for the synchronous GetDevice call,
+    // and the returned COM interface stays on this apartment thread.
+    let device = unsafe {
+        match enumerator.GetDevice(PCWSTR(wide.as_ptr())) {
+            Ok(device) => device,
+            Err(error) if error.code() == HRESULT_NOT_FOUND => return Ok(false),
+            Err(_) => return Err("endpoint_metadata_failed"),
+        }
+    };
+    // Driver provider and description come from the registered PnP driver
+    // properties. They remain stable when a user renames the render endpoint.
+    let properties =
+        unsafe { device.OpenPropertyStore(STGM_READ) }.map_err(|_| "endpoint_metadata_failed")?;
+    let Some(provider) = property_text(&properties, &PKEY_Device_DriverProvider) else {
+        // Non-PnP and virtual render endpoints can omit this property. They
+        // cannot positively identify the Steam driver, so skip them.
+        return Ok(false);
+    };
+    if !provider.eq_ignore_ascii_case(STEAM_DRIVER_PROVIDER) {
+        return Ok(false);
+    }
+    let descriptions = [
+        property_text(&properties, &PKEY_Device_DeviceDesc),
+        property_text(&properties, &PKEY_Device_DriverDesc),
+    ];
+    let has_product_description = descriptions.iter().flatten().any(|description| {
+        description
+            .trim()
+            .eq_ignore_ascii_case(STEAM_DRIVER_DESCRIPTION)
+    });
+    if descriptions.iter().all(Option::is_none) {
+        return Err("endpoint_metadata_failed");
+    }
+    Ok(has_product_description)
+}
+
+impl crate::steam_driver::SteamDriverBackend for WindowsSteamDriverBackend {
+    fn steam_speaker_endpoint(
+        &mut self,
+    ) -> Result<Option<String>, crate::steam_driver::DriverFailure> {
+        let enumerator = enumerator().map_err(|_| {
+            crate::steam_driver::DriverFailure::new("steam_driver_endpoint_enumeration_failed")
+        })?;
+        let endpoints = active_render_endpoints(&enumerator).map_err(|_| {
+            crate::steam_driver::DriverFailure::new("steam_driver_endpoint_enumeration_failed")
+        })?;
+        for endpoint in endpoints {
+            match steam_speaker_device_identity(&enumerator, &endpoint.id) {
+                Ok(true) => return Ok(Some(endpoint.id)),
+                Ok(false) => {}
+                Err(_) => {
+                    return Err(crate::steam_driver::DriverFailure::new(
+                        "steam_driver_endpoint_identity_failed",
+                    ));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn default_endpoints(
+        &mut self,
+    ) -> Result<[Option<String>; 3], crate::steam_driver::DriverFailure> {
+        let enumerator = enumerator().map_err(|_| {
+            crate::steam_driver::DriverFailure::new("steam_driver_route_snapshot_failed")
+        })?;
+        default_endpoints(&enumerator).map_err(|_| {
+            crate::steam_driver::DriverFailure::new("steam_driver_route_snapshot_failed")
+        })
+    }
+
+    fn install_driver(&mut self) -> Result<(), crate::steam_driver::DriverFailure> {
+        install_steam_driver_inf()
+    }
+
+    fn wait_for_reconfiguration(&mut self, interval: Duration) {
+        thread::sleep(interval);
+    }
+
+    fn is_steam_speaker_endpoint(
+        &mut self,
+        endpoint: &str,
+    ) -> Result<bool, crate::steam_driver::DriverFailure> {
+        let enumerator = enumerator().map_err(|_| {
+            crate::steam_driver::DriverFailure::new("steam_driver_endpoint_identity_failed")
+        })?;
+        steam_speaker_device_identity(&enumerator, endpoint).map_err(|_| {
+            crate::steam_driver::DriverFailure::new("steam_driver_endpoint_identity_failed")
+        })
+    }
+
+    fn current_default(
+        &mut self,
+        role: crate::steam_driver::DefaultRole,
+    ) -> Result<Option<String>, crate::steam_driver::DriverFailure> {
+        let enumerator = enumerator().map_err(|_| {
+            crate::steam_driver::DriverFailure::new("steam_driver_route_snapshot_failed")
+        })?;
+        role_endpoint(&enumerator, steam_driver_route_role(role)).map_err(|_| {
+            crate::steam_driver::DriverFailure::new("steam_driver_route_snapshot_failed")
+        })
+    }
+
+    fn set_default(
+        &mut self,
+        endpoint: &str,
+        role: crate::steam_driver::DefaultRole,
+    ) -> Result<(), crate::steam_driver::DriverFailure> {
+        PolicyConfig::new()
+            .and_then(|policy| policy.set_default(endpoint, steam_driver_route_role(role)))
+            .map_err(|_| {
+                crate::steam_driver::DriverFailure::new("steam_driver_route_restore_failed")
+            })
+    }
+}
+
+fn install_steam_driver_inf() -> Result<(), crate::steam_driver::DriverFailure> {
+    let common_files = std::env::var_os("CommonProgramFiles(x86)").ok_or_else(|| {
+        crate::steam_driver::DriverFailure::new("steam_driver_common_files_unavailable")
+    })?;
+    let inf_path =
+        crate::steam_driver::steam_driver_inf_path(&std::path::PathBuf::from(common_files));
+    if !inf_path.is_file() {
+        return Err(crate::steam_driver::DriverFailure::new(
+            "steam_driver_inf_not_found",
+        ));
+    }
+    let wide_path: Vec<u16> = inf_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let library_name: Vec<u16> = "newdev.dll".encode_utf16().chain(Some(0)).collect();
+    // SAFETY: the library name is fixed and loading is restricted to System32,
+    // so the current directory and PATH cannot provide a replacement DLL.
+    let library = unsafe {
+        LoadLibraryExW(
+            library_name.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if library.is_null() {
+        let error = unsafe { GetLastError() };
+        return Err(native_install_failure(error));
+    }
+
+    // SAFETY: the module is a live System32 newdev.dll handle and the symbol
+    // name is a static NUL-terminated export name.
+    let symbol = unsafe { GetProcAddress(library, b"DiInstallDriverW\0".as_ptr().cast()) };
+    let Some(symbol) = symbol else {
+        let error = unsafe { GetLastError() };
+        unsafe { FreeLibrary(library) };
+        return Err(crate::steam_driver::DriverFailure::native(
+            "steam_driver_installer_unavailable",
+            error,
+        ));
+    };
+    type InstallDriver = unsafe extern "system" fn(*mut c_void, *const u16, u32, *mut i32) -> i32;
+    // SAFETY: DiInstallDriverW has the documented BOOL(HWND, PCWSTR, DWORD,
+    // PBOOL) system ABI. The symbol comes from newdev.dll on the active Windows
+    // process architecture, and the exact signature is checked by the call.
+    let install_driver: InstallDriver = unsafe { std::mem::transmute(symbol) };
+    let mut _needs_reboot = 0;
+    // SAFETY: the INF path is NUL-terminated UTF-16 and remains live through
+    // the call; a null parent HWND and zero flags request normal installation.
+    let installed = unsafe {
+        install_driver(
+            std::ptr::null_mut(),
+            wide_path.as_ptr(),
+            0,
+            &mut _needs_reboot,
+        )
+    };
+    let error = if installed == 0 {
+        Some(unsafe { GetLastError() })
+    } else {
+        None
+    };
+    // SAFETY: this function owns the reference returned by LoadLibraryExW and
+    // no API call is in flight after DiInstallDriverW returns.
+    unsafe { FreeLibrary(library) };
+    error.map_or(Ok(()), |error| Err(native_install_failure(error)))
+}
+
+fn native_install_failure(error: u32) -> crate::steam_driver::DriverFailure {
+    let code = match error {
+        ERROR_ACCESS_DENIED => "steam_driver_access_denied",
+        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => "steam_driver_inf_not_found",
+        _ => "steam_driver_install_failed",
+    };
+    crate::steam_driver::DriverFailure::native(code, error)
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LoadLibraryExW(file_name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const i8) -> Option<unsafe extern "system" fn()>;
+    fn FreeLibrary(module: *mut c_void) -> i32;
+    fn GetLastError() -> u32;
 }
 
 fn retry_pending_route_restore_once() -> bool {

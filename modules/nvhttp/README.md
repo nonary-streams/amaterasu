@@ -696,3 +696,20 @@ authority fields and genuine disabled-feature codec availability. It opens only
 a loopback management listener. It does not qualify public stream projection,
 capture or playback; native software encode and independent decode have separate
 opt-in tests in `amaterasu-encode`.
+
+## Steam Streaming Speakers driver policy
+
+Product document v25 stores the global boolean `install_steam_audio_drivers`;
+documents v1 through v24 migrate with it enabled. Updates accept only `true` or
+`false`, participate in the product revision compare-and-swap, and are returned
+by both the signed settings read and update. The setting is intentionally absent
+from application and paired-client override schemas.
+
+After the durable document loads or changes, NVHTTP sends the setting and
+revision to `amaterasu.audio/1` asynchronously. Provider unavailability is
+retried and does not fail NVHTTP startup or block an otherwise successful
+settings write. Windows performs best-effort installation only when the active
+Steam Streaming Speakers endpoint is absent. Installer and conditional default
+role restoration status is available through `POST /v1/media/audio_driver_status`
+with an empty object and `media.read`. Machine installation and Windows default
+route behavior still require native Windows qualification.

@@ -189,6 +189,7 @@ namespace Amaterasu {
     configured_audio_sink: string | null;
     configured_virtual_sink: string | null;
     audio_sink_capture_only: boolean;
+    install_steam_audio_drivers: boolean;
     configured_nvenc_preset: number;
     configured_nvenc_h264_cavlc: boolean;
     configured_nvenc_twopass: NvencTwoPass;
@@ -219,6 +220,22 @@ namespace Amaterasu {
     active_rtsp_port: number | null;
     listener_error: string | null;
     rtsp_listener_error: string | null;
+  }
+  export interface SteamAudioDriverInstallStatus {
+    enabled: boolean;
+    revision: number | null;
+    state: "awaiting_configuration" | "disabled" | "checking" | "already_present" |
+      "installed" | "installed_with_route_restore_errors" | "installed_endpoint_unavailable" |
+      "error" | "unsupported_platform";
+    error_code: string | null;
+    native_error: number | null;
+    endpoint: string | null;
+    restored_roles: string[];
+    restore_failures: Array<{
+      role: string;
+      error_code: string;
+      native_error: number | null;
+    }>;
   }
   export interface SteamSettings {
     ok: true;

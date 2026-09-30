@@ -106,6 +106,10 @@ impl ContinuousAudio {
 
 pub enum Operation {
     Enumerate,
+    ConfigureSteamDriverInstall {
+        enabled: bool,
+        revision: u64,
+    },
     Open {
         endpoint: String,
         virtual_sink: Option<String>,
@@ -138,6 +142,10 @@ pub enum Operation {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum OperationInput {
     Enumerate,
+    ConfigureSteamDriverInstall {
+        enabled: bool,
+        revision: u64,
+    },
     Open {
         endpoint: String,
         #[serde(default)]
@@ -172,6 +180,9 @@ impl<'de> Deserialize<'de> for Operation {
     {
         Ok(match OperationInput::deserialize(deserializer)? {
             OperationInput::Enumerate => Self::Enumerate,
+            OperationInput::ConfigureSteamDriverInstall { enabled, revision } => {
+                Self::ConfigureSteamDriverInstall { enabled, revision }
+            }
             OperationInput::Open {
                 endpoint,
                 virtual_sink,
@@ -228,4 +239,42 @@ pub fn validate_operation(operation: &str) -> AudioResult<()> {
         return Err("invalid_operation_id");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Operation;
+
+    #[test]
+    fn steam_driver_configuration_request_is_strict_and_revisioned() {
+        let operation: Operation = serde_json::from_value(serde_json::json!({
+            "action":"configure_steam_driver_install",
+            "enabled":true,
+            "revision":9,
+        }))
+        .unwrap();
+        assert!(matches!(
+            operation,
+            Operation::ConfigureSteamDriverInstall {
+                enabled: true,
+                revision: 9
+            }
+        ));
+        assert!(
+            serde_json::from_value::<Operation>(serde_json::json!({
+                "action":"configure_steam_driver_install",
+                "enabled":true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<Operation>(serde_json::json!({
+                "action":"configure_steam_driver_install",
+                "enabled":true,
+                "revision":9,
+                "path":"C:/untrusted.inf",
+            }))
+            .is_err()
+        );
+    }
 }

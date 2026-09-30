@@ -1,6 +1,7 @@
 //! Bounded HTTP/TLS transport for Moonlight-compatible control and pairing.
 #![recursion_limit = "256"]
 
+mod audio_driver_install;
 mod frame_limiter;
 pub mod global_flags;
 mod launch;
@@ -121,6 +122,8 @@ enum Operation {
         #[serde(default, deserialize_with = "deserialize_field_update")]
         audio_sink_capture_only: FieldUpdate<bool>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
+        install_steam_audio_drivers: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
         nvenc_spatial_aq: FieldUpdate<bool>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         nvenc_preset: FieldUpdate<i32>,
@@ -237,6 +240,7 @@ struct NvhttpModule {
     management_exposure: upnp::ManagementExposure,
     next_listener_rebind: Instant,
     listener_rebind_delay: Duration,
+    audio_driver_install: audio_driver_install::AudioDriverInstallSync,
 }
 
 impl ManagedModule for NvhttpModule {
@@ -305,6 +309,7 @@ impl ManagedModule for NvhttpModule {
             management_exposure: upnp::ManagementExposure::default(),
             next_listener_rebind: Instant::now(),
             listener_rebind_delay: Duration::from_secs(1),
+            audio_driver_install: audio_driver_install::AudioDriverInstallSync::default(),
         })
     }
 
@@ -324,6 +329,12 @@ impl ManagedModule for NvhttpModule {
                 self.next_listener_rebind = Instant::now();
             }
         }
+        self.audio_driver_install.tick(
+            &self.runtime,
+            self.product_settings.loaded(),
+            self.product_settings.revision(),
+            self.product_settings.install_steam_audio_drivers(),
+        )?;
         if let Some(router) = &mut self.router {
             // Apply settings before completing management writes and before dispatching
             // HTTP requests later in this tick, so a returned update is launch-visible.
@@ -642,6 +653,7 @@ impl NvhttpModule {
                                 audio_sink,
                                 virtual_sink,
                                 audio_sink_capture_only,
+                                install_steam_audio_drivers,
                                 nvenc_spatial_aq,
                                 nvenc_preset,
                                 nvenc_h264_cavlc,
@@ -718,6 +730,7 @@ impl NvhttpModule {
                                     audio_sink,
                                     virtual_sink,
                                     audio_sink_capture_only,
+                                    install_steam_audio_drivers,
                                     nvenc_spatial_aq,
                                     nvenc_settings: NvencSettingsUpdate {
                                         nvenc_preset,

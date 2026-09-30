@@ -737,6 +737,20 @@ fn enabled_host_audio_policy_is_forwarded_and_reported_in_status() {
 }
 
 #[test]
+fn steam_driver_install_configuration_is_restricted_to_nvhttp() {
+    let mut controller = Controller::new(true);
+    let operation = Operation::ConfigureSteamDriverInstall {
+        enabled: true,
+        revision: 7,
+    };
+
+    assert_eq!(
+        controller.handle("amaterasu.management", operation).err(),
+        Some("permission_denied")
+    );
+}
+
+#[test]
 fn status_reports_recovering_until_capture_produces_a_recovered_packet() {
     let (mut controller, observed) = controller(true);
     controller.handle("alice", open()).unwrap();

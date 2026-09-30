@@ -2286,6 +2286,7 @@ function nvhttpHostSettings(revision = 8) {
     configured_max_bitrate: null, configured_minimum_fps_target: null,
     configured_ping_timeout_ms: null, configured_audio_sink: null,
     configured_virtual_sink: null, audio_sink_capture_only: false,
+    install_steam_audio_drivers: true,
     configured_nvenc_preset: 1, configured_nvenc_h264_cavlc: false,
     configured_nvenc_twopass: "quarter_res", configured_nvenc_vbv_increase: 0,
     configured_nvenc_split_encode: "auto", configured_nvenc_realtime_hags: true,
@@ -2313,7 +2314,8 @@ function nvhttpHostUpdate() {
     video_max_batch_size_kb: null, max_bitrate: null,
     minimum_fps_target: null, ping_timeout_ms: -1,
     audio_sink: null, virtual_sink: "",
-    audio_sink_capture_only: false, external_ip: null,
+    audio_sink_capture_only: false, install_steam_audio_drivers: true,
+    external_ip: null,
     nvenc_preset: 7, nvenc_h264_cavlc: true, nvenc_twopass: "full_res",
     nvenc_vbv_increase: 400, nvenc_split_encode: "disabled",
     nvenc_realtime_hags: false, nvenc_opengl_vulkan_on_dxgi: false,
@@ -2397,6 +2399,55 @@ test("Moonlight settings require and round-trip UPnP and global FEC selections",
   assert.throws(() => context.Amaterasu.parseNvhttpSettingsReply(invalidFec), /reply is invalid/);
   const invalidEncryption = { ...current, wan_encryption_mode: 3 };
   assert.throws(() => context.Amaterasu.parseNvhttpSettingsReply(invalidEncryption), /reply is invalid/);
+});
+
+test("Moonlight global Steam audio driver policy is saved and status is validated", async () => {
+  const current = nvhttpHostSettings();
+  const values = { ...nvhttpHostUpdate(), install_steam_audio_drivers: false };
+  const updated = { ...nvhttpUpdatedHost(), install_steam_audio_drivers: false };
+  const saved = await context.Amaterasu.saveNvhttpHostSettings({
+    async post(route) { return route === "nvhttp/settings_update" ? updated : updated; },
+  }, current, values);
+  assert.equal(saved.install_steam_audio_drivers, false);
+
+  const status = context.Amaterasu.parseSteamAudioDriverInstallStatus({
+    ok: true,
+    steam_driver_install: {
+      enabled: true,
+      revision: 9,
+      state: "installed",
+      error_code: null,
+      native_error: null,
+      endpoint: "{steam-endpoint}",
+      restored_roles: ["console", "communications"],
+      restore_failures: [],
+    },
+  });
+  assert.match(context.Amaterasu.steamAudioDriverInstallStatusText(status), /Restored defaults: console, communications/);
+  const timedOut = context.Amaterasu.parseSteamAudioDriverInstallStatus({
+    ok: true,
+    steam_driver_install: {
+      enabled: true,
+      revision: 10,
+      state: "installed_endpoint_unavailable",
+      error_code: null,
+      native_error: null,
+      endpoint: null,
+      restored_roles: ["console"],
+      restore_failures: [{ role: "communications", error_code: "route_restore_failed", native_error: null }],
+    },
+  });
+  assert.match(context.Amaterasu.steamAudioDriverInstallStatusText(timedOut), /30-second wait expired/);
+  assert.match(context.Amaterasu.steamAudioDriverInstallStatusText(timedOut), /Restored defaults: console/);
+  assert.match(context.Amaterasu.steamAudioDriverInstallStatusText(timedOut), /restoration errors: communications/);
+  assert.throws(() => context.Amaterasu.parseSteamAudioDriverInstallStatus({
+    ok: true,
+    steam_driver_install: { enabled: true, state: "error", restore_failures: [] },
+  }), /reply is invalid/);
+  assert.throws(() => context.Amaterasu.parseNvhttpSettingsReply({
+    ...current,
+    install_steam_audio_drivers: undefined,
+  }), /reply is invalid/);
 });
 
 test("Moonlight host editor confirms updated LAN and WAN encryption modes", async () => {

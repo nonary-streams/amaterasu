@@ -47,6 +47,30 @@ fn every_profile_contains_unique_providers_and_all_dependencies() {
 }
 
 #[test]
+fn nvhttp_policy_sync_and_management_audio_status_keep_the_provider_call_grant() {
+    assert!(NVHTTP.calls.contains(&"amaterasu.audio/1"));
+    assert!(MANAGEMENT.calls.contains(&"amaterasu.audio/1"));
+    for profile in [
+        PackageProfile::Platform,
+        PackageProfile::StreamProbe,
+        PackageProfile::SoftwareProbe,
+        PackageProfile::LinuxProbe,
+    ] {
+        let components = profile.components();
+        let nvhttp = components
+            .iter()
+            .find(|component| component.id == NVHTTP.id)
+            .unwrap();
+        let management = components
+            .iter()
+            .find(|component| component.id == MANAGEMENT.id)
+            .unwrap();
+        assert!(nvhttp.calls.contains(&"amaterasu.audio/1"));
+        assert!(management.calls.contains(&"amaterasu.audio/1"));
+    }
+}
+
+#[test]
 fn host_metrics_has_the_delegated_configuration_state_grant() {
     for profile in [
         PackageProfile::Platform,

@@ -9,6 +9,8 @@ mod packet;
 mod platform;
 #[cfg(any(windows, test))]
 mod route_policy;
+#[cfg(any(windows, test))]
+mod steam_driver;
 mod virtual_sink;
 mod worker;
 

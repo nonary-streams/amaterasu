@@ -2053,6 +2053,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "audio_sink",
                     "virtual_sink",
                     "audio_sink_capture_only",
+                    "install_steam_audio_drivers",
                     "external_ip",
                     "wgc_pacing_smoothing",
                     "nvenc_spatial_aq",
@@ -2177,6 +2178,12 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             }
             if object
                 .get("audio_sink_capture_only")
+                .is_some_and(|value| value.as_bool().is_none())
+            {
+                return Err(INVALID);
+            }
+            if object
+                .get("install_steam_audio_drivers")
                 .is_some_and(|value| value.as_bool().is_none())
             {
                 return Err(INVALID);
@@ -2568,6 +2575,53 @@ mod nvhttp_tests {
                 "{payload}"
             );
         }
+    }
+
+    #[test]
+    fn steam_audio_driver_install_policy_is_global_and_accepts_only_booleans() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        for value in [serde_json::json!(true), serde_json::json!(false)] {
+            let payload = serde_json::json!({
+                "hostname":"Host", "port":47989, "expected_revision":0,
+                "install_steam_audio_drivers":value,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_ok(),
+                "{payload}"
+            );
+        }
+        for value in [
+            Value::Null,
+            serde_json::json!(1),
+            serde_json::json!("enabled"),
+        ] {
+            let payload = serde_json::json!({
+                "hostname":"Host", "port":47989, "expected_revision":0,
+                "install_steam_audio_drivers":value,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_err(),
+                "{payload}"
+            );
+        }
+
+        let paired_route = Route {
+            service: "amaterasu.pairing/1",
+            action: "update_client_config_overrides",
+            scope: Some("pairing.admin"),
+            requires_empty_body: false,
+        };
+        let paired = serde_json::json!({
+            "certificate_id":"a".repeat(64),
+            "expected_revision":7,
+            "config_overrides":{"install_steam_audio_drivers":false},
+        });
+        assert!(validate(paired_route, paired.as_object().unwrap()).is_err());
     }
 
     #[test]

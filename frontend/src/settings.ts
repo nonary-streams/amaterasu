@@ -363,6 +363,7 @@ namespace Amaterasu {
     if (reply.ok !== true || !Number.isSafeInteger(reply.revision) || (reply.revision as number) < 0 ||
         typeof reply.configured_hostname !== "string" ||
         typeof reply.upnp !== "boolean" ||
+        typeof reply.install_steam_audio_drivers !== "boolean" ||
         ![0, 1, 2].includes(reply.lan_encryption_mode as number) ||
         ![0, 1, 2].includes(reply.wan_encryption_mode as number) ||
         !["disabled", "active", "waiting_for_ipv4_listener", "waiting_for_gateway_route", "waiting_for_listener", "error"].includes(String(reply.upnp_status)) ||
@@ -391,6 +392,51 @@ namespace Amaterasu {
         !Array.isArray(reply.configured_global_preparation))
       throw new Error("Moonlight host settings reply is invalid.");
     return reply as unknown as NvhttpSettings;
+  }
+
+  export function parseSteamAudioDriverInstallStatus(value: unknown): SteamAudioDriverInstallStatus {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Steam audio driver status reply is invalid.");
+    const reply = value as Record<string, unknown>;
+    const status = reply.steam_driver_install;
+    if (reply.ok !== true || status === null || typeof status !== "object" || Array.isArray(status))
+      throw new Error("Steam audio driver status reply is invalid.");
+    const fields = status as Record<string, unknown>;
+    const states = ["awaiting_configuration", "disabled", "checking", "already_present", "installed",
+      "installed_with_route_restore_errors", "installed_endpoint_unavailable", "error", "unsupported_platform"];
+    if (typeof fields.enabled !== "boolean" ||
+        !(fields.revision === null || Number.isSafeInteger(fields.revision)) ||
+        !states.includes(String(fields.state)) ||
+        !(fields.error_code === null || typeof fields.error_code === "string") ||
+        !(fields.native_error === null || Number.isSafeInteger(fields.native_error)) ||
+        !(fields.endpoint === null || typeof fields.endpoint === "string") ||
+        !Array.isArray(fields.restored_roles) || fields.restored_roles.some((role) => typeof role !== "string") ||
+        !Array.isArray(fields.restore_failures) || fields.restore_failures.some((failure) =>
+          !failure || typeof failure !== "object" || Array.isArray(failure) ||
+          typeof (failure as Record<string, unknown>).role !== "string" ||
+          typeof (failure as Record<string, unknown>).error_code !== "string" ||
+          !((failure as Record<string, unknown>).native_error === null ||
+            Number.isSafeInteger((failure as Record<string, unknown>).native_error))))
+      throw new Error("Steam audio driver status reply is invalid.");
+    return fields as unknown as SteamAudioDriverInstallStatus;
+  }
+
+  export function steamAudioDriverInstallStatusText(status: SteamAudioDriverInstallStatus): string {
+    if (status.state === "unsupported_platform")
+      return "Steam Streaming Speakers installation is available on Windows only.";
+    if (status.state === "disabled")
+      return "Automatic Steam Streaming Speakers driver installation is disabled.";
+    if (status.state === "awaiting_configuration" || status.state === "checking")
+      return "Steam Streaming Speakers driver status is being checked.";
+    if (status.state === "already_present")
+      return `Steam Streaming Speakers is already available${status.endpoint ? ` (${status.endpoint})` : ""}.`;
+    if (status.state === "installed")
+      return `Steam Streaming Speakers driver installed${status.endpoint ? ` (${status.endpoint})` : ""}. Restored defaults: ${status.restored_roles.join(", ") || "none"}.`;
+    if (status.state === "installed_with_route_restore_errors")
+      return `Steam Streaming Speakers driver installed, but default endpoint restoration reported errors for ${status.restore_failures.map((failure) => failure.role).join(", ")}.`;
+    if (status.state === "installed_endpoint_unavailable")
+      return `Steam's installer completed, but the Speakers endpoint did not become active before the 30-second wait expired. Restored defaults: ${status.restored_roles.join(", ") || "none"}${status.restore_failures.length ? `; restoration errors: ${status.restore_failures.map((failure) => failure.role).join(", ")}` : ""}.`;
+    return `Steam Streaming Speakers driver installation failed${status.error_code ? ` (${status.error_code})` : ""}${status.native_error === null ? "" : `, Windows error ${status.native_error}`}.`;
   }
 
   function nvencSparseBooleanSelect(
@@ -509,7 +555,7 @@ namespace Amaterasu {
     current: NvhttpSettings,
     values: Payload,
   ): Promise<NvhttpSettings> {
-    const preserved = ["port", "stream_audio", "audio_sink_capture_only", "nvenc_spatial_aq",
+    const preserved = ["port", "stream_audio", "audio_sink_capture_only", "install_steam_audio_drivers", "nvenc_spatial_aq",
       "lan_encryption_mode", "wan_encryption_mode"];
     const expected: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(current))
@@ -535,6 +581,7 @@ namespace Amaterasu {
       configured_audio_sink: values.audio_sink,
       configured_virtual_sink: values.virtual_sink,
       audio_sink_capture_only: values.audio_sink_capture_only,
+      install_steam_audio_drivers: values.install_steam_audio_drivers,
       configured_external_ip: values.external_ip,
       configured_wgc_pacing_smoothing: values.wgc_pacing_smoothing,
       configured_global_preparation: normalizedPreparationSteps(values.global_preparation),
@@ -3893,6 +3940,24 @@ namespace Amaterasu {
         updateGlobalPreparationValidation();
         const audioSinkCaptureOnly = input("audio_sink_capture_only", "", "checkbox");
         audioSinkCaptureOnly.checked = settings.audio_sink_capture_only;
+        const installSteamAudioDrivers = input("install_steam_audio_drivers", "", "checkbox");
+        installSteamAudioDrivers.checked = settings.install_steam_audio_drivers;
+        const steamAudioDriverStatus = el("p", "muted", "Steam Streaming Speakers driver status requires media.read.");
+        if (context.api.allows("media.read")) {
+          try {
+            const driverStatus = parseSteamAudioDriverInstallStatus(
+              await context.api.post<unknown>("media/audio_driver_status"),
+            );
+            if (!context.content.isConnected || !hostLoads.isCurrent(generation)) return;
+            steamAudioDriverStatus.className = driverStatus.state === "error" ||
+              driverStatus.state === "installed_with_route_restore_errors" ||
+              (driverStatus.state === "installed_endpoint_unavailable" && driverStatus.restore_failures.length > 0)
+              ? "error" : "muted";
+            steamAudioDriverStatus.textContent = steamAudioDriverInstallStatusText(driverStatus);
+          } catch {
+            steamAudioDriverStatus.textContent = "Steam Streaming Speakers driver status could not be read.";
+          }
+        }
         const externalIp = input("external_ip", settings.configured_external_ip ?? "");
         externalIp.maxLength = 4096;
         const encryptionChoices: Array<[string, string]> = [
@@ -4045,6 +4110,8 @@ namespace Amaterasu {
           ),
           globalPreparationValidation,
           field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."),
+          field("Install Steam Streaming Speakers driver when missing", installSteamAudioDrivers, "Enabled by default on Windows. Amaterasu best-effort installs Steam's x64 INF from Common Files when the endpoint is missing. Installer failures do not block streaming. Default roles are restored only when they remain on Steam's endpoint. Disabling does not cancel a Windows installation already in progress; its endpoint check and route cleanup finish."),
+          steamAudioDriverStatus,
           field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."),
           field("LAN video encryption", lanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for LAN peers. Applies to new streams."),
           field("WAN video encryption", wanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for WAN peers. Applies to new streams."),
@@ -4115,6 +4182,7 @@ namespace Amaterasu {
               audio_sink: parseAudioSinkSelection(audioSink.value),
               virtual_sink: parseVirtualSinkSelection(virtualSinkEnabled.checked, virtualSink.value),
               audio_sink_capture_only: audioSinkCaptureOnly.checked,
+              install_steam_audio_drivers: installSteamAudioDrivers.checked,
               external_ip: parseExternalIp(externalIp.value),
               lan_encryption_mode: parseEncryptionMode(lanEncryptionMode.value),
               wan_encryption_mode: parseEncryptionMode(wanEncryptionMode.value),

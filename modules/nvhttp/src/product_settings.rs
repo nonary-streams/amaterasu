@@ -44,7 +44,8 @@ const UPNP_SETTINGS_VERSION: u64 = 21;
 const QP_SETTINGS_VERSION: u64 = 22;
 const FEC_SETTINGS_VERSION: u64 = 23;
 const NVENC_SETTINGS_VERSION: u64 = 24;
-const SETTINGS_VERSION: u64 = NVENC_SETTINGS_VERSION;
+const STEAM_AUDIO_DRIVER_SETTINGS_VERSION: u64 = 25;
+const SETTINGS_VERSION: u64 = STEAM_AUDIO_DRIVER_SETTINGS_VERSION;
 const DISPLAY_POLICY_KEYS: [&str; 8] = [
     "dd_mode_remapping",
     "dd_resolution_option",
@@ -77,6 +78,7 @@ pub(crate) enum AdminAction {
         audio_sink: FieldUpdate<String>,
         virtual_sink: FieldUpdate<String>,
         audio_sink_capture_only: FieldUpdate<bool>,
+        install_steam_audio_drivers: FieldUpdate<bool>,
         nvenc_spatial_aq: FieldUpdate<bool>,
         external_ip: FieldUpdate<String>,
         stream_audio: FieldUpdate<bool>,
@@ -555,6 +557,7 @@ struct UpdatePurpose {
     audio_sink: Option<String>,
     virtual_sink: Option<String>,
     audio_sink_capture_only: bool,
+    install_steam_audio_drivers: bool,
     nvenc_spatial_aq: bool,
     external_ip: Option<String>,
     stream_audio: bool,
@@ -606,6 +609,7 @@ struct ProductDocument {
     audio_sink: Option<String>,
     virtual_sink: Option<String>,
     audio_sink_capture_only: bool,
+    install_steam_audio_drivers: bool,
     nvenc_spatial_aq: bool,
     external_ip: Option<String>,
     stream_audio: bool,
@@ -633,6 +637,7 @@ struct ProductStreamingSettings {
     audio_sink: Option<String>,
     virtual_sink: Option<String>,
     audio_sink_capture_only: bool,
+    install_steam_audio_drivers: bool,
     nvenc_spatial_aq: bool,
     external_ip: Option<String>,
     stream_audio: bool,
@@ -695,6 +700,7 @@ pub struct ProductSettings {
     configured_audio_sink: Option<String>,
     configured_virtual_sink: Option<String>,
     audio_sink_capture_only: bool,
+    install_steam_audio_drivers: bool,
     nvenc_spatial_aq: bool,
     configured_external_ip: Option<String>,
     configured_capture: CaptureMode,
@@ -815,6 +821,7 @@ impl ProductSettings {
             configured_audio_sink: None,
             configured_virtual_sink: None,
             audio_sink_capture_only: false,
+            install_steam_audio_drivers: true,
             nvenc_spatial_aq: false,
             configured_external_ip: None,
             configured_capture: CaptureMode::Auto,
@@ -901,6 +908,10 @@ impl ProductSettings {
 
     pub fn audio_sink_capture_only(&self) -> bool {
         self.audio_sink_capture_only
+    }
+
+    pub fn install_steam_audio_drivers(&self) -> bool {
+        self.install_steam_audio_drivers
     }
 
     pub fn effective_audio_sink(&self) -> &str {
@@ -1499,6 +1510,7 @@ impl ProductSettings {
                 audio_sink,
                 virtual_sink,
                 audio_sink_capture_only,
+                install_steam_audio_drivers,
                 nvenc_spatial_aq,
                 external_ip,
                 stream_audio,
@@ -1583,6 +1595,22 @@ impl ProductSettings {
                             failure(
                                 "invalid_audio_sink_capture_only",
                                 "audio_sink_capture_only must be a boolean",
+                            ),
+                        );
+                        return;
+                    }
+                };
+                let install_steam_audio_drivers = match apply_boolean_update(
+                    install_steam_audio_drivers,
+                    self.install_steam_audio_drivers,
+                ) {
+                    Ok(value) => value,
+                    Err(()) => {
+                        self.queue_completion(
+                            request.request,
+                            failure(
+                                "invalid_install_steam_audio_drivers",
+                                "install_steam_audio_drivers must be a boolean",
                             ),
                         );
                         return;
@@ -1870,6 +1898,7 @@ impl ProductSettings {
                             audio_sink: audio_sink.clone(),
                             virtual_sink: virtual_sink.clone(),
                             audio_sink_capture_only,
+                            install_steam_audio_drivers,
                             nvenc_spatial_aq,
                             external_ip: external_ip.clone(),
                             stream_audio,
@@ -1902,6 +1931,7 @@ impl ProductSettings {
                         audio_sink,
                         virtual_sink,
                         audio_sink_capture_only,
+                        install_steam_audio_drivers,
                         nvenc_spatial_aq,
                         external_ip,
                         stream_audio,
@@ -2037,6 +2067,7 @@ impl ProductSettings {
                     audio_sink,
                     virtual_sink,
                     audio_sink_capture_only,
+                    install_steam_audio_drivers,
                     nvenc_spatial_aq,
                     external_ip,
                     stream_audio,
@@ -2070,6 +2101,7 @@ impl ProductSettings {
                             audio_sink: audio_sink.as_deref(),
                             virtual_sink: virtual_sink.as_deref(),
                             audio_sink_capture_only,
+                            install_steam_audio_drivers,
                             nvenc_spatial_aq,
                             external_ip: external_ip.as_deref(),
                             stream_audio,
@@ -2404,6 +2436,7 @@ impl ProductSettings {
         self.configured_audio_sink = document.audio_sink;
         self.configured_virtual_sink = document.virtual_sink;
         self.audio_sink_capture_only = document.audio_sink_capture_only;
+        self.install_steam_audio_drivers = document.install_steam_audio_drivers;
         self.nvenc_spatial_aq = document.nvenc_spatial_aq;
         self.configured_external_ip = document.external_ip;
         self.stream_audio = document.stream_audio;
@@ -2450,6 +2483,7 @@ impl ProductSettings {
                 "configured_output_name":self.configured_output_name,
                 "configured_audio_sink":self.configured_audio_sink,
                 "configured_virtual_sink":self.configured_virtual_sink,
+                "install_steam_audio_drivers":self.install_steam_audio_drivers,
                 "nvenc_spatial_aq":self.nvenc_spatial_aq,
             }),
             json!({
@@ -2580,6 +2614,7 @@ pub fn default_document(settings: &Settings) -> Result<Value, &'static str> {
             audio_sink: None,
             virtual_sink: None,
             audio_sink_capture_only: false,
+            install_steam_audio_drivers: true,
             nvenc_spatial_aq: false,
             external_ip: None,
             stream_audio: true,
@@ -2650,6 +2685,7 @@ fn product_update_payload(
         "audio_sink":streaming.audio_sink,
         "virtual_sink":streaming.virtual_sink,
         "audio_sink_capture_only":streaming.audio_sink_capture_only,
+        "install_steam_audio_drivers":streaming.install_steam_audio_drivers,
         "nvenc_spatial_aq":streaming.nvenc_spatial_aq,
         "external_ip":streaming.external_ip,
         "stream_audio":streaming.stream_audio,
@@ -2784,6 +2820,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             audio_sink: None,
             virtual_sink: None,
             audio_sink_capture_only: false,
+            install_steam_audio_drivers: true,
             nvenc_spatial_aq: false,
             external_ip: None,
             stream_audio: true,
@@ -2837,6 +2874,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | QP_SETTINGS_VERSION
             | FEC_SETTINGS_VERSION
             | NVENC_SETTINGS_VERSION
+            | STEAM_AUDIO_DRIVER_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -2868,6 +2906,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         QP_SETTINGS_VERSION => 46,
         FEC_SETTINGS_VERSION => 47,
         NVENC_SETTINGS_VERSION => 56,
+        STEAM_AUDIO_DRIVER_SETTINGS_VERSION => 57,
         _ => unreachable!(),
     };
     let matches_expected_value_count = values.len() == expected_value_count
@@ -2919,6 +2958,8 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
                 .iter()
                 .any(|key| !values.contains_key(*key)))
         || (version >= UPNP_SETTINGS_VERSION && !values.contains_key("upnp"))
+        || (version >= STEAM_AUDIO_DRIVER_SETTINGS_VERSION
+            && !values.contains_key("install_steam_audio_drivers"))
     {
         return Err(invalid_state(
             "product settings contain unknown or missing values",
@@ -3129,6 +3170,16 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         false
     };
+    let install_steam_audio_drivers = if version >= STEAM_AUDIO_DRIVER_SETTINGS_VERSION {
+        values
+            .get("install_steam_audio_drivers")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                invalid_state("persisted install_steam_audio_drivers is not a boolean")
+            })?
+    } else {
+        true
+    };
     let nvenc_spatial_aq_update = if version >= GLOBAL_RAW_PREPARATION_SETTINGS_VERSION {
         parse_nvenc_spatial_aq_update(values.get("nvenc_spatial_aq"))
             .map_err(|()| invalid_state("persisted nvenc_spatial_aq is not a boolean"))?
@@ -3235,6 +3286,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         audio_sink,
         virtual_sink,
         audio_sink_capture_only,
+        install_steam_audio_drivers,
         nvenc_spatial_aq,
         external_ip,
         stream_audio,
@@ -3267,6 +3319,7 @@ struct UpdateExpectation<'a> {
     audio_sink: Option<&'a str>,
     virtual_sink: Option<&'a str>,
     audio_sink_capture_only: bool,
+    install_steam_audio_drivers: bool,
     nvenc_spatial_aq: bool,
     external_ip: Option<&'a str>,
     stream_audio: bool,
@@ -3297,7 +3350,7 @@ fn update_result(
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
-        return Err(invalid_state("product_update did not confirm v24 settings"));
+        return Err(invalid_state("product_update did not confirm v25 settings"));
     }
     let document = parse_document(payload)?;
     if document.hostname.as_deref() != Some(expected.hostname)
@@ -3308,6 +3361,7 @@ fn update_result(
         || document.audio_sink.as_deref() != expected.audio_sink
         || document.virtual_sink.as_deref() != expected.virtual_sink
         || document.audio_sink_capture_only != expected.audio_sink_capture_only
+        || document.install_steam_audio_drivers != expected.install_steam_audio_drivers
         || document.nvenc_spatial_aq != expected.nvenc_spatial_aq
         || document.external_ip.as_deref() != expected.external_ip
         || document.stream_audio != expected.stream_audio
@@ -3688,19 +3742,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_document_helpers_use_canonical_v24_defaults_and_legacy_migration() {
+    fn public_document_helpers_use_canonical_v25_defaults_and_legacy_migration() {
         let mut current = default_document(&Settings::default()).unwrap();
-        assert_eq!(current["version"], NVENC_SETTINGS_VERSION);
-        assert_eq!(current["values"].as_object().unwrap().len(), 56);
+        assert_eq!(current["version"], SETTINGS_VERSION);
+        assert_eq!(current["values"].as_object().unwrap().len(), 57);
+        assert_eq!(current["values"]["install_steam_audio_drivers"], true);
         assert_eq!(current["values"]["nvenc_preset"], 1);
         assert_eq!(current["values"]["vaapi_strict_rc_buffer"], false);
         assert!(validate_document(&current).is_ok());
+
+        let mut v24 = current.clone();
+        v24["version"] = json!(NVENC_SETTINGS_VERSION);
+        v24["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("install_steam_audio_drivers");
+        assert_eq!(v24["values"].as_object().unwrap().len(), 56);
+        assert!(validate_document(&v24).is_ok());
+        let migrated_v24 = parse_document(&v24).unwrap();
+        assert!(migrated_v24.install_steam_audio_drivers);
+        assert_eq!(migrated_v24.nvenc_settings.nvenc_preset, 1);
 
         let mut legacy = current.clone();
         legacy["version"] = json!(FEC_SETTINGS_VERSION);
         for key in NVENC_SETTINGS_KEYS {
             legacy["values"].as_object_mut().unwrap().remove(key);
         }
+        legacy["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("install_steam_audio_drivers");
         assert_eq!(legacy["values"].as_object().unwrap().len(), 47);
         assert!(validate_document(&legacy).is_ok());
 
@@ -3708,6 +3779,88 @@ mod tests {
         assert_eq!(
             validate_document(&current),
             Err("invalid_product_settings_document")
+        );
+    }
+
+    #[test]
+    fn steam_audio_driver_policy_migrates_v24_defaults_true_and_persists_globally() {
+        let mut v24 = default_document(&Settings::default()).unwrap();
+        v24["version"] = json!(NVENC_SETTINGS_VERSION);
+        v24["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("install_steam_audio_drivers");
+        v24["values"]["hostname"] = json!("Host");
+        for (key, value) in [
+            ("nvenc_preset", json!(7)),
+            ("nvenc_h264_cavlc", json!(true)),
+            ("nvenc_twopass", json!("full_res")),
+            ("nvenc_vbv_increase", json!(400)),
+            ("nvenc_split_encode", json!("disabled")),
+            ("nvenc_realtime_hags", json!(false)),
+            ("nvenc_opengl_vulkan_on_dxgi", json!(false)),
+            ("nvenc_latency_over_power", json!(false)),
+            ("vaapi_strict_rc_buffer", json!(true)),
+        ] {
+            v24["values"][key] = value;
+        }
+        let v24_values = v24["values"].clone();
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        let migrated = parse_document(&v24).unwrap();
+        assert!(migrated.install_steam_audio_drivers);
+        assert_eq!(migrated.nvenc_settings.nvenc_preset, 7);
+        product.apply_document(migrated);
+        assert!(product.install_steam_audio_drivers());
+
+        let mut action = display_update_action(DisplayPolicyUpdate::default(), 1);
+        let AdminAction::Update {
+            install_steam_audio_drivers,
+            ..
+        } = &mut action
+        else {
+            unreachable!()
+        };
+        *install_steam_audio_drivers = FieldUpdate::Value(false);
+        product.enqueue(82, 5_000, action).unwrap();
+        product.start_next();
+        let pending = product.pending.take().expect("Steam driver policy update");
+        assert_eq!(pending.payload["version"], SETTINGS_VERSION);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 57);
+        assert_eq!(
+            pending.payload["values"]["install_steam_audio_drivers"],
+            false
+        );
+        for (key, value) in v24_values.as_object().unwrap() {
+            assert_eq!(pending.payload["values"][key], *value, "v24 value {key}");
+        }
+        assert_eq!(pending.payload["values"]["nvenc_preset"], 7);
+        let response = json!({
+            "ok":true,"found":true,"version":SETTINGS_VERSION,"revision":2,
+            "values":pending.payload["values"].clone()
+        });
+        product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
+        assert!(!product.install_steam_audio_drivers());
+
+        let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        restarted.apply_document(parse_document(&response).unwrap());
+        assert!(!restarted.install_steam_audio_drivers());
+        assert_eq!(restarted.nvenc_settings().nvenc_preset, 7);
+
+        let mut invalid = display_update_action(DisplayPolicyUpdate::default(), 2);
+        let AdminAction::Update {
+            install_steam_audio_drivers,
+            ..
+        } = &mut invalid
+        else {
+            unreachable!()
+        };
+        *install_steam_audio_drivers = FieldUpdate::Null;
+        restarted.enqueue(83, 5_000, invalid).unwrap();
+        restarted.start_next();
+        assert!(restarted.pending.is_none());
+        assert_eq!(
+            restarted.completions.front().unwrap().payload["code"],
+            "invalid_install_steam_audio_drivers"
         );
     }
 
@@ -3742,6 +3895,9 @@ mod tests {
         for (key, value) in nvenc_settings_values(&NvencSettings::default()) {
             values.entry(key).or_insert(value);
         }
+        values
+            .entry("install_steam_audio_drivers")
+            .or_insert_with(|| json!(true));
         payload
     }
 
@@ -3766,6 +3922,7 @@ mod tests {
             audio_sink: FieldUpdate::Omitted,
             virtual_sink: FieldUpdate::Omitted,
             audio_sink_capture_only: FieldUpdate::Omitted,
+            install_steam_audio_drivers: FieldUpdate::Omitted,
             nvenc_spatial_aq: FieldUpdate::Omitted,
             external_ip: FieldUpdate::Omitted,
             stream_audio: FieldUpdate::Omitted,
@@ -3833,7 +3990,7 @@ mod tests {
         let pending = product.pending.take().unwrap();
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["expected_revision"], 7);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 56);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 57);
         let write = pending.payload["values"].clone();
         let response =
             json!({"ok":true,"found":true,"version":SETTINGS_VERSION,"revision":8,"values":write});
@@ -4547,6 +4704,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                install_steam_audio_drivers: true,
                 nvenc_spatial_aq: true,
                 external_ip: Some("198.51.100.7".into()),
                 stream_audio: true,
@@ -4597,6 +4755,7 @@ mod tests {
                     audio_sink: FieldUpdate::Omitted,
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
+                    install_steam_audio_drivers: FieldUpdate::Omitted,
                     nvenc_spatial_aq: FieldUpdate::Value(false),
                     external_ip: FieldUpdate::Value(external_ip.into()),
                     stream_audio: FieldUpdate::Omitted,
@@ -4745,6 +4904,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                install_steam_audio_drivers: true,
                 nvenc_spatial_aq: false,
                 external_ip: None,
                 stream_audio: true,
@@ -4808,6 +4968,7 @@ mod tests {
                         audio_sink: FieldUpdate::Omitted,
                         virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
+                        install_steam_audio_drivers: FieldUpdate::Omitted,
                         nvenc_spatial_aq: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
@@ -4917,6 +5078,7 @@ mod tests {
                     audio_sink: FieldUpdate::Omitted,
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Value(true),
+                    install_steam_audio_drivers: FieldUpdate::Omitted,
                     nvenc_spatial_aq: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
@@ -4996,6 +5158,7 @@ mod tests {
                     audio_sink: FieldUpdate::Value("render.selected".into()),
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
+                    install_steam_audio_drivers: FieldUpdate::Omitted,
                     nvenc_spatial_aq: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
@@ -5074,6 +5237,7 @@ mod tests {
                         audio_sink: FieldUpdate::Omitted,
                         virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
+                        install_steam_audio_drivers: FieldUpdate::Omitted,
                         nvenc_spatial_aq: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
@@ -5163,6 +5327,7 @@ mod tests {
                         audio_sink: FieldUpdate::Omitted,
                         virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
+                        install_steam_audio_drivers: FieldUpdate::Omitted,
                         nvenc_spatial_aq: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
@@ -5358,6 +5523,7 @@ mod tests {
             audio_sink: None,
             virtual_sink: None,
             audio_sink_capture_only: false,
+            install_steam_audio_drivers: true,
             nvenc_spatial_aq: false,
             external_ip: None,
             stream_audio: true,
@@ -5530,6 +5696,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                install_steam_audio_drivers: true,
                 nvenc_spatial_aq: product.nvenc_spatial_aq,
                 external_ip: None,
                 stream_audio: true,
@@ -5553,7 +5720,7 @@ mod tests {
             },
         );
         assert_eq!(update["version"], SETTINGS_VERSION);
-        assert_eq!(update["values"].as_object().unwrap().len(), 56);
+        assert_eq!(update["values"].as_object().unwrap().len(), 57);
         assert_eq!(update["values"]["nvenc_spatial_aq"], false);
         assert_eq!(
             update["values"]["global_preparation"]
@@ -5596,6 +5763,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                install_steam_audio_drivers: true,
                 nvenc_spatial_aq: true,
                 external_ip: None,
                 stream_audio: true,
@@ -5688,6 +5856,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("fec_percentage");
+        old_v17["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("install_steam_audio_drivers");
         let old_v17_document = parse_document(&old_v17).unwrap();
         assert!(!old_v17_document.nvenc_spatial_aq);
         let mut old_v17_restart = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
@@ -5734,6 +5906,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                install_steam_audio_drivers: true,
                 nvenc_spatial_aq: persisted_value,
                 external_ip: None,
                 stream_audio: true,
@@ -5779,6 +5952,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                install_steam_audio_drivers: true,
                 nvenc_spatial_aq: true,
                 external_ip: None,
                 stream_audio: true,
@@ -5827,6 +6001,7 @@ mod tests {
                     audio_sink: FieldUpdate::Omitted,
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
+                    install_steam_audio_drivers: FieldUpdate::Omitted,
                     nvenc_spatial_aq: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
@@ -5965,6 +6140,7 @@ mod tests {
                     "configured_output_name":null,
                     "configured_audio_sink":null,
                     "configured_virtual_sink":null,
+                    "install_steam_audio_drivers":true,
                     "nvenc_spatial_aq":false,
                     "configured_qp":null,
                     "effective_qp":28,
@@ -6138,6 +6314,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+            install_steam_audio_drivers: true,
                 nvenc_spatial_aq: false,
                 external_ip: None,
                 stream_audio: true,
@@ -6214,6 +6391,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+            install_steam_audio_drivers: true,
                 nvenc_spatial_aq: false,
                 external_ip: None,
                 stream_audio: true,
@@ -6403,6 +6581,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+            install_steam_audio_drivers: true,
                 nvenc_spatial_aq: false,
                 external_ip: None,
                 stream_audio: true,
@@ -6527,6 +6706,7 @@ mod tests {
                         audio_sink: FieldUpdate::Omitted,
                         virtual_sink,
                         audio_sink_capture_only: FieldUpdate::Omitted,
+                        install_steam_audio_drivers: FieldUpdate::Omitted,
                         nvenc_spatial_aq: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
@@ -6673,6 +6853,7 @@ mod tests {
                         audio_sink: FieldUpdate::Omitted,
                         virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
+                        install_steam_audio_drivers: FieldUpdate::Omitted,
                         nvenc_spatial_aq: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
@@ -6773,6 +6954,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                install_steam_audio_drivers: true,
                 nvenc_spatial_aq: false,
                 external_ip: None,
                 stream_audio: false,
@@ -6819,6 +7001,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                install_steam_audio_drivers: true,
                 nvenc_spatial_aq: false,
                 external_ip: None,
                 stream_audio: true,
@@ -6916,6 +7099,7 @@ mod tests {
                         audio_sink: FieldUpdate::Omitted,
                         virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
+                        install_steam_audio_drivers: FieldUpdate::Omitted,
                         nvenc_spatial_aq: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
@@ -6999,6 +7183,7 @@ mod tests {
                     audio_sink: FieldUpdate::Omitted,
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
+                    install_steam_audio_drivers: FieldUpdate::Omitted,
                     nvenc_spatial_aq: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
@@ -7053,6 +7238,7 @@ mod tests {
                     audio_sink: FieldUpdate::Omitted,
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
+                    install_steam_audio_drivers: FieldUpdate::Omitted,
                     nvenc_spatial_aq: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Null,
@@ -7110,6 +7296,7 @@ mod tests {
                     audio_sink: FieldUpdate::Omitted,
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
+                    install_steam_audio_drivers: FieldUpdate::Omitted,
                     nvenc_spatial_aq: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
@@ -7161,6 +7348,7 @@ mod tests {
         let prior_values = prior_version["values"].as_object_mut().unwrap();
         prior_values.remove("upnp");
         prior_values.remove("fec_percentage");
+        prior_values.remove("install_steam_audio_drivers");
         prior_values.insert("sw_preset".into(), Value::Null);
         prior_values.insert("sw_tune".into(), Value::Null);
         prior_values.insert("encoder".into(), Value::Null);
@@ -7183,6 +7371,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("fec_percentage");
+        legacy["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("install_steam_audio_drivers");
         for key in ["sw_preset", "sw_tune", "encoder", "min_threads", "qp"] {
             legacy["values"].as_object_mut().unwrap().remove(key);
         }
@@ -7288,6 +7480,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("fec_percentage");
+        prior["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("install_steam_audio_drivers");
         let migrated = parse_document(&prior).unwrap();
         assert!(!migrated.upnp);
 
@@ -7329,6 +7525,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("fec_percentage");
+        version_21["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("install_steam_audio_drivers");
         let mut upgraded = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
         upgraded.apply_document(parse_document(&version_21).unwrap());
         assert!(upgraded.upnp_enabled());
@@ -7355,6 +7555,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("fec_percentage");
+        version_22["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("install_steam_audio_drivers");
         let migrated_v22 = parse_document(&version_22).unwrap();
         assert!(migrated_v22.upnp);
         assert_eq!(migrated_v22.qp, Some(41));
@@ -7430,10 +7634,14 @@ mod tests {
     }
 
     #[test]
-    fn nvenc_v23_migration_defaults_v24_cas_roundtrip_and_validation() {
+    fn nvenc_v23_migration_defaults_v25_cas_roundtrip_and_validation() {
         let mut version_23 = display_v18_document(7);
         version_23["version"] = json!(FEC_SETTINGS_VERSION);
         remove_nvenc_settings(&mut version_23);
+        version_23["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("install_steam_audio_drivers");
         let migrated = parse_document(&version_23).unwrap();
         assert_eq!(migrated.nvenc_settings, NvencSettings::default());
 
@@ -7457,13 +7665,13 @@ mod tests {
         product.enqueue(99, 5_000, action).unwrap();
         product.start_next();
         let pending = product.pending.take().expect("NVENC settings update");
-        assert_eq!(pending.payload["version"], NVENC_SETTINGS_VERSION);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 56);
+        assert_eq!(pending.payload["version"], SETTINGS_VERSION);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 57);
         assert_eq!(pending.payload["values"]["nvenc_preset"], 7);
         assert_eq!(pending.payload["values"]["nvenc_twopass"], "full_res");
         assert_eq!(pending.payload["values"]["nvenc_split_encode"], "disabled");
         let confirmation = json!({
-            "ok":true,"found":true,"version":NVENC_SETTINGS_VERSION,"revision":8,
+            "ok":true,"found":true,"version":SETTINGS_VERSION,"revision":8,
             "values":pending.payload["values"]
         });
         product.finish_call(pending.purpose, CallOutcome::Payload(confirmation.clone()));

@@ -20,6 +20,36 @@ Strict JSON controls:
 {"action":"close","stream":1}
 ```
 
+The NVHTTP product setting `install_steam_audio_drivers` defaults to `true` and
+is global-only. NVHTTP sends the loaded setting to the audio provider after
+configuration becomes available; a provider outage is retried without blocking
+NVHTTP startup or writes. On Windows, the provider checks for an active
+`Steam Streaming Speakers` render endpoint and, if absent, best-effort calls
+`DiInstallDriverW` from System32 for
+`%CommonProgramFiles(x86)%\\Steam\\drivers\\Windows10\\x64\\SteamStreamingSpeakers.inf`.
+This may require administrator access. The installer runs on a separate STA
+worker and polls for endpoint activation every 500 ms for up to 30 seconds. It
+restores Console, Multimedia, and Communications defaults only when each role
+still points at the newly installed Steam endpoint. Endpoint identity uses the
+registered Valve driver provider and Steam device/driver description metadata,
+not the user-editable endpoint name alone. If activation times out, it applies
+the same metadata check to each current default. Before every restore it reads
+the role endpoint ID again and skips the write if that ID changed after the
+identity check. Windows does not offer an atomic compare-and-set for default
+roles, so a user choice made in the final interval between that read and the
+policy write can still race. Disablement prevents future attempts; Windows does
+not provide cancellation for an in-flight `DiInstallDriverW` call, so that call
+completes and the worker finishes bounded endpoint polling and conditional
+route cleanup before it exits. Installer and route restoration failures are
+best-effort status, not audio-service startup errors. Driver-property identity
+and route behavior still need qualification on a Windows host.
+
+Only `amaterasu.nvhttp` may configure the policy through the internal
+`configure_steam_driver_install` action. The global settings editor reads the
+structured state through the management `media/audio_driver_status` route,
+which requires `media.read`. This is trusted native-module coordination, not a
+native-code sandbox.
+
 Enumeration returns `{ok:true,enabled,endpoints:[{id,name,description,adapter_name,default_multimedia}]}`
 for active render endpoints. On Linux, endpoint IDs are Pulse sink names and
 capture reads their monitor sources. Explicit endpoint IDs come from that list. With no
@@ -291,10 +321,10 @@ switch failure and rollback, role changes made by another application, device
 removal, default-device changes while capturing, and recovery after restoration
 failure. Waveform/channel correctness,
 silence, sustained backpressure, discontinuities, and cancellation while drivers
-initialize also need hardware coverage. Automatic Steam fallback has pure
-endpoint-policy tests only; it requires an active Steam Streaming Speakers
-device, which Amaterasu does not install, and has not yet been qualified on that
-hardware. An ignored Linux virtual-monitor capture test creates a private null
+initialize also need hardware coverage. Steam driver setup and conditional role
+restoration have cross-platform fake-backend tests; native `DiInstallDriverW`,
+administrator access, active endpoint discovery, and Windows route behavior
+have not been qualified on a Windows host. An ignored Linux virtual-monitor capture test creates a private null
 sink and reads its silence; it requires an accessible per-user Pulse-compatible
 server and does not prove physical-device audio. This test has not been run where
 the user sound server is inaccessible. Linux physical input/output, route
