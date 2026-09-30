@@ -15,7 +15,7 @@ is a control-only metrics service; `{"action":"status"}` returns:
 {
   "ok": true,
   "fixture": true,
-  "video": {"opened": 0, "closed": 0, "active": 0, "frames": 0, "fragments": 0, "force_idr": 0},
+  "video": {"opened": 0, "closed": 0, "active": 0, "frames": 0, "fragments": 0, "force_idr": 0, "drains": 0, "eos": 0, "last_open_policy": null},
   "audio": {"opened": 0, "closed": 0, "active": 0, "frames": 0}
 }
 ```
@@ -28,6 +28,28 @@ request; every fixture access unit already carries a keyframe flag. `drain` emit
 all remaining fixture output, then exactly one EOS. Exhausted streams return
 PENDING until drain. Close is synchronous and status/lookup then return
 `stream_not_found`.
+
+Metrics retain the last accepted video policy as exactly `encoder`, `sw_preset`
+and `sw_tune`. The selector uses the shared bounded encoder syntax and tuning
+uses the production 128/256-byte bounds, preserving empty and raw strings.
+Unrelated request fields, credentials and transport keys are never projected.
+This records a requested policy, without resolving a codec identity or validating
+installed x264 vocabulary. Replay does not create or replace an observation.
+The retained observation survives close. `drains` counts the first owned drain
+transition for each video stream; `eos` counts accepted native EOS callbacks,
+so a rejected sink and foreign drain cannot inflate those counters.
+
+`scripts/test_public_launch_workflow.py` uses this bounded observation to qualify
+software policy forwarding through signed paired HTTPS, RTSP and stream-session
+admission. It changes global/application/client policy after ticket admission
+and checks that the consumer still receives the frozen exact selector and tuning.
+It separately uses the real signed default-feature video/encode libraries to
+verify unavailable-software rejection, closed operation replay and retained
+failed history. Resolver effect tests establish that unavailable selection does
+not open capture or encoder resources. Run the signed workflow with
+`AMATERASU_ENET_CLIENT_ORACLE` pointing to the independent ENet client oracle.
+Native capture/encoding, hardware fallback, performance and client playback
+remain separate qualification gates.
 
 Each video stream emits eight 1,700-byte units with sequence `s=0..7` and timestamp
 `s*10000` microseconds. Bytes 0 through 4 are `00 00 00 01 65`; every byte at index

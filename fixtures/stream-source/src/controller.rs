@@ -1,5 +1,6 @@
 use amaterasu_media::*;
 use amaterasu_module_sdk::abi::{STATUS_OK, Status};
+use amaterasu_module_sdk::{EncoderSelection, validate_software_options};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -58,6 +59,9 @@ pub struct Controller {
     audio_opens: u64,
     video_closes: u64,
     audio_closes: u64,
+    video_drains: u64,
+    video_eos: u64,
+    last_video_policy: Option<Value>,
     force_idr: u64,
     video_fragments: u64,
     audio_packets: u64,
@@ -124,7 +128,11 @@ impl Controller {
             }
             "close" => self.close(owner, kind, stream_id(&payload)?)?,
             "drain" if kind == Kind::Video => {
-                self.owned_mut(owner, kind, stream_id(&payload)?)?.draining = true;
+                let stream = self.owned_mut(owner, kind, stream_id(&payload)?)?;
+                if !stream.draining {
+                    stream.draining = true;
+                    self.video_drains += 1;
+                }
                 json!({"ok": true})
             }
             "force_idr" if kind == Kind::Video => {
@@ -143,6 +151,9 @@ impl Controller {
 
     fn open(&mut self, owner: &str, kind: Kind, payload: Value) -> Result<Reply> {
         validate_open(kind, &payload)?;
+        let policy = (kind == Kind::Video)
+            .then(|| video_policy_snapshot(&payload))
+            .transpose()?;
         let operation = operation_id(&payload)?.map(str::to_owned);
         if let Some(operation) = &operation
             && let Some(record) = self
@@ -171,6 +182,13 @@ impl Controller {
                 geometry_failed: false,
             },
         );
+        match kind {
+            Kind::Video => {
+                self.video_opens += 1;
+                self.last_video_policy = policy;
+            }
+            Kind::Audio => self.audio_opens += 1,
+        }
         if let Some(operation) = operation {
             self.operations.insert(
                 (owner.into(), kind, operation),
@@ -179,10 +197,6 @@ impl Controller {
                     payload,
                 },
             );
-        }
-        match kind {
-            Kind::Video => self.video_opens += 1,
-            Kind::Audio => self.audio_opens += 1,
         }
         Ok((self.metadata(owner, kind, id)?, Some((kind, id))))
     }
@@ -240,7 +254,9 @@ impl Controller {
                 "opened": self.video_opens, "closed": self.video_closes,
                 "active": self.streams.values().filter(|stream| stream.kind == Kind::Video).count(),
                 "frames": self.video_fragments / 2, "fragments": self.video_fragments,
-                "force_idr": self.force_idr
+                "force_idr": self.force_idr,
+                "drains": self.video_drains, "eos": self.video_eos,
+                "last_open_policy": self.last_video_policy
             },
             "audio": {
                 "opened": self.audio_opens, "closed": self.audio_closes,
@@ -281,6 +297,7 @@ impl Controller {
             let status = unsafe { sink.send(&packet) };
             if status == STATUS_OK {
                 stream.eos = true;
+                self.video_eos += 1;
             }
             return status;
         }
@@ -353,6 +370,28 @@ impl Controller {
         }
         status
     }
+}
+
+/// Only bounded policy fields are observable; unrelated request data never enters metrics.
+fn video_policy_snapshot(payload: &Value) -> Result<Value> {
+    let encoder = match payload.get("encoder") {
+        Some(value) => {
+            let selection: EncoderSelection =
+                serde_json::from_value(value.clone()).map_err(|_| "invalid_encoder_selection")?;
+            selection.validate()?;
+            value.clone()
+        }
+        None => Value::Null,
+    };
+    let tuning = |key| match payload["configuration"].get(key) {
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        None | Some(Value::Null) => Ok(None),
+        _ => Err("invalid_software_encoder_options"),
+    };
+    let preset = tuning("sw_preset")?;
+    let tune = tuning("sw_tune")?;
+    validate_software_options(preset, tune)?;
+    Ok(json!({"encoder": encoder, "sw_preset": preset, "sw_tune": tune}))
 }
 
 fn video_bytes(sequence: u64) -> Vec<u8> {

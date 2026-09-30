@@ -128,6 +128,36 @@ fn operation_replay_is_owned_and_does_not_increment_opens() {
 }
 
 #[test]
+fn policy_observability_is_exact_bounded_and_excludes_unrelated_request_data() {
+    let mut state = Controller::default();
+    let mut request = open(Kind::Video);
+    request["encoder"] = json!("software");
+    request["configuration"] = json!({"sw_preset":"", "sw_tune":"  film,zerolatency  "});
+    request["unrelated_token"] = json!("never expose this fixture request field");
+    let expected = json!({"encoder":"software", "sw_preset":"", "sw_tune":"  film,zerolatency  "});
+    let (_, created) = state
+        .handle("alice", Kind::Video.service(), request.clone())
+        .unwrap();
+    state
+        .handle("alice", Kind::Video.service(), request.clone())
+        .unwrap();
+    assert_eq!(state.metrics()["video"]["last_open_policy"], expected);
+    assert!(!state.metrics().to_string().contains("unrelated_token"));
+    request["operation_id"] = json!("oversized");
+    request["configuration"]["sw_tune"] = json!("x".repeat(257));
+    assert!(matches!(
+        state.handle("alice", Kind::Video.service(), request),
+        Err("invalid_software_encoder_options")
+    ));
+    assert_eq!(state.metrics()["video"]["opened"], 1);
+    state
+        .close("alice", Kind::Video, created.unwrap().1)
+        .unwrap();
+    assert_eq!(state.metrics()["video"]["last_open_policy"], expected);
+    assert_eq!(state.metrics()["video"]["active"], 0);
+}
+
+#[test]
 fn fragmented_video_is_finite_retries_exactly_and_eos_waits_for_drain() {
     let mut state = Controller::default();
     let id = state
@@ -176,11 +206,25 @@ fn fragmented_video_is_finite_retries_exactly_and_eos_waits_for_drain() {
                 json!({"action": "drain", "stream": id}),
             )
             .unwrap();
+        assert!(matches!(
+            state.handle(
+                "bob",
+                Kind::Video.service(),
+                json!({"action": "drain", "stream": id}),
+            ),
+            Err("stream_not_found")
+        ));
+        output.busy = true;
+        assert_eq!(state.video("alice", id, sink), MEDIA_BUSY);
+        assert_eq!(state.metrics()["video"]["eos"], 0);
+        output.busy = false;
         assert_eq!(state.video("alice", id, sink), STATUS_OK);
         assert_eq!(output.packets.last().unwrap().1, FLAG_END_OF_STREAM);
         assert_eq!(state.video("alice", id, sink), MEDIA_PENDING);
     }
     assert_eq!(state.metrics()["video"]["frames"], 8);
+    assert_eq!(state.metrics()["video"]["drains"], 1);
+    assert_eq!(state.metrics()["video"]["eos"], 1);
 }
 
 #[test]
