@@ -179,11 +179,6 @@ pub fn response(action: SelectionAction, payload: &Value) -> (u16, Value) {
         result["width"] = json!(width);
         result["height"] = json!(height);
     }
-    if matches!(action, SelectionAction::Begin | SelectionAction::Poll)
-        && let Some(operation_id) = payload.get("operation_id").and_then(Value::as_str)
-    {
-        result["operation_id"] = json!(operation_id);
-    }
     (200, result)
 }
 
@@ -277,19 +272,22 @@ mod tests {
         assert_eq!(disabled["availability"], "unavailable");
         assert_eq!(disabled["reason"], "capture_disabled");
 
-        let (status, selection) = response(
-            SelectionAction::Poll,
-            &json!({"ok":true,"operation_id":ID,"source_type":"monitor","selection_state":"ready",
+        for action in [SelectionAction::Begin, SelectionAction::Poll] {
+            let (status, selection) = response(
+                action,
+                &json!({"ok":true,"operation_id":ID,"source_type":"monitor","selection_state":"ready",
                 "output":{"id":"opaque-output","pipewire_node":19,"width":1920,"height":1080,"format":"bgra8","bus":"secret"}}),
-        );
-        assert_eq!(status, 200);
-        assert_eq!(
-            selection,
-            json!({"ok":true,"selection_state":"ready","source_type":"monitor","reason":null,"width":1920,"height":1080,"operation_id":ID})
-        );
-        assert!(!selection.to_string().contains("opaque-output"));
-        assert!(!selection.to_string().contains("pipewire_node"));
-        assert!(!selection.to_string().contains("bus"));
+            );
+            assert_eq!(status, 200);
+            assert_eq!(
+                selection,
+                json!({"ok":true,"selection_state":"ready","source_type":"monitor","reason":null,"width":1920,"height":1080})
+            );
+            assert!(selection.get("operation_id").is_none());
+            assert!(!selection.to_string().contains("opaque-output"));
+            assert!(!selection.to_string().contains("pipewire_node"));
+            assert!(!selection.to_string().contains("bus"));
+        }
 
         let (status, cancelled) = response(SelectionAction::Cancel, &json!({"ok":true}));
         assert_eq!(status, 200);
