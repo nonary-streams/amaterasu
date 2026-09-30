@@ -304,6 +304,8 @@ impl Controller {
                         "sw_tune":record.effective_software_encoder.effective_tune(),
                         "min_threads":record.effective_software_encoder.effective_threads(),
                         "qp":record.effective_qp,
+                        "nvenc_settings":record.effective_nvenc_settings,
+                        "nvenc_spatial_aq":record.effective_nvenc_spatial_aq,
                         "frame_limiter_settings": record.executable_path.as_ref().and(record.frame_limiter_snapshot.as_ref()),
                         "frame_limiter_executable_path": record.executable_path,
                         "display_policy_snapshot": record.display_policy_snapshot,
@@ -1360,6 +1362,26 @@ fn project_application_policy(
             min_threads: application_overrides.min_threads,
         })
         .with_overrides(&record.peer.client_software_encoder);
+    let application_nvenc_settings = amaterasu_module_sdk::NvencSettingsOverrides {
+        nvenc_preset: application_overrides.nvenc_preset,
+        nvenc_h264_cavlc: application_overrides.nvenc_h264_cavlc,
+        nvenc_twopass: application_overrides.nvenc_twopass,
+        nvenc_vbv_increase: application_overrides.nvenc_vbv_increase,
+        nvenc_split_encode: application_overrides.nvenc_split_encode,
+        nvenc_realtime_hags: application_overrides.nvenc_realtime_hags,
+        nvenc_opengl_vulkan_on_dxgi: application_overrides.nvenc_opengl_vulkan_on_dxgi,
+        nvenc_latency_over_power: application_overrides.nvenc_latency_over_power,
+        vaapi_strict_rc_buffer: application_overrides.vaapi_strict_rc_buffer,
+    };
+    record.effective_nvenc_settings = record
+        .global_nvenc_settings
+        .with_overrides(&application_nvenc_settings)
+        .with_overrides(&record.peer.client_nvenc_settings);
+    record.effective_nvenc_spatial_aq = record
+        .peer
+        .client_nvenc_spatial_aq
+        .or(application_overrides.nvenc_spatial_aq)
+        .unwrap_or(record.global_nvenc_spatial_aq);
     record.effective_qp = record
         .peer
         .client_qp
@@ -1577,6 +1599,17 @@ pub(super) struct ApplicationConfigOverrides {
     audio_sink: Option<String>,
     virtual_sink: Option<String>,
     audio_sink_capture_only: Option<bool>,
+    nvenc_preset: Option<u8>,
+    nvenc_h264_cavlc: Option<bool>,
+    nvenc_twopass: Option<amaterasu_module_sdk::NvencTwoPass>,
+    nvenc_vbv_increase: Option<u32>,
+    #[serde(alias = "nvenc_force_split_encode")]
+    nvenc_split_encode: Option<amaterasu_module_sdk::NvencSplitEncode>,
+    nvenc_realtime_hags: Option<bool>,
+    nvenc_opengl_vulkan_on_dxgi: Option<bool>,
+    nvenc_latency_over_power: Option<bool>,
+    vaapi_strict_rc_buffer: Option<bool>,
+    nvenc_spatial_aq: Option<bool>,
     back_button_timeout: Option<i32>,
     controller: Option<bool>,
     gamepad: Option<String>,
@@ -1805,6 +1838,19 @@ pub(super) fn parse_application_config_overrides(
     .map_err(|_| "invalid_application_response")?;
     amaterasu_module_sdk::validate_min_threads(config_overrides.min_threads)
         .map_err(|_| "invalid_application_response")?;
+    (amaterasu_module_sdk::NvencSettingsOverrides {
+        nvenc_preset: config_overrides.nvenc_preset,
+        nvenc_h264_cavlc: config_overrides.nvenc_h264_cavlc,
+        nvenc_twopass: config_overrides.nvenc_twopass,
+        nvenc_vbv_increase: config_overrides.nvenc_vbv_increase,
+        nvenc_split_encode: config_overrides.nvenc_split_encode,
+        nvenc_realtime_hags: config_overrides.nvenc_realtime_hags,
+        nvenc_opengl_vulkan_on_dxgi: config_overrides.nvenc_opengl_vulkan_on_dxgi,
+        nvenc_latency_over_power: config_overrides.nvenc_latency_over_power,
+        vaapi_strict_rc_buffer: config_overrides.vaapi_strict_rc_buffer,
+    })
+    .validate()
+    .map_err(|_| "invalid_application_response")?;
     if config_overrides.fec_percentage == Some(0)
         || config_overrides
             .dd_mode_remapping
@@ -1965,6 +2011,8 @@ fn rtsp_response<'a>(
         || payload["sw_tune"] != record.effective_software_encoder.effective_tune()
         || payload["min_threads"] != record.effective_software_encoder.effective_threads()
         || payload["qp"] != record.effective_qp
+        || payload["nvenc_settings"] != json!(record.effective_nvenc_settings)
+        || payload["nvenc_spatial_aq"] != record.effective_nvenc_spatial_aq
         || payload.get("failure").is_none()
         || payload.get("cleanup_error").is_none()
         || payload.get("frame_limiter_settings")

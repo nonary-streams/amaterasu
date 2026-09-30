@@ -179,6 +179,148 @@ namespace Amaterasu {
     return select;
   }
 
+  export type CatalogNvencSettingsOverrides = Pick<
+    NonNullable<Entry["config_overrides"]>,
+    | "nvenc_preset"
+    | "nvenc_h264_cavlc"
+    | "nvenc_twopass"
+    | "nvenc_vbv_increase"
+    | "nvenc_split_encode"
+    | "nvenc_realtime_hags"
+    | "nvenc_opengl_vulkan_on_dxgi"
+    | "nvenc_latency_over_power"
+    | "vaapi_strict_rc_buffer"
+  >;
+
+  export function mergeCatalogConfigOverrides(
+    saved: Entry["config_overrides"] | undefined,
+    renderedFields: Iterable<string>,
+    ...edited: Array<object | undefined>
+  ): NonNullable<Entry["config_overrides"]> {
+    const merged = Object.assign({}, saved, ...edited.filter((source) => source != null)) as Record<string, unknown>;
+    for (const name of renderedFields) {
+      if (!edited.some((source) => source != null && Object.hasOwn(source, name)))
+        delete merged[name];
+    }
+    return merged as NonNullable<Entry["config_overrides"]>;
+  }
+
+  type CatalogNvencSettingsOverrideFormValues = Record<
+    keyof CatalogNvencSettingsOverrides,
+    string
+  >;
+
+  export function catalogNvencSettingsOverrideFormValues(
+    overrides: Entry["config_overrides"] | undefined,
+  ): CatalogNvencSettingsOverrideFormValues {
+    const text = (value: boolean | number | string | null | undefined) =>
+      value == null ? "" : String(value);
+    return {
+      nvenc_preset: text(overrides?.nvenc_preset),
+      nvenc_h264_cavlc: text(overrides?.nvenc_h264_cavlc),
+      nvenc_twopass: text(overrides?.nvenc_twopass),
+      nvenc_vbv_increase: text(overrides?.nvenc_vbv_increase),
+      nvenc_split_encode: text(overrides?.nvenc_split_encode),
+      nvenc_realtime_hags: text(overrides?.nvenc_realtime_hags),
+      nvenc_opengl_vulkan_on_dxgi: text(overrides?.nvenc_opengl_vulkan_on_dxgi),
+      nvenc_latency_over_power: text(overrides?.nvenc_latency_over_power),
+      vaapi_strict_rc_buffer: text(overrides?.vaapi_strict_rc_buffer),
+    };
+  }
+
+  function catalogNvencSettingsOverrideFields(
+    overrides: Entry["config_overrides"] | undefined,
+  ): HTMLElement[] {
+    const values = catalogNvencSettingsOverrideFormValues(overrides);
+    const preset = input("nvenc_preset", values.nvenc_preset, "number");
+    preset.min = "1";
+    preset.max = "7";
+    preset.step = "1";
+    preset.placeholder = "Inherit";
+    const cavlc = audioOverrideSelect(
+      "nvenc_h264_cavlc",
+      values.nvenc_h264_cavlc === "" ? undefined : values.nvenc_h264_cavlc === "true",
+    );
+    const twopass = catalogEnumOverrideSelect(
+      "nvenc_twopass", values.nvenc_twopass, ["disabled", "quarter_res", "full_res"],
+    );
+    const vbvIncrease = input("nvenc_vbv_increase", values.nvenc_vbv_increase, "number");
+    vbvIncrease.min = "0";
+    vbvIncrease.max = "400";
+    vbvIncrease.step = "1";
+    vbvIncrease.placeholder = "Inherit";
+    const splitEncode = catalogEnumOverrideSelect(
+      "nvenc_split_encode", values.nvenc_split_encode, ["auto", "enabled", "disabled"],
+    );
+    const realtimeHags = audioOverrideSelect(
+      "nvenc_realtime_hags",
+      values.nvenc_realtime_hags === "" ? undefined : values.nvenc_realtime_hags === "true",
+    );
+    const openglVulkanOnDxgi = audioOverrideSelect(
+      "nvenc_opengl_vulkan_on_dxgi",
+      values.nvenc_opengl_vulkan_on_dxgi === "" ? undefined : values.nvenc_opengl_vulkan_on_dxgi === "true",
+    );
+    const latencyOverPower = audioOverrideSelect(
+      "nvenc_latency_over_power",
+      values.nvenc_latency_over_power === "" ? undefined : values.nvenc_latency_over_power === "true",
+    );
+    const vaapiStrictRcBuffer = audioOverrideSelect(
+      "vaapi_strict_rc_buffer",
+      values.vaapi_strict_rc_buffer === "" ? undefined : values.vaapi_strict_rc_buffer === "true",
+    );
+    return [
+      field("NVENC preset", preset, "Inherit or choose P1 through P7."),
+      field("NVENC H.264 CAVLC", cavlc, "Inherit the next scope or set CAVLC on or off."),
+      field("NVENC two-pass mode", twopass, "Inherit or choose disabled, quarter resolution, or full resolution."),
+      field("NVENC VBV increase (%)", vbvIncrease, "Inherit or set an integer from 0 to 400."),
+      field("NVENC split encode", splitEncode, "Inherit or choose automatic, enabled, or disabled."),
+      field("NVENC real-time HAGS", realtimeHags, "Inherit the next scope or set the real-time HAGS option."),
+      field("NVENC OpenGL/Vulkan on DXGI", openglVulkanOnDxgi, "Inherit the next scope or set this DXGI capture option."),
+      field("NVENC latency over power", latencyOverPower, "Inherit the next scope or prefer latency over power."),
+      field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Inherit the next scope or set strict rate-control buffer behavior."),
+    ];
+  }
+
+  export function parseCatalogNvencSettingsOverrides(
+    data: FormData,
+  ): CatalogNvencSettingsOverrides {
+    const text = (name: keyof CatalogNvencSettingsOverrides) => String(data.get(name) ?? "").trim();
+    const integer = (name: "nvenc_preset" | "nvenc_vbv_increase", minimum: number, maximum: number): number | null => {
+      const value = text(name);
+      if (value === "") return null;
+      if (!/^[0-9]+$/.test(value))
+        throw new Error(`${name} must be an integer from ${minimum} to ${maximum}, or blank to inherit.`);
+      const number = Number(value);
+      if (!Number.isSafeInteger(number) || number < minimum || number > maximum)
+        throw new Error(`${name} must be an integer from ${minimum} to ${maximum}, or blank to inherit.`);
+      return number;
+    };
+    const boolean = (name: "nvenc_h264_cavlc" | "nvenc_realtime_hags" | "nvenc_opengl_vulkan_on_dxgi" | "nvenc_latency_over_power" | "vaapi_strict_rc_buffer"): boolean | null => {
+      const value = text(name);
+      if (value === "") return null;
+      if (value === "true") return true;
+      if (value === "false") return false;
+      throw new Error(`${name} must be enabled, disabled, or inherited.`);
+    };
+    const enumeration = <T extends string>(name: "nvenc_twopass" | "nvenc_split_encode", choices: readonly T[]): T | null => {
+      const value = text(name);
+      if (value === "") return null;
+      if ((choices as readonly string[]).includes(value)) return value as T;
+      throw new Error(`${name} has an unsupported value.`);
+    };
+    return {
+      nvenc_preset: integer("nvenc_preset", 1, 7),
+      nvenc_h264_cavlc: boolean("nvenc_h264_cavlc"),
+      nvenc_twopass: enumeration<NvencTwoPass>("nvenc_twopass", ["disabled", "quarter_res", "full_res"]),
+      nvenc_vbv_increase: integer("nvenc_vbv_increase", 0, 400),
+      nvenc_split_encode: enumeration<NvencSplitEncode>("nvenc_split_encode", ["auto", "enabled", "disabled"]),
+      nvenc_realtime_hags: boolean("nvenc_realtime_hags"),
+      nvenc_opengl_vulkan_on_dxgi: boolean("nvenc_opengl_vulkan_on_dxgi"),
+      nvenc_latency_over_power: boolean("nvenc_latency_over_power"),
+      vaapi_strict_rc_buffer: boolean("vaapi_strict_rc_buffer"),
+    };
+  }
+
   const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"] as const;
   const catalogAutoVirtualFramegenModes = ["enabled", "vrr", "legacy", "disabled"] as const;
   const catalogFrameGenerationProviders = [
@@ -953,6 +1095,7 @@ namespace Amaterasu {
         row.entry.config_overrides,
         capabilities,
       );
+      const nvencSettingsFields = catalogNvencSettingsOverrideFields(row.entry.config_overrides);
       const streamAudio = audioOverrideSelect(
         "stream_audio",
         row.entry.config_overrides?.stream_audio,
@@ -1003,6 +1146,7 @@ namespace Amaterasu {
         field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
         ...advancedInput.fields,
         ...softwareEncoder.fields,
+        ...nvencSettingsFields,
       );
       const feedback = el("div");
       const save = el("button", "button primary", "Save streaming settings");
@@ -1013,17 +1157,20 @@ namespace Amaterasu {
         event.preventDefault();
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
-          const config_overrides = {
-            ...advancedInput.read(),
-            ...softwareEncoder.read(),
-            ...providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
-            ...parseCatalogFrameLimiterOverrides(
+          const config_overrides = mergeCatalogConfigOverrides(
+            row.entry.config_overrides,
+            new FormData(form).keys(),
+            advancedInput.read(),
+            softwareEncoder.read(),
+            providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
+            parseCatalogFrameLimiterOverrides(
               new FormData(form),
               capabilities,
               row.entry.config_overrides,
             ),
-            dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
-          };
+            parseCatalogNvencSettingsOverrides(new FormData(form)),
+            { dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)) },
+          );
           try {
             const reply = await api.post<{
               id: string;
@@ -1040,7 +1187,7 @@ namespace Amaterasu {
                 keyboard?: boolean;
                 mouse?: boolean;
                 dd_refresh_rate_option?: RefreshRateOption | null;
-              } & CatalogFrameLimiterOverrides;
+              } & CatalogFrameLimiterOverrides & CatalogNvencSettingsOverrides;
               changed: boolean;
               replayed: boolean;
             }>("catalog/update_provider_overrides", {
@@ -1118,14 +1265,17 @@ namespace Amaterasu {
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
           const entry = entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
-          entry.config_overrides = {
-            ...(entry.config_overrides ?? {}),
-            ...parseCatalogFrameLimiterOverrides(
+          entry.config_overrides = mergeCatalogConfigOverrides(
+            row?.entry.config_overrides,
+            new FormData(form).keys(),
+            entry.config_overrides,
+            parseCatalogFrameLimiterOverrides(
               new FormData(form),
               capabilities,
               row?.entry.config_overrides,
             ),
-          };
+            parseCatalogNvencSettingsOverrides(new FormData(form)),
+          );
           await api.post(row ? "catalog/update" : "catalog/create", {
             ...(row ? { id: row.id } : {}),
             entry,
@@ -1261,6 +1411,7 @@ namespace Amaterasu {
       entry?.config_overrides,
       capabilities,
     );
+    const nvencSettingsFields = catalogNvencSettingsOverrideFields(entry?.config_overrides);
     const streamAudio = audioOverrideSelect(
       "stream_audio",
       entry?.config_overrides?.stream_audio,
@@ -1378,6 +1529,7 @@ namespace Amaterasu {
       field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
       ...advancedInput.fields,
       ...softwareEncoder.fields,
+      ...nvencSettingsFields,
       steamIdField,
       steamInstallDirField,
       fullscreen,

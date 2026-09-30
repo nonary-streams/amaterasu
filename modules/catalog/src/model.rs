@@ -165,6 +165,28 @@ pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvenc_spatial_aq: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_preset: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_h264_cavlc: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_twopass: Option<amaterasu_module_sdk::NvencTwoPass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_vbv_increase: Option<u32>,
+    #[serde(
+        default,
+        alias = "nvenc_force_split_encode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub nvenc_split_encode: Option<amaterasu_module_sdk::NvencSplitEncode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_realtime_hags: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_opengl_vulkan_on_dxgi: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_latency_over_power: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vaapi_strict_rc_buffer: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefer_10bit_sdr: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_limiter_enable: Option<bool>,
@@ -230,6 +252,19 @@ impl ConfigOverrides {
         .map_err(|_| "software encoder options are invalid")?;
         amaterasu_module_sdk::validate_min_threads(self.min_threads)
             .map_err(|_| "software encoder thread request is invalid")?;
+        amaterasu_module_sdk::NvencSettingsOverrides {
+            nvenc_preset: self.nvenc_preset,
+            nvenc_h264_cavlc: self.nvenc_h264_cavlc,
+            nvenc_twopass: self.nvenc_twopass,
+            nvenc_vbv_increase: self.nvenc_vbv_increase,
+            nvenc_split_encode: self.nvenc_split_encode,
+            nvenc_realtime_hags: self.nvenc_realtime_hags,
+            nvenc_opengl_vulkan_on_dxgi: self.nvenc_opengl_vulkan_on_dxgi,
+            nvenc_latency_over_power: self.nvenc_latency_over_power,
+            vaapi_strict_rc_buffer: self.vaapi_strict_rc_buffer,
+        }
+        .validate()
+        .map_err(|_| "NVENC settings override is invalid")?;
         if self
             .key_repeat_delay
             .is_some_and(|delay| delay > i32::MAX as u32)
@@ -400,6 +435,15 @@ impl ConfigOverrides {
             && self.key_repeat_frequency.is_none()
             && self.amd_av1_latency_mode.is_none()
             && self.nvenc_spatial_aq.is_none()
+            && self.nvenc_preset.is_none()
+            && self.nvenc_h264_cavlc.is_none()
+            && self.nvenc_twopass.is_none()
+            && self.nvenc_vbv_increase.is_none()
+            && self.nvenc_split_encode.is_none()
+            && self.nvenc_realtime_hags.is_none()
+            && self.nvenc_opengl_vulkan_on_dxgi.is_none()
+            && self.nvenc_latency_over_power.is_none()
+            && self.vaapi_strict_rc_buffer.is_none()
             && self.prefer_10bit_sdr.is_none()
             && self.frame_limiter_enable.is_none()
             && self.frame_limiter_fps_limit.is_none()
@@ -1942,6 +1986,43 @@ mod tests {
                 .is_err(),
                 "accepted non-boolean spatial AQ value {invalid}"
             );
+        }
+    }
+
+    #[test]
+    fn nvenc_settings_overrides_are_sparse_bounded_and_roundtrip() {
+        for (value, preset, increase) in [
+            (json!({"nvenc_preset":1,"nvenc_vbv_increase":0}), 1, 0),
+            (
+                json!({"nvenc_preset":7,"nvenc_h264_cavlc":true,"nvenc_twopass":"full_res","nvenc_vbv_increase":400,"nvenc_split_encode":"disabled","nvenc_realtime_hags":false,"nvenc_opengl_vulkan_on_dxgi":false,"nvenc_latency_over_power":false,"vaapi_strict_rc_buffer":true}),
+                7,
+                400,
+            ),
+            (json!({"nvenc_force_split_encode":"driver_decides"}), 1, 0),
+        ] {
+            let overrides: ConfigOverrides = serde_json::from_value(value.clone()).unwrap();
+            assert!(overrides.validate().is_ok());
+            assert!(!overrides.is_empty());
+            let roundtrip = serde_json::to_value(overrides).unwrap();
+            if value.get("nvenc_preset").is_some() {
+                assert_eq!(roundtrip["nvenc_preset"], preset);
+                assert_eq!(roundtrip["nvenc_vbv_increase"], increase);
+            } else {
+                assert_eq!(roundtrip["nvenc_split_encode"], "auto");
+                assert!(roundtrip.get("nvenc_force_split_encode").is_none());
+            }
+        }
+        for invalid in [
+            json!({"nvenc_preset":0}),
+            json!({"nvenc_preset":8}),
+            json!({"nvenc_vbv_increase":401}),
+            json!({"nvenc_vbv_increase":-1}),
+            json!({"nvenc_twopass":"fast"}),
+            json!({"nvenc_split_encode":"forced"}),
+        ] {
+            if let Ok(overrides) = serde_json::from_value::<ConfigOverrides>(invalid) {
+                assert!(overrides.validate().is_err());
+            }
         }
     }
 

@@ -71,7 +71,7 @@ namespace Amaterasu {
     prep_cmd?: RawPreparationCommand[];
     exclude_global_prep_cmd?: boolean;
     elevated?: boolean;
-    config_overrides?: AdvancedInputOverrides & SoftwareEncoderOverrides & {
+    config_overrides?: AdvancedInputOverrides & SoftwareEncoderOverrides & NvencSettingsOverrides & {
       fec_percentage?: number;
       stream_audio?: boolean;
       audio_sink?: string;
@@ -110,6 +110,19 @@ namespace Amaterasu {
     encoder?: "auto" | "software" | null;
   }
   export type RefreshRateOption = "auto" | "disabled" | "manual" | "prefer_highest";
+  export type NvencTwoPass = "disabled" | "quarter_res" | "full_res";
+  export type NvencSplitEncode = "auto" | "enabled" | "disabled";
+  export interface NvencSettingsOverrides {
+    nvenc_preset?: number | null;
+    nvenc_h264_cavlc?: boolean | null;
+    nvenc_twopass?: NvencTwoPass | null;
+    nvenc_vbv_increase?: number | null;
+    nvenc_split_encode?: NvencSplitEncode | null;
+    nvenc_realtime_hags?: boolean | null;
+    nvenc_opengl_vulkan_on_dxgi?: boolean | null;
+    nvenc_latency_over_power?: boolean | null;
+    vaapi_strict_rc_buffer?: boolean | null;
+  }
   export interface CatalogRow {
     id: string;
     entry: Entry;
@@ -172,6 +185,15 @@ namespace Amaterasu {
     configured_audio_sink: string | null;
     configured_virtual_sink: string | null;
     audio_sink_capture_only: boolean;
+    configured_nvenc_preset: number;
+    configured_nvenc_h264_cavlc: boolean;
+    configured_nvenc_twopass: NvencTwoPass;
+    configured_nvenc_vbv_increase: number;
+    configured_nvenc_split_encode: NvencSplitEncode;
+    configured_nvenc_realtime_hags: boolean;
+    configured_nvenc_opengl_vulkan_on_dxgi: boolean;
+    configured_nvenc_latency_over_power: boolean;
+    configured_vaapi_strict_rc_buffer: boolean;
     configured_external_ip: string | null;
     effective_audio_sink: string;
     configured_wgc_pacing_smoothing: boolean | null;
@@ -321,7 +343,7 @@ namespace Amaterasu {
     client_id: string;
     name: string;
     paired_at: number;
-    config_overrides?: AdvancedInputOverrides & SoftwareEncoderOverrides & {
+    config_overrides?: AdvancedInputOverrides & SoftwareEncoderOverrides & NvencSettingsOverrides & {
       fec_percentage?: number;
       stream_audio?: boolean;
       audio_sink?: string;

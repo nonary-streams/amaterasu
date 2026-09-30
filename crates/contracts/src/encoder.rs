@@ -3,6 +3,186 @@ use serde::{Deserialize, Serialize};
 
 pub const SOFTWARE_ENCODER_ID: &str = "amaterasu.software.x264";
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoCodec {
+    H264,
+    Hevc,
+    Av1,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicRange {
+    #[default]
+    Sdr,
+    Hdr,
+}
+
+/// Immutable codec facts selected from the client's negotiation and host policy.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VideoStreamFormat {
+    pub codec: VideoCodec,
+    pub bit_depth: u8,
+    pub dynamic_range: DynamicRange,
+}
+
+impl VideoStreamFormat {
+    pub const H264_SDR: Self = Self {
+        codec: VideoCodec::H264,
+        bit_depth: 8,
+        dynamic_range: DynamicRange::Sdr,
+    };
+
+    pub fn validate(self) -> Result<(), &'static str> {
+        match (self.codec, self.bit_depth, self.dynamic_range) {
+            (VideoCodec::H264, 8, DynamicRange::Sdr)
+            | (VideoCodec::Hevc | VideoCodec::Av1, 8, DynamicRange::Sdr)
+            | (VideoCodec::Hevc | VideoCodec::Av1, 10, DynamicRange::Sdr | DynamicRange::Hdr) => {
+                Ok(())
+            }
+            _ => Err("unsupported_video_format"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NvencTwoPass {
+    Disabled,
+    #[default]
+    QuarterRes,
+    FullRes,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NvencSplitEncode {
+    #[default]
+    #[serde(alias = "driver_decides")]
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+/// Effective hardware-encoder policy after global, app, and client resolution.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct NvencSettings {
+    pub nvenc_preset: u8,
+    pub nvenc_h264_cavlc: bool,
+    pub nvenc_twopass: NvencTwoPass,
+    pub nvenc_vbv_increase: u32,
+    pub nvenc_split_encode: NvencSplitEncode,
+    pub nvenc_realtime_hags: bool,
+    pub nvenc_opengl_vulkan_on_dxgi: bool,
+    pub nvenc_latency_over_power: bool,
+    pub vaapi_strict_rc_buffer: bool,
+}
+
+impl Default for NvencSettings {
+    fn default() -> Self {
+        Self {
+            nvenc_preset: 1,
+            nvenc_h264_cavlc: false,
+            nvenc_twopass: NvencTwoPass::QuarterRes,
+            nvenc_vbv_increase: 0,
+            nvenc_split_encode: NvencSplitEncode::Auto,
+            nvenc_realtime_hags: true,
+            nvenc_opengl_vulkan_on_dxgi: true,
+            nvenc_latency_over_power: true,
+            vaapi_strict_rc_buffer: false,
+        }
+    }
+}
+
+impl NvencSettings {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !(1..=7).contains(&self.nvenc_preset) || self.nvenc_vbv_increase > 400 {
+            return Err("invalid_nvenc_settings");
+        }
+        Ok(())
+    }
+
+    pub fn with_overrides(&self, overrides: &NvencSettingsOverrides) -> Self {
+        Self {
+            nvenc_preset: overrides.nvenc_preset.unwrap_or(self.nvenc_preset),
+            nvenc_h264_cavlc: overrides.nvenc_h264_cavlc.unwrap_or(self.nvenc_h264_cavlc),
+            nvenc_twopass: overrides.nvenc_twopass.unwrap_or(self.nvenc_twopass),
+            nvenc_vbv_increase: overrides
+                .nvenc_vbv_increase
+                .unwrap_or(self.nvenc_vbv_increase),
+            nvenc_split_encode: overrides
+                .nvenc_split_encode
+                .unwrap_or(self.nvenc_split_encode),
+            nvenc_realtime_hags: overrides
+                .nvenc_realtime_hags
+                .unwrap_or(self.nvenc_realtime_hags),
+            nvenc_opengl_vulkan_on_dxgi: overrides
+                .nvenc_opengl_vulkan_on_dxgi
+                .unwrap_or(self.nvenc_opengl_vulkan_on_dxgi),
+            nvenc_latency_over_power: overrides
+                .nvenc_latency_over_power
+                .unwrap_or(self.nvenc_latency_over_power),
+            vaapi_strict_rc_buffer: overrides
+                .vaapi_strict_rc_buffer
+                .unwrap_or(self.vaapi_strict_rc_buffer),
+        }
+    }
+}
+
+/// Independent sparse app/client overrides; `None` inherits from the lower scope.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct NvencSettingsOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nvenc_preset: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nvenc_h264_cavlc: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nvenc_twopass: Option<NvencTwoPass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nvenc_vbv_increase: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nvenc_split_encode: Option<NvencSplitEncode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nvenc_realtime_hags: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nvenc_opengl_vulkan_on_dxgi: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nvenc_latency_over_power: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vaapi_strict_rc_buffer: Option<bool>,
+}
+
+impl NvencSettingsOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.nvenc_preset.is_none()
+            && self.nvenc_h264_cavlc.is_none()
+            && self.nvenc_twopass.is_none()
+            && self.nvenc_vbv_increase.is_none()
+            && self.nvenc_split_encode.is_none()
+            && self.nvenc_realtime_hags.is_none()
+            && self.nvenc_opengl_vulkan_on_dxgi.is_none()
+            && self.nvenc_latency_over_power.is_none()
+            && self.vaapi_strict_rc_buffer.is_none()
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .nvenc_preset
+            .is_some_and(|preset| !(1..=7).contains(&preset))
+            || self
+                .nvenc_vbv_increase
+                .is_some_and(|increase| increase > 400)
+        {
+            return Err("invalid_nvenc_settings");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 pub struct EncoderIdentity {
@@ -209,6 +389,111 @@ mod tests {
                 serde_json::from_value::<SoftwareEncoderOptions>(json!({"min_threads":threads}))
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn nvenc_settings_use_reference_defaults_and_resolve_sparse_scopes() {
+        let global = NvencSettings::default();
+        assert_eq!(
+            (
+                global.nvenc_preset,
+                global.nvenc_twopass,
+                global.nvenc_split_encode,
+                global.nvenc_realtime_hags,
+                global.nvenc_opengl_vulkan_on_dxgi,
+                global.nvenc_latency_over_power,
+                global.vaapi_strict_rc_buffer,
+            ),
+            (
+                1,
+                NvencTwoPass::QuarterRes,
+                NvencSplitEncode::Auto,
+                true,
+                true,
+                true,
+                false,
+            )
+        );
+        assert!(global.validate().is_ok());
+
+        let app: NvencSettingsOverrides = serde_json::from_value(json!({
+            "nvenc_preset": 7,
+            "nvenc_twopass": "full_res",
+            "vaapi_strict_rc_buffer": true
+        }))
+        .unwrap();
+        let client: NvencSettingsOverrides = serde_json::from_value(json!({
+            "nvenc_preset": null,
+            "nvenc_twopass": "disabled",
+            "nvenc_split_encode": "driver_decides",
+            "vaapi_strict_rc_buffer": false
+        }))
+        .unwrap();
+        assert!(app.validate().is_ok());
+        assert!(client.validate().is_ok());
+        let effective = global.with_overrides(&app).with_overrides(&client);
+        assert_eq!(effective.nvenc_preset, 7);
+        assert_eq!(effective.nvenc_twopass, NvencTwoPass::Disabled);
+        assert_eq!(effective.nvenc_split_encode, NvencSplitEncode::Auto);
+        assert!(!effective.vaapi_strict_rc_buffer);
+        assert_eq!(
+            serde_json::to_value(&effective).unwrap()["nvenc_split_encode"],
+            "auto"
+        );
+
+        for invalid in [json!({"nvenc_preset": 0}), json!({"nvenc_preset": 8})] {
+            let overrides: NvencSettingsOverrides = serde_json::from_value(invalid).unwrap();
+            assert_eq!(overrides.validate(), Err("invalid_nvenc_settings"));
+        }
+        let invalid: NvencSettingsOverrides =
+            serde_json::from_value(json!({"nvenc_vbv_increase": 401})).unwrap();
+        assert_eq!(invalid.validate(), Err("invalid_nvenc_settings"));
+        for invalid in [
+            json!({"nvenc_h264_cavlc": 0}),
+            json!({"nvenc_twopass": "quarter_resolution"}),
+            json!({"nvenc_split_encode": "force"}),
+            json!({"vaapi_strict_rc_buffer": "enabled"}),
+        ] {
+            assert!(serde_json::from_value::<NvencSettingsOverrides>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn video_stream_format_rejects_unsupported_depth_and_hdr_combinations() {
+        for format in [
+            VideoStreamFormat::H264_SDR,
+            VideoStreamFormat {
+                codec: VideoCodec::Hevc,
+                bit_depth: 8,
+                dynamic_range: DynamicRange::Sdr,
+            },
+            VideoStreamFormat {
+                codec: VideoCodec::Av1,
+                bit_depth: 10,
+                dynamic_range: DynamicRange::Hdr,
+            },
+        ] {
+            assert!(format.validate().is_ok());
+        }
+        for format in [
+            VideoStreamFormat {
+                codec: VideoCodec::H264,
+                bit_depth: 10,
+                dynamic_range: DynamicRange::Hdr,
+            },
+            VideoStreamFormat {
+                codec: VideoCodec::Hevc,
+                bit_depth: 8,
+                dynamic_range: DynamicRange::Hdr,
+            },
+            VideoStreamFormat {
+                codec: VideoCodec::Av1,
+                bit_depth: 12,
+                dynamic_range: DynamicRange::Sdr,
+            },
+        ] {
+            assert_eq!(format.validate(), Err("unsupported_video_format"));
         }
     }
 }

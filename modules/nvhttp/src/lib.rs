@@ -14,17 +14,19 @@ mod upnp;
 mod upnp_ipv6;
 mod wire;
 
+pub use product_settings::{default_document, validate_document};
+pub use settings::Settings;
+
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use launch::CaptureMode;
 use network_settings::NetworkSettings;
 use preparation::LegacyPreparationStep;
 use product_settings::{
     AdminAction, DisplayPolicyUpdate, EncryptionModeUpdate, FieldUpdate, FrameLimiterUpdate,
-    NetworkTarget, ProductSettings, SoftwareEncoderUpdate,
+    NetworkTarget, NvencSettingsUpdate, ProductSettings, SoftwareEncoderUpdate,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
-use settings::Settings;
 use std::time::{Duration, Instant};
 
 const SERVICE: &str = "amaterasu.nvhttp/1";
@@ -120,6 +122,28 @@ enum Operation {
         audio_sink_capture_only: FieldUpdate<bool>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         nvenc_spatial_aq: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        nvenc_preset: FieldUpdate<i32>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        nvenc_h264_cavlc: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        nvenc_twopass: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        nvenc_vbv_increase: FieldUpdate<i32>,
+        #[serde(
+            default,
+            alias = "nvenc_force_split_encode",
+            deserialize_with = "deserialize_field_update"
+        )]
+        nvenc_split_encode: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        nvenc_realtime_hags: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        nvenc_opengl_vulkan_on_dxgi: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        nvenc_latency_over_power: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        vaapi_strict_rc_buffer: FieldUpdate<bool>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         external_ip: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
@@ -328,6 +352,8 @@ impl ManagedModule for NvhttpModule {
             router.set_software_encoder_options(
                 self.product_settings.software_encoder_options().clone(),
             );
+            router.set_nvenc_settings(self.product_settings.nvenc_settings().clone());
+            router.set_nvenc_spatial_aq(self.product_settings.nvenc_spatial_aq());
             router.set_global_video_max_batch_size_kb(
                 self.product_settings.effective_video_max_batch_size_kb(),
             );
@@ -617,6 +643,15 @@ impl NvhttpModule {
                                 virtual_sink,
                                 audio_sink_capture_only,
                                 nvenc_spatial_aq,
+                                nvenc_preset,
+                                nvenc_h264_cavlc,
+                                nvenc_twopass,
+                                nvenc_vbv_increase,
+                                nvenc_split_encode,
+                                nvenc_realtime_hags,
+                                nvenc_opengl_vulkan_on_dxgi,
+                                nvenc_latency_over_power,
+                                vaapi_strict_rc_buffer,
                                 external_ip,
                                 stream_audio,
                                 capture,
@@ -684,6 +719,17 @@ impl NvhttpModule {
                                     virtual_sink,
                                     audio_sink_capture_only,
                                     nvenc_spatial_aq,
+                                    nvenc_settings: NvencSettingsUpdate {
+                                        nvenc_preset,
+                                        nvenc_h264_cavlc,
+                                        nvenc_twopass,
+                                        nvenc_vbv_increase,
+                                        nvenc_split_encode,
+                                        nvenc_realtime_hags,
+                                        nvenc_opengl_vulkan_on_dxgi,
+                                        nvenc_latency_over_power,
+                                        vaapi_strict_rc_buffer,
+                                    },
                                     external_ip,
                                     stream_audio,
                                     capture,

@@ -1110,6 +1110,8 @@ struct Broker {
     rtsp_sw_tune: Value,
     rtsp_min_threads: Value,
     rtsp_qp: Value,
+    rtsp_nvenc_settings: Value,
+    rtsp_nvenc_spatial_aq: Value,
     rtsp_display_request: Option<Value>,
     rtsp_executable_path: Option<String>,
     wrong_rtsp_snapshot: bool,
@@ -1182,7 +1184,8 @@ impl Default for Broker {
             application_catalog_revision: 1,
             rtsp_snapshot: None,
             rtsp_display_policy_snapshot: None,
-            rtsp_encoder: Value::Null,rtsp_sw_preset:Value::Null,rtsp_sw_tune:Value::Null,rtsp_min_threads:Value::Null,rtsp_qp:Value::Null,
+            rtsp_encoder: Value::Null,rtsp_sw_preset:Value::Null,rtsp_sw_tune:Value::Null,rtsp_min_threads:Value::Null,rtsp_qp:Value::Null,rtsp_nvenc_settings:Value::Null,
+            rtsp_nvenc_spatial_aq: Value::Null,
             rtsp_display_request: None,
             rtsp_executable_path: None,
             wrong_rtsp_snapshot: false,
@@ -1387,6 +1390,8 @@ impl Broker {
             self.rtsp_sw_tune = payload["sw_tune"].clone();
             self.rtsp_min_threads = payload["min_threads"].clone();
             self.rtsp_qp = payload["qp"].clone();
+            self.rtsp_nvenc_settings = payload["nvenc_settings"].clone();
+            self.rtsp_nvenc_spatial_aq = payload["nvenc_spatial_aq"].clone();
             self.rtsp_snapshot = payload.get("frame_limiter_settings").cloned();
             self.rtsp_display_policy_snapshot = payload.get("display_policy_snapshot").cloned();
             self.rtsp_display_request = payload.get("display_request").cloned();
@@ -1600,6 +1605,8 @@ impl Broker {
             "encoder":self.rtsp_encoder,"sw_preset":self.rtsp_sw_preset,"sw_tune":self.rtsp_sw_tune,
             "min_threads":self.rtsp_min_threads,
             "qp":self.rtsp_qp,
+            "nvenc_settings":self.rtsp_nvenc_settings,
+            "nvenc_spatial_aq":self.rtsp_nvenc_spatial_aq,
             "frame_limiter_settings": if wrong_rtsp_snapshot {
                 json!({"wrong":"snapshot"})
             } else {
@@ -4283,6 +4290,57 @@ fn software_scopes_freeze_and_qp_resolves_client_before_application_before_globa
         let unpaired=PeerIdentity::new("127.0.0.1".parse().unwrap(),cert.clone()).unwrap();
         assert!(unpaired.with_paired_identity("client-9".into(),fingerprint(&[9;32]),ClientConfigOverrides {sw_preset:Some("slow".into()),..Default::default()}).is_err());
     }
+}
+
+#[test]
+fn nvenc_scopes_freeze_client_over_application_over_global_and_verify_readback() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let global = amaterasu_module_sdk::NvencSettings {
+        nvenc_preset: 2,
+        nvenc_vbv_increase: 10,
+        ..Default::default()
+    };
+    controller.set_nvenc_settings(global);
+    controller.set_nvenc_spatial_aq(true);
+
+    let application_overrides = json!({
+        "nvenc_preset": 4,
+        "nvenc_h264_cavlc": true,
+        "nvenc_twopass": "full_res",
+        "nvenc_vbv_increase": 25,
+        "nvenc_spatial_aq": false
+    });
+    let mut broker = Broker {
+        application_input_overrides: Some(application_overrides),
+        ..Default::default()
+    };
+    let certificate = vec![19; 32];
+    let client = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            "nvenc-client".into(),
+            fingerprint(&certificate),
+            serde_json::from_value(json!({
+                "nvenc_preset": 7,
+                "nvenc_split_encode": "disabled",
+                "nvenc_spatial_aq": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert!(controller.launch(10, request(19), client, now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let open = opened_rtsp_payload(&broker);
+    assert_eq!(open["nvenc_settings"]["nvenc_preset"], 7);
+    assert_eq!(open["nvenc_settings"]["nvenc_h264_cavlc"], true);
+    assert_eq!(open["nvenc_settings"]["nvenc_twopass"], "full_res");
+    assert_eq!(open["nvenc_settings"]["nvenc_vbv_increase"], 25);
+    assert_eq!(open["nvenc_settings"]["nvenc_split_encode"], "disabled");
+    assert_eq!(open["nvenc_spatial_aq"], true);
+    assert_eq!(broker.rtsp_nvenc_settings, open["nvenc_settings"]);
 }
 
 #[test]

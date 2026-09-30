@@ -375,9 +375,118 @@ namespace Amaterasu {
         (reply.effective_fec_percentage as number) < 1 ||
         (reply.effective_fec_percentage as number) > 255 ||
         !Number.isSafeInteger(reply.port) ||
+        !Number.isSafeInteger(reply.configured_nvenc_preset) ||
+        (reply.configured_nvenc_preset as number) < 1 ||
+        (reply.configured_nvenc_preset as number) > 7 ||
+        typeof reply.configured_nvenc_h264_cavlc !== "boolean" ||
+        !["disabled", "quarter_res", "full_res"].includes(String(reply.configured_nvenc_twopass)) ||
+        !Number.isSafeInteger(reply.configured_nvenc_vbv_increase) ||
+        (reply.configured_nvenc_vbv_increase as number) < 0 ||
+        (reply.configured_nvenc_vbv_increase as number) > 400 ||
+        !["auto", "enabled", "disabled"].includes(String(reply.configured_nvenc_split_encode)) ||
+        typeof reply.configured_nvenc_realtime_hags !== "boolean" ||
+        typeof reply.configured_nvenc_opengl_vulkan_on_dxgi !== "boolean" ||
+        typeof reply.configured_nvenc_latency_over_power !== "boolean" ||
+        typeof reply.configured_vaapi_strict_rc_buffer !== "boolean" ||
         !Array.isArray(reply.configured_global_preparation))
       throw new Error("Moonlight host settings reply is invalid.");
     return reply as unknown as NvhttpSettings;
+  }
+
+  function nvencSparseBooleanSelect(
+    name: keyof NvencSettingsOverrides,
+    value: boolean | null | undefined,
+  ): HTMLSelectElement {
+    const select = el("select");
+    select.name = name;
+    for (const [optionValue, label] of [["", "Inherit"], ["true", "Enabled"], ["false", "Disabled"]] as const) {
+      const option = el("option", "", label);
+      option.value = optionValue;
+      select.append(option);
+    }
+    select.value = value == null ? "" : String(value);
+    return select;
+  }
+
+  function nvencSettingsOverrideControls(
+    overrides: PairingClient["config_overrides"],
+  ): { fields: HTMLElement[]; read: () => NvencSettingsOverrides } {
+    const preset = input("nvenc_preset", overrides?.nvenc_preset == null ? "" : String(overrides.nvenc_preset), "number");
+    preset.min = "1";
+    preset.max = "7";
+    preset.step = "1";
+    preset.placeholder = "Inherit";
+    const cavlc = nvencSparseBooleanSelect("nvenc_h264_cavlc", overrides?.nvenc_h264_cavlc);
+    const twopass = el("select");
+    twopass.name = "nvenc_twopass";
+    for (const [value, label] of [["", "Inherit"], ["disabled", "Disabled"], ["quarter_res", "Quarter resolution"], ["full_res", "Full resolution"]] as const) {
+      const option = el("option", "", label);
+      option.value = value;
+      twopass.append(option);
+    }
+    twopass.value = overrides?.nvenc_twopass ?? "";
+    const vbvIncrease = input("nvenc_vbv_increase", overrides?.nvenc_vbv_increase == null ? "" : String(overrides.nvenc_vbv_increase), "number");
+    vbvIncrease.min = "0";
+    vbvIncrease.max = "400";
+    vbvIncrease.step = "1";
+    vbvIncrease.placeholder = "Inherit";
+    const splitEncode = el("select");
+    splitEncode.name = "nvenc_split_encode";
+    for (const [value, label] of [["", "Inherit"], ["auto", "Automatic"], ["enabled", "Enabled"], ["disabled", "Disabled"]] as const) {
+      const option = el("option", "", label);
+      option.value = value;
+      splitEncode.append(option);
+    }
+    splitEncode.value = overrides?.nvenc_split_encode ?? "";
+    const realtimeHags = nvencSparseBooleanSelect("nvenc_realtime_hags", overrides?.nvenc_realtime_hags);
+    const openglVulkanOnDxgi = nvencSparseBooleanSelect("nvenc_opengl_vulkan_on_dxgi", overrides?.nvenc_opengl_vulkan_on_dxgi);
+    const latencyOverPower = nvencSparseBooleanSelect("nvenc_latency_over_power", overrides?.nvenc_latency_over_power);
+    const vaapiStrictRcBuffer = nvencSparseBooleanSelect("vaapi_strict_rc_buffer", overrides?.vaapi_strict_rc_buffer);
+    const booleanValue = (select: HTMLSelectElement, name: string): boolean | null => {
+      if (select.value === "") return null;
+      if (select.value === "true") return true;
+      if (select.value === "false") return false;
+      throw new Error(`${name} must be enabled, disabled, or inherited.`);
+    };
+    const integerValue = (control: HTMLInputElement, name: string, minimum: number, maximum: number): number | null => {
+      const value = control.value.trim();
+      if (value === "") return null;
+      if (!/^[0-9]+$/.test(value))
+        throw new Error(`${name} must be a whole number from ${minimum} to ${maximum}, or blank to inherit.`);
+      const number = Number(value);
+      if (!Number.isSafeInteger(number) || number < minimum || number > maximum)
+        throw new Error(`${name} must be a whole number from ${minimum} to ${maximum}, or blank to inherit.`);
+      return number;
+    };
+    const enumValue = <T extends string>(select: HTMLSelectElement, choices: readonly T[], name: string): T | null => {
+      if (select.value === "") return null;
+      if ((choices as readonly string[]).includes(select.value)) return select.value as T;
+      throw new Error(`${name} has an unsupported value.`);
+    };
+    return {
+      fields: [
+        field("NVENC preset", preset, "Inherit or choose P1 through P7."),
+        field("NVENC H.264 CAVLC", cavlc, "Inherit or set CAVLC on or off."),
+        field("NVENC two-pass mode", twopass, "Inherit or choose disabled, quarter resolution, or full resolution."),
+        field("NVENC VBV increase (%)", vbvIncrease, "Inherit or set an integer from 0 to 400."),
+        field("NVENC split encode", splitEncode, "Inherit or choose automatic, enabled, or disabled."),
+        field("NVENC real-time HAGS", realtimeHags, "Inherit or set the real-time HAGS option."),
+        field("NVENC OpenGL/Vulkan on DXGI", openglVulkanOnDxgi, "Inherit or set this DXGI capture option."),
+        field("NVENC latency over power", latencyOverPower, "Inherit or prefer latency over power."),
+        field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Inherit or set strict rate-control buffer behavior."),
+      ],
+      read: () => ({
+        nvenc_preset: integerValue(preset, "NVENC preset", 1, 7),
+        nvenc_h264_cavlc: booleanValue(cavlc, "NVENC H.264 CAVLC"),
+        nvenc_twopass: enumValue<NvencTwoPass>(twopass, ["disabled", "quarter_res", "full_res"], "NVENC two-pass mode"),
+        nvenc_vbv_increase: integerValue(vbvIncrease, "NVENC VBV increase", 0, 400),
+        nvenc_split_encode: enumValue<NvencSplitEncode>(splitEncode, ["auto", "enabled", "disabled"], "NVENC split encode"),
+        nvenc_realtime_hags: booleanValue(realtimeHags, "NVENC real-time HAGS"),
+        nvenc_opengl_vulkan_on_dxgi: booleanValue(openglVulkanOnDxgi, "NVENC OpenGL/Vulkan on DXGI"),
+        nvenc_latency_over_power: booleanValue(latencyOverPower, "NVENC latency over power"),
+        vaapi_strict_rc_buffer: booleanValue(vaapiStrictRcBuffer, "VAAPI strict rate-control buffer"),
+      }),
+    };
   }
 
   function normalizedPreparationSteps(value: unknown): unknown {
@@ -429,6 +538,15 @@ namespace Amaterasu {
       configured_external_ip: values.external_ip,
       configured_wgc_pacing_smoothing: values.wgc_pacing_smoothing,
       configured_global_preparation: normalizedPreparationSteps(values.global_preparation),
+      configured_nvenc_preset: values.nvenc_preset,
+      configured_nvenc_h264_cavlc: values.nvenc_h264_cavlc,
+      configured_nvenc_twopass: values.nvenc_twopass,
+      configured_nvenc_vbv_increase: values.nvenc_vbv_increase,
+      configured_nvenc_split_encode: values.nvenc_split_encode,
+      configured_nvenc_realtime_hags: values.nvenc_realtime_hags,
+      configured_nvenc_opengl_vulkan_on_dxgi: values.nvenc_opengl_vulkan_on_dxgi,
+      configured_nvenc_latency_over_power: values.nvenc_latency_over_power,
+      configured_vaapi_strict_rc_buffer: values.vaapi_strict_rc_buffer,
     });
     for (const key of ["sw_preset", "sw_tune", "encoder"])
       if (Object.prototype.hasOwnProperty.call(values, key)) expected[`configured_${key}`] = values[key];
@@ -990,7 +1108,10 @@ namespace Amaterasu {
     "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
     "frame_limiter_fps_limit", "frame_limiter_enable", "frame_limiter_provider",
     "frame_limiter_disable_vsync", "frame_limiter_auto_virtual_framegen",
-    "rtss_frame_limit_type", "nvenc_spatial_aq", "high_resolution_scrolling",
+    "rtss_frame_limit_type", "nvenc_spatial_aq", "nvenc_preset", "nvenc_h264_cavlc",
+    "nvenc_twopass", "nvenc_vbv_increase", "nvenc_split_encode", "nvenc_realtime_hags",
+    "nvenc_opengl_vulkan_on_dxgi", "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
+    "high_resolution_scrolling",
     "always_send_scancodes", "key_rightalt_to_key_win", "key_repeat_delay",
     "key_repeat_frequency", "keybindings",
   ];
@@ -1011,7 +1132,9 @@ namespace Amaterasu {
     if (value === null || value === undefined) return false;
     if (["stream_audio", "audio_sink_capture_only", "controller", "keyboard", "mouse",
       "native_pen_touch", "ds4_back_as_touchpad_click", "frame_limiter_enable", "frame_limiter_disable_vsync",
-      "nvenc_spatial_aq", "high_resolution_scrolling", "always_send_scancodes",
+      "nvenc_spatial_aq", "nvenc_h264_cavlc", "nvenc_realtime_hags",
+      "nvenc_opengl_vulkan_on_dxgi", "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
+      "high_resolution_scrolling", "always_send_scancodes",
       "key_rightalt_to_key_win"].includes(field)) return typeof value === "boolean";
     if (field === "audio_sink" || field === "virtual_sink")
       return typeof value === "string" && new TextEncoder().encode(value).length <= 4096 &&
@@ -1035,6 +1158,14 @@ namespace Amaterasu {
     if (field === "rtss_frame_limit_type")
       return typeof value === "string" && ["async", "front edge sync", "back edge sync",
         "nvidia reflex"].includes(value);
+    if (field === "nvenc_twopass")
+      return value === "disabled" || value === "quarter_res" || value === "full_res";
+    if (field === "nvenc_split_encode")
+      return value === "auto" || value === "enabled" || value === "disabled";
+    if (field === "nvenc_preset")
+      return Number.isSafeInteger(value) && (value as number) >= 1 && (value as number) <= 7;
+    if (field === "nvenc_vbv_increase")
+      return Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 400;
     if (field === "fec_percentage")
       return Number.isSafeInteger(value) && (value as number) >= 1 && (value as number) <= 255;
     if (field === "video_max_batch_size_kb")
@@ -3000,6 +3131,7 @@ namespace Amaterasu {
           ds4BackAsTouchpadClick.setAttribute("aria-label", `DS4 Back as touchpad click override for ${client.name}`);
           const advancedInput = advancedInputOverrideControls(client.config_overrides);
           const softwareEncoder = softwareEncoderOverrideControls(client.config_overrides);
+          const nvencSettings = nvencSettingsOverrideControls(client.config_overrides);
           const streamAudio = el("select");
           streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
           const audioChoices: Array<[string, string]> = [
@@ -3080,6 +3212,7 @@ namespace Amaterasu {
                 const values = {
                   ...advancedInput.read(),
                   ...softwareEncoder.read(),
+                  ...nvencSettings.read(),
                   ...parseClientFecOverride(fec.value),
                   back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeout.value),
                   stream_audio: parseStreamAudioOverride(streamAudio.value),
@@ -3124,7 +3257,7 @@ namespace Amaterasu {
             el("strong", "", client.name),
             el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
           );
-          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields), el("div", "", save, status)];
+          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields), el("div", "", save, status)];
         });
         const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "DS4 Back as touchpad click", "Input and software encoding preferences", ""], rows);
         pairingArea.replaceChildren(
@@ -3561,6 +3694,40 @@ namespace Amaterasu {
         outputName.value = settings.configured_output_name ?? "";
         const streamAudio = input("stream_audio", "", "checkbox");
         streamAudio.checked = settings.stream_audio;
+        const nvencPreset = input("nvenc_preset", String(settings.configured_nvenc_preset), "number");
+        nvencPreset.min = "1";
+        nvencPreset.max = "7";
+        nvencPreset.step = "1";
+        const nvencH264Cavlc = input("nvenc_h264_cavlc", "", "checkbox");
+        nvencH264Cavlc.checked = settings.configured_nvenc_h264_cavlc;
+        const nvencTwoPass = el("select");
+        nvencTwoPass.name = "nvenc_twopass";
+        for (const [value, label] of [["disabled", "Disabled"], ["quarter_res", "Quarter resolution"], ["full_res", "Full resolution"]] as const) {
+          const option = el("option", "", label);
+          option.value = value;
+          nvencTwoPass.append(option);
+        }
+        nvencTwoPass.value = settings.configured_nvenc_twopass;
+        const nvencVbvIncrease = input("nvenc_vbv_increase", String(settings.configured_nvenc_vbv_increase), "number");
+        nvencVbvIncrease.min = "0";
+        nvencVbvIncrease.max = "400";
+        nvencVbvIncrease.step = "1";
+        const nvencSplitEncode = el("select");
+        nvencSplitEncode.name = "nvenc_split_encode";
+        for (const [value, label] of [["auto", "Automatic"], ["enabled", "Enabled"], ["disabled", "Disabled"]] as const) {
+          const option = el("option", "", label);
+          option.value = value;
+          nvencSplitEncode.append(option);
+        }
+        nvencSplitEncode.value = settings.configured_nvenc_split_encode;
+        const nvencRealtimeHags = input("nvenc_realtime_hags", "", "checkbox");
+        nvencRealtimeHags.checked = settings.configured_nvenc_realtime_hags;
+        const nvencOpenGlVulkanOnDxgi = input("nvenc_opengl_vulkan_on_dxgi", "", "checkbox");
+        nvencOpenGlVulkanOnDxgi.checked = settings.configured_nvenc_opengl_vulkan_on_dxgi;
+        const nvencLatencyOverPower = input("nvenc_latency_over_power", "", "checkbox");
+        nvencLatencyOverPower.checked = settings.configured_nvenc_latency_over_power;
+        const vaapiStrictRcBuffer = input("vaapi_strict_rc_buffer", "", "checkbox");
+        vaapiStrictRcBuffer.checked = settings.configured_vaapi_strict_rc_buffer;
         const wgcPacing = el("select");
         wgcPacing.name = "wgc_pacing_smoothing";
         for (const [value, label] of [
@@ -3775,6 +3942,15 @@ namespace Amaterasu {
             "Choose a display for future Moonlight streams. Automatic retains the configured startup output.",
           ),
           field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."),
+          field("NVENC preset", nvencPreset, "Select NVENC preset P1 through P7 for future streams."),
+          field("NVENC H.264 CAVLC", nvencH264Cavlc, "Request CAVLC entropy coding for NVENC H.264."),
+          field("NVENC two-pass mode", nvencTwoPass, "Choose disabled, quarter-resolution, or full-resolution two-pass encoding."),
+          field("NVENC VBV increase (%)", nvencVbvIncrease, "Increase NVENC VBV buffer size by 0–400 percent."),
+          field("NVENC split encode", nvencSplitEncode, "Choose automatic driver selection or explicitly enable or disable split encoding."),
+          field("NVENC real-time HAGS", nvencRealtimeHags, "Configure the NVENC real-time scheduling hint for systems using hardware-accelerated GPU scheduling."),
+          field("NVENC OpenGL/Vulkan on DXGI", nvencOpenGlVulkanOnDxgi, "Configure NVENC handling for OpenGL and Vulkan capture through DXGI."),
+          field("NVENC latency over power", nvencLatencyOverPower, "Prefer encoding latency over power efficiency."),
+          field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Use strict rate-control buffer behavior for VAAPI."),
           field(
             "WGC pacing smoothing",
             wgcPacing,
@@ -3844,6 +4020,15 @@ namespace Amaterasu {
               capture: parseCaptureSelection(capture.value),
               output_name: parseOutputNameSelection(outputName.value),
               stream_audio: streamAudio.checked,
+              nvenc_preset: nvencPreset.valueAsNumber,
+              nvenc_h264_cavlc: nvencH264Cavlc.checked,
+              nvenc_twopass: nvencTwoPass.value,
+              nvenc_vbv_increase: nvencVbvIncrease.valueAsNumber,
+              nvenc_split_encode: nvencSplitEncode.value,
+              nvenc_realtime_hags: nvencRealtimeHags.checked,
+              nvenc_opengl_vulkan_on_dxgi: nvencOpenGlVulkanOnDxgi.checked,
+              nvenc_latency_over_power: nvencLatencyOverPower.checked,
+              vaapi_strict_rc_buffer: vaapiStrictRcBuffer.checked,
               video_max_batch_size_kb: parseVideoMaxBatchSize(videoBatchSize.value),
               max_bitrate: parseMaxBitrate(maxBitrate.value),
               minimum_fps_target: parseMinimumFpsTarget(minimumFpsTarget.value),

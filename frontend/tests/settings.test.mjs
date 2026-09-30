@@ -1927,6 +1927,48 @@ test("paired-client editor preserves hidden overrides and confirms complete sign
   assert.equal(saved.clients[0].config_overrides.ds4_back_as_touchpad_click, false);
 });
 
+test("paired-client NVENC overrides preserve sparse false and zero values", async () => {
+  const current = pairedClients();
+  const values = {
+    nvenc_preset: 7,
+    nvenc_h264_cavlc: false,
+    nvenc_twopass: "disabled",
+    nvenc_vbv_increase: 0,
+    nvenc_split_encode: "auto",
+    nvenc_realtime_hags: false,
+    nvenc_opengl_vulkan_on_dxgi: true,
+    nvenc_latency_over_power: false,
+    vaapi_strict_rc_buffer: true,
+  };
+  const desired = { ...current.clients[0].config_overrides, ...values };
+  const saved = { ...current, revision: 8, clients: [
+    { ...current.clients[0], config_overrides: desired }, current.clients[1],
+  ] };
+  const api = { async post(route, body) {
+    if (route === "pairing/update_client_config_overrides") {
+      assert.deepEqual(ordinary(body.config_overrides), desired);
+      return { ok: true, certificate_id: "a".repeat(64) };
+    }
+    assert.equal(route, "pairing/list_clients");
+    return saved;
+  } };
+  assert.deepEqual(ordinary(await context.Amaterasu.savePairingClientOverrides(
+    api, current, "a".repeat(64), values,
+  )), saved);
+  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields({
+    ...current.clients[0], config_overrides: values,
+  })), []);
+  for (const invalid of [
+    { nvenc_preset: 0 }, { nvenc_preset: 8 }, { nvenc_vbv_increase: 401 },
+    { nvenc_twopass: "fast" }, { nvenc_split_encode: "forced" },
+    { nvenc_h264_cavlc: "false" },
+  ]) {
+    assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields({
+      ...current.clients[0], config_overrides: invalid,
+    })), Object.keys(invalid));
+  }
+});
+
 test("paired-client DS4 Back inheritance omits the field when saving", async () => {
   const current = pairedClients();
   const id = "a".repeat(64);
@@ -2209,6 +2251,11 @@ function nvhttpHostSettings(revision = 8) {
     configured_max_bitrate: null, configured_minimum_fps_target: null,
     configured_ping_timeout_ms: null, configured_audio_sink: null,
     configured_virtual_sink: null, audio_sink_capture_only: false,
+    configured_nvenc_preset: 1, configured_nvenc_h264_cavlc: false,
+    configured_nvenc_twopass: "quarter_res", configured_nvenc_vbv_increase: 0,
+    configured_nvenc_split_encode: "auto", configured_nvenc_realtime_hags: true,
+    configured_nvenc_opengl_vulkan_on_dxgi: true, configured_nvenc_latency_over_power: true,
+    configured_vaapi_strict_rc_buffer: false,
     configured_external_ip: null, configured_wgc_pacing_smoothing: null,
     configured_global_preparation: [],
     configured_legacy_global_preparation: [{ do: "old command", elevated: false }],
@@ -2232,6 +2279,10 @@ function nvhttpHostUpdate() {
     minimum_fps_target: null, ping_timeout_ms: -1,
     audio_sink: null, virtual_sink: "",
     audio_sink_capture_only: false, external_ip: null,
+    nvenc_preset: 7, nvenc_h264_cavlc: true, nvenc_twopass: "full_res",
+    nvenc_vbv_increase: 400, nvenc_split_encode: "disabled",
+    nvenc_realtime_hags: false, nvenc_opengl_vulkan_on_dxgi: false,
+    nvenc_latency_over_power: false, vaapi_strict_rc_buffer: true,
     wgc_pacing_smoothing: null,
     global_preparation: [{ run: { executable: "C:/tools/prepare.exe" } }],
   };
@@ -2242,6 +2293,11 @@ function nvhttpUpdatedHost() {
     ...nvhttpHostSettings(9),
     configured_hostname: "Living Room", configured_output_name: null,
     stream_audio: true, configured_virtual_sink: "",
+    configured_nvenc_preset: 7, configured_nvenc_h264_cavlc: true,
+    configured_nvenc_twopass: "full_res", configured_nvenc_vbv_increase: 400,
+    configured_nvenc_split_encode: "disabled", configured_nvenc_realtime_hags: false,
+    configured_nvenc_opengl_vulkan_on_dxgi: false, configured_nvenc_latency_over_power: false,
+    configured_vaapi_strict_rc_buffer: true,
     configured_global_preparation: [{
       run: {
         executable: "C:/tools/prepare.exe", args: [], environment: {},
@@ -2268,6 +2324,20 @@ test("Moonlight host editor confirms signed update and GET with canonical prepar
     ["nvhttp/settings_update", { ...values, expected_revision: 8 }],
     ["nvhttp/settings", {}],
   ]);
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(saved).filter(([key]) => key.startsWith("configured_nvenc_") || key === "configured_vaapi_strict_rc_buffer")),
+    {
+      configured_nvenc_preset: 7,
+      configured_nvenc_h264_cavlc: true,
+      configured_nvenc_twopass: "full_res",
+      configured_nvenc_vbv_increase: 400,
+      configured_nvenc_split_encode: "disabled",
+      configured_nvenc_realtime_hags: false,
+      configured_nvenc_opengl_vulkan_on_dxgi: false,
+      configured_nvenc_latency_over_power: false,
+      configured_vaapi_strict_rc_buffer: true,
+    },
+  );
 });
 
 test("Moonlight settings require and round-trip UPnP and global FEC selections", async () => {
@@ -2502,6 +2572,15 @@ test("Moonlight host form reloads its revision and listener status after a persi
   const upnp = find(oldForm, (node) => node.name === "upnp");
   assert.ok(upnp);
   assert.equal(upnp.checked, false);
+  for (const name of [
+    "nvenc_preset", "nvenc_h264_cavlc", "nvenc_twopass", "nvenc_vbv_increase",
+    "nvenc_split_encode", "nvenc_realtime_hags", "nvenc_opengl_vulkan_on_dxgi",
+    "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
+  ]) assert.ok(find(oldForm, (node) => node.name === name), `missing ${name} control`);
+  assert.equal(find(oldForm, (node) => node.name === "nvenc_preset").min, "1");
+  assert.equal(find(oldForm, (node) => node.name === "nvenc_preset").max, "7");
+  assert.equal(find(oldForm, (node) => node.name === "nvenc_vbv_increase").min, "0");
+  assert.equal(find(oldForm, (node) => node.name === "nvenc_vbv_increase").max, "400");
   upnp.checked = true;
   assert.match(hostArea.textContent, /Revision 8/);
   oldForm.fire("submit", { preventDefault() {} });
@@ -2521,6 +2600,20 @@ test("Moonlight host form reloads its revision and listener status after a persi
   assert.equal(secondSubmittedRevision, 9);
   assert.equal(submittedUpdates[0].upnp, true);
   assert.equal(submittedUpdates[0].fec_percentage, null);
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(submittedUpdates[0]).filter(([key]) => key.startsWith("nvenc_") || key === "vaapi_strict_rc_buffer")),
+    {
+      nvenc_preset: 1,
+      nvenc_h264_cavlc: false,
+      nvenc_twopass: "quarter_res",
+      nvenc_vbv_increase: 0,
+      nvenc_split_encode: "auto",
+      nvenc_realtime_hags: true,
+      nvenc_opengl_vulkan_on_dxgi: true,
+      nvenc_latency_over_power: true,
+      vaapi_strict_rc_buffer: false,
+    },
+  );
   assert.equal(submittedUpdates[1].upnp, true);
 });
 

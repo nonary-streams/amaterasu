@@ -237,6 +237,14 @@ impl Router {
         self.launches.set_software_encoder_options(options);
     }
 
+    pub fn set_nvenc_settings(&mut self, settings: amaterasu_module_sdk::NvencSettings) {
+        self.launches.set_nvenc_settings(settings);
+    }
+
+    pub fn set_nvenc_spatial_aq(&mut self, enabled: bool) {
+        self.launches.set_nvenc_spatial_aq(enabled);
+    }
+
     pub fn set_global_wgc_pacing_smoothing(&mut self, enabled: bool) {
         self.launches.set_global_wgc_pacing_smoothing(enabled);
     }
@@ -600,6 +608,17 @@ pub(super) struct ClientConfigOverrides {
     pub(super) max_bitrate: Option<i32>,
     pub(super) minimum_fps_target: Option<f64>,
     pub(super) video_max_batch_size_kb: Option<u8>,
+    pub(super) nvenc_preset: Option<u8>,
+    pub(super) nvenc_h264_cavlc: Option<bool>,
+    pub(super) nvenc_twopass: Option<amaterasu_module_sdk::NvencTwoPass>,
+    pub(super) nvenc_vbv_increase: Option<u32>,
+    #[serde(alias = "nvenc_force_split_encode")]
+    pub(super) nvenc_split_encode: Option<amaterasu_module_sdk::NvencSplitEncode>,
+    pub(super) nvenc_realtime_hags: Option<bool>,
+    pub(super) nvenc_opengl_vulkan_on_dxgi: Option<bool>,
+    pub(super) nvenc_latency_over_power: Option<bool>,
+    pub(super) vaapi_strict_rc_buffer: Option<bool>,
+    pub(super) nvenc_spatial_aq: Option<bool>,
     pub(super) dd_mode_remapping: Option<serde_json::Value>,
     pub(super) dd_resolution_option: Option<String>,
     pub(super) dd_manual_resolution: Option<String>,

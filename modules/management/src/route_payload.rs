@@ -1350,6 +1350,16 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
         &[],
         &[
             "fec_percentage",
+            "nvenc_preset",
+            "nvenc_h264_cavlc",
+            "nvenc_twopass",
+            "nvenc_vbv_increase",
+            "nvenc_split_encode",
+            "nvenc_force_split_encode",
+            "nvenc_realtime_hags",
+            "nvenc_opengl_vulkan_on_dxgi",
+            "nvenc_latency_over_power",
+            "vaapi_strict_rc_buffer",
             "sw_preset",
             "sw_tune",
             "encoder",
@@ -1403,7 +1413,55 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
     optional_audio_sink_capture_only(overrides)?;
     optional_back_button_timeout(overrides)?;
     optional_input_overrides(overrides)?;
+    optional_nvenc_settings(overrides)?;
     optional_catalog_frame_limiter_overrides(overrides)?;
+    Ok(())
+}
+
+fn optional_nvenc_settings(overrides: &Object) -> Result<(), &'static str> {
+    if overrides.get("nvenc_preset").is_some_and(|value| {
+        !value.is_null()
+            && !value
+                .as_u64()
+                .is_some_and(|preset| (1..=7).contains(&preset))
+    }) || overrides.get("nvenc_vbv_increase").is_some_and(|value| {
+        !value.is_null() && !value.as_u64().is_some_and(|increase| increase <= 400)
+    }) || overrides.get("nvenc_twopass").is_some_and(|value| {
+        !value.is_null()
+            && !matches!(
+                value.as_str(),
+                Some("disabled" | "quarter_res" | "full_res")
+            )
+    }) || overrides
+        .get("nvenc_split_encode")
+        .or_else(|| overrides.get("nvenc_force_split_encode"))
+        .is_some_and(|value| {
+            !value.is_null()
+                && !matches!(
+                    value.as_str(),
+                    Some("auto" | "enabled" | "disabled" | "driver_decides")
+                )
+        })
+        || (overrides.contains_key("nvenc_split_encode")
+            && overrides.contains_key("nvenc_force_split_encode"))
+    {
+        return Err(INVALID);
+    }
+    for field in [
+        "nvenc_h264_cavlc",
+        "nvenc_realtime_hags",
+        "nvenc_opengl_vulkan_on_dxgi",
+        "nvenc_latency_over_power",
+        "vaapi_strict_rc_buffer",
+        "nvenc_spatial_aq",
+    ] {
+        if overrides
+            .get(field)
+            .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
+        {
+            return Err(INVALID);
+        }
+    }
     Ok(())
 }
 
@@ -1969,6 +2027,16 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "external_ip",
                     "wgc_pacing_smoothing",
                     "nvenc_spatial_aq",
+                    "nvenc_preset",
+                    "nvenc_h264_cavlc",
+                    "nvenc_twopass",
+                    "nvenc_vbv_increase",
+                    "nvenc_split_encode",
+                    "nvenc_force_split_encode",
+                    "nvenc_realtime_hags",
+                    "nvenc_opengl_vulkan_on_dxgi",
+                    "nvenc_latency_over_power",
+                    "vaapi_strict_rc_buffer",
                     "ping_timeout_ms",
                     "global_preparation",
                     "lan_encryption_mode",
@@ -2096,6 +2164,43 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             optional_software_encoder_options(object)?;
             optional_nullable_boolean(object, "wgc_pacing_smoothing")?;
             optional_nullable_boolean(object, "nvenc_spatial_aq")?;
+            if object.get("nvenc_preset").is_some_and(|value| {
+                !value.is_null()
+                    && !value
+                        .as_u64()
+                        .is_some_and(|preset| (1..=7).contains(&preset))
+            }) || object.get("nvenc_vbv_increase").is_some_and(|value| {
+                !value.is_null() && !value.as_u64().is_some_and(|increase| increase <= 400)
+            }) || object.get("nvenc_twopass").is_some_and(|value| {
+                !value.is_null()
+                    && !matches!(
+                        value.as_str(),
+                        Some("disabled" | "quarter_res" | "full_res")
+                    )
+            }) || object
+                .get("nvenc_split_encode")
+                .or_else(|| object.get("nvenc_force_split_encode"))
+                .is_some_and(|value| {
+                    !value.is_null()
+                        && !matches!(
+                            value.as_str(),
+                            Some("auto" | "enabled" | "disabled" | "driver_decides")
+                        )
+                })
+                || (object.contains_key("nvenc_split_encode")
+                    && object.contains_key("nvenc_force_split_encode"))
+            {
+                return Err(INVALID);
+            }
+            for field in [
+                "nvenc_h264_cavlc",
+                "nvenc_realtime_hags",
+                "nvenc_opengl_vulkan_on_dxgi",
+                "nvenc_latency_over_power",
+                "vaapi_strict_rc_buffer",
+            ] {
+                optional_nullable_boolean(object, field)?;
+            }
             for field in ["lan_encryption_mode", "wan_encryption_mode"] {
                 if object.get(field).is_some_and(|value| {
                     !value.is_null() && !value.as_u64().is_some_and(|mode| mode <= 2)
@@ -2206,6 +2311,42 @@ mod nvhttp_tests {
                 validate(route, payload.as_object().unwrap()).is_err(),
                 "{payload}"
             );
+        }
+    }
+
+    #[test]
+    fn nvenc_settings_update_accepts_bounded_reference_values_only() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        let base = serde_json::json!({
+            "hostname":"Host", "port":47989, "expected_revision":0,
+        });
+        for overrides in [
+            serde_json::json!({"nvenc_preset":1,"nvenc_twopass":"disabled","nvenc_vbv_increase":0,"nvenc_split_encode":"auto"}),
+            serde_json::json!({"nvenc_preset":7,"nvenc_h264_cavlc":true,"nvenc_twopass":"full_res","nvenc_vbv_increase":400,"nvenc_split_encode":"disabled","nvenc_realtime_hags":false,"nvenc_opengl_vulkan_on_dxgi":true,"nvenc_latency_over_power":false,"vaapi_strict_rc_buffer":true}),
+            serde_json::json!({"nvenc_force_split_encode":"driver_decides"}),
+        ] {
+            let mut payload = base.as_object().unwrap().clone();
+            payload.extend(overrides.as_object().unwrap().clone());
+            assert!(validate(route, &payload).is_ok(), "{payload:?}");
+        }
+        for overrides in [
+            serde_json::json!({"nvenc_preset":0}),
+            serde_json::json!({"nvenc_preset":8}),
+            serde_json::json!({"nvenc_vbv_increase":401}),
+            serde_json::json!({"nvenc_vbv_increase":-1}),
+            serde_json::json!({"nvenc_twopass":"quarter"}),
+            serde_json::json!({"nvenc_split_encode":"yes"}),
+            serde_json::json!({"nvenc_h264_cavlc":"true"}),
+            serde_json::json!({"nvenc_split_encode":"auto","nvenc_force_split_encode":"enabled"}),
+        ] {
+            let mut payload = base.as_object().unwrap().clone();
+            payload.extend(overrides.as_object().unwrap().clone());
+            assert!(validate(route, &payload).is_err(), "{payload:?}");
         }
     }
 
@@ -3026,6 +3167,16 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                     "virtual_sink",
                     "audio_sink_capture_only",
                     "nvenc_spatial_aq",
+                    "nvenc_preset",
+                    "nvenc_h264_cavlc",
+                    "nvenc_twopass",
+                    "nvenc_vbv_increase",
+                    "nvenc_split_encode",
+                    "nvenc_force_split_encode",
+                    "nvenc_realtime_hags",
+                    "nvenc_opengl_vulkan_on_dxgi",
+                    "nvenc_latency_over_power",
+                    "vaapi_strict_rc_buffer",
                     "back_button_timeout",
                     "controller",
                     "gamepad",
@@ -3062,6 +3213,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                 return Err(INVALID);
             }
             optional_software_encoder_options(config_overrides)?;
+            optional_nvenc_settings(config_overrides)?;
             optional_audio_sink(config_overrides)?;
             optional_virtual_sink(config_overrides)?;
             optional_audio_sink_capture_only(config_overrides)?;

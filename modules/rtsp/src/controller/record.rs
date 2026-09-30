@@ -94,6 +94,8 @@ impl Record {
             "frame_limiter_settings":self.config.frame_limiter_settings,
             "encoder":self.config.capture.encoder,"sw_preset":self.config.sw_preset,"sw_tune":self.config.sw_tune,"min_threads":self.config.min_threads,"qp":self.config.qp,
             "slices_per_frame":self.negotiated_slices_per_frame,
+            "nvenc_settings":self.config.nvenc_settings,
+            "nvenc_spatial_aq":self.config.nvenc_spatial_aq,
             "frame_limiter_executable_path":self.config.frame_limiter_executable_path,
             "history_activity_id":self.config.history_activity_id,
             "display_request":self.config.display_request,

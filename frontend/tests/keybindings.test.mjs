@@ -91,7 +91,7 @@ test("application DOM saves output and keybindings while preserving raw preparat
     launch: { kind: "application", path: "/opt/game" },
     output: " logs/$(APP).log ",
     prep_cmd: rawPreparation,
-    config_overrides: { keybindings: [65, 66, 65, 67], frame_limiter_enable: false, frame_limiter_fps_limit: 0 },
+    config_overrides: { keybindings: [65, 66, 65, 67], frame_limiter_enable: false, frame_limiter_fps_limit: 0, nvenc_spatial_aq: false },
   };
   const updates = [];
   context.Amaterasu.renderCatalog({
@@ -152,6 +152,7 @@ test("application DOM saves output and keybindings while preserving raw preparat
     assert.deepEqual(entry.prep_cmd, rawPreparation);
     assert.equal(entry.config_overrides.frame_limiter_enable, false);
     assert.equal(entry.config_overrides.frame_limiter_fps_limit, 0);
+    assert.equal(entry.config_overrides.nvenc_spatial_aq, false);
   }
   assert.deepEqual(updates.map((update) => update.expected_revision), [7, 8, 9]);
 });

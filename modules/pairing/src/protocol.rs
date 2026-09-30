@@ -271,6 +271,28 @@ pub struct ClientConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvenc_spatial_aq: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_preset: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_h264_cavlc: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_twopass: Option<amaterasu_module_sdk::NvencTwoPass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_vbv_increase: Option<u32>,
+    #[serde(
+        default,
+        alias = "nvenc_force_split_encode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub nvenc_split_encode: Option<amaterasu_module_sdk::NvencSplitEncode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_realtime_hags: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_opengl_vulkan_on_dxgi: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_latency_over_power: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vaapi_strict_rc_buffer: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub back_button_timeout: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller: Option<bool>,
@@ -307,6 +329,22 @@ impl ClientConfigOverrides {
         .map_err(|_| "invalid_config_overrides")?;
         amaterasu_module_sdk::validate_min_threads(self.min_threads)
             .map_err(|_| "invalid_config_overrides")?;
+        if (amaterasu_module_sdk::NvencSettingsOverrides {
+            nvenc_preset: self.nvenc_preset,
+            nvenc_h264_cavlc: self.nvenc_h264_cavlc,
+            nvenc_twopass: self.nvenc_twopass,
+            nvenc_vbv_increase: self.nvenc_vbv_increase,
+            nvenc_split_encode: self.nvenc_split_encode,
+            nvenc_realtime_hags: self.nvenc_realtime_hags,
+            nvenc_opengl_vulkan_on_dxgi: self.nvenc_opengl_vulkan_on_dxgi,
+            nvenc_latency_over_power: self.nvenc_latency_over_power,
+            vaapi_strict_rc_buffer: self.vaapi_strict_rc_buffer,
+        })
+        .validate()
+        .is_err()
+        {
+            return Err("invalid_config_overrides");
+        }
         if self
             .display_mode
             .as_deref()
@@ -454,6 +492,15 @@ impl ClientConfigOverrides {
             && self.virtual_sink.is_none()
             && self.audio_sink_capture_only.is_none()
             && self.nvenc_spatial_aq.is_none()
+            && self.nvenc_preset.is_none()
+            && self.nvenc_h264_cavlc.is_none()
+            && self.nvenc_twopass.is_none()
+            && self.nvenc_vbv_increase.is_none()
+            && self.nvenc_split_encode.is_none()
+            && self.nvenc_realtime_hags.is_none()
+            && self.nvenc_opengl_vulkan_on_dxgi.is_none()
+            && self.nvenc_latency_over_power.is_none()
+            && self.vaapi_strict_rc_buffer.is_none()
             && self.back_button_timeout.is_none()
             && self.controller.is_none()
             && self.gamepad.is_none()
@@ -1067,6 +1114,35 @@ mod tests {
             serde_json::to_value(client).unwrap()["config_overrides"]["nvenc_spatial_aq"],
             false
         );
+    }
+
+    #[test]
+    fn client_nvenc_settings_overrides_are_sparse_bounded_and_roundtrip() {
+        for value in [
+            json!({"nvenc_preset":1,"nvenc_vbv_increase":0}),
+            json!({"nvenc_preset":7,"nvenc_h264_cavlc":true,"nvenc_twopass":"full_res","nvenc_vbv_increase":400,"nvenc_split_encode":"disabled","nvenc_realtime_hags":false,"nvenc_opengl_vulkan_on_dxgi":false,"nvenc_latency_over_power":false,"vaapi_strict_rc_buffer":true}),
+            json!({"nvenc_force_split_encode":"driver_decides"}),
+        ] {
+            let overrides: ClientConfigOverrides = serde_json::from_value(value.clone()).unwrap();
+            assert!(overrides.validate().is_ok());
+            assert!(!overrides.is_empty());
+            let serialized = serde_json::to_value(overrides).unwrap();
+            if value.get("nvenc_preset").is_none() {
+                assert_eq!(serialized["nvenc_split_encode"], "auto");
+                assert!(serialized.get("nvenc_force_split_encode").is_none());
+            }
+        }
+        for invalid in [
+            json!({"nvenc_preset":0}),
+            json!({"nvenc_preset":8}),
+            json!({"nvenc_vbv_increase":401}),
+            json!({"nvenc_twopass":"fast"}),
+            json!({"nvenc_split_encode":"forced"}),
+        ] {
+            if let Ok(overrides) = serde_json::from_value::<ClientConfigOverrides>(invalid) {
+                assert!(overrides.validate().is_err());
+            }
+        }
     }
 
     #[test]

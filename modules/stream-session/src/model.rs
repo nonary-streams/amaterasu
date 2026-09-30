@@ -698,10 +698,19 @@ pub struct VideoConfiguration {
     /// single H.264 reference frame.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_reference_frames: u32,
+    /// Frozen host hardware-encoder controls resolved before stream activation.
+    #[serde(default, skip_serializing_if = "is_default_nvenc_settings")]
+    pub nvenc_settings: amaterasu_module_sdk::NvencSettings,
+    #[serde(default)]
+    pub nvenc_spatial_aq: bool,
 }
 
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+fn is_default_nvenc_settings(settings: &amaterasu_module_sdk::NvencSettings) -> bool {
+    settings == &amaterasu_module_sdk::NvencSettings::default()
 }
 
 fn default_slices_per_frame() -> i32 {
@@ -936,7 +945,8 @@ impl VideoConfiguration {
             && (1..=120).contains(&self.fps)
             && (100_000..=100_000_000).contains(&self.bitrate)
             && self.slices_per_frame >= 1
-            && self.max_reference_frames <= 1
+            && self.nvenc_settings.validate().is_ok()
+            && self.max_reference_frames <= 16
             && amaterasu_module_sdk::validate_software_options(
                 self.sw_preset.as_deref(),
                 self.sw_tune.as_deref(),

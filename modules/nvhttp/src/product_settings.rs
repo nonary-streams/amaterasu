@@ -8,7 +8,8 @@ use crate::{
     settings::{self, AddressFamily, Settings},
 };
 use amaterasu_module_sdk::{
-    Command, EncoderBackend, ModuleResult, Response, RuntimeClient, SoftwareEncoderOptions,
+    Command, EncoderBackend, ModuleResult, NvencSettings, Response, RuntimeClient,
+    SoftwareEncoderOptions,
 };
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -42,7 +43,8 @@ const MIN_THREADS_SETTINGS_VERSION: u64 = 20;
 const UPNP_SETTINGS_VERSION: u64 = 21;
 const QP_SETTINGS_VERSION: u64 = 22;
 const FEC_SETTINGS_VERSION: u64 = 23;
-const SETTINGS_VERSION: u64 = FEC_SETTINGS_VERSION;
+const NVENC_SETTINGS_VERSION: u64 = 24;
+const SETTINGS_VERSION: u64 = NVENC_SETTINGS_VERSION;
 const DISPLAY_POLICY_KEYS: [&str; 8] = [
     "dd_mode_remapping",
     "dd_resolution_option",
@@ -84,6 +86,7 @@ pub(crate) enum AdminAction {
         minimum_fps_target: FieldUpdate<f64>,
         wgc_pacing_smoothing: FieldUpdate<bool>,
         software_encoder: SoftwareEncoderUpdate,
+        nvenc_settings: NvencSettingsUpdate,
         qp: FieldUpdate<i32>,
         fec_percentage: FieldUpdate<i32>,
         ping_timeout_ms: FieldUpdate<i32>,
@@ -96,6 +99,131 @@ pub(crate) enum AdminAction {
         expected_revision: u64,
         require_listener_apply: bool,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NvencSettingsUpdate {
+    pub(crate) nvenc_preset: FieldUpdate<i32>,
+    pub(crate) nvenc_h264_cavlc: FieldUpdate<bool>,
+    pub(crate) nvenc_twopass: FieldUpdate<String>,
+    pub(crate) nvenc_vbv_increase: FieldUpdate<i32>,
+    pub(crate) nvenc_split_encode: FieldUpdate<String>,
+    pub(crate) nvenc_realtime_hags: FieldUpdate<bool>,
+    pub(crate) nvenc_opengl_vulkan_on_dxgi: FieldUpdate<bool>,
+    pub(crate) nvenc_latency_over_power: FieldUpdate<bool>,
+    pub(crate) vaapi_strict_rc_buffer: FieldUpdate<bool>,
+}
+
+const NVENC_SETTINGS_KEYS: [&str; 9] = [
+    "nvenc_preset",
+    "nvenc_h264_cavlc",
+    "nvenc_twopass",
+    "nvenc_vbv_increase",
+    "nvenc_split_encode",
+    "nvenc_realtime_hags",
+    "nvenc_opengl_vulkan_on_dxgi",
+    "nvenc_latency_over_power",
+    "vaapi_strict_rc_buffer",
+];
+
+fn nvenc_settings_values(settings: &NvencSettings) -> serde_json::Map<String, Value> {
+    serde_json::to_value(settings)
+        .expect("NVENC settings serialize")
+        .as_object()
+        .expect("NVENC settings are an object")
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn parse_nvenc_settings(
+    values: &serde_json::Map<String, Value>,
+    version: u64,
+) -> Result<NvencSettings, SettingFailure> {
+    if version < NVENC_SETTINGS_VERSION {
+        return Ok(NvencSettings::default());
+    }
+    let settings = serde_json::from_value::<NvencSettings>(Value::Object(
+        NVENC_SETTINGS_KEYS
+            .iter()
+            .map(|key| ((*key).to_owned(), values[*key].clone()))
+            .collect(),
+    ))
+    .map_err(|_| invalid_state("persisted NVENC settings are invalid"))?;
+    settings
+        .validate()
+        .map_err(|_| invalid_state("persisted NVENC settings are invalid"))?;
+    Ok(settings)
+}
+
+fn update_nvenc_settings(
+    update: NvencSettingsUpdate,
+    current: &NvencSettings,
+) -> Result<NvencSettings, &'static str> {
+    let defaults = NvencSettings::default();
+    let parse_twopass = |setting: String| match setting.as_str() {
+        "disabled" => Some(amaterasu_module_sdk::NvencTwoPass::Disabled),
+        "quarter_res" => Some(amaterasu_module_sdk::NvencTwoPass::QuarterRes),
+        "full_res" => Some(amaterasu_module_sdk::NvencTwoPass::FullRes),
+        _ => None,
+    };
+    let parse_split = |setting: String| match setting.as_str() {
+        "auto" | "driver_decides" => Some(amaterasu_module_sdk::NvencSplitEncode::Auto),
+        "enabled" => Some(amaterasu_module_sdk::NvencSplitEncode::Enabled),
+        "disabled" => Some(amaterasu_module_sdk::NvencSplitEncode::Disabled),
+        _ => None,
+    };
+    let settings = NvencSettings {
+        nvenc_preset: u8::try_from(apply_settings_update(
+            update.nvenc_preset,
+            i32::from(current.nvenc_preset),
+            i32::from(defaults.nvenc_preset),
+        ))
+        .map_err(|_| "invalid_nvenc_settings")?,
+        nvenc_h264_cavlc: apply_settings_update(
+            update.nvenc_h264_cavlc,
+            current.nvenc_h264_cavlc,
+            defaults.nvenc_h264_cavlc,
+        ),
+        nvenc_twopass: match update.nvenc_twopass {
+            FieldUpdate::Omitted => current.nvenc_twopass,
+            FieldUpdate::Null => defaults.nvenc_twopass,
+            FieldUpdate::Value(value) => parse_twopass(value).ok_or("invalid_nvenc_settings")?,
+        },
+        nvenc_vbv_increase: u32::try_from(apply_settings_update(
+            update.nvenc_vbv_increase,
+            current.nvenc_vbv_increase as i32,
+            defaults.nvenc_vbv_increase as i32,
+        ))
+        .map_err(|_| "invalid_nvenc_settings")?,
+        nvenc_split_encode: match update.nvenc_split_encode {
+            FieldUpdate::Omitted => current.nvenc_split_encode,
+            FieldUpdate::Null => defaults.nvenc_split_encode,
+            FieldUpdate::Value(value) => parse_split(value).ok_or("invalid_nvenc_settings")?,
+        },
+        nvenc_realtime_hags: apply_settings_update(
+            update.nvenc_realtime_hags,
+            current.nvenc_realtime_hags,
+            defaults.nvenc_realtime_hags,
+        ),
+        nvenc_opengl_vulkan_on_dxgi: apply_settings_update(
+            update.nvenc_opengl_vulkan_on_dxgi,
+            current.nvenc_opengl_vulkan_on_dxgi,
+            defaults.nvenc_opengl_vulkan_on_dxgi,
+        ),
+        nvenc_latency_over_power: apply_settings_update(
+            update.nvenc_latency_over_power,
+            current.nvenc_latency_over_power,
+            defaults.nvenc_latency_over_power,
+        ),
+        vaapi_strict_rc_buffer: apply_settings_update(
+            update.vaapi_strict_rc_buffer,
+            current.vaapi_strict_rc_buffer,
+            defaults.vaapi_strict_rc_buffer,
+        ),
+    };
+    settings.validate()?;
+    Ok(settings)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -360,6 +488,14 @@ pub enum FieldUpdate<T> {
     Null,
     Value(T),
 }
+
+fn apply_settings_update<T>(update: FieldUpdate<T>, current: T, default: T) -> T {
+    match update {
+        FieldUpdate::Omitted => current,
+        FieldUpdate::Null => default,
+        FieldUpdate::Value(value) => value,
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkTarget {
     pub port: u16,
@@ -430,6 +566,7 @@ struct UpdatePurpose {
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
     software_encoder: SoftwareEncoderOptions,
+    nvenc_settings: NvencSettings,
     ping_timeout_ms: Option<i32>,
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
@@ -480,6 +617,7 @@ struct ProductDocument {
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
     software_encoder: SoftwareEncoderOptions,
+    nvenc_settings: NvencSettings,
     ping_timeout_ms: Option<i32>,
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
@@ -506,6 +644,7 @@ struct ProductStreamingSettings {
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
     software_encoder: SoftwareEncoderOptions,
+    nvenc_settings: NvencSettings,
     ping_timeout_ms: Option<i32>,
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
@@ -566,6 +705,7 @@ pub struct ProductSettings {
     configured_minimum_fps_target: Option<f64>,
     configured_wgc_pacing_smoothing: Option<bool>,
     configured_software_encoder: SoftwareEncoderOptions,
+    configured_nvenc_settings: NvencSettings,
     configured_ping_timeout_ms: Option<i32>,
     configured_global_preparation: Vec<PreparationStep>,
     configured_legacy_global_preparation: Vec<LegacyPreparationStep>,
@@ -685,6 +825,7 @@ impl ProductSettings {
             configured_minimum_fps_target: None,
             configured_wgc_pacing_smoothing: None,
             configured_software_encoder: SoftwareEncoderOptions::default(),
+            configured_nvenc_settings: NvencSettings::default(),
             configured_ping_timeout_ms: None,
             configured_global_preparation: Vec::new(),
             configured_legacy_global_preparation: Vec::new(),
@@ -824,6 +965,14 @@ impl ProductSettings {
 
     pub fn software_encoder_options(&self) -> &SoftwareEncoderOptions {
         &self.configured_software_encoder
+    }
+
+    pub fn nvenc_settings(&self) -> &NvencSettings {
+        &self.configured_nvenc_settings
+    }
+
+    pub fn nvenc_spatial_aq(&self) -> bool {
+        self.nvenc_spatial_aq
     }
 
     pub fn configured_wgc_pacing_smoothing(&self) -> Option<bool> {
@@ -1361,6 +1510,7 @@ impl ProductSettings {
                 minimum_fps_target,
                 wgc_pacing_smoothing,
                 software_encoder,
+                nvenc_settings,
                 ping_timeout_ms,
                 global_preparation,
                 legacy_global_preparation,
@@ -1529,6 +1679,17 @@ impl ProductSettings {
                         return;
                     }
                 };
+                let nvenc_settings =
+                    match update_nvenc_settings(nvenc_settings, &self.configured_nvenc_settings) {
+                        Ok(settings) => settings,
+                        Err(code) => {
+                            self.queue_completion(
+                                request.request,
+                                failure(code, "NVENC settings are invalid"),
+                            );
+                            return;
+                        }
+                    };
                 let ping_timeout_ms = match apply_ping_timeout_update(
                     ping_timeout_ms,
                     self.configured_ping_timeout_ms,
@@ -1720,6 +1881,7 @@ impl ProductSettings {
                             minimum_fps_target,
                             wgc_pacing_smoothing,
                             software_encoder: software_encoder.clone(),
+                            nvenc_settings: nvenc_settings.clone(),
                             ping_timeout_ms,
                             global_preparation: global_preparation.clone(),
                             legacy_global_preparation: legacy_global_preparation.clone(),
@@ -1751,6 +1913,7 @@ impl ProductSettings {
                         minimum_fps_target,
                         wgc_pacing_smoothing,
                         software_encoder,
+                        nvenc_settings,
                         ping_timeout_ms,
                         global_preparation,
                         legacy_global_preparation,
@@ -1885,6 +2048,7 @@ impl ProductSettings {
                     minimum_fps_target,
                     wgc_pacing_smoothing,
                     software_encoder,
+                    nvenc_settings,
                     ping_timeout_ms,
                     global_preparation,
                     legacy_global_preparation,
@@ -1917,6 +2081,7 @@ impl ProductSettings {
                             minimum_fps_target,
                             wgc_pacing_smoothing,
                             software_encoder: &software_encoder,
+                            nvenc_settings: &nvenc_settings,
                             ping_timeout_ms,
                             global_preparation: &global_preparation,
                             legacy_global_preparation: &legacy_global_preparation,
@@ -2138,6 +2303,10 @@ impl ProductSettings {
     fn validate_document(&self, document: &ProductDocument) -> Result<(), SettingFailure> {
         validate_display_policy_values(&document.display_policy)
             .map_err(|_| invalid_state("persisted display policy is invalid"))?;
+        document
+            .nvenc_settings
+            .validate()
+            .map_err(|_| invalid_state("persisted NVENC settings are invalid"))?;
         if document
             .output_name
             .as_deref()
@@ -2246,6 +2415,7 @@ impl ProductSettings {
         self.configured_minimum_fps_target = document.minimum_fps_target;
         self.configured_wgc_pacing_smoothing = document.wgc_pacing_smoothing;
         self.configured_software_encoder = document.software_encoder;
+        self.configured_nvenc_settings = document.nvenc_settings;
         self.configured_ping_timeout_ms = document.ping_timeout_ms;
         self.configured_global_preparation = document.global_preparation;
         self.configured_legacy_global_preparation = document.legacy_global_preparation;
@@ -2322,6 +2492,15 @@ impl ProductSettings {
                 "configured_sw_tune":self.configured_software_encoder.sw_tune,
                 "configured_encoder":self.configured_software_encoder.encoder,
                 "configured_min_threads":self.configured_software_encoder.min_threads,
+                "configured_nvenc_preset":self.configured_nvenc_settings.nvenc_preset,
+                "configured_nvenc_h264_cavlc":self.configured_nvenc_settings.nvenc_h264_cavlc,
+                "configured_nvenc_twopass":self.configured_nvenc_settings.nvenc_twopass,
+                "configured_nvenc_vbv_increase":self.configured_nvenc_settings.nvenc_vbv_increase,
+                "configured_nvenc_split_encode":self.configured_nvenc_settings.nvenc_split_encode,
+                "configured_nvenc_realtime_hags":self.configured_nvenc_settings.nvenc_realtime_hags,
+                "configured_nvenc_opengl_vulkan_on_dxgi":self.configured_nvenc_settings.nvenc_opengl_vulkan_on_dxgi,
+                "configured_nvenc_latency_over_power":self.configured_nvenc_settings.nvenc_latency_over_power,
+                "configured_vaapi_strict_rc_buffer":self.configured_nvenc_settings.vaapi_strict_rc_buffer,
                 "effective_sw_preset":self.configured_software_encoder.effective_preset(),
                 "effective_sw_tune":self.configured_software_encoder.effective_tune(),
                 "effective_min_threads":self.configured_software_encoder.effective_threads(),
@@ -2383,6 +2562,68 @@ impl ProductSettings {
     }
 }
 
+/// Builds a complete current-version stored document using the product's
+/// canonical defaults and the startup listener configuration.
+pub fn default_document(settings: &Settings) -> Result<Value, &'static str> {
+    settings.validate()?;
+    let bootstrap = ProductSettings::with_bootstrap_settings(settings.hostname.clone(), settings);
+    let values = product_update_payload(
+        1,
+        bootstrap.hostname(),
+        &NetworkTarget {
+            port: bootstrap.port,
+            address_family: bootstrap.bootstrap_address_family,
+            bind_address: bootstrap.bootstrap_bind_address.clone(),
+        },
+        None,
+        ProductStreamingSettings {
+            audio_sink: None,
+            virtual_sink: None,
+            audio_sink_capture_only: false,
+            nvenc_spatial_aq: false,
+            external_ip: None,
+            stream_audio: true,
+            capture: CaptureMode::Auto,
+            video_max_batch_size_kb: None,
+            max_bitrate: None,
+            qp: None,
+            fec_percentage: None,
+            minimum_fps_target: None,
+            wgc_pacing_smoothing: None,
+            software_encoder: SoftwareEncoderOptions::default(),
+            nvenc_settings: NvencSettings::default(),
+            ping_timeout_ms: None,
+            global_preparation: Vec::new(),
+            legacy_global_preparation: Vec::new(),
+            frame_limiter: FrameLimiterSettings::default(),
+            display_policy: empty_display_policy(),
+            lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
+            wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
+            upnp: false,
+        },
+    )
+    .get("values")
+    .cloned()
+    .ok_or("invalid_product_settings_defaults")?;
+    let document = json!({
+        "ok": true,
+        "found": true,
+        "version": SETTINGS_VERSION,
+        "revision": 1,
+        "values": values,
+    });
+    validate_document(&document)?;
+    Ok(document)
+}
+
+/// Validates a stored product document through the same strict parser used
+/// for service readback, including its supported legacy migrations.
+pub fn validate_document(document: &Value) -> Result<(), &'static str> {
+    parse_document(document)
+        .map(|_| ())
+        .map_err(|_| "invalid_product_settings_document")
+}
+
 fn request_command(pending: &PendingCall) -> Command {
     Command::Request {
         service: CONFIGURATION_SERVICE.into(),
@@ -2440,6 +2681,10 @@ fn product_update_payload(
                 .expect("display policy values")
                 .clone(),
         );
+    values
+        .as_object_mut()
+        .expect("product settings values are an object")
+        .extend(nvenc_settings_values(&streaming.nvenc_settings));
     let frame_limiter_values =
         serde_json::to_value(streaming.frame_limiter).expect("frame-limiter settings serialize");
     values
@@ -2550,6 +2795,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             minimum_fps_target: None,
             wgc_pacing_smoothing: None,
             software_encoder: SoftwareEncoderOptions::default(),
+            nvenc_settings: NvencSettings::default(),
             ping_timeout_ms: None,
             global_preparation: Vec::new(),
             legacy_global_preparation: Vec::new(),
@@ -2590,6 +2836,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | UPNP_SETTINGS_VERSION
             | QP_SETTINGS_VERSION
             | FEC_SETTINGS_VERSION
+            | NVENC_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -2620,6 +2867,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         UPNP_SETTINGS_VERSION => 45,
         QP_SETTINGS_VERSION => 46,
         FEC_SETTINGS_VERSION => 47,
+        NVENC_SETTINGS_VERSION => 56,
         _ => unreachable!(),
     };
     let matches_expected_value_count = values.len() == expected_value_count
@@ -2631,6 +2879,10 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         || (version >= MIN_THREADS_SETTINGS_VERSION && !values.contains_key("min_threads"))
         || (version >= QP_SETTINGS_VERSION && !values.contains_key("qp"))
         || (version >= FEC_SETTINGS_VERSION && !values.contains_key("fec_percentage"))
+        || (version >= NVENC_SETTINGS_VERSION
+            && NVENC_SETTINGS_KEYS
+                .iter()
+                .any(|key| !values.contains_key(*key)))
         || !matches_expected_value_count
         || !values.contains_key("hostname")
         || (version >= PORT_SETTINGS_VERSION && !values.contains_key("port"))
@@ -2854,6 +3106,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         SoftwareEncoderOptions::default()
     };
+    let nvenc_settings = parse_nvenc_settings(values, version)?;
     let ping_timeout_ms = if version >= PING_TIMEOUT_SETTINGS_VERSION {
         match values.get("ping_timeout_ms") {
             Some(Value::Null) => None,
@@ -2993,6 +3246,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         minimum_fps_target,
         wgc_pacing_smoothing,
         software_encoder,
+        nvenc_settings,
         ping_timeout_ms,
         global_preparation,
         legacy_global_preparation,
@@ -3024,6 +3278,7 @@ struct UpdateExpectation<'a> {
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
     software_encoder: &'a SoftwareEncoderOptions,
+    nvenc_settings: &'a NvencSettings,
     ping_timeout_ms: Option<i32>,
     global_preparation: &'a [PreparationStep],
     legacy_global_preparation: &'a [LegacyPreparationStep],
@@ -3042,7 +3297,7 @@ fn update_result(
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
-        return Err(invalid_state("product_update did not confirm v23 settings"));
+        return Err(invalid_state("product_update did not confirm v24 settings"));
     }
     let document = parse_document(payload)?;
     if document.hostname.as_deref() != Some(expected.hostname)
@@ -3063,6 +3318,7 @@ fn update_result(
         || document.fec_percentage != expected.fec_percentage
         || document.minimum_fps_target != expected.minimum_fps_target
         || document.wgc_pacing_smoothing != expected.wgc_pacing_smoothing
+        || &document.nvenc_settings != expected.nvenc_settings
         || &document.software_encoder != expected.software_encoder
         || document.ping_timeout_ms != expected.ping_timeout_ms
         || document.global_preparation != expected.global_preparation
@@ -3431,6 +3687,30 @@ fn failure_with_revision(code: &str, message: &str, revision: Option<u64>) -> Va
 mod tests {
     use super::*;
 
+    #[test]
+    fn public_document_helpers_use_canonical_v24_defaults_and_legacy_migration() {
+        let mut current = default_document(&Settings::default()).unwrap();
+        assert_eq!(current["version"], NVENC_SETTINGS_VERSION);
+        assert_eq!(current["values"].as_object().unwrap().len(), 56);
+        assert_eq!(current["values"]["nvenc_preset"], 1);
+        assert_eq!(current["values"]["vaapi_strict_rc_buffer"], false);
+        assert!(validate_document(&current).is_ok());
+
+        let mut legacy = current.clone();
+        legacy["version"] = json!(FEC_SETTINGS_VERSION);
+        for key in NVENC_SETTINGS_KEYS {
+            legacy["values"].as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(legacy["values"].as_object().unwrap().len(), 47);
+        assert!(validate_document(&legacy).is_ok());
+
+        current["values"]["unexpected"] = json!(true);
+        assert_eq!(
+            validate_document(&current),
+            Err("invalid_product_settings_document")
+        );
+    }
+
     fn v17_update_confirmation(mut payload: Value) -> Value {
         payload["version"] = json!(SETTINGS_VERSION);
         let values = payload["values"]
@@ -3459,7 +3739,18 @@ mod tests {
         for key in ["sw_preset", "sw_tune", "encoder", "min_threads", "qp"] {
             values.entry(key.to_owned()).or_insert(Value::Null);
         }
+        for (key, value) in nvenc_settings_values(&NvencSettings::default()) {
+            values.entry(key).or_insert(value);
+        }
         payload
+    }
+
+    fn remove_nvenc_settings(document: &mut Value) {
+        if let Some(values) = document["values"].as_object_mut() {
+            for key in NVENC_SETTINGS_KEYS {
+                values.remove(key);
+            }
+        }
     }
 
     fn display_update_action(
@@ -3486,6 +3777,7 @@ mod tests {
             minimum_fps_target: FieldUpdate::Omitted,
             wgc_pacing_smoothing: FieldUpdate::Omitted,
             software_encoder: SoftwareEncoderUpdate::default(),
+            nvenc_settings: NvencSettingsUpdate::default(),
             ping_timeout_ms: FieldUpdate::Omitted,
             global_preparation: FieldUpdate::Omitted,
             legacy_global_preparation: FieldUpdate::Omitted,
@@ -3541,7 +3833,7 @@ mod tests {
         let pending = product.pending.take().unwrap();
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["expected_revision"], 7);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 47);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 56);
         let write = pending.payload["values"].clone();
         let response =
             json!({"ok":true,"found":true,"version":SETTINGS_VERSION,"revision":8,"values":write});
@@ -4266,6 +4558,7 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
+                nvenc_settings: NvencSettings::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -4295,6 +4588,7 @@ mod tests {
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
                     software_encoder: SoftwareEncoderUpdate::default(),
+                    nvenc_settings: NvencSettingsUpdate::default(),
                     hostname: "Host".into(),
                     port: settings::DEFAULT_PORT,
                     address_family: FieldUpdate::Omitted,
@@ -4462,6 +4756,7 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
+                nvenc_settings: NvencSettings::default(),
                 ping_timeout_ms: reset,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -4504,6 +4799,7 @@ mod tests {
                     AdminAction::Update {
                         display_policy: DisplayPolicyUpdate::default(),
                         software_encoder: SoftwareEncoderUpdate::default(),
+                        nvenc_settings: NvencSettingsUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -4612,6 +4908,7 @@ mod tests {
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
                     software_encoder: SoftwareEncoderUpdate::default(),
+                    nvenc_settings: NvencSettingsUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -4690,6 +4987,7 @@ mod tests {
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
                     software_encoder: SoftwareEncoderUpdate::default(),
+                    nvenc_settings: NvencSettingsUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -4767,6 +5065,7 @@ mod tests {
                     AdminAction::Update {
                         display_policy: DisplayPolicyUpdate::default(),
                         software_encoder: SoftwareEncoderUpdate::default(),
+                        nvenc_settings: NvencSettingsUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -4855,6 +5154,7 @@ mod tests {
                     AdminAction::Update {
                         display_policy: DisplayPolicyUpdate::default(),
                         software_encoder: SoftwareEncoderUpdate::default(),
+                        nvenc_settings: NvencSettingsUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -5050,6 +5350,7 @@ mod tests {
         let expected = UpdateExpectation {
             display_policy: &expected_display_policy,
             software_encoder: &SoftwareEncoderOptions::default(),
+            nvenc_settings: &NvencSettings::default(),
             revision: 3,
             hostname: "New Host",
             target: &target,
@@ -5240,6 +5541,7 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
+                nvenc_settings: NvencSettings::default(),
                 ping_timeout_ms: None,
                 global_preparation: product.global_preparation().to_vec(),
                 legacy_global_preparation: product.legacy_global_preparation().to_vec(),
@@ -5251,7 +5553,7 @@ mod tests {
             },
         );
         assert_eq!(update["version"], SETTINGS_VERSION);
-        assert_eq!(update["values"].as_object().unwrap().len(), 47);
+        assert_eq!(update["values"].as_object().unwrap().len(), 56);
         assert_eq!(update["values"]["nvenc_spatial_aq"], false);
         assert_eq!(
             update["values"]["global_preparation"]
@@ -5305,6 +5607,7 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
+                nvenc_settings: NvencSettings::default(),
                 ping_timeout_ms: None,
                 global_preparation: vec![structured.clone()],
                 legacy_global_preparation: vec![raw.clone()],
@@ -5369,6 +5672,7 @@ mod tests {
 
         let mut old_v17 = reply.clone();
         old_v17["version"] = json!(GLOBAL_RAW_PREPARATION_SETTINGS_VERSION);
+        remove_nvenc_settings(&mut old_v17);
         old_v17["values"].as_object_mut().unwrap().remove("upnp");
         for key in ["sw_preset", "sw_tune", "encoder", "min_threads", "qp"] {
             old_v17["values"].as_object_mut().unwrap().remove(key);
@@ -5441,6 +5745,7 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
+                nvenc_settings: NvencSettings::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -5485,6 +5790,7 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
+                nvenc_settings: NvencSettings::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -5512,6 +5818,7 @@ mod tests {
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
                     software_encoder: SoftwareEncoderUpdate::default(),
+                    nvenc_settings: NvencSettingsUpdate::default(),
                     hostname: "Host".into(),
                     port: settings::DEFAULT_PORT,
                     address_family: FieldUpdate::Omitted,
@@ -5722,6 +6029,15 @@ mod tests {
                     "configured_sw_preset":null,"configured_sw_tune":null,"configured_encoder":null,
                     "effective_sw_preset":"superfast","effective_sw_tune":"zerolatency",
                     "configured_min_threads":null,"effective_min_threads":2,
+                    "configured_nvenc_preset":1,
+                    "configured_nvenc_h264_cavlc":false,
+                    "configured_nvenc_twopass":"quarter_res",
+                    "configured_nvenc_vbv_increase":0,
+                    "configured_nvenc_split_encode":"auto",
+                    "configured_nvenc_realtime_hags":true,
+                    "configured_nvenc_opengl_vulkan_on_dxgi":true,
+                    "configured_nvenc_latency_over_power":true,
+                    "configured_vaapi_strict_rc_buffer":false,
                     "effective_wgc_pacing_smoothing":true,
                     "configured_ping_timeout_ms":null,
                 }),
@@ -5833,6 +6149,7 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
+            nvenc_settings: NvencSettings::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -5908,6 +6225,7 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
+            nvenc_settings: NvencSettings::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -6096,6 +6414,7 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
+            nvenc_settings: NvencSettings::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -6199,6 +6518,7 @@ mod tests {
                     AdminAction::Update {
                         display_policy: DisplayPolicyUpdate::default(),
                         software_encoder: SoftwareEncoderUpdate::default(),
+                        nvenc_settings: NvencSettingsUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -6344,6 +6664,7 @@ mod tests {
                     AdminAction::Update {
                         display_policy: DisplayPolicyUpdate::default(),
                         software_encoder: SoftwareEncoderUpdate::default(),
+                        nvenc_settings: NvencSettingsUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -6463,6 +6784,7 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 software_encoder: SoftwareEncoderOptions::default(),
+                nvenc_settings: NvencSettings::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -6508,6 +6830,7 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: Some(false),
                 software_encoder: SoftwareEncoderOptions::default(),
+                nvenc_settings: NvencSettings::default(),
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
@@ -6584,6 +6907,7 @@ mod tests {
                     AdminAction::Update {
                         display_policy: DisplayPolicyUpdate::default(),
                         software_encoder: SoftwareEncoderUpdate::default(),
+                        nvenc_settings: NvencSettingsUpdate::default(),
                         hostname: "Host".into(),
                         port: 47_989,
                         address_family: FieldUpdate::Omitted,
@@ -6666,6 +6990,7 @@ mod tests {
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
                     software_encoder: SoftwareEncoderUpdate::default(),
+                    nvenc_settings: NvencSettingsUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -6719,6 +7044,7 @@ mod tests {
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
                     software_encoder: SoftwareEncoderUpdate::default(),
+                    nvenc_settings: NvencSettingsUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -6775,6 +7101,7 @@ mod tests {
                 AdminAction::Update {
                     display_policy: DisplayPolicyUpdate::default(),
                     software_encoder: SoftwareEncoderUpdate::default(),
+                    nvenc_settings: NvencSettingsUpdate::default(),
                     hostname: "Host".into(),
                     port: 47_989,
                     address_family: FieldUpdate::Omitted,
@@ -6830,6 +7157,7 @@ mod tests {
     fn software_v23_cas_restart_reset_empty_and_signed_values_are_exact() {
         let mut prior_version = display_v18_document(7);
         prior_version["version"] = json!(SOFTWARE_ENCODER_SETTINGS_VERSION);
+        remove_nvenc_settings(&mut prior_version);
         let prior_values = prior_version["values"].as_object_mut().unwrap();
         prior_values.remove("upnp");
         prior_values.remove("fec_percentage");
@@ -6849,6 +7177,7 @@ mod tests {
 
         let mut legacy = display_v18_document(7);
         legacy["version"] = json!(DISPLAY_POLICY_SETTINGS_VERSION);
+        remove_nvenc_settings(&mut legacy);
         legacy["values"].as_object_mut().unwrap().remove("upnp");
         legacy["values"]
             .as_object_mut()
@@ -6886,13 +7215,13 @@ mod tests {
         product.enqueue(51, 5000, action).unwrap();
         product.start_next();
         let pending = product.pending.take().unwrap();
-        assert_eq!(pending.payload["version"], 23);
+        assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["expected_revision"], 7);
         assert_eq!(pending.payload["values"]["upnp"], false);
         assert_eq!(pending.payload["values"]["sw_tune"], "");
         assert_eq!(pending.payload["values"]["min_threads"], i32::MIN);
         assert_eq!(pending.payload["values"]["qp"], i32::MAX);
-        let saved = json!({"ok":true,"found":true,"version":23,"revision":8,"values":pending.payload["values"]});
+        let saved = json!({"ok":true,"found":true,"version":SETTINGS_VERSION,"revision":8,"values":pending.payload["values"]});
         product.finish_call(pending.purpose, CallOutcome::Payload(saved.clone()));
         assert_eq!(product.revision(), Some(8));
         let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
@@ -6952,6 +7281,7 @@ mod tests {
     fn version_twenty_two_migrates_with_prior_upnp_and_qp_values_preserved() {
         let mut prior = display_v18_document(7);
         prior["version"] = json!(MIN_THREADS_SETTINGS_VERSION);
+        remove_nvenc_settings(&mut prior);
         prior["values"].as_object_mut().unwrap().remove("upnp");
         prior["values"].as_object_mut().unwrap().remove("qp");
         prior["values"]
@@ -6993,6 +7323,7 @@ mod tests {
 
         let mut version_21 = saved.clone();
         version_21["version"] = json!(UPNP_SETTINGS_VERSION);
+        remove_nvenc_settings(&mut version_21);
         version_21["values"].as_object_mut().unwrap().remove("qp");
         version_21["values"]
             .as_object_mut()
@@ -7018,6 +7349,7 @@ mod tests {
 
         let mut version_22 = saved;
         version_22["version"] = json!(QP_SETTINGS_VERSION);
+        remove_nvenc_settings(&mut version_22);
         version_22["values"]["qp"] = json!(41);
         version_22["values"]
             .as_object_mut()
@@ -7044,13 +7376,13 @@ mod tests {
         product.enqueue(91, 5_000, action).unwrap();
         product.start_next();
         let pending = product.pending.take().expect("FEC settings update");
-        assert_eq!(pending.payload["version"], FEC_SETTINGS_VERSION);
+        assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["values"]["fec_percentage"], 255);
         assert_eq!(pending.payload["values"]["upnp"], false);
         assert_eq!(pending.payload["values"]["qp"], Value::Null);
 
         let confirmation = json!({
-            "ok":true,"found":true,"version":FEC_SETTINGS_VERSION,"revision":8,
+            "ok":true,"found":true,"version":SETTINGS_VERSION,"revision":8,
             "values":pending.payload["values"]
         });
         product.finish_call(pending.purpose, CallOutcome::Payload(confirmation));
@@ -7070,7 +7402,7 @@ mod tests {
         let pending = product.pending.take().expect("FEC reset update");
         assert!(pending.payload["values"]["fec_percentage"].is_null());
         let confirmation = json!({
-            "ok":true,"found":true,"version":FEC_SETTINGS_VERSION,"revision":9,
+            "ok":true,"found":true,"version":SETTINGS_VERSION,"revision":9,
             "values":pending.payload["values"]
         });
         product.finish_call(pending.purpose, CallOutcome::Payload(confirmation));
@@ -7094,6 +7426,64 @@ mod tests {
                 .pop_front()
                 .expect("invalid FEC completion");
             assert_eq!(completion.payload["code"], "invalid_fec_percentage");
+        }
+    }
+
+    #[test]
+    fn nvenc_v23_migration_defaults_v24_cas_roundtrip_and_validation() {
+        let mut version_23 = display_v18_document(7);
+        version_23["version"] = json!(FEC_SETTINGS_VERSION);
+        remove_nvenc_settings(&mut version_23);
+        let migrated = parse_document(&version_23).unwrap();
+        assert_eq!(migrated.nvenc_settings, NvencSettings::default());
+
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(migrated);
+        let mut action = display_update_action(DisplayPolicyUpdate::default(), 7);
+        let AdminAction::Update { nvenc_settings, .. } = &mut action else {
+            unreachable!()
+        };
+        *nvenc_settings = NvencSettingsUpdate {
+            nvenc_preset: FieldUpdate::Value(7),
+            nvenc_h264_cavlc: FieldUpdate::Value(true),
+            nvenc_twopass: FieldUpdate::Value("full_res".into()),
+            nvenc_vbv_increase: FieldUpdate::Value(400),
+            nvenc_split_encode: FieldUpdate::Value("disabled".into()),
+            nvenc_realtime_hags: FieldUpdate::Value(false),
+            nvenc_opengl_vulkan_on_dxgi: FieldUpdate::Value(false),
+            nvenc_latency_over_power: FieldUpdate::Value(false),
+            vaapi_strict_rc_buffer: FieldUpdate::Value(true),
+        };
+        product.enqueue(99, 5_000, action).unwrap();
+        product.start_next();
+        let pending = product.pending.take().expect("NVENC settings update");
+        assert_eq!(pending.payload["version"], NVENC_SETTINGS_VERSION);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 56);
+        assert_eq!(pending.payload["values"]["nvenc_preset"], 7);
+        assert_eq!(pending.payload["values"]["nvenc_twopass"], "full_res");
+        assert_eq!(pending.payload["values"]["nvenc_split_encode"], "disabled");
+        let confirmation = json!({
+            "ok":true,"found":true,"version":NVENC_SETTINGS_VERSION,"revision":8,
+            "values":pending.payload["values"]
+        });
+        product.finish_call(pending.purpose, CallOutcome::Payload(confirmation.clone()));
+        assert_eq!(product.completions.pop_front().unwrap().payload["ok"], true);
+        let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        restarted.apply_document(parse_document(&confirmation).unwrap());
+        assert_eq!(restarted.nvenc_settings().nvenc_preset, 7);
+        assert_eq!(
+            restarted.nvenc_settings().nvenc_twopass,
+            amaterasu_module_sdk::NvencTwoPass::FullRes
+        );
+        assert!(restarted.nvenc_settings().vaapi_strict_rc_buffer);
+
+        for (preset, increase) in [(8, 0), (1, 401)] {
+            let invalid = NvencSettings {
+                nvenc_preset: preset,
+                nvenc_vbv_increase: increase,
+                ..Default::default()
+            };
+            assert!(invalid.validate().is_err());
         }
     }
 }

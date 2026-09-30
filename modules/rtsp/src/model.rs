@@ -403,7 +403,7 @@ impl Profile {
             || !self.height.is_multiple_of(2)
             || !(1..=120).contains(&self.fps)
             || !(100..=100000).contains(&self.bitrate_kbps)
-            || self.max_reference_frames > 1
+            || self.max_reference_frames > 16
             || self.video_max_batch_size_kb > 64
             || !matches!(self.packet_ms, 5 | 10)
             || !(6000..=512000).contains(&self.audio_bitrate)
@@ -493,6 +493,10 @@ pub struct Open {
     pub min_threads: i32,
     #[serde(default = "default_qp")]
     pub qp: i32,
+    #[serde(default)]
+    pub nvenc_settings: amaterasu_module_sdk::NvencSettings,
+    #[serde(default)]
+    pub nvenc_spatial_aq: bool,
     #[serde(default)]
     pub capture_sink_without_routing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -636,6 +640,9 @@ impl Open {
         self.validate_capture()?;
         self.validate_max_bitrate()?;
         self.profile.validate()?;
+        self.nvenc_settings
+            .validate()
+            .map_err(|_| "invalid_nvenc_settings")?;
         decode_key(&self.key_hex)
     }
 
@@ -884,6 +891,8 @@ impl Open {
                     "min_threads": self.min_threads,
                     "qp": self.qp,
                     "max_reference_frames": self.profile.max_reference_frames,
+                    "nvenc_settings": self.nvenc_settings,
+                    "nvenc_spatial_aq": self.nvenc_spatial_aq,
                 },
             },
         });
@@ -2220,6 +2229,37 @@ mod tests {
     }
 
     #[test]
+    fn nvenc_settings_and_spatial_aq_reach_the_frozen_video_open() {
+        let mut request = open();
+        request.nvenc_settings.nvenc_preset = 6;
+        request.nvenc_settings.nvenc_h264_cavlc = true;
+        request.nvenc_settings.nvenc_vbv_increase = 40;
+        request.nvenc_spatial_aq = true;
+        request.validate(false).unwrap();
+
+        let payload = request.arm(52);
+        assert_eq!(
+            payload["configuration"]["configuration"]["nvenc_settings"]["nvenc_preset"],
+            6
+        );
+        assert_eq!(
+            payload["configuration"]["configuration"]["nvenc_settings"]["nvenc_h264_cavlc"],
+            true
+        );
+        assert_eq!(
+            payload["configuration"]["configuration"]["nvenc_settings"]["nvenc_vbv_increase"],
+            40
+        );
+        assert_eq!(
+            payload["configuration"]["configuration"]["nvenc_spatial_aq"],
+            true
+        );
+
+        request.nvenc_settings.nvenc_preset = 8;
+        assert_eq!(request.validate(false), Err("invalid_nvenc_settings"));
+    }
+
+    #[test]
     fn wgc_pacing_smoothing_defaults_on_and_reaches_stream_session_start() {
         let mut request = open();
         assert!(request.wgc_pacing_smoothing);
@@ -2433,7 +2473,7 @@ mod tests {
             ("fps", json!(121)),
             ("bitrate_kbps", json!(99)),
             ("bitrate_kbps", json!(100001)),
-            ("max_reference_frames", json!(2)),
+            ("max_reference_frames", json!(17)),
             ("packet_ms", json!(20)),
             ("audio_bitrate", json!(5999)),
             ("audio_bitrate", json!(512001)),
@@ -2448,7 +2488,7 @@ mod tests {
             assert_eq!(request.validate(false), Err("invalid_profile"), "{field}");
         }
 
-        for maximum in [0, 1] {
+        for maximum in [0, 1, 2, 16] {
             let mut request = open();
             request.profile.max_reference_frames = maximum;
             assert!(request.validate(false).is_ok(), "{maximum}");

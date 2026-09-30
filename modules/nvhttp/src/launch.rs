@@ -3,7 +3,9 @@
 //! The wire layer authenticates the TLS peer and parses Moonlight fields. This
 //! controller owns the resulting application and RTSP operations until the
 //! successful HTTP reply has been re-authorized and completely written.
-use amaterasu_module_sdk::{EncoderSelection, SoftwareEncoderOptions};
+use amaterasu_module_sdk::{
+    EncoderSelection, NvencSettings, NvencSettingsOverrides, SoftwareEncoderOptions,
+};
 mod call;
 mod record;
 mod workflow;
@@ -155,6 +157,8 @@ pub struct PeerIdentity {
     client_display_overrides: Value,
     client_display_mode: Option<PhysicalDisplayMode>,
     client_software_encoder: SoftwareEncoderOptions,
+    client_nvenc_settings: NvencSettingsOverrides,
+    client_nvenc_spatial_aq: Option<bool>,
 }
 
 impl PeerIdentity {
@@ -196,6 +200,8 @@ impl PeerIdentity {
             client_display_overrides: json!({}),
             client_display_mode: None,
             client_software_encoder: SoftwareEncoderOptions::default(),
+            client_nvenc_settings: NvencSettingsOverrides::default(),
+            client_nvenc_spatial_aq: None,
         })
     }
 
@@ -206,6 +212,21 @@ impl PeerIdentity {
         config_overrides: ClientConfigOverrides,
     ) -> Result<Self, &'static str> {
         let client_display_overrides = config_overrides.display_overrides();
+        let client_nvenc_settings = NvencSettingsOverrides {
+            nvenc_preset: config_overrides.nvenc_preset,
+            nvenc_h264_cavlc: config_overrides.nvenc_h264_cavlc,
+            nvenc_twopass: config_overrides.nvenc_twopass,
+            nvenc_vbv_increase: config_overrides.nvenc_vbv_increase,
+            nvenc_split_encode: config_overrides.nvenc_split_encode,
+            nvenc_realtime_hags: config_overrides.nvenc_realtime_hags,
+            nvenc_opengl_vulkan_on_dxgi: config_overrides.nvenc_opengl_vulkan_on_dxgi,
+            nvenc_latency_over_power: config_overrides.nvenc_latency_over_power,
+            vaapi_strict_rc_buffer: config_overrides.vaapi_strict_rc_buffer,
+        };
+        let client_nvenc_spatial_aq = config_overrides.nvenc_spatial_aq;
+        client_nvenc_settings
+            .validate()
+            .map_err(|_| "invalid_paired_identity")?;
         let client_software_encoder = SoftwareEncoderOptions {
             sw_preset: config_overrides.sw_preset.clone(),
             sw_tune: config_overrides.sw_tune.clone(),
@@ -312,6 +333,8 @@ impl PeerIdentity {
         self.client_display_overrides = client_display_overrides;
         self.client_display_mode = client_display_mode;
         self.client_software_encoder = client_software_encoder;
+        self.client_nvenc_settings = client_nvenc_settings;
+        self.client_nvenc_spatial_aq = client_nvenc_spatial_aq;
         Ok(self)
     }
 
@@ -551,6 +574,8 @@ pub struct Controller {
     global_minimum_fps_target: f64,
     global_wgc_pacing_smoothing: bool,
     software_encoder: SoftwareEncoderOptions,
+    nvenc_settings: NvencSettings,
+    nvenc_spatial_aq: bool,
     device_name: String,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
@@ -589,6 +614,8 @@ impl Controller {
             global_minimum_fps_target: 20.0,
             global_wgc_pacing_smoothing: true,
             software_encoder: SoftwareEncoderOptions::default(),
+            nvenc_settings: NvencSettings::default(),
+            nvenc_spatial_aq: false,
             device_name: "Amaterasu".into(),
             records: BTreeMap::new(),
             job: None,
@@ -680,6 +707,14 @@ impl Controller {
 
     pub fn set_software_encoder_options(&mut self, options: SoftwareEncoderOptions) {
         self.software_encoder = options;
+    }
+
+    pub fn set_nvenc_settings(&mut self, settings: NvencSettings) {
+        self.nvenc_settings = settings;
+    }
+
+    pub fn set_nvenc_spatial_aq(&mut self, enabled: bool) {
+        self.nvenc_spatial_aq = enabled;
     }
 
     pub fn set_global_wgc_pacing_smoothing(&mut self, enabled: bool) {
@@ -833,6 +868,15 @@ impl Controller {
         record.effective_software_encoder = self
             .software_encoder
             .with_overrides(&record.peer.client_software_encoder);
+        record.global_nvenc_settings = self.nvenc_settings.clone();
+        record.effective_nvenc_settings = self
+            .nvenc_settings
+            .with_overrides(&record.peer.client_nvenc_settings);
+        record.global_nvenc_spatial_aq = self.nvenc_spatial_aq;
+        record.effective_nvenc_spatial_aq = record
+            .peer
+            .client_nvenc_spatial_aq
+            .unwrap_or(self.nvenc_spatial_aq);
         record.global_qp = self.global_qp;
         record.effective_qp = record.peer.client_qp.unwrap_or(record.global_qp);
         record.selected_encoder = startup_encoder;

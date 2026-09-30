@@ -68,6 +68,73 @@ test("catalog output edits preserve raw preparation, keybindings, and sparse fra
   }
 });
 
+test("catalog NVENC overrides preserve inheritance, false booleans, zero, and bounds", () => {
+  const model = context.Amaterasu;
+  const ordinary = (value) => JSON.parse(JSON.stringify(value));
+  const defaults = model.catalogNvencSettingsOverrideFormValues({});
+  assert.deepEqual(ordinary(defaults), {
+    nvenc_preset: "", nvenc_h264_cavlc: "", nvenc_twopass: "",
+    nvenc_vbv_increase: "", nvenc_split_encode: "", nvenc_realtime_hags: "",
+    nvenc_opengl_vulkan_on_dxgi: "", nvenc_latency_over_power: "",
+    vaapi_strict_rc_buffer: "",
+  });
+  const fields = new FormData();
+  for (const [name, value] of Object.entries({
+    nvenc_preset: "7", nvenc_h264_cavlc: "false", nvenc_twopass: "full_res",
+    nvenc_vbv_increase: "0", nvenc_split_encode: "disabled", nvenc_realtime_hags: "false",
+    nvenc_opengl_vulkan_on_dxgi: "true", nvenc_latency_over_power: "false",
+    vaapi_strict_rc_buffer: "true",
+  })) fields.set(name, value);
+  assert.deepEqual(ordinary(model.parseCatalogNvencSettingsOverrides(fields)), {
+    nvenc_preset: 7, nvenc_h264_cavlc: false, nvenc_twopass: "full_res",
+    nvenc_vbv_increase: 0, nvenc_split_encode: "disabled", nvenc_realtime_hags: false,
+    nvenc_opengl_vulkan_on_dxgi: true, nvenc_latency_over_power: false,
+    vaapi_strict_rc_buffer: true,
+  });
+  const inherited = model.parseCatalogNvencSettingsOverrides(new FormData());
+  assert.deepEqual(ordinary(inherited), {
+    nvenc_preset: null, nvenc_h264_cavlc: null, nvenc_twopass: null,
+    nvenc_vbv_increase: null, nvenc_split_encode: null, nvenc_realtime_hags: null,
+    nvenc_opengl_vulkan_on_dxgi: null, nvenc_latency_over_power: null,
+    vaapi_strict_rc_buffer: null,
+  });
+  for (const [name, value] of [["nvenc_preset", "0"], ["nvenc_preset", "8"], ["nvenc_vbv_increase", "401"], ["nvenc_vbv_increase", "1.5"], ["nvenc_twopass", "fast"], ["nvenc_split_encode", "force"], ["nvenc_h264_cavlc", "0"]]) {
+    const invalid = new FormData();
+    invalid.set(name, value);
+    assert.throws(() => model.parseCatalogNvencSettingsOverrides(invalid));
+  }
+});
+
+test("catalog app and provider saves retain unrendered overrides while applying sparse edits", () => {
+  const merge = context.Amaterasu.mergeCatalogConfigOverrides;
+  const saved = {
+    nvenc_spatial_aq: false,
+    vaapi_quality: 5,
+    custom_unrendered_flag: true,
+    nvenc_h264_cavlc: true,
+  };
+  const edits = {
+    nvenc_h264_cavlc: false,
+    nvenc_vbv_increase: 0,
+  };
+
+  // The ordinary and Playnite-provider submit handlers both seed the same
+  // merge with the stored overrides and then apply their rendered edit fields.
+  for (const result of [
+    merge(saved, ["nvenc_h264_cavlc", "nvenc_vbv_increase"], edits),
+    merge(saved, ["nvenc_h264_cavlc", "nvenc_vbv_increase"], {}, edits),
+  ]) {
+    const persisted = JSON.parse(JSON.stringify(result));
+    assert.equal(persisted.nvenc_spatial_aq, false);
+    assert.equal(persisted.vaapi_quality, 5);
+    assert.equal(persisted.custom_unrendered_flag, true);
+    assert.equal(persisted.nvenc_h264_cavlc, false);
+    assert.equal(persisted.nvenc_vbv_increase, 0);
+  }
+  assert.equal(merge(saved, ["keybindings"], edits).nvenc_spatial_aq, false);
+  assert.equal(Object.hasOwn(merge({ keybindings: [65] }, ["keybindings"], {}), "keybindings"), false);
+});
+
 test("application refresh rate option editor reads back and writes sparse exact tokens", () => {
   const parse = context.Amaterasu.parseCatalogRefreshRateOptionOverride;
   const fields = new FormData();
