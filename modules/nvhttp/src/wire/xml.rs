@@ -40,6 +40,19 @@ pub fn error(status: u16, message: &str) -> Reply {
     response(status, message, &[("paired", "0")])
 }
 
+/// `/serverinfo` over TLS from a certificate that is not (or no longer) paired.
+///
+/// moonlight-qt treats any non-2xx HTTP status as a network failure and shows
+/// the host offline. Only an XML `status_code` of 401 inside a successful HTTP
+/// reply (`NvHTTP::verifyResponseStatus`) makes it fall back to plain-HTTP
+/// `/serverinfo` and show "not paired", which is also what the Vibeshine
+/// reference answers when client verification fails.
+pub fn unpaired_certificate() -> Reply {
+    let mut reply = error(401, "client certificate is not paired");
+    reply.status = 200;
+    reply
+}
+
 pub fn paired() -> Reply {
     response(200, "OK", &[("paired", "1")])
 }

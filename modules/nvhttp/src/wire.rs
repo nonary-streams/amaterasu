@@ -289,7 +289,7 @@ impl Router {
         match query.path.as_str() {
             "/serverinfo" => {
                 if peer.secure && !trusted {
-                    return Some(xml::error(401, "client certificate is not paired"));
+                    return Some(xml::unpaired_certificate());
                 }
                 self.queue(
                     connection.into(),

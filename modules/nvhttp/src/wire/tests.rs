@@ -1257,3 +1257,25 @@ fn unpairing_a_client_cancels_its_active_launch_through_the_revoke_path() {
     assert!(!router.launches.busy());
     assert_eq!(router.launches.current_game(&owner), 0);
 }
+
+#[test]
+fn untrusted_tls_serverinfo_is_an_http_success_carrying_xml_401() {
+    let mut router = router();
+    let mut broker = Broker::default();
+    let reply = router
+        .dispatch_with(
+            1,
+            request("/serverinfo?uniqueid=client"),
+            peer("127.0.0.1", true, Some(vec![9, 9, 9]), false),
+            Instant::now(),
+            &mut |command| broker.send(command),
+        )
+        .unwrap();
+    // A non-2xx HTTP status makes moonlight-qt report the host offline instead
+    // of falling back to plain-HTTP /serverinfo; the XML status drives that.
+    assert_eq!(reply.status, 200);
+    let body = String::from_utf8(reply.body).unwrap();
+    assert!(body.contains("status_code=\"401\""), "{body}");
+    assert!(!body.contains("PairStatus"));
+    assert!(broker.accepted.is_empty());
+}

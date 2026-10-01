@@ -370,7 +370,10 @@ BMP noncharacters U+FFFE/U+FFFF and controls.
 - `/serverinfo` retrieves the persistent host UUID through pairing. Plain HTTP
   always returns `PairStatus=0`; HTTPS requires a currently paired client TLS
   certificate, returning `PairStatus=1` only after the transport's live check.
-  An untrusted HTTPS request returns 401, allowing Moonlight to fall back to HTTP.
+  An untrusted HTTPS request returns an HTTP 200 reply whose XML root carries
+  `status_code="401"`. moonlight-qt maps every non-2xx HTTP status to a network
+  error (the host shows offline) and only falls back to plain-HTTP `/serverinfo`
+  for an XML 401 (`nvhttp.cpp:355-381`, `:153-165`, `:550-575`).
 - `/pair` implements the Gen7 phases below, including the held initial request.
 - `/applist` requires trusted paired TLS and exports the configured catalog owner
   as Moonlight `App` elements with `AppTitle`, numeric `ID`, and
@@ -413,7 +416,7 @@ unconfirmed cleanup. `currentgame` contains the app ID only for the owning paire
 certificate and remains zero for other clients.
 
 Responses use XML `<root status_code="..." status_message="...">`; the HTTP
-status matches the root status. Successful cryptographic phases return `paired=1`
+status matches the root status, except the untrusted-TLS `/serverinfo` 401 above. Successful cryptographic phases return `paired=1`
 only after the pairing service has acknowledged that phase. Runtime/service error
 text does not expose private keys, PINs, or internal cryptographic details.
 
