@@ -120,6 +120,7 @@ Administrative and trusted-transport operations:
 {"action":"list_clients"}
 {"action":"unpair","certificate_id":"<SHA256 certificate DER>"}
 {"action":"check_client_certificate","certificate_pem":"..."}
+{"action":"unpair_presented_client","certificate_pem":"..."}
 ```
 
 Pending and list-clients expose bounded metadata only and require an administrator
@@ -131,6 +132,20 @@ the byte cap sooner. Expired paired certificates remain listable/removable but
 cannot authenticate. PEM certificate and key inputs are each at most 4096 bytes;
 requests are at most 12,000 serialized bytes. Client IDs are 1–64 identifier bytes
 and names 1–128 bytes without control characters.
+
+Unpair-presented-client is the self-service counterpart of unpair and is allowed
+only for `transport_principals`; administrators that are not transport principals
+and foreign callers receive `forbidden`. It removes exactly the committed client whose
+certificate fingerprint equals the supplied PEM, together with any pending transcript
+for that fingerprint, and replies `{"ok":true,"unpaired":1,"certificate_id":...}`.
+An unknown or already-removed certificate replies `unpaired:0` without writing, so
+the operation is idempotent. The removal uses the same revision-checked, acknowledged
+state write as administrator unpair and survives a restart. Like
+check-client-certificate it trusts the supplied PEM to come from an authenticated TLS
+handshake with proof of private-key possession; a plaintext `uniqueid` or a bare
+fingerprint can never select the client to remove. The certificate must be a
+well-formed self-signed Moonlight client certificate but, unlike authentication, its
+validity period is not checked, because removing trust is always safe.
 
 Check-client-certificate is allowed only for `transport_principals`; it validates
 the supplied certificate and looks up its persisted fingerprint, returning

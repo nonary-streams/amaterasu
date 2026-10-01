@@ -79,6 +79,11 @@ pub enum Operation {
     CheckClientCertificate {
         certificate_pem: String,
     },
+    /// Removes exactly the certificate a trusted transport authenticated on a
+    /// live TLS connection. Never selected by client ID or fingerprint.
+    UnpairPresentedClient {
+        certificate_pem: String,
+    },
 }
 impl Operation {
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -147,7 +152,8 @@ impl Operation {
                 config_overrides,
                 expected_revision: _,
             } => hex_length(certificate_id, 32) && config_overrides.validate().is_ok(),
-            Self::CheckClientCertificate { certificate_pem } => certificate_pem.len() <= 4096,
+            Self::CheckClientCertificate { certificate_pem }
+            | Self::UnpairPresentedClient { certificate_pem } => certificate_pem.len() <= 4096,
             _ => true,
         };
         if valid {
@@ -164,7 +170,17 @@ impl Operation {
                 | Self::ImportClient { .. }
                 | Self::ClientPairingSecret { .. }
                 | Self::Unpair { .. }
+                | Self::UnpairPresentedClient { .. }
                 | Self::UpdateClientConfigOverrides { .. }
+        )
+    }
+
+    /// Operations only a configured transport principal may call, because the
+    /// supplied certificate is trusted to come from an authenticated handshake.
+    pub fn transport_only(&self) -> bool {
+        matches!(
+            self,
+            Self::CheckClientCertificate { .. } | Self::UnpairPresentedClient { .. }
         )
     }
 

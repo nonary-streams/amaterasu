@@ -38,9 +38,7 @@ impl Engine {
         if operation.admin_only() && !self.settings.administrator_principals.contains(caller) {
             return Err("forbidden");
         }
-        if matches!(operation, Operation::CheckClientCertificate { .. })
-            && !self.settings.transport_principals.contains(caller)
-        {
+        if operation.transport_only() && !self.settings.transport_principals.contains(caller) {
             return Err("forbidden");
         }
         Ok(())
@@ -134,6 +132,9 @@ impl Engine {
             ),
             Operation::CheckClientCertificate { certificate_pem } => {
                 Self::check_certificate(&document, &certificate_pem, now)
+            }
+            Operation::UnpairPresentedClient { certificate_pem } => {
+                self.unpair_presented(document, &certificate_pem, now)
             }
         }
     }
@@ -338,12 +339,41 @@ impl Engine {
         id: &str,
         now: u64,
     ) -> Result<Change, &'static str> {
+        self.remove_client(&mut document, id);
+        write(document, json!({"ok":true}), now)
+    }
+    /// Removes the one client whose certificate fingerprint matches `pem`.
+    /// An unknown certificate is not an error: the result is idempotent and
+    /// reports `unpaired:0` without writing.
+    fn unpair_presented(
+        &mut self,
+        mut document: Document,
+        pem: &str,
+        now: u64,
+    ) -> Result<Change, &'static str> {
+        // Expiry is deliberately not checked: removing trust is always safe.
+        let fingerprint = crypto::parse_certificate(pem, None)?.fingerprint;
+        if !self.remove_client(&mut document, &fingerprint) {
+            return Ok(Change::Read(
+                json!({"ok":true,"unpaired":0,"certificate_id":fingerprint}),
+            ));
+        }
+        write(
+            document,
+            json!({"ok":true,"unpaired":1,"certificate_id":fingerprint}),
+            now,
+        )
+    }
+    /// Drops the committed client and any pending transcript for `id`; returns
+    /// whether a committed client was removed.
+    fn remove_client(&mut self, document: &mut Document, id: &str) -> bool {
+        let committed = document.clients.len();
         document
             .clients
             .retain(|client| client.certificate_id != id);
         self.pending
             .retain(|_, pending| pending.client.certificate_id != id);
-        write(document, json!({"ok":true}), now)
+        document.clients.len() != committed
     }
     fn update_client_config_overrides(
         mut document: Document,

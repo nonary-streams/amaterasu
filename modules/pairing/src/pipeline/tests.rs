@@ -2591,3 +2591,139 @@ fn legacy_pipeline_skips_host_configuration_and_keeps_persisted_identity_flow() 
         .unwrap();
     assert!(matches!(commands.as_slice(), [Command::Poll {}]));
 }
+
+fn import_client(
+    state: &mut Harness,
+    pipeline: &mut Pipeline,
+    client_id: &str,
+    pem: &str,
+) -> Value {
+    let reply = state.request(
+        pipeline,
+        "console",
+        json!({"action":"import_client","client_id":client_id,"name":"Moonlight test","certificate_pem":pem}),
+        now(),
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    reply
+}
+
+fn check_client(state: &mut Harness, pipeline: &mut Pipeline, pem: &str) -> Value {
+    state.request(
+        pipeline,
+        "nvhttp",
+        json!({"action":"check_client_certificate","certificate_pem":pem}),
+        now(),
+    )
+}
+
+#[test]
+fn presented_client_unpair_is_transport_only_and_rejects_admin_and_foreign_callers() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    import_client(&mut state, &mut pipeline, "moonlight", CLIENT_CERT);
+    let writes = state.writes;
+    let request = json!({"action":"unpair_presented_client","certificate_pem":CLIENT_CERT});
+    for caller in ["console", "untrusted"] {
+        assert_eq!(
+            state.request(&mut pipeline, caller, request.clone(), now())["code"],
+            "forbidden",
+            "{caller}"
+        );
+    }
+    assert_eq!(state.writes, writes);
+    assert_eq!(
+        check_client(&mut state, &mut pipeline, CLIENT_CERT)["paired"],
+        1
+    );
+}
+
+#[test]
+fn presented_client_unpair_removes_exactly_that_certificate_and_is_idempotent() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    // The host certificate is a second valid self-signed certificate; it stands
+    // in for another paired client that must stay trusted.
+    let other = import_client(&mut state, &mut pipeline, "other", HOST_CERT);
+    let first = import_client(&mut state, &mut pipeline, "moonlight", CLIENT_CERT);
+    let request = json!({"action":"unpair_presented_client","certificate_pem":CLIENT_CERT});
+
+    let removed = state.request(&mut pipeline, "nvhttp", request.clone(), now());
+    assert_eq!(removed["ok"], true, "{removed}");
+    assert_eq!(removed["unpaired"], 1);
+    assert_eq!(removed["certificate_id"], first["certificate_id"]);
+    assert_eq!(
+        check_client(&mut state, &mut pipeline, CLIENT_CERT)["code"],
+        "not_paired"
+    );
+    let kept = check_client(&mut state, &mut pipeline, HOST_CERT);
+    assert_eq!(kept["certificate_id"], other["certificate_id"]);
+
+    let writes = state.writes;
+    let repeated = state.request(&mut pipeline, "nvhttp", request, now());
+    assert_eq!(repeated["ok"], true);
+    assert_eq!(repeated["unpaired"], 0);
+    assert_eq!(
+        state.writes, writes,
+        "an unknown certificate must not write"
+    );
+}
+
+#[test]
+fn presented_client_unpair_persists_across_restart_and_allows_pairing_again() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    import_client(&mut state, &mut pipeline, "moonlight", CLIENT_CERT);
+    let removed = state.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"unpair_presented_client","certificate_pem":CLIENT_CERT}),
+        now(),
+    );
+    assert_eq!(removed["unpaired"], 1);
+
+    let mut restarted = Pipeline::new(settings());
+    assert_eq!(
+        check_client(&mut state, &mut restarted, CLIENT_CERT)["code"],
+        "not_paired"
+    );
+    let id = begin(&mut state, &mut restarted, "moonlight", now());
+    let client = exchange(&mut state, &mut restarted, &id, "1234", now());
+    let paired = state.request(
+        &mut restarted,
+        "nvhttp",
+        json!({"action":"client_pairing_secret","pairing_id":id,"clientpairingsecret":client.finish()}),
+        now(),
+    );
+    assert_eq!(paired["paired"], 1, "{paired}");
+    assert_eq!(
+        check_client(&mut state, &mut restarted, CLIENT_CERT)["paired"],
+        1
+    );
+}
+
+#[test]
+fn presented_client_unpair_rejects_malformed_and_oversized_certificates() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    import_client(&mut state, &mut pipeline, "moonlight", CLIENT_CERT);
+    let writes = state.writes;
+    for pem in ["", "not a certificate", &"A".repeat(4097)] {
+        let reply = state.request(
+            &mut pipeline,
+            "nvhttp",
+            json!({"action":"unpair_presented_client","certificate_pem":pem}),
+            now(),
+        );
+        assert_eq!(reply["ok"], false, "{pem:.20}");
+    }
+    assert_eq!(state.writes, writes);
+    assert_eq!(
+        check_client(&mut state, &mut pipeline, CLIENT_CERT)["paired"],
+        1
+    );
+}
