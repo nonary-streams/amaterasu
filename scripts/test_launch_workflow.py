@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Catalog-to-process launch, session leases, ownership and teardown over real HTTP."""
+"""Catalog-to-process and process-less Desktop launch, session leases, ownership and teardown
+over real loopback HTTP. Every command and marker lives in a temporary directory; no host
+display, audio or input state is touched."""
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
+import random
 import sys
 import tempfile
 import time
@@ -17,7 +20,14 @@ from test_platform_modules import PlatformHarness
 
 
 def post(api, path, payload, bearer):
-    status, result, _ = api.post(path, payload, bearer)
+    # The launch provider runs one dependency workflow at a time, and its idle
+    # monitor can briefly hold it; workflow_busy is documented and retryable.
+    for _ in range(200):
+        status, result, _ = api.post(path, payload, bearer)
+        if not (status == 200 and result.get("code") == "workflow_busy"):
+            break
+        # Jitter keeps retries from phase-locking with the provider's tick.
+        time.sleep(random.uniform(0.02, 0.15))
     assert status == 200 and result["ok"], result
     return result
 
@@ -140,6 +150,184 @@ def test_preparation_and_undo(api, bearer, directory, revision):
     assert trace_events(failed_trace) == ["prepare-one", "prepare-two", "undo-two", "undo-one"]
 
 
+def desktop_steps(trace, *, fail_preparation=False):
+    return [
+        {
+            "run": lifecycle_command(trace, "prepare-one"),
+            "undo": lifecycle_command(trace, "undo-one"),
+        },
+        {
+            "run": lifecycle_command(
+                trace, "prepare-two", delay=0.2,
+                exit_code=3 if fail_preparation else 0,
+            ),
+            "undo": lifecycle_command(trace, "undo-two", delay=0.2),
+        },
+    ]
+
+
+def call(console, service, payload, timeout_ms=10000):
+    """One signed-module request through the host console principal.
+
+    The management HTTP surface validates catalog launch kinds itself and does
+    not yet admit Desktop, so this composition drives catalog, launch, session
+    and application directly. The launch provider serves one workflow at a time,
+    so workflow_busy is retried with jitter.
+    """
+    reply = None
+    for _ in range(200):
+        console.sequence += 1
+        console.send({
+            "op": "request", "service": service, "payload": payload,
+            "timeout_ms": timeout_ms, "operation_id": f"desktop-launch.{console.sequence}",
+        })
+        result = console.receive()
+        assert result["kind"] == "result", result
+        reply = result["payload"]
+        if reply.get("code") != "workflow_busy":
+            return reply
+        time.sleep(random.uniform(0.02, 0.15))
+    return reply
+
+
+def accepted(reply):
+    assert reply["ok"], reply
+    return reply
+
+
+def create_desktop(console, revision, name, preparation, **launch):
+    return accepted(call(console, "amaterasu.catalog/1", {
+        "action": "create", "expected_revision": revision,
+        "entry": {"name": name, "launch": {"kind": "desktop", "preparation": preparation, **launch}},
+    }))
+
+
+def launch_state(console, launch_id, expected):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        launch = accepted(call(console, "amaterasu.launch/1", {
+            "action": "status", "launch_id": launch_id,
+        }))["launch"]
+        if launch["state"] == expected:
+            return launch
+        assert launch["state"] not in ["failed", "cleanup_failed", "cancelled"], launch
+        time.sleep(0.05)
+    raise AssertionError(f"launch did not reach {expected}: {launch}")
+
+
+def start(console, operation_id, app_id):
+    return accepted(call(console, "amaterasu.launch/1", {
+        "action": "launch", "operation_id": operation_id, "app_id": app_id,
+    }))["launch"]
+
+
+def stop(console, launch_id):
+    return accepted(call(console, "amaterasu.launch/1", {
+        "action": "stop", "launch_id": launch_id,
+    }))["launch"]
+
+
+def wait_trace(trace, expected):
+    deadline = time.monotonic() + 5
+    while trace_events(trace) != expected and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert trace_events(trace) == expected, trace_events(trace)
+
+
+def test_desktop_launch(console, directory):
+    """A process-less Desktop session: prepare, activate, stop, undo in reverse."""
+    # The Desktop kind names nothing to run: every process or game identity is rejected.
+    for forbidden in (
+        {"program": str(Path(sys.executable).resolve())},
+        {"path": "/usr/bin/true"},
+        {"game_id": "a1b2c3d4-1234-5678-9abc-0123456789ab"},
+        {"steam_id": "480"},
+        {"elevated": True},
+        {"unknown": 1},
+    ):
+        reply = call(console, "amaterasu.catalog/1", {
+            "action": "create", "expected_revision": 0,
+            "entry": {"name": "Forbidden", "launch": {"kind": "desktop", **forbidden}},
+        })
+        assert not reply["ok"], (forbidden, reply)
+    reply = call(console, "amaterasu.catalog/1", {
+        "action": "create", "expected_revision": 0,
+        "entry": {"name": "Elevated", "elevated": True, "launch": {"kind": "desktop"}},
+    })
+    assert not reply["ok"] and reply["error"]["code"] == "invalid_entry", reply
+
+    trace = directory / "desktop.trace"
+    desktop = create_desktop(console, 0, "Desktop", desktop_steps(trace))
+    assert desktop["entry"]["launch"]["kind"] == "desktop", desktop
+    assert desktop["entry"]["launch"]["exit_timeout_seconds"] == 10, desktop
+    started = start(console, "desktop-session", desktop["id"])
+    active = launch_state(console, started["launch_id"], "active")
+    assert active["session_id"] and active["process_id"] is None, active
+    assert "executable_path" not in active, active
+    # The session activates only after preparation completed, and nothing else ran.
+    assert trace_events(trace) == ["prepare-one", "prepare-two"], trace_events(trace)
+    repeated = start(console, "desktop-session", desktop["id"])
+    assert repeated["launch_id"] == active["launch_id"], repeated
+    assert trace_events(trace) == ["prepare-one", "prepare-two"], "retry repeated preparation"
+
+    # The same operation cannot move to another entry, and the held lease keeps
+    # a second operation from preparing the same entry again.
+    other = create_desktop(console, desktop["revision"], "Second desktop", [])
+    conflict = call(console, "amaterasu.launch/1", {
+        "action": "launch", "operation_id": "desktop-session", "app_id": other["id"],
+    })
+    assert not conflict["ok"] and conflict["code"] == "operation_conflict", conflict
+    contender = start(console, "desktop-contender", desktop["id"])
+    assert contender["state"] != "active", contender
+    assert launch_state(console, active["launch_id"], "active")["state"] == "active"
+    assert trace_events(trace) == ["prepare-one", "prepare-two"], "contender prepared"
+
+    stop(console, active["launch_id"])
+    stopped = launch_state(console, active["launch_id"], "stopped")
+    assert stopped["cleanup_error"] is None and stopped["process_id"] is None, stopped
+    expected = ["prepare-one", "prepare-two", "undo-two", "undo-one"]
+    wait_trace(trace, expected)
+    stop(console, active["launch_id"])
+    assert trace_events(trace) == expected, "idempotent stop repeated undo"
+
+    # An entry without preparation needs no application lease at all.
+    bare = start(console, "desktop-bare", other["id"])
+    launch_state(console, bare["launch_id"], "active")
+    stop(console, bare["launch_id"])
+    launch_state(console, bare["launch_id"], "stopped")
+
+    # Failed preparation rolls back in reverse and releases the lease: the same
+    # entry launches again once its plan is repaired.
+    failing_trace = directory / "desktop-failing.trace"
+    failing = create_desktop(
+        console, other["revision"], "Failing desktop",
+        desktop_steps(failing_trace, fail_preparation=True),
+    )
+    attempt = start(console, "desktop-fails", failing["id"])
+    failed = launch_state(console, attempt["launch_id"], "failed")
+    assert failed["cleanup_error"] is None and failed["process_id"] is None, failed
+    wait_trace(failing_trace, ["prepare-one", "prepare-two", "undo-two", "undo-one"])
+    repaired_trace = directory / "desktop-repaired.trace"
+    accepted(call(console, "amaterasu.catalog/1", {
+        "action": "update", "id": failing["id"], "expected_revision": failing["revision"],
+        "entry": {"name": "Failing desktop", "launch": {
+            "kind": "desktop", "preparation": desktop_steps(repaired_trace),
+        }},
+    }))
+    retried = start(console, "desktop-repaired", failing["id"])
+    launch_state(console, retried["launch_id"], "active")
+    stop(console, retried["launch_id"])
+    launch_state(console, retried["launch_id"], "stopped")
+    wait_trace(repaired_trace, ["prepare-one", "prepare-two", "undo-two", "undo-one"])
+
+    # Leave the console catalog as found: later checks rely on it being empty.
+    for entry in (desktop, other, failing):
+        revision = accepted(call(console, "amaterasu.catalog/1", {"action": "list"}))["revision"]
+        accepted(call(console, "amaterasu.catalog/1", {
+            "action": "delete", "id": entry["id"], "expected_revision": revision,
+        }))
+
+
 def test_workflow(console, api, bearer, directory):
     pid_path = directory / "launched.pid"
     app = create_app(api, bearer, "Controlled sleeper", 30, 0, pid_path)
@@ -181,6 +369,25 @@ def test_workflow(console, api, bearer, directory):
     return short["revision"]
 
 
+def isolated_environment(directory):
+    """Keep the host from importing the real user's Lutris or Steam libraries.
+
+    Provider imports race the test's catalog revisions; an empty home also keeps
+    the run from reading any user data.
+    """
+    environment = os.environ.copy()
+    for name in ("home", "data", "config", "state", "cache"):
+        (directory / f"isolated-{name}").mkdir(mode=0o700, exist_ok=True)
+    environment.update(
+        HOME=str(directory / "isolated-home"),
+        XDG_DATA_HOME=str(directory / "isolated-data"),
+        XDG_CONFIG_HOME=str(directory / "isolated-config"),
+        XDG_STATE_HOME=str(directory / "isolated-state"),
+        XDG_CACHE_HOME=str(directory / "isolated-cache"),
+    )
+    return environment
+
+
 def main():
     run(CARGO, "build", "--workspace", "--offline")
     with tempfile.TemporaryDirectory(prefix="amaterasu-launch-") as temporary:
@@ -194,19 +401,21 @@ def main():
             }
         path.write_text(json.dumps(settings))
         harness.stage(harness.package(1))
-        console = Console(harness)
+        console = Console(harness, environment=isolated_environment(Path(temporary)))
         try:
             assert console.request("amaterasu.authentication/1", {
                 "action": "setup", "username": "test", "password": "local-launch-test-password",
             })["ok"]
             bearer = token(console, ["catalog.read", "catalog.write", "application.read", "application.launch", "application.terminate"])
             api = Api(console)
+            test_desktop_launch(console, Path(temporary))
+            print("Passed: process-less Desktop composition (catalog, launch, session, application prepare lease).", flush=True)
             revision = test_workflow(console, api, bearer, Path(temporary))
             test_preparation_and_undo(api, bearer, Path(temporary), revision)
             console.eof()
         finally:
             console.close()
-    print("Passed: catalog-backed process launch, operation retries, caller/scope isolation, explicit stop, natural exit, ordered preparation, reverse undo, and failed-preparation rollback before lease cleanup.")
+    print("Passed: catalog-backed process launch, operation retries, caller/scope isolation, explicit stop, natural exit, ordered preparation, reverse undo, failed-preparation rollback before lease cleanup, and process-less Desktop sessions with preparation, reverse undo, retry idempotency and lease release.")
 
 
 if __name__ == "__main__":
