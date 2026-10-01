@@ -17,7 +17,7 @@ pub enum Step {
     Acquire,
     Spawn,
     AwaitApplication,
-    PreparePlaynite,
+    PrepareApplication,
     AwaitPreparation,
     StartPlaynite,
     AwaitPlayniteStart,
@@ -151,7 +151,7 @@ impl Workflow {
                 ),
                 _ => return Err("invalid_workflow"),
             },
-            Step::PreparePlaynite => {
+            Step::PrepareApplication => {
                 let (preparation, working_directory, exit_timeout_seconds) =
                     match record.target.as_ref() {
                         Some(LaunchTarget::Playnite {
@@ -161,6 +161,11 @@ impl Workflow {
                             ..
                         })
                         | Some(LaunchTarget::PlayniteFullscreen {
+                            preparation,
+                            working_directory,
+                            exit_timeout_seconds,
+                        })
+                        | Some(LaunchTarget::Desktop {
                             preparation,
                             working_directory,
                             exit_timeout_seconds,
@@ -289,6 +294,9 @@ impl Workflow {
 // eight raw undos: 321,000 + 8 * 303,000 milliseconds.
 pub(crate) const MAX_CLEANUP_BUDGET_MS: u64 = 2_745_000;
 
+/// Session stop, preparation polling, and the finish call, before any undo.
+const DESKTOP_CLEANUP_BASE_MS: u64 = 20_000;
+
 pub(crate) fn cleanup_budget(target: Option<&LaunchTarget>) -> Duration {
     let (primary_budget_ms, exit_timeout_seconds, preparation) = match target {
         Some(LaunchTarget::Executable(executable)) => {
@@ -312,6 +320,16 @@ pub(crate) fn cleanup_budget(target: Option<&LaunchTarget>) -> Duration {
             let timeout = (*exit_timeout_seconds).min(300);
             // Two bounded authenticated pipe connections, stop, and polling.
             ((timeout + 21) * 1_000, timeout, preparation.as_slice())
+        }
+        Some(LaunchTarget::Desktop {
+            exit_timeout_seconds,
+            preparation,
+            ..
+        }) => {
+            // No process or provider stop exists. Only the session stop and the
+            // application provider's reverse undo remain.
+            let timeout = (*exit_timeout_seconds).min(300);
+            (DESKTOP_CLEANUP_BASE_MS, timeout, preparation.as_slice())
         }
         None => return Duration::from_secs(20),
     };
@@ -484,7 +502,7 @@ mod tests {
                 launch_id,
                 request: Some(1),
                 deadline: Instant::now() + Duration::from_secs(5),
-                step: Step::PreparePlaynite,
+                step: Step::PrepareApplication,
                 pending: None,
                 cleanup: false,
             };

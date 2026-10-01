@@ -13,6 +13,7 @@ const DEFAULT_AUTO_DETACH: bool = true;
 const DEFAULT_WAIT_ALL: bool = true;
 const DEFAULT_EXECUTABLE_EXIT_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_PLAYNITE_EXIT_TIMEOUT_SECONDS: u64 = 10;
+const DEFAULT_DESKTOP_EXIT_TIMEOUT_SECONDS: u64 = 10;
 const MAX_SEARCH_PATH_BYTES: usize = 16_384;
 const MAX_SEARCH_PATH_ENTRIES: usize = 128;
 
@@ -394,6 +395,16 @@ pub enum CatalogLaunch {
         #[serde(default)]
         preparation: Vec<PreparationStep>,
     },
+    /// A process-less session that owns only the prepare lease. It carries no
+    /// program, path, or provider identity.
+    Desktop {
+        #[serde(default = "default_desktop_exit_timeout_seconds")]
+        exit_timeout_seconds: u64,
+        #[serde(default, alias = "working-dir")]
+        working_directory: Option<String>,
+        #[serde(default)]
+        preparation: Vec<PreparationStep>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -540,10 +551,21 @@ pub enum LaunchTarget {
         working_directory: Option<String>,
         preparation: Vec<PlannedPreparationStep>,
     },
+    /// A Desktop session has no process and no provider ticket. The application
+    /// provider's prepare lease is the only effect-bearing dependency.
+    Desktop {
+        exit_timeout_seconds: u64,
+        working_directory: Option<String>,
+        preparation: Vec<PlannedPreparationStep>,
+    },
 }
 
 fn default_playnite_exit_timeout_seconds() -> u64 {
     DEFAULT_PLAYNITE_EXIT_TIMEOUT_SECONDS
+}
+
+fn default_desktop_exit_timeout_seconds() -> u64 {
+    DEFAULT_DESKTOP_EXIT_TIMEOUT_SECONDS
 }
 
 impl LaunchTarget {
@@ -606,6 +628,10 @@ impl LaunchTarget {
             }
             Self::Playnite { .. } if elevated => Err("invalid_catalog_response"),
             Self::PlayniteFullscreen { .. } if elevated => Err("invalid_catalog_response"),
+            Self::Desktop { .. } if elevated => Err("invalid_catalog_response"),
+            Self::Desktop { .. } if steam_id.is_some() || steam_install_dir.is_some() => {
+                Err("invalid_catalog_response")
+            }
             Self::Playnite { .. } if steam_id.is_some() || steam_install_dir.is_some() => {
                 Err("invalid_catalog_response")
             }
@@ -654,7 +680,32 @@ impl LaunchTarget {
                     preparation,
                 })
             }
+            Self::Desktop {
+                exit_timeout_seconds,
+                working_directory,
+                preparation,
+            } => {
+                let preparation = merge_preparation_plan(
+                    global_preparation,
+                    legacy_global_preparation,
+                    preparation,
+                    legacy_application_preparation,
+                    !exclude_global_preparation,
+                    working_directory.as_deref(),
+                )?;
+                Ok(Self::Desktop {
+                    exit_timeout_seconds,
+                    working_directory,
+                    preparation,
+                })
+            }
         }
+    }
+
+    /// Whether an active session has a process or provider whose natural exit
+    /// must be observed. Desktop sessions end only by stop, cancel, or quit.
+    pub fn is_monitored_after_activation(&self) -> bool {
+        !matches!(self, Self::Desktop { .. })
     }
 
     #[cfg(test)]
@@ -715,6 +766,30 @@ impl LaunchTarget {
                     return Err("invalid_catalog_response");
                 }
                 Ok(Self::PlayniteFullscreen {
+                    exit_timeout_seconds,
+                    working_directory,
+                    preparation: preparation
+                        .into_iter()
+                        .map(PlannedPreparationStep::Structured)
+                        .collect(),
+                })
+            }
+            CatalogLaunch::Desktop {
+                exit_timeout_seconds,
+                working_directory,
+                preparation,
+            } => {
+                let working_directory = working_directory
+                    .as_deref()
+                    .map(|directory| resolve_working_directory(directory, environment))
+                    .transpose()?
+                    .flatten();
+                if exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS
+                    || !valid_preparation(&preparation)
+                {
+                    return Err("invalid_catalog_response");
+                }
+                Ok(Self::Desktop {
                     exit_timeout_seconds,
                     working_directory,
                     preparation: preparation
@@ -1247,7 +1322,9 @@ impl Executable {
                 Err("unsupported_launch_kind")
             }
             CatalogLaunch::Playnite { .. } => Err("unsupported_launch_kind"),
-            CatalogLaunch::PlayniteFullscreen { .. } => Err("unsupported_launch_kind"),
+            CatalogLaunch::PlayniteFullscreen { .. } | CatalogLaunch::Desktop { .. } => {
+                Err("unsupported_launch_kind")
+            }
         }
     }
 }

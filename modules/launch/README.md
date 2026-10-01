@@ -116,6 +116,31 @@ the lease remains held until the provider confirms cleanup. A zero fullscreen
 timeout posts a safe close request and uses the provider's fixed 20-second
 recovery grace, rather than waiting indefinitely.
 
+Typed `desktop` catalog targets are process-less sessions. They carry no program,
+path, or provider identity, only an optional working directory, an exit timeout
+(default 10, maximum 300) and the merged preparation. Launch reuses the prepare-only
+application lease described for Playnite, without a provider start: it creates the
+session, acquires the owner-and-app exclusive lease, sends `prepare` with the global
+and application plan (global steps first, honoring `exclude_global_prep_cmd`), polls
+`preparation_status`, and activates the session only when the lease reports `ready`.
+An entry with no steps and no `output` skips the application provider and activates
+directly. Launch, status, lookup and list report `process_id:null` and omit
+`executable_path`, so the frame-limiter snapshot verifier never accepts a Desktop
+launch and frame-limiter application is skipped. `preflight_export`, the preflight
+token, frozen `config_overrides`, idempotent `operation_id`, `operation_conflict`
+and `launch_export` work as for other kinds. `cleanup_budget_ms` is frozen at 20,000
+ms plus each configured undo's budget and three seconds of containment.
+
+Stop, cancellation and client quit run `preparation_stop`, which undoes in reverse
+order and confirms the lease complete, then stop and finish the session so the
+exclusive lease is released. A failed undo, an unconfirmed preparation, or a lost
+`prepare` acknowledgement retains the lease: the ambiguous prepare is never
+replayed, and cleanup uses the stable preparation operation ID. A failed undo
+reports `cleanup_failed` and an explicit `stop` retries it. An active Desktop is
+not polled, because nothing can exit on its own; it ends only by stop,
+cancellation, or client quit. Real Moonlight launch of Desktop, and capture or
+encode of a live KDE output, remain pending real-client and native qualification.
+
 Catalog lookup uses `resolve_launch` with the original runtime parent. Catalog
 accepts this action only from configured launch principals and selects the
 immutable runtime initiating principal's namespace. No supplied owner string is

@@ -100,6 +100,8 @@ struct Harness {
     global_preparation_statuses: usize,
     fail_global_preparation: bool,
     fail_global_preparation_cleanup_once: bool,
+    catalog_desktop: bool,
+    drop_prepare_result: bool,
 }
 impl Harness {
     fn new() -> Self {
@@ -170,6 +172,8 @@ impl Harness {
             global_preparation_statuses: 0,
             fail_global_preparation: false,
             fail_global_preparation_cleanup_once: false,
+            catalog_desktop: false,
+            drop_prepare_result: false,
         }
     }
     fn session_reply(session: &TestSession) -> Value {
@@ -584,10 +588,14 @@ impl Harness {
                         } else {
                             "pipeline::tests::controlled_process"
                         };
-                        let launch = self.catalog_playnite_game_id.as_ref().map_or_else(
-                            || json!({"kind":"executable","program":std::env::current_exe().unwrap(),"arguments":["--exact",fixture,"--ignored"],"working_directory":null}),
-                            |game_id| json!({"kind":"playnite","game_id":game_id,"exit_timeout_seconds":self.catalog_playnite_exit_timeout_seconds}),
-                        );
+                        let launch = if self.catalog_desktop {
+                            json!({"kind":"desktop","exit_timeout_seconds":10})
+                        } else {
+                            self.catalog_playnite_game_id.as_ref().map_or_else(
+                                || json!({"kind":"executable","program":std::env::current_exe().unwrap(),"arguments":["--exact",fixture,"--ignored"],"working_directory":null}),
+                                |game_id| json!({"kind":"playnite","game_id":game_id,"exit_timeout_seconds":self.catalog_playnite_exit_timeout_seconds}),
+                            )
+                        };
                         let mut reply = json!({"ok":true,"revision":1,"id":payload["id"],"entry":{"name":"Test executable","launch":launch}});
                         let mut overrides = serde_json::Map::new();
                         if let Some(fec_percentage) = self.catalog_fec_percentage {
@@ -739,6 +747,16 @@ impl Harness {
                     self.drop_spawn_result = false;
                     self.reply = None;
                     return Err("simulated transport failure".into());
+                }
+                if self.drop_prepare_result
+                    && self
+                        .commands
+                        .last()
+                        .is_some_and(|(_, payload, _)| payload["action"] == "prepare")
+                {
+                    self.drop_prepare_result = false;
+                    self.reply = None;
+                    return Err("simulated preparation acknowledgement loss".into());
                 }
                 if self.drop_provider_start_result
                     && self
@@ -4612,3 +4630,5 @@ fn cleanup_readback_list_paginates_by_bytes_and_preserves_owner() {
     }
     assert_eq!(seen, expected);
 }
+
+mod desktop;
