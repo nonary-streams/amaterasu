@@ -451,17 +451,26 @@ representation, preserving the bit pattern.
 
 The bounded normal metadata allowlist is `uniqueid`, `uuid`, `additionalStates`,
 `clientName`, `sops`, the `clientHdrCap*` fields, `hdrMode`, `localAudioPlayMode`,
-`surroundAudioInfo`, `remoteControllersBitmap`, `gcmap`, `gcpersist`, and
+`surroundAudioInfo`, `remoteControllersBitmap`, `gcmap`, `psmap`, `gcpersist`, and
 `corever`. Unknown fields are rejected, including executable, path, arguments,
-environment, or catalog-owner overrides. The current profile accepts SDR,
-stereo remote playback, core version 1, and `sops=0`. `localAudioPlayMode` accepts
-only `0` or `1` and defaults to `0`; it snapshots whether audio capture should
-prefer host audio, with the Windows audio module applying its Steam-sink fallback
-when host audio is disabled or the ordinary sink is unavailable. HDR, surround
-audio, display optimization, and controller forwarding requests fail before the
-application service is called. `additionalStates` is accepted only as a decimal
-Boolean. These gates prevent successful XML from implying unsupported
-media or input behavior.
+environment, or catalog-owner overrides. The current profile accepts SDR and core
+version 1. `localAudioPlayMode` accepts only `0` or `1` and defaults to `0`; it
+snapshots whether audio capture should prefer host audio, with the Windows audio
+module applying its Steam-sink fallback when host audio is disabled or the ordinary
+sink is unavailable. `surroundAudioInfo` is `channel_mask << 16 | channel_count` and
+accepts exactly stereo (`196610`), 5.1 (`4128774`), and 7.1 (`104792072`). HDR
+requests (`hdrMode=1` or nonzero `clientHdrCap*`) fail before the application
+service is called, so a successful reply never implies an HDR stream.
+
+Three groups are deliberately accepted and ignored, because moonlight-qt sends them
+on every default launch and rejecting them would fail every stream. `sops` is `0` or
+`1` (the client default is `1`); this host never tunes a game's own settings.
+`remoteControllersBitmap`, `gcmap`, and `psmap` are bounded decimal slot bitmaps
+(moonlight-qt reports player 1 present as `1` even without a pad,
+`gamepad.cpp:994-1004`), and `gcpersist` is `0` or `1`. Controllers attach through
+the control stream, so none of these pre-allocates input devices; controller
+forwarding itself remains pending real-client verification. `additionalStates` is
+accepted only as a decimal Boolean.
 
 The lifecycle calls the launch service's exported-app API with only the immutable
 numeric catalog ID and a private operation ID. Catalog policy resolves the trusted

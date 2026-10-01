@@ -20,6 +20,7 @@ const LAUNCH_FIELDS: &[&str] = &[
     "surroundAudioInfo",
     "remoteControllersBitmap",
     "gcmap",
+    "psmap",
     "gcpersist",
     "corever",
     "continuousAudio",
@@ -74,7 +75,10 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
         return Err("invalid request identifier");
     }
     optional_boolean(query, "additionalStates")?;
-    require_optional_value(query, "sops", "0", "display optimization is unsupported")?;
+    // moonlight-qt sends `sops=1` by default. It only asks the host to tune the
+    // game's own settings, which this host never does, so both values are
+    // accepted and ignored rather than failing every default launch.
+    optional_boolean(query, "sops")?;
     require_optional_value(query, "hdrMode", "0", "HDR streaming is unsupported")?;
     require_optional_value(
         query,
@@ -102,18 +106,35 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
     )?;
     optional_boolean(query, "localAudioPlayMode")?;
     optional_boolean(query, "continuousAudio")?;
-    for field in ["remoteControllersBitmap", "gcmap", "gcpersist"] {
-        require_optional_value(query, field, "0", "controller forwarding is unsupported")?;
+    // moonlight-qt reports player 1 as present (`gcmap=1`) even without a
+    // pad. The bitmaps only say which controller slots exist at launch time;
+    // controllers still attach through the control stream, so they are bounded
+    // and ignored here.
+    for field in ["remoteControllersBitmap", "gcmap", "psmap"] {
+        controller_bitmap(query, field)?;
     }
+    optional_boolean(query, "gcpersist")?;
     require_optional_value(query, "corever", "1", "unsupported Moonlight core version")
 }
 
+/// `surroundAudioInfo` is `channel_mask << 16 | channel_count`, from
+/// `SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION` in moonlight-common-c.
 fn surround_audio_channels(value: Option<&str>) -> Result<u32, &'static str> {
     match value {
-        None | Some("196610") => Ok(2),
-        Some("393222") => Ok(6),
-        Some("524296") => Ok(8),
+        None | Some("196610") => Ok(2), // stereo: mask 0x3, 2 channels
+        Some("4128774") => Ok(6),       // 5.1: mask 0x3F, 6 channels
+        Some("104792072") => Ok(8),     // 7.1: mask 0x63F, 8 channels
         Some(_) => Err("unsupported surround audio configuration"),
+    }
+}
+
+fn controller_bitmap(query: &Query, name: &str) -> Result<(), &'static str> {
+    match query.get(name) {
+        None => Ok(()),
+        Some(value) => match decimal_u32(value) {
+            Ok(bitmap) if bitmap <= 0xFFFF => Ok(()),
+            _ => Err("invalid controller bitmap"),
+        },
     }
 }
 
@@ -290,12 +311,13 @@ mod tests {
         );
         for field in [
             "hdrMode=1",
-            "sops=1",
+            "sops=2",
             "surroundAudioInfo=393223",
             "localAudioPlayMode=2",
-            "remoteControllersBitmap=1",
-            "gcmap=1",
-            "gcpersist=1",
+            "remoteControllersBitmap=65536",
+            "gcmap=-1",
+            "psmap=x",
+            "gcpersist=2",
             "corever=2",
             "additionalStates=2",
         ] {
@@ -326,7 +348,8 @@ mod tests {
     fn surround_audio_info_accepts_only_exact_supported_client_layouts() {
         let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
         assert_eq!(parse(base).unwrap().audio_channels, 2);
-        for (value, channels) in [("196610", 2), ("393222", 6), ("524296", 8)] {
+        // Values computed from moonlight-common-c's AUDIO_CONFIGURATION_* macros.
+        for (value, channels) in [("196610", 2), ("4128774", 6), ("104792072", 8)] {
             assert_eq!(
                 parse(&format!("{base}&surroundAudioInfo={value}"))
                     .unwrap()
@@ -334,12 +357,70 @@ mod tests {
                 channels
             );
         }
-        for value in ["", "0", "6", "393223", "524294", "+393222", "393222 "] {
+        for value in [
+            "",
+            "0",
+            "6",
+            "393222",
+            "524296",
+            "393223",
+            "+4128774",
+            "4128774 ",
+            "104792073",
+        ] {
             assert!(
                 parse(&format!("{base}&surroundAudioInfo={value}")).is_err(),
                 "accepted {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn default_moonlight_qt_launch_query_is_accepted() {
+        // Captured from NvHTTP::startApp (nvhttp.cpp:208-240) with default
+        // preferences: game optimizations on, multi-controller on with no pad,
+        // stereo audio, SDR. Every field below is sent on every launch.
+        let request = parse(concat!(
+            "uniqueid=0123456789ABCDEF&uuid=0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            "&appid=1&mode=1920x1080x60&additionalStates=1&sops=1",
+            "&rikey=00112233445566778899aabbccddeeff&rikeyid=-1419472071",
+            "&localAudioPlayMode=0&surroundAudioInfo=196610",
+            "&remoteControllersBitmap=0&gcmap=0&psmap=0&gcpersist=0&corever=1"
+        ))
+        .unwrap();
+        assert_eq!(
+            (request.width, request.height, request.fps),
+            (1920, 1080, 60)
+        );
+        assert_eq!(request.audio_channels, 2);
+    }
+
+    #[test]
+    fn single_controller_mode_launch_query_is_accepted() {
+        // With multi-controller off moonlight-qt always reports player 1
+        // present and persists controllers (`gcpersist=1`); a PlayStation pad
+        // sets bit 0 of `psmap`.
+        let request = parse(concat!(
+            "uniqueid=0123456789ABCDEF&appid=1&mode=1280x720x120&additionalStates=1&sops=1",
+            "&rikey=00112233445566778899aabbccddeeff&rikeyid=7&localAudioPlayMode=1",
+            "&surroundAudioInfo=4128774&remoteControllersBitmap=1&gcmap=1&psmap=1",
+            "&gcpersist=1&corever=1"
+        ))
+        .unwrap();
+        assert_eq!(request.audio_channels, 6);
+        assert!(request.host_audio_enabled);
+    }
+
+    #[test]
+    fn hdr_launch_request_from_moonlight_qt_is_still_refused() {
+        let error = parse(concat!(
+            "appid=1&mode=1920x1080x60&rikey=00112233445566778899aabbccddeeff&rikeyid=1",
+            "&hdrMode=1&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0",
+            "&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1",
+            "&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0"
+        ))
+        .err();
+        assert_eq!(error, Some("HDR streaming is unsupported"));
     }
 
     #[test]
