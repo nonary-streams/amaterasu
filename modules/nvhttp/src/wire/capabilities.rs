@@ -188,8 +188,9 @@ impl Router {
 }
 
 /// Returns whether the enumeration proves an 8-bit HEVC encoder, or `None`
-/// when the reply is not a valid enumeration. The encoder module lists an
-/// `hevc` entry only after a probe proved 8-bit HEVC output (contract C3).
+/// when the reply is not a valid enumeration. No encoder backend lists `hevc`
+/// today, so this stays false until one can deliver 8-bit HEVC end to end; an
+/// entry in the enumeration is the only evidence this adapter accepts.
 fn parse_enumeration(payload: &Value) -> Option<bool> {
     if payload.get("ok") != Some(&Value::Bool(true)) {
         return None;

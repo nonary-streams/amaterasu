@@ -415,7 +415,10 @@ capability query fails. The remaining bits come from a cached snapshot of
   is configured. `/serverinfo` only reads the cache and never waits for the encoder.
 - `SCM_HEVC` (`0x100`) and a nonzero `MaxLumaPixelsHEVC` (the conventional
   `1869449984`) are set only when the enabled encoder module lists a hardware `hevc`
-  encoder, which it does only after proving 8-bit HEVC output.
+  encoder. No encoder backend lists HEVC today (the encoder and stream-session still
+  reject an HEVC configuration), so this gate is dormant and real clients see H.264
+  only. An HEVC entry must not appear in the enumeration before the encoder and the
+  stream path can actually deliver 8-bit HEVC.
 - A missing `amaterasu.encode/1` call grant, a rejected or malformed reply, a request
   that exceeds five seconds, or a snapshot older than 90 seconds discards the snapshot,
   so the reply falls back to H.264 only with `MaxLumaPixelsHEVC=0`.
@@ -712,8 +715,8 @@ composition.
 Behavioral references were the pinned sibling's Gen7 server-info/pairing behavior
 and the primary Moonlight Qt client in `app/backend/nvpairingmanager.cpp`,
 `nvhttp.cpp`, and `nvcomputer.cpp`. The implementation does not copy or translate
-sibling source. Gen6/SHA-1, discovery, self-service unpair,
-resume, self-service unpair, HDR, surround audio, display optimization, and controller
+sibling source. Gen6/SHA-1, discovery,
+resume, HDR, surround audio, display optimization, and controller
 input forwarding remain unimplemented here.
 
 The enabled transport accepts `:0` for ephemeral ports; non-loopback binding
