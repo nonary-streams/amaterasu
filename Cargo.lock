@@ -517,6 +517,7 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
+ "amaterasu-nvhttp",
  "amaterasu-package",
  "amaterasu-runtime",
  "amaterasu-storage",

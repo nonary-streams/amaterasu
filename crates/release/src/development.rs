@@ -1,5 +1,5 @@
 //! Local-only publisher tooling. Generated keys are not production release identities.
-use amaterasu_contracts::Grants;
+use amaterasu_contracts::{Grants, RuntimeConfig};
 use amaterasu_package::{
     ActivationState, BootstrapConfig, ComponentManifest, PackageResult, ReleaseManifest,
     ReleaseSignature, RootLock, VerificationPolicy, create_machine_private_directory,
@@ -12,6 +12,9 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::profiles::linux_session::{
+    apply_management_bind, linux_session_policy, options::LinuxSessionOptions,
+};
 use crate::profiles::{
     ComponentDefinition, PackageProfile, RUNTIME_ID, development_policy, installer_policy,
 };
@@ -177,6 +180,25 @@ fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
 }
 
 pub fn initialize(root: &Path) -> PackageResult<()> {
+    initialize_root(root, development_policy, |_| {})
+}
+
+/// Initialises a development root whose policy is the Linux session profile.
+/// The policy lives in the root's `bootstrap.json`, so the profile options are
+/// fixed here and a later `pack-linux-session` only supplies signed libraries.
+pub fn initialize_linux_session(root: &Path, options: &LinuxSessionOptions) -> PackageResult<()> {
+    initialize_root(
+        root,
+        |root| linux_session_policy(root, options),
+        |management| apply_management_bind(management, options.management_port),
+    )
+}
+
+fn initialize_root(
+    root: &Path,
+    policy: impl FnOnce(&Path) -> PackageResult<RuntimeConfig>,
+    configure_management: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> PackageResult<()> {
     let tls = InstallerTls::from_environment()?;
     if root.join("bootstrap.json").exists() || root.join("development-key.json").exists() {
         return Err(
@@ -196,7 +218,7 @@ pub fn initialize(root: &Path) -> PackageResult<()> {
             DEVELOPMENT_KEY_ID.into(),
             encode_hex(signing_key.verifying_key().as_bytes()),
         )]),
-        policy: development_policy(root)?,
+        policy: policy(root)?,
     };
     let web_directory = root.join("web");
     create_private_directory(&web_directory)?;
@@ -204,6 +226,14 @@ pub fn initialize(root: &Path) -> PackageResult<()> {
         "enabled": false,
         "web": {"directory": web_directory.canonicalize().map_err(|error| error.to_string())?, "trusted_keys": bootstrap.trusted_keys}
     }));
+    configure_management(
+        bootstrap
+            .policy
+            .settings
+            .get_mut("amaterasu.management")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("development bootstrap lacks management settings")?,
+    );
     if let Some(tls) = &tls {
         let state_root = root.join("data/state");
         create_private_directory(&state_root)?;

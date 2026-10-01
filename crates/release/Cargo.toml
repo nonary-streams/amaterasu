@@ -16,6 +16,8 @@ getrandom.workspace = true
 
 [dev-dependencies]
 amaterasu-runtime = { path = "../runtime" }
+# Generated NVHTTP settings are parsed and resolved by the module's own rules.
+amaterasu-nvhttp = { path = "../../modules/nvhttp" }
 
 [lints]
 workspace = true

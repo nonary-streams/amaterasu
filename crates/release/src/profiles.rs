@@ -5,6 +5,8 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+pub mod linux_session;
+
 pub const RUNTIME_ID: &str = "amaterasu.runtime";
 
 #[derive(Clone, Copy)]
@@ -17,6 +19,9 @@ pub enum PackageProfile {
     SoftwareProbe,
     /// Explicit Linux portal capture with real video/encoder and test-only audio.
     LinuxProbe,
+    /// Product Linux session host with real KMS capture, audio, input and
+    /// virtual display libraries. Effects stay disabled until requested.
+    LinuxSession,
 }
 
 #[derive(Clone, Copy)]
@@ -1203,6 +1208,7 @@ impl PackageProfile {
                 LINUX_STREAM_SESSION,
                 LINUX_RTSP,
             ],
+            Self::LinuxSession => linux_session::COMPONENTS,
             Self::Platform => &[
                 RUNTIME,
                 STATE,

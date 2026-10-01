@@ -18,6 +18,12 @@ fn run() -> PackageResult<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     match arguments.as_slice() {
         [command, root] if command == "init" => development::initialize(Path::new(root)),
+        [command, root, options @ ..] if command == "init-linux-session" => {
+            let options =
+                profiles::linux_session::options::LinuxSessionOptions::from_arguments(options)
+                    .map_err(|error| error.to_string())?;
+            development::initialize_linux_session(Path::new(root), &options)
+        }
         [command, root, artifacts, output, sequence]
             if matches!(
                 command.as_str(),
@@ -27,12 +33,15 @@ fn run() -> PackageResult<()> {
                     | "pack-stream-probe"
                     | "pack-software-probe"
                     | "pack-linux-probe"
+                    | "pack-linux-session"
             ) =>
         {
             let sequence = sequence
                 .parse()
                 .map_err(|_| "sequence must be an unsigned integer")?;
-            let profile = if command == "pack-linux-probe" {
+            let profile = if command == "pack-linux-session" {
+                profiles::PackageProfile::LinuxSession
+            } else if command == "pack-linux-probe" {
                 profiles::PackageProfile::LinuxProbe
             } else if command == "pack-software-probe" {
                 profiles::PackageProfile::SoftwareProbe
@@ -149,5 +158,5 @@ fn verify(root: &str, source: &str) -> PackageResult<()> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-software-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-linux-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT"
+    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-software-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-linux-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release init-linux-session ROOT [--lan ADDRESS:PORT [--allow-remote]] [--catalog-owner management|console] [--management-port PORT] [--capture-output ID] [--audio-endpoint NAME] [--enable-capture] [--enable-audio] [--enable-virtual-display] [--enable-input] [--enable-display-mutation]\n  amaterasu-release pack-linux-session ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT"
 }
