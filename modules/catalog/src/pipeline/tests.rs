@@ -5634,3 +5634,4 @@ fn keybindings_catalog_updates_preserve_lists_durability_and_revision_authority(
         assert!(backend.entries.is_empty());
     }
 }
+mod desktop_seed;

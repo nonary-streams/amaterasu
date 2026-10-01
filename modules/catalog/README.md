@@ -245,7 +245,7 @@ inherit; explicit false and zero remain present. The launch provider retains
 these values in launch and status results. NVHTTP consumer resolution and
 management UI support remain cross-module parity requirements. Other catalog
 gaps include legacy IDs/aliases, portable UUIDs, artwork loading and
-fingerprinting, desktop entries, shell-command launch forms, environment
+fingerprinting, artwork for the seeded Desktop entry, shell-command launch forms, environment
 overlays, and migration from Vibeshine data. There is no cross-caller aggregation
 API.
 
@@ -471,6 +471,48 @@ The provider uses this row only when Playnite is enabled, on Windows, and
 the generated row with `provider_entry_managed`. The action and reserved row
 are independent of Playnite library snapshots, so incomplete scans cannot
 create or remove them. Snapshot cleanup explicitly excludes this source ID.
+
+## Desktop launch entries
+
+A manual entry may use the process-less `desktop` launch kind, so a paired client
+can start a desktop session with no game:
+
+```json
+{"action":"create","expected_revision":0,"entry":{"name":"Desktop","launch":{"kind":"desktop"}}}
+```
+
+The target accepts only optional `working_directory` (alias `working-dir`, same
+absolute-path bounds as Playnite targets), `exit_timeout_seconds` (default 10,
+0..=300, serialized in canonical form) and structured `preparation` with paired
+`undo` commands, plus the entry-level `prep_cmd` and `exclude_global_prep_cmd`.
+The shared eight-step limit applies. `program`, `path`, `arguments`, `detached`,
+`game_id`, `steam_id`, `steam_install_dir`, artwork, `elevated` and any unknown
+field are rejected, so the entry cannot name something to run. Provider snapshots
+cannot import this kind; it is user-managed. Catalog stores and exports it like
+other kinds (`export_list` still returns only `id` and `name`) and never executes
+anything. The launch module owns session behavior; see its README.
+
+### First-run seed
+
+The startup setting `seed_desktop_entry` (strict boolean, default `false`) creates
+one entry named `Desktop` with launch `{"kind":"desktop","exit_timeout_seconds":10}`.
+It applies to each catalog owner named by a value of `export_principals`, the
+catalogs served to streaming clients. A hidden row, `~seed.desktop`, is committed
+atomically with the entry, so every later write preserves it. Once the marker
+exists the seed never runs again: deleting or renaming the entry cannot recreate
+it, and a restart reads the marker and writes nothing. Enabling the setting on an
+existing catalog adds the entry once. The marker row is skipped by list, search,
+export and provider scans and counted with the provider rows.
+
+The seed runs as a startup job between ordinary requests, which wait for it. Its
+state requests are parentless and use the catalog's own state grant. A failed
+attempt is retried every five seconds up to eight times and then abandoned until
+the next start; the marker is still absent, so the next start tries again. A
+catalog that still holds an unmigrated legacy document is skipped, because the
+first ordinary access migrates it and seeding first would fork it. No Desktop
+entry is created without the marker commit, so a lost commit acknowledgement
+reconciles by reading the marker. Real Moonlight client acceptance of a Desktop
+launch is pending; see the launch README.
 
 Sparse software encoder overrides support exact `sw_preset`/`sw_tune` strings
 (up to 128/256 UTF-8 bytes, no controls), `encoder: "auto" | "software"`, and

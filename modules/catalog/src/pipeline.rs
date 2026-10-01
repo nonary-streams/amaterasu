@@ -10,6 +10,7 @@ use crate::product::{
 use crate::protocol::{
     Change, Cursor, Operation, ProviderEntry, apply, error, matches_query, project_entry,
 };
+use crate::seed::{self, DesktopSeed};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -204,6 +205,7 @@ pub struct Pipeline {
     queued: VecDeque<Incoming>,
     pending: Option<Pending>,
     sequence: u64,
+    seed: DesktopSeed,
 }
 impl Pipeline {
     pub fn new_with_steam_id_export_principals(
@@ -219,6 +221,13 @@ impl Pipeline {
             import_principals,
             ..Self::default()
         }
+    }
+
+    /// Seed the Desktop entry once into each owner's catalog before ordinary
+    /// requests are served. See [`crate::seed`] for the durable marker.
+    pub fn with_desktop_seed(mut self, owners: impl IntoIterator<Item = String>) -> Self {
+        self.seed = DesktopSeed::new(owners.into_iter().map(|owner| format!("principal/{owner}")));
+        self
     }
 
     fn select_catalog(
@@ -317,6 +326,9 @@ impl Pipeline {
         }
         if self.queued.len() < MAX_QUEUED {
             self.receive(&mut send)?;
+        }
+        if self.pending.is_none() && self.seed.needs_turn() {
+            return self.seed.step(&mut send);
         }
         if self.pending.is_none()
             && let Some(incoming) = self.queued.pop_front()
@@ -1730,8 +1742,12 @@ impl Pipeline {
                 &entry.launch,
                 Launch::Playnite { .. } | Launch::PlayniteFullscreen { .. }
             ) && session.caller != PLAYNITE_IMPORTER;
-            let invalid_fullscreen_import =
-                matches!(&entry.launch, Launch::PlayniteFullscreen { .. });
+            // Fullscreen is a reserved provider row and Desktop is user-managed;
+            // neither can arrive through a library snapshot.
+            let invalid_fullscreen_import = matches!(
+                &entry.launch,
+                Launch::PlayniteFullscreen { .. } | Launch::Desktop { .. }
+            );
             let invalid_artwork_owner = match &entry.artwork {
                 Some(ArtworkReference::Steam { app_id, .. }) => {
                     session.caller != STEAM_IMPORTER || source_id != format!("steam:{app_id}")
@@ -2365,6 +2381,8 @@ impl Pipeline {
                         }
                         scan.markers.insert(key.into(), marker);
                         scan.hidden_rows += 1;
+                    } else if key == seed::MARKER_KEY {
+                        scan.hidden_rows += 1;
                     } else if let Some(caller) = key.strip_prefix(STATE_PREFIX) {
                         scan.hidden_rows += 1;
                         if Some(caller) == context.importer.as_deref() {
@@ -2822,7 +2840,7 @@ impl Pipeline {
             let Some(id) = row["key"].as_str() else {
                 return complete(send, context.request_id, malformed());
             };
-            if row["key"].as_str().is_some_and(is_provider_key) {
+            if row["key"].as_str().is_some_and(is_reserved_key) {
                 scan.after = Some(row["key"].as_str().unwrap().into());
                 scan.scanned += 1;
                 continue;
@@ -2927,7 +2945,7 @@ fn complete_selected(
     complete(send, context.request_id, reply)
 }
 
-fn header(metadata: &Value) -> Result<Document, Value> {
+pub(crate) fn header(metadata: &Value) -> Result<Document, Value> {
     let mut value = metadata.clone();
     if !value.is_object() {
         return Err(malformed());
@@ -3016,11 +3034,13 @@ fn unix_timestamp() -> Option<i64> {
 }
 
 fn valid_collection_cursor(value: &str) -> bool {
-    crate::model::parse_id(value).is_some() || is_provider_key(value)
+    crate::model::parse_id(value).is_some() || is_reserved_key(value)
 }
 
-fn is_provider_key(key: &str) -> bool {
-    key.starts_with(ENTRY_PREFIX) || key.starts_with(STATE_PREFIX)
+/// Hidden rows that are never catalog entries: provider markers and state, and
+/// the first-run seed marker.
+fn is_reserved_key(key: &str) -> bool {
+    key.starts_with(ENTRY_PREFIX) || key.starts_with(STATE_PREFIX) || key == seed::MARKER_KEY
 }
 fn malformed() -> Value {
     error(
