@@ -44,6 +44,12 @@ pub fn paired() -> Reply {
     response(200, "OK", &[("paired", "1")])
 }
 
+/// `SCM_H264` in moonlight-common-c `Limelight.h`. moonlight-qt forwards the
+/// advertised mask unchanged and `LiStartConnection` aborts when it is zero, so
+/// the baseline H.264 bit is advertised unconditionally. Software H.264 is the
+/// guaranteed encoder; HEVC, 10-bit, 4:4:4 and AV1 are never claimed here.
+const SERVER_CODEC_MODE_SUPPORT_H264: u32 = 0x0001;
+
 pub fn server_info(
     config: &RouterConfig,
     host_id: &str,
@@ -80,7 +86,10 @@ pub fn server_info(
                     "AMATERASU_SERVER_FREE"
                 },
             ),
-            ("ServerCodecModeSupport", "0"),
+            (
+                "ServerCodecModeSupport",
+                &SERVER_CODEC_MODE_SUPPORT_H264.to_string(),
+            ),
             ("MaxLumaPixelsHEVC", "0"),
             (
                 "StreamingSupported",

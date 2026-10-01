@@ -387,9 +387,12 @@ BMP noncharacters U+FFFE/U+FFFF and controls.
 Without streaming configuration, server info advertises `appversion=7.1.0.0` and
 `StreamingSupported=0`. Configured streaming advertises `appversion=7.1.431.0` and
 `StreamingSupported=1`. This reports accepted startup policy; it is not a runtime
-GPU, encoder, or capture probe. `ServerCodecModeSupport` and unavailable hardware
-fields remain zero rather than claiming codecs, HDR, a public IP, or a hardware
-MAC. `state` is globally busy while any owned launch remains active or has
+GPU, encoder, or capture probe. `ServerCodecModeSupport` is never zero: moonlight-qt
+passes it through unchanged and moonlight-common-c `LiStartConnection` aborts when it
+is zero (`Connection.c:228-233`), so the H.264 bit (`0x1`) is always advertised.
+`MaxLumaPixelsHEVC` stays zero and no HEVC, 10-bit, 4:4:4, or AV1 bit is set. Other
+unavailable hardware fields remain zero rather than claiming HDR, a public IP, or a
+hardware MAC. `state` is globally busy while any owned launch remains active or has
 unconfirmed cleanup. `currentgame` contains the app ID only for the owning paired
 certificate and remains zero for other clients.
 
