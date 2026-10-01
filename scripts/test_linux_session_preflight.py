@@ -934,6 +934,14 @@ class IdenticalAndDriftTests(unittest.TestCase):
         comparison = snapshot.compare_states(baseline, after)
         self.assert_drift(comparison, "audio.sink_inputs", "4001")
 
+    def test_retitled_stream_on_the_same_sink_is_not_a_move(self):
+        probe = FixtureProbe()
+        probe.sink_inputs = SYNTHETIC_SINK_INPUTS
+        baseline = capture(probe)
+        after = edit(baseline, lambda s: section(s, "audio")["sink_inputs"]["4001"].update(
+            media="next track"))
+        self.assertEqual(snapshot.compare_states(baseline, after).exit_code, 0)
+
     def test_stream_start_and_end_are_ordinary_churn(self):
         probe = FixtureProbe()
         probe.sink_inputs = SYNTHETIC_SINK_INPUTS
@@ -1334,6 +1342,7 @@ class ReadOnlyGuardTests(unittest.TestCase):
         ["nvidia-smi", "--gpu-reset"],
         ["getfacl", "-R", "/dev"],
         ["getfacl", "-cp", "relative"],
+        ["getfacl", "-cp", "/dev/../etc/shadow"],
         ["setfacl", "-m", "u:x:rw", "/dev/uinput"],
         ["stat", "-f", "/dev/uinput"],
         ["chmod", "600", "/dev/uinput"],

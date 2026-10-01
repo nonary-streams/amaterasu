@@ -37,7 +37,7 @@ Moonlight session has been run.
 | # | Milestone (visible pass condition in the plan) | Implementation | Focused tests | Integration | Native | Real client |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Pair Moonlight: a fresh client pairs, sees the game, stays trusted after a host restart | partial: nvhttp and pairing exist; `ServerCodecModeSupport` is hardcoded to 0, so moonlight-common-c aborts `LiStartConnection` (Connection.c:228-233) and no client can stream; Unpair is administrator-only | pending | pending | pending | pending (R1, R2) |
-| 2 | Own the session: rejection or cancellation leaves the desktop unchanged; retries allocate nothing twice | `branch`: session ledger (journal, obligations) is in the lifecycle task; the read-only baseline and comparator exist (this change) | 83 unit tests for the baseline tool only | pending | read-only baseline and compare ran clean on this host, 2026-09-30 (section 6); this is tool evidence, not milestone completion | pending |
+| 2 | Own the session: rejection or cancellation leaves the desktop unchanged; retries allocate nothing twice | `branch`: session ledger (journal, obligations) is in the lifecycle task; the read-only baseline and comparator exist (this change) | 84 unit tests for the baseline tool only | pending | read-only baseline and compare ran clean on this host, 2026-09-30 (section 6); this is tool evidence, not milestone completion | pending |
 | 3 | Create the screen: KDE sees the intended screen; releasing it cannot affect another session's output | `branch`: Linux VKMS lease provider (a8a1441) | pending | pending | blocked: mutating owned-output checks need operator decision E2 (section 5) | pending (R3) |
 | 4 | Configure the screen: readback shows the requested compositor state and monitor policy | not started: KScreen apply and restore is the next display-capture task | pending | pending | pending | pending (R3) |
 | 5 | Capture real frames: moving pixels from the exact owned output, SDR and 10-bit HDR verified separately | partial: capture-kms enumerates; `vibeshine_drm` frame producer and managed routing are `branch` | pending | pending | blocked: `vibeshine_drm` ioctls need `CAP_SYS_ADMIN`, operator decision E3 | pending (R4) |
@@ -216,8 +216,8 @@ This is evidence that the tool itself is read-only and self-consistent on this h
 not completion of any milestone.
 
 - 2026-09-30 21:19 local, host `AmbidexL`, `scripts/linux_host_snapshot.py` at commit
-  `0c12e8d` on `linux-session/qualification-preflight-baseline`, run under
-  `flock native.lock`: `preflight` exited 0, `snapshot` exited 0 and wrote
+  `0c12e8d` on `linux-session/qualification-preflight-baseline` (read-only, so it did not
+  need the lock): `preflight` exited 0, `snapshot` exited 0 and wrote
   a `0600` file inside a `0700` directory, and `compare` against it immediately exited 0
   (84 items restored, 1 advisory `unverified`: `vainfo` is not installed, 3 informational).
 - Observed live state at that time: `Virtual-1` enabled, connected, 3840x2160@120, scale

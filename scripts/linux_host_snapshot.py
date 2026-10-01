@@ -134,7 +134,7 @@ class UsageError(Exception):
 PACTL_LIST_KINDS = frozenset({"sinks", "sources", "modules", "sink-inputs"})
 NVIDIA_QUERY_FIELDS = re.compile(r"--query-gpu=[A-Za-z0-9_.,]+")
 STAT_FORMAT = re.compile(r"--printf=(?:%[A-Za-z]|\\[tn]|[^A-Za-z0-9%\\ ])+")
-READ_ONLY_PATH = re.compile(r"/(?:dev|run)/[A-Za-z0-9_./-]+")
+READ_ONLY_PATH = re.compile(r"/(?:dev|run)/(?!.*\.\.)[A-Za-z0-9_./-]+")
 FORBIDDEN_TOKEN = re.compile(
     r"^(?:output\.|set-|load-|unload-|move-|suspend|kill-|--set|-pm$|-e$|-r$)"
 )
@@ -1512,7 +1512,8 @@ def compare_sink_inputs(before: dict, after: dict, owned: frozenset[str], allow_
         old, new = before.get(index), after.get(index)
         if old is None or new is None:
             findings.append(_stream_churn(index, old, new))
-        elif old == new:
+        elif old["sink"] == new["sink"]:
+            # Only a move matters; media titles and similar properties change freely.
             comparer._add(index, CLASS_RESTORED, "stream unmoved", False, old, new)
         elif {old["sink"], new["sink"]} & owned:
             comparer._add(
