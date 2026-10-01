@@ -384,8 +384,22 @@ BMP noncharacters U+FFFE/U+FFFF and controls.
 - `/cancel` requires trusted paired TLS and scopes cancellation to the exact paired
   certificate that owns the active launch. Query `uniqueid` is metadata, not
   authority. A foreign paired certificate cannot inspect or stop the owner record.
-- `/resume` and `/unpair` require trusted paired TLS and return 501. Resume is not
-  reported as implemented by replaying a fresh launch.
+- `/unpair` is self-service and authority comes only from the TLS connection. Over
+  paired TLS it asks the pairing authority (`unpair_presented_client`) to remove the
+  one certificate presented on that connection and answers HTTP 200 with
+  `<unpaired>1</unpaired>`, or `0` when that certificate was already gone. The reply
+  does not require paired TLS, because the trust it reports was just removed. Any
+  later request from that certificate gets 401, and an active launch it owned is
+  cancelled by the same revoke path as an administrator unpair (the tick calls
+  `revoke_untrusted`, failure `client_revoked`). Plaintext `/unpair` does nothing and
+  answers HTTP 200 with `unpaired=0`; `uniqueid` is never used to choose a client.
+  An untrusted TLS peer gets 401. Query fields other than `uniqueid` and `uuid` are
+  rejected. moonlight-qt calls only the plaintext form, to clean up failed pairings
+  (`nvpairingmanager.cpp:248-366`); a pairing transcript that the client abandoned
+  therefore expires on its own after 120 seconds.
+- `/resume` requires trusted paired TLS and returns an explicit 501 (untrusted
+  callers get 401). It is not implemented, and is not faked by replaying a fresh
+  launch. See the audit table for why this matters to reconnecting clients.
 
 Without streaming configuration, server info advertises `appversion=7.1.0.0` and
 `StreamingSupported=0`. Configured streaming advertises `appversion=7.1.431.0` and
@@ -437,6 +451,86 @@ Catalog work is never dispatched for an untrusted HTTP/TLS request. Before a
 completed list enters the transport write queue, the exact handshake-proven
 certificate is checked against live paired trust again; revocation replaces the
 private reply with 401.
+
+## Moonlight client wire audit
+
+Checked against the moonlight-qt checkout and its moonlight-common-c submodule
+(paths below are relative to the moonlight-qt root; common-c paths are under
+`moonlight-common-c/moonlight-common-c/src/`). "Sent" is what Amaterasu answers.
+This audit was read-only and static: no real Moonlight client has run against this
+host yet, and that stays pending in `docs/linux-session-acceptance.md`.
+
+`/serverinfo` (fetched over HTTPS first once a server certificate is pinned, with
+HTTP fallback on an XML 401; `app/backend/nvhttp.cpp:134-195`). Every field is read
+by `NvComputer::NvComputer` (`app/backend/nvcomputer.cpp:131-221`) unless noted.
+
+| Field | Client reads | Sent | Notes |
+| --- | --- | --- | --- |
+| `hostname` | `nvcomputer.cpp:136` | configured hostname | Empty becomes "UNKNOWN". |
+| `uniqueid` | `nvcomputer.cpp:141` | persistent host id | Identity of the PC in the client's list. |
+| `mac` | `nvcomputer.cpp:142-148` | first physical interface, else zeros | Wake-on-LAN only; all-zero means unknown. |
+| `ServerCodecModeSupport` | `nvcomputer.cpp:150-157`, `session.cpp:1798`, `session.cpp:1144-1300` | `1` (H.264), plus `0x100` for a proven HEVC encoder | `Connection.c:228-233` aborts `LiStartConnection` with -1 when zero. Fixed: was hardcoded 0. |
+| `MaxLumaPixelsHEVC` | `nvcomputer.cpp:159-165`, `session.cpp:1174,1216,1377` | `0`, or `1869449984` with HEVC | Zero removes HEVC from the client's formats. |
+| `FrameLimiter*` | `framelimitercapabilities.h:16-37` | omitted | Vibeshine extension; absent means unsupported. |
+| `DisplayMode` list (`Width`, `Height`, `RefreshRate`) | `nvhttp.cpp:274-300` | omitted | Only used for NVIDIA servers (`session.cpp:1749-1760`). |
+| `LocalIP` | `nvcomputer.cpp:181-184` | omitted | Optional; the client keeps the address it connected to (`:562`). |
+| `HttpsPort` | `nvcomputer.cpp:186-189`, `nvhttp.cpp:183` | active HTTPS port | Falls back to 47984 if absent or zero. |
+| `ExternalPort` | `nvcomputer.cpp:193-196` | active HTTP port | Sunshine extension. |
+| `ExternalIP` | `nvcomputer.cpp:198-204` | omitted | Optional. |
+| `state` | `nvcomputer.cpp:209`, `nvhttp.cpp:122` | `AMATERASU_SERVER_FREE` / `_BUSY` | The client needs the `_SERVER_BUSY` suffix and must not see `MJOLNIR`. |
+| `currentgame` | `nvhttp.cpp:117-131` | app id for the owner only | Zero unless `state` is busy; this is what selects resume. |
+| `PairStatus` | `nvcomputer.cpp:211` | `1` only on live-trusted TLS | Plaintext always `0`. |
+| `appversion` | `nvcomputer.cpp:214`, `session.cpp:1793`, `Connection.c:237` | `7.1.431.0` (`7.1.0.0` when unconfigured) | Selects SHA-256 pairing, encrypted control and RTSP (`RtspConnection.c:953-955`, `InputStream.c:105`). A non-Sunshine version quad. |
+| `GfeVersion` | `nvcomputer.cpp:215,220`, `session.cpp:1333,1802` | `0.0.0.0` | `compatfetcher.cpp:53-120` accepts it; only an empty or `2.x` value limits 4K. No client dependency found, so unchanged. |
+| `gputype` | `nvcomputer.cpp:216` | omitted | Informational. |
+
+`/applist` (`nvhttp.cpp:303-352`, status check `:355-392`): the root must carry
+`status_code="200"`. Each `App` needs `AppTitle` (a null title counts as
+uninitialized, an empty one is allowed) and a nonzero integer `ID`; `IsHdrSupported`
+(`== "1"`) and `IsAppCollectorGame` are optional. Sent: `AppTitle`, `ID`,
+`IsHdrSupported=0` in that order. Element order does not matter to the parser.
+
+`/launch` (`nvhttp.cpp:200-248`, `session.cpp:1745-1812`). The client sends
+`uniqueid`, `uuid`, `appid`, `mode`, `additionalStates`, `sops`, `rikey`, `rikeyid`,
+`localAudioPlayMode`, `surroundAudioInfo`, `remoteControllersBitmap`, `gcmap`,
+`psmap`, `gcpersist`, `corever`, and the `hdrMode`/`clientHdrCap*` group only for
+10-bit formats (`nvhttp.cpp:219-239`, `Connection.c:550-554`). It reads `status_code`
+and `sessionUrl0` (`nvhttp.cpp:247`). `LiStartConnection` takes the RTSP port from the
+last `:` of `sessionUrl0` (`Connection.c:182-203,272`), expects `rtspenc://` for
+encryption (`RtspConnection.c:955`), and connects to the address it already used.
+Fixed: the launch parser rejected `psmap`, `sops=1`, any nonzero controller bitmap
+(player 1 is always reported as `1`, `gamepad.cpp:994-1004`), `gcpersist=1`, and the
+real 5.1/7.1 `surroundAudioInfo` values, so every default launch returned 400. See
+"Public launch lifecycle". HDR requests are still refused.
+
+`/cancel` (`nvhttp.cpp:251-272`): sends only `uniqueid` and `uuid`; reads
+`status_code` and then `/serverinfo` `currentgame`, which must be zero or the client
+reports "can't kill someone else's stream" (`:269`). The owner's `currentgame` drops
+to zero as soon as cleanup starts.
+
+`/resume` (`session.cpp:1775`): moonlight-qt sends `resume` instead of `launch`
+whenever `/serverinfo` reports a nonzero `currentgame` for its certificate, which is
+the normal state after closing a stream without choosing "quit app" (the default
+preference). Amaterasu answers 501, so a reconnect to a still-running session fails
+with "Host returned error" until the user quits the app from the client. This is a
+known unimplemented requirement, not a quiet fallback.
+
+Error mapping (`nvhttp.cpp:550-575`, `:153-165`): any non-2xx HTTP status becomes a
+network error and the host shows offline. Only an XML `status_code` inside a 2xx
+reply reaches `verifyResponseStatus`. Fixed: an untrusted TLS `/serverinfo` is now
+HTTP 200 with XML 401, which triggers the plain-HTTP fallback. Other 4xx/5xx replies
+keep the HTTP status equal to the XML status and surface as a launch/list error,
+which is acceptable because those requests have no fallback. A failed TLS handshake
+also falls back (`:556-562`).
+
+Pairing (`nvpairingmanager.cpp:233-366`): `paired`, `plaincert`, `challengeresponse`,
+`pairingsecret`, then HTTPS `pairchallenge`; the query carries `devicename` and
+`updateState`, both accepted. `/appasset` returns 404, which the client tolerates
+(`boxartmanager.cpp:113-115`).
+
+Not verified here: the RTSP/UDP legs after `LiStartConnection`, which the RTSP,
+video, audio and input modules own; that `sessionUrl0` names an address a LAN client
+can use; and any behavior of a real Moonlight session.
 
 ## Public launch lifecycle
 
