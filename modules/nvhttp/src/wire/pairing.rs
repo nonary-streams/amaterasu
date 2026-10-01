@@ -370,6 +370,14 @@ impl Router {
                 complete(&job, reply, replies);
                 None
             }
+            Purpose::Unpair => {
+                let reply = match payload.get("unpaired").and_then(Value::as_u64) {
+                    Some(removed @ (0 | 1)) => xml::unpaired(removed == 1),
+                    _ => xml::error(503, "invalid unpair response"),
+                };
+                complete(&job, reply, replies);
+                None
+            }
             Purpose::Begin { client } => self.resolve_begin(job, &client, payload, now, replies),
             Purpose::Certificate { client } => {
                 self.resolve_certificate(job, &client, payload, now, replies)

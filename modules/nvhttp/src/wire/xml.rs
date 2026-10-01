@@ -44,6 +44,11 @@ pub fn paired() -> Reply {
     response(200, "OK", &[("paired", "1")])
 }
 
+/// Reply to `/unpair`: `unpaired=1` only after a paired certificate was removed.
+pub fn unpaired(removed: bool) -> Reply {
+    response(200, "OK", &[("unpaired", if removed { "1" } else { "0" })])
+}
+
 pub fn server_info(
     config: &RouterConfig,
     host_id: &str,

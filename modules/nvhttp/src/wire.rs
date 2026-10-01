@@ -125,6 +125,8 @@ enum Purpose {
         request: LaunchRequest,
         peer: PeerIdentity,
     },
+    /// Removes the certificate presented on this paired TLS connection.
+    Unpair,
     Cleanup,
     Applications,
 }
@@ -353,7 +355,8 @@ impl Router {
                 };
                 self.launches.cancel(connection, &identity, now)
             }
-            "/resume" | "/unpair" => {
+            "/unpair" => self.unpair(connection, &query, &peer, now),
+            "/resume" => {
                 if trusted {
                     Some(xml::error(
                         501,
@@ -365,6 +368,42 @@ impl Router {
             }
             _ => Some(xml::error(404, "unknown Moonlight route")),
         }
+    }
+
+    /// Self-service unpair. Authority is the certificate of the verified TLS
+    /// connection; `uniqueid` is never used to select a client. Plaintext
+    /// requests are inert, because nothing proves who is asking.
+    fn unpair(
+        &mut self,
+        connection: u64,
+        query: &Query,
+        peer: &RequestContext,
+        now: Instant,
+    ) -> Option<Reply> {
+        if !peer.secure {
+            return Some(xml::unpaired(false));
+        }
+        if !peer.trusted() {
+            return Some(xml::error(401, "authenticated paired TLS is required"));
+        }
+        if let Err(error) = query.require_only(&["uniqueid", "uuid"]) {
+            return Some(xml::error(400, error));
+        }
+        let certificate_pem = match peer.peer_certificate.as_deref().and_then(|der| {
+            pem_rfc7468::encode_string("CERTIFICATE", pem_rfc7468::LineEnding::LF, der).ok()
+        }) {
+            Some(certificate_pem) => certificate_pem,
+            None => return Some(xml::error(401, "client certificate is unavailable")),
+        };
+        self.queue(
+            Some(connection),
+            Purpose::Unpair,
+            json!({"action":"unpair_presented_client","certificate_pem":certificate_pem}),
+            now + SERVICE_TIMEOUT,
+            now,
+        )
+        .err()
+        .map(|error| xml::error(503, error))
     }
 
     fn queue(

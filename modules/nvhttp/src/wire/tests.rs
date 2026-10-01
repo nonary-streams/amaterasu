@@ -41,6 +41,12 @@ struct Broker {
     approved: bool,
     pause_begin: bool,
     encode: EncodeBehavior,
+    /// Last exported application launch and RTSP session, replayed by the
+    /// status and teardown calls of a cleanup.
+    launch_template: Option<Value>,
+    rtsp_template: Option<Value>,
+    cleanup_started: bool,
+    unpair_misses: bool,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -97,7 +103,11 @@ impl Broker {
                     return Ok(Response::Pending);
                 }
                 let service = &self.services[&request];
-                let result = match (service.as_str(), payload["action"].as_str().unwrap()) {
+                let key = (
+                    service.clone(),
+                    payload["action"].as_str().unwrap().to_owned(),
+                );
+                let result = match (key.0.as_str(), key.1.as_str()) {
                     (capabilities::ENCODE_SERVICE, "enumerate") => {
                         let mut encoders = vec![json!({
                             "identity":{"clsid":"amaterasu.hardware.nvenc.h264"},
@@ -173,6 +183,11 @@ impl Broker {
                         json!({"ok":true,"paired":1,"certificate_id":"00".repeat(32)})
                     }
                     (PAIRING_SERVICE, "cancel") => json!({"ok":true}),
+                    (PAIRING_SERVICE, "unpair_presented_client") => json!({
+                        "ok":true,
+                        "unpaired":if self.unpair_misses { 0 } else { 1 },
+                        "certificate_id":"00".repeat(32)
+                    }),
                     ("amaterasu.launch/1", "preflight_export") => json!({
                         "ok":true,
                         "preflight_token":"fixture-preflight-token",
@@ -236,8 +251,34 @@ impl Broker {
                         "failure": null,
                         "cleanup_error": null
                     }),
+                    ("amaterasu.launch/1", "stop" | "status") => {
+                        let mut launch = self.launch_template.clone().expect("exported launch");
+                        launch["state"] = json!(if self.cleanup_started {
+                            "stopped"
+                        } else {
+                            "active"
+                        });
+                        json!({"ok":true,"launch":launch})
+                    }
+                    ("amaterasu.rtsp/1", "close" | "status") => {
+                        self.cleanup_started |= key.1 == "close";
+                        let mut session = self.rtsp_template.clone().expect("opened RTSP session");
+                        session["state"] = json!(if self.cleanup_started {
+                            "closed"
+                        } else {
+                            "ready"
+                        });
+                        session
+                    }
                     (service, action) => panic!("unexpected service operation {service} {action}"),
                 };
+                match (key.0.as_str(), key.1.as_str()) {
+                    ("amaterasu.launch/1", "launch_export") => {
+                        self.launch_template = Some(result["launch"].clone());
+                    }
+                    ("amaterasu.rtsp/1", "open") => self.rtsp_template = Some(result.clone()),
+                    _ => {}
+                }
                 self.requests.remove(&request);
                 self.services.remove(&request);
                 Response::Result { payload: result }
@@ -610,17 +651,20 @@ fn foreign_peer_duplicate_begin_and_unpair_cannot_consume_a_victim_transcript() 
             .status,
         409
     );
-    assert_eq!(
-        dispatch(
-            &mut router,
-            &mut broker,
-            4,
-            "/unpair?uniqueid=client-1",
-            now
-        )
-        .unwrap()
-        .status,
-        401
+    // Plaintext unpair is inert: it neither names a victim nor ends a transcript.
+    let plaintext = dispatch(
+        &mut router,
+        &mut broker,
+        4,
+        "/unpair?uniqueid=client-1",
+        now,
+    )
+    .unwrap();
+    assert_eq!(plaintext.status, 200);
+    assert!(
+        String::from_utf8(plaintext.body)
+            .unwrap()
+            .contains("<unpaired>0</unpaired>")
     );
     assert_eq!(broker.accepted.len(), requests);
     assert_eq!(router.transcripts.len(), 1);
@@ -1012,4 +1056,204 @@ fn a_stalled_refresh_lets_the_snapshot_go_stale_to_the_baseline() {
     }
     let text = server_info_text(&mut router, &mut broker, now);
     assert_eq!(codec_fields(&text), (SCM_H264, 0));
+}
+
+const LAUNCH_TARGET: &str = concat!(
+    "/launch?appid=7&mode=1280x720x60&",
+    "rikey=00112233445566778899aabbccddeeff&rikeyid=17"
+);
+
+fn poll_until_reply(router: &mut Router, broker: &mut Broker, now: Instant) -> (u64, Reply) {
+    for _ in 0..32 {
+        if let Some(reply) = poll(router, broker, now).into_iter().next() {
+            return reply;
+        }
+    }
+    panic!("no reply was produced");
+}
+
+fn trusted_tls(certificate: &[u8]) -> RequestContext {
+    peer("127.0.0.1", true, Some(certificate.to_vec()), true)
+}
+
+fn unpair_over_tls(
+    router: &mut Router,
+    broker: &mut Broker,
+    connection: u64,
+    now: Instant,
+) -> Reply {
+    assert!(
+        router
+            .dispatch_with(
+                connection,
+                request("/unpair?uniqueid=ignored-metadata"),
+                trusted_tls(&[1, 2, 3]),
+                now,
+                &mut |command| broker.send(command),
+            )
+            .is_none()
+    );
+    let (id, reply) = poll_until_reply(router, broker, now);
+    assert_eq!(id, connection);
+    reply
+}
+
+#[test]
+fn plaintext_unpair_answers_unpaired_zero_and_calls_no_service() {
+    let mut router = streaming_router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    for target in ["/unpair", "/unpair?uniqueid=victim&uuid=1234"] {
+        let reply = dispatch(&mut router, &mut broker, 1, target, now).unwrap();
+        assert_eq!(reply.status, 200);
+        assert!(!reply.requires_paired_tls);
+        let body = String::from_utf8(reply.body).unwrap();
+        assert!(body.contains("<unpaired>0</unpaired>"), "{body}");
+    }
+    assert!(broker.accepted.is_empty());
+}
+
+#[test]
+fn untrusted_tls_unpair_is_rejected_without_a_service_call() {
+    let mut router = router();
+    let mut broker = Broker::default();
+    let reply = router
+        .dispatch_with(
+            1,
+            request("/unpair"),
+            peer("127.0.0.1", true, Some(vec![9, 9, 9]), false),
+            Instant::now(),
+            &mut |command| broker.send(command),
+        )
+        .unwrap();
+    assert_eq!(reply.status, 401);
+    assert!(broker.accepted.is_empty());
+}
+
+#[test]
+fn paired_tls_unpair_removes_the_presented_certificate_and_answers_one() {
+    let mut router = router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    let reply = unpair_over_tls(&mut router, &mut broker, 5, now);
+    assert_eq!(reply.status, 200);
+    // The certificate stops being trusted the moment the removal commits; the
+    // acknowledgement must still reach the client that asked for it.
+    assert!(!reply.requires_paired_tls);
+    let delivered = reply.authorize(false);
+    assert_eq!(delivered.status, 200);
+    let body = String::from_utf8(delivered.body).unwrap();
+    assert!(body.contains("<unpaired>1</unpaired>"), "{body}");
+
+    let removal = broker
+        .accepted
+        .iter()
+        .find(|payload| payload["action"] == "unpair_presented_client")
+        .unwrap();
+    assert_eq!(removal["certificate_pem"], pem());
+    assert!(removal.get("uniqueid").is_none());
+    assert!(removal.get("certificate_id").is_none());
+}
+
+#[test]
+fn paired_tls_unpair_reports_zero_when_nothing_was_removed() {
+    let mut router = router();
+    let mut broker = Broker {
+        unpair_misses: true,
+        ..Broker::default()
+    };
+    let reply = unpair_over_tls(&mut router, &mut broker, 5, Instant::now());
+    assert_eq!(reply.status, 200);
+    let body = String::from_utf8(reply.body).unwrap();
+    assert!(body.contains("<unpaired>0</unpaired>"), "{body}");
+}
+
+#[test]
+fn unpair_rejects_unknown_query_fields_before_calling_the_pairing_service() {
+    let mut router = router();
+    let mut broker = Broker::default();
+    let reply = router
+        .dispatch_with(
+            1,
+            request("/unpair?certificate_id=00"),
+            trusted_tls(&[1, 2, 3]),
+            Instant::now(),
+            &mut |command| broker.send(command),
+        )
+        .unwrap();
+    assert_eq!(reply.status, 400);
+    assert!(broker.accepted.is_empty());
+}
+
+#[test]
+fn resume_stays_an_explicit_not_implemented_response() {
+    let mut router = router();
+    let mut broker = Broker::default();
+    let trusted = router
+        .dispatch_with(
+            1,
+            request("/resume?uniqueid=client"),
+            trusted_tls(&[1, 2, 3]),
+            Instant::now(),
+            &mut |command| broker.send(command),
+        )
+        .unwrap();
+    assert_eq!(trusted.status, 501);
+    let plaintext = dispatch(&mut router, &mut broker, 2, "/resume", Instant::now()).unwrap();
+    assert_eq!(plaintext.status, 401);
+    assert!(broker.accepted.is_empty());
+}
+
+#[test]
+fn unpairing_a_client_cancels_its_active_launch_through_the_revoke_path() {
+    let mut router = streaming_router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    assert!(
+        router
+            .dispatch_with(
+                19,
+                request(LAUNCH_TARGET),
+                trusted_tls(&[1, 2, 3]),
+                now,
+                &mut |command| broker.send(command),
+            )
+            .is_none()
+    );
+    let (_, launched) = poll_until_reply(&mut router, &mut broker, now);
+    assert_eq!(launched.status, 200);
+    router.reply_delivered(19);
+    let owner = PeerIdentity::new("127.0.0.1".parse().unwrap(), vec![1, 2, 3]).unwrap();
+    assert_eq!(router.launches.current_game(&owner), 7);
+    assert!(router.launches.busy());
+
+    let reply = unpair_over_tls(&mut router, &mut broker, 20, now);
+    assert!(
+        String::from_utf8(reply.body)
+            .unwrap()
+            .contains("<unpaired>1</unpaired>")
+    );
+
+    // Mirrors NvhttpModule::tick: after the pairing authority drops the
+    // certificate, every non-terminal launch it owns is revoked.
+    let unrelated = [9u8, 9, 9];
+    router.revoke_untrusted(|certificate| certificate == unrelated);
+    let actions = |broker: &Broker| {
+        broker
+            .accepted
+            .iter()
+            .filter_map(|payload| payload["action"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..64 {
+        poll(&mut router, &mut broker, now);
+        if !router.launches.busy() {
+            break;
+        }
+    }
+    let actions = actions(&broker);
+    assert!(actions.contains(&"close".to_owned()), "{actions:?}");
+    assert!(actions.contains(&"stop".to_owned()), "{actions:?}");
+    assert!(!router.launches.busy());
+    assert_eq!(router.launches.current_game(&owner), 0);
 }
