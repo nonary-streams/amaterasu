@@ -152,6 +152,8 @@ fn forty_entries_require_two_pages_before_one_complete_xml_reply() {
         body.matches("<IsHdrSupported>0</IsHdrSupported>").count(),
         40
     );
+    // No client may be told a title is HDR-capable until a real 10-bit path exists.
+    assert!(!body.contains("<IsHdrSupported>1</IsHdrSupported>"));
     assert_eq!(
         catalog.requests[1]["cursor"]["after"],
         "app-0000000000000020"

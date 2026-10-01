@@ -1,5 +1,6 @@
 //! Moonlight Gen7 HTTP/XML adapter. This layer never performs TLS or PIN approval.
 mod applications;
+mod capabilities;
 mod cleanup;
 mod pairing;
 mod query;
@@ -86,6 +87,7 @@ pub struct Router {
     transcripts: BTreeMap<String, pairing::Transcript>,
     jobs: BTreeMap<u64, Job>,
     cancellations: BTreeMap<u64, Instant>,
+    capabilities: capabilities::HostCapabilities,
     next_job: u64,
     next_call: u64,
 }
@@ -141,6 +143,7 @@ impl Router {
             transcripts: BTreeMap::new(),
             jobs: BTreeMap::new(),
             cancellations: BTreeMap::new(),
+            capabilities: capabilities::HostCapabilities::new(Instant::now()),
             next_job: 0,
             next_call: 0,
         }
@@ -408,6 +411,7 @@ impl Router {
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> Vec<(u64, Reply)> {
         self.poll_cancellations(now, send);
+        self.poll_capabilities(now, send);
         let mut replies = self.launches.poll(now, send);
         let keys: Vec<_> = self.jobs.keys().copied().collect();
         for key in keys {

@@ -386,13 +386,29 @@ BMP noncharacters U+FFFE/U+FFFF and controls.
 
 Without streaming configuration, server info advertises `appversion=7.1.0.0` and
 `StreamingSupported=0`. Configured streaming advertises `appversion=7.1.431.0` and
-`StreamingSupported=1`. This reports accepted startup policy; it is not a runtime
-GPU, encoder, or capture probe. `ServerCodecModeSupport` is never zero: moonlight-qt
-passes it through unchanged and moonlight-common-c `LiStartConnection` aborts when it
-is zero (`Connection.c:228-233`), so the H.264 bit (`0x1`) is always advertised.
-`MaxLumaPixelsHEVC` stays zero and no HEVC, 10-bit, 4:4:4, or AV1 bit is set. Other
-unavailable hardware fields remain zero rather than claiming HDR, a public IP, or a
-hardware MAC. `state` is globally busy while any owned launch remains active or has
+`StreamingSupported=1`. Both report accepted startup policy, not a runtime probe.
+
+`ServerCodecModeSupport` is never zero: moonlight-qt passes it through unchanged and
+moonlight-common-c `LiStartConnection` aborts when it is zero (`Connection.c:228-233`),
+so the H.264 bit (`0x1`) is always advertised, also when streaming is unsupported or the
+capability query fails. The remaining bits come from a cached snapshot of
+`amaterasu.encode/1` `enumerate` (contract C3):
+
+- The router refreshes the snapshot from its poll loop every 30 seconds while streaming
+  is configured. `/serverinfo` only reads the cache and never waits for the encoder.
+- `SCM_HEVC` (`0x100`) and a nonzero `MaxLumaPixelsHEVC` (the conventional
+  `1869449984`) are set only when the enabled encoder module lists a hardware `hevc`
+  encoder, which it does only after proving 8-bit HEVC output.
+- A missing `amaterasu.encode/1` call grant, a rejected or malformed reply, a request
+  that exceeds five seconds, or a snapshot older than 90 seconds discards the snapshot,
+  so the reply falls back to H.264 only with `MaxLumaPixelsHEVC=0`.
+- No 10-bit, 4:4:4, or AV1 bit is ever set, and `/applist` keeps `IsHdrSupported=0`,
+  until the media path delivers real 10-bit output.
+- `mac` is the address of the first physical network interface read from
+  `/sys/class/net` on Linux, or `00:00:00:00:00:00` when none can be read. `GfeVersion`
+  stays `0.0.0.0` (see the wire audit table).
+
+`state` is globally busy while any owned launch remains active or has
 unconfirmed cleanup. `currentgame` contains the app ID only for the owning paired
 certificate and remains zero for other clients.
 

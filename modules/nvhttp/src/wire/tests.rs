@@ -1,3 +1,4 @@
+use super::capabilities::Advertised;
 use super::*;
 use crate::launch::{CaptureConfig, CaptureProvider, StreamProfile, StreamingConfig};
 use sha2::{Digest, Sha256};
@@ -39,6 +40,16 @@ struct Broker {
     cancelled: BTreeSet<u64>,
     approved: bool,
     pause_begin: bool,
+    encode: EncodeBehavior,
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+enum EncodeBehavior {
+    #[default]
+    H264Only,
+    ProvenHevc,
+    Denied,
+    Pending,
 }
 
 impl Broker {
@@ -50,6 +61,7 @@ impl Broker {
                 assert!(matches!(
                     service.as_str(),
                     PAIRING_SERVICE
+                        | capabilities::ENCODE_SERVICE
                         | "amaterasu.input/1"
                         | "amaterasu.launch/1"
                         | "amaterasu.rtsp/1"
@@ -69,11 +81,39 @@ impl Broker {
                     });
                 }
                 let payload = &self.requests[&request];
+                if self.services[&request] == capabilities::ENCODE_SERVICE {
+                    match self.encode {
+                        EncodeBehavior::Denied => {
+                            return Ok(Response::Error {
+                                code: "access_denied".into(),
+                                message: String::new(),
+                            });
+                        }
+                        EncodeBehavior::Pending => return Ok(Response::Pending),
+                        _ => {}
+                    }
+                }
                 if self.pause_begin && payload["action"] == "begin" {
                     return Ok(Response::Pending);
                 }
                 let service = &self.services[&request];
                 let result = match (service.as_str(), payload["action"].as_str().unwrap()) {
+                    (capabilities::ENCODE_SERVICE, "enumerate") => {
+                        let mut encoders = vec![json!({
+                            "identity":{"clsid":"amaterasu.hardware.nvenc.h264"},
+                            "name":"NVENC H.264","codec":"h264","hardware":true,"vendor_id":0x10de
+                        })];
+                        if self.encode == EncodeBehavior::ProvenHevc {
+                            encoders.push(json!({
+                                "identity":{"clsid":"amaterasu.hardware.nvenc.hevc"},
+                                "name":"NVENC HEVC","codec":"hevc","hardware":true,"vendor_id":0x10de
+                            }));
+                        }
+                        json!({
+                            "ok":true,"enabled":true,"encoders":encoders,
+                            "software_encoder":{"available":true,"reason":null}
+                        })
+                    }
                     ("amaterasu.input/1", "settings_get") => json!({
                         "ok":true,
                         "persisted":true,
@@ -339,7 +379,15 @@ fn query_rejects_duplicate_escaped_fields_and_bounded_malformed_input() {
 #[test]
 fn xml_escapes_metadata_and_advertises_configured_streaming_honestly() {
     assert_eq!(xml::escape("<&>\"'"), "&lt;&amp;&gt;&quot;&apos;");
-    let response = xml::server_info(&router().config, "host-id", false, 0, false, false);
+    let response = xml::server_info(
+        &router().config,
+        "host-id",
+        false,
+        0,
+        false,
+        false,
+        &Advertised::baseline(),
+    );
     let text = String::from_utf8(response.body).unwrap();
     assert!(text.contains("Amaterasu &amp; &lt;test&gt;"));
     assert!(text.contains("<appversion>7.1.0.0</appversion>"));
@@ -391,7 +439,15 @@ fn hostname_updates_change_the_default_launch_device_name() {
 
 #[test]
 fn configured_streaming_advertises_only_the_baseline_h264_codec() {
-    let response = xml::server_info(&router().config, "host-id", true, 0, true, true);
+    let response = xml::server_info(
+        &router().config,
+        "host-id",
+        true,
+        0,
+        true,
+        true,
+        &Advertised::baseline(),
+    );
     let text = String::from_utf8(response.body).unwrap();
     assert!(text.contains("<appversion>7.1.431.0</appversion>"));
     assert!(text.contains("<StreamingSupported>1</StreamingSupported>"));
@@ -458,8 +514,11 @@ fn launch_identity_and_client_override_come_from_the_authenticated_certificate()
     );
 
     assert!(poll(&mut router, &mut broker, now).is_empty());
-    let pairing_lookup = broker.accepted.first().unwrap();
-    assert_eq!(pairing_lookup["action"], "check_client_certificate");
+    let pairing_lookup = broker
+        .accepted
+        .iter()
+        .find(|payload| payload["action"] == "check_client_certificate")
+        .unwrap();
     assert_eq!(pairing_lookup["certificate_pem"], pem());
     assert!(pairing_lookup.get("uniqueid").is_none());
 
@@ -722,7 +781,15 @@ fn peer(
 fn configured_hostname_replaces_xml_noncharacters_and_escapes_quotes() {
     let mut config = router().config;
     config.hostname = "A&<\"'\u{fffe}\u{ffff}Z".into();
-    let reply = xml::server_info(&config, "host", false, 0, false, false);
+    let reply = xml::server_info(
+        &config,
+        "host",
+        false,
+        0,
+        false,
+        false,
+        &Advertised::baseline(),
+    );
     let body = String::from_utf8(reply.body).unwrap();
     assert!(body.contains("<hostname>A&amp;&lt;&quot;&apos;  Z</hostname>"));
     assert!(!body.contains('\u{fffe}'));
@@ -813,4 +880,136 @@ fn conflicting_phase_selectors_and_foreign_certificate_do_not_advance() {
         0
     );
     assert_eq!(router.transcripts.len(), 1);
+}
+
+fn server_info_text(router: &mut Router, broker: &mut Broker, now: Instant) -> String {
+    assert!(dispatch(router, broker, 31, "/serverinfo", now).is_none());
+    for _ in 0..4 {
+        let replies = poll(router, broker, now);
+        if let Some((_, reply)) = replies.into_iter().find(|(id, _)| *id == 31) {
+            assert_eq!(reply.status, 200);
+            return String::from_utf8(reply.body).unwrap();
+        }
+    }
+    panic!("serverinfo did not complete");
+}
+
+fn codec_fields(text: &str) -> (u32, u32) {
+    let field = |name: &str| -> u32 {
+        let open = format!("<{name}>");
+        let start = text.find(&open).unwrap() + open.len();
+        let end = text[start..].find('<').unwrap() + start;
+        text[start..end].parse().unwrap()
+    };
+    (field("ServerCodecModeSupport"), field("MaxLumaPixelsHEVC"))
+}
+
+const SCM_H264: u32 = 0x1;
+const SCM_HEVC: u32 = 0x100;
+
+#[test]
+fn serverinfo_without_streaming_never_asks_for_encoders_and_keeps_the_h264_bit() {
+    let mut router = router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    let text = server_info_text(&mut router, &mut broker, now);
+    assert_eq!(codec_fields(&text), (SCM_H264, 0));
+    assert!(
+        broker
+            .requests
+            .values()
+            .all(|payload| payload["action"] != "enumerate")
+    );
+}
+
+#[test]
+fn serverinfo_answers_before_the_first_capability_refresh_completes() {
+    let mut router = streaming_router();
+    let mut broker = Broker {
+        encode: EncodeBehavior::Pending,
+        ..Broker::default()
+    };
+    let now = Instant::now();
+    // The enumerate call is outstanding and never completes; serverinfo still
+    // answers from the baseline instead of waiting for it.
+    let text = server_info_text(&mut router, &mut broker, now);
+    assert_eq!(codec_fields(&text), (SCM_H264, 0));
+    assert!(
+        broker
+            .requests
+            .values()
+            .any(|payload| payload["action"] == "enumerate")
+    );
+}
+
+#[test]
+fn proven_hevc_encoder_sets_only_the_hevc_bit_and_a_luma_budget() {
+    let mut router = streaming_router();
+    let mut broker = Broker {
+        encode: EncodeBehavior::ProvenHevc,
+        ..Broker::default()
+    };
+    let now = Instant::now();
+    poll(&mut router, &mut broker, now);
+    poll(&mut router, &mut broker, now);
+    let (mask, luma) = codec_fields(&server_info_text(&mut router, &mut broker, now));
+    assert_eq!(mask, SCM_H264 | SCM_HEVC);
+    assert_ne!(luma, 0);
+}
+
+#[test]
+fn h264_only_enumeration_keeps_the_hevc_budget_at_zero() {
+    let mut router = streaming_router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    poll(&mut router, &mut broker, now);
+    poll(&mut router, &mut broker, now);
+    let text = server_info_text(&mut router, &mut broker, now);
+    assert_eq!(codec_fields(&text), (SCM_H264, 0));
+}
+
+#[test]
+fn denied_or_failed_refresh_discards_a_previous_hevc_snapshot() {
+    let mut router = streaming_router();
+    let mut broker = Broker {
+        encode: EncodeBehavior::ProvenHevc,
+        ..Broker::default()
+    };
+    let start = Instant::now();
+    poll(&mut router, &mut broker, start);
+    poll(&mut router, &mut broker, start);
+    let text = server_info_text(&mut router, &mut broker, start);
+    assert_eq!(codec_fields(&text).0, SCM_H264 | SCM_HEVC);
+
+    broker.encode = EncodeBehavior::Denied;
+    let later = start + Duration::from_secs(31);
+    poll(&mut router, &mut broker, later);
+    poll(&mut router, &mut broker, later);
+    let text = server_info_text(&mut router, &mut broker, later);
+    assert_eq!(codec_fields(&text), (SCM_H264, 0));
+}
+
+#[test]
+fn a_stalled_refresh_lets_the_snapshot_go_stale_to_the_baseline() {
+    let mut router = streaming_router();
+    let mut broker = Broker {
+        encode: EncodeBehavior::ProvenHevc,
+        ..Broker::default()
+    };
+    let start = Instant::now();
+    poll(&mut router, &mut broker, start);
+    poll(&mut router, &mut broker, start);
+    assert_eq!(
+        codec_fields(&server_info_text(&mut router, &mut broker, start)).0,
+        SCM_H264 | SCM_HEVC
+    );
+    // The encoder module stops answering: the next refresh never completes.
+    broker.encode = EncodeBehavior::Pending;
+    let mut now = start;
+    for _ in 0..100 {
+        now += Duration::from_secs(1);
+        poll(&mut router, &mut broker, now);
+    }
+    let text = server_info_text(&mut router, &mut broker, now);
+    assert_eq!(codec_fields(&text), (SCM_H264, 0));
 }
