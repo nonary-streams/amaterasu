@@ -12,9 +12,9 @@ use crate::{
         channel_layout, preferred_format_candidates, select_endpoint, select_policy_virtual_sink,
     },
 };
-use amaterasu_media::{
-    AUDIO_DISCONTINUITY, AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, PCM_F32, PCM_I16,
-};
+#[cfg(test)]
+use amaterasu_media::PCM_I16;
+use amaterasu_media::{AUDIO_DISCONTINUITY, AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, PCM_F32};
 use std::{
     ffi::c_void,
     sync::{
@@ -829,6 +829,7 @@ impl MixFormat {
         }
     }
 
+    #[cfg(test)]
     fn describe(&self) -> AudioResult<Format> {
         if self.0.is_null() {
             return Err("unsupported_format");
@@ -1075,11 +1076,13 @@ impl CaptureInitializer for IAudioClient {
     }
 
     fn get_capture(&mut self) -> AudioResult<Self::Capture> {
-        IAudioClient::GetService(self).map_err(|_| "audio_capture_unavailable")
+        // SAFETY: Initialize succeeded on this client in the same COM apartment.
+        unsafe { IAudioClient::GetService(self) }.map_err(|_| "audio_capture_unavailable")
     }
 
     fn start(&mut self) -> AudioResult<()> {
-        IAudioClient::Start(self).map_err(|_| "audio_start_failed")
+        // SAFETY: the initialized client and acquired capture service remain live.
+        unsafe { IAudioClient::Start(self) }.map_err(|_| "audio_start_failed")
     }
 }
 
@@ -1661,7 +1664,9 @@ mod tests {
     fn assert_loopback_float_target(mix: &mut WAVEFORMATEXTENSIBLE, channels: u32, mask: u32) {
         // This descriptor borrows test storage; ManuallyDrop avoids freeing it
         // as if it came from COM's GetMixFormat allocation.
-        let descriptor = std::mem::ManuallyDrop::new(MixFormat((mix as *mut _).cast()));
+        let descriptor = std::mem::ManuallyDrop::new(MixFormat(
+            (mix as *mut WAVEFORMATEXTENSIBLE).cast::<WAVEFORMATEX>(),
+        ));
         let (format, target) = loopback_capture_format(&descriptor).unwrap();
         assert_eq!(
             (
