@@ -5223,9 +5223,11 @@ mod tests {
                 ..FrameLimiterUpdate::default()
             },
             current.clone(),
-        )
-        .unwrap();
-        assert_eq!(alias.frame_limiter_disable_vsync, Some(false));
+        );
+        #[cfg(windows)]
+        assert_eq!(alias.unwrap().frame_limiter_disable_vsync, Some(false));
+        #[cfg(not(windows))]
+        assert_eq!(alias, Err("unsupported_frame_limiter_setting"));
 
         let same_values = apply_frame_limiter_update(
             FrameLimiterUpdate {
@@ -5234,9 +5236,11 @@ mod tests {
                 ..FrameLimiterUpdate::default()
             },
             current.clone(),
-        )
-        .unwrap();
-        assert_eq!(same_values.frame_limiter_disable_vsync, Some(true));
+        );
+        #[cfg(windows)]
+        assert_eq!(same_values.unwrap().frame_limiter_disable_vsync, Some(true));
+        #[cfg(not(windows))]
+        assert_eq!(same_values, Err("unsupported_frame_limiter_setting"));
 
         let conflict = apply_frame_limiter_update(
             FrameLimiterUpdate {

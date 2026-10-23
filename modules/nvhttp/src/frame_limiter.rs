@@ -274,7 +274,13 @@ mod tests {
             ..FrameLimiterSettings::default()
         };
 
+        #[cfg(windows)]
         assert!(settings.validate().is_ok());
+        #[cfg(not(windows))]
+        assert_eq!(
+            settings.validate(),
+            Err("unsupported_frame_limiter_setting")
+        );
         let persisted = serde_json::to_value(&settings).unwrap();
         assert_eq!(persisted["frame_limiter_enable"], false);
         assert_eq!(persisted["frame_limiter_fps_limit"], 0.0);
