@@ -10,6 +10,7 @@ use crate::model::{
     Axis, Button, Event, InputError, InputResult, Key, KeyState, PenTouchDevice,
     effective_virtual_key,
 };
+#[path = "linux_pen_touch.rs"]
 mod linux_pen_touch;
 use linux_pen_touch::LinuxPenTouch;
 use std::collections::HashMap;
@@ -133,7 +134,7 @@ impl Device {
                 REL_HWHEEL_HI_RES,
                 REL_WHEEL_HI_RES,
             ] {
-                set_bit(fd, UI_SET_RELBIT, code)?;
+                set_bit(fd, UI_SET_RELBIT, u32::from(code))?;
             }
         }
         let name: &[u8] = if keyboard {
