@@ -729,6 +729,34 @@ fn constant_rate_mode_reaches_video_open_and_uses_a_distinct_capture_lease() {
 }
 
 #[test]
+fn pipewire_portal_source_reaches_video_open_with_its_capture_lease() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let id = prepared["session"].as_u64().unwrap();
+    let mut configuration = start(id);
+    configuration["configuration"]["capture_provider"] = json!("pipewire");
+    configuration["configuration"]["output"] = json!("portal-selected-session-source");
+
+    assert_eq!(host.response(2, configuration)["state"], "active");
+    let record = &host.pipeline.records[&id];
+    assert!(matches!(
+        record.start.as_ref().unwrap().capture_provider,
+        CaptureProvider::PipeWire
+    ));
+    let video_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("PipeWire video open");
+    assert_eq!(video_open.payload["capture_provider"], "pipewire");
+    assert_eq!(
+        video_open.payload["output"],
+        "portal-selected-session-source"
+    );
+}
+
+#[test]
 fn wgc_pacing_smoothing_snapshot_reaches_video_open() {
     let mut enabled_host = Harness::new();
     let id = enabled_host.response(1, prepare())["session"]

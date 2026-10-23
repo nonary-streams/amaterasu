@@ -292,6 +292,9 @@ pub struct Capture {
 pub enum CaptureProvider {
     Dxgi,
     Wgc,
+    /// The active user-selected source supplied by the desktop portal.
+    #[serde(rename = "pipewire")]
+    PipeWire,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -2682,6 +2685,21 @@ mod tests {
 
         request.capture.capture_provider = CaptureProvider::Dxgi;
         assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
+    }
+
+    #[test]
+    fn pipewire_capture_is_valid_and_serializes_portal_source_to_stream_session() {
+        let mut request = open();
+        request.capture.capture_provider = CaptureProvider::PipeWire;
+        request.capture.output = "portal-selected-session-source".into();
+
+        assert!(request.validate(false).is_ok());
+        let start = request.arm(41)["configuration"].clone();
+        assert_eq!(start["capture_provider"], "pipewire");
+        assert_eq!(start["output"], "portal-selected-session-source");
+        let decoded: CaptureProvider = serde_json::from_value(start["capture_provider"].clone())
+            .expect("serialized PipeWire provider is accepted by the session model");
+        assert!(matches!(decoded, CaptureProvider::PipeWire));
     }
 
     #[test]

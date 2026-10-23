@@ -476,13 +476,13 @@ impl Controller {
                             | "ensure_active"
                             | "ensure_primary"
                             | "ensure_only_display",
-                        ) => {
-                            if capture_source(record).is_ok() {
-                                record.stage = Stage::SnapshotDisplay;
-                            } else {
-                                fail_record(record, "invalid_capture_output", now);
+                        ) => match capture_source(record) {
+                            Ok(_) => record.stage = Stage::SnapshotDisplay,
+                            Err("capture_display_mapping_unsupported") => {
+                                fail_record(record, "capture_display_mapping_unsupported", now)
                             }
-                        }
+                            Err(_) => fail_record(record, "invalid_capture_output", now),
+                        },
                         None | Some("disabled") => record.stage = Stage::LaunchApplication,
                         Some(_) => fail_record(record, "display_mutation_unavailable", now),
                     }
@@ -1254,9 +1254,18 @@ fn display_admission_response(record: &Record, payload: &Value) -> Result<String
 }
 
 fn capture_source(record: &Record) -> Result<&str, &'static str> {
-    let output = record.capture_output.as_str();
-    let source = match record.capture_provider {
+    capture_source_for(record.capture_provider, &record.capture_output)
+}
+
+fn capture_source_for(
+    provider: super::CaptureProvider,
+    output: &str,
+) -> Result<&str, &'static str> {
+    let source = match provider {
         super::CaptureProvider::Wgc => output,
+        // Portal-selected sources are user-session identities, not physical
+        // display identifiers. They must never authorize display mutation.
+        super::CaptureProvider::PipeWire => return Err("capture_display_mapping_unsupported"),
         super::CaptureProvider::Dxgi => {
             let (luid, source) = output.split_once('/').ok_or("invalid_capture_output")?;
             let Some((high, low)) = luid.split_once(':') else {
@@ -1278,6 +1287,20 @@ fn capture_source(record: &Record) -> Result<&str, &'static str> {
         return Err("invalid_capture_output");
     }
     Ok(source)
+}
+
+#[cfg(test)]
+mod capture_source_tests {
+    use super::capture_source_for;
+    use crate::launch::CaptureProvider;
+
+    #[test]
+    fn portal_source_cannot_be_used_as_a_physical_display_mapping() {
+        assert_eq!(
+            capture_source_for(CaptureProvider::PipeWire, "portal-selected-session-source"),
+            Err("capture_display_mapping_unsupported")
+        );
+    }
 }
 
 fn display_enumeration(

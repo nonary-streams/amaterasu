@@ -34,6 +34,7 @@ pub(crate) type Send<'a> = dyn FnMut(Command) -> Transport + 'a;
 
 const MAX_RECORDS: usize = 32;
 pub(crate) const DESKTOP_APP_ID: u32 = i32::MAX as u32;
+pub(crate) const PORTAL_SELECTED_SESSION_SOURCE: &str = "portal-selected-session-source";
 const INITIAL_DEADLINE: Duration = Duration::from_secs(40);
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(20);
 const MONITOR_INTERVAL: Duration = Duration::from_millis(250);
@@ -396,8 +397,32 @@ impl StreamingConfig {
 pub struct CaptureConfig {
     pub capture_provider: CaptureProvider,
     pub output: String,
+    #[serde(deserialize_with = "deserialize_capture_encoder")]
     pub encoder: u32,
     pub audio_endpoint: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CaptureEncoderSetting {
+    Index(u32),
+    Backend(CaptureEncoderBackend),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CaptureEncoderBackend {
+    Auto,
+}
+
+fn deserialize_capture_encoder<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match CaptureEncoderSetting::deserialize(deserializer)? {
+        CaptureEncoderSetting::Index(index) => Ok(index),
+        CaptureEncoderSetting::Backend(CaptureEncoderBackend::Auto) => Ok(0),
+    }
 }
 
 impl CaptureConfig {
@@ -444,6 +469,9 @@ impl CaptureMode {
 pub enum CaptureProvider {
     Dxgi,
     Wgc,
+    /// The active user-selected source supplied by the desktop portal.
+    #[serde(rename = "pipewire")]
+    PipeWire,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -714,21 +742,24 @@ impl Controller {
         let global_max_bitrate_kbps = self.global_max_bitrate_kbps;
         let global_minimum_fps_target = self.global_minimum_fps_target;
         let global_wgc_pacing_smoothing = self.global_wgc_pacing_smoothing;
-        let capture_output = self
-            .configured_output_name
-            .as_deref()
-            .filter(|output_name| !output_name.is_empty())
-            .unwrap_or(&config.capture.output)
-            .to_owned();
+        let (capture_provider, constant_rate) = self
+            .configured_capture
+            .resolve(config.capture.capture_provider);
+        let capture_output = match capture_provider {
+            CaptureProvider::PipeWire => PORTAL_SELECTED_SESSION_SOURCE.to_owned(),
+            CaptureProvider::Dxgi | CaptureProvider::Wgc => self
+                .configured_output_name
+                .as_deref()
+                .filter(|output_name| !output_name.is_empty())
+                .unwrap_or(&config.capture.output)
+                .to_owned(),
+        };
         let audio_endpoint = self
             .configured_audio_sink
             .as_deref()
             .unwrap_or(&config.capture.audio_endpoint)
             .to_owned();
         let bootstrap_audio_endpoint = config.capture.audio_endpoint.clone();
-        let (capture_provider, constant_rate) = self
-            .configured_capture
-            .resolve(config.capture.capture_provider);
 
         if let Some(record) = self
             .records

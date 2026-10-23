@@ -31,6 +31,21 @@ fn config() -> StreamingConfig {
     }
 }
 
+#[test]
+fn linux_pipewire_profile_accepts_auto_encoder_selection() {
+    let mut value = serde_json::to_value(config()).unwrap();
+    value["capture"]["capture_provider"] = json!("pipewire");
+    value["capture"]["encoder"] = json!("auto");
+
+    let streaming: StreamingConfig = serde_json::from_value(value.clone()).unwrap();
+    assert!(streaming.validate().is_ok());
+    assert_eq!(streaming.capture.capture_provider, CaptureProvider::PipeWire);
+    assert_eq!(streaming.capture.encoder, 0);
+
+    value["capture"]["encoder"] = json!("software");
+    assert!(serde_json::from_value::<StreamingConfig>(value).is_err());
+}
+
 fn peer(marker: u8) -> PeerIdentity {
     peer_with_fec(marker, None)
 }
@@ -1664,6 +1679,46 @@ fn desktop_launch_and_cancel_only_manage_rtsp_and_history() {
     assert_eq!(reply.status, 200);
     assert_eq!(controller.current_game(&peer(91)), 0);
     assert!(!broker.actions().iter().any(|(service, _)| *service == "amaterasu.launch/1"));
+}
+
+#[test]
+fn desktop_launch_carries_portal_pipewire_source_to_rtsp_without_display_preflight() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    settings.capture.capture_provider = CaptureProvider::PipeWire;
+    settings.capture.output = "profile-output-must-not-be-used".into();
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    controller.set_output_name_settings(true, Some("configured-physical-display"));
+    let mut broker = Broker::default();
+    let mut desktop_request = request(95);
+    desktop_request.app_id = DESKTOP_APP_ID;
+
+    assert!(controller.launch(95, desktop_request, peer(95), now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(connection, 95);
+    assert_eq!(reply.status, 200);
+
+    let rtsp_open = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .expect("desktop RTSP open request");
+    assert_eq!(rtsp_open["capture"]["capture_provider"], "pipewire");
+    assert_eq!(
+        rtsp_open["capture"]["output"],
+        PORTAL_SELECTED_SESSION_SOURCE
+    );
+    assert!(!broker.actions().iter().any(|(service, action)| {
+        *service == "amaterasu.display/1"
+            || *service == "amaterasu.launch/1"
+            || (*service == "amaterasu.rtsp/1" && *action == "prepare_display_admission")
+    }));
 }
 
 #[test]
