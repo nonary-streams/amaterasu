@@ -17,9 +17,9 @@ mod tests;
 
 use super::{
     APPLICATION, AUDIO, AUDIO_ENCODE, AUTHENTICATION, CAPTURE_PIPEWIRE, CATALOG, CONFIGURATION,
-    CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, FRAME_LIMITER, INPUT, LAUNCH, LUTRIS,
+    CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, FRAME_LIMITER, INPUT, LAUNCH,
     MANAGEMENT, MEDIA_TRANSPORT, NVHTTP, PAIRING, RTSP, RUNTIME, RUNTIME_ID, SESSION,
-    SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO, VIRTUAL_DISPLAY, names,
+    SESSION_HISTORY, STATE, STREAM_SESSION, VIDEO, VIRTUAL_DISPLAY, names,
 };
 use amaterasu_contracts::{Grants, RuntimeConfig};
 use amaterasu_package::{PackageResult, create_private_directory};
@@ -32,13 +32,13 @@ use std::path::Path;
 /// development policy holds 4 and the installer policy 3. Advance this whenever
 /// the administrator principals or the allowed scopes below
 /// change, including a revert. TTL-only edits do not bump it.
-pub const AUTHORIZATION_POLICY_GENERATION: u64 = 6;
+pub const AUTHORIZATION_POLICY_GENERATION: u64 = 7;
 
 pub const ADMINISTRATOR_PRINCIPALS: [&str; 2] = ["amaterasu.console", "amaterasu.management"];
 
 /// Management scopes without diagnostics; capture scopes authorize the
 /// current user's explicit XDG Desktop Portal source selection.
-pub const ALLOWED_SCOPES: [&str; 18] = [
+pub const ALLOWED_SCOPES: [&str; 15] = [
     "catalog.read",
     "catalog.write",
     "configuration.read",
@@ -48,9 +48,6 @@ pub const ALLOWED_SCOPES: [&str; 18] = [
     "application.read",
     "application.launch",
     "application.terminate",
-    "steam.read",
-    "steam.refresh",
-    "lutris.read",
     "pairing.admin",
     "display.read",
     "display.write",
@@ -81,14 +78,13 @@ const LINUX_SESSION_PAIRING: ComponentDefinition = ComponentDefinition {
     ..PAIRING
 };
 
-/// Launch without the Playnite provider; Lutris and Steam launches stay reachable.
+/// Launch without third-party library providers.
 const LINUX_SESSION_LAUNCH: ComponentDefinition = ComponentDefinition {
     calls: &[
         "amaterasu.catalog/1",
         "amaterasu.state/1",
         "amaterasu.session/1",
         "amaterasu.application/1",
-        "amaterasu.lutris/1",
     ],
     dependencies: &[
         RUNTIME_ID,
@@ -96,7 +92,6 @@ const LINUX_SESSION_LAUNCH: ComponentDefinition = ComponentDefinition {
         "amaterasu.state",
         "amaterasu.session",
         "amaterasu.application",
-        "amaterasu.lutris",
     ],
     ..LAUNCH
 };
@@ -128,7 +123,6 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.launch/1",
         "amaterasu.display/1",
         "amaterasu.virtual-display/1",
-        "amaterasu.lutris/1",
         "amaterasu.application/1",
         "amaterasu.rtsp/1",
         "amaterasu.stream-session/1",
@@ -221,12 +215,13 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.session/1",
         "amaterasu.application/1",
         "amaterasu.input/1",
-        "amaterasu.steam/1",
-        "amaterasu.lutris/1",
         "amaterasu.pairing/1",
         "amaterasu.display/1",
         "amaterasu.launch/1",
-        // Authenticated status and explicit current-user portal selection.
+        // Authenticated status and portal-selection delegation through video.
+        // Retain the capture call grant for management -> video -> PipeWire
+        // nested authority intersection; management does not depend on or
+        // invoke the provider directly.
         "amaterasu.capture-pipewire/1",
         "amaterasu.audio/1",
         "amaterasu.audio-encode/1",
@@ -249,12 +244,9 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.session",
         "amaterasu.application",
         "amaterasu.input",
-        "amaterasu.steam",
-        "amaterasu.lutris",
         "amaterasu.pairing",
         "amaterasu.display",
         "amaterasu.launch",
-        "amaterasu.capture-pipewire",
         "amaterasu.audio",
         "amaterasu.audio-encode",
         "amaterasu.encode",
@@ -276,8 +268,6 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     SESSION_HISTORY,
     CATALOG,
     APPLICATION,
-    STEAM,
-    LUTRIS,
     AUTHENTICATION,
     LINUX_SESSION_MANAGEMENT,
     LINUX_SESSION_PAIRING,
@@ -452,7 +442,7 @@ fn authentication_settings() -> Value {
 fn portal_capture_settings() -> Value {
     json!({
         "enabled": true,
-        "selection_principals": ["amaterasu.management"],
+        "selection_principals": [VIDEO_COMPONENT_ID],
         "capture_principals": [VIDEO_COMPONENT_ID],
     })
 }
@@ -465,11 +455,6 @@ fn catalog_settings(options: &LinuxSessionOptions) -> Value {
         // create an ordinary catalog row named Desktop.
         "seed_desktop_entry": false,
         "export_principals": {"amaterasu.nvhttp": owner},
-        "steam_id_export_principals": {"amaterasu.lutris": owner},
-        "import_principals": {
-            "amaterasu.steam": owner,
-            "amaterasu.lutris": owner,
-        },
     })
 }
 
