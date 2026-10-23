@@ -1,4 +1,5 @@
 mod development;
+mod preflight;
 mod profiles;
 mod repositories;
 mod vhf_install;
@@ -20,6 +21,12 @@ fn run() -> PackageResult<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     match arguments.as_slice() {
         [command, root] if command == "init" => development::initialize(Path::new(root)),
+        [command, root] if command == "preflight-desktop-stream-smoke" => {
+            preflight::run(Path::new(root), None)
+        }
+        [command, root, vhf_install_root] if command == "preflight-desktop-stream-smoke" => {
+            preflight::run(Path::new(root), Some(Path::new(vhf_install_root)))
+        }
         [command, root] if command == "init-desktop-stream-smoke" => {
             development::initialize_desktop_stream_smoke(Path::new(root), false)
         }
@@ -231,5 +238,5 @@ fn verify(root: &str, source: &str) -> PackageResult<()> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release init-desktop-stream-smoke ROOT [--allow-remote]\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-desktop-stream-smoke ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release repository-approve ROOT ID HTTPS_URL PUBLIC_KEY_HEX CONFIRMED_SHA256\n  amaterasu-release repository-revoke ROOT ID\n  amaterasu-release repository-refresh ROOT ID\n  amaterasu-release repository-list ROOT\n  amaterasu-release repository-download ROOT ID SLOT IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-install-ui ROOT ID IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-stage-native ROOT ID SLOT IMPLEMENTATION VERSION SOURCE\n  amaterasu-release repository-activate-native ROOT DIGEST\n  amaterasu-release repository-restore-ui ROOT [DIGEST]\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT\n  amaterasu-release seal-vhf-package PACKAGE CONFIRMED_FINGERPRINT SIGNTOOL\n  amaterasu-release verify-vhf-package PACKAGE CONFIRMED_FINGERPRINT SIGNTOOL\n  amaterasu-release install-vhf-package PACKAGE INSTALL_ROOT RUNTIME_ROOT CONFIRMED_FINGERPRINT SIGNTOOL DEVCON\n  amaterasu-release rollback-vhf-package INSTALL_ROOT RUNTIME_ROOT DEVCON\n  amaterasu-release grant-vhf-input INSTALL_ROOT RUNTIME_ROOT ACTIVE_SET_DIGEST KEYBOARD_0_OR_1 MOUSE_0_OR_1\n  amaterasu-release revoke-vhf-input INSTALL_ROOT RUNTIME_ROOT\n  Desktop smoke requires replacing SELECT_OUTPUT_ID with a current DXGI output ID in bootstrap.json.\n  --allow-remote selects wildcard stream listeners only; it does not alter firewall or machine network settings."
+    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release init-desktop-stream-smoke ROOT [--allow-remote]\n  amaterasu-release preflight-desktop-stream-smoke ROOT [VHF_INSTALL_ROOT]\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-desktop-stream-smoke ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release repository-approve ROOT ID HTTPS_URL PUBLIC_KEY_HEX CONFIRMED_SHA256\n  amaterasu-release repository-revoke ROOT ID\n  amaterasu-release repository-refresh ROOT ID\n  amaterasu-release repository-list ROOT\n  amaterasu-release repository-download ROOT ID SLOT IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-install-ui ROOT ID IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-stage-native ROOT ID SLOT IMPLEMENTATION VERSION SOURCE\n  amaterasu-release repository-activate-native ROOT DIGEST\n  amaterasu-release repository-restore-ui ROOT [DIGEST]\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT\n  amaterasu-release seal-vhf-package PACKAGE CONFIRMED_FINGERPRINT SIGNTOOL\n  amaterasu-release verify-vhf-package PACKAGE CONFIRMED_FINGERPRINT SIGNTOOL\n  amaterasu-release install-vhf-package PACKAGE INSTALL_ROOT RUNTIME_ROOT CONFIRMED_FINGERPRINT SIGNTOOL DEVCON\n  amaterasu-release rollback-vhf-package INSTALL_ROOT RUNTIME_ROOT DEVCON\n  amaterasu-release grant-vhf-input INSTALL_ROOT RUNTIME_ROOT ACTIVE_SET_DIGEST KEYBOARD_0_OR_1 MOUSE_0_OR_1\n  amaterasu-release revoke-vhf-input INSTALL_ROOT RUNTIME_ROOT\n  Desktop smoke requires replacing SELECT_OUTPUT_ID with a current DXGI output ID in bootstrap.json.\n  --allow-remote selects wildcard stream listeners only; it does not alter firewall or machine network settings."
 }
