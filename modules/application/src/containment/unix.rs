@@ -131,6 +131,10 @@ pub(crate) struct DetachedChild {
 }
 
 impl DetachedChild {
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn output_redirection_supported(_elevated: bool) -> io::Result<bool> {
         Ok(true)
     }
