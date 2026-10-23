@@ -111,9 +111,9 @@ const LINUX_SESSION_VIDEO: ComponentDefinition = ComponentDefinition {
 };
 
 // The grant chain. A parented request carries the intersection of every
-// ancestor's call grants, so each service a stream reaches must appear on
-// NVHTTP, RTSP, and the stream session as well as on the component that
-// finally calls it:
+// ancestor's call grants, so PipeWire call authority must transit NVHTTP,
+// RTSP, and the stream session. Native-use authority stays on the Linux video
+// component, which is the only module that directly invokes capture frames:
 //   nvhttp -> rtsp -> stream-session -> video / media-transport / control-transport
 //   video -> encode / current-user PipeWire capture
 //   stream-session -> session / display / virtual-display / input / audio / audio-encode
