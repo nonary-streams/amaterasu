@@ -657,7 +657,13 @@ impl Backend for LinuxBackend {
                     std::time::Instant::now(),
                     |slot| UinputGamepad::create(path, slot),
                 )
-                .map_err(|error| InputError::new("controller_unavailable", error.message));
+                .map_err(|error| {
+                    if error.code == "release_failed" {
+                        error
+                    } else {
+                        InputError::new("controller_unavailable", error.message)
+                    }
+                });
         }
         if let Event::Key { key, state } = event {
             if self.keyboard_retired {
@@ -1512,7 +1518,7 @@ mod tests {
 
         assert_eq!(
             backend.validate(&event).unwrap_err().code,
-            "unsupported_event"
+            "controller_unavailable"
         );
         assert!(!backend.controller_input_supported());
     }

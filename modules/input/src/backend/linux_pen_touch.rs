@@ -328,11 +328,7 @@ impl ContactTracker {
         // A failed Down may have reserved a slot without creating a uinput
         // device. The first successful Move must establish its tracking ID.
         let recovering_down = phase == PenTouchPhase::Move && !down_written;
-        let frame_event = if recovering_down {
-            with_phase(event, PenTouchPhase::Down)
-        } else {
-            event.clone()
-        };
+        let frame_event = event.clone();
         if matches!(phase, PenTouchPhase::Up | PenTouchPhase::Cancel)
             && !touch.contact.native_write_attempted
         {
@@ -345,7 +341,7 @@ impl ContactTracker {
             .filter(|touch| touch.contact.native_write_attempted)
             .count();
         let active_contacts = native_contacts + usize::from(!touch.contact.native_write_attempted);
-        let frame = touch_frame(&frame_event, slot, active_contacts)?;
+        let frame = touch_frame(&frame_event, slot, active_contacts, recovering_down)?;
         let mut attempted = false;
         let result = emit(Target::Touch, &frame, &mut attempted);
         self.touches
@@ -451,7 +447,7 @@ impl ContactTracker {
                 .count();
             let active_contacts =
                 native_contacts + usize::from(!touch.contact.native_write_attempted);
-            let frame = touch_frame(&cancel_event, touch.slot, active_contacts)?;
+            let frame = touch_frame(&cancel_event, touch.slot, active_contacts, false)?;
             let mut attempted = false;
             match emit(Target::Touch, &frame, &mut attempted) {
                 Ok(()) => {
@@ -510,7 +506,7 @@ impl ContactTracker {
                 continue;
             }
             let down = with_phase(&touch.replay_event, PenTouchPhase::Down);
-            let frame = touch_frame(&down, touch.slot, active_contacts + 1)?;
+            let frame = touch_frame(&down, touch.slot, active_contacts + 1, false)?;
             let mut attempted = false;
             let result = emit(Target::Touch, &frame, &mut attempted);
             touch.contact.native_write_attempted |= attempted;
@@ -915,6 +911,7 @@ fn touch_frame(
     event: &Event,
     slot: TouchSlot,
     active_contacts: usize,
+    recovering_down: bool,
 ) -> InputResult<Vec<(u16, u16, i32)>> {
     let Event::PenTouch {
         device: PenTouchDevice::Touch,
@@ -936,6 +933,9 @@ fn touch_frame(
     let mut frame = vec![(EV_ABS, ABS_MT_SLOT, slot.slot)];
     match phase {
         PenTouchPhase::Down => frame.push((EV_ABS, ABS_MT_TRACKING_ID, slot.tracking_id)),
+        PenTouchPhase::Move if recovering_down => {
+            frame.push((EV_ABS, ABS_MT_TRACKING_ID, slot.tracking_id));
+        }
         PenTouchPhase::Move => {}
         PenTouchPhase::Up | PenTouchPhase::Cancel => {
             frame.push((EV_ABS, ABS_MT_TRACKING_ID, -1));
@@ -966,9 +966,9 @@ fn touch_frame(
             // ABS_MT_ORIENTATION has no unknown value; zero is the neutral angle.
             frame.push((EV_ABS, ABS_MT_ORIENTATION, 0));
         }
-        if *phase == PenTouchPhase::Down {
+        if *phase == PenTouchPhase::Down || recovering_down {
             // A prior frame may have stopped after TRACKING_ID but before the
-            // shared touch key. Reassert it for every complete Down report.
+            // shared touch key. Reassert it for Down and recovered Move frames.
             frame.push((EV_KEY, BTN_TOUCH, 1));
         }
     } else {
