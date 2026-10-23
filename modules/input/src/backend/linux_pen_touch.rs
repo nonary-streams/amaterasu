@@ -1808,7 +1808,7 @@ mod tests {
         let second_down = event(8, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 40);
         assert!(
             tracker
-                .inject(&first_down, |_, _, _| Err(InputError::new(
+                .inject(&first_down, |_, _, _, _| Err(InputError::new(
                     "injection_failed",
                     "open failed"
                 )))
@@ -1825,7 +1825,7 @@ mod tests {
         emit(&mut tracker, &mut writer, &second_down).unwrap();
         assert_eq!(event_at(&writer.frames[0].1, EV_KEY, BTN_TOUCH), Some(1));
         tracker
-            .inject(&with_phase(&first_down, PenTouchPhase::Up), |_, _, _| {
+            .inject(&with_phase(&first_down, PenTouchPhase::Up), |_, _, _, _| {
                 panic!("uncreated contact must not emit a native release")
             })
             .unwrap();
