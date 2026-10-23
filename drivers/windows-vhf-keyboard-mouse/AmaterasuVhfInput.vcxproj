@@ -50,6 +50,7 @@
       <AdditionalDependencies>VhfUm.lib;WdfDriverStubUm.lib;ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(WDKContentRoot)Lib\$(TargetPlatformVersion)\um\$(Platform);$(WDKContentRoot)Lib\wdf\umdf\$(Platform)\2.15;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <GenerateDebugInformation Condition="'$(LocalBuildWithoutPdb)' == 'true'">false</GenerateDebugInformation>
+      <GenerateMapFile Condition="'$(LocalBuildWithoutPdb)' == 'true'">true</GenerateMapFile>
       <GenerateDebugInformation Condition="'$(LocalBuildWithoutPdb)' != 'true'">true</GenerateDebugInformation>
       <AdditionalOptions Condition="'$(LocalBuildWithoutPdb)' == 'true'">/DEBUG:NONE /INCREMENTAL:NO %(AdditionalOptions)</AdditionalOptions>
     </Link>

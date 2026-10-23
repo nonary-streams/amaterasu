@@ -62,6 +62,16 @@ pub fn create_machine_private_directory(path: &Path) -> StorageResult<()> {
     Ok(())
 }
 
+/// Explicit installer operation. Unlike `create_machine_private_directory`,
+/// this seals the directory when called by an elevated administrator too.
+/// The caller must establish that every parent is installer-owned.
+pub fn seal_machine_private_directory(path: &Path) -> StorageResult<()> {
+    create_private_directory(path)?;
+    #[cfg(windows)]
+    set_machine_private_dacl(path)?;
+    Ok(())
+}
+
 /// Protects an existing regular file containing machine-owned secrets.
 /// On Windows, only LocalSystem applies the installed SY/BA ACL, matching
 /// `create_machine_private_directory`; non-SYSTEM development runs retain
@@ -83,6 +93,34 @@ pub fn protect_machine_private_file(path: &Path) -> StorageResult<()> {
         if running_as_local_system()? {
             set_machine_private_dacl(path)?;
         }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Explicit elevated-installer counterpart to `protect_machine_private_file`.
+/// It sets the SYSTEM/Administrators DACL even when the caller is an admin
+/// rather than LocalSystem. The caller must establish a protected parent.
+pub fn seal_machine_private_file(path: &Path) -> StorageResult<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("not a regular file: {}", path.display()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(format!(
+                "reparse point is not a regular file: {}",
+                path.display()
+            ));
+        }
+        set_machine_private_dacl(path)?;
     }
     #[cfg(unix)]
     {

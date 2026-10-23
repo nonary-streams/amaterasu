@@ -1,6 +1,7 @@
 mod development;
 mod profiles;
 mod repositories;
+mod vhf_install;
 
 use amaterasu_package::{
     BootstrapConfig, PackageResult, RootLock, VerificationPolicy, read_json, stage_package,
@@ -113,6 +114,49 @@ fn run() -> PackageResult<()> {
         [command, root] if command == "finalize-installer-provision" => {
             development::finalize_installer_provision(Path::new(root))
         }
+        [command, package, fingerprint, signtool] if command == "verify-vhf-package" => {
+            vhf_install::verify_command(Path::new(package), fingerprint, Path::new(signtool))
+        }
+        [command, package, fingerprint, signtool] if command == "seal-vhf-package" => {
+            vhf_install::seal_command(Path::new(package), fingerprint, Path::new(signtool))
+        }
+        [
+            command,
+            package,
+            install_root,
+            runtime_root,
+            fingerprint,
+            signtool,
+            devcon,
+        ] if command == "install-vhf-package" => vhf_install::install_command(
+            Path::new(package),
+            Path::new(install_root),
+            Path::new(runtime_root),
+            fingerprint,
+            Path::new(signtool),
+            Path::new(devcon),
+        ),
+        [command, install_root, runtime_root, devcon] if command == "rollback-vhf-package" => {
+            vhf_install::rollback_command(
+                Path::new(install_root),
+                Path::new(runtime_root),
+                Path::new(devcon),
+            )
+        }
+        [command, install_root, runtime_root, digest, keyboard, mouse]
+            if command == "grant-vhf-input" =>
+        {
+            vhf_install::grant_command(
+                Path::new(install_root),
+                Path::new(runtime_root),
+                digest,
+                keyboard,
+                mouse,
+            )
+        }
+        [command, install_root, runtime_root] if command == "revoke-vhf-input" => {
+            vhf_install::revoke_command(Path::new(install_root), Path::new(runtime_root))
+        }
         _ => Err(usage().into()),
     }
 }
@@ -173,5 +217,5 @@ fn verify(root: &str, source: &str) -> PackageResult<()> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release repository-approve ROOT ID HTTPS_URL PUBLIC_KEY_HEX CONFIRMED_SHA256\n  amaterasu-release repository-revoke ROOT ID\n  amaterasu-release repository-refresh ROOT ID\n  amaterasu-release repository-list ROOT\n  amaterasu-release repository-download ROOT ID SLOT IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-install-ui ROOT ID IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-stage-native ROOT ID SLOT IMPLEMENTATION VERSION SOURCE\n  amaterasu-release repository-activate-native ROOT DIGEST\n  amaterasu-release repository-restore-ui ROOT [DIGEST]\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT"
+    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release repository-approve ROOT ID HTTPS_URL PUBLIC_KEY_HEX CONFIRMED_SHA256\n  amaterasu-release repository-revoke ROOT ID\n  amaterasu-release repository-refresh ROOT ID\n  amaterasu-release repository-list ROOT\n  amaterasu-release repository-download ROOT ID SLOT IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-install-ui ROOT ID IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-stage-native ROOT ID SLOT IMPLEMENTATION VERSION SOURCE\n  amaterasu-release repository-activate-native ROOT DIGEST\n  amaterasu-release repository-restore-ui ROOT [DIGEST]\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT\n  amaterasu-release seal-vhf-package PACKAGE CONFIRMED_FINGERPRINT SIGNTOOL\n  amaterasu-release verify-vhf-package PACKAGE CONFIRMED_FINGERPRINT SIGNTOOL\n  amaterasu-release install-vhf-package PACKAGE INSTALL_ROOT RUNTIME_ROOT CONFIRMED_FINGERPRINT SIGNTOOL DEVCON\n  amaterasu-release rollback-vhf-package INSTALL_ROOT RUNTIME_ROOT DEVCON\n  amaterasu-release grant-vhf-input INSTALL_ROOT RUNTIME_ROOT ACTIVE_SET_DIGEST KEYBOARD_0_OR_1 MOUSE_0_OR_1\n  amaterasu-release revoke-vhf-input INSTALL_ROOT RUNTIME_ROOT"
 }
