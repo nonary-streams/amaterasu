@@ -62,7 +62,11 @@ impl Broker {
                     .unwrap_or_else(|| serde_json::json!({})),
             },
             Command::GetHostContext {} => {
-                if caller != "amaterasu.state" {
+                // Audio needs the host-owned state root on Linux to reconcile
+                // its own Pulse cleanup journal after a worker restart.
+                if caller != "amaterasu.state"
+                    && !(cfg!(target_os = "linux") && caller == "amaterasu.audio")
+                {
                     return errors::permission_denied();
                 }
                 Response::Result {

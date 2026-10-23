@@ -147,8 +147,9 @@ pub enum Command {
         binding: u64,
     },
     GetSettings {},
-    /// Returns host-owned context only to the state service. This prevents a
-    /// module policy from impersonating a host decision through `GetSettings`.
+    /// Returns host-owned context to the state service, and to the Linux audio
+    /// module for its restart-safe cleanup journal. This prevents a module
+    /// policy from impersonating a host decision through `GetSettings`.
     GetHostContext {},
     Register {
         service: String,

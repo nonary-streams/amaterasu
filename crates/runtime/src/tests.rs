@@ -62,11 +62,14 @@ fn test_broker() -> Broker {
 }
 
 #[test]
-fn host_state_context_is_available_only_to_the_state_service() {
+fn host_state_context_is_available_only_to_trusted_state_consumers() {
     let mut configuration = RuntimeConfig::default();
     configuration
         .principals
         .insert("amaterasu.state".into(), Grants::default());
+    configuration
+        .principals
+        .insert("amaterasu.audio".into(), Grants::default());
     configuration
         .principals
         .insert("other".into(), Grants::default());
@@ -74,6 +77,7 @@ fn host_state_context_is_available_only_to_the_state_service() {
         schema: 1,
         state_root: Some(r"C:\\ProgramData\\Amaterasu\\runtime\\user-state\\S-1-5-21-1".into()),
     };
+    let state_root = configuration.host_context.state_root.clone();
     let mut broker = Broker::new(configuration).unwrap();
     let Response::Result { payload } =
         broker.dispatch("amaterasu.state", Command::GetHostContext {})
@@ -81,6 +85,18 @@ fn host_state_context_is_available_only_to_the_state_service() {
         panic!("state service did not receive host context");
     };
     assert_eq!(payload["schema"], 1);
+    let audio_context = broker.dispatch("amaterasu.audio", Command::GetHostContext {});
+    if cfg!(target_os = "linux") {
+        let Response::Result { payload } = audio_context else {
+            panic!("Linux audio did not receive its host-owned state root");
+        };
+        assert_eq!(payload["state_root"].as_str(), state_root.as_deref());
+    } else {
+        assert!(matches!(
+            audio_context,
+            Response::Error { code, .. } if code == "permission_denied"
+        ));
+    }
     assert!(matches!(
         broker.dispatch("other", Command::GetHostContext {}),
         Response::Error { code, .. } if code == "permission_denied"
