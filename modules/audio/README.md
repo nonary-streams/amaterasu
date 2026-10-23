@@ -1,16 +1,19 @@
-# WASAPI loopback audio
+# Desktop loopback audio
 
 `amaterasu-audio` provides `amaterasu.audio/1` control and the matching native
 `amaterasu_media::AudioCaptureApi`. Startup settings default to
 `{"enabled":false}`. Disabled enumeration returns an empty list without starting
-COM or touching audio endpoints; open returns `disabled`. On non-Windows systems,
-enabled enumeration is empty and open returns `unsupported_platform`.
+COM or connecting to an audio server; open returns `disabled`. Windows uses
+WASAPI loopback. Linux uses monitor sources from the user's existing
+PulseAudio-compatible server, including PipeWire's Pulse server. Other operating
+systems return an empty endpoint list and `unsupported_platform` on open.
 
 Strict JSON controls:
 
 ```json
 {"action":"enumerate"}
 {"action":"open","endpoint":"default","host_audio_enabled":false,"operation_id":"living-room-audio"}
+{"action":"open","endpoint":"default","capture_format":{"sample_rate":48000,"channels":6,"sample_format":"f32"}}
 {"action":"open","endpoint":"default","operation_id":"continuous-audio","continuous_audio":{"packet_ms":5}}
 {"action":"open","endpoint":"","virtual_sink":"","channels":6,"operation_id":"surround-audio"}
 {"action":"lookup","operation_id":"living-room-audio"}
@@ -21,10 +24,26 @@ Strict JSON controls:
 
 Enumeration returns `{ok:true,enabled,endpoints:[{id,name,description,adapter_name,default_multimedia}]}`
 for active render endpoints. Explicit endpoint IDs come from that list. With no
-virtual sink selected, an empty or `default` ordinary endpoint initially selects
-the current Windows Console render default. Regular empty/default opens normally
-follow later Console default changes; capture-only opens pin the initially
-selected endpoint.
+virtual sink selected, an empty or `default` ordinary endpoint selects the
+current default render sink. Regular empty/default opens follow later default
+changes; capture-only opens pin the initially selected endpoint. Windows uses
+the Console role; Linux uses the Pulse server's default sink.
+On Linux, capture reads the selected render sink's monitor source through the
+user's existing PulseAudio-compatible server. It never autospawns that server.
+The default capture uses 48 kHz float PCM and keeps the monitor's actual channel
+layout. The optional `capture_format` requests 48 kHz float PCM with 2, 6, or 8
+channels; the server performs any channel conversion. Unsupported monitor layouts
+fail rather than being reported as a different channel count. Linux enumeration
+and capture link against libpulse.
+
+On Linux, `host_audio_enabled:false` creates a uniquely named managed null sink
+for capture, then releases it when the last stream closes. An explicit
+`virtual_sink` selects an existing sink by exact ID, name, description, or
+adapter name. Routed explicit and virtual opens use a shared route lease and
+restore the previous default only while it still points at the selected sink;
+default and capture-only opens do not change the default. Failed restoration
+remains visible in `audio_route_restore_pending` and is retried in the
+background. Linux does not install or require a Steam audio driver.
 Enumeration is limited to 64 endpoints and a 12,000-byte metadata reply. On
 Windows, opening an explicit endpoint with `capture_sink_without_routing` omitted
 or false temporarily assigns that endpoint as the Console, Multimedia, and
@@ -194,8 +213,10 @@ borrowed buffers on that same thread. Polling sleeps two milliseconds only when
 no packet is available. No COM pointer or borrowed WASAPI allocation crosses a
 thread boundary. Endpoint enumeration uses a short-lived separate apartment.
 
-Supported formats are little-endian 32-bit IEEE floating point or 16-bit signed PCM,
-8–192 kHz and 1–8 channels. There is no format conversion or resampling.
+Windows supports little-endian 32-bit IEEE floating point or 16-bit signed PCM,
+8–192 kHz and 1–8 channels. It performs no format conversion or resampling.
+Linux publishes 48 kHz float PCM, retaining the endpoint's 1–8 channel monitor
+layout by default, or using the requested 2/6/8 channel capture format above.
 WAVEFORMATEXTENSIBLE valid bits, block alignment, byte rate, subtype and channel
 mask are checked. `channel_mask` preserves the platform speaker mask; interleaved
 samples follow ascending speaker-mask bit order. Zero means unspecified layout.
@@ -231,7 +252,7 @@ behavioral references without copying or translating source. The selected-endpoi
 capture-only case is represented by the per-open policy above. Continuous audio
 is opt-in per open; product setting persistence, management UI, and hardware
 qualification remain unimplemented. Opus encoding, configured speaker remapping,
-resampling, process-specific loopback, microphone capture, Linux/macOS backends,
+resampling, process-specific loopback, microphone capture, the macOS backend,
 and full streaming audio parity remain unimplemented.
 
 Host tests use fake endpoint/capture backends and real native callback bindings
@@ -251,7 +272,10 @@ checks all three default render roles before and after:
 cargo test -p amaterasu-audio explicit_endpoint_captures_without_changing_any_default_role -- --ignored
 ```
 
-That test has not been run on development hardware. Real Windows qualification
+That test has not been run on development hardware. Linux tests exercise Pulse
+ABI layout, endpoint selection, channel negotiation, route restoration policy,
+and silence packet sizing without opening a server; the ignored Linux monitor
+test requires the user's PulseAudio-compatible server. Real Windows qualification
 of routed opens must exercise successful switching/restoration, each partial
 switch failure and rollback, role changes made by another application, device
 removal, default-device changes while capturing, and recovery after restoration
