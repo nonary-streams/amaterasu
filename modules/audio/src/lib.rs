@@ -51,6 +51,17 @@ impl ManagedModule for AudioModule {
         unsafe {
             runtime.register_native(SERVICE, &factory.api)?;
         }
+        #[cfg(target_os = "linux")]
+        {
+            let state_root = runtime
+                .runtime_state_root()
+                .map_err(|_| "audio host state root unavailable")?;
+            if !state_root.is_absolute() {
+                return Err("audio host state root is invalid".into());
+            }
+            platform::startup(&state_root).map_err(|_| "audio cleanup journal unavailable")?;
+        }
+        #[cfg(windows)]
         platform::startup();
         Ok(Self {
             runtime,

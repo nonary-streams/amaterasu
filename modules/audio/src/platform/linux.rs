@@ -1,10 +1,17 @@
 //! PulseAudio capture for Linux, including PipeWire's Pulse compatibility server.
+mod cleanup_journal;
+
 use super::RecoveryConfig;
 use crate::{
     model::{AudioResult, Endpoint, Format, Packet, PcmCaptureFormat},
     virtual_sink::{self, select_endpoint},
 };
 use amaterasu_media::{AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, PCM_F32};
+use cleanup_journal::{
+    CleanupJournal, CleanupState, RouteIntent, RouteRestoreAction, SinkCleanupAction, SinkIntent,
+    SinkObservation, deactivate_prior_process_sinks, route_restore_action, sink_cleanup_action,
+    sink_cleanup_requested,
+};
 use std::{
     any::Any,
     collections::{BTreeMap, VecDeque},
@@ -14,6 +21,7 @@ use std::{
     ptr,
     sync::{
         Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, Sender},
     },
     thread::{self, JoinHandle},
@@ -45,6 +53,10 @@ const FRAMES_PER_PACKET: u32 = 480;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CAPTURE_CHUNK: usize = 1024 * 1024;
+static NEXT_MANAGED_SINK: AtomicU64 = AtomicU64::new(1);
+static NEXT_SINK_CLEANUP_SLOT: AtomicU64 = AtomicU64::new(0);
+static CLEANUP_JOURNAL: OnceLock<Mutex<Option<CleanupJournal>>> = OnceLock::new();
+static CLEANUP_JOURNAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[repr(C)]
 struct PaMainloop {
@@ -237,6 +249,7 @@ struct Sink {
     monitor_source: String,
     channel_positions: Vec<c_int>,
     owner_module: u32,
+    managed_token: Option<String>,
 }
 
 #[derive(Default)]
@@ -504,10 +517,10 @@ impl PulseClient {
         }
     }
 
-    fn load_null_sink(&mut self, name: &str, channels: u32) -> AudioResult<u32> {
+    fn load_null_sink(&mut self, name: &str, channels: u32, owner_token: &str) -> AudioResult<u32> {
         let layout = null_sink_layout(channels)?;
         let arguments = CString::new(format!(
-            "sink_name={name} rate={AUDIO_RATE} format=float32le channels={channels} channel_map={} sink_properties=device.description=AmaterasuAudio",
+            "sink_name={name} rate={AUDIO_RATE} format=float32le channels={channels} channel_map={} sink_properties=\"device.description=AmaterasuAudio amaterasu.audio.owner={owner_token}\"",
             layout.pulse_map
         ))
         .map_err(|_| "invalid_virtual_sink")?;
@@ -761,6 +774,7 @@ unsafe fn read_sink_info(info: &PaSinkInfo) -> Option<Sink> {
         monitor_source,
         channel_positions,
         owner_module: info.owner_module,
+        managed_token: unsafe { proplist_string(info.proplist, c"amaterasu.audio.owner") },
     })
 }
 
@@ -880,20 +894,32 @@ fn channel_mask(positions: &[c_int]) -> u32 {
 #[derive(Debug)]
 pub(super) struct ManagedVirtualSink {
     name: String,
+    owner_token: String,
     channels: u32,
     module_index: Mutex<Option<u32>>,
 }
 
 impl ManagedVirtualSink {
     fn ensure(&self, client: &mut PulseClient) -> AudioResult<()> {
-        if client
-            .sinks()?
-            .iter()
-            .any(|sink| sink.endpoint.id == self.name)
-        {
+        let sinks = client.sinks()?;
+        if sinks.iter().any(|sink| {
+            sink.endpoint.id == self.name
+                && sink.managed_token.as_deref() == Some(self.owner_token.as_str())
+        }) {
             return Ok(());
         }
-        let index = client.load_null_sink(&self.name, self.channels)?;
+        if sinks.iter().any(|sink| sink.endpoint.id == self.name) {
+            return Err("virtual_sink_name_conflict");
+        }
+        persist_sink_intent(&self.name, &self.owner_token, None, false, true)?;
+        let index = client.load_null_sink(&self.name, self.channels, &self.owner_token)?;
+        if let Err(error) =
+            persist_sink_intent(&self.name, &self.owner_token, Some(index), true, false)
+        {
+            let _ = request_sink_cleanup(&self.name, &self.owner_token);
+            retry_virtual_sink_cleanups_with_client(client, Some(&self.name));
+            return Err(error);
+        }
         *self
             .module_index
             .lock()
@@ -904,88 +930,309 @@ impl ManagedVirtualSink {
 
 impl Drop for ManagedVirtualSink {
     fn drop(&mut self) {
-        let Some(index) = *self
+        if self
             .module_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-        else {
+            .is_none()
+        {
             return;
-        };
+        }
+        let _ = request_sink_cleanup(&self.name, &self.owner_token);
         let _cleanup_guard = virtual_sink_cleanup_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cleaned = PulseClient::connect()
-            .and_then(|mut client| unload_owned_virtual_sink(&mut client, &self.name, index))
-            .is_ok();
-        if !cleaned {
-            remember_virtual_sink_cleanup(&self.name, index);
+        if let Ok(mut client) = PulseClient::connect() {
+            retry_virtual_sink_cleanups_with_client(&mut client, Some(&self.name));
         }
     }
 }
 
-#[derive(Clone, Debug)]
-struct PendingVirtualSinkCleanup {
-    name: String,
-    module_index: u32,
-}
-
-static PENDING_VIRTUAL_SINK_CLEANUPS: OnceLock<
-    Mutex<BTreeMap<(String, u32), PendingVirtualSinkCleanup>>,
-> = OnceLock::new();
 static VIRTUAL_SINK_CLEANUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn pending_virtual_sink_cleanups()
--> &'static Mutex<BTreeMap<(String, u32), PendingVirtualSinkCleanup>> {
-    PENDING_VIRTUAL_SINK_CLEANUPS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
 
 fn virtual_sink_cleanup_lock() -> &'static Mutex<()> {
     VIRTUAL_SINK_CLEANUP_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn remember_virtual_sink_cleanup(name: &str, module_index: u32) {
-    let mut pending = pending_virtual_sink_cleanups()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    pending
-        .entry((name.to_owned(), module_index))
-        .or_insert_with(|| PendingVirtualSinkCleanup {
-            name: name.to_owned(),
-            module_index,
-        });
+fn cleanup_journal_lock() -> &'static Mutex<()> {
+    CLEANUP_JOURNAL_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn read_cleanup_state() -> AudioResult<CleanupState> {
+    let _guard = cleanup_journal_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let journal = CLEANUP_JOURNAL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    journal
+        .as_ref()
+        .ok_or("audio_cleanup_journal_unavailable")?
+        .read()
+}
+
+fn update_cleanup_state(update: impl FnOnce(&mut CleanupState)) -> AudioResult<()> {
+    let _guard = cleanup_journal_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let journal = CLEANUP_JOURNAL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let journal = journal
+        .as_ref()
+        .ok_or("audio_cleanup_journal_unavailable")?;
+    let mut state = journal.read()?;
+    update(&mut state);
+    journal.write(&state)
+}
+
+fn persist_sink_intent(
+    name: &str,
+    owner_token: &str,
+    module_index: Option<u32>,
+    lease_active: bool,
+    cleanup_requested: bool,
+) -> AudioResult<()> {
+    update_cleanup_state(|state| {
+        state.sinks.insert(
+            name.to_owned(),
+            SinkIntent {
+                owner_token: owner_token.to_owned(),
+                module_index,
+                lease_active,
+                cleanup_requested,
+                unload_submitted: false,
+                unload_confirmed: false,
+            },
+        );
+    })
+}
+
+fn request_sink_cleanup(name: &str, owner_token: &str) -> AudioResult<()> {
+    update_cleanup_state(|state| {
+        if let Some(intent) = state
+            .sinks
+            .get_mut(name)
+            .filter(|intent| intent.owner_token == owner_token)
+        {
+            intent.lease_active = false;
+            intent.cleanup_requested = true;
+        }
+    })
+}
+
+fn mark_sink_unload_submitted(name: &str, owner_token: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(intent) = state
+            .sinks
+            .get_mut(name)
+            .filter(|intent| intent.owner_token == owner_token)
+        {
+            found = true;
+            intent.unload_submitted = true;
+            intent.unload_confirmed = false;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn mark_sink_unload_confirmed(name: &str, owner_token: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(intent) = state
+            .sinks
+            .get_mut(name)
+            .filter(|intent| intent.owner_token == owner_token)
+        {
+            found = true;
+            intent.unload_confirmed = true;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn remove_sink_intent(name: &str, owner_token: &str) -> AudioResult<()> {
+    update_cleanup_state(|state| {
+        if state
+            .sinks
+            .get(name)
+            .is_some_and(|intent| intent.owner_token == owner_token)
+        {
+            state.sinks.remove(name);
+        }
+    })
+}
+
+fn persist_route_intent(target_sink: &str, original_sink: &str) -> AudioResult<()> {
+    update_cleanup_state(|state| {
+        state.route = Some(RouteIntent {
+            target_sink: target_sink.to_owned(),
+            original_sink: original_sink.to_owned(),
+            assignment_confirmed: false,
+            restoration_submitted: false,
+            restoration_confirmed: false,
+        });
+    })
+}
+
+fn confirm_route_intent(target_sink: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(route) = state
+            .route
+            .as_mut()
+            .filter(|route| route.target_sink == target_sink)
+        {
+            found = true;
+            route.assignment_confirmed = true;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn mark_route_restoration_submitted(target_sink: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(route) = state
+            .route
+            .as_mut()
+            .filter(|route| route.target_sink == target_sink)
+        {
+            found = true;
+            route.restoration_submitted = true;
+            route.restoration_confirmed = false;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn mark_route_restoration_confirmed(target_sink: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(route) = state
+            .route
+            .as_mut()
+            .filter(|route| route.target_sink == target_sink)
+        {
+            found = true;
+            route.restoration_confirmed = true;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn clear_route_intent(target_sink: &str) -> AudioResult<()> {
+    let mut conflict = false;
+    update_cleanup_state(|state| match state.route.as_ref() {
+        Some(route) if route.target_sink == target_sink => state.route = None,
+        Some(_) => conflict = true,
+        None => (),
+    })?;
+    if conflict {
+        Err("audio_cleanup_journal_conflict")
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 fn owns_virtual_sink_module(sinks: &[Sink], sink_name: &str, module_index: u32) -> bool {
     sinks
         .iter()
         .any(|sink| sink.endpoint.id == sink_name && sink.owner_module == module_index)
 }
 
-fn unload_owned_virtual_sink(
-    client: &mut PulseClient,
-    sink_name: &str,
-    module_index: u32,
-) -> AudioResult<()> {
-    if !owns_virtual_sink_module(&client.sinks()?, sink_name, module_index) {
-        return Ok(());
-    }
-    client.unload_module(module_index)
-}
-
 fn retry_virtual_sink_cleanups_with_client(client: &mut PulseClient, name_filter: Option<&str>) {
-    let pending = pending_virtual_sink_cleanups()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-        .filter(|cleanup| name_filter.is_none_or(|name| cleanup.name == name))
-        .cloned()
+    let Ok(state) = read_cleanup_state() else {
+        return;
+    };
+    let pending = state
+        .sinks
+        .into_iter()
+        .filter(|(_, intent)| sink_cleanup_requested(intent))
+        .filter(|(name, _)| name_filter.is_none_or(|filter| name == filter))
         .collect::<Vec<_>>();
-    for cleanup in pending {
-        if unload_owned_virtual_sink(client, &cleanup.name, cleanup.module_index).is_ok() {
-            pending_virtual_sink_cleanups()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&(cleanup.name, cleanup.module_index));
+    if pending.is_empty() {
+        return;
+    }
+    let cleanup_slot =
+        NEXT_SINK_CLEANUP_SLOT.fetch_add(1, Ordering::Relaxed) as usize % pending.len();
+    let pending = pending.into_iter().skip(cleanup_slot).take(1);
+    let Ok(sinks) = client.sinks() else {
+        return;
+    };
+    for (name, intent) in pending {
+        let sink = sinks.iter().find(|sink| sink.endpoint.id == name);
+        let observation = sink.map_or(SinkObservation::Absent, |sink| {
+            match sink.managed_token.as_deref() {
+                Some(token) => SinkObservation::Owned {
+                    owner_token: token,
+                    module_index: sink.owner_module,
+                },
+                None => SinkObservation::Foreign,
+            }
+        });
+        match sink_cleanup_action(&intent, observation) {
+            SinkCleanupAction::KeepTombstone => continue,
+            SinkCleanupAction::ClearConfirmedAbsent => {
+                let _ = remove_sink_intent(&name, &intent.owner_token);
+                continue;
+            }
+            SinkCleanupAction::Unload(module_index) => {
+                if intent.module_index.is_none()
+                    && persist_sink_intent(
+                        &name,
+                        &intent.owner_token,
+                        Some(module_index),
+                        false,
+                        true,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                if mark_sink_unload_submitted(&name, &intent.owner_token).is_err() {
+                    continue;
+                }
+                if client.unload_module(module_index).is_err() {
+                    continue;
+                }
+                if mark_sink_unload_confirmed(&name, &intent.owner_token).is_err() {
+                    continue;
+                }
+            }
+        }
+        let Ok(after_unload) = client.sinks() else {
+            continue;
+        };
+        if !after_unload.iter().any(|remaining| {
+            remaining.endpoint.id == name
+                && remaining.managed_token.as_deref() == Some(intent.owner_token.as_str())
+        }) {
+            let _ = remove_sink_intent(&name, &intent.owner_token);
         }
     }
 }
@@ -1004,10 +1251,7 @@ fn retry_virtual_sink_cleanups() {
 }
 
 pub fn virtual_sink_cleanup_pending() -> bool {
-    !pending_virtual_sink_cleanups()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_empty()
+    read_cleanup_state().is_ok_and(|state| state.sinks.values().any(sink_cleanup_requested))
 }
 
 static VIRTUAL_SINKS: OnceLock<Mutex<BTreeMap<String, Weak<ManagedVirtualSink>>>> = OnceLock::new();
@@ -1017,17 +1261,18 @@ fn managed_virtual_sink(
     channels: u32,
 ) -> AudioResult<Arc<ManagedVirtualSink>> {
     let layout = null_sink_layout(channels)?;
-    let name = format!("amaterasu_stream_{}_{}ch", std::process::id(), channels);
+    let sequence = NEXT_MANAGED_SINK.fetch_add(1, Ordering::Relaxed);
+    let token = format!("{}-{sequence}", std::process::id());
+    let name = format!(
+        "amaterasu_stream_{}_{}ch_{sequence}",
+        std::process::id(),
+        channels
+    );
     let cleanup_guard = virtual_sink_cleanup_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     retry_virtual_sink_cleanups_with_client(client, Some(&name));
-    if pending_virtual_sink_cleanups()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .keys()
-        .any(|(pending_name, _)| pending_name == &name)
-    {
+    if read_cleanup_state()?.sinks.contains_key(&name) {
         return Err("virtual_sink_cleanup_pending");
     }
     let registry = VIRTUAL_SINKS.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -1042,17 +1287,26 @@ fn managed_virtual_sink(
         return Ok(existing);
     }
 
-    let existing_sink = client
-        .sinks()?
-        .into_iter()
-        .find(|sink| sink.endpoint.id == name);
-    let module_index = if existing_sink.is_some() {
-        None
-    } else {
-        Some(client.load_null_sink(&name, channels)?)
+    if client.sinks()?.iter().any(|sink| sink.endpoint.id == name) {
+        return Err("virtual_sink_name_conflict");
+    }
+    persist_sink_intent(&name, &token, None, false, true)?;
+    let index = match client.load_null_sink(&name, channels, &token) {
+        Ok(index) => index,
+        Err(error) => {
+            retry_virtual_sink_cleanups_with_client(client, Some(&name));
+            return Err(error);
+        }
     };
+    if let Err(error) = persist_sink_intent(&name, &token, Some(index), true, false) {
+        let _ = request_sink_cleanup(&name, &token);
+        retry_virtual_sink_cleanups_with_client(client, Some(&name));
+        return Err(error);
+    }
+    let module_index = Some(index);
     let lease = Arc::new(ManagedVirtualSink {
         name: name.clone(),
+        owner_token: token,
         channels,
         module_index: Mutex::new(module_index),
     });
@@ -1069,6 +1323,7 @@ struct ActiveRoute {
     endpoint: String,
     original: Option<String>,
     references: usize,
+    assignment_confirmed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1098,28 +1353,6 @@ fn route_plan(
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum RestoreAction {
-    WaitForDefault,
-    Release,
-    Restore(String),
-}
-
-fn restore_action(
-    endpoint: &str,
-    original: Option<&str>,
-    current_default: Option<&str>,
-) -> RestoreAction {
-    match current_default {
-        None => RestoreAction::WaitForDefault,
-        Some(current) if current != endpoint => RestoreAction::Release,
-        Some(_) => match original {
-            Some(original) if original != endpoint => RestoreAction::Restore(original.to_owned()),
-            _ => RestoreAction::Release,
-        },
-    }
-}
-
 #[derive(Default, Debug)]
 struct RouteRegistry {
     active: Option<ActiveRoute>,
@@ -1138,20 +1371,8 @@ fn record_pending_route(registry: &mut RouteRegistry, endpoint: &str, original: 
         endpoint: endpoint.to_owned(),
         original,
         references: 0,
+        assignment_confirmed: false,
     });
-}
-
-fn finish_route_restore(
-    registry: &mut RouteRegistry,
-    action: &RestoreAction,
-    restoration_succeeded: bool,
-) {
-    match action {
-        RestoreAction::WaitForDefault => {}
-        RestoreAction::Release => registry.active = None,
-        RestoreAction::Restore(_) if restoration_succeeded => registry.active = None,
-        RestoreAction::Restore(_) => {}
-    }
 }
 
 #[derive(Debug)]
@@ -1188,6 +1409,13 @@ fn acquire_route(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     retry_route_restore(client, &mut registry);
 
+    if registry.active.is_none() {
+        let _ = reconcile_persisted_route(client);
+        if read_cleanup_state()?.route.is_some() {
+            return Err("audio_route_restore_pending");
+        }
+    }
+
     if let Some(active) = &mut registry.active {
         if active.references == 0 {
             return Err("audio_route_restore_failed");
@@ -1212,14 +1440,28 @@ fn acquire_route(
         return Ok(None);
     }
     if needs_assignment {
-        // Record ownership before asking PulseAudio to change the global route.
-        // The request may apply even if its callback or the verification query
-        // fails; zero references keeps that state visible to the retry worker.
+        let original_sink = original.as_deref().ok_or("audio_route_failed")?;
+        if client.default_sink()?.as_deref() != Some(original_sink) {
+            return Err("audio_route_changed");
+        }
+        // Durable intent precedes the global route mutation. If the callback
+        // is lost, a restart can check the target before attempting restore.
+        persist_route_intent(endpoint, original_sink)?;
         record_pending_route(&mut registry, endpoint, original);
-        if client.set_default_sink(endpoint).is_err()
-            || !client
-                .default_sink()
-                .is_ok_and(|current| current.as_deref() == Some(endpoint))
+        if client.set_default_sink(endpoint).is_err() {
+            retry_route_restore(client, &mut registry);
+            return Err("audio_route_failed");
+        }
+        if confirm_route_intent(endpoint).is_err() {
+            retry_route_restore(client, &mut registry);
+            return Err("audio_cleanup_journal_unavailable");
+        }
+        if let Some(active) = registry.active.as_mut() {
+            active.assignment_confirmed = true;
+        }
+        if !client
+            .default_sink()
+            .is_ok_and(|current| current.as_deref() == Some(endpoint))
         {
             retry_route_restore(client, &mut registry);
             return Err("audio_route_failed");
@@ -1235,6 +1477,7 @@ fn acquire_route(
             endpoint: endpoint.to_owned(),
             original,
             references: 1,
+            assignment_confirmed: true,
         });
     }
     Ok(Some(Arc::new(RouteLease {
@@ -1271,17 +1514,76 @@ fn retry_route_restore(client: &mut PulseClient, registry: &mut RouteRegistry) {
     else {
         return;
     };
-    let endpoint = active.endpoint.clone();
-    let original = active.original.clone();
-    let Ok(current_default) = client.default_sink() else {
-        return;
+    let intent = match read_cleanup_state().ok().and_then(|state| state.route) {
+        Some(intent) => intent,
+        None => {
+            let Some(original_sink) = active.original.clone() else {
+                registry.active = None;
+                return;
+            };
+            RouteIntent {
+                target_sink: active.endpoint.clone(),
+                original_sink,
+                assignment_confirmed: active.assignment_confirmed,
+                restoration_submitted: false,
+                restoration_confirmed: false,
+            }
+        }
     };
-    let action = restore_action(&endpoint, original.as_deref(), current_default.as_deref());
-    let restoration_succeeded = match &action {
-        RestoreAction::Restore(original) => client.set_default_sink(original).is_ok(),
-        RestoreAction::WaitForDefault | RestoreAction::Release => false,
+    if reconcile_route_intent(client, &intent) {
+        registry.active = None;
+    }
+}
+
+fn reconcile_route_intent(client: &mut PulseClient, intent: &RouteIntent) -> bool {
+    let Ok(Some(current_default)) = client.default_sink() else {
+        return false;
     };
-    finish_route_restore(registry, &action, restoration_succeeded);
+    match route_restore_action(intent, Some(&current_default)) {
+        RouteRestoreAction::Wait | RouteRestoreAction::KeepTombstone => false,
+        RouteRestoreAction::Release => clear_route_intent(&intent.target_sink).is_ok(),
+        RouteRestoreAction::RestoreOriginal => {
+            // Re-read immediately before the write. PulseAudio has no compare-
+            // and-set route API, so this prevents overwriting any user change
+            // already visible to us at restoration time.
+            let Ok(Some(current_default)) = client.default_sink() else {
+                return false;
+            };
+            match route_restore_action(intent, Some(&current_default)) {
+                RouteRestoreAction::Release => clear_route_intent(&intent.target_sink).is_ok(),
+                RouteRestoreAction::KeepTombstone | RouteRestoreAction::Wait => false,
+                RouteRestoreAction::RestoreOriginal => {
+                    if mark_route_restoration_submitted(&intent.target_sink).is_err() {
+                        return false;
+                    }
+                    if client.set_default_sink(&intent.original_sink).is_err() {
+                        return false;
+                    }
+                    if mark_route_restoration_confirmed(&intent.target_sink).is_err() {
+                        return false;
+                    }
+                    if client
+                        .default_sink()
+                        .is_ok_and(|current| current.as_deref() == Some(&intent.original_sink))
+                    {
+                        clear_route_intent(&intent.target_sink).is_ok()
+                    } else {
+                        false
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn reconcile_persisted_route(client: &mut PulseClient) -> bool {
+    let Ok(state) = read_cleanup_state() else {
+        return false;
+    };
+    let Some(intent) = state.route else {
+        return true;
+    };
+    reconcile_route_intent(client, &intent)
 }
 
 fn resolve_virtual<'a>(sinks: &'a [Sink], selector: &str) -> Option<&'a Sink> {
@@ -1325,13 +1627,25 @@ pub fn route_restore_pending() -> bool {
     let mut registry = registry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !registry.restore_pending() {
+    if registry
+        .active
+        .as_ref()
+        .is_some_and(|active| active.references > 0)
+    {
+        return false;
+    }
+    let persisted_route_pending = read_cleanup_state().is_ok_and(|state| state.route.is_some());
+    if !registry.restore_pending() && !persisted_route_pending {
         return false;
     }
     if let Ok(mut client) = PulseClient::connect() {
-        retry_route_restore(&mut client, &mut registry);
+        if registry.restore_pending() {
+            retry_route_restore(&mut client, &mut registry);
+        } else {
+            let _ = reconcile_persisted_route(&mut client);
+        }
     }
-    registry.restore_pending()
+    registry.restore_pending() || read_cleanup_state().is_ok_and(|state| state.route.is_some())
 }
 
 pub struct Capture {
@@ -1644,14 +1958,32 @@ struct RestoreWorker {
 
 static RESTORE_WORKER: OnceLock<Mutex<Option<RestoreWorker>>> = OnceLock::new();
 
-pub fn startup() {
+pub fn startup(state_root: &Path) -> AudioResult<()> {
     let workers = RESTORE_WORKER.get_or_init(|| Mutex::new(None));
     let mut workers = workers
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(worker) = workers.as_mut() {
         worker.owners = worker.owners.saturating_add(1);
-        return;
+        return Ok(());
+    }
+
+    let journal = CleanupJournal::open(state_root)?;
+    let mut state = journal.read()?;
+    // No capture leases from the previous module instance can survive this
+    // process start. Convert its active sink ownership into cleanup work.
+    deactivate_prior_process_sinks(&mut state);
+    journal.write(&state)?;
+    {
+        let mut configured = CLEANUP_JOURNAL
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *configured = Some(journal);
+    }
+    if let Ok(mut client) = PulseClient::connect() {
+        let _ = reconcile_persisted_route(&mut client);
+        retry_virtual_sink_cleanups_with_client(&mut client, None);
     }
     let (stop, stopped) = mpsc::channel();
     let Ok(worker_thread) = thread::Builder::new()
@@ -1668,33 +2000,43 @@ pub fn startup() {
             }
         })
     else {
-        return;
+        return Err("audio_restore_worker_unavailable");
     };
     *workers = Some(RestoreWorker {
         stop,
         thread: worker_thread,
         owners: 1,
     });
+    Ok(())
 }
 
 pub fn shutdown() {
-    let worker = RESTORE_WORKER.get().and_then(|workers| {
+    let (worker, final_shutdown) = RESTORE_WORKER.get().map_or((None, false), |workers| {
         let mut workers = workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let worker = workers.as_mut()?;
+        let Some(worker) = workers.as_mut() else {
+            return (None, false);
+        };
         if worker.owners > 1 {
             worker.owners -= 1;
-            None
+            (None, false)
         } else {
-            workers.take()
+            (workers.take(), true)
         }
     });
     if let Some(worker) = worker {
         let _ = worker.stop.send(());
         let _ = worker.thread.join();
     }
-    retry_virtual_sink_cleanups();
+    if final_shutdown {
+        // One final bounded pass. Failed or indeterminate operations remain in
+        // the durable journal for the next worker start.
+        if let Ok(mut client) = PulseClient::connect() {
+            let _ = reconcile_persisted_route(&mut client);
+            retry_virtual_sink_cleanups_with_client(&mut client, None);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1849,6 +2191,7 @@ mod tests {
             monitor_source: "render.device.monitor".into(),
             channel_positions: STEREO_POSITIONS.to_vec(),
             owner_module: PA_INVALID_INDEX,
+            managed_token: None,
         };
         let sinks = [sink];
         assert!(resolve_regular(&sinks, "render.device", None).is_some());
@@ -1913,6 +2256,7 @@ mod tests {
             monitor_source: "amaterasu_stream_42_2ch.monitor".into(),
             channel_positions: STEREO_POSITIONS.to_vec(),
             owner_module: 19,
+            managed_token: Some("test-owner".into()),
         };
 
         assert!(owns_virtual_sink_module(
@@ -1959,40 +2303,19 @@ mod tests {
             route_plan("sink", Some("sink"), false, false, true),
             RoutePlan::Track
         );
-        assert_eq!(
-            restore_action("sink", Some("before"), Some("sink")),
-            RestoreAction::Restore("before".into())
-        );
-        assert_eq!(
-            restore_action("sink", Some("before"), Some("user-choice")),
-            RestoreAction::Release
-        );
-        assert_eq!(
-            restore_action("sink", Some("before"), None),
-            RestoreAction::WaitForDefault
-        );
     }
 
     #[test]
-    fn failed_route_verification_and_restore_keep_owned_cleanup_pending() {
+    fn periodic_route_reconciler_does_not_release_a_live_stream_route() {
         let mut registry = RouteRegistry::default();
-        record_pending_route(&mut registry, "selected", Some("original".into()));
-        assert!(registry.restore_pending());
-
-        // A failed verification query cannot distinguish a changed route from
-        // an unavailable server, so retain ownership for the next retry.
-        let unavailable = restore_action("selected", Some("original"), None);
-        assert_eq!(unavailable, RestoreAction::WaitForDefault);
-        finish_route_restore(&mut registry, &unavailable, false);
-        assert!(registry.restore_pending());
-
-        let restore = restore_action("selected", Some("original"), Some("selected"));
-        assert_eq!(restore, RestoreAction::Restore("original".into()));
-        finish_route_restore(&mut registry, &restore, false);
-        assert!(registry.restore_pending());
-
-        finish_route_restore(&mut registry, &restore, true);
+        registry.active = Some(ActiveRoute {
+            endpoint: "selected".into(),
+            original: Some("original".into()),
+            references: 1,
+            assignment_confirmed: true,
+        });
         assert!(!registry.restore_pending());
+        assert_eq!(registry.active.as_ref().unwrap().references, 1);
     }
 
     #[test]
@@ -2001,7 +2324,7 @@ mod tests {
         let mut client = PulseClient::connect().expect("user Pulse server is available");
         let name = format!("amaterasu_test_{}_2ch", std::process::id());
         let module_index = client
-            .load_null_sink(&name, 2)
+            .load_null_sink(&name, 2, "ignored-test-owner")
             .expect("test null sink loads");
         let result = (|| {
             let mut capture = Capture::open(&name, None, None, None, true, true)
