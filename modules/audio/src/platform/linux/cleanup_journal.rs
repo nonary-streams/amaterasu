@@ -19,6 +19,10 @@ const JOURNAL_VERSION: u64 = 1;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct CleanupState {
     pub(super) sinks: BTreeMap<String, SinkIntent>,
@@ -61,7 +65,13 @@ impl CleanupJournal {
         }
         let root_metadata =
             fs::symlink_metadata(state_root).map_err(|_| "audio_cleanup_state_root_unavailable")?;
-        if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        // SAFETY: geteuid has no pointer arguments or mutable process state.
+        let current_uid = unsafe { geteuid() };
+        if !root_metadata.is_dir()
+            || root_metadata.file_type().is_symlink()
+            || root_metadata.uid() != current_uid
+            || root_metadata.mode() & 0o077 != 0
+        {
             return Err("audio_cleanup_state_root_invalid");
         }
 
@@ -330,6 +340,18 @@ mod tests {
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    #[test]
+    fn journal_refuses_a_host_root_visible_to_other_users() {
+        let root = temporary_root("public-root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            CleanupJournal::open(&root),
+            Err("audio_cleanup_state_root_invalid")
+        ));
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
