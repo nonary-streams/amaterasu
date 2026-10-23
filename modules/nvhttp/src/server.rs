@@ -368,6 +368,13 @@ fn bind_listener(address: SocketAddr, name: &str) -> Result<TcpListener, String>
     let domain = Domain::for_address(address);
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
         .map_err(|_| format!("{name} socket unavailable"))?;
+    // Unix can keep recently closed loopback connections in TIME_WAIT. Permit
+    // the same Amaterasu listener to restart on its configured port; this does
+    // not grant SO_REUSEPORT semantics or displace another live service.
+    #[cfg(unix)]
+    socket
+        .set_reuse_address(true)
+        .map_err(|_| format!("{name} address reuse configuration failed"))?;
     if address.is_ipv6() {
         socket
             .set_only_v6(true)
@@ -738,6 +745,19 @@ mod tests {
     use std::sync::Mutex;
 
     static FIXED_PORT_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_loopback_listener_can_restart_without_sharing_a_live_port() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), "test").unwrap();
+        let address = listener.local_addr().unwrap();
+        assert!(bind_listener(address, "occupied").is_err());
+        drop(listener);
+
+        let restarted = bind_listener(address, "restart").unwrap();
+        assert_eq!(restarted.local_addr().unwrap(), address);
+    }
+
     #[test]
     fn strict_http_framing_rejects_smuggling_and_waits_for_complete_bodies() {
         assert!(
