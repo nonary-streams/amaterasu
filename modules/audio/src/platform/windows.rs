@@ -815,8 +815,9 @@ impl MixFormat {
                     return Err("unsupported_format");
                 }
                 let extended = self.0.cast::<WAVEFORMATEXTENSIBLE>().read_unaligned();
-                if extended.SubFormat != KSDATAFORMAT_SUBTYPE_PCM
-                    && extended.SubFormat != KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+                let subformat = extended.SubFormat;
+                if subformat != KSDATAFORMAT_SUBTYPE_PCM
+                    && subformat != KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
                 {
                     return Err("unsupported_format");
                 }
@@ -1803,7 +1804,7 @@ mod tests {
     #[test]
     fn ordinary_loopback_infers_default_layout_from_legacy_multichannel_mix() {
         let mut mix = legacy_endpoint_mix(48_000, 6, 24);
-        let descriptor = std::mem::ManuallyDrop::new(MixFormat((&mut mix as *mut _).cast()));
+        let descriptor = std::mem::ManuallyDrop::new(MixFormat(&mut mix as *mut WAVEFORMATEX));
         let (format, target) = loopback_capture_format(&descriptor, None).unwrap();
         assert_eq!(
             (
@@ -1828,7 +1829,7 @@ mod tests {
     fn ordinary_loopback_rejects_unrecognized_legacy_format_tag() {
         let mut mix = legacy_endpoint_mix(48_000, 6, 24);
         mix.wFormatTag = 2;
-        let descriptor = std::mem::ManuallyDrop::new(MixFormat((&mut mix as *mut _).cast()));
+        let descriptor = std::mem::ManuallyDrop::new(MixFormat(&mut mix as *mut WAVEFORMATEX));
         assert!(matches!(
             loopback_capture_format(&descriptor, None),
             Err("unsupported_format")
