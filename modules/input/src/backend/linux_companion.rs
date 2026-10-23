@@ -8,7 +8,6 @@ use crate::model::{
 use amaterasu_input_companion::{InputEvent, LinuxInputClient};
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Instant;
 
 pub struct LinuxCompanionBackend {
     socket_path: String,
