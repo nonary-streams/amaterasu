@@ -157,8 +157,8 @@ impl Drop for LinuxInputService {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(join) = self.join.take() {
-            if join.join().is_err() {
-                eprintln!("input companion listener thread panicked");
+            if let Some(diagnostic) = listener_exit_diagnostic(join.join()) {
+                eprintln!("{diagnostic}");
             }
         }
         if let Ok(metadata) = std::fs::symlink_metadata(&self.socket_path)
@@ -167,6 +167,14 @@ impl Drop for LinuxInputService {
         {
             let _ = std::fs::remove_file(&self.socket_path);
         }
+    }
+}
+
+fn listener_exit_diagnostic(result: std::thread::Result<InputResult<()>>) -> Option<String> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!("input companion listener ended: {error:?}")),
+        Err(_) => Some("input companion listener thread panicked".into()),
     }
 }
 
@@ -886,6 +894,15 @@ fn button_code(button: MouseButton) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_cleanup_failure_is_reported_on_join() {
+        assert_eq!(listener_exit_diagnostic(Ok(Ok(()))), None);
+        assert_eq!(
+            listener_exit_diagnostic(Ok(Err(InputError::Device))).as_deref(),
+            Some("input companion listener ended: Device")
+        );
+    }
 
     #[test]
     fn peer_identity_comes_from_socket_credentials_and_proc_starttime() {

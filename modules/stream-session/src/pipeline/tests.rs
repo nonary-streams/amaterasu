@@ -741,7 +741,7 @@ fn pipewire_portal_source_reaches_video_open_with_its_capture_lease() {
     let record = &host.pipeline.records[&id];
     assert!(matches!(
         record.start.as_ref().unwrap().capture_provider,
-        CaptureProvider::PipeWire
+        crate::model::CaptureProvider::PipeWire
     ));
     let video_open = host
         .broker
