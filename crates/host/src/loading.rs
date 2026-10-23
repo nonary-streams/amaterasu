@@ -11,6 +11,8 @@ use std::mem::MaybeUninit;
 use std::path::Path;
 
 pub(crate) mod management_tls;
+#[cfg(test)]
+mod teardown_tests;
 
 const HOST_CONFIGURATION_COMPONENT: &str = "amaterasu.host-configuration";
 const STEAM_COMPONENT: &str = "amaterasu.steam";
@@ -84,23 +86,41 @@ impl LoadedComponents {
         }
         let configuration =
             serde_json::to_vec(&runtime_config).map_err(|error| error.to_string())?;
-        let mut runtime =
+        let runtime =
             RuntimeLibrary::load(&directory.join(&runtime_component.file), &configuration)?;
-        progress(1)?;
-        let mut modules = Vec::new();
+        let components = ordered_components(&package.manifest.components)?;
+        Self::load_features(
+            runtime,
+            components
+                .into_iter()
+                .filter(|component| !component.runtime),
+            |runtime, component| {
+                let endpoint = runtime.endpoint(&component.id)?;
+                FeatureLibrary::load(&directory.join(&component.file), &component.id, &endpoint)
+            },
+            progress,
+        )
+    }
 
-        for (index, component) in ordered_components(&package.manifest.components)?
-            .into_iter()
-            .filter(|component| !component.runtime)
-            .enumerate()
-        {
-            let endpoint = runtime.endpoint(&component.id)?;
-            let module =
-                FeatureLibrary::load(&directory.join(&component.file), &component.id, &endpoint)?;
-            modules.push(module);
+    fn load_features<Component>(
+        runtime: RuntimeLibrary,
+        components: impl IntoIterator<Item = Component>,
+        mut load: impl FnMut(&mut RuntimeLibrary, Component) -> PackageResult<FeatureLibrary>,
+        progress: &mut dyn FnMut(usize) -> PackageResult<()>,
+    ) -> PackageResult<Self> {
+        // Own partial initialization immediately so every error path stops consumers
+        // before their native providers, including progress and endpoint failures.
+        let mut loaded = Self {
+            modules: Vec::new(),
+            runtime,
+        };
+        progress(1)?;
+        for (index, component) in components.into_iter().enumerate() {
+            let module = load(&mut loaded.runtime, component)?;
+            loaded.modules.push(module);
             progress(index + 2)?;
         }
-        Ok(Self { modules, runtime })
+        Ok(loaded)
     }
 
     pub fn tick(&mut self) -> PackageResult<()> {
