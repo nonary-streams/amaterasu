@@ -850,7 +850,10 @@ impl Broker {
                 reply
             }
             "amaterasu.audio/1" => {
-                let channels = allocation.request["channels"].as_u64().unwrap_or(2);
+                let channels = allocation.request["capture_format"]["channels"]
+                    .as_u64()
+                    .or_else(|| allocation.request["channels"].as_u64())
+                    .unwrap_or(2);
                 let mask = match channels {
                     6 => 0x3f,
                     8 => 0x63f,

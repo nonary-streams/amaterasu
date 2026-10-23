@@ -23,6 +23,7 @@ mod tests {
             endpoint: "render.configured".into(),
             virtual_sink: virtual_sink.map(str::to_owned),
             channels: Some(2),
+            capture_format: None,
             host_audio_enabled: true,
             operation_id: Some("open-operation".into()),
             capture_sink_without_routing,
@@ -35,6 +36,7 @@ mod tests {
             endpoint,
             virtual_sink,
             channels,
+            capture_format,
             host_audio_enabled,
             operation_id,
             capture_sink_without_routing,
@@ -46,6 +48,7 @@ mod tests {
         assert_eq!(endpoint, "render.configured");
         assert_eq!(virtual_sink.as_deref(), Some("Studio Virtual"));
         assert_eq!(channels, Some(2));
+        assert_eq!(capture_format, None);
         assert!(host_audio_enabled);
         assert_eq!(operation_id.as_deref(), Some("open-operation"));
         assert!(!capture_sink_without_routing);
@@ -72,6 +75,7 @@ mod tests {
             endpoint,
             virtual_sink,
             channels,
+            capture_format,
             host_audio_enabled,
             operation_id,
             capture_sink_without_routing,
@@ -83,6 +87,7 @@ mod tests {
         assert_eq!(endpoint, "render.configured");
         assert_eq!(virtual_sink, None);
         assert_eq!(channels, Some(2));
+        assert_eq!(capture_format, None);
         assert!(host_audio_enabled);
         assert_eq!(operation_id.as_deref(), Some("open-operation"));
         assert!(capture_sink_without_routing);

@@ -1,6 +1,6 @@
 //! Worker-owned COM capture feeds a bounded queue; no COM interface is Send.
 use crate::{
-    model::{AudioResult, Endpoint, Format, Health, Packet},
+    model::{AudioResult, Endpoint, Format, Health, Packet, PcmCaptureFormat},
     packet::Continuity,
     platform,
 };
@@ -66,6 +66,7 @@ pub trait Backend: Send {
         endpoint: &str,
         virtual_sink: Option<&str>,
         channels: Option<u32>,
+        capture_format: Option<PcmCaptureFormat>,
         host_audio_enabled: bool,
         capture_sink_without_routing: bool,
     ) -> AudioResult<Opened>;
@@ -82,6 +83,7 @@ impl Backend for NativeBackend {
         endpoint: &str,
         virtual_sink: Option<&str>,
         channels: Option<u32>,
+        capture_format: Option<PcmCaptureFormat>,
         host_audio_enabled: bool,
         capture_sink_without_routing: bool,
     ) -> AudioResult<Opened> {
@@ -89,6 +91,7 @@ impl Backend for NativeBackend {
             endpoint.to_owned(),
             virtual_sink.map(str::to_owned),
             channels,
+            capture_format,
             host_audio_enabled,
             capture_sink_without_routing,
         )?;
@@ -112,6 +115,7 @@ impl Worker {
         endpoint: String,
         virtual_sink: Option<String>,
         channels: Option<u32>,
+        capture_format: Option<PcmCaptureFormat>,
         host_audio_enabled: bool,
         capture_sink_without_routing: bool,
     ) -> AudioResult<(Self, String, Format)> {
@@ -128,6 +132,7 @@ impl Worker {
                     &endpoint,
                     virtual_sink.as_deref(),
                     channels,
+                    capture_format,
                     host_audio_enabled,
                     capture_sink_without_routing,
                 ) {

@@ -103,12 +103,42 @@ impl ContinuousAudio {
     }
 }
 
+/// Optional PCM output requested from ordinary endpoint loopback. When absent,
+/// capture retains the endpoint's supported channel layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcmCaptureFormat {
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub sample_format: PcmSampleFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PcmSampleFormat {
+    F32,
+    I16,
+}
+
+impl PcmCaptureFormat {
+    pub fn validate(self) -> AudioResult<()> {
+        if self.sample_rate != 48_000
+            || !matches!(self.channels, 2 | 6 | 8)
+            || self.sample_format != PcmSampleFormat::F32
+        {
+            return Err("unsupported_capture_format");
+        }
+        Ok(())
+    }
+}
+
 pub enum Operation {
     Enumerate,
     Open {
         endpoint: String,
         virtual_sink: Option<String>,
         channels: Option<u32>,
+        capture_format: Option<PcmCaptureFormat>,
         host_audio_enabled: bool,
         operation_id: Option<String>,
         capture_sink_without_routing: bool,
@@ -117,6 +147,7 @@ pub enum Operation {
         endpoint: String,
         virtual_sink: Option<String>,
         channels: Option<u32>,
+        capture_format: Option<PcmCaptureFormat>,
         host_audio_enabled: bool,
         operation_id: Option<String>,
         capture_sink_without_routing: bool,
@@ -143,6 +174,8 @@ enum OperationInput {
         virtual_sink: Option<String>,
         #[serde(default)]
         channels: Option<u32>,
+        #[serde(default)]
+        capture_format: Option<PcmCaptureFormat>,
         #[serde(default)]
         host_audio_enabled: bool,
         #[serde(default)]
@@ -175,6 +208,7 @@ impl<'de> Deserialize<'de> for Operation {
                 endpoint,
                 virtual_sink,
                 channels,
+                capture_format,
                 host_audio_enabled,
                 operation_id,
                 capture_sink_without_routing,
@@ -184,6 +218,7 @@ impl<'de> Deserialize<'de> for Operation {
                     endpoint,
                     virtual_sink,
                     channels,
+                    capture_format,
                     host_audio_enabled,
                     operation_id,
                     capture_sink_without_routing,
@@ -193,6 +228,7 @@ impl<'de> Deserialize<'de> for Operation {
                     endpoint,
                     virtual_sink,
                     channels,
+                    capture_format,
                     host_audio_enabled,
                     operation_id,
                     capture_sink_without_routing,

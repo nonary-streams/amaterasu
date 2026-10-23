@@ -356,6 +356,13 @@ impl Record {
                     "virtual_sink":start.virtual_sink,
                     "channels":start.channels,
                     "host_audio_enabled":start.host_audio_enabled});
+                if self.config.stream_audio {
+                    payload["capture_format"] = json!({
+                        "sample_rate": 48_000,
+                        "channels": self.config.audio.channels,
+                        "sample_format": "f32"
+                    });
+                }
                 if self.config.stream_audio && start.continuous_audio == Some(true) {
                     payload["continuous_audio"] = json!({"packet_ms":config.audio.packet_ms});
                 }

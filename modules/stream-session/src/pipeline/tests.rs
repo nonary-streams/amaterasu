@@ -67,6 +67,32 @@ fn stereo_512k_prepare_reaches_encoder_with_bounded_packet_size() {
 }
 
 #[test]
+fn prepared_stereo_session_requests_48khz_float_stereo_loopback() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let session = prepared["session"].as_u64().expect("prepared session");
+
+    let started = host.response(2, start(session));
+    assert_eq!(started["state"], "active", "{started}");
+
+    let audio_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| {
+            call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
+        })
+        .expect("audio capture opened");
+    assert_eq!(
+        audio_open.payload["capture_format"],
+        json!({"sample_rate":48000,"channels":2,"sample_format":"f32"})
+    );
+    // The fake provider returns the exact requested format. Reaching active
+    // means lifecycle validation accepted its 48 kHz float stereo metadata.
+    assert_eq!(host.broker.format_rate, 48_000);
+}
+
+#[test]
 fn surround_prepare_start_and_stop_preserve_layout_and_bounded_wire() {
     for (channels, mask, packet_ms, bitrate, bytes, wire) in [
         (6, 0x3f, 5, 1_536_000, 960, 976),
@@ -124,6 +150,10 @@ fn surround_prepare_start_and_stop_preserve_layout_and_bounded_wire() {
             })
             .unwrap();
         assert_eq!(capture.payload["channels"], channels);
+        assert_eq!(
+            capture.payload["capture_format"],
+            json!({"sample_rate":48000,"channels":channels,"sample_format":"f32"})
+        );
         assert_eq!(
             host.response(3, json!({"action":"stop","session":id}))["state"],
             "stopped"

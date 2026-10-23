@@ -1,6 +1,6 @@
 //! All COM references and WASAPI buffers stay on one dedicated apartment thread.
 use crate::{
-    model::{AudioResult, Endpoint, Format, Packet},
+    model::{AudioResult, Endpoint, Format, Packet, PcmCaptureFormat},
     packet::{Timeline, copy_samples},
     platform::RecoveryConfig,
     route_policy::{
@@ -995,11 +995,25 @@ fn validate_virtual_mix(
 }
 
 /// Ordinary endpoint loopback needs a stable format for the media pipeline.
-/// Ask shared-mode WASAPI to convert the endpoint mix to 48 kHz float while
-/// retaining its supported speaker layout. Explicit virtual sinks keep their
-/// separately selected device format path below.
-fn loopback_capture_format(mix: &MixFormat) -> AudioResult<(Format, WAVEFORMATEXTENSIBLE)> {
-    let (channels, channel_mask) = mix.channel_layout()?;
+/// Ask shared-mode WASAPI to convert the endpoint mix to 48 kHz float. Without
+/// an explicit request, retain the endpoint's supported speaker layout;
+/// explicit virtual sinks keep their separately selected device format path.
+fn loopback_capture_format(
+    mix: &MixFormat,
+    requested: Option<PcmCaptureFormat>,
+) -> AudioResult<(Format, WAVEFORMATEXTENSIBLE)> {
+    let (channels, channel_mask) = if let Some(requested) = requested {
+        requested.validate()?;
+        let channel_mask = match requested.channels {
+            2 => 0x0003,
+            6 => 0x003f,
+            8 => 0x063f,
+            _ => return Err("unsupported_channel_layout"),
+        };
+        (requested.channels, channel_mask)
+    } else {
+        mix.channel_layout()?
+    };
     let mut format = Format::new(48_000, channels, PCM_F32)?;
     format.channel_mask = channel_mask;
     Ok((
@@ -1024,6 +1038,7 @@ fn virtual_mix_error(error: &'static str, recovering: bool) -> &'static str {
 
 struct OpenSelectedOptions {
     desired_layout: Option<ChannelLayout>,
+    capture_format: Option<PcmCaptureFormat>,
     preferred_valid_bits: Option<u16>,
     capture_sink_without_routing: bool,
     follow_console_default: bool,
@@ -1120,6 +1135,7 @@ impl Capture {
         requested: &str,
         virtual_sink: Option<&str>,
         channels: Option<u32>,
+        capture_format: Option<PcmCaptureFormat>,
         host_audio_enabled: bool,
         capture_sink_without_routing: bool,
     ) -> AudioResult<Self> {
@@ -1200,6 +1216,7 @@ impl Capture {
                 endpoint,
                 OpenSelectedOptions {
                     desired_layout,
+                    capture_format,
                     preferred_valid_bits,
                     capture_sink_without_routing: effective_capture_only,
                     follow_console_default,
@@ -1236,6 +1253,7 @@ impl Capture {
                 endpoint,
                 OpenSelectedOptions {
                     desired_layout,
+                    capture_format: config.capture_format,
                     preferred_valid_bits: config.preferred_valid_bits,
                     capture_sink_without_routing: config.capture_sink_without_routing,
                     follow_console_default: config.follow_console_default,
@@ -1259,6 +1277,7 @@ impl Capture {
     ) -> AudioResult<Self> {
         let OpenSelectedOptions {
             desired_layout,
+            capture_format,
             preferred_valid_bits,
             capture_sink_without_routing,
             follow_console_default,
@@ -1290,8 +1309,14 @@ impl Capture {
                 .Activate(CLSCTX_ALL, None)
                 .map_err(|_| "audio_activation_failed")?;
             let mix = MixFormat(client.GetMixFormat().map_err(|_| "unsupported_format")?);
-            let mut capture_format = match (desired_layout, selected_virtual_format) {
+            let mut capture_target = match (desired_layout, selected_virtual_format) {
                 (Some(layout), Some(candidate)) => {
+                    if let Some(requested) = capture_format {
+                        requested.validate()?;
+                        if requested.channels != layout.channels {
+                            return Err("invalid_capture_format");
+                        }
+                    }
                     if let Err(error) = validate_virtual_mix(&mix, layout, candidate) {
                         // Windows can still publish the old mix immediately
                         // after SetDeviceFormat succeeds. A shared capture
@@ -1311,10 +1336,10 @@ impl Capture {
                     );
                     Some((format, waveformat))
                 }
-                (None, None) => Some(loopback_capture_format(&mix)?),
+                (None, None) => Some(loopback_capture_format(&mix, capture_format)?),
                 _ => return Err("virtual_sink_format_unavailable"),
             };
-            let (format, waveformat) = capture_format.as_mut().ok_or("unsupported_format")?;
+            let (format, waveformat) = capture_target.as_mut().ok_or("unsupported_format")?;
             let mut stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK;
             stream_flags |=
                 AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
@@ -1324,6 +1349,7 @@ impl Capture {
                 endpoint: endpoint.clone(),
                 follow_console_default,
                 virtual_channels: desired_layout.map(|layout| layout.channels),
+                capture_format,
                 preferred_valid_bits,
                 capture_sink_without_routing,
                 explicit_route,
@@ -1667,7 +1693,7 @@ mod tests {
         let descriptor = std::mem::ManuallyDrop::new(MixFormat(
             (mix as *mut WAVEFORMATEXTENSIBLE).cast::<WAVEFORMATEX>(),
         ));
-        let (format, target) = loopback_capture_format(&descriptor).unwrap();
+        let (format, target) = loopback_capture_format(&descriptor, None).unwrap();
         assert_eq!(
             (
                 format.sample_rate,
@@ -1731,6 +1757,42 @@ mod tests {
     fn ordinary_loopback_converts_24bit_mix_and_preserves_six_channel_layout() {
         let mut mix = endpoint_mix(48_000, 6, 24, 24, 0x003f);
         assert_loopback_float_target(&mut mix, 6, 0x003f);
+    }
+
+    #[test]
+    fn requested_stereo_loopback_converts_six_channel_mix_to_48khz_float_stereo() {
+        let mut mix = endpoint_mix(48_000, 6, 24, 24, 0x003f);
+        let descriptor = std::mem::ManuallyDrop::new(MixFormat(
+            (&mut mix as *mut WAVEFORMATEXTENSIBLE).cast::<WAVEFORMATEX>(),
+        ));
+        let (format, target) = loopback_capture_format(
+            &descriptor,
+            Some(PcmCaptureFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                sample_format: crate::model::PcmSampleFormat::F32,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                format.sample_rate,
+                format.channels,
+                format.channel_mask,
+                format.code()
+            ),
+            (48_000, 2, 0x0003, PCM_F32)
+        );
+        assert_eq!(
+            (
+                target.Format.nSamplesPerSec,
+                target.Format.nChannels,
+                target.Format.wBitsPerSample,
+                target.dwChannelMask,
+                target.SubFormat
+            ),
+            (48_000, 2, 32, 0x0003, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)
+        );
     }
 
     #[test]

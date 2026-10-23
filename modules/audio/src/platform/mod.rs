@@ -10,6 +10,7 @@ pub struct RecoveryConfig {
     pub endpoint: String,
     pub follow_console_default: bool,
     pub virtual_channels: Option<u32>,
+    pub capture_format: Option<crate::model::PcmCaptureFormat>,
     pub preferred_valid_bits: Option<u16>,
     pub capture_sink_without_routing: bool,
     pub explicit_route: bool,
@@ -74,6 +75,7 @@ mod unsupported {
             _: &str,
             _: Option<&str>,
             _: Option<u32>,
+            _: Option<crate::model::PcmCaptureFormat>,
             _: bool,
             _: bool,
         ) -> AudioResult<Self> {
