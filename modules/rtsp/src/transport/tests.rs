@@ -12,6 +12,19 @@ use std::{
 fn server() -> Transport {
     Transport::bind("127.0.0.1:0".parse().unwrap(), false).unwrap()
 }
+
+#[cfg(unix)]
+#[test]
+fn configured_loopback_port_restarts_without_sharing_an_existing_listener() {
+    let server = server();
+    let address = server.local_addr().unwrap();
+    assert!(Transport::bind(address, false).is_err());
+    drop(server);
+
+    let restarted = Transport::bind(address, false).unwrap();
+    assert_eq!(restarted.local_addr().unwrap(), address);
+}
+
 fn request(cseq: u32) -> Vec<u8> {
     format!("OPTIONS rtsp://localhost/ RTSP/1.0\r\nCSeq: {cseq}\r\n\r\n").into_bytes()
 }

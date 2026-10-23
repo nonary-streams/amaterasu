@@ -70,6 +70,13 @@ impl Transport {
                 Some(Protocol::TCP),
             )
             .map_err(|_| "tcp_bind_failed")?;
+            // Unix retains actively closed TCP connections in TIME_WAIT. Allow
+            // the configured local transport to restart while keeping a second
+            // live listener from sharing this endpoint.
+            #[cfg(unix)]
+            socket
+                .set_reuse_address(true)
+                .map_err(|_| "tcp_configuration_failed")?;
             if address.is_ipv6() {
                 socket
                     .set_only_v6(true)
