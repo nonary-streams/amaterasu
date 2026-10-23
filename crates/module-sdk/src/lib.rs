@@ -50,8 +50,9 @@ impl RuntimeClient {
     }
 
     /// Returns the state location chosen by the trusted host for this worker.
-    /// The control-plane runtime exposes it only to the state module; callers
-    /// cannot substitute a JSON setting or a package-supplied path.
+    /// The control-plane runtime exposes it to the state module and, on Linux,
+    /// to audio for its cleanup journal. Callers cannot substitute a JSON
+    /// setting or a package-supplied path.
     pub fn runtime_state_root(&self) -> ModuleResult<std::path::PathBuf> {
         let Response::Result { payload } = self.send(Command::GetHostContext {})? else {
             return Err("host context request did not return a result".into());
