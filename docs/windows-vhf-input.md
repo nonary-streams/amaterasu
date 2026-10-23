@@ -10,7 +10,7 @@ the Windows service stays in Session 0. Keep these contracts when replacing the
 Windows transport. Linux's backend uses uinput and does not need Windows HID
 mechanics.
 
-The new VHF device is not installed or selected by the runtime. `WindowsBackend` currently uses
+The new VHF device is not installed or selected by default. `WindowsBackend` currently uses
 `SendInput` for keyboard and mouse, ViGEm for controller input, and the
 Synthetic Pointer API for pen/touch. Those paths are current behavior, not the
 chosen new Windows transport.
@@ -96,25 +96,49 @@ seventh simultaneous non-modifier key fail closed. Moonlight key mapping,
 absolute pointer, high-resolution wheel, pen/touch and controller events remain
 unsupported on this path. Scan codes are never copied directly into reports.
 
-The host-owned `amaterasu-input-companion` crate now provides a typed,
-testable authorization state machine for keyboard/mouse events. It binds a
-synthetic transport peer, set identity, session, lease token and generation;
-permits one active device lease at a time; checks sequence, grants and event
-values; rate-limits nonrelease events; and deletes the keyboard/mouse child on revoke,
-expiry or uncertain delivery. The replaceable input module has a narrow
-translator for currently representable events. Moonlight key mapping,
-absolute pointer, high-resolution wheel, pen/touch and controller events fail
-closed in that translator. The crate is **not connected to authenticated
-Windows IPC**; its device sink is connected to the VHF control interface but
-cannot open it without the installed driver and companion service identity.
-There is deliberately no production grant-registry constructor. Its exclusivity
-guarantee is scoped to one registry instance; the installed companion must own
-one exclusive device handle and registry for that handle. A production companion
-must derive peer identity from the accepted OS connection and grants from
-protected host policy, persist
-generation floors, call expiry/close cleanup, and own a driver handle whose
-access is restricted by the installed driver. No production elevated operation
-is enabled by this code; the user worker still uses the current backend.
+The `amaterasu-input-companion` crate has a typed permit and input session state
+machine and a separately built Windows SCM service. The host reads an optional
+machine-owned `input-companion-policy.json` with schema 1, selected component-set
+SHA-256 digest and keyboard/mouse grants. When present, it sends a short-lived
+permit for the supervised interactive worker's OS PID and creation time, read
+from its retained process handle, to a SYSTEM/Administrator
+only host pipe, and refreshes it while that worker and policy remain current.
+The companion independently checks that the caller is the live `Amaterasu` SCM
+service, inspects the worker's SID, session, PID and creation time, and allows
+only that process to open the interactive worker pipe. It rechecks the sender's
+impersonated token on each event. The worker gets one device lease with a random
+token, strictly increasing sequence and generation, a two-second host-permit
+deadline and a bounded event rate. A current host permit refreshes the active
+session's expiry for long-running input; losing the permit closes it. The
+generation floor is written before issue
+to a protected machine directory and survives companion restart; live grants do
+not. A policy change stops the supervised worker; a stale permit, disconnect or
+shutdown destroys the VHF child before another lease may activate. Two pipe
+names separate host permits from user event traffic. Worker client rights omit
+`FILE_CREATE_PIPE_INSTANCE`, frames and connection counts are bounded, and
+unpermitted opening PIDs are rejected before reading a frame.
+
+The input module can explicitly select `windows_backend: "vhf_companion"` in its
+settings. That mode sends keyboard/mouse events through the companion and fails
+closed for unsupported event types. It never falls back to `SendInput`; omitted
+settings keep the existing backend. The service does not install itself or the
+driver, nor does it create or modify the machine-owned policy. An approved
+repository is not an elevated-input grant. The companion's current LocalSystem
+account and device service SID require separate installation review.
+The service's `ROOT` argument must be an installer-owned, machine-private
+runtime root under the trusted installation. Its child generation directory is
+protected by the companion; an installer must establish and verify the parent
+before starting either service.
+Windows HID typematic owns repeat for a held key in this mode; scheduled repeat
+events do not submit duplicate down reports. A dead pipe is discarded so
+controller cleanup can clear local held state and a later lease can reconnect.
+
+Native modules in one user process share that process's privileges and memory.
+A duplicated pipe handle written by another process under the same user and
+session can retain the opening PID as seen by Windows; this protocol does not
+claim to sandbox hostile code from the same user. Its privileged boundary is
+the independently installed companion and fixed driver protocol. Runtime
+pipe/SCM, ACL, driver and real HID behavior have not been VM tested.
 
 The cross-platform module contract remains one logical package with target
 adapters: VHF on Windows, uinput or a narrowly authorized device-access helper
@@ -141,13 +165,11 @@ selection and API contract should not require end users to compile with Cargo.
   release. Verify no user module can open the device directly.
 - Test real keyboard, mouse, pen/touch and controller consumers, including
   multi-session behavior and any XInput compatibility requirement.
-- Integrate the companion only after the elevated broker has authenticated
-  identity-bound grants and explicit privileged-handler approval. The dedicated
-  service must run with a service SID matching the INF, authenticate the worker
-  OS token/session and host-confirmed component-set identity, own protected
-  grant and generation state, and poll leases/driver heartbeat. No service IPC,
-  protected grant storage or installation path exists yet. Do not install a
-  driver or grant OS privileges as part of ordinary repository activation.
+- Review an installer that registers `AmaterasuInputCompanion` as a dedicated
+  service with its service SID, protects the machine policy/root, installs the
+  signed driver and limits device access. Do not install a driver or grant OS
+  privileges as part of ordinary repository activation. No installation or
+  end-to-end OS test has been performed in this development task.
 
 Microsoft references: [VHF architecture and lifecycle](https://learn.microsoft.com/en-us/windows-hardware/drivers/hid/virtual-hid-framework--vhf-),
 [VhfReadReportSubmit and buffering](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/vhf/nf-vhf-vhfreadreportsubmit),

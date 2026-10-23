@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Supplied by a trusted OS transport adapter. It is never read from a packet.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerIdentity {
     principal: String,
     interactive_session: u32,
@@ -12,6 +13,17 @@ pub struct PeerIdentity {
 }
 
 impl PeerIdentity {
+    pub(crate) fn valid(&self) -> bool {
+        !self.principal.is_empty()
+            && self.principal.len() <= 256
+            && self.interactive_session != u32::MAX
+            && self.component_set_digest.len() == 64
+            && self
+                .component_set_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
+
     /// The caller must derive these values from the OS connection and the
     /// verified active component set, not from worker-provided JSON.
     pub fn from_verified_connection(
@@ -19,21 +31,15 @@ impl PeerIdentity {
         interactive_session: u32,
         component_set_digest: String,
     ) -> InputResult<Self> {
-        if principal.is_empty()
-            || principal.len() > 256
-            || interactive_session == u32::MAX
-            || component_set_digest.len() != 64
-            || !component_set_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            return Err(InputError::InvalidPeer);
-        }
-        Ok(Self {
+        let identity = Self {
             principal,
             interactive_session,
             component_set_digest,
-        })
+        };
+        if !identity.valid() {
+            return Err(InputError::InvalidPeer);
+        }
+        Ok(identity)
     }
 }
 

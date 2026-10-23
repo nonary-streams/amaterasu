@@ -29,6 +29,8 @@ struct Settings {
     allow_injection: bool,
     #[serde(default = "default_uinput_path")]
     uinput_path: String,
+    #[serde(default)]
+    windows_backend: Option<String>,
 }
 fn default_uinput_path() -> String {
     "/dev/uinput".into()
@@ -88,15 +90,27 @@ impl ManagedModule for InputModule {
         if cfg!(target_os = "linux") && !std::path::Path::new(&settings.uinput_path).is_absolute() {
             return Err("uinput_path must be absolute".into());
         }
+        #[cfg(windows)]
+        let backend = match settings.windows_backend.as_deref() {
+            None | Some("native") => NativeBackend::new(settings.uinput_path),
+            Some("vhf_companion") => NativeBackend::new_with_companion(true),
+            Some(_) => return Err("unknown Windows input backend".into()),
+        };
+        #[cfg(not(windows))]
+        let backend = {
+            if settings.windows_backend.is_some() {
+                return Err(
+                    "Windows input backend selection is unavailable on this platform".into(),
+                );
+            }
+            NativeBackend::new(settings.uinput_path)
+        };
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
         Ok(Self {
             runtime,
-            controller: Controller::new(
-                NativeBackend::new(settings.uinput_path),
-                settings.allow_injection,
-            ),
+            controller: Controller::new(backend, settings.allow_injection),
             product_settings: ProductSettings::new(),
             queued: VecDeque::new(),
         })

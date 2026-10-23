@@ -38,6 +38,7 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
+ "amaterasu-input-companion",
  "amaterasu-package",
  "ed25519-dalek",
  "libloading",
@@ -256,6 +257,7 @@ dependencies = [
 name = "amaterasu-input-companion"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-storage",
  "serde",
  "serde_json",
  "windows-sys 0.61.2",

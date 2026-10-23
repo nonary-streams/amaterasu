@@ -87,6 +87,12 @@ struct ProcessInformation {
 }
 
 #[repr(C)]
+struct FileTime {
+    low: u32,
+    high: u32,
+}
+
+#[repr(C)]
 struct WtsSessionInfoW {
     session_id: u32,
     station_name: *mut u16,
@@ -182,6 +188,13 @@ unsafe extern "system" {
         template: *mut c_void,
     ) -> *mut c_void;
     fn CloseHandle(handle: *mut c_void) -> i32;
+    fn GetProcessTimes(
+        process: *mut c_void,
+        created: *mut FileTime,
+        exited: *mut FileTime,
+        kernel: *mut FileTime,
+        user: *mut FileTime,
+    ) -> i32;
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
     fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
     fn CreatePipe(
@@ -228,6 +241,7 @@ unsafe extern "system" {
 pub(crate) struct Supervisor<'a> {
     root: &'a Path,
     digest: &'a str,
+    companion_policy: Option<crate::input_companion::CompanionPolicy>,
     worker: Option<Worker>,
     failed_starts: usize,
     observed_session: Option<u32>,
@@ -238,6 +252,7 @@ impl<'a> Supervisor<'a> {
         let mut supervisor = Self {
             root,
             digest,
+            companion_policy: crate::input_companion::CompanionPolicy::load(root, digest)?,
             worker: None,
             failed_starts: 0,
             observed_session: None,
@@ -249,6 +264,14 @@ impl<'a> Supervisor<'a> {
     /// Stops a worker as soon as its user session is no longer active. Polling
     /// also closes the race where SCM does not deliver a session-change event.
     pub(crate) fn refresh(&mut self, session_changed: bool) -> PackageResult<()> {
+        if crate::input_companion::CompanionPolicy::load(self.root, self.digest)?
+            != self.companion_policy
+        {
+            self.worker = None;
+            return Err(
+                "input companion policy changed; restart the service to reauthorize".into(),
+            );
+        }
         let active = active_user_session()?;
         let session_changed_by_polling = active != self.observed_session;
         self.observed_session = active;
@@ -270,7 +293,12 @@ impl<'a> Supervisor<'a> {
             && let Some(session_id) = active
             && (session_changed || session_changed_by_polling || self.failed_starts > 0)
         {
-            match Worker::start(self.root, self.digest, session_id) {
+            match Worker::start(
+                self.root,
+                self.digest,
+                session_id,
+                self.companion_policy.as_ref(),
+            ) {
                 Ok(worker) => {
                     self.worker = Some(worker);
                     self.failed_starts = 0;
@@ -280,6 +308,9 @@ impl<'a> Supervisor<'a> {
         }
         if self.failed_starts >= MAX_START_FAILURES {
             return Err("interactive worker restart budget exhausted".into());
+        }
+        if let (Some(policy), Some(worker)) = (&self.companion_policy, &self.worker) {
+            policy.authorize(worker.process_id, worker.creation_time)?;
         }
         Ok(())
     }
@@ -307,11 +338,18 @@ impl<'a> Supervisor<'a> {
 /// A process handle and the WTS session that owns its desktop.
 struct Worker {
     process: *mut c_void,
+    process_id: u32,
+    creation_time: u64,
     session_id: u32,
 }
 
 impl Worker {
-    fn start(root: &Path, digest: &str, session_id: u32) -> PackageResult<Self> {
+    fn start(
+        root: &Path,
+        digest: &str,
+        session_id: u32,
+        companion_policy: Option<&crate::input_companion::CompanionPolicy>,
+    ) -> PackageResult<Self> {
         let user_token = UserToken::for_session(session_id)?;
         let prepared = crate::state_root::prepare(root, digest, user_token.handle)?;
         let primary_token = user_token.duplicate_primary()?;
@@ -398,10 +436,37 @@ impl Worker {
         // handle. The retained process handle has the worker's full lifetime.
         unsafe { CloseHandle(process.thread) };
         readiness.close_write();
+        let mut created = FileTime { low: 0, high: 0 };
+        let mut exited = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        // SAFETY: the newly created process handle remains owned by Worker;
+        // all four FILETIME outputs are writable for this synchronous call.
+        let times_ok = unsafe {
+            GetProcessTimes(
+                process.process,
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        } != 0;
         let worker = Self {
             process: process.process,
+            process_id: process.process_id,
+            creation_time: (u64::from(created.high) << 32) | u64::from(created.low),
             session_id,
         };
+        if !times_ok || worker.creation_time == 0 {
+            drop(worker);
+            return Err("interactive worker creation identity is unavailable".into());
+        }
+        if let Some(policy) = companion_policy
+            && let Err(error) = policy.authorize(worker.process_id, worker.creation_time)
+        {
+            drop(worker);
+            return Err(error);
+        }
         if let Err(error) = readiness.wait_for_ready(&worker) {
             drop(worker);
             return Err(error);

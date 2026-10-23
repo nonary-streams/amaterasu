@@ -1,12 +1,17 @@
 use crate::model::{HeldInput, InputEvent, InputPacket, PROTOCOL_VERSION, PeerIdentity};
 use crate::{InputError, InputResult};
-use std::collections::HashMap;
+use amaterasu_storage::{
+    create_machine_private_directory, protect_machine_private_file, read_json,
+    write_json_atomically,
+};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const MAX_PEERS: usize = 64;
 const MAX_HELD: usize = 128;
 const MAX_EVENTS_PER_SECOND: usize = 2048;
+const HOST_AUTHORIZED_SESSION_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// A companion-owned device handle. `release_all` must neutralize the state
 /// owned by that handle, independently of the replaceable worker's cleanup.
@@ -32,26 +37,83 @@ pub struct InputGrant {
 
 #[derive(Default)]
 struct RegistryState {
-    highest_generation: HashMap<PeerIdentity, u64>,
+    // One exclusive device has one global replay floor across all users and
+    // component sets. Upgrades cannot exhaust a table of historical digests.
+    highest_generation: u64,
     // One source device is owned by at most one worker lease at a time.
     active: Option<(PeerIdentity, u64)>,
 }
 
-/// In-memory generation floors for synthetic testing. Production must persist
-/// these floors in protected state and revoke them on policy/set changes.
+/// Generation floors are in memory for synthetic tests and persisted in a
+/// protected machine directory by the installed service.
 pub struct GrantRegistry {
     state: Arc<Mutex<RegistryState>>,
+    generation_file: Option<PathBuf>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedGenerations {
+    schema: u32,
+    highest_generation: u64,
 }
 
 impl GrantRegistry {
-    // No production constructor exists yet. The installed companion must
-    // create exactly one registry for its exclusive device handle after OS
-    // authentication and protected-policy integration are implemented.
+    // Tests use an isolated in-memory registry without changing machine trust.
     #[cfg(test)]
     pub(crate) fn synthetic() -> Self {
         Self {
             state: Arc::new(Mutex::new(RegistryState::default())),
+            generation_file: None,
         }
+    }
+
+    /// The installed service must supply an installer-owned machine root and
+    /// run as LocalSystem. Generation floors survive a companion restart;
+    /// live grants deliberately do not, so a restart invalidates all tickets.
+    pub fn open_protected(root: &Path) -> InputResult<Self> {
+        create_machine_private_directory(root).map_err(|_| InputError::Storage)?;
+        let generation_file = root.join("input-generation-floors.json");
+        let highest_generation = if generation_file
+            .try_exists()
+            .map_err(|_| InputError::Storage)?
+        {
+            let stored: PersistedGenerations =
+                read_json(&generation_file).map_err(|_| InputError::Storage)?;
+            if stored.schema != 1 {
+                return Err(InputError::Storage);
+            }
+            protect_machine_private_file(&generation_file).map_err(|_| InputError::Storage)?;
+            stored.highest_generation
+        } else {
+            0
+        };
+        Ok(Self {
+            state: Arc::new(Mutex::new(RegistryState {
+                highest_generation,
+                active: None,
+            })),
+            generation_file: Some(generation_file),
+        })
+    }
+
+    pub fn issue_next(
+        &mut self,
+        peer: PeerIdentity,
+        lease_token: String,
+        expires_at: Instant,
+        keyboard: bool,
+        mouse: bool,
+    ) -> InputResult<(u64, InputGrant)> {
+        let next = {
+            let state = self.state.lock().map_err(|_| InputError::InvalidGrant)?;
+            state
+                .highest_generation
+                .checked_add(1)
+                .ok_or(InputError::InvalidSequence)?
+        };
+        let grant = self.issue(peer, lease_token, next, expires_at, keyboard, mouse)?;
+        Ok((next, grant))
     }
 
     pub fn issue(
@@ -74,19 +136,18 @@ impl GrantRegistry {
         if registry.active.is_some() {
             return Err(InputError::ResourceExhausted);
         }
-        if registry
-            .highest_generation
-            .get(&peer)
-            .is_some_and(|highest| generation <= *highest)
-        {
+        if generation <= registry.highest_generation {
             return Err(InputError::InvalidSequence);
         }
-        if !registry.highest_generation.contains_key(&peer)
-            && registry.highest_generation.len() >= MAX_PEERS
-        {
-            return Err(InputError::ResourceExhausted);
+        if let Some(path) = &self.generation_file {
+            let record = PersistedGenerations {
+                schema: 1,
+                highest_generation: generation,
+            };
+            write_json_atomically(path, &record).map_err(|_| InputError::Storage)?;
+            protect_machine_private_file(path).map_err(|_| InputError::Storage)?;
         }
-        registry.highest_generation.insert(peer.clone(), generation);
+        registry.highest_generation = generation;
         Ok(InputGrant {
             peer,
             lease_token,
@@ -112,6 +173,15 @@ pub struct InputSession<S: DeviceSink> {
 }
 
 impl<S: DeviceSink> InputSession<S> {
+    /// Called only while the separate host permit is current. This keeps a
+    /// long-running authorized worker from hitting its original one-hour cap.
+    pub(crate) fn refresh_host_authorized_expiry(&mut self, now: Instant) -> InputResult<()> {
+        if self.closed {
+            return Err(InputError::Closed);
+        }
+        self.grant.expires_at = now + HOST_AUTHORIZED_SESSION_WINDOW;
+        Ok(())
+    }
     pub fn connect(
         peer_from_transport: &PeerIdentity,
         grant: InputGrant,
@@ -260,6 +330,9 @@ impl<S: DeviceSink> InputSession<S> {
     }
 
     pub fn revoke(&mut self) -> InputResult<()> {
+        if self.closed && !self.cleanup_required {
+            return Ok(());
+        }
         self.closed = true;
         let mut failure = None;
         for index in (0..self.held.len()).rev() {
@@ -292,7 +365,7 @@ impl<S: DeviceSink> InputSession<S> {
 impl InputGrant {
     fn activate(&self) -> InputResult<()> {
         let mut registry = self.registry.lock().map_err(|_| InputError::InvalidGrant)?;
-        if registry.highest_generation.get(&self.peer) != Some(&self.generation) {
+        if registry.highest_generation != self.generation {
             return Err(InputError::InvalidSequence);
         }
         if registry.active.is_some() {

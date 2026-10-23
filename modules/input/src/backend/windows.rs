@@ -8,12 +8,15 @@ use crate::model::{
     Axis, Button, Event, InputError, InputResult, Key, KeyState, PenTouchDevice,
     effective_virtual_key,
 };
+use amaterasu_input_companion::WindowsInputClient;
 use std::collections::HashMap;
 use windows_gamepad::WindowsGamepads;
 use windows_pen_touch::WindowsPenTouch;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 pub struct WindowsBackend {
+    vhf_companion: bool,
+    companion: Option<WindowsInputClient>,
     always_send_scancodes: bool,
     key_rightalt_to_key_win: bool,
     held_key_plans: HashMap<u8, KeyboardPlan>,
@@ -23,7 +26,13 @@ pub struct WindowsBackend {
 
 impl WindowsBackend {
     pub fn new(_: String) -> Self {
+        Self::new_with_companion(false)
+    }
+
+    pub fn new_with_companion(vhf_companion: bool) -> Self {
         Self {
+            vhf_companion,
+            companion: None,
             always_send_scancodes: true,
             key_rightalt_to_key_win: false,
             held_key_plans: HashMap::new(),
@@ -129,7 +138,11 @@ impl WindowsBackend {
 
 impl Backend for WindowsBackend {
     fn name(&self) -> &'static str {
-        "windows_send_input"
+        if self.vhf_companion {
+            "windows_vhf_companion"
+        } else {
+            "windows_send_input"
+        }
     }
 
     fn supported(&self) -> bool {
@@ -137,27 +150,39 @@ impl Backend for WindowsBackend {
     }
 
     fn absolute_pointer(&self) -> bool {
-        true
+        !self.vhf_companion
     }
 
     fn controller_input_supported(&self) -> bool {
-        self.gamepads.supported()
+        !self.vhf_companion && self.gamepads.supported()
     }
 
     fn pen_touch_supported(&self) -> bool {
-        self.pen_touch.supported()
+        !self.vhf_companion && self.pen_touch.supported()
     }
 
     fn pen_touch_max_contacts(&self, device: PenTouchDevice) -> Option<usize> {
-        Some(self.pen_touch.max_contacts(device))
+        if self.vhf_companion {
+            None
+        } else {
+            Some(self.pen_touch.max_contacts(device))
+        }
     }
 
     fn effective_gamepad_profile(&self) -> Option<&'static str> {
-        self.gamepads.effective_profile()
+        if self.vhf_companion {
+            None
+        } else {
+            self.gamepads.effective_profile()
+        }
     }
 
     fn gamepad_unavailable_reason(&self) -> Option<&str> {
-        self.gamepads.unavailable_reason()
+        if self.vhf_companion {
+            Some("VHF companion currently supports keyboard and mouse only")
+        } else {
+            self.gamepads.unavailable_reason()
+        }
     }
 
     fn key_encoding(&self) -> &'static str {
@@ -165,6 +190,9 @@ impl Backend for WindowsBackend {
     }
 
     fn validate(&self, event: &Event) -> InputResult<()> {
+        if self.vhf_companion {
+            return companion_intent(event).map(|_| ());
+        }
         event.validate()?;
         if matches!(event, Event::PenTouch { .. }) {
             // Controller batch validation calls this before any batch event is
@@ -188,6 +216,10 @@ impl Backend for WindowsBackend {
     }
 
     fn start(&mut self) -> InputResult<()> {
+        if self.vhf_companion {
+            self.companion = Some(WindowsInputClient::connect().map_err(companion_error)?);
+            return Ok(());
+        }
         self.gamepads.start()?;
         self.pen_touch.start()?;
         self.held_key_plans.clear();
@@ -195,6 +227,32 @@ impl Backend for WindowsBackend {
     }
 
     fn inject(&mut self, event: &Event) -> InputResult<()> {
+        if self.vhf_companion {
+            let Some(translated) = companion_intent(event)? else {
+                // Windows HID typematic repeats a held keyboard report. An
+                // application-level Repeat must not submit a second down.
+                return Ok(());
+            };
+            if let Some(companion) = &mut self.companion {
+                if let Err(error) = companion.send(translated) {
+                    // Closing the pipe makes the companion destroy its HID
+                    // child. Let subsequent releases clear controller state.
+                    self.companion = None;
+                    if !companion_release(event) {
+                        return Err(companion_error(error));
+                    }
+                }
+                return Ok(());
+            }
+            return if companion_release(event) {
+                Ok(())
+            } else {
+                Err(InputError::new(
+                    "companion_unavailable",
+                    "VHF companion lease is not active",
+                ))
+            };
+        }
         self.inject_with_sender(event, |input, _held_plan_snapshot| {
             // SAFETY: input is a fully initialized INPUT with the matching union tag.
             // SendInput reads this one owned record synchronously and retains no pointer.
@@ -221,11 +279,17 @@ impl Backend for WindowsBackend {
     }
 
     fn advance(&mut self, now: std::time::Instant) -> InputResult<()> {
+        if self.vhf_companion {
+            return Ok(());
+        }
         self.gamepads.advance(now);
         self.pen_touch.advance(now)
     }
 
     fn advance_pen_touch(&mut self, now: std::time::Instant) -> InputResult<()> {
+        if self.vhf_companion {
+            return Ok(());
+        }
         self.pen_touch.advance(now)
     }
 
@@ -242,16 +306,60 @@ impl Backend for WindowsBackend {
     }
 
     fn disable_controller_input(&mut self) -> InputResult<()> {
+        if self.vhf_companion {
+            return Ok(());
+        }
         self.gamepads.disable()
     }
 
     fn stop(&mut self) -> InputResult<()> {
+        if self.vhf_companion {
+            if let Some(mut companion) = self.companion.take() {
+                // The server destroys its child on disconnect. Discard the
+                // terminal pipe even if its close acknowledgement is lost.
+                companion.close().map_err(companion_error)?;
+            }
+            return Ok(());
+        }
         let gamepad_result = self.gamepads.stop();
         let pen_touch_result = self.pen_touch.stop();
         self.held_key_plans.clear();
         gamepad_result?;
         pen_touch_result
     }
+}
+
+fn companion_intent(event: &Event) -> InputResult<Option<amaterasu_input_companion::InputEvent>> {
+    if let Event::Key {
+        key,
+        state: KeyState::Repeat,
+    } = event
+    {
+        event.validate()?;
+        crate::companion_client::translate(&Event::Key {
+            key: key.clone(),
+            state: KeyState::Down,
+        })?;
+        return Ok(None);
+    }
+    crate::companion_client::translate(event).map(Some)
+}
+
+fn companion_release(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key {
+            state: KeyState::Up,
+            ..
+        } | Event::Button { pressed: false, .. }
+    )
+}
+
+fn companion_error(error: amaterasu_input_companion::InputError) -> InputError {
+    InputError::new(
+        "companion_unavailable",
+        format!("VHF companion denied input: {error:?}"),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -446,6 +554,47 @@ fn native_input(event: &Event) -> InputResult<INPUT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vhf_companion_requires_a_live_lease_without_native_fallback() {
+        let mut selected = WindowsBackend::new_with_companion(true);
+        let event = Event::Key {
+            key: Key::WindowsScan {
+                code: 0x1e,
+                extended: false,
+            },
+            state: KeyState::Down,
+        };
+        assert_eq!(
+            WindowsBackend::new(String::new()).name(),
+            "windows_send_input"
+        );
+        assert_eq!(selected.name(), "windows_vhf_companion");
+        selected.validate(&event).unwrap();
+        assert_eq!(
+            selected.inject(&event).unwrap_err().code,
+            "companion_unavailable"
+        );
+        assert!(!selected.absolute_pointer());
+        assert!(!selected.controller_input_supported());
+        let repeated = Event::Key {
+            key: Key::WindowsScan {
+                code: 0x1e,
+                extended: false,
+            },
+            state: KeyState::Repeat,
+        };
+        selected.validate(&repeated).unwrap();
+        selected.inject(&repeated).unwrap();
+        let released = Event::Key {
+            key: Key::WindowsScan {
+                code: 0x1e,
+                extended: false,
+            },
+            state: KeyState::Up,
+        };
+        selected.inject(&released).unwrap();
+    }
 
     fn key(code: u8, normalized: bool, state: KeyState) -> Event {
         Event::Key {

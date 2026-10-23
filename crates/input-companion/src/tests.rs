@@ -157,6 +157,63 @@ fn grant_generation_is_single_use_and_monotonic_per_peer() {
 }
 
 #[test]
+fn protected_generation_floor_survives_restart_and_rejects_corruption() {
+    let fixture = std::env::temp_dir().join(format!(
+        "amaterasu-input-floor-{}",
+        amaterasu_storage::random_identifier().unwrap()
+    ));
+    let now = Instant::now();
+    let identity = peer();
+    let mut registry = GrantRegistry::open_protected(&fixture).unwrap();
+    let (generation, _) = registry
+        .issue_next(
+            identity.clone(),
+            "a".repeat(32),
+            now + Duration::from_secs(1),
+            true,
+            true,
+        )
+        .unwrap();
+    assert_eq!(generation, 1);
+    drop(registry);
+    let mut reopened = GrantRegistry::open_protected(&fixture).unwrap();
+    assert_eq!(
+        reopened
+            .issue(
+                identity.clone(),
+                "b".repeat(32),
+                1,
+                now + Duration::from_secs(1),
+                true,
+                true
+            )
+            .err(),
+        Some(InputError::InvalidSequence)
+    );
+    assert_eq!(
+        reopened
+            .issue_next(
+                identity,
+                "b".repeat(32),
+                now + Duration::from_secs(1),
+                true,
+                true,
+            )
+            .unwrap()
+            .0,
+        2
+    );
+    std::fs::write(fixture.join("input-generation-floors.json"), b"{}").unwrap();
+    assert!(matches!(
+        GrantRegistry::open_protected(&fixture),
+        Err(InputError::Storage)
+    ));
+    let canonical = fixture.canonicalize().unwrap();
+    assert!(canonical.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    std::fs::remove_dir_all(canonical).unwrap();
+}
+
+#[test]
 fn a_new_grant_waits_for_the_old_device_lease_to_neutralize() {
     let now = Instant::now();
     let mut registry = GrantRegistry::synthetic();
@@ -413,6 +470,25 @@ fn idle_expiry_releases_without_another_worker_packet() {
     assert_eq!(session.sink.releases, 1);
     assert_eq!(
         session.submit(&packet(2, key(true)), now),
+        Err(InputError::Closed)
+    );
+}
+
+#[test]
+fn current_host_permit_can_extend_a_live_session_without_replaying_a_generation() {
+    let now = Instant::now();
+    let mut session = connect(now, FakeDevice::default());
+    session.submit(&packet(1, key(true)), now).unwrap();
+    session
+        .refresh_host_authorized_expiry(now + Duration::from_millis(900))
+        .unwrap();
+    assert!(!session.poll_expiry(now + Duration::from_secs(2)).unwrap());
+    session
+        .submit(&packet(2, key(false)), now + Duration::from_secs(2))
+        .unwrap();
+    session.revoke().unwrap();
+    assert_eq!(
+        session.refresh_host_authorized_expiry(now + Duration::from_secs(3)),
         Err(InputError::Closed)
     );
 }

@@ -1,4 +1,6 @@
 #[cfg(windows)]
+mod input_companion;
+#[cfg(windows)]
 mod interactive_worker;
 mod loading;
 mod logging_config;

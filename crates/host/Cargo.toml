@@ -8,6 +8,7 @@ rust-version.workspace = true
 amaterasu-abi.workspace = true
 amaterasu-contracts.workspace = true
 amaterasu-package.workspace = true
+amaterasu-input-companion.workspace = true
 libloading.workspace = true
 serde_json.workspace = true
 serde.workspace = true
