@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::profiles::{
-    ComponentDefinition, PackageProfile, RUNTIME_ID, development_policy, installer_policy,
+    ComponentDefinition, PackageProfile, RUNTIME_ID, desktop_stream_smoke_policy,
+    development_policy, installer_policy,
 };
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -177,6 +178,14 @@ fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
 }
 
 pub fn initialize(root: &Path) -> PackageResult<()> {
+    initialize_profile(root, None)
+}
+
+pub fn initialize_desktop_stream_smoke(root: &Path, allow_remote: bool) -> PackageResult<()> {
+    initialize_profile(root, Some(allow_remote))
+}
+
+fn initialize_profile(root: &Path, desktop_smoke_remote: Option<bool>) -> PackageResult<()> {
     let tls = InstallerTls::from_environment()?;
     if root.join("bootstrap.json").exists() || root.join("development-key.json").exists() {
         return Err(
@@ -196,7 +205,10 @@ pub fn initialize(root: &Path) -> PackageResult<()> {
             DEVELOPMENT_KEY_ID.into(),
             encode_hex(signing_key.verifying_key().as_bytes()),
         )]),
-        policy: development_policy(root)?,
+        policy: match desktop_smoke_remote {
+            Some(allow_remote) => desktop_stream_smoke_policy(root, allow_remote)?,
+            None => development_policy(root)?,
+        },
     };
     let web_directory = root.join("web");
     create_private_directory(&web_directory)?;
