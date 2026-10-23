@@ -56,6 +56,14 @@ fn profile_uses_owner_selected_pipewire_capture_without_kms_or_metrics_modules()
         streaming_settings(&LinuxSessionOptions::default())["capture"]["capture_provider"],
         "pipewire"
     );
+    assert_eq!(
+        streaming_settings(&LinuxSessionOptions::default())["desktop"]["enabled"],
+        true
+    );
+    assert_eq!(
+        catalog_settings(&LinuxSessionOptions::default())["seed_desktop_entry"],
+        false
+    );
     assert!(!COMPONENTS.iter().any(|component| matches!(
         component.id,
         "amaterasu.capture-kms" | "amaterasu.host-metrics"
