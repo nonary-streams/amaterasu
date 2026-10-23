@@ -541,15 +541,15 @@ const RTSP: ComponentDefinition = ComponentDefinition {
 };
 
 // The desktop smoke profile follows a manually-added Moonlight desktop path.
-// It deliberately excludes app-launch integrations and WGC while retaining
-// catalog reads so NVHTTP can fail closed if the reserved desktop ID collides.
+// It deliberately excludes app-launch integrations, WGC, and the catalog;
+// no catalog is needed for the Desktop-only app list. NVHTTP still detects ID
+// collisions if a catalog is provided in a different profile.
 const NVHTTP_DESKTOP_SMOKE: ComponentDefinition = ComponentDefinition {
     calls: &[
         "amaterasu.configuration/1",
         "amaterasu.input/1",
         "amaterasu.pairing/1",
         "amaterasu.state/1",
-        "amaterasu.catalog/1",
         "amaterasu.display/1",
         "amaterasu.rtsp/1",
         "amaterasu.stream-session/1",
@@ -568,7 +568,6 @@ const NVHTTP_DESKTOP_SMOKE: ComponentDefinition = ComponentDefinition {
         "amaterasu.input",
         "amaterasu.pairing",
         "amaterasu.state",
-        "amaterasu.catalog",
         "amaterasu.display",
         "amaterasu.rtsp",
         "amaterasu.stream-session",
@@ -827,7 +826,6 @@ impl PackageProfile {
                 SESSION,
                 SESSION_HISTORY,
                 CONFIGURATION,
-                CATALOG,
                 HOST_CONFIGURATION,
                 DIAGNOSTICS,
                 PLATFORM_PAIRING,
@@ -1030,9 +1028,9 @@ pub fn desktop_stream_smoke_policy(
     let mut policy = development_policy(root)?;
     let components = PackageProfile::DesktopStreamSmoke.components();
     let component_ids: BTreeSet<_> = components.iter().map(|component| component.id).collect();
-    policy
-        .principals
-        .retain(|principal, _| principal == "amaterasu.console" || component_ids.contains(principal.as_str()));
+    policy.principals.retain(|principal, _| {
+        principal == "amaterasu.console" || component_ids.contains(principal.as_str())
+    });
     let mut console = Grants::default();
     for component in components {
         if component.id == RUNTIME_ID {
@@ -1049,7 +1047,9 @@ pub fn desktop_stream_smoke_policy(
         .insert("amaterasu.console".into(), console);
 
     let remote_stream = allow_remote;
-    policy.settings.retain(|principal, _| component_ids.contains(principal.as_str()));
+    policy
+        .settings
+        .retain(|principal, _| component_ids.contains(principal.as_str()));
     policy.settings.extend(BTreeMap::from([
         (
             "amaterasu.rtsp".into(),
@@ -1071,10 +1071,6 @@ pub fn desktop_stream_smoke_policy(
         (
             "amaterasu.media-transport".into(),
             json!({"enabled":true,"allow_remote":remote_stream,"allowed_principals":["amaterasu.stream-session"]}),
-        ),
-        (
-            "amaterasu.catalog".into(),
-            json!({"export_principals":{"amaterasu.nvhttp":"amaterasu.console"}}),
         ),
         (
             "amaterasu.input".into(),

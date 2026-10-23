@@ -390,7 +390,10 @@ mod tests {
             );
         }
         for value in ["65536", "-1", "+1", "1.0", " 1", "1 ", ""] {
-            assert!(parse(&format!("{base}&psmap={value}")).is_err(), "accepted {value:?}");
+            assert!(
+                parse(&format!("{base}&psmap={value}")).is_err(),
+                "accepted {value:?}"
+            );
         }
     }
 

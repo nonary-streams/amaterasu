@@ -54,7 +54,6 @@ fn desktop_stream_smoke_profile_is_dxgi_only_and_has_no_library_integrations() {
         SESSION.id,
         SESSION_HISTORY.id,
         CONFIGURATION.id,
-        CATALOG.id,
         PLATFORM_PAIRING.id,
         NVHTTP.id,
         INPUT.id,
@@ -81,12 +80,21 @@ fn desktop_stream_smoke_profile_is_dxgi_only_and_has_no_library_integrations() {
     ] {
         assert!(!ids.contains(excluded), "unexpected {excluded}");
     }
-    assert!(VIDEO_DXGI_SMOKE.native_uses.contains(&"amaterasu.capture-dxgi/1"));
-    assert!(!VIDEO_DXGI_SMOKE.native_uses.contains(&"amaterasu.capture-wgc/1"));
+    assert!(
+        VIDEO_DXGI_SMOKE
+            .native_uses
+            .contains(&"amaterasu.capture-dxgi/1")
+    );
+    assert!(
+        !VIDEO_DXGI_SMOKE
+            .native_uses
+            .contains(&"amaterasu.capture-wgc/1")
+    );
     assert!(!NVHTTP_DESKTOP_SMOKE.calls.contains(&"amaterasu.launch/1"));
     assert!(!NVHTTP_DESKTOP_SMOKE.calls.contains(&"amaterasu.playnite/1"));
     assert!(!NVHTTP_DESKTOP_SMOKE.calls.contains(&"amaterasu.lutris/1"));
-    assert!(NVHTTP_DESKTOP_SMOKE.calls.contains(&"amaterasu.catalog/1"));
+    assert!(!NVHTTP_DESKTOP_SMOKE.calls.contains(&"amaterasu.catalog/1"));
+    assert!(!ids.contains(CATALOG.id));
 }
 
 #[test]
@@ -122,30 +130,61 @@ fn desktop_smoke_policy_is_explicit_and_keeps_development_and_production_default
         "SELECT_OUTPUT_ID"
     );
     assert_eq!(local.settings["amaterasu.rtsp"]["allow_remote"], false);
-    assert_eq!(local.settings["amaterasu.media-transport"]["allow_remote"], false);
-    assert_eq!(local.settings["amaterasu.control-transport"]["allow_remote"], false);
-    assert_eq!(local.settings["amaterasu.stream-session"]["allow_remote"], false);
+    assert_eq!(
+        local.settings["amaterasu.media-transport"]["allow_remote"],
+        false
+    );
+    assert_eq!(
+        local.settings["amaterasu.control-transport"]["allow_remote"],
+        false
+    );
+    assert_eq!(
+        local.settings["amaterasu.stream-session"]["allow_remote"],
+        false
+    );
     assert_eq!(local.settings["amaterasu.input"]["allow_injection"], true);
-    assert_eq!(local.settings["amaterasu.input"]["windows_backend"], "vhf_companion");
+    assert_eq!(
+        local.settings["amaterasu.input"]["windows_backend"],
+        "vhf_companion"
+    );
     assert_eq!(remote.settings["amaterasu.nvhttp"]["allow_remote"], true);
     assert_eq!(remote.settings["amaterasu.rtsp"]["allow_remote"], true);
-    assert_eq!(remote.settings["amaterasu.media-transport"]["allow_remote"], true);
-    assert_eq!(remote.settings["amaterasu.control-transport"]["allow_remote"], true);
-    assert_eq!(remote.settings["amaterasu.stream-session"]["allow_remote"], true);
+    assert_eq!(
+        remote.settings["amaterasu.media-transport"]["allow_remote"],
+        true
+    );
+    assert_eq!(
+        remote.settings["amaterasu.control-transport"]["allow_remote"],
+        true
+    );
+    assert_eq!(
+        remote.settings["amaterasu.stream-session"]["allow_remote"],
+        true
+    );
 
+    assert_eq!(development.settings["amaterasu.nvhttp"]["enabled"], false);
+    // The installed profile still exposes loopback pairing, without streaming.
+    assert_eq!(production.settings["amaterasu.nvhttp"]["enabled"], true);
     for policy in [&development, &production] {
-        assert_eq!(policy.settings["amaterasu.nvhttp"]["enabled"], false);
+        assert!(
+            policy.settings["amaterasu.nvhttp"]
+                .get("streaming")
+                .is_none()
+        );
         assert_eq!(policy.settings["amaterasu.capture-dxgi"]["enabled"], false);
         assert_eq!(policy.settings["amaterasu.video"]["enabled"], false);
-        assert_eq!(policy.settings["amaterasu.stream-session"]["enabled"], false);
+        assert_eq!(
+            policy.settings["amaterasu.stream-session"]["enabled"],
+            false
+        );
     }
-    assert!(local
-        .principals
-        .keys()
-        .all(|principal| principal == "amaterasu.console" || PackageProfile::DesktopStreamSmoke
-            .components()
-            .iter()
-            .any(|component| component.id == principal.as_str())));
+    assert!(local.principals.keys().all(|principal| {
+        principal == "amaterasu.console"
+            || PackageProfile::DesktopStreamSmoke
+                .components()
+                .iter()
+                .any(|component| component.id == principal.as_str())
+    }));
     assert!(!local.principals.contains_key(STEAM.id));
     assert!(!local.principals.contains_key(PLAYNITE.id));
     assert!(!local.principals.contains_key(LUTRIS.id));
