@@ -479,7 +479,9 @@ fn streaming_settings(options: &LinuxSessionOptions) -> Value {
         "capture": {
             "capture_provider": "pipewire",
             "output": "portal-selected-session-source",
-            "encoder": "auto",
+            // NVHTTP's bootstrap schema selects encoders with a numeric ID;
+            // zero delegates encoder choice to its runtime probe.
+            "encoder": 0,
             "audio_endpoint": options.audio_endpoint,
         },
         "profile": {

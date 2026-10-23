@@ -189,3 +189,10 @@ fn stream_session_opens_portal_capture_only_through_video() {
         json!([VIDEO_COMPONENT_ID])
     );
 }
+
+#[test]
+fn linux_profile_uses_numeric_nvhttp_encoder_selection() {
+    let encoder = &streaming_settings(&LinuxSessionOptions::default())["capture"]["encoder"];
+    assert!(encoder.is_number());
+    assert_eq!(encoder, &json!(0));
+}
