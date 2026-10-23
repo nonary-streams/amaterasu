@@ -404,7 +404,11 @@ impl ManagedModule for NvhttpModule {
                     }
                 }
             }
-            for (id, reply) in router.poll(&self.runtime) {
+            for (id, reply) in router.poll_with_trust(&self.runtime, |certificate| {
+                self.identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.trusted(certificate))
+            }) {
                 let accepted = server.respond_checked(id, reply, |certificate| {
                     self.identity
                         .as_ref()

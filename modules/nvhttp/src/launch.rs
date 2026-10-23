@@ -872,10 +872,7 @@ impl Controller {
             || !matches!(request.audio_channels, 2 | 6 | 8)
             || (request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
             || (request.audio_channels == 8 && config.profile.audio_bitrate < 512_000)
-            || request
-                .device_name
-                .as_deref()
-                .is_some_and(|name| !valid_device_name(name))
+            || request.device_name.as_deref().is_some_and(|name| !valid_device_name(name))
         {
             return Some(private_error(400, "unsupported streaming request"));
         }
@@ -886,15 +883,10 @@ impl Controller {
             record.request.remote_input_key == request.remote_input_key
                 && (record.peer != *peer || record.request != request)
         }) {
-            return Some(private_error(
-                409,
-                "launch key conflicts with an existing request",
-            ));
+            return Some(private_error(409, "launch key conflicts with an existing request"));
         }
         let Some(record) = self.records.values_mut().find(|record| {
-            record.desktop
-                && record.peer.certificate == peer.certificate
-                && record.state == State::Ready
+            record.desktop && record.peer.certificate == peer.certificate && record.state == State::Ready
         }) else {
             return Some(private_error(404, "live Desktop session was not found"));
         };
@@ -918,7 +910,17 @@ impl Controller {
             .map_or(0, |record| record.request.app_id)
     }
 
+    #[cfg(test)]
     pub fn poll(&mut self, now: Instant, send: &mut Send<'_>) -> Vec<(u64, Reply)> {
+        self.poll_with_trust(now, send, |_| true)
+    }
+
+    pub fn poll_with_trust(
+        &mut self,
+        now: Instant,
+        send: &mut Send<'_>,
+        mut trusted: impl FnMut(&[u8]) -> bool,
+    ) -> Vec<(u64, Reply)> {
         let mut replies = Vec::new();
         if let Some(mut job) = self.job.take() {
             self.advance(&mut job, now, send, &mut replies);
@@ -937,29 +939,41 @@ impl Controller {
                 .get(&pending.record)
                 .is_some_and(|record| record.state == State::Stopped)
             {
-                if let Some(old_record) = self.records.get_mut(&pending.record)
-                    && old_record.request.remote_input_key == pending.request.remote_input_key
-                {
-                    // A resumed RTSP ticket may legitimately reuse Moonlight's key.
-                    // The old record is terminal and no longer owns live input.
-                    old_record.request.remote_input_key = [0; 16];
-                }
-                if let Some(reply) =
-                    self.launch(pending.connection, pending.request, pending.peer, now)
-                {
-                    replies.push((pending.connection, reply));
-                } else if let Some(record) = self
+                let resume_trusted = self
                     .records
-                    .values_mut()
-                    .find(|record| record.launch_connection == Some(pending.connection))
-                {
-                    record.resumed = true;
+                    .get(&pending.record)
+                    .is_some_and(|record| !record.revoked && trusted(&pending.peer.certificate));
+                if !resume_trusted {
+                    if let Some(record) = self.records.get_mut(&pending.record) {
+                        record.revoked = true;
+                    }
+                    replies.push((
+                        pending.connection,
+                        private_error(401, "paired client is no longer trusted"),
+                    ));
+                } else {
+                    if let Some(old_record) = self.records.get_mut(&pending.record)
+                        && old_record.request.remote_input_key == pending.request.remote_input_key
+                    {
+                        // A resumed RTSP ticket may legitimately reuse Moonlight's key.
+                        // The old record is terminal and no longer owns live input.
+                        old_record.request.remote_input_key = [0; 16];
+                    }
+                    if let Some(reply) = self.launch(
+                        pending.connection,
+                        pending.request,
+                        pending.peer,
+                        now,
+                    ) {
+                        replies.push((pending.connection, reply));
+                    } else if let Some(record) = self.records.values_mut().find(|record| {
+                        record.launch_connection == Some(pending.connection)
+                    }) {
+                        record.resumed = true;
+                    }
                 }
             } else {
-                replies.push((
-                    pending.connection,
-                    private_error(503, "Desktop cleanup failed"),
-                ));
+                replies.push((pending.connection, private_error(503, "Desktop cleanup failed")));
             }
         }
         replies
@@ -989,11 +1003,7 @@ impl Controller {
     }
 
     pub fn connection_closed(&mut self, connection: u64, now: Instant) {
-        if self
-            .pending_resume
-            .as_ref()
-            .is_some_and(|pending| pending.connection == connection)
-        {
+        if self.pending_resume.as_ref().is_some_and(|pending| pending.connection == connection) {
             self.pending_resume = None;
         }
         let mut affected = None;
@@ -1023,6 +1033,14 @@ impl Controller {
         mut trusted: impl FnMut(&[u8]) -> bool,
     ) -> Vec<u64> {
         let mut close = Vec::new();
+        if self
+            .pending_resume
+            .as_ref()
+            .is_some_and(|pending| !trusted(&pending.peer.certificate))
+            && let Some(pending) = self.pending_resume.take()
+        {
+            close.push(pending.connection);
+        }
         let mut affected = Vec::new();
         for record in self.records.values_mut() {
             if !record.state.terminal() && !record.revoked && !trusted(&record.peer.certificate) {

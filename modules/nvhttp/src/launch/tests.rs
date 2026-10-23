@@ -1592,6 +1592,39 @@ fn poll_until_reply(
     panic!("lifecycle did not produce a bounded reply")
 }
 
+fn poll_until_reply_with_trust(
+    controller: &mut Controller,
+    broker: &mut Broker,
+    now: Instant,
+    mut trusted: impl FnMut(&[u8]) -> bool,
+) -> (u64, Reply) {
+    for _ in 0..32 {
+        let replies = controller.poll_with_trust(
+            now,
+            &mut |command| broker.send(command),
+            &mut trusted,
+        );
+        if let Some(reply) = replies.into_iter().next() {
+            return reply;
+        }
+    }
+    panic!("trusted lifecycle did not produce a bounded reply")
+}
+
+fn poll_until_stopped(controller: &mut Controller, broker: &mut Broker, now: Instant, id: u64) {
+    for _ in 0..32 {
+        if controller
+            .records
+            .get(&id)
+            .is_some_and(|record| record.state == State::Stopped)
+        {
+            return;
+        }
+        controller.poll(now, &mut |command| broker.send(command));
+    }
+    panic!("cleanup did not reach Stopped")
+}
+
 fn launch_ready(controller: &mut Controller, broker: &mut Broker, now: Instant) {
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (connection, reply) = poll_until_reply(controller, broker, now);
@@ -1650,15 +1683,135 @@ fn desktop_resume_retires_rtsp_then_opens_a_fresh_ticket_without_app_calls() {
     let mut resumed = request(93);
     resumed.app_id = DESKTOP_APP_ID;
     assert!(controller.resume(94, resumed, &client, now).is_none());
-    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    let (connection, reply) =
+        poll_until_reply_with_trust(&mut controller, &mut broker, now, |_| true);
     assert_eq!(connection, 94);
     assert_eq!(reply.status, 200);
-    assert!(String::from_utf8(reply.body).unwrap().contains("<resume>1</resume>"));
-    let opens = broker.actions().iter()
+    assert!(
+        String::from_utf8(reply.body)
+            .unwrap()
+            .contains("<resume>1</resume>")
+    );
+    let opens = broker
+        .actions()
+        .iter()
         .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
         .count();
     assert_eq!(opens, 2);
-    assert!(!broker.actions().iter().any(|(service, _)| *service == "amaterasu.launch/1"));
+    assert!(
+        !broker
+            .actions()
+            .iter()
+            .any(|(service, _)| *service == "amaterasu.launch/1")
+    );
+}
+
+#[test]
+fn revoked_pending_desktop_resume_is_closed_before_stopped_without_reopening_rtsp() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let client = peer(95);
+    let mut first = request(95);
+    first.app_id = DESKTOP_APP_ID;
+    assert!(controller.launch(95, first, client.clone(), now).is_none());
+    let (connection, _) = poll_until_reply(&mut controller, &mut broker, now);
+    controller.reply_delivered(connection, now);
+    let opens_before_resume = broker
+        .actions()
+        .iter()
+        .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+        .count();
+    assert_eq!(opens_before_resume, 1);
+
+    let mut resumed = request(95);
+    resumed.app_id = DESKTOP_APP_ID;
+    assert!(controller.resume(96, resumed, &client, now).is_none());
+    let closed = controller.revoke_untrusted(now, |_| false);
+    assert_eq!(closed, vec![96]);
+    assert!(controller.pending_resume.is_none());
+    poll_until_stopped(&mut controller, &mut broker, now, 1);
+    assert!(controller.records.get(&1).unwrap().revoked);
+    let opens_after_revoke = broker
+        .actions()
+        .iter()
+        .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+        .count();
+    assert_eq!(opens_after_revoke, opens_before_resume);
+}
+
+#[test]
+fn deferred_desktop_resume_revalidates_current_certificate_trust() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let client = peer(97);
+    let mut first = request(97);
+    first.app_id = DESKTOP_APP_ID;
+    assert!(controller.launch(97, first, client.clone(), now).is_none());
+    let (connection, _) = poll_until_reply(&mut controller, &mut broker, now);
+    controller.reply_delivered(connection, now);
+
+    let mut resumed = request(97);
+    resumed.app_id = DESKTOP_APP_ID;
+    assert!(controller.resume(98, resumed, &client, now).is_none());
+    let (connection, reply) =
+        poll_until_reply_with_trust(&mut controller, &mut broker, now, |_| false);
+    assert_eq!(connection, 98);
+    assert_eq!(reply.status, 401);
+    assert!(controller.records.get(&1).unwrap().revoked);
+    assert_eq!(
+        broker
+            .actions()
+            .iter()
+            .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn duplicate_resume_cancel_and_repeated_revocation_are_idempotent() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let client = peer(99);
+    let mut first = request(99);
+    first.app_id = DESKTOP_APP_ID;
+    assert!(controller.launch(99, first, client.clone(), now).is_none());
+    let (connection, _) = poll_until_reply(&mut controller, &mut broker, now);
+    controller.reply_delivered(connection, now);
+
+    let mut resumed = request(99);
+    resumed.app_id = DESKTOP_APP_ID;
+    assert!(controller.resume(100, resumed.clone(), &client, now).is_none());
+    assert_eq!(
+        controller.resume(101, resumed, &client, now).unwrap().status,
+        409
+    );
+    assert!(controller.pending_resume.is_some());
+    assert!(controller.cancel(102, &client, now).is_none());
+    assert!(controller.pending_resume.is_none());
+
+    let first_revocation = controller.revoke_untrusted(now, |_| false);
+    assert_eq!(first_revocation, vec![102]);
+    let repeated_revocation = controller.revoke_untrusted(now, |_| false);
+    assert!(repeated_revocation.is_empty());
+    poll_until_stopped(&mut controller, &mut broker, now, 1);
+    assert_eq!(
+        broker
+            .actions()
+            .iter()
+            .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+            .count(),
+        1
+    );
 }
 
 #[test]

@@ -413,19 +413,42 @@ impl Router {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn poll(&mut self, runtime: &RuntimeClient) -> Vec<(u64, Reply)> {
         self.poll_with(Instant::now(), &mut |command| {
             runtime.send_ephemeral(command)
         })
     }
 
+    pub fn poll_with_trust(
+        &mut self,
+        runtime: &RuntimeClient,
+        trusted: impl FnMut(&[u8]) -> bool,
+    ) -> Vec<(u64, Reply)> {
+        self.poll_with_identity(
+            Instant::now(),
+            &mut |command| runtime.send_ephemeral(command),
+            trusted,
+        )
+    }
+
+    #[cfg(test)]
     fn poll_with(
         &mut self,
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> Vec<(u64, Reply)> {
+        self.poll_with_identity(now, send, |_| true)
+    }
+
+    fn poll_with_identity(
+        &mut self,
+        now: Instant,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+        trusted: impl FnMut(&[u8]) -> bool,
+    ) -> Vec<(u64, Reply)> {
         self.poll_cancellations(now, send);
-        let mut replies = self.launches.poll(now, send);
+        let mut replies = self.launches.poll_with_trust(now, send, trusted);
         let keys: Vec<_> = self.jobs.keys().copied().collect();
         for key in keys {
             let Some(mut job) = self.jobs.remove(&key) else {
