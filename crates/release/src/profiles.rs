@@ -424,6 +424,18 @@ const VIDEO: ComponentDefinition = ComponentDefinition {
         "amaterasu.encode",
     ],
 };
+
+/// Current-user XDG Desktop Portal capture through a restricted PipeWire remote.
+const CAPTURE_PIPEWIRE: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.capture-pipewire",
+    library: "amaterasu_capture_pipewire",
+    provides: &["amaterasu.capture-pipewire/1"],
+    calls: &[],
+    publishes: &[],
+    native_provides: &["amaterasu.capture-pipewire/1"],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
+};
 const MEDIA_TRANSPORT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.media-transport",
     library: "amaterasu_media_transport",

@@ -1,6 +1,6 @@
 //! The Linux session product profile.
 //!
-//! This composition carries the real input, audio, KMS capture, virtual display
+//! This composition carries the real input, audio, portal capture, virtual display
 //! and encoder libraries so a Moonlight client can reach a Linux host. It is
 //! separate from `LinuxProbe`, which holds qualification fixtures, and from
 //! `Platform`, which is the Windows product. Every effect-bearing component
@@ -16,10 +16,10 @@ pub mod options;
 mod tests;
 
 use super::{
-    APPLICATION, AUDIO, AUDIO_ENCODE, AUTHENTICATION, CAPTURE_KMS, CATALOG, CONFIGURATION,
-    CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, FRAME_LIMITER, HOST_METRICS, INPUT,
-    LAUNCH, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NVHTTP, PAIRING, RTSP, RUNTIME, RUNTIME_ID,
-    SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO, VIRTUAL_DISPLAY, names,
+    APPLICATION, AUDIO, AUDIO_ENCODE, AUTHENTICATION, CAPTURE_PIPEWIRE, CATALOG, CONFIGURATION,
+    CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, FRAME_LIMITER, INPUT, LAUNCH, LUTRIS,
+    MANAGEMENT, MEDIA_TRANSPORT, NVHTTP, PAIRING, RTSP, RUNTIME, RUNTIME_ID, SESSION,
+    SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO, VIRTUAL_DISPLAY, names,
 };
 use amaterasu_contracts::{Grants, RuntimeConfig};
 use amaterasu_package::{PackageResult, create_private_directory};
@@ -32,13 +32,13 @@ use std::path::Path;
 /// development policy holds 4 and the installer policy 3. Advance this whenever
 /// the administrator principals or the allowed scopes below
 /// change, including a revert. TTL-only edits do not bump it.
-pub const AUTHORIZATION_POLICY_GENERATION: u64 = 5;
+pub const AUTHORIZATION_POLICY_GENERATION: u64 = 6;
 
 pub const ADMINISTRATOR_PRINCIPALS: [&str; 2] = ["amaterasu.console", "amaterasu.management"];
 
-/// Management scopes without the diagnostics scopes (that component is absent)
-/// and without the portal capture scopes (no portal capture in this profile).
-pub const ALLOWED_SCOPES: [&str; 16] = [
+/// Management scopes without diagnostics; capture scopes authorize the
+/// current user's explicit XDG Desktop Portal source selection.
+pub const ALLOWED_SCOPES: [&str; 18] = [
     "catalog.read",
     "catalog.write",
     "configuration.read",
@@ -54,6 +54,8 @@ pub const ALLOWED_SCOPES: [&str; 16] = [
     "pairing.admin",
     "display.read",
     "display.write",
+    "capture.read",
+    "capture.write",
     "media.read",
 ];
 
@@ -99,13 +101,12 @@ const LINUX_SESSION_LAUNCH: ComponentDefinition = ComponentDefinition {
     ..LAUNCH
 };
 
-/// The video module offering only the KMS provider, whose capture-kms library
-/// serves both physical outputs and managed virtual outputs.
+/// The profile's only video source is a current-user ScreenCast portal stream.
 const LINUX_SESSION_VIDEO: ComponentDefinition = ComponentDefinition {
     id: VIDEO_COMPONENT_ID,
-    calls: &["amaterasu.capture-kms/1", "amaterasu.encode/1"],
-    native_uses: &["amaterasu.capture-kms/1", "amaterasu.encode/1"],
-    dependencies: &[RUNTIME_ID, "amaterasu.capture-kms", "amaterasu.encode"],
+    calls: &["amaterasu.capture-pipewire/1", "amaterasu.encode/1"],
+    native_uses: &["amaterasu.capture-pipewire/1", "amaterasu.encode/1"],
+    dependencies: &[RUNTIME_ID, "amaterasu.capture-pipewire", "amaterasu.encode"],
     ..VIDEO
 };
 
@@ -114,7 +115,7 @@ const LINUX_SESSION_VIDEO: ComponentDefinition = ComponentDefinition {
 // NVHTTP, RTSP, and the stream session as well as on the component that
 // finally calls it:
 //   nvhttp -> rtsp -> stream-session -> video / media-transport / control-transport
-//   video -> encode / capture-kms
+//   video -> encode / current-user PipeWire capture
 //   stream-session -> session / display / virtual-display / input / audio / audio-encode
 //   nvhttp -> launch / catalog / application / session / input / pairing / encode
 const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
@@ -137,7 +138,7 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.audio-encode/1",
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
-        "amaterasu.capture-kms/1",
+        "amaterasu.capture-pipewire/1",
         "amaterasu.encode/1",
     ],
     dependencies: &[
@@ -167,7 +168,7 @@ const LINUX_SESSION_RTSP: ComponentDefinition = ComponentDefinition {
         "amaterasu.audio-encode/1",
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
-        "amaterasu.capture-kms/1",
+        "amaterasu.capture-pipewire/1",
         "amaterasu.encode/1",
     ],
     ..RTSP
@@ -185,10 +186,9 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.audio-encode/1",
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
-        "amaterasu.capture-kms/1",
+        "amaterasu.capture-pipewire/1",
         "amaterasu.encode/1",
         "amaterasu.session-history/1",
-        "amaterasu.host-metrics/1",
         "amaterasu.frame-limiter/1",
     ],
     dependencies: &[
@@ -199,7 +199,6 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.virtual-display",
         "amaterasu.state",
         "amaterasu.session-history",
-        "amaterasu.host-metrics",
         VIDEO_COMPONENT_ID,
         "amaterasu.audio",
         "amaterasu.audio-encode",
@@ -227,8 +226,8 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.pairing/1",
         "amaterasu.display/1",
         "amaterasu.launch/1",
-        // Read-only output enumeration for choosing a capture output.
-        "amaterasu.capture-kms/1",
+        // Authenticated status and explicit current-user portal selection.
+        "amaterasu.capture-pipewire/1",
         "amaterasu.audio/1",
         "amaterasu.audio-encode/1",
         "amaterasu.encode/1",
@@ -240,7 +239,6 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
         "amaterasu.session-history/1",
-        "amaterasu.host-metrics/1",
     ],
     dependencies: &[
         RUNTIME_ID,
@@ -256,7 +254,7 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.pairing",
         "amaterasu.display",
         "amaterasu.launch",
-        "amaterasu.capture-kms",
+        "amaterasu.capture-pipewire",
         "amaterasu.audio",
         "amaterasu.audio-encode",
         "amaterasu.encode",
@@ -266,7 +264,6 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport",
         "amaterasu.control-transport",
         "amaterasu.session-history",
-        "amaterasu.host-metrics",
     ],
     ..MANAGEMENT
 };
@@ -277,7 +274,6 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     SESSION,
     CONFIGURATION,
     SESSION_HISTORY,
-    HOST_METRICS,
     CATALOG,
     APPLICATION,
     STEAM,
@@ -290,7 +286,7 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     LINUX_SESSION_LAUNCH,
     INPUT,
     VIRTUAL_DISPLAY,
-    CAPTURE_KMS,
+    CAPTURE_PIPEWIRE,
     AUDIO,
     AUDIO_ENCODE,
     ENCODE,
@@ -419,15 +415,14 @@ fn settings(
     insert("amaterasu.encode", json!({"enabled": true}));
     insert("amaterasu.audio-encode", json!({"enabled": true}));
 
-    // Effect-bearing components stay disabled until an explicit option.
+    // The portal owns the explicit user-consent prompt. Capture remains
+    // disabled until selected in the portal; video processing is separately
+    // enabled through the profile option.
     insert(
         VIDEO_COMPONENT_ID,
-        json!({"enabled": options.enable_capture, "capture_providers": ["kms"]}),
+        json!({"enabled": options.enable_capture, "capture_providers": ["pipewire"]}),
     );
-    insert(
-        "amaterasu.capture-kms",
-        json!({"enabled": options.enable_capture}),
-    );
+    insert("amaterasu.capture-pipewire", portal_capture_settings());
     insert("amaterasu.audio", json!({"enabled": options.enable_audio}));
     insert(
         "amaterasu.virtual-display",
@@ -451,6 +446,14 @@ fn authentication_settings() -> Value {
         "session_token_ttl_seconds": 7200,
         "remember_me_refresh_token_ttl_seconds": 604800,
         "allowed_scopes": ALLOWED_SCOPES,
+    })
+}
+
+fn portal_capture_settings() -> Value {
+    json!({
+        "enabled": true,
+        "selection_principals": ["amaterasu.management"],
+        "capture_principals": [VIDEO_COMPONENT_ID],
     })
 }
 
@@ -487,8 +490,8 @@ fn nvhttp_settings(options: &LinuxSessionOptions) -> Value {
 fn streaming_settings(options: &LinuxSessionOptions) -> Value {
     json!({
         "capture": {
-            "capture_provider": "kms",
-            "output": options.capture_output,
+            "capture_provider": "pipewire",
+            "output": "portal-selected-session-source",
             "encoder": "auto",
             "audio_endpoint": options.audio_endpoint,
         },

@@ -15,12 +15,8 @@ pub const MIN_BASE_PORT: u16 = 1_029;
 pub const MAX_BASE_PORT: u16 = 65_514;
 const HTTPS_PORT_OFFSET: u16 = 5;
 const RTSP_PORT_OFFSET: u16 = 21;
-const MAX_CAPTURE_OUTPUT_BYTES: usize = 512;
 const MAX_AUDIO_ENDPOINT_BYTES: usize = 4096;
 
-/// The default KMS output label. It deliberately matches no physical output, so
-/// physical capture stays unavailable until the operator names one.
-pub const DEFAULT_CAPTURE_OUTPUT: &str = "amaterasu-managed-output";
 /// The default audio endpoint selector passed through to the audio module.
 pub const DEFAULT_AUDIO_ENDPOINT: &str = "default";
 
@@ -264,9 +260,8 @@ pub struct LinuxSessionOptions {
     pub catalog_owner: CatalogOwner,
     /// Enables the loopback management listener on this port.
     pub management_port: Option<u16>,
-    pub capture_output: String,
     pub audio_endpoint: String,
-    /// Enables the video module and KMS capture.
+    /// Enables video streams after portal source selection.
     pub enable_capture: bool,
     /// Enables host audio capture.
     pub enable_audio: bool,
@@ -284,7 +279,6 @@ impl Default for LinuxSessionOptions {
             network: NetworkOption::default(),
             catalog_owner: CatalogOwner::default(),
             management_port: None,
-            capture_output: DEFAULT_CAPTURE_OUTPUT.into(),
             audio_endpoint: DEFAULT_AUDIO_ENDPOINT.into(),
             enable_capture: false,
             enable_audio: false,
@@ -324,14 +318,6 @@ impl LinuxSessionOptions {
                         &mut arguments,
                         "--management-port",
                     )?)?);
-                }
-                "--capture-output" => {
-                    seen.once("--capture-output")?;
-                    options.capture_output = label(
-                        required_value(&mut arguments, "--capture-output")?,
-                        "--capture-output",
-                        MAX_CAPTURE_OUTPUT_BYTES,
-                    )?;
                 }
                 "--audio-endpoint" => {
                     seen.once("--audio-endpoint")?;
