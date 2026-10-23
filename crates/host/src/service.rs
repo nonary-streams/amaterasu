@@ -319,7 +319,7 @@ pub(crate) fn run_managed_service(
     let mut restarts = 0;
     let mut worker = start_with_recovery(root, &digest, &mut restarts, false)?;
     #[cfg(target_os = "linux")]
-    linux_input.refresh(root, &digest, worker.child.id())?;
+    linux_input.refresh(root, &digest, worker.child.id(), worker.creation_time)?;
     publish_service_readiness(root, &digest)?;
     on_started();
 
@@ -331,7 +331,7 @@ pub(crate) fn run_managed_service(
             worker = restart(root, &digest, &mut restarts, false)?;
         }
         #[cfg(target_os = "linux")]
-        linux_input.refresh(root, &digest, worker.child.id())?;
+        linux_input.refresh(root, &digest, worker.child.id(), worker.creation_time)?;
         std::thread::sleep(Duration::from_millis(20));
     }
     #[cfg(target_os = "linux")]
@@ -410,6 +410,8 @@ fn write_reply(value: &impl serde::Serialize) -> PackageResult<()> {
 
 struct Worker {
     child: Child,
+    #[cfg(target_os = "linux")]
+    creation_time: u64,
     input: Option<ChildStdin>,
     output: Receiver<Result<String, String>>,
     last_heartbeat: Instant,
@@ -432,10 +434,21 @@ impl Worker {
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "linux")]
+        let creation_time = match crate::linux_input::process_starttime(child.id()) {
+            Ok(starttime) => starttime,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         let input = child.stdin.take();
         let stdout = child.stdout.take().ok_or("worker stdout missing")?;
         let mut worker = Self {
             child,
+            #[cfg(target_os = "linux")]
+            creation_time,
             input,
             output: crate::protocol::lines(stdout),
             last_heartbeat: Instant::now(),

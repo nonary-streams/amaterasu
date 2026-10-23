@@ -59,14 +59,21 @@ impl Supervisor {
 
     /// Refresh at most once per second, including a re-read of the host policy.
     /// The companion expires a permit if refreshes cease for two seconds.
-    pub(crate) fn refresh(&mut self, root: &Path, digest: &str, pid: u32) -> PackageResult<()> {
-        let (Some(policy), Some(service)) = (&self.policy, &self.service) else {
+    pub(crate) fn refresh(
+        &mut self,
+        root: &Path,
+        digest: &str,
+        pid: u32,
+        starttime: u64,
+    ) -> PackageResult<()> {
+        let (Some(policy), Some(_)) = (&self.policy, &self.service) else {
             return Ok(());
         };
-        if self.worker.is_some() && self.last_refresh.elapsed() < REFRESH_INTERVAL {
+        let policy = policy.clone();
+        if self.worker == Some((pid, starttime)) && self.last_refresh.elapsed() < REFRESH_INTERVAL {
             return Ok(());
         }
-        if CompanionPolicy::load(root, digest)?.as_ref() != Some(policy) {
+        if CompanionPolicy::load(root, digest)?.as_ref() != Some(&policy) {
             self.revoke();
             return Err("Linux input companion policy changed; worker permit revoked".into());
         }
@@ -75,11 +82,14 @@ impl Supervisor {
             self.revoke();
             return Err("Linux input companion selected set changed; worker permit revoked".into());
         }
-        let starttime = match self.worker {
-            Some((known_pid, starttime)) if known_pid == pid => starttime,
-            _ => process_starttime(pid)?,
-        };
+        if self.worker.is_some() && self.worker != Some((pid, starttime)) {
+            self.revoke();
+        }
         let (keyboard, mouse) = policy.capabilities();
+        let service = self
+            .service
+            .as_ref()
+            .ok_or("Linux input companion permit service was revoked")?;
         if let Err(error) = service.authorize_worker(pid, starttime, digest, keyboard, mouse) {
             self.revoke();
             return Err(format!(
@@ -142,7 +152,7 @@ fn default_socket_path() -> PackageResult<PathBuf> {
     )))
 }
 
-fn process_starttime(pid: u32) -> PackageResult<u64> {
+pub(crate) fn process_starttime(pid: u32) -> PackageResult<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .map_err(|error| format!("cannot read supervised worker identity: {error}"))?;
     parse_starttime(&stat)
@@ -162,7 +172,7 @@ fn parse_starttime(stat: &str) -> PackageResult<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Supervisor, parse_starttime};
+    use super::{Supervisor, parse_starttime, process_starttime};
 
     #[test]
     fn stat_parser_handles_parentheses_in_process_name() {
@@ -171,6 +181,7 @@ mod tests {
         let stat = format!("42 (worker ) name) {}", fields.join(" "));
         assert_eq!(parse_starttime(&stat).unwrap(), 12345);
         assert!(parse_starttime("42 (missing) S").is_err());
+        assert!(process_starttime(std::process::id()).unwrap() > 0);
     }
 
     #[test]
