@@ -993,6 +993,26 @@ fn validate_virtual_mix(
     Ok(())
 }
 
+/// Ordinary endpoint loopback needs a stable format for the media pipeline.
+/// Ask shared-mode WASAPI to convert the endpoint mix to 48 kHz float while
+/// retaining its supported speaker layout. Explicit virtual sinks keep their
+/// separately selected device format path below.
+fn loopback_capture_format(mix: &MixFormat) -> AudioResult<(Format, WAVEFORMATEXTENSIBLE)> {
+    let (channels, channel_mask) = mix.channel_layout()?;
+    let mut format = Format::new(48_000, channels, PCM_F32)?;
+    format.channel_mask = channel_mask;
+    Ok((
+        format,
+        virtual_waveformat(
+            VirtualFormatCandidate {
+                sample_format: VirtualSampleFormat::Float32,
+                channel_mask,
+            },
+            channels,
+        ),
+    ))
+}
+
 fn virtual_mix_error(error: &'static str, recovering: bool) -> &'static str {
     if recovering {
         "virtual_sink_format_changed"
@@ -1024,6 +1044,57 @@ pub struct Capture {
     _virtual_format_lease: Option<VirtualFormatLease>,
     _route_lease: RouteLease,
     _apartment: Apartment,
+}
+
+trait CaptureInitializer {
+    type Capture;
+
+    fn initialize(&mut self, stream_flags: u32, format: &mut WAVEFORMATEX) -> AudioResult<()>;
+    fn get_capture(&mut self) -> AudioResult<Self::Capture>;
+    fn start(&mut self) -> AudioResult<()>;
+}
+
+impl CaptureInitializer for IAudioClient {
+    type Capture = IAudioCaptureClient;
+
+    fn initialize(&mut self, stream_flags: u32, format: &mut WAVEFORMATEX) -> AudioResult<()> {
+        // SAFETY: format belongs to the caller and remains live through this
+        // synchronous shared-mode loopback initialization call.
+        unsafe {
+            IAudioClient::Initialize(
+                self,
+                AUDCLNT_SHAREMODE_SHARED,
+                stream_flags,
+                1_000_000,
+                0,
+                format,
+                None,
+            )
+            .map_err(|_| "audio_initialize_failed")
+        }
+    }
+
+    fn get_capture(&mut self) -> AudioResult<Self::Capture> {
+        IAudioClient::GetService(self).map_err(|_| "audio_capture_unavailable")
+    }
+
+    fn start(&mut self) -> AudioResult<()> {
+        IAudioClient::Start(self).map_err(|_| "audio_start_failed")
+    }
+}
+
+/// Consume the newly activated client so every failed initialization or
+/// startup step drops its COM reference and any capture service acquired so
+/// far. Returning the owner transfers both references into `Capture`.
+fn initialize_capture<C: CaptureInitializer>(
+    mut client: C,
+    format: &mut WAVEFORMATEX,
+    stream_flags: u32,
+) -> AudioResult<(C, C::Capture)> {
+    client.initialize(stream_flags, format)?;
+    let capture = client.get_capture()?;
+    client.start()?;
+    Ok((client, capture))
 }
 
 fn validate_render_device(device: &IMMDevice) -> AudioResult<()> {
@@ -1237,35 +1308,15 @@ impl Capture {
                     );
                     Some((format, waveformat))
                 }
-                (None, None) => None,
+                (None, None) => Some(loopback_capture_format(&mix)?),
                 _ => return Err("virtual_sink_format_unavailable"),
             };
-            let format = match &capture_format {
-                Some((format, _)) => *format,
-                None => mix.describe()?,
-            };
+            let (format, waveformat) = capture_format.as_mut().ok_or("unsupported_format")?;
             let mut stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK;
-            let format_pointer = if let Some((_, waveformat)) = capture_format.as_mut() {
-                stream_flags |=
-                    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-                &mut waveformat.Format as *mut WAVEFORMATEX
-            } else {
-                mix.0
-            };
-            client
-                .Initialize(
-                    AUDCLNT_SHAREMODE_SHARED,
-                    stream_flags,
-                    1_000_000,
-                    0,
-                    format_pointer,
-                    None,
-                )
-                .map_err(|_| "audio_initialize_failed")?;
-            let capture = client
-                .GetService()
-                .map_err(|_| "audio_capture_unavailable")?;
-            client.Start().map_err(|_| "audio_start_failed")?;
+            stream_flags |=
+                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+            let (client, capture) =
+                initialize_capture(client, &mut waveformat.Format, stream_flags)?;
             let recovery_config = RecoveryConfig {
                 endpoint: endpoint.clone(),
                 follow_console_default,
@@ -1282,7 +1333,7 @@ impl Capture {
                 route_virtual_sink,
                 next_endpoint_check: Instant::now() + DEFAULT_ENDPOINT_POLL_INTERVAL,
                 buffer_errors: BufferErrorStreak::default(),
-                format,
+                format: *format,
                 timeline: Timeline::new(),
                 recovery_config,
                 _virtual_format_lease: virtual_format_lease,
@@ -1576,7 +1627,130 @@ impl BufferErrorStreak {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    fn endpoint_mix(
+        sample_rate: u32,
+        channels: u16,
+        container_bits: u16,
+        valid_bits: u16,
+        channel_mask: u32,
+    ) -> WAVEFORMATEXTENSIBLE {
+        let block_align = channels * container_bits / 8;
+        WAVEFORMATEXTENSIBLE {
+            Format: WAVEFORMATEX {
+                wFormatTag: 0xfffe,
+                nChannels: channels,
+                nSamplesPerSec: sample_rate,
+                nAvgBytesPerSec: sample_rate * u32::from(block_align),
+                nBlockAlign: block_align,
+                wBitsPerSample: container_bits,
+                cbSize: 22,
+            },
+            Samples: WAVEFORMATEXTENSIBLE_0 {
+                wValidBitsPerSample: valid_bits,
+            },
+            dwChannelMask: channel_mask,
+            SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
+        }
+    }
+
+    fn assert_loopback_float_target(mix: &mut WAVEFORMATEXTENSIBLE, channels: u32, mask: u32) {
+        // This descriptor borrows test storage; ManuallyDrop avoids freeing it
+        // as if it came from COM's GetMixFormat allocation.
+        let descriptor = std::mem::ManuallyDrop::new(MixFormat((mix as *mut _).cast()));
+        let (format, target) = loopback_capture_format(&descriptor).unwrap();
+        assert_eq!(
+            (
+                format.sample_rate,
+                format.channels,
+                format.channel_mask,
+                format.code()
+            ),
+            (48_000, channels, mask, PCM_F32)
+        );
+        assert_eq!(
+            (
+                target.Format.nSamplesPerSec,
+                target.Format.nChannels,
+                target.Format.wBitsPerSample,
+                target.dwChannelMask,
+                target.SubFormat,
+            ),
+            (
+                48_000,
+                channels as u16,
+                32,
+                mask,
+                KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+            )
+        );
+    }
+
+    struct FailingCaptureInitializer {
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl CaptureInitializer for FailingCaptureInitializer {
+        type Capture = ();
+
+        fn initialize(&mut self, _: u32, _: &mut WAVEFORMATEX) -> AudioResult<()> {
+            Err("audio_initialize_failed")
+        }
+
+        fn get_capture(&mut self) -> AudioResult<Self::Capture> {
+            panic!("capture service must not be requested after failed initialization")
+        }
+
+        fn start(&mut self) -> AudioResult<()> {
+            panic!("client must not start after failed initialization")
+        }
+    }
+
+    impl Drop for FailingCaptureInitializer {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    #[test]
+    fn ordinary_loopback_converts_44100_hz_mix_to_supported_48khz_float() {
+        let mut mix = endpoint_mix(44_100, 2, 16, 16, 0x0003);
+        assert_loopback_float_target(&mut mix, 2, 0x0003);
+    }
+
+    #[test]
+    fn ordinary_loopback_converts_24bit_mix_and_preserves_six_channel_layout() {
+        let mut mix = endpoint_mix(48_000, 6, 24, 24, 0x003f);
+        assert_loopback_float_target(&mut mix, 6, 0x003f);
+    }
+
+    #[test]
+    fn failed_wasapi_initialization_drops_new_capture_client() {
+        let mut format = virtual_waveformat(
+            VirtualFormatCandidate {
+                sample_format: VirtualSampleFormat::Float32,
+                channel_mask: 0x0003,
+            },
+            2,
+        );
+        let drops = Rc::new(Cell::new(0));
+        let client = FailingCaptureInitializer {
+            drops: Rc::clone(&drops),
+        };
+        let result = initialize_capture(
+            client,
+            &mut format.Format,
+            AUDCLNT_STREAMFLAGS_LOOPBACK
+                | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+        );
+        assert!(matches!(result, Err("audio_initialize_failed")));
+        assert_eq!(drops.get(), 1, "failed initialization releases client");
+    }
 
     #[test]
     fn route_retry_lifecycle_preserves_peer_and_rearms_after_final_release() {
