@@ -42,6 +42,7 @@ impl LoadedComponents {
         state_root: &Path,
         progress: &mut dyn FnMut(usize) -> PackageResult<()>,
     ) -> PackageResult<Self> {
+        crate::privilege::require_user_process()?;
         let runtime_component = package
             .manifest
             .components

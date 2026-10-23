@@ -25,6 +25,11 @@ pub fn resolve(path: &str) -> Option<Route> {
             "settings_update",
             Some("configuration.write"),
         ),
+        ("repositories", "list") => (
+            "amaterasu.management/1",
+            "repository_list",
+            Some("configuration.read"),
+        ),
         ("catalog", action) => (
             "amaterasu.catalog/1",
             catalog_action(action)?,

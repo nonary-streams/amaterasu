@@ -2,11 +2,15 @@
 mod interactive_worker;
 mod loading;
 mod logging_config;
+mod native_recovery;
+mod privilege;
 mod protocol;
+mod publisher_selection;
 mod service;
 #[cfg(windows)]
 mod state_root;
 mod supervisor;
+mod web_recovery;
 #[cfg(windows)]
 mod windows_service;
 mod worker;
@@ -33,6 +37,18 @@ fn run() -> PackageResult<()> {
         [command, root] if command == "operational-ready" => {
             service::probe_operational_readiness(Path::new(root))?;
             println!("operationally ready");
+        }
+        [command, root] if command == "web-recovery-status" => {
+            web_recovery::status(Path::new(root))?;
+        }
+        [command, root, digest] if command == "web-recover" => {
+            web_recovery::restore(Path::new(root), digest)?;
+        }
+        [command, root] if command == "native-recover" => {
+            native_recovery::restore(Path::new(root), None)?;
+        }
+        [command, root, digest] if command == "native-recover" => {
+            native_recovery::restore(Path::new(root), Some(digest))?;
         }
         [command, root, digest] if command == "worker-serve" => {
             worker::serve(Path::new(root), digest)?;
@@ -65,7 +81,7 @@ fn run() -> PackageResult<()> {
         }
         _ => {
             return Err(
-                "usage: amaterasu probe ROOT [CONTROL_MESSAGE_JSON] | service-ready ROOT | operational-ready ROOT | serve ROOT | service ROOT"
+                "usage: amaterasu probe ROOT [CONTROL_MESSAGE_JSON] | service-ready ROOT | operational-ready ROOT | web-recovery-status ROOT | web-recover ROOT DIGEST | native-recover ROOT [DIGEST] | serve ROOT | service ROOT"
                     .into(),
             );
         }

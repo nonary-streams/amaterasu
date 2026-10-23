@@ -1,5 +1,6 @@
 //! Caller-owned keyboard, mouse, and capability-gated gamepad input with leases.
 mod backend;
+pub mod companion_client;
 mod controller;
 #[cfg(any(target_os = "linux", windows, test))]
 mod gamepad;

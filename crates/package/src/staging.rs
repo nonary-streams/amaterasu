@@ -50,7 +50,7 @@ fn read_selection(path: &Path) -> PackageResult<ActivationState> {
     }
 }
 
-fn install_immutable_set(
+pub(crate) fn install_immutable_set(
     source: &Path,
     root: &Path,
     bootstrap: &BootstrapConfig,

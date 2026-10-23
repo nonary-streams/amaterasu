@@ -1,7 +1,7 @@
 //! Package integrity, trust verification, and local activation primitives.
 //!
-//! These primitives support development packages. Production release repository
-//! metadata, key rotation, and installed-system permissions are not implemented yet.
+//! Native activation remains separate from repository catalog verification.
+//! Installed-service authorization and native publisher trust are not integrated.
 
 mod dependencies;
 mod digest;
@@ -10,6 +10,7 @@ pub mod importer;
 mod manifest;
 pub mod migration;
 pub mod playnite_extension;
+pub mod repository;
 mod staging;
 mod storage;
 mod verification;

@@ -1,0 +1,316 @@
+use crate::model::{HeldInput, InputEvent, InputPacket, PROTOCOL_VERSION, PeerIdentity};
+use crate::{InputError, InputResult};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const MAX_PEERS: usize = 64;
+const MAX_HELD: usize = 128;
+const MAX_EVENTS_PER_SECOND: usize = 2048;
+
+/// A companion-owned device handle. `release_all` must neutralize the state
+/// owned by that handle, independently of the replaceable worker's cleanup.
+pub trait DeviceSink {
+    fn submit(&mut self, event: &InputEvent) -> InputResult<()>;
+    fn release_all(&mut self) -> InputResult<()>;
+}
+
+/// A single-use grant issued only after independent host policy approval.
+/// Native publisher signatures alone cannot authorize this grant.
+pub struct InputGrant {
+    peer: PeerIdentity,
+    lease_token: String,
+    generation: u64,
+    expires_at: Instant,
+    keyboard: bool,
+    mouse: bool,
+    registry: Arc<Mutex<RegistryState>>,
+}
+
+#[derive(Default)]
+struct RegistryState {
+    highest_generation: HashMap<PeerIdentity, u64>,
+    // One source device is owned by at most one worker lease at a time.
+    active: Option<(PeerIdentity, u64)>,
+}
+
+/// In-memory generation floors for synthetic testing. Production must persist
+/// these floors in protected state and revoke them on policy/set changes.
+pub struct GrantRegistry {
+    state: Arc<Mutex<RegistryState>>,
+}
+
+impl GrantRegistry {
+    // No production constructor exists yet. The installed companion must
+    // create exactly one registry for its exclusive device handle after OS
+    // authentication and protected-policy integration are implemented.
+    #[cfg(test)]
+    pub(crate) fn synthetic() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RegistryState::default())),
+        }
+    }
+
+    pub fn issue(
+        &mut self,
+        peer: PeerIdentity,
+        lease_token: String,
+        generation: u64,
+        expires_at: Instant,
+        keyboard: bool,
+        mouse: bool,
+    ) -> InputResult<InputGrant> {
+        if lease_token.len() != 32
+            || !lease_token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || generation == 0
+            || !keyboard && !mouse
+        {
+            return Err(InputError::InvalidGrant);
+        }
+        let mut registry = self.state.lock().map_err(|_| InputError::InvalidGrant)?;
+        if registry.active.is_some() {
+            return Err(InputError::ResourceExhausted);
+        }
+        if registry
+            .highest_generation
+            .get(&peer)
+            .is_some_and(|highest| generation <= *highest)
+        {
+            return Err(InputError::InvalidSequence);
+        }
+        if !registry.highest_generation.contains_key(&peer)
+            && registry.highest_generation.len() >= MAX_PEERS
+        {
+            return Err(InputError::ResourceExhausted);
+        }
+        registry.highest_generation.insert(peer.clone(), generation);
+        Ok(InputGrant {
+            peer,
+            lease_token,
+            generation,
+            expires_at,
+            keyboard,
+            mouse,
+            registry: Arc::clone(&self.state),
+        })
+    }
+}
+
+/// Companion-side validation before a restricted device interface is called.
+pub struct InputSession<S: DeviceSink> {
+    grant: InputGrant,
+    pub(crate) sink: S,
+    next_sequence: u64,
+    held: Vec<HeldInput>,
+    window_start: Instant,
+    events_in_window: usize,
+    closed: bool,
+    cleanup_required: bool,
+}
+
+impl<S: DeviceSink> InputSession<S> {
+    pub fn connect(
+        peer_from_transport: &PeerIdentity,
+        grant: InputGrant,
+        sink: S,
+        now: Instant,
+    ) -> InputResult<Self> {
+        if peer_from_transport != &grant.peer {
+            return Err(InputError::PermissionDenied);
+        }
+        if now >= grant.expires_at {
+            return Err(InputError::Expired);
+        }
+        grant.activate()?;
+        Ok(Self {
+            grant,
+            sink,
+            next_sequence: 1,
+            held: Vec::new(),
+            window_start: now,
+            events_in_window: 0,
+            closed: false,
+            cleanup_required: false,
+        })
+    }
+
+    pub fn submit(&mut self, packet: &InputPacket, now: Instant) -> InputResult<()> {
+        if self.closed {
+            return Err(InputError::Closed);
+        }
+        if now >= self.grant.expires_at {
+            let _ = self.revoke();
+            return Err(InputError::Expired);
+        }
+        if packet.version != PROTOCOL_VERSION
+            || packet.generation != self.grant.generation
+            || packet.lease_token != self.grant.lease_token
+        {
+            return Err(InputError::PermissionDenied);
+        }
+        if packet.sequence != self.next_sequence {
+            return Err(InputError::InvalidSequence);
+        }
+        packet.event.validate()?;
+        if packet.event.keyboard() && !self.grant.keyboard
+            || !packet.event.keyboard() && !self.grant.mouse
+        {
+            return Err(InputError::PermissionDenied);
+        }
+        let transition = packet.event.transition();
+        self.validate_transition(transition)?;
+        self.check_rate(now, transition)?;
+
+        // Keep issuance of a newer generation serialized with device I/O.
+        // Once `issue` returns, the old session cannot submit another event.
+        let registry_handle = Arc::clone(&self.grant.registry);
+        let registry = match registry_handle.lock() {
+            Ok(registry) => registry,
+            Err(_) => {
+                let _ = self.revoke();
+                return Err(InputError::InvalidGrant);
+            }
+        };
+        if registry.active.as_ref() != Some(&(self.grant.peer.clone(), self.grant.generation)) {
+            drop(registry);
+            let _ = self.revoke();
+            return Err(InputError::PermissionDenied);
+        }
+
+        // Consume the sequence before I/O: a failed acknowledgement might
+        // follow a delivered event and must not be replayed.
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(InputError::InvalidSequence)?;
+        if let Some((held, true)) = transition {
+            self.held.push(held);
+        }
+        if let Err(error) = self.sink.submit(&packet.event) {
+            drop(registry);
+            self.cleanup_required = true;
+            let _ = self.revoke();
+            return Err(error);
+        }
+        drop(registry);
+        if let Some((held, false)) = transition {
+            self.held.retain(|item| *item != held);
+        }
+        Ok(())
+    }
+
+    fn validate_transition(&self, transition: Option<(HeldInput, bool)>) -> InputResult<()> {
+        match transition {
+            Some((held, true)) if self.held.contains(&held) => Err(InputError::InvalidSequence),
+            Some((_, true)) if self.held.len() >= MAX_HELD => Err(InputError::ResourceExhausted),
+            Some((held, false)) if !self.held.contains(&held) => Err(InputError::InvalidSequence),
+            _ => Ok(()),
+        }
+    }
+
+    fn check_rate(
+        &mut self,
+        now: Instant,
+        transition: Option<(HeldInput, bool)>,
+    ) -> InputResult<()> {
+        if now.saturating_duration_since(self.window_start) >= Duration::from_secs(1) {
+            self.window_start = now;
+            self.events_in_window = 0;
+        }
+        // Never rate-limit a release needed to clear a held state.
+        if self.events_in_window >= MAX_EVENTS_PER_SECOND && !matches!(transition, Some((_, false)))
+        {
+            return Err(InputError::ResourceExhausted);
+        }
+        self.events_in_window = self.events_in_window.saturating_add(1);
+        Ok(())
+    }
+
+    /// Call from the companion timer even when no worker packet arrives.
+    /// Connection close and policy revocation must call `revoke` immediately.
+    pub fn poll_expiry(&mut self, now: Instant) -> InputResult<bool> {
+        if self.closed {
+            if self.cleanup_required {
+                self.revoke()?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if now < self.grant.expires_at {
+            match self.grant.is_active() {
+                Ok(true) => return Ok(false),
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = self.revoke();
+                    return Err(error);
+                }
+            }
+        }
+        self.revoke()?;
+        Ok(true)
+    }
+
+    pub fn revoke(&mut self) -> InputResult<()> {
+        self.closed = true;
+        let mut failure = None;
+        for index in (0..self.held.len()).rev() {
+            match self.sink.submit(&self.held[index].release()) {
+                Ok(()) => {
+                    self.held.remove(index);
+                }
+                Err(error) => failure = Some(error),
+            }
+        }
+        match self.sink.release_all() {
+            Ok(()) => {
+                self.held.clear();
+                self.cleanup_required = false;
+                self.grant.deactivate()?;
+            }
+            Err(error) => {
+                self.cleanup_required = true;
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    pub fn cleanup_required(&self) -> bool {
+        self.cleanup_required
+    }
+}
+
+impl InputGrant {
+    fn activate(&self) -> InputResult<()> {
+        let mut registry = self.registry.lock().map_err(|_| InputError::InvalidGrant)?;
+        if registry.highest_generation.get(&self.peer) != Some(&self.generation) {
+            return Err(InputError::InvalidSequence);
+        }
+        if registry.active.is_some() {
+            return Err(InputError::ResourceExhausted);
+        }
+        registry.active = Some((self.peer.clone(), self.generation));
+        Ok(())
+    }
+
+    fn is_active(&self) -> InputResult<bool> {
+        let registry = self.registry.lock().map_err(|_| InputError::InvalidGrant)?;
+        Ok(registry.active.as_ref() == Some(&(self.peer.clone(), self.generation)))
+    }
+
+    fn deactivate(&self) -> InputResult<()> {
+        let mut registry = self.registry.lock().map_err(|_| InputError::InvalidGrant)?;
+        if registry.active.as_ref() == Some(&(self.peer.clone(), self.generation)) {
+            registry.active = None;
+        }
+        Ok(())
+    }
+}
+
+impl<S: DeviceSink> Drop for InputSession<S> {
+    fn drop(&mut self) {
+        if !self.closed || self.cleanup_required {
+            let _ = self.revoke();
+        }
+    }
+}

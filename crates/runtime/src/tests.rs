@@ -102,6 +102,309 @@ fn accepted_id(request_id: Response) -> u64 {
         panic!("{request_id:?}")
     }
 }
+
+fn synthetic_api(privilege: ApiPrivilege) -> (RuntimeConfig, ApiMethod) {
+    let service = "org.example.paint/1";
+    let method = ApiMethod {
+        service: service.into(),
+        method: "render".into(),
+        interface_major: 1,
+        interface_minor: 2,
+        request: ApiSchema {
+            required: [("size".into(), ApiFieldKind::Integer)].into(),
+            optional: Default::default(),
+            allow_extra: false,
+        },
+        response: ApiSchema {
+            required: [("done".into(), ApiFieldKind::Boolean)].into(),
+            optional: Default::default(),
+            allow_extra: false,
+        },
+        privilege,
+    };
+    let mut config = RuntimeConfig::default();
+    config.principals.insert(
+        "org.example.provider".into(),
+        Grants {
+            provide: names(&[service]),
+            ..Default::default()
+        },
+    );
+    for caller in ["org.example.client", "org.example.outsider"] {
+        config.principals.insert(
+            caller.into(),
+            Grants {
+                call: names(&[service]),
+                ..Default::default()
+            },
+        );
+    }
+    config.api_methods.push(ApiMethodApproval {
+        provider: "org.example.provider".into(),
+        callers: names(&["org.example.client"]),
+        method: method.clone(),
+    });
+    (config, method)
+}
+
+#[test]
+fn installed_user_api_methods_enforce_identity_schema_version_and_raw_route_block() {
+    let (config, method) = synthetic_api(ApiPrivilege::User);
+    let mut broker = Broker::new(config).unwrap();
+    let provider = "org.example.provider";
+    let client = "org.example.client";
+    let outsider = "org.example.outsider";
+    assert_error_code(
+        broker.dispatch(
+            outsider,
+            Command::RegisterApi {
+                method: method.clone(),
+            },
+        ),
+        "permission_denied",
+    );
+    let mut altered = method.clone();
+    altered.request.allow_extra = true;
+    assert_error_code(
+        broker.dispatch(provider, Command::RegisterApi { method: altered }),
+        "permission_denied",
+    );
+    assert_error_code(
+        broker.dispatch(
+            provider,
+            Command::Register {
+                service: method.service.clone(),
+            },
+        ),
+        "permission_denied",
+    );
+    assert!(matches!(
+        broker.dispatch(
+            provider,
+            Command::RegisterApi {
+                method: method.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    assert_error_code(
+        broker.dispatch(
+            client,
+            Command::Request {
+                service: method.service.clone(),
+                payload: json!({"method":"render","arguments":{"size":1}}),
+                timeout_ms: 100,
+                operation_id: "raw.route".into(),
+                parent: None,
+            },
+        ),
+        "permission_denied",
+    );
+    assert_error_code(
+        broker.dispatch(
+            outsider,
+            Command::QueryApi {
+                service: method.service.clone(),
+                method: "render".into(),
+                interface_major: 1,
+                min_minor: 2,
+            },
+        ),
+        "permission_denied",
+    );
+    assert!(matches!(broker.dispatch(client, Command::QueryApi {
+        service: method.service.clone(), method:"render".into(), interface_major:1, min_minor:2,
+    }), Response::Result { payload } if payload == serde_json::to_value(&method).unwrap()));
+    assert_error_code(
+        broker.dispatch(
+            client,
+            Command::QueryApi {
+                service: method.service.clone(),
+                method: "render".into(),
+                interface_major: 1,
+                min_minor: 3,
+            },
+        ),
+        "incompatible_api",
+    );
+    let call = |payload, minor, operation: &str| Command::CallApi {
+        service: method.service.clone(),
+        method: "render".into(),
+        interface_major: 1,
+        interface_minor: minor,
+        payload,
+        timeout_ms: 100,
+        operation_id: operation.into(),
+        parent: None,
+    };
+    assert_error_code(
+        broker.dispatch(client, call(json!({"size":"1"}), 2, "bad.shape")),
+        "invalid_request",
+    );
+    assert_error_code(
+        broker.dispatch(client, call(json!({"size":1}), 1, "bad.version")),
+        "incompatible_api",
+    );
+    assert_error_code(
+        broker.dispatch(outsider, call(json!({"size":1}), 2, "bad.caller")),
+        "permission_denied",
+    );
+    let id = accepted_id(broker.dispatch(client, call(json!({"size":4}), 2, "valid.call")));
+    assert!(
+        matches!(broker.dispatch(provider, Command::Poll {}), Response::Request { payload, .. }
+        if payload == json!({"method":"render","interface_major":1,"interface_minor":2,"arguments":{"size":4}}))
+    );
+    assert_error_code(
+        broker.dispatch(
+            provider,
+            Command::Complete {
+                request: id,
+                payload: json!({"done":"yes"}),
+            },
+        ),
+        "invalid_request",
+    );
+    assert!(matches!(
+        broker.dispatch(
+            provider,
+            Command::Complete {
+                request: id,
+                payload: json!({"done":true})
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(
+        matches!(broker.dispatch(client, Command::TakeResult { request:id }), Response::Result { payload } if payload == json!({"done":true}))
+    );
+}
+
+#[test]
+fn publisher_approval_never_registers_an_elevated_handler_in_user_broker() {
+    let (config, method) = synthetic_api(ApiPrivilege::Elevated);
+    let mut broker = Broker::new(config).unwrap();
+    assert_error_code(
+        broker.dispatch(
+            "org.example.provider",
+            Command::RegisterApi {
+                method: method.clone(),
+            },
+        ),
+        "permission_denied",
+    );
+    assert_error_code(
+        broker.dispatch(
+            "org.example.client",
+            Command::CallApi {
+                service: method.service,
+                method: method.method,
+                interface_major: 1,
+                interface_minor: 2,
+                payload: json!({"size":1}),
+                timeout_ms: 100,
+                operation_id: "elevated.denied".into(),
+                parent: None,
+            },
+        ),
+        "permission_denied",
+    );
+}
+
+#[test]
+fn dynamic_api_policy_cannot_shadow_a_core_service() {
+    for reserved in ["amaterasu.authentication/1", "hooks/org.example.paint/1"] {
+        let (mut config, mut method) = synthetic_api(ApiPrivilege::User);
+        let original = method.service.clone();
+        method.service = reserved.into();
+        for grants in config.principals.values_mut() {
+            if grants.provide.remove(&original) {
+                grants.provide.insert(method.service.clone());
+            }
+            if grants.call.remove(&original) {
+                grants.call.insert(method.service.clone());
+            }
+        }
+        config.api_methods[0].method = method;
+        assert!(Broker::new(config).is_err());
+    }
+}
+
+#[test]
+fn delegated_api_call_requires_approval_for_the_original_initiator() {
+    let (mut config, method) = synthetic_api(ApiPrivilege::User);
+    let intermediary = "org.example.intermediary";
+    config.principals.insert(
+        intermediary.into(),
+        Grants {
+            provide: names(&["org.example.forward/1"]),
+            call: names(&[&method.service]),
+            ..Default::default()
+        },
+    );
+    for principal in ["org.example.client", "org.example.outsider"] {
+        config
+            .principals
+            .get_mut(principal)
+            .unwrap()
+            .call
+            .insert("org.example.forward/1".into());
+    }
+    config.api_methods[0].callers.insert(intermediary.into());
+    let mut broker = Broker::new(config).unwrap();
+    assert!(matches!(
+        broker.dispatch(
+            "org.example.provider",
+            Command::RegisterApi {
+                method: method.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch(
+            intermediary,
+            Command::Register {
+                service: "org.example.forward/1".into()
+            }
+        ),
+        Response::Ok
+    ));
+    let forward = |operation: &str| Command::Request {
+        service: "org.example.forward/1".into(),
+        payload: json!({}),
+        timeout_ms: 100,
+        operation_id: operation.into(),
+        parent: None,
+    };
+    let bad_parent = accepted_id(broker.dispatch("org.example.outsider", forward("outsider")));
+    assert!(matches!(
+        broker.dispatch(intermediary, Command::Poll {}),
+        Response::Request { id, .. } if id == bad_parent
+    ));
+    let api_call = |parent| Command::CallApi {
+        service: method.service.clone(),
+        method: method.method.clone(),
+        interface_major: 1,
+        interface_minor: 2,
+        payload: json!({"size": 1}),
+        timeout_ms: 100,
+        operation_id: format!("api.{parent}"),
+        parent: Some(parent),
+    };
+    assert_error_code(
+        broker.dispatch(intermediary, api_call(bad_parent)),
+        "permission_denied",
+    );
+    let good_parent = accepted_id(broker.dispatch("org.example.client", forward("client")));
+    assert!(matches!(
+        broker.dispatch(intermediary, Command::Poll {}),
+        Response::Request { id, .. } if id == good_parent
+    ));
+    assert!(matches!(
+        broker.dispatch(intermediary, api_call(good_parent)),
+        Response::Accepted { .. }
+    ));
+}
 fn assert_error_code(request_id: Response, expected: &str) {
     assert!(
         matches!(request_id, Response::Error { ref code, .. } if code == expected),

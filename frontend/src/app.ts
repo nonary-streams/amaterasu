@@ -3,12 +3,14 @@ namespace Amaterasu {
     overview: "Overview",
     catalog: "Library",
     settings: "Settings",
+    updates: "Modules & UI",
     sessions: "Sessions",
     applications: "Applications",
     steam: "Steam",
     diagnostics: "Diagnostics",
   };
   const pageIcons: Record<Page, string> = {
+    updates: "+",
     overview: "▦",
     catalog: "⊞",
     settings: "≡",
@@ -409,6 +411,7 @@ namespace Amaterasu {
         overview: renderOverview,
         catalog: renderCatalog,
         settings: renderSettings,
+        updates: renderUpdates,
         sessions: renderSessions,
         applications: renderApplications,
         steam: renderSteam,

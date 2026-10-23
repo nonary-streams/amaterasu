@@ -3,6 +3,7 @@ namespace Amaterasu {
     | "overview"
     | "catalog"
     | "settings"
+    | "updates"
     | "sessions"
     | "applications"
     | "steam"

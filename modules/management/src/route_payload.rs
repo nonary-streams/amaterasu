@@ -14,6 +14,16 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         return fields(object, &[], &[]);
     }
     match route.service {
+        "amaterasu.management/1" if route.action == "repository_list" => {
+            fields(object, &[], &["offset"])?;
+            if object
+                .get("offset")
+                .is_some_and(|value| !value.as_u64().is_some_and(|offset| offset <= 4096))
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
         "amaterasu.authentication/1" => authentication(route.action, object),
         "amaterasu.host-configuration/1" => host_configuration(route.action, object),
         "amaterasu.catalog/1" => catalog(route.action, object),

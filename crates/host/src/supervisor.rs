@@ -92,6 +92,7 @@ fn probe_candidate(
 
     match result {
         Ok(_) => {
+            selection.healthy_sets.insert(candidate.clone());
             if selection.active.as_ref() != Some(&candidate) {
                 selection.previous = selection.active.replace(candidate.clone());
             }

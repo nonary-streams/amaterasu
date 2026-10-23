@@ -1,7 +1,7 @@
 //! Metadata persisted at the package and host boundaries.
 use amaterasu_contracts::{Grants, RuntimeConfig};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +57,29 @@ pub struct ActivationState {
     #[serde(default)]
     pub trial: Option<String>,
     pub highest_sequence: u64,
+    /// Development repository sets retain their explicit signer provenance.
+    #[serde(default)]
+    pub repository_sets: BTreeMap<String, RepositorySet>,
+    /// Highest signed native release accepted from each pinned publisher key.
+    #[serde(default)]
+    pub repository_floors: BTreeMap<String, NativeReleaseFloor>,
+    /// Sets successfully promoted after a disposable worker health trial.
+    #[serde(default)]
+    pub healthy_sets: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySet {
+    pub repository_id: String,
+    pub key_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeReleaseFloor {
+    pub sequence: u64,
+    pub digest: String,
 }
 pub struct VerifiedPackage {
     pub manifest: ReleaseManifest,

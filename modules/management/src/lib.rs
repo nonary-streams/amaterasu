@@ -7,6 +7,7 @@ mod server;
 mod tls;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_package::repository::RepositoryStore;
 use serde::Deserialize;
 use serde_json::json;
 use server::Server;
@@ -33,6 +34,7 @@ struct Settings {
 struct ManagementModule {
     runtime: RuntimeClient,
     server: Option<Server>,
+    repositories: Option<RepositoryStore>,
     operational_health: Option<OperationalHealth>,
 }
 
@@ -60,6 +62,11 @@ impl ManagedModule for ManagementModule {
         let settings: Settings =
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
         validate_settings(&settings)?;
+        let repositories = settings
+            .web
+            .as_ref()
+            .map(|web| RepositoryStore::new(web.repository_directory()?))
+            .transpose()?;
         let tls_configuration = match (
             &settings.tls_certificate_path,
             &settings.tls_private_key_path,
@@ -88,6 +95,7 @@ impl ManagedModule for ManagementModule {
         Ok(Self {
             runtime,
             server,
+            repositories,
             operational_health: None,
         })
     }
@@ -101,6 +109,7 @@ impl ManagedModule for ManagementModule {
             Response::Pending => Ok(()),
             Response::Request {
                 id,
+                caller,
                 service,
                 payload,
                 remaining_ms,
@@ -116,7 +125,42 @@ impl ManagedModule for ManagementModule {
                 if payload == json!({"action":"operational_health"}) {
                     return self.begin_operational_health(id, remaining_ms);
                 }
-                let payload = if payload == json!({"action":"status"}) {
+                let payload = if payload.get("action").and_then(serde_json::Value::as_str)
+                    == Some("repository_list")
+                    && caller == "amaterasu.management"
+                {
+                    match &self.repositories {
+                        Some(store) => match store.list(
+                            &amaterasu_package::current_target(),
+                            amaterasu_package::unix_timestamp(),
+                        ) {
+                            Ok(mut repositories) => {
+                                let offset = payload
+                                    .get("offset")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0)
+                                    as usize;
+                                let mut seen = 0usize;
+                                let mut included = 0usize;
+                                for repository in &mut repositories {
+                                    repository.candidates.retain(|_| {
+                                        let keep = seen >= offset && included < 32;
+                                        seen += 1;
+                                        if keep {
+                                            included += 1;
+                                        }
+                                        keep
+                                    });
+                                }
+                                let next_offset = (seen > offset.saturating_add(included))
+                                    .then_some(offset.saturating_add(included));
+                                json!({"ok":true,"repositories":repositories,"next_offset":next_offset})
+                            }
+                            Err(_) => json!({"ok":false,"code":"repository_state_unavailable"}),
+                        },
+                        None => json!({"ok":false,"code":"repository_state_unavailable"}),
+                    }
+                } else if payload == json!({"action":"status"}) {
                     json!({"ok":true,"enabled":self.server.is_some(),"bound_address":self.server.as_ref().map(Server::address),"tls_address":self.server.as_ref().and_then(Server::tls_address)})
                 } else {
                     json!({"ok":false,"code":"invalid_request"})

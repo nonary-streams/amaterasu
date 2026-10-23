@@ -1,3 +1,4 @@
+mod api;
 mod configuration;
 mod errors;
 mod events;
@@ -7,6 +8,7 @@ mod requests;
 use amaterasu_contracts::{Command, Response, RuntimeConfig};
 use std::time::Instant;
 
+use api::{ApiInvocation, ApiRegistry};
 use events::EventBus;
 use hooks::HookRegistry;
 use requests::{RequestOptions, RequestRouter};
@@ -16,6 +18,7 @@ pub struct Broker {
     requests: RequestRouter,
     events: EventBus,
     hooks: HookRegistry,
+    api: ApiRegistry,
 }
 
 impl Broker {
@@ -24,6 +27,7 @@ impl Broker {
 
         Ok(Self {
             hooks: HookRegistry::new(configuration.hooks.clone()),
+            api: ApiRegistry::new(&configuration),
             configuration,
             requests: RequestRouter::default(),
             events: EventBus::default(),
@@ -67,7 +71,80 @@ impl Broker {
                 }
             }
             Command::Register { service } => {
-                self.requests.register_service(caller, grants, service)
+                if self.api.owns_service(&service) {
+                    errors::permission_denied()
+                } else {
+                    self.requests.register_service(caller, grants, service)
+                }
+            }
+            Command::RegisterApi { method } => {
+                let registered = self.api.register(caller, grants, method.clone());
+                if registered.is_error() {
+                    registered
+                } else {
+                    self.requests
+                        .register_service(caller, grants, method.service)
+                }
+            }
+            Command::QueryApi {
+                service,
+                method,
+                interface_major,
+                min_minor,
+            } => self.api.query(
+                caller,
+                grants,
+                &service,
+                &method,
+                interface_major,
+                min_minor,
+            ),
+            Command::CallApi {
+                service,
+                method,
+                interface_major,
+                interface_minor,
+                payload,
+                timeout_ms,
+                operation_id,
+                parent,
+            } => {
+                let initiator = match parent {
+                    Some(parent_id) => {
+                        match self.requests.initiator_for_parent(caller, parent_id) {
+                            Ok(initiator) => initiator.to_owned(),
+                            Err(error) => return error,
+                        }
+                    }
+                    None => caller.to_owned(),
+                };
+                match self.api.callable(
+                    caller,
+                    &initiator,
+                    grants,
+                    ApiInvocation {
+                        service: &service,
+                        method: &method,
+                        major: interface_major,
+                        minor: interface_minor,
+                        payload: &payload,
+                    },
+                ) {
+                    Ok((payload, response_schema)) => self.requests.submit(
+                        caller,
+                        grants,
+                        RequestOptions {
+                            service,
+                            payload,
+                            timeout_ms,
+                            operation_id,
+                            parent,
+                            response_schema: Some(response_schema),
+                        },
+                        now,
+                    ),
+                    Err(error) => error,
+                }
             }
             Command::Request {
                 service,
@@ -76,12 +153,16 @@ impl Broker {
                 operation_id,
                 parent,
             } => {
+                if self.api.owns_service(&service) {
+                    return errors::permission_denied();
+                }
                 let options = RequestOptions {
                     service,
                     payload,
                     timeout_ms,
                     operation_id,
                     parent,
+                    response_schema: None,
                 };
                 self.requests.submit(caller, grants, options, now)
             }

@@ -10,11 +10,17 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_seed(17)
+    }
+    fn with_seed(seed: u8) -> Self {
         let root =
             std::env::temp_dir().join(format!("amaterasu-web-{}", random_identifier().unwrap()));
         fs::create_dir(&root).unwrap();
-        let signer = SigningKey::from_bytes(&[17; 32]);
-        let keys = BTreeMap::from([("test".into(), encode_hex(signer.verifying_key().as_bytes()))]);
+        let signer = SigningKey::from_bytes(&[seed; 32]);
+        let keys = BTreeMap::from([(
+            crate::sha256(signer.verifying_key().as_bytes()),
+            encode_hex(signer.verifying_key().as_bytes()),
+        )]);
         Self { root, signer, keys }
     }
     fn bundle(&self, label: &str, sequence: u64) -> PathBuf {
@@ -31,11 +37,126 @@ impl Fixture {
         let bytes = serde_json::to_vec(manifest).unwrap();
         fs::write(directory.join("manifest.json"), &bytes).unwrap();
         let signature = ReleaseSignature {
-            key_id: "test".into(),
+            key_id: self.keys.keys().next().unwrap().clone(),
             signature: encode_hex(&self.signer.sign(&bytes).to_bytes()),
         };
         write_json_atomically(&directory.join("manifest.sig"), &signature).unwrap();
     }
+}
+
+#[test]
+fn approved_publishers_have_independent_ui_release_floors() {
+    let first = Fixture::with_seed(31);
+    let second = Fixture::with_seed(32);
+    let root = first.root.join("publisher-installed");
+    let first_key = first.keys.keys().next().unwrap();
+    let second_key = second.keys.keys().next().unwrap();
+    let first_v8 = first.bundle("first-v8", 8);
+    let first_v9 = first.bundle("first-v9", 9);
+    let second_v1 = second.bundle("second-v1", 1);
+    let second_substitute = second.bundle("second-substitute", 1);
+
+    stage_repository_bundle(&first_v8, &root, &first.keys, first_key, 10).unwrap();
+    stage_repository_bundle(&first_v9, &root, &first.keys, first_key, 10).unwrap();
+    stage_repository_bundle(&second_v1, &root, &second.keys, second_key, 10).unwrap();
+    let selected = read_selection(&root).unwrap();
+    assert_eq!(selected.highest_sequence, 9);
+    assert_eq!(selected.active_sequence, Some(1));
+    assert_eq!(selected.publisher_floors[first_key].sequence, 9);
+    assert_eq!(selected.publisher_floors[second_key].sequence, 1);
+    assert!(stage_repository_bundle(&first_v8, &root, &first.keys, first_key, 10).is_err());
+    assert!(
+        stage_repository_bundle(&second_substitute, &root, &second.keys, second_key, 10,).is_err()
+    );
+    let keys = first
+        .keys
+        .clone()
+        .into_iter()
+        .chain(second.keys.clone())
+        .collect();
+    assert_eq!(
+        load_selected(&root, &keys, 10).unwrap().manifest.sequence,
+        1
+    );
+}
+
+#[test]
+fn project_ui_sequence_is_independent_of_approved_publisher_sequence() {
+    let project = Fixture::with_seed(41);
+    let publisher = Fixture::with_seed(42);
+    let root = project.root.join("mixed-installed");
+    let project_v8 = project.bundle("project-v8", 8);
+    let project_v9 = project.bundle("project-v9", 9);
+    let publisher_v100 = publisher.bundle("publisher-v100", 100);
+    let publisher_key = publisher.keys.keys().next().unwrap();
+    stage_bundle(&project_v8, &root, &project.keys, 10).unwrap();
+    stage_repository_bundle(&publisher_v100, &root, &publisher.keys, publisher_key, 10).unwrap();
+    stage_bundle(&project_v9, &root, &project.keys, 10).unwrap();
+    let selection = read_selection(&root).unwrap();
+    assert_eq!(selection.highest_sequence, 100);
+    assert_eq!(selection.active_sequence, Some(9));
+    assert_eq!(selection.project_floor.unwrap().sequence, 9);
+    assert!(stage_bundle(&project_v8, &root, &project.keys, 10).is_err());
+}
+
+#[test]
+fn publisher_floor_cannot_be_reset_by_relabeling_the_same_key() {
+    let publisher = Fixture::with_seed(51);
+    let root = publisher.root.join("relabel-installed");
+    let newer = publisher.bundle("newer", 9);
+    let older = publisher.bundle("older", 8);
+    let fingerprint = publisher.keys.keys().next().unwrap();
+    stage_repository_bundle(&newer, &root, &publisher.keys, fingerprint, 10).unwrap();
+
+    let false_fingerprint = "a".repeat(64);
+    let relabeled = BTreeMap::from([(
+        false_fingerprint.clone(),
+        publisher.keys[fingerprint].clone(),
+    )]);
+    let mut signature: ReleaseSignature = read_json(&older.join("manifest.sig")).unwrap();
+    signature.key_id = false_fingerprint.clone();
+    write_json_atomically(&older.join("manifest.sig"), &signature).unwrap();
+    assert!(stage_repository_bundle(&older, &root, &relabeled, &false_fingerprint, 10).is_err());
+    assert_eq!(
+        read_selection(&root).unwrap().publisher_floors[fingerprint].sequence,
+        9
+    );
+}
+
+#[test]
+fn administrator_can_restore_any_retained_trusted_ui_without_erasing_floors() {
+    let fixture = Fixture::new();
+    let root = fixture.root.join("deep-recovery");
+    let first = fixture.bundle("first", 1);
+    let second = fixture.bundle("second", 2);
+    let third = fixture.bundle("third", 3);
+    let first_digest = stage_bundle(&first, &root, &fixture.keys, 10).unwrap();
+    stage_bundle(&second, &root, &fixture.keys, 10).unwrap();
+    stage_bundle(&third, &root, &fixture.keys, 10).unwrap();
+    assert_eq!(
+        restore_version(&root, &first_digest, &fixture.keys, 10).unwrap(),
+        first_digest
+    );
+    let selected = read_selection(&root).unwrap();
+    assert_eq!(selected.highest_sequence, 3);
+    assert_eq!(selected.project_floor.unwrap().sequence, 3);
+    assert_eq!(selected.active_sequence, Some(1));
+    assert!(stage_bundle(&second, &root, &fixture.keys, 10).is_err());
+}
+
+#[test]
+fn restaging_the_selected_ui_keeps_its_recovery_pointer() {
+    let fixture = Fixture::new();
+    let root = fixture.root.join("restage-recovery");
+    let first = fixture.bundle("recovery-first", 1);
+    let second = fixture.bundle("recovery-second", 2);
+    let first_digest = stage_bundle(&first, &root, &fixture.keys, 10).unwrap();
+    stage_bundle(&second, &root, &fixture.keys, 10).unwrap();
+    stage_bundle(&second, &root, &fixture.keys, 10).unwrap();
+    assert_eq!(
+        restore_previous(&root, &fixture.keys, 10).unwrap(),
+        first_digest
+    );
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -63,6 +184,26 @@ fn signed_bundles_activate_independently_and_reject_rollback_or_equivocation() {
         load_selected(&root, &fixture.keys, 10).unwrap().digest,
         new.digest
     );
+}
+
+#[test]
+fn administrator_can_restore_previous_ui_without_lowering_release_floor() {
+    let fixture = Fixture::new();
+    let first = fixture.bundle("recovery-one", 1);
+    let second = fixture.bundle("recovery-two", 2);
+    let root = fixture.root.join("recovery-installed");
+    let first_digest = stage_bundle(&first, &root, &fixture.keys, 10).unwrap();
+    stage_bundle(&second, &root, &fixture.keys, 10).unwrap();
+    assert_eq!(
+        restore_previous(&root, &fixture.keys, 10).unwrap(),
+        first_digest
+    );
+    let selected = load_selected(&root, &fixture.keys, 10).unwrap();
+    assert_eq!(selected.digest, first_digest);
+    let selection = read_selection(&root).unwrap();
+    assert_eq!(selection.highest_sequence, 2);
+    assert_eq!(selection.active_sequence, Some(1));
+    assert!(stage_bundle(&first, &root, &fixture.keys, 10).is_err());
 }
 
 #[test]

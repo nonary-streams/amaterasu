@@ -1,10 +1,7 @@
 //! Short-lived development worker used to prove native loading and request routing.
 use amaterasu_abi::HostApi;
 use amaterasu_contracts::{Command, Response};
-use amaterasu_package::{
-    BootstrapConfig, PackageResult, VerificationPolicy, package_directory, read_json,
-    unix_timestamp, verify_package_with_progress,
-};
+use amaterasu_package::{BootstrapConfig, PackageResult, package_directory, read_json};
 use serde_json::Value;
 use std::io::Write;
 use std::path::Path;
@@ -115,43 +112,39 @@ fn load_components(
         return Err("production bootstrap cannot permit unsigned packages".into());
     }
     let directory = package_directory(root, digest)?;
-    let mut package = {
-        let mut verification_progress = |verified, total| {
-            if verified == 0 {
-                progress(StartupProgress::Manifest(total))
-            } else {
-                progress(StartupProgress::Artifact(verified))
-            }
-        };
-        verify_package_with_progress(
-            &directory,
-            &bootstrap,
-            VerificationPolicy {
-                minimum_sequence: 0,
-                allow_historical: true,
-                now: unix_timestamp(),
-            },
-            &mut verification_progress,
-        )?
+    let progress = std::cell::RefCell::new(progress);
+    let mut verification_progress = |verified, total| {
+        if verified == 0 {
+            progress.borrow_mut()(StartupProgress::Manifest(total))
+        } else {
+            progress.borrow_mut()(StartupProgress::Artifact(verified))
+        }
     };
-    if package.digest != digest {
-        return Err("selected package identity does not match its manifest".into());
-    }
-
-    let logging = crate::logging_config::HostLoggingConfig::from_global(
-        bootstrap.policy.settings.get("global"),
-        state_root,
-    )?;
-    logging.inject(&mut package.runtime_config)?;
-
-    let mut loaded = |index| progress(StartupProgress::Component(index));
-    if !bootstrap.development && !package.signed {
-        return Err("production service requires a signed package".into());
-    }
-    if !bootstrap.development && package.manifest.host_context_schema != 1 {
-        return Err("production package has an incompatible host context ABI".into());
-    }
-    LoadedComponents::load(&directory, &package, state_root, &mut loaded)
+    crate::publisher_selection::with_verified_selected(
+        root,
+        digest,
+        &bootstrap,
+        crate::publisher_selection::SelectionPurpose::Worker,
+        &mut verification_progress,
+        |mut package| {
+            if package.digest != digest {
+                return Err("selected package identity does not match its manifest".into());
+            }
+            let logging = crate::logging_config::HostLoggingConfig::from_global(
+                bootstrap.policy.settings.get("global"),
+                state_root,
+            )?;
+            logging.inject(&mut package.runtime_config)?;
+            if !bootstrap.development && !package.signed {
+                return Err("production service requires a signed package".into());
+            }
+            if !bootstrap.development && package.manifest.host_context_schema != 1 {
+                return Err("production package has an incompatible host context ABI".into());
+            }
+            let mut loaded = |index| progress.borrow_mut()(StartupProgress::Component(index));
+            LoadedComponents::load(&directory, &package, state_root, &mut loaded)
+        },
+    )
 }
 
 /// Console and probe modes retain an isolated development root. Production

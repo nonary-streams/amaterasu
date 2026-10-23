@@ -5154,6 +5154,140 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function parseRepositoryList(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Repository response is invalid.");
+        const reply = value;
+        if (reply.ok !== true || !Array.isArray(reply.repositories))
+            throw new Error("Repository state is unavailable.");
+        return reply.repositories.map((item) => {
+            if (!item || typeof item !== "object" || Array.isArray(item))
+                throw new Error("Repository entry is invalid.");
+            const repository = item;
+            if (typeof repository.id !== "string" ||
+                typeof repository.location !== "string" ||
+                typeof repository.fingerprint !== "string" ||
+                typeof repository.revoked !== "boolean" ||
+                !Array.isArray(repository.candidates))
+                throw new Error("Repository entry is invalid.");
+            const candidates = repository.candidates.map((raw) => {
+                if (!raw || typeof raw !== "object" || Array.isArray(raw))
+                    throw new Error("Repository choice is invalid.");
+                const choice = raw;
+                if (typeof choice.slot !== "string" ||
+                    typeof choice.implementation !== "string" ||
+                    typeof choice.version !== "string" ||
+                    typeof choice.manifest_sha256 !== "string" ||
+                    !["native_set", "web_bundle"].includes(choice.kind))
+                    throw new Error("Repository choice is invalid.");
+                return choice;
+            });
+            return { ...repository, candidates };
+        });
+    }
+    Amaterasu.parseRepositoryList = parseRepositoryList;
+    function parseRepositoryPage(value) {
+        const repositories = parseRepositoryList(value);
+        const reply = value;
+        const nextOffset = reply.next_offset;
+        if (nextOffset !== null &&
+            (!Number.isSafeInteger(nextOffset) || nextOffset <= 0 || nextOffset > 4096))
+            throw new Error("Repository pagination is invalid.");
+        return { repositories, nextOffset: nextOffset };
+    }
+    Amaterasu.parseRepositoryPage = parseRepositoryPage;
+    function renderUpdates(context) {
+        const area = Amaterasu.el("div");
+        context.content.append(Amaterasu.sectionHeading("Modules & UI", "Choose verified implementations from approved publishers.", Amaterasu.button("Refresh", load)), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Publisher authority is broad"), Amaterasu.el("p", "", "Approving a publisher allows it to supply any native module slot, including management, and the UI. Native modules share their worker's user privileges, while a replacement UI runs in the signed-in browser session and can use its API authority. Approval does not grant elevation. A signature proves source, not safe behavior.")), area);
+        async function load() {
+            try {
+                const byId = new Map();
+                let offset = 0;
+                while (true) {
+                    const page = parseRepositoryPage(await context.api.post("repositories/list", { offset }));
+                    for (const repository of page.repositories) {
+                        const previous = byId.get(repository.id);
+                        if (previous && (previous.fingerprint !== repository.fingerprint || previous.revoked !== repository.revoked))
+                            throw new Error("Repository state changed during listing. Refresh to retry.");
+                        byId.set(repository.id, previous
+                            ? { ...previous, candidates: [...previous.candidates, ...repository.candidates] }
+                            : repository);
+                    }
+                    if (page.nextOffset === null)
+                        break;
+                    if (page.nextOffset <= offset)
+                        throw new Error("Repository pagination did not advance.");
+                    offset = page.nextOffset;
+                }
+                if (!area.isConnected)
+                    return;
+                renderChoices([...byId.values()]);
+            }
+            catch (error) {
+                if (area.isConnected)
+                    area.replaceChildren(Amaterasu.errorPanel(error, load));
+            }
+        }
+        function renderChoices(repositories) {
+            const active = repositories.filter((repository) => !repository.revoked);
+            const repositorySelect = Amaterasu.el("select");
+            const slotSelect = Amaterasu.el("select");
+            const implementationSelect = Amaterasu.el("select");
+            const details = Amaterasu.el("div", "notice");
+            const choices = Amaterasu.panel("Choose an implementation", Amaterasu.field("Approved repository", repositorySelect), Amaterasu.field("Module slot or UI", slotSelect), Amaterasu.field("Implementation and version", implementationSelect), details);
+            const addOption = (select, value, label) => {
+                const option = Amaterasu.el("option", "", label);
+                option.value = value;
+                select.append(option);
+            };
+            active.forEach((repository, index) => addOption(repositorySelect, String(index), `${repository.id} · ${repository.fingerprint.slice(0, 16)}…`));
+            const selectedRepository = () => active[Number(repositorySelect.value)];
+            const selectedChoice = () => {
+                const repository = selectedRepository();
+                return repository?.candidates.filter((choice) => choice.slot === slotSelect.value)[Number(implementationSelect.value)];
+            };
+            const showChoice = () => {
+                const repository = selectedRepository();
+                const choice = selectedChoice();
+                if (!repository || !choice) {
+                    details.replaceChildren(Amaterasu.el("p", "muted", "No verified choice is available for this slot."));
+                    return;
+                }
+                const command = choice.kind === "web_bundle"
+                    ? `amaterasu-release repository-install-ui ROOT ${repository.id} ${choice.implementation} ${choice.version} OUTPUT`
+                    : `amaterasu-release repository-download ROOT ${repository.id} ${choice.slot} ${choice.implementation} ${choice.version} OUTPUT`;
+                details.replaceChildren(Amaterasu.el("strong", "", `${choice.implementation} ${choice.version}`), Amaterasu.el("p", "", `Source: ${repository.location}`), Amaterasu.el("p", "", `Publisher key SHA-256: ${repository.fingerprint}`), Amaterasu.el("p", "", `Signed manifest SHA-256: ${choice.manifest_sha256}`), Amaterasu.el("p", "", choice.kind === "web_bundle"
+                    ? "Run this explicit administrator command to download, verify and select the UI. The previous UI remains recoverable at /recovery."
+                    : "This choice supplies a complete native component set. Download and stage it for review. A separate activate command explicitly authorizes its native code to run under the user account at the next development worker start or probe. Production native activation remains disabled."), Amaterasu.el("code", "", command), ...(choice.kind === "native_set" ? [
+                    Amaterasu.el("code", "", `amaterasu-release repository-stage-native ROOT ${repository.id} ${choice.slot} ${choice.implementation} ${choice.version} OUTPUT`),
+                    Amaterasu.el("code", "", "amaterasu-release repository-activate-native ROOT STAGED_DIGEST"),
+                ] : []));
+            };
+            const fillImplementations = () => {
+                implementationSelect.replaceChildren();
+                selectedRepository()?.candidates
+                    .filter((choice) => choice.slot === slotSelect.value)
+                    .forEach((choice, index) => addOption(implementationSelect, String(index), `${choice.implementation} · ${choice.version}`));
+                showChoice();
+            };
+            const fillSlots = () => {
+                slotSelect.replaceChildren();
+                const slots = [...new Set(selectedRepository()?.candidates.map((choice) => choice.slot) ?? [])];
+                slots.forEach((slot) => addOption(slotSelect, slot, slot === "amaterasu.ui" ? "UI" : slot));
+                fillImplementations();
+            };
+            repositorySelect.addEventListener("change", fillSlots);
+            slotSelect.addEventListener("change", fillImplementations);
+            implementationSelect.addEventListener("change", showChoice);
+            fillSlots();
+            area.replaceChildren(Amaterasu.panel("Approve a publisher", Amaterasu.el("p", "", "On this development host, use repository-approve with the publisher's public key and a SHA-256 fingerprint confirmed through an independent channel. The repository URL alone cannot establish key identity."), Amaterasu.el("code", "", "amaterasu-release repository-approve ROOT ID HTTPS_URL PUBLIC_KEY_HEX CONFIRMED_SHA256"), Amaterasu.el("p", "", "Then run repository-refresh ROOT ID to retrieve the signed catalog. Key rotation uses a new publisher ID; revoke the old ID explicitly.")), choices, Amaterasu.panel("Recovery", Amaterasu.el("p", "", "The host shell can restore retained verified UI or native sets without loading the selected management module. Use `amaterasu web-recover ROOT DIGEST` or `amaterasu native-recover ROOT [DIGEST]`. Release floors remain intact. The management /recovery page also covers UI failures while management is healthy.")));
+        }
+        void load();
+    }
+    Amaterasu.renderUpdates = renderUpdates;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     Amaterasu.LOCALE_OPTIONS = [
         "bg",
         "cs",
@@ -6255,12 +6389,14 @@ var Amaterasu;
         overview: "Overview",
         catalog: "Library",
         settings: "Settings",
+        updates: "Modules & UI",
         sessions: "Sessions",
         applications: "Applications",
         steam: "Steam",
         diagnostics: "Diagnostics",
     };
     const pageIcons = {
+        updates: "+",
         overview: "▦",
         catalog: "⊞",
         settings: "≡",
@@ -6506,6 +6642,7 @@ var Amaterasu;
                 overview: Amaterasu.renderOverview,
                 catalog: Amaterasu.renderCatalog,
                 settings: Amaterasu.renderSettings,
+                updates: Amaterasu.renderUpdates,
                 sessions: Amaterasu.renderSessions,
                 applications: Amaterasu.renderApplications,
                 steam: Amaterasu.renderSteam,

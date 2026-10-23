@@ -1,5 +1,6 @@
 mod development;
 mod profiles;
+mod repositories;
 
 use amaterasu_package::{
     BootstrapConfig, PackageResult, RootLock, VerificationPolicy, read_json, stage_package,
@@ -53,6 +54,38 @@ fn run() -> PackageResult<()> {
             pack_web(root, source, output, sequence)
         }
         [command, root, source] if command == "stage-web" => stage_web(root, source),
+        [command, root, id, location, public_key, fingerprint]
+            if command == "repository-approve" =>
+        {
+            repositories::approve(root, id, location, public_key, fingerprint)
+        }
+        [command, root, id] if command == "repository-revoke" => repositories::revoke(root, id),
+        [command, root, id] if command == "repository-refresh" => repositories::refresh(root, id),
+        [command, root] if command == "repository-list" => repositories::list(root),
+        [command, root, id, slot, implementation, version, output]
+            if command == "repository-download" =>
+        {
+            repositories::download(root, id, slot, implementation, version, Path::new(output))
+        }
+        [command, root, id, implementation, version, output]
+            if command == "repository-install-ui" =>
+        {
+            repositories::install_ui(root, id, implementation, version, Path::new(output))
+        }
+        [command, root, id, slot, implementation, version, source]
+            if command == "repository-stage-native" =>
+        {
+            repositories::stage_native(root, id, slot, implementation, version, Path::new(source))
+        }
+        [command, root, digest] if command == "repository-activate-native" => {
+            repositories::activate_native(root, digest)
+        }
+        [command, root] if command == "repository-restore-ui" => {
+            repositories::restore_ui(root, None)
+        }
+        [command, root, digest] if command == "repository-restore-ui" => {
+            repositories::restore_ui(root, Some(digest))
+        }
         [command, artifacts, web, output] if command == "prepare-installer" => {
             development::prepare_installer_assets(
                 Path::new(artifacts),
@@ -140,5 +173,5 @@ fn verify(root: &str, source: &str) -> PackageResult<()> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT"
+    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release repository-approve ROOT ID HTTPS_URL PUBLIC_KEY_HEX CONFIRMED_SHA256\n  amaterasu-release repository-revoke ROOT ID\n  amaterasu-release repository-refresh ROOT ID\n  amaterasu-release repository-list ROOT\n  amaterasu-release repository-download ROOT ID SLOT IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-install-ui ROOT ID IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-stage-native ROOT ID SLOT IMPLEMENTATION VERSION SOURCE\n  amaterasu-release repository-activate-native ROOT DIGEST\n  amaterasu-release repository-restore-ui ROOT [DIGEST]\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT"
 }

@@ -1,4 +1,4 @@
-use amaterasu_contracts::{Grants, Response, valid_name};
+use amaterasu_contracts::{ApiSchema, Grants, Response, valid_name};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -14,6 +14,7 @@ pub(super) struct RequestOptions {
     pub timeout_ms: u64,
     pub operation_id: String,
     pub parent: Option<u64>,
+    pub response_schema: Option<ApiSchema>,
 }
 
 struct CallAuthority {
@@ -55,6 +56,19 @@ pub(super) struct RequestRouter {
 }
 
 impl RequestRouter {
+    /// The initiator is inherited from a broker-owned request, never supplied
+    /// as a module-controlled identity field in the command payload.
+    pub fn initiator_for_parent(&self, caller: &str, parent_id: u64) -> Result<&str, Response> {
+        let parent = self
+            .requests
+            .get(&parent_id)
+            .ok_or_else(permission_denied)?;
+        if parent.provider != caller {
+            return Err(permission_denied());
+        }
+        Ok(&parent.authority.initiator)
+    }
+
     pub fn register_service(&mut self, caller: &str, grants: &Grants, service: String) -> Response {
         if !grants.provide.contains(&service) {
             return permission_denied();
@@ -249,6 +263,17 @@ impl RequestRouter {
         }
         if !payload_fits(&payload) {
             return Response::error("invalid_request", "result payload is too large");
+        }
+        if request
+            .options
+            .response_schema
+            .as_ref()
+            .is_some_and(|schema| !super::api::payload_matches(schema, &payload))
+        {
+            return Response::error(
+                "invalid_request",
+                "API result does not match its installed schema",
+            );
         }
 
         request.finish(Response::Result { payload }, now);

@@ -18,6 +18,7 @@
     "src/ui.ts",
     "src/catalog.ts",
     "src/settings.ts",
+    "src/updates.ts",
     "src/locale.ts",
     "src/pages.ts",
     "src/app.ts"
