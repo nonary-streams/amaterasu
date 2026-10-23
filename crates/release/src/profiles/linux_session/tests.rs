@@ -1,4 +1,5 @@
 use super::*;
+use crate::profiles::PackageProfile;
 
 #[test]
 fn profile_uses_owner_selected_pipewire_capture_without_kms_or_metrics_modules() {
