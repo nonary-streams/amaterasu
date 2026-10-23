@@ -284,6 +284,7 @@ name = "amaterasu-input-companion"
 version = "0.1.0"
 dependencies = [
  "amaterasu-storage",
+ "libc",
  "serde",
  "serde_json",
  "windows-sys 0.61.2",
