@@ -6,6 +6,7 @@ use crate::{
 };
 use amaterasu_media::{AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, PCM_F32};
 use std::{
+    any::Any,
     collections::{BTreeMap, VecDeque},
     ffi::{CStr, CString, c_char, c_int, c_void},
     mem::size_of,
@@ -202,6 +203,7 @@ unsafe extern "C" {
         userdata: *mut c_void,
     ) -> *mut PaOperation;
     fn pa_operation_get_state(operation: *const PaOperation) -> c_int;
+    fn pa_operation_cancel(operation: *mut PaOperation);
     fn pa_operation_unref(operation: *mut PaOperation);
     fn pa_proplist_gets(proplist: *const PaProplist, key: *const c_char) -> *const c_char;
 }
@@ -263,13 +265,39 @@ struct IndexResult {
     index: Option<u32>,
 }
 
+#[derive(Default)]
+struct PendingCallbackStates {
+    states: Vec<Box<dyn Any>>,
+}
+
+impl PendingCallbackStates {
+    fn retain<T: 'static>(&mut self, state: Box<T>) {
+        self.states.push(state);
+    }
+}
+
+fn finish_operation_wait<T: 'static>(
+    result: AudioResult<()>,
+    callback_state: Box<T>,
+    pending_callback_states: &mut PendingCallbackStates,
+) -> AudioResult<Box<T>> {
+    match result {
+        Ok(()) => Ok(callback_state),
+        Err(error) => {
+            pending_callback_states.retain(callback_state);
+            Err(error)
+        }
+    }
+}
+
 struct Operation(*mut PaOperation);
 
 impl Drop for Operation {
     fn drop(&mut self) {
         if !self.0.is_null() {
             // SAFETY: this guard owns the unique operation reference returned
-            // by libpulse and releases it after its callback has completed.
+            // by libpulse. Error paths cancel before unref and retain userdata
+            // until this client's mainloop has been destroyed.
             unsafe { pa_operation_unref(self.0) };
         }
     }
@@ -278,6 +306,7 @@ impl Drop for Operation {
 struct PulseClient {
     mainloop: *mut PaMainloop,
     context: *mut PaContext,
+    pending_callback_states: PendingCallbackStates,
 }
 
 impl PulseClient {
@@ -302,7 +331,11 @@ impl PulseClient {
             unsafe { pa_mainloop_free(mainloop) };
             return Err("audio_backend_unavailable");
         }
-        let mut client = Self { mainloop, context };
+        let mut client = Self {
+            mainloop,
+            context,
+            pending_callback_states: PendingCallbackStates::default(),
+        };
         // Disable PulseAudio's autospawn behavior: the audio module connects to
         // the user's existing service and never starts or restarts it.
         // SAFETY: context is live; null selects the user's configured server.
@@ -387,33 +420,45 @@ impl PulseClient {
         }
     }
 
-    fn wait_operation(&mut self, pointer: *mut PaOperation) -> AudioResult<()> {
+    fn wait_operation<T: 'static>(
+        &mut self,
+        pointer: *mut PaOperation,
+        callback_state: Box<T>,
+    ) -> AudioResult<Box<T>> {
         if pointer.is_null() {
             return Err("audio_backend_failed");
         }
         let operation = Operation(pointer);
-        self.wait_until(CONTROL_TIMEOUT, || {
+        let result = self.wait_until(CONTROL_TIMEOUT, || {
             // SAFETY: operation guard keeps the operation alive until this call ends.
             match unsafe { pa_operation_get_state(operation.0) } {
                 PA_OPERATION_DONE => Some(Ok(())),
                 PA_OPERATION_CANCELLED => Some(Err("audio_backend_failed")),
                 _ => None,
             }
-        })
+        });
+        if result.is_err() {
+            // SAFETY: this operation is uniquely owned and all PulseAudio API
+            // access occurs on this client thread. Cancel disables its result
+            // callback; retaining the boxed state until mainloop teardown also
+            // covers any callback already queued before cancellation.
+            unsafe { pa_operation_cancel(operation.0) };
+        }
+        finish_operation_wait(result, callback_state, &mut self.pending_callback_states)
     }
 
     fn default_sink(&mut self) -> AudioResult<Option<String>> {
-        let mut result = ServerInfoResult::default();
-        // SAFETY: callback userdata points to a stack result that remains live
-        // until wait_operation returns and the operation has completed.
+        let mut result = Box::new(ServerInfoResult::default());
+        // SAFETY: callback userdata points to heap-owned result state retained
+        // until completion or until this client's mainloop has been destroyed.
         let operation = unsafe {
             pa_context_get_server_info(
                 self.context,
                 Some(server_info_callback),
-                (&mut result as *mut ServerInfoResult).cast(),
+                (&mut *result as *mut ServerInfoResult).cast(),
             )
         };
-        self.wait_operation(operation)?;
+        let result = self.wait_operation(operation, result)?;
         if result.failed || !result.completed {
             return Err("audio_backend_failed");
         }
@@ -421,17 +466,17 @@ impl PulseClient {
     }
 
     fn sinks(&mut self) -> AudioResult<Vec<Sink>> {
-        let mut result = SinkListResult::default();
-        // SAFETY: callback userdata points to a stack result that stays live
-        // until the list operation has completed on this mainloop.
+        let mut result = Box::new(SinkListResult::default());
+        // SAFETY: callback userdata points to heap-owned result state retained
+        // until completion or until this client's mainloop has been destroyed.
         let operation = unsafe {
             pa_context_get_sink_info_list(
                 self.context,
                 Some(sink_info_callback),
-                (&mut result as *mut SinkListResult).cast(),
+                (&mut *result as *mut SinkListResult).cast(),
             )
         };
-        self.wait_operation(operation)?;
+        let result = self.wait_operation(operation, result)?;
         if result.failed || !result.completed {
             return Err("audio_backend_failed");
         }
@@ -440,18 +485,18 @@ impl PulseClient {
 
     fn set_default_sink(&mut self, name: &str) -> AudioResult<()> {
         let name = CString::new(name).map_err(|_| "invalid_endpoint")?;
-        let mut result = BooleanResult::default();
-        // SAFETY: the endpoint CString and callback state remain live until the
-        // asynchronous operation has completed.
+        let mut result = Box::new(BooleanResult::default());
+        // SAFETY: the endpoint CString remains live through operation creation;
+        // boxed callback state is retained through completion or cancellation.
         let operation = unsafe {
             pa_context_set_default_sink(
                 self.context,
                 name.as_ptr(),
                 Some(success_callback),
-                (&mut result as *mut BooleanResult).cast(),
+                (&mut *result as *mut BooleanResult).cast(),
             )
         };
-        self.wait_operation(operation)?;
+        let result = self.wait_operation(operation, result)?;
         if result.completed && result.succeeded {
             Ok(())
         } else {
@@ -467,34 +512,35 @@ impl PulseClient {
         ))
         .map_err(|_| "invalid_virtual_sink")?;
         let module = CString::new("module-null-sink").expect("static module name contains no NUL");
-        let mut result = IndexResult::default();
-        // SAFETY: module arguments and callback state live until the operation
-        // completes; only known generated sink names reach this function.
+        let mut result = Box::new(IndexResult::default());
+        // SAFETY: module arguments live through operation creation; boxed
+        // callback state is retained through completion or cancellation.
         let operation = unsafe {
             pa_context_load_module(
                 self.context,
                 module.as_ptr(),
                 arguments.as_ptr(),
                 Some(index_callback),
-                (&mut result as *mut IndexResult).cast(),
+                (&mut *result as *mut IndexResult).cast(),
             )
         };
-        self.wait_operation(operation)?;
+        let result = self.wait_operation(operation, result)?;
         result.index.ok_or("virtual_sink_unavailable")
     }
 
     fn unload_module(&mut self, index: u32) -> AudioResult<()> {
-        let mut result = BooleanResult::default();
-        // SAFETY: callback state remains live until the module operation ends.
+        let mut result = Box::new(BooleanResult::default());
+        // SAFETY: boxed callback state is retained through completion or
+        // cancellation of the module operation.
         let operation = unsafe {
             pa_context_unload_module(
                 self.context,
                 index,
                 Some(success_callback),
-                (&mut result as *mut BooleanResult).cast(),
+                (&mut *result as *mut BooleanResult).cast(),
             )
         };
-        self.wait_operation(operation)?;
+        let result = self.wait_operation(operation, result)?;
         if result.completed && result.succeeded {
             Ok(())
         } else {
@@ -581,7 +627,9 @@ fn context_error_code(error: c_int) -> &'static str {
 impl Drop for PulseClient {
     fn drop(&mut self) {
         // SAFETY: context and mainloop are uniquely owned and destroyed in
-        // dependency order after every stream has released its context use.
+        // dependency order. `pending_callback_states` is a field and therefore
+        // remains alive through this body, including mainloop teardown, before
+        // Rust drops that field after this method returns.
         unsafe {
             if !self.context.is_null() {
                 pa_context_disconnect(self.context);
@@ -1652,6 +1700,45 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_operation_wait_keeps_userdata_valid_for_a_late_callback() {
+        for failure in ["audio_operation_timeout", "audio_server_unavailable"] {
+            let mut callback_state = Box::new(BooleanResult::default());
+            let userdata = (&mut *callback_state as *mut BooleanResult).cast();
+            let mut pending = PendingCallbackStates::default();
+
+            let outcome = finish_operation_wait(Err(failure), callback_state, &mut pending);
+            assert!(outcome.is_err());
+
+            // Model libpulse delivering a callback that was already queued
+            // when the operation wait returned. The client-owned box keeps
+            // this exact production callback's userdata valid.
+            unsafe { success_callback(ptr::null_mut(), 1, userdata) };
+
+            let state = pending.states[0]
+                .downcast_ref::<BooleanResult>()
+                .expect("the pending callback state retains its concrete type");
+            assert!(state.completed);
+            assert!(state.succeeded);
+        }
+    }
+
+    #[test]
+    fn completed_operation_wait_returns_callback_state_to_its_caller() {
+        let mut pending = PendingCallbackStates::default();
+        let callback_state = Box::new(BooleanResult {
+            completed: true,
+            succeeded: true,
+        });
+
+        let result = finish_operation_wait(Ok(()), callback_state, &mut pending)
+            .expect("completed operation returns its result state");
+
+        assert!(result.completed);
+        assert!(result.succeeded);
+        assert!(pending.states.is_empty());
+    }
 
     #[test]
     fn context_connect_wait_accepts_every_documented_transition_state() {
