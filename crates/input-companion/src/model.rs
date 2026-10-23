@@ -63,6 +63,10 @@ pub enum InputEvent {
         extended: bool,
         pressed: bool,
     },
+    EvdevKey {
+        code: u16,
+        pressed: bool,
+    },
     MouseButton {
         button: MouseButton,
         pressed: bool,
@@ -83,6 +87,9 @@ impl InputEvent {
             Self::Key { scan_code, .. } if !(1..=127).contains(scan_code) => {
                 Err(InputError::InvalidEvent)
             }
+            Self::EvdevKey { code, .. } if !(1..=248).contains(code) || *code == 240 => {
+                Err(InputError::InvalidEvent)
+            }
             Self::Relative { dx: 0, dy: 0 }
             | Self::Scroll {
                 vertical: 0,
@@ -99,7 +106,7 @@ impl InputEvent {
     }
 
     pub(crate) fn keyboard(&self) -> bool {
-        matches!(self, Self::Key { .. })
+        matches!(self, Self::Key { .. } | Self::EvdevKey { .. })
     }
 
     pub(crate) fn transition(&self) -> Option<(HeldInput, bool)> {
@@ -109,6 +116,7 @@ impl InputEvent {
                 extended,
                 pressed,
             } => Some((HeldInput::Key(*scan_code, *extended), *pressed)),
+            Self::EvdevKey { code, pressed } => Some((HeldInput::EvdevKey(*code), *pressed)),
             Self::MouseButton { button, pressed } => {
                 Some((HeldInput::MouseButton(*button), *pressed))
             }
@@ -120,6 +128,7 @@ impl InputEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeldInput {
     Key(u8, bool),
+    EvdevKey(u16),
     MouseButton(MouseButton),
 }
 
@@ -129,6 +138,10 @@ impl HeldInput {
             Self::Key(scan_code, extended) => InputEvent::Key {
                 scan_code,
                 extended,
+                pressed: false,
+            },
+            Self::EvdevKey(code) => InputEvent::EvdevKey {
+                code,
                 pressed: false,
             },
             Self::MouseButton(button) => InputEvent::MouseButton {

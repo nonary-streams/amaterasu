@@ -92,12 +92,14 @@ impl PermitLedger {
         if !keyboard && !mouse || !peer.valid() {
             return Err(InputError::InvalidGrant);
         }
-        if let Some(previous) = &self.authorized
-            && previous.process == process
-            && (previous.component_set_digest != digest
-                || previous.keyboard != keyboard
-                || previous.mouse != mouse)
-        {
+        let changed_authorization = self.authorized.as_ref().is_some_and(|previous| {
+            previous.process == process
+                && (previous.component_set_digest != digest
+                    || previous.keyboard != keyboard
+                    || previous.mouse != mouse)
+        });
+        if changed_authorization {
+            self.revoke(&process);
             return Err(InputError::InvalidGrant);
         }
         self.authorized = Some(HostPermit {
@@ -162,6 +164,37 @@ impl PermitLedger {
             self.active = None;
         }
     }
+
+    /// Immediately invalidates a host permit and its active worker lease.
+    pub fn revoke(&mut self, process: &ProcessIdentity) {
+        if self
+            .authorized
+            .as_ref()
+            .is_some_and(|permit| &permit.process == process)
+        {
+            self.authorized = None;
+        }
+        if self.active.as_ref() == Some(process) {
+            self.active = None;
+        }
+    }
+
+    /// Revokes by the OS process identity captured when it was authorized.
+    /// This also works after `/proc/<pid>` disappears on worker exit.
+    pub fn revoke_instance(&mut self, process_id: u32, creation_time: u64) {
+        let matches =
+            |process: &ProcessIdentity| process.matches_instance(process_id, creation_time);
+        let process = self
+            .authorized
+            .as_ref()
+            .map(|permit| &permit.process)
+            .filter(|process| matches(process))
+            .or_else(|| self.active.as_ref().filter(|process| matches(process)))
+            .cloned();
+        if let Some(process) = process {
+            self.revoke(&process);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -217,5 +250,60 @@ mod tests {
             .unwrap();
         assert!(!ledger.is_current(&process(11), now));
         assert_eq!(ledger.claim(&process(12), now).unwrap().generation, 2);
+    }
+
+    #[test]
+    fn host_revocation_invalidates_open_and_active_worker_lease() {
+        let now = Instant::now();
+        let process = process(11);
+        let mut ledger = PermitLedger::new(GrantRegistry::synthetic());
+        ledger
+            .refresh_from_host(process.clone(), "a".repeat(64), true, true, now)
+            .unwrap();
+        let _lease = ledger.claim(&process, now).unwrap();
+
+        ledger.revoke(&process);
+
+        assert!(!ledger.may_open(&process, now));
+        assert!(!ledger.is_current(&process, now));
+        assert!(matches!(
+            ledger.claim(&process, now),
+            Err(InputError::PermissionDenied)
+        ));
+    }
+
+    #[test]
+    fn changed_same_worker_policy_immediately_revokes_the_previous_permit() {
+        let now = Instant::now();
+        let process = process(11);
+        let mut ledger = PermitLedger::new(GrantRegistry::synthetic());
+        ledger
+            .refresh_from_host(process.clone(), "a".repeat(64), true, true, now)
+            .unwrap();
+        let _lease = ledger.claim(&process, now).unwrap();
+
+        assert_eq!(
+            ledger.refresh_from_host(process.clone(), "b".repeat(64), true, true, now),
+            Err(InputError::InvalidGrant)
+        );
+
+        assert!(!ledger.is_current(&process, now));
+        assert!(!ledger.may_open(&process, now));
+    }
+
+    #[test]
+    fn exited_worker_can_be_revoked_using_its_captured_starttime() {
+        let now = Instant::now();
+        let process = process(11);
+        let mut ledger = PermitLedger::new(GrantRegistry::synthetic());
+        ledger
+            .refresh_from_host(process.clone(), "a".repeat(64), true, true, now)
+            .unwrap();
+        let _lease = ledger.claim(&process, now).unwrap();
+
+        ledger.revoke_instance(process.process_id, process.creation_time);
+
+        assert!(!ledger.may_open(&process, now));
+        assert!(!ledger.is_current(&process, now));
     }
 }

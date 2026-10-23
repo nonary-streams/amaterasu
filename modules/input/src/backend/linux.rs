@@ -718,7 +718,10 @@ impl Backend for LinuxBackend {
                 // uncertain outcome and a later cleanup must use this mapping.
                 self.held_virtual_keycodes.insert(
                     identity,
-                    code_for_virtual_key(*code, *normalized, self.key_rightalt_to_key_win)?,
+                    code_for_virtual_key(*code, *normalized, self.key_rightalt_to_key_win)
+                        .ok_or_else(|| {
+                            InputError::new("unsupported_event", "unmapped Moonlight key")
+                        })?,
                 );
             }
             let result = keyboard.emit(&[(

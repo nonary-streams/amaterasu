@@ -68,6 +68,18 @@ impl GrantRegistry {
         }
     }
 
+    /// Creates an in-memory generation floor for an unprivileged user-session
+    /// companion. Linux live grants are bound to a live host permit and random
+    /// token; restarting the listener drops every grant, so persistent
+    /// machine-owned storage is neither needed nor appropriate here.
+    #[cfg(target_os = "linux")]
+    pub fn session_only() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RegistryState::default())),
+            generation_file: None,
+        }
+    }
+
     /// The installed service must supply an installer-owned machine root and
     /// run as LocalSystem. Generation floors survive a companion restart;
     /// live grants deliberately do not, so a restart invalidates all tickets.
@@ -363,6 +375,14 @@ impl<S: DeviceSink> InputSession<S> {
 }
 
 impl InputGrant {
+    pub fn keyboard_enabled(&self) -> bool {
+        self.keyboard
+    }
+
+    pub fn mouse_enabled(&self) -> bool {
+        self.mouse
+    }
+
     fn activate(&self) -> InputResult<()> {
         let mut registry = self.registry.lock().map_err(|_| InputError::InvalidGrant)?;
         if registry.highest_generation != self.generation {

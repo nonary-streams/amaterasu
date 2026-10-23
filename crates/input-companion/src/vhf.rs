@@ -127,6 +127,7 @@ impl<T: VhfTransport> DeviceSink for VhfDeviceSink<T> {
                 extended,
                 pressed,
             } => self.key(*scan_code, *extended, *pressed),
+            InputEvent::EvdevKey { .. } => Err(InputError::InvalidEvent),
             InputEvent::MouseButton { button, pressed } => {
                 let bit = match button {
                     MouseButton::Left => 0,
