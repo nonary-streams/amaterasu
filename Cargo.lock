@@ -41,6 +41,7 @@ dependencies = [
  "amaterasu-input-companion",
  "amaterasu-package",
  "ed25519-dalek",
+ "libc",
  "libloading",
  "serde",
  "serde_json",

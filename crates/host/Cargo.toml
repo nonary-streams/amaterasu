@@ -16,6 +16,9 @@ serde.workspace = true
 [lints]
 workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 ed25519-dalek.workspace = true
 

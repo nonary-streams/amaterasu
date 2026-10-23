@@ -1,5 +1,5 @@
-//! Machine-owned opt-in for the separately installed VHF companion. A signed
-//! component set does not gain privileged input solely by selecting a backend.
+//! Host-owned opt-in for a separately authorized input companion. A signed
+//! component set does not gain input solely by selecting a backend.
 use amaterasu_package::{PackageResult, read_json};
 use serde::Deserialize;
 use std::path::Path;
@@ -38,6 +38,7 @@ impl CompanionPolicy {
         Ok(Some(policy))
     }
 
+    #[cfg(windows)]
     pub(crate) fn authorize(&self, process_id: u32, creation_time: u64) -> PackageResult<()> {
         amaterasu_input_companion::authorize_worker(
             process_id,
@@ -47,6 +48,11 @@ impl CompanionPolicy {
             self.mouse,
         )
         .map_err(|error| format!("input companion rejected supervised worker: {error:?}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn capabilities(&self) -> (bool, bool) {
+        (self.keyboard, self.mouse)
     }
 }
 

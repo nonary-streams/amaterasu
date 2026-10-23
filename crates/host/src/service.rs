@@ -314,18 +314,28 @@ pub(crate) fn run_managed_service(
 ) -> PackageResult<()> {
     let _lock = RootLock::acquire(root)?;
     let digest = crate::supervisor::select_active(root)?;
+    #[cfg(target_os = "linux")]
+    let mut linux_input = crate::linux_input::Supervisor::new(root, &digest)?;
     let mut restarts = 0;
     let mut worker = start_with_recovery(root, &digest, &mut restarts, false)?;
+    #[cfg(target_os = "linux")]
+    linux_input.refresh(root, &digest, worker.child.id())?;
     publish_service_readiness(root, &digest)?;
     on_started();
 
     while !stop_requested() {
         if worker.check_idle().is_err() {
+            #[cfg(target_os = "linux")]
+            linux_input.revoke();
             drop(worker);
             worker = restart(root, &digest, &mut restarts, false)?;
         }
+        #[cfg(target_os = "linux")]
+        linux_input.refresh(root, &digest, worker.child.id())?;
         std::thread::sleep(Duration::from_millis(20));
     }
+    #[cfg(target_os = "linux")]
+    linux_input.revoke();
     let result = worker.shutdown();
     remove_service_readiness(root);
     result

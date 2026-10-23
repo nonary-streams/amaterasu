@@ -1,7 +1,11 @@
 #[cfg(windows)]
 mod input_companion;
+#[cfg(target_os = "linux")]
+mod input_companion;
 #[cfg(windows)]
 mod interactive_worker;
+#[cfg(target_os = "linux")]
+mod linux_input;
 mod loading;
 mod logging_config;
 mod native_recovery;
