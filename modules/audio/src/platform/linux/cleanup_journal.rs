@@ -571,7 +571,7 @@ mod tests {
 
         let indeterminate = RouteIntent {
             assignment_confirmed: false,
-            ..route
+            ..route.clone()
         };
         assert_eq!(
             route_restore_action(&indeterminate, Some("new-user-choice")),

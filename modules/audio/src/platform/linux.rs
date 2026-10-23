@@ -18,6 +18,7 @@ use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
     mem::size_of,
     panic::{AssertUnwindSafe, catch_unwind},
+    path::Path,
     ptr,
     sync::{
         Arc, Mutex, OnceLock, Weak,
