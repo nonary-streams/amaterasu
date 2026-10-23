@@ -1,9 +1,8 @@
-//! Caller-owned Windows WASAPI loopback audio and borrowed native PCM frames.
+//! Caller-owned desktop loopback audio and borrowed native PCM frames.
 mod controller;
 mod model;
 mod native;
 mod open_policy;
-#[cfg(any(windows, test))]
 mod packet;
 mod platform;
 #[cfg(any(windows, test))]

@@ -1,10 +1,10 @@
 use crate::model::AudioResult;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 use crate::model::Endpoint;
 #[cfg(any(windows, test))]
 use std::collections::BTreeMap;
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 pub const DEFAULT_VIRTUAL_SINK_ADAPTER: &str = "Steam Streaming Speakers";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,7 +171,7 @@ pub fn preferred_format_candidates(
 
 /// Matches the configured text against the endpoint fields in Vibeshine's
 /// priority order. Empty selection means the built-in Steam adapter match.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 pub fn select_endpoint<'a>(endpoints: &'a [Endpoint], selector: &str) -> Option<&'a Endpoint> {
     if selector.is_empty() {
         return endpoints.iter().find(|endpoint| {
@@ -225,7 +225,7 @@ pub fn select_policy_virtual_sink<'a>(
     select_endpoint(endpoints, "")
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 #[derive(Clone, Copy)]
 enum MatchField {
     Id,
