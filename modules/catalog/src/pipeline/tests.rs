@@ -1,6 +1,8 @@
 use super::*;
 use std::collections::BTreeMap;
 
+mod desktop_seed;
+
 #[derive(Clone, Copy, Default)]
 struct CleanupPolicy {
     remove_stale: bool,

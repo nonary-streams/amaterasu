@@ -3,6 +3,7 @@ mod model;
 mod pipeline;
 mod product;
 mod protocol;
+mod seed;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use pipeline::Pipeline;
@@ -17,6 +18,9 @@ struct Settings {
     export_principals: std::collections::BTreeMap<String, String>,
     steam_id_export_principals: std::collections::BTreeMap<String, String>,
     import_principals: std::collections::BTreeMap<String, String>,
+    /// Create one `Desktop` entry, once, in each catalog that
+    /// `export_principals` serves to streaming clients.
+    seed_desktop_entry: bool,
 }
 
 impl Settings {
@@ -72,6 +76,11 @@ impl ManagedModule for CatalogModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        let seeded_owners: std::collections::BTreeSet<String> = if settings.seed_desktop_entry {
+            settings.export_principals.values().cloned().collect()
+        } else {
+            Default::default()
+        };
         Ok(Self {
             runtime,
             pipeline: Pipeline::new_with_steam_id_export_principals(
@@ -79,7 +88,8 @@ impl ManagedModule for CatalogModule {
                 settings.export_principals,
                 settings.steam_id_export_principals,
                 settings.import_principals,
-            ),
+            )
+            .with_desktop_seed(seeded_owners),
         })
     }
 
@@ -94,6 +104,23 @@ amaterasu_module_sdk::export_module!(CatalogModule);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_seed_is_off_by_default_and_strictly_typed() {
+        let defaults: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!defaults.seed_desktop_entry);
+        let enabled: Settings =
+            serde_json::from_value(serde_json::json!({"seed_desktop_entry":true})).unwrap();
+        assert!(enabled.seed_desktop_entry);
+        assert!(enabled.validate().is_ok());
+        for invalid in [
+            serde_json::json!({"seed_desktop_entry":"yes"}),
+            serde_json::json!({"seed_desktop_entry":null}),
+            serde_json::json!({"seed-desktop-entry":true}),
+        ] {
+            assert!(serde_json::from_value::<Settings>(invalid).is_err());
+        }
+    }
 
     #[test]
     fn export_settings_validate_both_sides_and_capacity() {

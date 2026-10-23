@@ -17,7 +17,7 @@ pub enum Step {
     Acquire,
     Spawn,
     AwaitApplication,
-    PreparePlaynite,
+    PrepareApplication,
     AwaitPreparation,
     StartPlaynite,
     AwaitPlayniteStart,
@@ -96,6 +96,9 @@ impl Workflow {
                 exit_timeout_seconds,
                 ..
             }) => exit_timeout_seconds.saturating_add(21).min(321),
+            Some(LaunchTarget::Desktop { exit_timeout_seconds, .. }) => {
+                exit_timeout_seconds.saturating_add(21).min(321)
+            }
             _ => 20,
         };
         self.deadline = Instant::now() + Duration::from_secs(cleanup_seconds);
@@ -144,7 +147,7 @@ impl Workflow {
                 ),
                 _ => return Err("invalid_workflow"),
             },
-            Step::PreparePlaynite => {
+            Step::PrepareApplication => {
                 let (preparation, working_directory) = match record.target.as_ref() {
                     Some(LaunchTarget::Playnite {
                         preparation,
@@ -152,6 +155,11 @@ impl Workflow {
                         ..
                     })
                     | Some(LaunchTarget::PlayniteFullscreen {
+                        preparation,
+                        working_directory,
+                        ..
+                    })
+                    | Some(LaunchTarget::Desktop {
                         preparation,
                         working_directory,
                         ..
@@ -375,7 +383,7 @@ mod tests {
                 launch_id,
                 request: Some(1),
                 deadline: Instant::now() + Duration::from_secs(5),
-                step: Step::PreparePlaynite,
+                step: Step::PrepareApplication,
                 pending: None,
                 cleanup: false,
             };

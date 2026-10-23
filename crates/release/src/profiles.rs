@@ -5,6 +5,8 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+pub mod linux_session;
+
 pub const RUNTIME_ID: &str = "amaterasu.runtime";
 
 #[derive(Clone, Copy)]
@@ -14,6 +16,8 @@ pub enum PackageProfile {
     MediaProbe,
     StreamProbe,
     DesktopStreamSmoke,
+    /// Product Linux session host; effects stay disabled until selected.
+    LinuxSession,
 }
 
 #[derive(Clone, Copy)]
@@ -419,6 +423,18 @@ const VIDEO: ComponentDefinition = ComponentDefinition {
         "amaterasu.capture-wgc",
         "amaterasu.encode",
     ],
+};
+
+/// Current-user XDG Desktop Portal capture through a restricted PipeWire remote.
+const CAPTURE_PIPEWIRE: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.capture-pipewire",
+    library: "amaterasu_capture_pipewire",
+    provides: &["amaterasu.capture-pipewire/1"],
+    calls: &[],
+    publishes: &[],
+    native_provides: &["amaterasu.capture-pipewire/1"],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
 };
 const MEDIA_TRANSPORT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.media-transport",
@@ -843,6 +859,7 @@ impl PackageProfile {
                 STREAM_SESSION_DXGI_SMOKE,
                 RTSP_DESKTOP_SMOKE,
             ],
+            Self::LinuxSession => linux_session::COMPONENTS,
             Self::Platform => &[
                 RUNTIME,
                 STATE,

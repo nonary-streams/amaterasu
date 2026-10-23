@@ -647,6 +647,22 @@ pub enum Launch {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         preparation: Vec<PreparationStep>,
     },
+    /// A process-less desktop session. It names no program, path, or provider
+    /// identity: launch only prepares the host, holds the session, and undoes
+    /// the preparation when the client leaves.
+    Desktop {
+        #[serde(default = "default_desktop_exit_timeout_seconds")]
+        exit_timeout_seconds: u64,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            alias = "working-dir",
+            deserialize_with = "empty_working_directory_as_none"
+        )]
+        working_directory: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preparation: Vec<PreparationStep>,
+    },
 }
 
 /// Keep legacy command strings and per-command settings in one catalog value.
@@ -718,6 +734,10 @@ fn default_playnite_fullscreen_exit_timeout_seconds() -> u64 {
     10
 }
 
+fn default_desktop_exit_timeout_seconds() -> u64 {
+    10
+}
+
 pub fn valid_guid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| match index {
@@ -781,12 +801,14 @@ impl Entry {
         }
         self.config_overrides.validate()?;
         validate_raw_preparation(&self.prep_cmd)?;
-        if matches!(&self.launch, Launch::PlayniteFullscreen { .. })
-            && (self.artwork.is_some()
-                || self.steam_id.is_some()
-                || self.steam_install_dir.is_some())
+        if matches!(
+            &self.launch,
+            Launch::PlayniteFullscreen { .. } | Launch::Desktop { .. }
+        ) && (self.artwork.is_some()
+            || self.steam_id.is_some()
+            || self.steam_install_dir.is_some())
         {
-            return Err("Playnite Fullscreen entries cannot contain Steam metadata");
+            return Err("Playnite Fullscreen and Desktop entries cannot contain Steam metadata");
         }
         if !bounded_text(&self.name, 160) || self.name.trim().is_empty() {
             return Err("name must contain 1..160 bytes of printable text");
@@ -855,6 +877,20 @@ impl Entry {
             } => {
                 if *exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
                     return Err("invalid Playnite Fullscreen exit timeout");
+                }
+                if let Some(directory) = working_directory {
+                    validate_working_directory(directory)?;
+                }
+                validate_preparation(preparation)?;
+                validate_combined_preparation_count(preparation.len(), self.prep_cmd.len())?;
+            }
+            Launch::Desktop {
+                exit_timeout_seconds,
+                working_directory,
+                preparation,
+            } => {
+                if *exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
+                    return Err("invalid Desktop exit timeout");
                 }
                 if let Some(directory) = working_directory {
                     validate_working_directory(directory)?;
@@ -1561,6 +1597,7 @@ mod tests {
             json!({"kind":"application","path":"/games/example"}),
             json!({"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}),
             json!({"kind":"playnite_fullscreen"}),
+            json!({"kind":"desktop"}),
         ] {
             let entry: Entry = serde_json::from_value(json!({
                 "name":"Not executable",
@@ -1871,6 +1908,112 @@ mod tests {
                 assert!(entry.validate().is_err(), "accepted {forged}");
             }
         }
+    }
+
+    #[test]
+    fn desktop_target_is_process_less_normalized_and_bounded() {
+        let bare: Entry = serde_json::from_value(json!({
+            "name":"Desktop",
+            "launch":{"kind":"desktop"}
+        }))
+        .unwrap();
+        bare.validate().unwrap();
+        assert!(matches!(
+            bare.launch,
+            Launch::Desktop {
+                exit_timeout_seconds: 10,
+                working_directory: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap()["launch"],
+            json!({"kind":"desktop","exit_timeout_seconds":10})
+        );
+
+        let configured: Entry = serde_json::from_value(json!({
+            "name":"Desktop",
+            "prep_cmd":[{"do":"enable","undo":"disable"}],
+            "launch":{
+                "kind":"desktop",
+                "exit_timeout_seconds":30,
+                "working-dir":"/home/player",
+                "preparation":[{
+                    "run":{"executable":"/usr/bin/configure","args":["enable"]},
+                    "undo":{"executable":"/usr/bin/configure","args":["disable"]}
+                }]
+            }
+        }))
+        .unwrap();
+        configured.validate().unwrap();
+        let normalized = serde_json::to_value(&configured).unwrap();
+        assert_eq!(normalized["launch"]["exit_timeout_seconds"], 30);
+        assert_eq!(normalized["launch"]["working_directory"], "/home/player");
+        assert_eq!(
+            normalized["launch"]["preparation"][0]["run"]["timeout_ms"],
+            10_000
+        );
+        assert_eq!(
+            normalized["launch"]["preparation"][0]["undo"]["cwd"],
+            json!(null)
+        );
+        // Normalization is stable: reading the stored form changes nothing.
+        let reread: Entry = serde_json::from_value(normalized.clone()).unwrap();
+        assert_eq!(serde_json::to_value(reread).unwrap(), normalized);
+
+        for timeout in [0, 300] {
+            let entry: Entry = serde_json::from_value(json!({
+                "name":"Desktop","launch":{"kind":"desktop","exit_timeout_seconds":timeout}
+            }))
+            .unwrap();
+            entry.validate().unwrap();
+        }
+        let too_long: Entry = serde_json::from_value(json!({
+            "name":"Desktop","launch":{"kind":"desktop","exit_timeout_seconds":301}
+        }))
+        .unwrap();
+        assert!(too_long.validate().is_err());
+        let relative: Entry = serde_json::from_value(json!({
+            "name":"Desktop","launch":{"kind":"desktop","working_directory":"relative"}
+        }))
+        .unwrap();
+        assert!(relative.validate().is_err());
+    }
+
+    #[test]
+    fn desktop_target_rejects_programs_identities_elevation_and_unknown_fields() {
+        for launch in [
+            json!({"kind":"desktop","program":"/usr/bin/true"}),
+            json!({"kind":"desktop","path":"/usr/bin/true"}),
+            json!({"kind":"desktop","arguments":["--fullscreen"]}),
+            json!({"kind":"desktop","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}),
+            json!({"kind":"desktop","steam_id":"480"}),
+            json!({"kind":"desktop","elevated":true}),
+            json!({"kind":"desktop","detached":["true"]}),
+            json!({"kind":"desktop","unknown":1}),
+        ] {
+            assert!(
+                serde_json::from_value::<Entry>(json!({"name":"Desktop","launch":launch.clone()}))
+                    .is_err(),
+                "accepted {launch}"
+            );
+        }
+        for entry in [
+            json!({"name":"Desktop","elevated":true,"launch":{"kind":"desktop"}}),
+            json!({"name":"Desktop","steam_id":"480","launch":{"kind":"desktop"}}),
+            json!({"name":"Desktop","steam_install_dir":"/games/steam","launch":{"kind":"desktop"}}),
+            json!({"name":"Desktop","artwork":{"provider":"steam","app_id":480,"revision":"1"},"launch":{"kind":"desktop"}}),
+        ] {
+            let parsed: Entry = serde_json::from_value(entry.clone()).unwrap();
+            assert!(parsed.validate().is_err(), "accepted {entry}");
+        }
+        let too_many_steps: Entry = serde_json::from_value(json!({
+            "name":"Desktop",
+            "prep_cmd":(0..8).map(|index| json!({"do":format!("step-{index}")})).collect::<Vec<_>>(),
+            "launch":{"kind":"desktop","preparation":[{"run":{"executable":"/usr/bin/configure"}}]}
+        }))
+        .unwrap();
+        assert!(too_many_steps.validate().is_err());
     }
 
     #[test]
