@@ -1,5 +1,5 @@
 use super::{
-    AudioSinkCaptureOnlyOverrides, CLEANUP_DEADLINE, Controller, Send, app_id,
+    AudioSinkCaptureOnlyOverrides, CLEANUP_DEADLINE, Controller, Send, StreamingConfig, app_id,
     call::{Call, Outcome},
     capture_sink_without_routing, key_hex, private_error,
     record::{Record, Stage, State},
@@ -141,7 +141,7 @@ impl Controller {
         }
     }
 
-    fn advance_after_history(&self, record: &mut Record, now: Instant) {
+    fn advance_after_history(config: Option<&StreamingConfig>, record: &mut Record, now: Instant) {
         if record.state != State::Starting {
             return;
         }
@@ -149,16 +149,14 @@ impl Controller {
             record.stage = Stage::PreflightApplication;
             return;
         }
-        let Some(config) = &self.config else {
+        let Some(config) = config else {
             fail_record(record, "streaming_disabled", now);
             return;
         };
         let mut profile = config.profile.clone();
-        if let Err(code) = project_application_policy(
-            record,
-            &ApplicationConfigOverrides::default(),
-            &mut profile,
-        ) {
+        if let Err(code) =
+            project_application_policy(record, &ApplicationConfigOverrides::default(), &mut profile)
+        {
             fail_record(record, code, now);
             return;
         }
@@ -432,7 +430,7 @@ impl Controller {
                 } else {
                     "unavailable"
                 };
-                self.advance_after_history(record, now);
+                Self::advance_after_history(self.config.as_ref(), record, now);
             }
             Phase::PreflightApplication => match application_preflight_response(record, &payload) {
                 Ok((token, catalog_revision, application_overrides, executable_path))
@@ -704,7 +702,7 @@ impl Controller {
                 }
                 record.history_state = "unavailable";
                 record.history_release_required = false;
-                self.advance_after_history(record, now);
+                Self::advance_after_history(self.config.as_ref(), record, now);
             }
             Phase::ReleaseHistory => {
                 record.cleanup_error = Some("history_release_unavailable");
@@ -759,7 +757,7 @@ impl Controller {
                     record.cleanup_error = None;
                 }
                 record.history_state = "unavailable";
-                self.advance_after_history(record, now);
+                Self::advance_after_history(self.config.as_ref(), record, now);
             }
             Phase::ReleaseHistory => {
                 record.cleanup_error = Some("history_release_unavailable");
@@ -933,7 +931,9 @@ fn next_phase(record: &Record) -> Phase {
         Stage::LaunchApplication => Phase::LaunchApplication,
         Stage::PrepareDisplayAdmission => Phase::PrepareDisplayAdmission,
         Stage::OpenRtsp => Phase::OpenRtsp,
-        Stage::Live if !record.desktop && record.monitor_application_next => Phase::MonitorApplication,
+        Stage::Live if !record.desktop && record.monitor_application_next => {
+            Phase::MonitorApplication
+        }
         Stage::Live => Phase::MonitorRtsp,
         Stage::Cleanup
             if record.rtsp_requested

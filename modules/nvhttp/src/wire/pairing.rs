@@ -379,7 +379,11 @@ impl Router {
                 complete(&job, reply, replies);
                 None
             }
-            Purpose::LaunchIdentity { request, peer, resume } => {
+            Purpose::LaunchIdentity {
+                request,
+                peer,
+                resume,
+            } => {
                 let connection = job.connection?;
                 let Some(client_id) = payload.get("client_id").and_then(Value::as_str) else {
                     complete(

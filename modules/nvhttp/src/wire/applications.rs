@@ -106,7 +106,10 @@ impl Applications {
     fn append(&mut self, entry: Entry) -> Result<(), Reply> {
         let id = numeric_id(&entry.id).map_err(|message| xml::error(502, message))?;
         if self.desktop_enabled && id == DESKTOP_APP_ID {
-            return Err(xml::error(502, "catalog ID conflicts with the Desktop app ID"));
+            return Err(xml::error(
+                502,
+                "catalog ID conflicts with the Desktop app ID",
+            ));
         }
         if self.last_id.is_some_and(|previous| id <= previous) {
             return Err(xml::error(502, "catalog IDs are duplicated or not ordered"));
@@ -156,7 +159,9 @@ impl Applications {
 }
 
 fn desktop_xml() -> String {
-    format!("<App><AppTitle>Desktop</AppTitle><ID>{DESKTOP_APP_ID}</ID><IsHdrSupported>0</IsHdrSupported></App>")
+    format!(
+        "<App><AppTitle>Desktop</AppTitle><ID>{DESKTOP_APP_ID}</ID><IsHdrSupported>0</IsHdrSupported></App>"
+    )
 }
 
 fn decode_page(payload: Value) -> Result<Page, Reply> {

@@ -872,7 +872,10 @@ impl Controller {
             || !matches!(request.audio_channels, 2 | 6 | 8)
             || (request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
             || (request.audio_channels == 8 && config.profile.audio_bitrate < 512_000)
-            || request.device_name.as_deref().is_some_and(|name| !valid_device_name(name))
+            || request
+                .device_name
+                .as_deref()
+                .is_some_and(|name| !valid_device_name(name))
         {
             return Some(private_error(400, "unsupported streaming request"));
         }
@@ -883,10 +886,15 @@ impl Controller {
             record.request.remote_input_key == request.remote_input_key
                 && (record.peer != *peer || record.request != request)
         }) {
-            return Some(private_error(409, "launch key conflicts with an existing request"));
+            return Some(private_error(
+                409,
+                "launch key conflicts with an existing request",
+            ));
         }
         let Some(record) = self.records.values_mut().find(|record| {
-            record.desktop && record.peer.certificate == peer.certificate && record.state == State::Ready
+            record.desktop
+                && record.peer.certificate == peer.certificate
+                && record.state == State::Ready
         }) else {
             return Some(private_error(404, "live Desktop session was not found"));
         };
@@ -924,7 +932,11 @@ impl Controller {
             }) && self.job.is_none()
         });
         if resume_ready && let Some(pending) = self.pending_resume.take() {
-            if self.records.get(&pending.record).is_some_and(|record| record.state == State::Stopped) {
+            if self
+                .records
+                .get(&pending.record)
+                .is_some_and(|record| record.state == State::Stopped)
+            {
                 if let Some(old_record) = self.records.get_mut(&pending.record)
                     && old_record.request.remote_input_key == pending.request.remote_input_key
                 {
@@ -932,20 +944,22 @@ impl Controller {
                     // The old record is terminal and no longer owns live input.
                     old_record.request.remote_input_key = [0; 16];
                 }
-                if let Some(reply) = self.launch(
-                    pending.connection,
-                    pending.request,
-                    pending.peer,
-                    now,
-                ) {
+                if let Some(reply) =
+                    self.launch(pending.connection, pending.request, pending.peer, now)
+                {
                     replies.push((pending.connection, reply));
-                } else if let Some(record) = self.records.values_mut().find(|record| {
-                    record.launch_connection == Some(pending.connection)
-                }) {
+                } else if let Some(record) = self
+                    .records
+                    .values_mut()
+                    .find(|record| record.launch_connection == Some(pending.connection))
+                {
                     record.resumed = true;
                 }
             } else {
-                replies.push((pending.connection, private_error(503, "Desktop cleanup failed")));
+                replies.push((
+                    pending.connection,
+                    private_error(503, "Desktop cleanup failed"),
+                ));
             }
         }
         replies
@@ -975,7 +989,11 @@ impl Controller {
     }
 
     pub fn connection_closed(&mut self, connection: u64, now: Instant) {
-        if self.pending_resume.as_ref().is_some_and(|pending| pending.connection == connection) {
+        if self
+            .pending_resume
+            .as_ref()
+            .is_some_and(|pending| pending.connection == connection)
+        {
             self.pending_resume = None;
         }
         let mut affected = None;

@@ -232,7 +232,11 @@ fn malformed_pages_duplicate_ids_and_nonadvancing_cursors_fail_closed() {
         page(1, vec![entry(1, "\n")], None),
     ] {
         assert_eq!(
-            Applications::new(false).accept(invalid).err().unwrap().status,
+            Applications::new(false)
+                .accept(invalid)
+                .err()
+                .unwrap()
+                .status,
             502
         );
     }
@@ -438,9 +442,11 @@ fn desktop_entry_is_opt_in_and_catalog_collision_fails_closed() {
     let body = String::from_utf8(desktop_only.body).unwrap();
     assert!(body.contains("<AppTitle>Desktop</AppTitle>"));
     assert!(body.contains("<ID>2147483647</ID>"));
-    assert!(!String::from_utf8(Applications::new(false).finish().body)
-        .unwrap()
-        .contains("Desktop"));
+    assert!(
+        !String::from_utf8(Applications::new(false).finish().body)
+            .unwrap()
+            .contains("Desktop")
+    );
 
     let collision = Applications::new(true)
         .accept(page(1, vec![entry(i32::MAX as u64, "collision")], None))
@@ -459,17 +465,28 @@ fn desktop_list_survives_missing_or_unavailable_catalog_provider() {
         let mut router = router();
         let job = Job {
             connection: Some(7),
-            purpose: Purpose::Applications { desktop_enabled: true },
-            call: Call::Ready { payload: json!({}), not_before: now },
+            purpose: Purpose::Applications {
+                desktop_enabled: true,
+            },
+            call: Call::Ready {
+                payload: json!({}),
+                not_before: now,
+            },
             deadline: now + LIST_TIMEOUT,
             applications: Some(Applications::new(true)),
         };
         let mut replies = Vec::new();
-        assert!(router.resolve_applications(job, failure, now, &mut replies).is_none());
+        assert!(
+            router
+                .resolve_applications(job, failure, now, &mut replies)
+                .is_none()
+        );
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].1.status, 200);
-        assert!(String::from_utf8(replies.pop().unwrap().1.body)
-            .unwrap()
-            .contains("<AppTitle>Desktop</AppTitle>"));
+        assert!(
+            String::from_utf8(replies.pop().unwrap().1.body)
+                .unwrap()
+                .contains("<AppTitle>Desktop</AppTitle>")
+        );
     }
 }

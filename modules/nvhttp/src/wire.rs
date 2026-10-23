@@ -125,7 +125,9 @@ enum Purpose {
         resume: bool,
     },
     Cleanup,
-    Applications { desktop_enabled: bool },
+    Applications {
+        desktop_enabled: bool,
+    },
 }
 
 const PAIRING_SERVICE: &str = "amaterasu.pairing/1";
@@ -349,7 +351,11 @@ impl Router {
                 };
                 self.queue(
                     Some(connection),
-                    Purpose::LaunchIdentity { request, peer: identity, resume: true },
+                    Purpose::LaunchIdentity {
+                        request,
+                        peer: identity,
+                        resume: true,
+                    },
                     json!({"action":"check_client_certificate", "certificate_pem":certificate_pem}),
                     now + SERVICE_TIMEOUT,
                     now,
@@ -359,7 +365,10 @@ impl Router {
             }
             "/unpair" => {
                 if trusted {
-                    Some(xml::error(501, "this Moonlight operation is not implemented"))
+                    Some(xml::error(
+                        501,
+                        "this Moonlight operation is not implemented",
+                    ))
                 } else {
                     Some(xml::error(401, "authenticated paired TLS is required"))
                 }
@@ -389,7 +398,7 @@ impl Router {
                 connection,
                 applications: match purpose {
                     Purpose::Applications { desktop_enabled } => {
-                        Some(applications::Applications::new(*desktop_enabled))
+                        Some(applications::Applications::new(desktop_enabled))
                     }
                     _ => None,
                 },
