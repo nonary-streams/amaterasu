@@ -781,6 +781,7 @@ impl ProductSettings {
             match provider {
                 crate::launch::CaptureProvider::Dxgi => "dxgi",
                 crate::launch::CaptureProvider::Wgc => "wgc",
+                crate::launch::CaptureProvider::PipeWire => "pipewire",
             }
         })
     }
@@ -4629,6 +4630,20 @@ mod tests {
             settings.apply_document(parse_document(&document).unwrap());
             assert_eq!(settings.capture_provider(), Some(provider), "{mode:?}");
         }
+    }
+
+    #[test]
+    fn automatic_capture_reports_pipewire_bootstrap_provider() {
+        let mut bootstrap = bootstrap_with_capture_output("portal-selected-session-source");
+        bootstrap
+            .streaming
+            .as_mut()
+            .expect("test streaming config")
+            .capture
+            .capture_provider = crate::launch::CaptureProvider::PipeWire;
+        let settings = ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
+
+        assert_eq!(settings.capture_provider(), Some("pipewire"));
     }
 
     #[test]

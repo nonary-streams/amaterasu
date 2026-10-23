@@ -662,6 +662,9 @@ pub enum CaptureProvider {
     #[default]
     Dxgi,
     Wgc,
+    /// An active user-selected source supplied by the desktop portal.
+    #[serde(rename = "pipewire")]
+    PipeWire,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -991,6 +994,20 @@ mod tests {
             serde_json::to_value(&strict).unwrap()["max_reference_frames"],
             1
         );
+    }
+
+    #[test]
+    fn pipewire_capture_provider_and_portal_sentinel_are_accepted_and_preserved() {
+        let mut value = start_json();
+        value["capture_provider"] = json!("pipewire");
+        value["output"] = json!("portal-selected-session-source");
+        let start: StartConfig = serde_json::from_value(value).unwrap();
+
+        assert!(start.validate(true).is_ok());
+        assert!(matches!(start.capture_provider, CaptureProvider::PipeWire));
+        let serialized = serde_json::to_value(&start).unwrap();
+        assert_eq!(serialized["capture_provider"], "pipewire");
+        assert_eq!(serialized["output"], "portal-selected-session-source");
     }
 
     #[test]
