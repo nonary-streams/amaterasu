@@ -266,7 +266,7 @@ mod tests {
             )
             .unwrap_err()
             .code,
-            "unsupported_event"
+            "invalid_event"
         );
         assert_eq!(
             translate(
