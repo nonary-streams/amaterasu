@@ -2366,7 +2366,7 @@ mod tests {
             .or(devices.first())
             .expect("test needs an active render endpoint");
         let before = defaults();
-        let mut capture = Capture::open(&endpoint.id, None, None, true, true).unwrap();
+        let mut capture = Capture::open(&endpoint.id, None, None, None, true, true).unwrap();
         assert_eq!(capture.endpoint(), endpoint.id);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut packets = 0;
