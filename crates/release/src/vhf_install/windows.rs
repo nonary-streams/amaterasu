@@ -204,16 +204,13 @@ fn microsoft_tool(path: &Path, expected_name: &str) -> PackageResult<()> {
     Ok(())
 }
 
-fn windows_powershell_path(system_directory: &Path) -> PathBuf {
-    system_directory
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe")
+fn windows_powershell_path(program_files: &Path) -> PathBuf {
+    program_files.join("PowerShell").join("7").join("pwsh.exe")
 }
 
-fn require_system_powershell_path(path: &Path, system_directory: &Path) -> PackageResult<()> {
-    if path != windows_powershell_path(system_directory) {
-        return Err("PowerShell executable is outside the Windows system directory".into());
+fn require_protected_powershell_path(path: &Path, program_files: &Path) -> PackageResult<()> {
+    if !program_files.is_absolute() || path != windows_powershell_path(program_files) {
+        return Err("PowerShell executable is outside the protected Program Files path".into());
     }
     Ok(())
 }
@@ -251,20 +248,244 @@ struct Guid {
     data4: [u8; 8],
 }
 
-fn system_directory() -> PackageResult<PathBuf> {
+fn program_files_directory() -> PackageResult<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHGetFolderPathW(
+            window: *mut std::ffi::c_void,
+            folder: i32,
+            token: *mut std::ffi::c_void,
+            flags: u32,
+            buffer: *mut u16,
+        ) -> i32;
+    }
+    let mut buffer = [0u16; 260];
+    // SAFETY: SHGetFolderPathW writes a NUL-terminated path of at most MAX_PATH
+    // characters to the documented 260-element buffer.
+    if unsafe {
+        SHGetFolderPathW(
+            std::ptr::null_mut(),
+            0x0026, // CSIDL_PROGRAM_FILES
+            std::ptr::null_mut(),
+            0, // SHGFP_TYPE_CURRENT
+            buffer.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err("Program Files known folder is unavailable".into());
+    }
+    let length = buffer
+        .iter()
+        .position(|character| *character == 0)
+        .ok_or("invalid Program Files path")?;
+    let root: PathBuf = std::ffi::OsString::from_wide(&buffer[..length]).into();
+    if !root.is_absolute() {
+        return Err("Program Files known folder is not absolute".into());
+    }
+    Ok(root)
+}
+
+fn system_windows_directory() -> PackageResult<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+        fn GetSystemWindowsDirectoryW(buffer: *mut u16, length: u32) -> u32;
     }
-    use std::os::windows::ffi::OsStringExt;
-    let mut buffer = vec![0u16; 32_768];
-    // SAFETY: buffer is writable and its capacity is passed in UTF-16 units.
-    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    let mut buffer = [0u16; 1024];
+    // SAFETY: Windows writes at most `length` UTF-16 units to this stack buffer.
+    let length = unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
     if length == 0 || length as usize >= buffer.len() {
-        return Err("Windows system directory could not be determined".into());
+        return Err("Windows system directory is unavailable".into());
     }
-    buffer.truncate(length as usize);
-    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
+    Ok(std::ffi::OsString::from_wide(&buffer[..length as usize]).into())
+}
+
+fn trusted_sid(sid: &str) -> bool {
+    matches!(
+        sid,
+        "S-1-5-18"
+            | "S-1-5-32-544"
+            | "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+    )
+}
+
+fn write_access(mask: u32) -> bool {
+    const WRITE_MASK: u32 = 0x0000_0002 // FILE_WRITE_DATA / FILE_ADD_FILE
+        | 0x0000_0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+        | 0x0000_0010 // FILE_WRITE_EA
+        | 0x0000_0040 // FILE_DELETE_CHILD
+        | 0x0000_0100 // FILE_WRITE_ATTRIBUTES
+        | 0x0001_0000 // DELETE
+        | 0x0004_0000 // WRITE_DAC
+        | 0x0008_0000 // WRITE_OWNER
+        | 0x1000_0000 // GENERIC_ALL
+        | 0x4000_0000; // GENERIC_WRITE
+    mask & WRITE_MASK != 0
+}
+
+#[repr(C)]
+struct AclSizeInformation {
+    ace_count: u32,
+    acl_bytes_in_use: u32,
+    acl_bytes_free: u32,
+}
+
+#[repr(C)]
+struct AceHeader {
+    ace_type: u8,
+    ace_flags: u8,
+    ace_size: u16,
+}
+
+struct LocalSecurityDescriptor(*mut std::ffi::c_void);
+
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        }
+        // SAFETY: GetNamedSecurityInfoW allocates this descriptor with LocalAlloc.
+        unsafe { LocalFree(self.0) };
+    }
+}
+
+fn sid_text(sid: *mut std::ffi::c_void) -> PackageResult<String> {
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ConvertSidToStringSidW(sid: *mut std::ffi::c_void, text: *mut *mut u16) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+    let mut text = std::ptr::null_mut();
+    // SAFETY: `sid` points into a live security descriptor or ACE returned by Windows.
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 || text.is_null() {
+        return Err("invalid Windows security identifier".into());
+    }
+    // SID strings are small. Bound the read even if a malformed native result is returned.
+    let mut length = 0;
+    // SAFETY: ConvertSidToStringSidW allocated a NUL-terminated UTF-16 string.
+    while length < 256 && unsafe { *text.add(length) } != 0 {
+        length += 1;
+    }
+    // SAFETY: `text` belongs to LocalAlloc and is no longer used after this call.
+    let value = if length < 256 {
+        let slice = unsafe { std::slice::from_raw_parts(text, length) };
+        String::from_utf16(slice).map_err(|error| error.to_string())
+    } else {
+        Err("Windows security identifier is too long".into())
+    };
+    unsafe { LocalFree(text.cast()) };
+    value
+}
+
+fn validate_machine_owned_acl(path: &Path, directory: bool) -> PackageResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn GetNamedSecurityInfoW(
+            object: *const u16,
+            object_type: u32,
+            information: u32,
+            owner: *mut *mut std::ffi::c_void,
+            group: *mut *mut std::ffi::c_void,
+            dacl: *mut *mut std::ffi::c_void,
+            sacl: *mut *mut std::ffi::c_void,
+            descriptor: *mut *mut std::ffi::c_void,
+        ) -> u32;
+        fn GetAclInformation(
+            acl: *mut std::ffi::c_void,
+            information: *mut AclSizeInformation,
+            length: u32,
+            information_class: u32,
+        ) -> i32;
+        fn GetAce(acl: *mut std::ffi::c_void, index: u32, ace: *mut *mut std::ffi::c_void) -> i32;
+    }
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let (mut owner, mut dacl, mut raw) = (
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    // SAFETY: Windows writes pointers into `raw`; all returned pointers remain valid until
+    // LocalSecurityDescriptor is dropped below. Other optional outputs are null.
+    let result = unsafe {
+        GetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            1,                         // SE_FILE_OBJECT
+            0x0000_0001 | 0x0000_0004, // OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut raw,
+        )
+    };
+    if result != 0 || raw.is_null() {
+        return Err(format!("could not read PowerShell path ACL: {result}"));
+    }
+    let _descriptor = LocalSecurityDescriptor(raw);
+    if owner.is_null() || dacl.is_null() || !trusted_sid(&sid_text(owner)?) {
+        return Err("PowerShell path has an untrusted owner or null DACL".into());
+    }
+    let mut information = AclSizeInformation {
+        ace_count: 0,
+        acl_bytes_in_use: 0,
+        acl_bytes_free: 0,
+    };
+    // SAFETY: `dacl` points into the live security descriptor and `information` has the
+    // documented ACL_SIZE_INFORMATION layout and size.
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            &mut information,
+            std::mem::size_of::<AclSizeInformation>() as u32,
+            2, // AclSizeInformation
+        )
+    } == 0
+    {
+        return Err("could not inspect PowerShell path ACL".into());
+    }
+    for index in 0..information.ace_count {
+        let mut ace = std::ptr::null_mut();
+        // SAFETY: Windows bounds the index against the validated ACL and returns an ACE
+        // pointer valid for the lifetime of `_descriptor`.
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+            return Err("could not read PowerShell path ACE".into());
+        }
+        let header = unsafe { &*ace.cast::<AceHeader>() };
+        if header.ace_size < 12 {
+            return Err("PowerShell path has a malformed ACE".into());
+        }
+        if header.ace_type == 1 {
+            continue; // Explicit denial cannot create a writer.
+        }
+        if header.ace_type != 0 {
+            return Err("PowerShell path has an unsupported ACE type".into());
+        }
+        let mask = unsafe { *ace.cast::<u8>().add(4).cast::<u32>() };
+        if !write_access(mask) {
+            continue;
+        }
+        let sid = sid_text(unsafe { ace.cast::<u8>().add(8).cast() })?;
+        if trusted_sid(&sid) || header.ace_flags & 0x08 != 0 && (!directory || sid == "S-1-3-0") {
+            continue;
+        }
+        return Err("PowerShell path permits a nonprivileged writer".into());
+    }
+    Ok(())
+}
+
+fn validate_protected_module_path(path: &Path) -> PackageResult<()> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
+        return Err("PowerShell module path is not a protected directory".into());
+    }
+    validate_machine_owned_acl(path, true)
 }
 
 fn validate_windows_powershell(path: &Path) -> PackageResult<()> {
@@ -280,12 +501,13 @@ fn validate_windows_powershell(path: &Path) -> PackageResult<()> {
         ) -> i32;
     }
 
-    let system = system_directory()?;
-    let expected = windows_powershell_path(&system);
-    require_system_powershell_path(path, &system)?;
+    let program_files = program_files_directory()?;
+    let expected = windows_powershell_path(&program_files);
+    require_protected_powershell_path(path, &program_files)?;
     for candidate in [
-        system.join("WindowsPowerShell"),
-        system.join("WindowsPowerShell").join("v1.0"),
+        program_files.clone(),
+        program_files.join("PowerShell"),
+        program_files.join("PowerShell").join("7"),
         expected.clone(),
     ] {
         let metadata = fs::symlink_metadata(&candidate).map_err(|error| error.to_string())?;
@@ -300,6 +522,7 @@ fn validate_windows_powershell(path: &Path) -> PackageResult<()> {
                 "Windows PowerShell path contains a reparse point or unexpected file".into(),
             );
         }
+        validate_machine_owned_acl(&candidate, metadata.is_dir())?;
     }
 
     let file_path: Vec<u16> = expected.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -338,10 +561,41 @@ fn validate_windows_powershell(path: &Path) -> PackageResult<()> {
 }
 
 fn powershell(script: &str, environment: &[(&str, &Path)]) -> PackageResult<String> {
-    let program = windows_powershell_path(&system_directory()?);
+    let program_files = program_files_directory()?;
+    let program = windows_powershell_path(&program_files);
     validate_windows_powershell(&program)?;
+    let system_root = system_windows_directory()?;
+    let system32 = system_root.join("System32");
+    let legacy_powershell = system32.join("WindowsPowerShell");
+    let legacy_modules = system32
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("Modules");
+    let modern_modules = program_files.join("PowerShell").join("7").join("Modules");
+    for directory in [
+        system_root.as_path(),
+        system32.as_path(),
+        legacy_powershell.as_path(),
+    ] {
+        validate_protected_module_path(directory)?;
+    }
+    validate_protected_module_path(&legacy_powershell.join("v1.0"))?;
+    validate_protected_module_path(&legacy_modules)?;
+    validate_protected_module_path(&legacy_modules.join("PnpDevice"))?;
+    validate_protected_module_path(&modern_modules)?;
     let mut command = Command::new(program);
     command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    // Do not allow user profile modules to shadow the management cmdlets used
+    // by the privileged installer. The two module roots are OS-protected.
+    let module_paths = std::env::join_paths([modern_modules, legacy_modules])
+        .map_err(|error| error.to_string())?;
+    command.env("PSModulePath", module_paths);
+    command.env("SystemRoot", &system_root);
+    command.env(
+        "PATH",
+        std::env::join_paths([system32, program_files.join("PowerShell").join("7")])
+            .map_err(|error| error.to_string())?,
+    );
     for (name, value) in environment {
         command.env(name, value);
     }
@@ -852,35 +1106,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn powershell_is_resolved_only_under_the_windows_system_directory() {
-        let system = Path::new(r"C:\Windows\System32");
-        let executable = windows_powershell_path(system);
+    fn powershell_is_resolved_only_under_protected_program_files() {
+        let program_files = Path::new(r"C:\Program Files");
+        let executable = windows_powershell_path(program_files);
         assert_eq!(
             executable,
-            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+            PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe")
         );
         assert!(
-            require_system_powershell_path(
-                Path::new(r"C:\Program Files\PowerShell\7\pwsh.exe"),
-                system
+            require_protected_powershell_path(
+                Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+                program_files
             )
             .is_err()
         );
     }
 
     #[test]
-    #[ignore = "validates the live Windows inbox PowerShell signature"]
-    fn inbox_powershell_passes_independent_signature_validation() {
-        let path = windows_powershell_path(&system_directory().unwrap());
+    #[ignore = "reads the live PowerShell 7 signature and protected ACL"]
+    fn protected_powershell_passes_independent_signature_validation() {
+        let path = windows_powershell_path(&program_files_directory().unwrap());
         validate_windows_powershell(&path).unwrap();
     }
 
     #[test]
+    #[ignore = "launches protected PowerShell 7 for a read-only module lookup"]
+    fn protected_powershell_loads_device_management_module() {
+        let output = powershell(
+            "$ErrorActionPreference = 'Stop'; (Get-Command Get-PnpDevice).Name",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(output.trim(), "Get-PnpDevice");
+    }
+
+    #[test]
     fn failed_grant_policy_seal_removes_the_active_policy() {
-        let path = std::env::temp_dir().join(format!(
-            "amaterasu-vhf-policy-seal-{}.json",
-            amaterasu_storage::random_identifier().unwrap()
-        ));
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "amaterasu-vhf-policy-seal-{}.json",
+                amaterasu_storage::random_identifier().unwrap()
+            ));
         let digest = "0".repeat(64);
         let policy = InputPolicy {
             schema: 1,
