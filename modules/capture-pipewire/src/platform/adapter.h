@@ -1,0 +1,30 @@
+#ifndef AMATERASU_PIPEWIRE_ADAPTER_H
+#define AMATERASU_PIPEWIRE_ADAPTER_H
+#include <stddef.h>
+#include <stdint.h>
+
+/* Private ABI only. SPA/PipeWire/GIO structs never cross this boundary. */
+enum am_pw_state { AM_PW_SELECTING = 1, AM_PW_READY, AM_PW_DENIED, AM_PW_FAILED, AM_PW_REVOKED };
+struct am_pw_probe { uint32_t available, version, source_types, cursor_modes; };
+struct am_pw_snapshot { uint32_t state, node, width, height, format, error; };
+struct am_pw_plane {
+    const uint8_t *data;
+    uint32_t memory_type, flags, max_size, chunk_offset, chunk_size;
+    int32_t stride;
+    uint32_t chunk_flags, plane_count;
+    int64_t fd;
+    uint32_t map_offset;
+};
+/* 1: a valid owned copy was published; 0: transient mailbox backpressure;
+ * 2: unsupported/invalid CPU buffer. Borrowed plane bytes last only through call. */
+typedef uint32_t (*am_pw_frame_callback)(void *, const struct am_pw_plane *, uint32_t, uint32_t, uint32_t, uint64_t);
+struct am_pw_session;
+int am_pw_probe(struct am_pw_probe *);
+/* File containment only; never maps pixels or closes this borrowed FD. */
+int am_pw_memfd_extent_valid(int64_t fd, uint32_t map_offset, uint32_t max_size);
+struct am_pw_session *am_pw_start(uint32_t source_type, uint32_t timeout_seconds, am_pw_frame_callback, void *);
+void am_pw_snapshot(struct am_pw_session *, struct am_pw_snapshot *);
+/* Cancels synchronous D-Bus I/O, closes request/session and joins the sole worker.
+ * No callback or adapter worker can outlive this return. */
+void am_pw_destroy(struct am_pw_session *);
+#endif
