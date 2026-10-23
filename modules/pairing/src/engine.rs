@@ -5,6 +5,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub enum Change {
     Read(Value),
@@ -53,12 +54,12 @@ impl Engine {
         now: u64,
     ) -> Result<Change, &'static str> {
         self.admit(caller, &operation)?;
+        let now = self.latest_time.max(now);
         document.validate(now)?;
-        self.latest_time = self.latest_time.max(now);
-        let now = self.latest_time;
+        self.latest_time = now;
         self.pending.retain(|_, pending| pending.expires_at > now);
         match operation {
-            Operation::Initialize {} => Self::initialize(document, now),
+            Operation::Initialize {} => self.initialize(document, now),
             Operation::ImportIdentity {
                 certificate_pem,
                 private_key_pem,
@@ -156,13 +157,21 @@ impl Engine {
         json!({"ok":true,"pending":pending})
     }
 
-    fn initialize(mut document: Document, now: u64) -> Result<Change, &'static str> {
+    fn initialize(&mut self, mut document: Document, now: u64) -> Result<Change, &'static str> {
         if let Some(identity) = &document.identity {
             return Ok(Change::Read(identity_response(identity)));
         }
         document.identity = Some(crypto::generate_identity()?);
         let response = identity_response(document.identity.as_ref().ok_or("identity_failure")?);
-        write(document, response, now)
+        // RSA generation may cross a clock second after the request timestamp
+        // was captured. Validate the new certificate at or after issuance.
+        let issued_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "clock_failure")?
+            .as_secs()
+            .max(now);
+        self.latest_time = issued_at;
+        write(document, response, issued_at)
     }
     fn import(
         mut document: Document,

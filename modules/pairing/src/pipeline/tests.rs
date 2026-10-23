@@ -550,6 +550,32 @@ fn generated_host_identity_is_self_signed_and_matches_its_private_key() {
 }
 
 #[test]
+fn initialize_validates_generated_identity_after_key_generation() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    let request_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(60);
+
+    let response = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"initialize"}),
+        request_time,
+    );
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(state.writes, 1);
+    let persisted: Document = serde_json::from_value(state.document.unwrap()).unwrap();
+    let current = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(persisted.validate(current).is_ok());
+}
+
+#[test]
 fn malformed_certificate_and_expired_certificate_fail_closed() {
     let mut certificate = Certificate::from_pem(CLIENT_CERT).unwrap();
     let mut signature = certificate.signature.as_bytes().unwrap().to_vec();

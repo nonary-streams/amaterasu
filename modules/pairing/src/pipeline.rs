@@ -649,7 +649,15 @@ impl Pipeline {
                     document.identity = Some(identity);
                 }
                 self.identity.invalidate();
-                let snapshot = match self.prepare_snapshot(&document, now) {
+                let snapshot_now = if initialize {
+                    match SystemTime::now().duration_since(UNIX_EPOCH) {
+                        Ok(current) => now.max(current.as_secs()),
+                        Err(_) => return complete(send, request.id, error("clock_failure")),
+                    }
+                } else {
+                    now
+                };
+                let snapshot = match self.prepare_snapshot(&document, snapshot_now) {
                     Ok(snapshot) => snapshot,
                     Err(code) => {
                         return complete(send, request.id, error(code));
