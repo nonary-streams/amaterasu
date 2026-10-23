@@ -42,14 +42,25 @@ fn profile_uses_owner_selected_pipewire_capture_without_kms_or_metrics_modules()
         .iter()
         .find(|component| component.id == MANAGEMENT.id)
         .expect("Linux management component");
+    assert!(management.calls.contains(&"amaterasu.video/1"));
     assert!(management.calls.contains(&"amaterasu.capture-pipewire/1"));
+    assert!(
+        !management
+            .native_uses
+            .contains(&"amaterasu.capture-pipewire/1")
+    );
+    assert!(
+        !management
+            .dependencies
+            .contains(&"amaterasu.capture-pipewire")
+    );
     assert!(ALLOWED_SCOPES.contains(&"capture.read"));
     assert!(ALLOWED_SCOPES.contains(&"capture.write"));
     assert_eq!(
         portal_capture_settings(),
         json!({
             "enabled": true,
-            "selection_principals": ["amaterasu.management"],
+            "selection_principals": [VIDEO_COMPONENT_ID],
             "capture_principals": [VIDEO_COMPONENT_ID],
         })
     );
@@ -65,6 +76,51 @@ fn profile_uses_owner_selected_pipewire_capture_without_kms_or_metrics_modules()
         catalog_settings(&LinuxSessionOptions::default())["seed_desktop_entry"],
         false
     );
+    assert!(
+        catalog_settings(&LinuxSessionOptions::default())
+            .get("import_principals")
+            .is_none()
+    );
+    assert!(
+        catalog_settings(&LinuxSessionOptions::default())
+            .get("steam_id_export_principals")
+            .is_none()
+    );
+    assert!(
+        !ALLOWED_SCOPES
+            .iter()
+            .any(|scope| { matches!(*scope, "steam.read" | "steam.refresh" | "lutris.read") })
+    );
+    assert!(
+        !COMPONENTS
+            .iter()
+            .any(|component| matches!(component.id, "amaterasu.steam" | "amaterasu.lutris"))
+    );
+    for component in COMPONENTS {
+        assert!(
+            !component
+                .calls
+                .iter()
+                .any(|service| matches!(*service, "amaterasu.steam/1" | "amaterasu.lutris/1"))
+        );
+        assert!(
+            !component.dependencies.iter().any(|dependency| {
+                matches!(*dependency, "amaterasu.steam" | "amaterasu.lutris")
+            })
+        );
+    }
+    assert!(
+        PackageProfile::Platform
+            .components()
+            .iter()
+            .any(|component| component.id == "amaterasu.steam")
+    );
+    assert!(
+        PackageProfile::Platform
+            .components()
+            .iter()
+            .any(|component| component.id == "amaterasu.lutris")
+    );
     assert!(!COMPONENTS.iter().any(|component| matches!(
         component.id,
         "amaterasu.capture-kms" | "amaterasu.host-metrics"
@@ -74,5 +130,62 @@ fn profile_uses_owner_selected_pipewire_capture_without_kms_or_metrics_modules()
             .components()
             .iter()
             .any(|component| component.id == capture.id)
+    );
+}
+
+#[test]
+fn management_delegates_portal_selection_to_video() {
+    let management = COMPONENTS
+        .iter()
+        .find(|component| component.id == MANAGEMENT.id)
+        .expect("Linux management component");
+    let video = COMPONENTS
+        .iter()
+        .find(|component| component.id == VIDEO_COMPONENT_ID)
+        .expect("Linux video component");
+
+    assert!(management.calls.contains(&"amaterasu.video/1"));
+    // This is a transitive broker grant for management -> video -> provider,
+    // not a native-use grant or a direct provider dependency.
+    assert!(management.calls.contains(&"amaterasu.capture-pipewire/1"));
+    assert!(
+        !management
+            .dependencies
+            .contains(&"amaterasu.capture-pipewire")
+    );
+    assert!(video.calls.contains(&"amaterasu.capture-pipewire/1"));
+    assert!(video.native_uses.contains(&"amaterasu.capture-pipewire/1"));
+    assert_eq!(
+        portal_capture_settings()["selection_principals"],
+        json!([VIDEO_COMPONENT_ID])
+    );
+}
+
+#[test]
+fn stream_session_opens_portal_capture_only_through_video() {
+    let stream_session = COMPONENTS
+        .iter()
+        .find(|component| component.id == STREAM_SESSION.id)
+        .expect("Linux stream-session component");
+    let video = COMPONENTS
+        .iter()
+        .find(|component| component.id == VIDEO_COMPONENT_ID)
+        .expect("Linux video component");
+
+    assert!(stream_session.calls.contains(&"amaterasu.video/1"));
+    assert!(
+        stream_session
+            .calls
+            .contains(&"amaterasu.capture-pipewire/1")
+    );
+    assert!(
+        !stream_session
+            .native_uses
+            .contains(&"amaterasu.capture-pipewire/1")
+    );
+    assert!(video.native_uses.contains(&"amaterasu.capture-pipewire/1"));
+    assert_eq!(
+        portal_capture_settings()["capture_principals"],
+        json!([VIDEO_COMPONENT_ID])
     );
 }
