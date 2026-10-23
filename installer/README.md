@@ -6,7 +6,9 @@ The VHF keyboard/mouse source is a separate root device and privileged
 companion. It is never installed by the ordinary Amaterasu MSI or by approving
 an update repository. `prepare-vhf-input.ps1 -OutputDirectory <new-directory>`
 builds the x64 UMDF driver and user-mode companion, checks the INF, and runs
-Inf2Cat. The resulting catalog and companion are **unsigned and not
+Inf2Cat. Cargo uses the explicit `x86_64-pc-windows-msvc` target, and sealing
+checks the PE machine type of both native payloads. The resulting catalog and
+companion are **unsigned and not
 installable**. `-WithoutPdb` permits a local diagnostic build when the installed
 VS PDB components are inconsistent; it also emits a linker map but does not
 replace release PDBs. The build needs VS2022, the WDK 26100 tool package,
@@ -42,6 +44,8 @@ instance ID. If an OS operation's outcome is uncertain,
 hardware ID and matching INF, including a root device without a bound driver;
 mismatches stop recovery. Rollback
 requires an explicit grant revocation and stopped companion service first.
+Install, rollback, grant, and revoke take the same runtime operation lock so
+two administrators cannot race through preflight and overwrite one journal.
 These installer commands are code paths for later approved deployment and have
 not been run against a machine.
 

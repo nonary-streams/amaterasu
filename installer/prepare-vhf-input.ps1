@@ -30,7 +30,7 @@ if ($LASTEXITCODE -ne 0) { throw 'VHF driver build failed.' }
 
 Push-Location $repository
 try {
-    & cargo build -p amaterasu-input-companion --release --locked --bin amaterasu-input-companion
+    & cargo build -p amaterasu-input-companion --release --locked --target x86_64-pc-windows-msvc --bin amaterasu-input-companion
     if ($LASTEXITCODE -ne 0) { throw 'VHF companion build failed.' }
 }
 finally {
@@ -48,7 +48,7 @@ elseif ([IO.Path]::IsPathFullyQualified($env:CARGO_TARGET_DIR)) {
 else {
     Join-Path $repository $env:CARGO_TARGET_DIR
 }
-$companionOutput = Join-Path $cargoTarget 'release\amaterasu-input-companion.exe'
+$companionOutput = Join-Path $cargoTarget 'x86_64-pc-windows-msvc\release\amaterasu-input-companion.exe'
 if (-not (Test-Path -LiteralPath $driverOutput -PathType Leaf) -or
     -not (Test-Path -LiteralPath $companionOutput -PathType Leaf)) {
     throw 'Required VHF build output is missing.'

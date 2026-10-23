@@ -26,7 +26,7 @@ impl Fixture {
         let mut files = BTreeMap::new();
         for name in FILES {
             let path = source.join(name);
-            fs::write(&path, format!("fixture for {name}")).unwrap();
+            fs::write(&path, fixture_payload(name)).unwrap();
             files.insert(name.into(), file_hash(&path).unwrap());
         }
         write_json_atomically(
@@ -46,6 +46,19 @@ impl Fixture {
             destination,
             runtime,
         }
+    }
+}
+
+fn fixture_payload(name: &str) -> Vec<u8> {
+    if name == FILES[1] || name == FILES[3] {
+        let mut image = vec![0u8; 0x90];
+        image[..2].copy_from_slice(b"MZ");
+        image[0x3c..0x40].copy_from_slice(&(0x80u32).to_le_bytes());
+        image[0x80..0x84].copy_from_slice(b"PE\0\0");
+        image[0x84..0x86].copy_from_slice(&(0x8664u16).to_le_bytes());
+        image
+    } else {
+        format!("fixture for {name}").into_bytes()
     }
 }
 
@@ -190,11 +203,7 @@ fn payload_mutation_and_wrong_signer_fail_before_any_install_action() {
         .is_err()
     );
     assert!(!fixture.destination.exists());
-    fs::write(
-        fixture.source.join(FILES[1]),
-        format!("fixture for {}", FILES[1]),
-    )
-    .unwrap();
+    fs::write(fixture.source.join(FILES[1]), fixture_payload(FILES[1])).unwrap();
     signatures.signer = "f".repeat(40);
     assert!(
         install(
@@ -504,4 +513,47 @@ fn preexisting_published_inf_is_not_claimed() {
         actions.published_inf.borrow().as_deref(),
         Some("oem123.inf")
     );
+}
+
+#[test]
+fn non_x64_native_payload_is_rejected_before_installation() {
+    let fixture = Fixture::new();
+    let mut arm64 = fixture_payload(FILES[3]);
+    arm64[0x84..0x86].copy_from_slice(&(0xaa64u16).to_le_bytes());
+    fs::write(fixture.source.join(FILES[3]), arm64).unwrap();
+    let actions = FixtureActions::default();
+    assert!(
+        install(
+            &fixture.source,
+            &fixture.destination,
+            &fixture.runtime,
+            FINGERPRINT,
+            &FixtureSignatures::default(),
+            &actions,
+        )
+        .is_err()
+    );
+    assert!(!fixture.destination.exists());
+    fs::remove_file(fixture.source.join("manifest.json")).unwrap();
+    assert!(seal_package(&fixture.source, FINGERPRINT, &FixtureSignatures::default(),).is_err());
+    assert!(!fixture.source.join("manifest.json").exists());
+}
+
+#[test]
+fn concurrent_install_cannot_pass_the_operation_lock() {
+    let fixture = Fixture::new();
+    let held_lock = operation_lock(&fixture.runtime).unwrap();
+    let actions = FixtureActions::default();
+    let error = install(
+        &fixture.source,
+        &fixture.destination,
+        &fixture.runtime,
+        FINGERPRINT,
+        &FixtureSignatures::default(),
+        &actions,
+    )
+    .unwrap_err();
+    assert!(error.contains("another VHF installation operation"));
+    assert!(!journal_path(&fixture.destination).exists());
+    drop(held_lock);
 }

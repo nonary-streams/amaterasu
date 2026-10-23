@@ -5,7 +5,7 @@ use amaterasu_storage::{read_json, write_json_atomically};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 const HARDWARE_ID: &str = "ROOT\\AMATERASUVHFINPUT";
@@ -109,6 +109,41 @@ fn file_hash(path: &Path) -> PackageResult<String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn require_x64_pe(path: &Path) -> PackageResult<()> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    if bytes.len() < 0x40 || &bytes[..2] != b"MZ" {
+        return Err("VHF native payload is not a PE image".into());
+    }
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    if bytes
+        .get(pe_offset..pe_offset.saturating_add(6))
+        .is_none_or(|header| {
+            &header[..4] != b"PE\0\0" || u16::from_le_bytes([header[4], header[5]]) != 0x8664
+        })
+    {
+        return Err("VHF native payload is not an x64 PE image".into());
+    }
+    Ok(())
+}
+
+fn operation_lock(runtime: &Path) -> PackageResult<File> {
+    let path = runtime.join("vhf-install.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| error.to_string())?;
+    let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("VHF operation lock is not a regular file".into());
+    }
+    file.try_lock()
+        .map_err(|error| format!("another VHF installation operation is active: {error}"))?;
+    Ok(file)
+}
+
 fn verify_package(
     root: &Path,
     confirmed_fingerprint: &str,
@@ -138,6 +173,8 @@ fn verify_package(
             return Err(format!("VHF package payload hash mismatch: {relative}"));
         }
     }
+    require_x64_pe(&safe_file(root, FILES[1])?)?;
+    require_x64_pe(&safe_file(root, FILES[3])?)?;
     let catalog = safe_file(root, FILES[2])?;
     if normalized_fingerprint(&signatures.verified_signer(&catalog)?)? != confirmed {
         return Err("VHF catalog signer differs from confirmed fingerprint".into());
@@ -162,6 +199,8 @@ fn seal_package(root: &Path, fingerprint: &str, signatures: &impl Signatures) ->
         return Err("VHF manifest already exists; refusing to replace it".into());
     }
     let confirmed = normalized_fingerprint(fingerprint)?;
+    require_x64_pe(&safe_file(root, FILES[1])?)?;
+    require_x64_pe(&safe_file(root, FILES[3])?)?;
     let catalog = safe_file(root, FILES[2])?;
     if normalized_fingerprint(&signatures.verified_signer(&catalog)?)? != confirmed {
         return Err("VHF catalog signer differs from confirmed fingerprint".into());
@@ -208,6 +247,7 @@ fn install(
     signatures: &impl Signatures,
     actions: &impl InstallActions,
 ) -> PackageResult<()> {
+    let _operation_lock = operation_lock(runtime)?;
     let (manifest, package_digest) = verify_package(source, fingerprint, signatures)?;
     actions.ensure_ready(destination)?;
     if fs::read_dir(destination)
@@ -329,6 +369,7 @@ fn rollback(
     runtime: &Path,
     actions: &impl InstallActions,
 ) -> PackageResult<()> {
+    let _operation_lock = operation_lock(runtime)?;
     if runtime.join("input-companion-policy.json").exists() {
         return Err("revoke the VHF input grant before package rollback".into());
     }

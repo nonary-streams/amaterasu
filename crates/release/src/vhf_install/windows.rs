@@ -98,6 +98,9 @@ $writeMask = [Security.AccessControl.FileSystemRights]::WriteData -bor
     [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
     [Security.AccessControl.FileSystemRights]::TakeOwnership
 foreach ($rule in $acl.GetAccessRules($true, $true, $sidType)) {
+    if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+        continue
+    }
     if ($rule.AccessControlType -eq 'Allow' -and
         $rule.IdentityReference.Value -notin @('S-1-5-18', 'S-1-5-32-544', $trustedInstaller) -and
         ($rule.FileSystemRights -band $writeMask) -ne 0) {
@@ -177,6 +180,15 @@ fn microsoft_tool(path: &Path, expected_name: &str) -> PackageResult<()> {
         directory = directory
             .parent()
             .ok_or("Microsoft tool escaped Program Files")?;
+    }
+    if powershell(
+        PROTECTED_DIRECTORY_SCRIPT,
+        &[("AMATERASU_VHF_PROTECTED_DIRECTORY", path)],
+    )?
+    .trim()
+        != "protected"
+    {
+        return Err("Microsoft tool executable is writable".into());
     }
     if powershell(MICROSOFT_TOOL_SCRIPT, &[("AMATERASU_VHF_TOOL_PATH", path)])?.trim() != "verified"
     {
@@ -584,6 +596,7 @@ pub(super) fn grant_command(
 ) -> PackageResult<()> {
     require_admin()?;
     checked_root(destination, runtime)?;
+    let _operation_lock = operation_lock(runtime)?;
     let enabled = |value: &str| match value {
         "0" => Ok(false),
         "1" => Ok(true),
@@ -652,6 +665,7 @@ pub(super) fn grant_command(
 pub(super) fn revoke_command(destination: &Path, runtime: &Path) -> PackageResult<()> {
     require_admin()?;
     checked_root(destination, runtime)?;
+    let _operation_lock = operation_lock(runtime)?;
     let policy_path = runtime.join("input-companion-policy.json");
     if policy_path.exists() {
         safe_file(runtime, "input-companion-policy.json")?;
