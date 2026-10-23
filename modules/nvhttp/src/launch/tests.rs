@@ -8,7 +8,7 @@ fn config() -> StreamingConfig {
         capture: CaptureConfig {
             capture_provider: CaptureProvider::Dxgi,
             output: "display-one".into(),
-            encoder: 0,
+            encoder: CaptureEncoderSelection::Index(0),
             audio_endpoint: "default".into(),
         },
         desktop: DesktopSettings::default(),
@@ -40,7 +40,17 @@ fn linux_pipewire_profile_accepts_auto_encoder_selection() {
     let streaming: StreamingConfig = serde_json::from_value(value.clone()).unwrap();
     assert!(streaming.validate().is_ok());
     assert_eq!(streaming.capture.capture_provider, CaptureProvider::PipeWire);
-    assert_eq!(streaming.capture.encoder, 0);
+    assert_eq!(
+        streaming.capture.encoder,
+        CaptureEncoderSelection::Backend(CaptureEncoderBackend::Auto)
+    );
+    let automatic_value = serde_json::to_value(&streaming).unwrap();
+    assert_eq!(automatic_value["capture"]["encoder"], "auto");
+    value["capture"]["encoder"] = json!(0);
+    let indexed: StreamingConfig = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(indexed.capture.encoder, CaptureEncoderSelection::Index(0));
+    let indexed_value = serde_json::to_value(&indexed).unwrap();
+    assert_eq!(indexed_value["capture"]["encoder"], 0);
 
     value["capture"]["encoder"] = json!("software");
     assert!(serde_json::from_value::<StreamingConfig>(value).is_err());
