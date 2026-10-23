@@ -22,6 +22,21 @@ fn profile_uses_owner_selected_pipewire_capture_without_kms_or_metrics_modules()
     assert!(video.native_uses.contains(&"amaterasu.capture-pipewire/1"));
     assert!(video.dependencies.contains(&"amaterasu.capture-pipewire"));
 
+    // Nested broker requests intersect the call grants at every ancestor, but
+    // only video needs direct native-use authority for frame capture.
+    for component_id in [NVHTTP.id, RTSP.id, STREAM_SESSION.id] {
+        let component = COMPONENTS
+            .iter()
+            .find(|component| component.id == component_id)
+            .expect("stream ancestor component");
+        assert!(component.calls.contains(&"amaterasu.capture-pipewire/1"));
+        assert!(
+            !component
+                .native_uses
+                .contains(&"amaterasu.capture-pipewire/1")
+        );
+    }
+
     let management = COMPONENTS
         .iter()
         .find(|component| component.id == MANAGEMENT.id)
@@ -45,4 +60,10 @@ fn profile_uses_owner_selected_pipewire_capture_without_kms_or_metrics_modules()
         component.id,
         "amaterasu.capture-kms" | "amaterasu.host-metrics"
     )));
+    assert!(
+        !PackageProfile::Platform
+            .components()
+            .iter()
+            .any(|component| component.id == capture.id)
+    );
 }
