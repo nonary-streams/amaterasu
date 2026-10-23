@@ -191,7 +191,7 @@ impl Backend for WindowsBackend {
 
     fn validate(&self, event: &Event) -> InputResult<()> {
         if self.vhf_companion {
-            return companion_intent(event).map(|_| ());
+            return companion_intent(event, self.key_rightalt_to_key_win).map(|_| ());
         }
         event.validate()?;
         if matches!(event, Event::PenTouch { .. }) {
@@ -228,7 +228,7 @@ impl Backend for WindowsBackend {
 
     fn inject(&mut self, event: &Event) -> InputResult<()> {
         if self.vhf_companion {
-            let Some(translated) = companion_intent(event)? else {
+            let Some(translated) = companion_intent(event, self.key_rightalt_to_key_win)? else {
                 // Windows HID typematic repeats a held keyboard report. An
                 // application-level Repeat must not submit a second down.
                 return Ok(());
@@ -329,20 +329,15 @@ impl Backend for WindowsBackend {
     }
 }
 
-fn companion_intent(event: &Event) -> InputResult<Option<amaterasu_input_companion::InputEvent>> {
-    if let Event::Key {
-        key,
-        state: KeyState::Repeat,
-    } = event
-    {
-        event.validate()?;
-        crate::companion_client::translate(&Event::Key {
-            key: key.clone(),
-            state: KeyState::Down,
-        })?;
-        return Ok(None);
-    }
-    crate::companion_client::translate(event).map(Some)
+fn companion_intent(
+    event: &Event,
+    key_rightalt_to_key_win: bool,
+) -> InputResult<Option<amaterasu_input_companion::InputEvent>> {
+    crate::companion_client::translate(event, key_rightalt_to_key_win, |code| {
+        let code = effective_virtual_key(code, key_rightalt_to_key_win);
+        let scan_code = map_virtual_key(code);
+        (scan_code != 0).then_some((scan_code, is_extended_virtual_key(code)))
+    })
 }
 
 fn companion_release(event: &Event) -> bool {
