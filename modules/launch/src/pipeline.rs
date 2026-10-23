@@ -876,13 +876,13 @@ impl Pipeline {
             .records
             .values
             .values()
-            .filter(|record| record.state == State::Active)
+            .filter(|record| is_monitored(record))
             .find(|record| record.launch_id > self.monitor_after)
             .or_else(|| {
                 self.records
                     .values
                     .values()
-                    .find(|record| record.state == State::Active)
+                    .find(|record| is_monitored(record))
             });
         if let Some(record) = next {
             self.ingress_since_monitor = 0;
@@ -941,7 +941,7 @@ impl Pipeline {
         if job.step == Step::Spawn {
             record.process_requested = true;
         }
-        if job.step == Step::PreparePlaynite {
+        if job.step == Step::PrepareApplication {
             record.preparation_requested = true;
         }
         if job.step == Step::StartPlaynite {
@@ -1141,17 +1141,19 @@ impl Pipeline {
                     Some(LaunchTarget::Executable(_)) => Step::Spawn,
                     Some(LaunchTarget::Playnite { preparation, .. })
                     | Some(LaunchTarget::PlayniteFullscreen { preparation, .. })
+                    | Some(LaunchTarget::Desktop { preparation, .. })
                         if !preparation.is_empty() =>
                     {
-                        Step::PreparePlaynite
+                        Step::PrepareApplication
                     }
                     Some(
                         LaunchTarget::Playnite { .. } | LaunchTarget::PlayniteFullscreen { .. },
                     ) => Step::StartPlaynite,
+                    Some(LaunchTarget::Desktop { .. }) => Step::Activate,
                     None => return self.dependency_failed(job, "invalid_catalog_response", send),
                 };
             }
-            Step::PreparePlaynite | Step::AwaitPreparation => {
+            Step::PrepareApplication | Step::AwaitPreparation => {
                 let (_, state) = match responses::preparation(&payload, record) {
                     Ok(preparation) => preparation,
                     Err(code) => return self.dependency_failed(job, code, send),
@@ -1161,7 +1163,13 @@ impl Pipeline {
                     | responses::PreparationState::Cleaning => {
                         job.step = Step::AwaitPreparation;
                     }
-                    responses::PreparationState::Ready => job.step = Step::StartPlaynite,
+                    responses::PreparationState::Ready => {
+                        job.step = if matches!(record.target, Some(LaunchTarget::Desktop { .. })) {
+                            Step::Activate
+                        } else {
+                            Step::StartPlaynite
+                        };
+                    }
                     responses::PreparationState::PreparationFailed => job.begin_cleanup(
                         record,
                         Outcome::Failed,
@@ -1650,6 +1658,14 @@ fn complete(
         Response::Error { code, .. } if code == "request_ended" || code == "not_found" => Ok(()),
         _ => Err("launch completion failed".into()),
     }
+}
+
+fn is_monitored(record: &crate::records::Record) -> bool {
+    record.state == State::Active
+        && record
+            .target
+            .as_ref()
+            .is_some_and(LaunchTarget::is_monitored_after_activation)
 }
 
 fn apply_application_outcome(record: &mut crate::records::Record, outcome: ApplicationOutcome) {

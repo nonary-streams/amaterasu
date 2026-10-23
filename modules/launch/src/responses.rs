@@ -181,7 +181,7 @@ pub fn provider_launch(payload: &Value, record: &Record) -> Result<ProviderLaunc
             (payload["started"] == true && payload.get("found").is_none())
                 || (payload["found"] == true && payload.get("started").is_none())
         }
-        LaunchTarget::Executable(_) => false,
+        LaunchTarget::Executable(_) | LaunchTarget::Desktop { .. } => false,
     };
     if !identity_matches
         || record
@@ -207,7 +207,9 @@ pub fn provider_launch(payload: &Value, record: &Record) -> Result<ProviderLaunc
             &["ok", "started", "ticket", "state"]
         }
         LaunchTarget::PlayniteFullscreen { .. } => &["ok", "found", "ticket", "state"],
-        LaunchTarget::Executable(_) => return Err("invalid_provider_response"),
+        LaunchTarget::Executable(_) | LaunchTarget::Desktop { .. } => {
+            return Err("invalid_provider_response");
+        }
     };
     if object.len() != expected_keys.len()
         || object

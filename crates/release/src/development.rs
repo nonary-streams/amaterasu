@@ -12,6 +12,9 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::profiles::linux_session::{
+    apply_management_bind, linux_session_policy, options::LinuxSessionOptions,
+};
 use crate::profiles::{
     ComponentDefinition, PackageProfile, RUNTIME_ID, desktop_stream_smoke_policy,
     development_policy, installer_policy,
@@ -178,14 +181,24 @@ fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
 }
 
 pub fn initialize(root: &Path) -> PackageResult<()> {
-    initialize_profile(root, None)
+    initialize_profile(root, DevelopmentProfile::Standard)
 }
 
 pub fn initialize_desktop_stream_smoke(root: &Path, allow_remote: bool) -> PackageResult<()> {
-    initialize_profile(root, Some(allow_remote))
+    initialize_profile(root, DevelopmentProfile::DesktopStreamSmoke(allow_remote))
 }
 
-fn initialize_profile(root: &Path, desktop_smoke_remote: Option<bool>) -> PackageResult<()> {
+pub fn initialize_linux_session(root: &Path, options: &LinuxSessionOptions) -> PackageResult<()> {
+    initialize_profile(root, DevelopmentProfile::LinuxSession(options))
+}
+
+enum DevelopmentProfile<'a> {
+    Standard,
+    DesktopStreamSmoke(bool),
+    LinuxSession(&'a LinuxSessionOptions),
+}
+
+fn initialize_profile(root: &Path, profile: DevelopmentProfile<'_>) -> PackageResult<()> {
     let tls = InstallerTls::from_environment()?;
     if root.join("bootstrap.json").exists() || root.join("development-key.json").exists() {
         return Err(
@@ -205,9 +218,12 @@ fn initialize_profile(root: &Path, desktop_smoke_remote: Option<bool>) -> Packag
             DEVELOPMENT_KEY_ID.into(),
             encode_hex(signing_key.verifying_key().as_bytes()),
         )]),
-        policy: match desktop_smoke_remote {
-            Some(allow_remote) => desktop_stream_smoke_policy(root, allow_remote)?,
-            None => development_policy(root)?,
+        policy: match &profile {
+            DevelopmentProfile::Standard => development_policy(root)?,
+            DevelopmentProfile::DesktopStreamSmoke(allow_remote) => {
+                desktop_stream_smoke_policy(root, *allow_remote)?
+            }
+            DevelopmentProfile::LinuxSession(options) => linux_session_policy(root, options)?,
         },
     };
     let web_directory = root.join("web");
@@ -216,6 +232,15 @@ fn initialize_profile(root: &Path, desktop_smoke_remote: Option<bool>) -> Packag
         "enabled": false,
         "web": {"directory": web_directory.canonicalize().map_err(|error| error.to_string())?, "trusted_keys": bootstrap.trusted_keys}
     }));
+    if let DevelopmentProfile::LinuxSession(options) = &profile {
+        let management = bootstrap
+            .policy
+            .settings
+            .get_mut("amaterasu.management")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("development bootstrap lacks management settings")?;
+        apply_management_bind(management, options.management_port);
+    }
     if let Some(tls) = &tls {
         let state_root = root.join("data/state");
         create_private_directory(&state_root)?;

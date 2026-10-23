@@ -5,6 +5,8 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+pub mod linux_session;
+
 pub const RUNTIME_ID: &str = "amaterasu.runtime";
 
 #[derive(Clone, Copy)]
@@ -14,6 +16,8 @@ pub enum PackageProfile {
     MediaProbe,
     StreamProbe,
     DesktopStreamSmoke,
+    /// Product Linux session host; effects stay disabled until selected.
+    LinuxSession,
 }
 
 #[derive(Clone, Copy)]
@@ -843,6 +847,7 @@ impl PackageProfile {
                 STREAM_SESSION_DXGI_SMOKE,
                 RTSP_DESKTOP_SMOKE,
             ],
+            Self::LinuxSession => linux_session::COMPONENTS,
             Self::Platform => &[
                 RUNTIME,
                 STATE,
