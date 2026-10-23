@@ -736,11 +736,26 @@ pub struct StartConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<u32>,
     pub output: String,
-    pub encoder: u32,
+    pub encoder: EncoderSelection,
     pub configuration: VideoConfiguration,
     pub audio_endpoint: String,
     #[serde(default)]
     pub host_audio_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum EncoderSelection {
+    /// Zero-based index into the encoder registry enumeration.
+    Index(u32),
+    /// Selection policy resolved by the video module.
+    Backend(EncoderBackend),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EncoderBackend {
+    Auto,
 }
 impl StartConfig {
     pub fn matches_prepared_frame_limiter(&self, prepared: &PrepareConfig) -> bool {
@@ -1008,6 +1023,28 @@ mod tests {
         let serialized = serde_json::to_value(&start).unwrap();
         assert_eq!(serialized["capture_provider"], "pipewire");
         assert_eq!(serialized["output"], "portal-selected-session-source");
+    }
+
+    #[test]
+    fn encoder_index_zero_and_auto_alias_round_trip_without_collapsing() {
+        let index_zero: StartConfig = serde_json::from_value(start_json()).unwrap();
+        assert_eq!(index_zero.encoder, EncoderSelection::Index(0));
+        assert_eq!(serde_json::to_value(&index_zero).unwrap()["encoder"], 0);
+
+        let mut automatic = start_json();
+        automatic["encoder"] = json!("auto");
+        let automatic: StartConfig = serde_json::from_value(automatic).unwrap();
+        assert_eq!(
+            automatic.encoder,
+            EncoderSelection::Backend(EncoderBackend::Auto)
+        );
+        assert_eq!(serde_json::to_value(&automatic).unwrap()["encoder"], "auto");
+
+        let mut explicit = start_json();
+        explicit["encoder"] = json!(7);
+        let explicit: StartConfig = serde_json::from_value(explicit).unwrap();
+        assert_eq!(explicit.encoder, EncoderSelection::Index(7));
+        assert_eq!(serde_json::to_value(&explicit).unwrap()["encoder"], 7);
     }
 
     #[test]

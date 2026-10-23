@@ -754,6 +754,43 @@ fn pipewire_portal_source_reaches_video_open_with_its_capture_lease() {
         video_open.payload["output"],
         "portal-selected-session-source"
     );
+    assert_eq!(video_open.payload["encoder"], 0);
+}
+
+#[test]
+fn automatic_encoder_alias_reaches_video_open_without_becoming_index_zero() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let id = prepared["session"].as_u64().unwrap();
+    let mut configuration = start(id);
+    configuration["configuration"]["encoder"] = json!("auto");
+
+    assert_eq!(host.response(2, configuration)["state"], "active");
+    let video_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("video open");
+    assert_eq!(video_open.payload["encoder"], "auto");
+}
+
+#[test]
+fn explicit_encoder_index_reaches_video_open_unchanged() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let id = prepared["session"].as_u64().unwrap();
+    let mut configuration = start(id);
+    configuration["configuration"]["encoder"] = json!(7);
+
+    assert_eq!(host.response(2, configuration)["state"], "active");
+    let video_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("video open");
+    assert_eq!(video_open.payload["encoder"], 7);
 }
 
 #[test]

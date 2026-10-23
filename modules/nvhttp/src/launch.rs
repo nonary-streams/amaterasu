@@ -397,32 +397,23 @@ impl StreamingConfig {
 pub struct CaptureConfig {
     pub capture_provider: CaptureProvider,
     pub output: String,
-    #[serde(deserialize_with = "deserialize_capture_encoder")]
-    pub encoder: u32,
+    pub encoder: CaptureEncoderSelection,
     pub audio_endpoint: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
-enum CaptureEncoderSetting {
+pub enum CaptureEncoderSelection {
+    /// Zero-based index into the encoder registry enumeration.
     Index(u32),
+    /// Selection policy resolved by the video module.
     Backend(CaptureEncoderBackend),
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum CaptureEncoderBackend {
+pub enum CaptureEncoderBackend {
     Auto,
-}
-
-fn deserialize_capture_encoder<'de, D>(deserializer: D) -> Result<u32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    match CaptureEncoderSetting::deserialize(deserializer)? {
-        CaptureEncoderSetting::Index(index) => Ok(index),
-        CaptureEncoderSetting::Backend(CaptureEncoderBackend::Auto) => Ok(0),
-    }
 }
 
 impl CaptureConfig {

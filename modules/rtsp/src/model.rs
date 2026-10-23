@@ -282,10 +282,25 @@ pub struct Capture {
     #[serde(default)]
     pub constant_rate: bool,
     pub output: String,
-    pub encoder: u32,
+    pub encoder: EncoderSelection,
     pub audio_endpoint: String,
     #[serde(default)]
     pub host_audio_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum EncoderSelection {
+    /// Zero-based index into the encoder registry enumeration.
+    Index(u32),
+    /// Selection policy resolved by the video module.
+    Backend(EncoderBackend),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EncoderBackend {
+    Auto,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -2697,9 +2712,15 @@ mod tests {
         let start = request.arm(41)["configuration"].clone();
         assert_eq!(start["capture_provider"], "pipewire");
         assert_eq!(start["output"], "portal-selected-session-source");
+        assert_eq!(start["encoder"], 0);
         let decoded: CaptureProvider = serde_json::from_value(start["capture_provider"].clone())
             .expect("serialized PipeWire provider is accepted by the session model");
         assert!(matches!(decoded, CaptureProvider::PipeWire));
+
+        request.capture.encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+        assert_eq!(request.arm(41)["configuration"]["encoder"], "auto");
+        request.capture.encoder = EncoderSelection::Index(7);
+        assert_eq!(request.arm(41)["configuration"]["encoder"], 7);
     }
 
     #[test]

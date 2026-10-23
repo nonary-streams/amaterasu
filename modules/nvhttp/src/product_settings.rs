@@ -3348,7 +3348,7 @@ mod tests {
                 capture: crate::launch::CaptureConfig {
                     capture_provider: crate::launch::CaptureProvider::Dxgi,
                     output: output.into(),
-                    encoder: 0,
+                    encoder: crate::launch::CaptureEncoderSelection::Index(0),
                     audio_endpoint: audio_endpoint.into(),
                 },
                 desktop: crate::launch::DesktopSettings::default(),

@@ -205,7 +205,7 @@ fn streaming_router() -> Router {
             capture: CaptureConfig {
                 capture_provider: CaptureProvider::Dxgi,
                 output: "display-one".into(),
-                encoder: 0,
+                encoder: crate::launch::CaptureEncoderSelection::Index(0),
                 audio_endpoint: "default".into(),
             },
             desktop: crate::launch::DesktopSettings::default(),
