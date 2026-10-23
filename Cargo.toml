@@ -37,6 +37,8 @@ members = [
     "modules/input",
     "modules/virtual-display",
     "modules/capture-dxgi",
+    "modules/capture-pipewire",
+    "modules/capture-kms",
     "modules/capture-wgc",
     "modules/audio",
     "modules/audio-encode",
