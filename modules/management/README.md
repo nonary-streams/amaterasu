@@ -99,9 +99,21 @@ Plaintext requests cannot use browser cookie routes or cookie authentication.
 | `/v1/pairing/` | identity, pending, list_clients, approve_pin, unpair | `pairing.admin` |
 | `/v1/display/` | status, enumerate | `display.read` |
 | `/v1/display/` | apply, restore, recover | `display.write` |
+| `/v1/capture/` | select_portal_source, cancel_portal_selection | `capture.write` |
+| `/v1/capture/` | poll_portal_selection | `capture.read` |
 | `/v1/launch/` | start | `application.launch` |
 | `/v1/launch/` | status, list | `application.read` |
 | `/v1/launch/` | stop | `application.terminate` |
+
+On Linux, an authenticated operator selects a desktop source before launching
+Desktop: `POST /v1/capture/select_portal_source` with
+`{"source_type":"monitor","operation_id":"desktop-1"}`, then polls
+`/v1/capture/poll_portal_selection` with the same operation ID until ready.
+The current-user portal displays the consent prompt. The response never exposes
+the PipeWire node handle; the signed video component retains the selected
+source for the next Desktop stream. The operator can cancel with
+`/v1/capture/cancel_portal_selection`. These routes do not open a capture
+stream by themselves.
 
 Host-configuration `update` forwards the provider's complete version-1 document:
 `expected_revision`, `file_state`, `vibeshine_file_state`, `credentials_file`,

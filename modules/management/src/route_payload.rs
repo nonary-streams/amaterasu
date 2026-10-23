@@ -29,6 +29,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.catalog/1" => catalog(route.action, object),
         "amaterasu.pairing/1" => pairing(route.action, object),
         "amaterasu.display/1" => display(route.action, object),
+        "amaterasu.video/1" => video(route.action, object),
         "amaterasu.launch/1" => launch(route.action, object),
         "amaterasu.nvhttp/1" => nvhttp(route.action, object),
         "amaterasu.steam/1" => steam(route.action, object),
@@ -65,6 +66,29 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         }
         _ => Ok(()),
     }
+}
+
+fn video(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "select_portal_source" => {
+            fields(object, &["source_type", "operation_id"], &[])?;
+            if !matches!(text(object, "source_type")?, "monitor" | "window") {
+                return Err(INVALID);
+            }
+        }
+        "poll_portal_selection" | "cancel_portal_selection" => {
+            fields(object, &["operation_id"], &[])?;
+        }
+        _ => return Err(INVALID),
+    }
+    let operation_id = text(object, "operation_id")?;
+    if operation_id.is_empty()
+        || operation_id.len() > 128
+        || !operation_id.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(INVALID);
+    }
+    Ok(())
 }
 
 fn host_configuration(action: &str, object: &Object) -> Result<(), &'static str> {
