@@ -810,17 +810,27 @@ impl MixFormat {
         unsafe {
             let base = self.0.read_unaligned();
             let channels = u32::from(base.nChannels);
-            let mask = if base.wFormatTag == 0xfffe && base.cbSize >= 22 {
-                self.0
-                    .cast::<WAVEFORMATEXTENSIBLE>()
-                    .read_unaligned()
-                    .dwChannelMask
-            } else {
-                match channels {
-                    1 => 0x0004,
-                    2 => 0x0003,
-                    _ => 0,
+            let mask = if base.wFormatTag == 0xfffe {
+                if base.cbSize < 22 {
+                    return Err("unsupported_format");
                 }
+                let extended = self.0.cast::<WAVEFORMATEXTENSIBLE>().read_unaligned();
+                if extended.SubFormat != KSDATAFORMAT_SUBTYPE_PCM
+                    && extended.SubFormat != KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+                {
+                    return Err("unsupported_format");
+                }
+                extended.dwChannelMask
+            } else {
+                if base.wFormatTag != 1 && base.wFormatTag != 3 {
+                    return Err("unsupported_format");
+                }
+                0
+            };
+            let mask = if mask == 0 {
+                default_channel_mask(channels).ok_or("unsupported_channel_layout")?
+            } else {
+                mask
             };
             if mask == 0 || mask.count_ones() != channels {
                 return Err("unsupported_channel_layout");
@@ -882,6 +892,17 @@ impl MixFormat {
             }
             Ok(format)
         }
+    }
+}
+
+fn default_channel_mask(channels: u32) -> Option<u32> {
+    match channels {
+        1 => Some(0x0004),
+        2 => Some(0x0003),
+        4 => Some(0x0033),
+        6 => Some(0x003f),
+        8 => Some(0x063f),
+        _ => None,
     }
 }
 
@@ -1002,6 +1023,7 @@ fn loopback_capture_format(
     mix: &MixFormat,
     requested: Option<PcmCaptureFormat>,
 ) -> AudioResult<(Format, WAVEFORMATEXTENSIBLE)> {
+    let (endpoint_channels, endpoint_mask) = mix.channel_layout()?;
     let (channels, channel_mask) = if let Some(requested) = requested {
         requested.validate()?;
         let channel_mask = match requested.channels {
@@ -1012,7 +1034,7 @@ fn loopback_capture_format(
         };
         (requested.channels, channel_mask)
     } else {
-        mix.channel_layout()?
+        (endpoint_channels, endpoint_mask)
     };
     let mut format = Format::new(48_000, channels, PCM_F32)?;
     format.channel_mask = channel_mask;
@@ -1687,6 +1709,19 @@ mod tests {
         }
     }
 
+    fn legacy_endpoint_mix(sample_rate: u32, channels: u16, container_bits: u16) -> WAVEFORMATEX {
+        let block_align = channels * container_bits / 8;
+        WAVEFORMATEX {
+            wFormatTag: 1,
+            nChannels: channels,
+            nSamplesPerSec: sample_rate,
+            nAvgBytesPerSec: sample_rate * u32::from(block_align),
+            nBlockAlign: block_align,
+            wBitsPerSample: container_bits,
+            cbSize: 0,
+        }
+    }
+
     fn assert_loopback_float_target(mix: &mut WAVEFORMATEXTENSIBLE, channels: u32, mask: u32) {
         // This descriptor borrows test storage; ManuallyDrop avoids freeing it
         // as if it came from COM's GetMixFormat allocation.
@@ -1760,8 +1795,49 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_loopback_infers_default_six_channel_layout_from_zero_mask() {
+        let mut mix = endpoint_mix(48_000, 6, 24, 24, 0);
+        assert_loopback_float_target(&mut mix, 6, 0x003f);
+    }
+
+    #[test]
+    fn ordinary_loopback_infers_default_layout_from_legacy_multichannel_mix() {
+        let mut mix = legacy_endpoint_mix(48_000, 6, 24);
+        let descriptor = std::mem::ManuallyDrop::new(MixFormat((&mut mix as *mut _).cast()));
+        let (format, target) = loopback_capture_format(&descriptor, None).unwrap();
+        assert_eq!(
+            (
+                format.sample_rate,
+                format.channels,
+                format.channel_mask,
+                format.code()
+            ),
+            (48_000, 6, 0x003f, PCM_F32)
+        );
+        assert_eq!(
+            (
+                target.Format.nSamplesPerSec,
+                target.Format.nChannels,
+                target.dwChannelMask
+            ),
+            (48_000, 6, 0x003f)
+        );
+    }
+
+    #[test]
+    fn ordinary_loopback_rejects_unrecognized_legacy_format_tag() {
+        let mut mix = legacy_endpoint_mix(48_000, 6, 24);
+        mix.wFormatTag = 2;
+        let descriptor = std::mem::ManuallyDrop::new(MixFormat((&mut mix as *mut _).cast()));
+        assert!(matches!(
+            loopback_capture_format(&descriptor, None),
+            Err("unsupported_format")
+        ));
+    }
+
+    #[test]
     fn requested_stereo_loopback_converts_six_channel_mix_to_48khz_float_stereo() {
-        let mut mix = endpoint_mix(48_000, 6, 24, 24, 0x003f);
+        let mut mix = endpoint_mix(48_000, 6, 24, 24, 0);
         let descriptor = std::mem::ManuallyDrop::new(MixFormat(
             (&mut mix as *mut WAVEFORMATEXTENSIBLE).cast::<WAVEFORMATEX>(),
         ));
