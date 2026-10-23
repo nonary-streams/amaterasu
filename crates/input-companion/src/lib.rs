@@ -1,6 +1,6 @@
-//! Host-owned permit model, authenticated Windows pipe service, and restricted
-//! VHF adapter for a separately installed virtual-input companion. Native
-//! modules remain trusted user code; this service never loads them.
+//! Host-owned permit model, authenticated platform transports, and restricted
+//! virtual-input adapters. Native modules remain trusted user code; this
+//! service never loads them or treats grants as a native-code sandbox.
 
 mod model;
 mod permit;
@@ -11,6 +11,11 @@ pub use model::{InputEvent, InputPacket, MouseButton, PROTOCOL_VERSION, PeerIden
 pub use permit::{PermitLedger, ProcessIdentity, WorkerLease};
 pub use session::{DeviceSink, GrantRegistry, InputGrant, InputSession};
 pub use vhf::{VhfDeviceSink, VhfTransport};
+
+#[cfg(target_os = "linux")]
+mod linux_service;
+#[cfg(target_os = "linux")]
+pub use linux_service::{LinuxInputClient, LinuxInputService};
 
 #[cfg(windows)]
 mod windows_identity;

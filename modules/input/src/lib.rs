@@ -27,13 +27,32 @@ const CONFIGURATION_SERVICE: &str = "amaterasu.configuration/1";
 struct Settings {
     #[serde(default)]
     allow_injection: bool,
+    #[cfg(windows)]
     #[serde(default = "default_uinput_path")]
     uinput_path: String,
+    #[serde(default = "default_linux_companion_socket_path")]
+    linux_companion_socket_path: String,
     #[serde(default)]
     windows_backend: Option<String>,
 }
+#[cfg(windows)]
 fn default_uinput_path() -> String {
     "/dev/uinput".into()
+}
+#[cfg(target_os = "linux")]
+fn default_linux_companion_socket_path() -> String {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|runtime| std::path::PathBuf::from(runtime).join("amaterasu-input.sock"))
+        .unwrap_or_else(|| {
+            let uid = unsafe { libc::geteuid() };
+            std::path::PathBuf::from(format!("/run/user/{uid}/amaterasu-input.sock"))
+        })
+        .to_string_lossy()
+        .into_owned()
+}
+#[cfg(not(target_os = "linux"))]
+fn default_linux_companion_socket_path() -> String {
+    String::new()
 }
 struct InputModule {
     runtime: RuntimeClient,
@@ -87,8 +106,9 @@ impl ManagedModule for InputModule {
         };
         let settings: Settings = serde_json::from_value(payload)
             .map_err(|error| format!("invalid input settings: {error}"))?;
-        if cfg!(target_os = "linux") && !std::path::Path::new(&settings.uinput_path).is_absolute() {
-            return Err("uinput_path must be absolute".into());
+        #[cfg(target_os = "linux")]
+        if !std::path::Path::new(&settings.linux_companion_socket_path).is_absolute() {
+            return Err("linux_companion_socket_path must be absolute".into());
         }
         #[cfg(windows)]
         let backend = match settings.windows_backend.as_deref() {
@@ -103,7 +123,7 @@ impl ManagedModule for InputModule {
                     "Windows input backend selection is unavailable on this platform".into(),
                 );
             }
-            NativeBackend::new(settings.uinput_path)
+            NativeBackend::new(settings.linux_companion_socket_path)
         };
         runtime.require_success(Command::Register {
             service: SERVICE.into(),

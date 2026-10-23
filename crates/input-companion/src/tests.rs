@@ -327,6 +327,14 @@ fn invalid_events_and_device_grants_do_not_reach_the_sink() {
             extended: false,
             pressed: true,
         },
+        InputEvent::EvdevKey {
+            code: 0,
+            pressed: true,
+        },
+        InputEvent::EvdevKey {
+            code: 240,
+            pressed: true,
+        },
         InputEvent::Relative { dx: 4, dy: 0 },
         InputEvent::Scroll {
             vertical: 12_001,
@@ -335,6 +343,20 @@ fn invalid_events_and_device_grants_do_not_reach_the_sink() {
     ] {
         assert!(session.submit(&packet(1, event), now).is_err());
     }
+    assert!(session.sink.sent.is_empty());
+    assert_eq!(
+        session.submit(
+            &packet(
+                1,
+                InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    pressed: true,
+                },
+            ),
+            now,
+        ),
+        Err(InputError::PermissionDenied)
+    );
     assert!(session.sink.sent.is_empty());
     assert!(serde_json::from_str::<InputPacket>(r#"{"version":1,"generation":7,"sequence":1,"lease_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","event":{"kind":"raw_report","report_id":1}}"#).is_err());
 }

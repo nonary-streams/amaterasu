@@ -13,8 +13,8 @@ use super::{
     Device, EV_ABS, EV_KEY, InputError, InputResult, MAX_TOUCH_SLOTS,
 };
 use crate::model::{
-    Event, PEN_BUTTON_PRIMARY, PEN_BUTTON_SECONDARY, PEN_BUTTON_TERTIARY, PEN_POINTER_ID, PenTool,
-    PenTouchDevice, PenTouchPhase, pen_tilt_axes,
+    Event, PEN_BUTTON_PRIMARY, PEN_BUTTON_SECONDARY, PEN_BUTTON_TERTIARY, PenTool, PenTouchDevice,
+    PenTouchPhase, pen_tilt_axes,
 };
 use std::collections::BTreeMap;
 
@@ -1046,11 +1046,13 @@ fn with_phase(event: &Event, phase: PenTouchPhase) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PEN_POINTER_ID;
 
     fn fake_device(path: &str) -> Device {
         Device {
             file: std::fs::OpenOptions::new().write(true).open(path).unwrap(),
             created: false,
+            fake: None,
         }
     }
 
@@ -1288,6 +1290,7 @@ mod tests {
                 .open("/dev/null")
                 .unwrap(),
             created: false,
+            fake: None,
         });
         pen_touch.inject(unavailable_path, &first_down).unwrap();
         assert!(pen_touch.tracker.touches.contains_key(&11));
@@ -1310,6 +1313,7 @@ mod tests {
                 .open("/dev/null")
                 .unwrap(),
             created: false,
+            fake: None,
         });
         assert!(super::super::Backend::pen_touch_supported(&backend));
         let pen_down = event(
@@ -1350,6 +1354,7 @@ mod tests {
                 .open("/dev/full")
                 .unwrap(),
             created: false,
+            fake: None,
         });
         let down = event(
             PEN_POINTER_ID,
@@ -1423,6 +1428,7 @@ mod tests {
                 .open("/dev/null")
                 .unwrap(),
             created: false,
+            fake: None,
         });
         let touch_down = event(42, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 40);
         pen_touch.inject("\0", &touch_down).unwrap();
@@ -1462,6 +1468,7 @@ mod tests {
                 .open("/dev/null")
                 .unwrap(),
             created: false,
+            fake: None,
         });
         pen_touch.inject("\0", &down).unwrap();
         assert!(pen_touch.tracker.pen.as_ref().unwrap().contact.down_written);

@@ -937,19 +937,20 @@ fn active_gamepad_readback_tracks_recovery_without_changing_lease_identity() {
         } = &mut request
         {
             *operation_id = Some("reconnecting-gamepad".into());
-            *gamepad = Some(GamepadProfile::X360);
+            *gamepad = Some(selected_supported_profile());
         }
         request
     };
     let acquired = controller.handle("owner", operation(), now, &mut || Ok(()));
+    let profile = selected_supported_profile().as_str();
     let first_token = acquired["lease"].as_str().unwrap().to_owned();
-    assert_eq!(acquired["gamepad_profile"], "x360");
+    assert_eq!(acquired["gamepad_profile"], profile);
     assert_eq!(acquired["controller_input"], false);
     assert_eq!(acquired["effective_gamepad_profile"], Value::Null);
     assert_eq!(acquired["gamepad_unavailable_reason"], "bus unavailable");
 
     controller.backend.controller_input_supported = true;
-    controller.backend.effective_gamepad_profile = Some("x360");
+    controller.backend.effective_gamepad_profile = Some(profile);
     controller.backend.gamepad_unavailable_reason = None;
     let recovered = controller.handle("owner", operation(), now, &mut || Ok(()));
     let lookup = controller.handle(
@@ -963,13 +964,13 @@ fn active_gamepad_readback_tracks_recovery_without_changing_lease_identity() {
     let status = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
     for readback in [&recovered, &lookup] {
         assert_eq!(readback["lease"], first_token);
-        assert_eq!(readback["gamepad_profile"], "x360");
+        assert_eq!(readback["gamepad_profile"], profile);
         assert_eq!(readback["controller_input"], true);
-        assert_eq!(readback["effective_gamepad_profile"], "x360");
+        assert_eq!(readback["effective_gamepad_profile"], profile);
         assert_eq!(readback["gamepad_unavailable_reason"], Value::Null);
     }
-    assert_eq!(status["effective_gamepad_profile"], "x360");
-    assert_eq!(status["lease"]["effective_gamepad_profile"], "x360");
+    assert_eq!(status["effective_gamepad_profile"], profile);
+    assert_eq!(status["lease"]["effective_gamepad_profile"], profile);
     assert_eq!(status["lease"]["gamepad_unavailable_reason"], Value::Null);
 
     controller.backend.controller_input_supported = false;

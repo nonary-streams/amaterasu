@@ -58,12 +58,14 @@ pub trait Backend {
 mod windows;
 #[cfg(windows)]
 pub use windows::WindowsBackend as NativeBackend;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 mod linux;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
+mod linux_companion;
+#[cfg(all(target_os = "linux", test))]
 mod owned_devices;
 #[cfg(target_os = "linux")]
-pub use linux::LinuxBackend as NativeBackend;
+pub use linux_companion::LinuxCompanionBackend as NativeBackend;
 #[cfg(not(any(windows, target_os = "linux")))]
 pub struct NativeBackend;
 #[cfg(not(any(windows, target_os = "linux")))]
