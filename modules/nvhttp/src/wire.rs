@@ -122,9 +122,10 @@ enum Purpose {
     LaunchIdentity {
         request: LaunchRequest,
         peer: PeerIdentity,
+        resume: bool,
     },
     Cleanup,
-    Applications,
+    Applications { desktop_enabled: bool },
 }
 
 const PAIRING_SERVICE: &str = "amaterasu.pairing/1";
@@ -302,6 +303,7 @@ impl Router {
                         Purpose::LaunchIdentity {
                             request,
                             peer: identity,
+                            resume: false,
                         },
                         json!({
                             "action": "check_client_certificate",
@@ -327,12 +329,37 @@ impl Router {
                 };
                 self.launches.cancel(connection, &identity, now)
             }
-            "/resume" | "/unpair" => {
+            "/resume" => {
+                if !trusted {
+                    return Some(xml::error(401, "authenticated paired TLS is required"));
+                }
+                let request = match streaming::launch_request(&query) {
+                    Ok(request) => request,
+                    Err(error) => return Some(xml::error(400, error)),
+                };
+                let identity = match peer.identity() {
+                    Ok(identity) => identity,
+                    Err(error) => return Some(xml::error(401, error)),
+                };
+                let certificate_pem = match peer.peer_certificate.as_deref().and_then(|der| {
+                    pem_rfc7468::encode_string("CERTIFICATE", pem_rfc7468::LineEnding::LF, der).ok()
+                }) {
+                    Some(certificate_pem) => certificate_pem,
+                    None => return Some(xml::error(401, "client certificate is unavailable")),
+                };
+                self.queue(
+                    Some(connection),
+                    Purpose::LaunchIdentity { request, peer: identity, resume: true },
+                    json!({"action":"check_client_certificate", "certificate_pem":certificate_pem}),
+                    now + SERVICE_TIMEOUT,
+                    now,
+                )
+                .err()
+                .map(|error| xml::error(503, error))
+            }
+            "/unpair" => {
                 if trusted {
-                    Some(xml::error(
-                        501,
-                        "this Moonlight operation is not implemented",
-                    ))
+                    Some(xml::error(501, "this Moonlight operation is not implemented"))
                 } else {
                     Some(xml::error(401, "authenticated paired TLS is required"))
                 }
@@ -360,8 +387,12 @@ impl Router {
             self.next_job,
             Job {
                 connection,
-                applications: matches!(purpose, Purpose::Applications)
-                    .then(applications::Applications::new),
+                applications: match purpose {
+                    Purpose::Applications { desktop_enabled } => {
+                        Some(applications::Applications::new(*desktop_enabled))
+                    }
+                    _ => None,
+                },
                 purpose,
                 call: Call::Ready {
                     payload,
@@ -399,7 +430,7 @@ impl Router {
                 self.jobs.insert(key, job);
                 continue;
             };
-            let continued = if matches!(job.purpose, Purpose::Applications) {
+            let continued = if matches!(job.purpose, Purpose::Applications { .. }) {
                 self.resolve_applications(job, result, now, &mut replies)
             } else {
                 self.resolve(job, result, now, &mut replies)
@@ -548,7 +579,7 @@ impl Router {
 
 impl Purpose {
     fn service(&self) -> &'static str {
-        if matches!(self, Self::Applications) {
+        if matches!(self, Self::Applications { .. }) {
             applications::CATALOG_SERVICE
         } else {
             PAIRING_SERVICE

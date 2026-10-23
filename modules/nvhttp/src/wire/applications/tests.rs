@@ -187,7 +187,7 @@ fn snapshot_changes_and_provider_errors_never_return_the_partial_list() {
         );
     }
     assert_eq!(
-        Applications::new()
+        Applications::new(false)
             .accept(json!({"ok":false,"error":{"code":"permission_denied"}}))
             .err()
             .unwrap()
@@ -210,7 +210,7 @@ fn moonlight_ids_are_checked_without_hashing_or_truncation() {
     ] {
         assert!(numeric_id(invalid).is_err(), "{invalid}");
         assert_eq!(
-            Applications::new()
+            Applications::new(false)
                 .accept(page(1, vec![json!({"id":invalid,"name":"invalid"})], None))
                 .err()
                 .unwrap()
@@ -232,11 +232,11 @@ fn malformed_pages_duplicate_ids_and_nonadvancing_cursors_fail_closed() {
         page(1, vec![entry(1, "\n")], None),
     ] {
         assert_eq!(
-            Applications::new().accept(invalid).err().unwrap().status,
+            Applications::new(false).accept(invalid).err().unwrap().status,
             502
         );
     }
-    let mut accumulator = Applications::new();
+    let mut accumulator = Applications::new(false);
     accumulator
         .accept(page(1, vec![entry(1, "a")], Some(1)))
         .unwrap();
@@ -252,7 +252,7 @@ fn malformed_pages_duplicate_ids_and_nonadvancing_cursors_fail_closed() {
 
 #[test]
 fn byte_entry_page_and_concurrency_bounds_are_visible() {
-    let mut accumulator = Applications::new();
+    let mut accumulator = Applications::new(false);
     let long_name = "&".repeat(160);
     let mut overflow = None;
     for page_index in 0..100 {
@@ -270,7 +270,7 @@ fn byte_entry_page_and_concurrency_bounds_are_visible() {
     }
     assert_eq!(overflow.unwrap().status, 413);
     assert!(accumulator.body.len() < MAX_XML_BYTES);
-    let mut accumulator = Applications::new();
+    let mut accumulator = Applications::new(false);
     accumulator.entries = MAX_ENTRIES;
     assert_eq!(
         accumulator
@@ -280,7 +280,7 @@ fn byte_entry_page_and_concurrency_bounds_are_visible() {
             .status,
         413
     );
-    let mut accumulator = Applications::new();
+    let mut accumulator = Applications::new(false);
     accumulator.pages = MAX_PAGES;
     assert_eq!(
         accumulator
@@ -331,7 +331,7 @@ fn cancellation_and_total_deadline_cancel_outstanding_catalog_work() {
 
 #[test]
 fn revocation_before_response_discards_complete_catalog_xml() {
-    let mut applications = Applications::new();
+    let mut applications = Applications::new(false);
     applications
         .accept(page(1, vec![entry(1, "private app")], None))
         .unwrap();
@@ -430,4 +430,46 @@ fn failed_result_release_enters_cleanup_without_replaying_catalog_page() {
     });
     assert!(router.cancellations.is_empty());
     assert_eq!(catalog.requests.len(), 1);
+}
+
+#[test]
+fn desktop_entry_is_opt_in_and_catalog_collision_fails_closed() {
+    let desktop_only = Applications::new(true).finish();
+    let body = String::from_utf8(desktop_only.body).unwrap();
+    assert!(body.contains("<AppTitle>Desktop</AppTitle>"));
+    assert!(body.contains("<ID>2147483647</ID>"));
+    assert!(!String::from_utf8(Applications::new(false).finish().body)
+        .unwrap()
+        .contains("Desktop"));
+
+    let collision = Applications::new(true)
+        .accept(page(1, vec![entry(i32::MAX as u64, "collision")], None))
+        .err()
+        .unwrap();
+    assert_eq!(collision.status, 502);
+}
+
+#[test]
+fn desktop_list_survives_missing_or_unavailable_catalog_provider() {
+    let now = Instant::now();
+    for failure in [
+        Err("catalog provider is not registered".to_owned()),
+        Ok(json!({"ok":false,"error":{"code":"permission_denied"}})),
+    ] {
+        let mut router = router();
+        let job = Job {
+            connection: Some(7),
+            purpose: Purpose::Applications { desktop_enabled: true },
+            call: Call::Ready { payload: json!({}), not_before: now },
+            deadline: now + LIST_TIMEOUT,
+            applications: Some(Applications::new(true)),
+        };
+        let mut replies = Vec::new();
+        assert!(router.resolve_applications(job, failure, now, &mut replies).is_none());
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].1.status, 200);
+        assert!(String::from_utf8(replies.pop().unwrap().1.body)
+            .unwrap()
+            .contains("<AppTitle>Desktop</AppTitle>"));
+    }
 }

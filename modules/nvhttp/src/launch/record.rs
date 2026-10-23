@@ -51,6 +51,8 @@ pub enum Stage {
 
 pub struct Record {
     pub id: u64,
+    pub desktop: bool,
+    pub resumed: bool,
     pub peer: PeerIdentity,
     pub request: LaunchRequest,
     /// Frozen requested physical mode; this does not assert a host display topology.
@@ -193,6 +195,8 @@ impl Record {
         });
         Self {
             id,
+            desktop: false,
+            resumed: false,
             peer,
             request,
             physical_display_mode,

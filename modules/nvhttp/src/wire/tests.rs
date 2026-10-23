@@ -208,6 +208,7 @@ fn streaming_router() -> Router {
                 encoder: 0,
                 audio_endpoint: "default".into(),
             },
+            desktop: crate::launch::DesktopSettings::default(),
             profile: StreamProfile {
                 max_width: 1920,
                 max_height: 1080,

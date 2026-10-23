@@ -141,6 +141,33 @@ impl Controller {
         }
     }
 
+    fn advance_after_history(&self, record: &mut Record, now: Instant) {
+        if record.state != State::Starting {
+            return;
+        }
+        if !record.desktop {
+            record.stage = Stage::PreflightApplication;
+            return;
+        }
+        let Some(config) = &self.config else {
+            fail_record(record, "streaming_disabled", now);
+            return;
+        };
+        let mut profile = config.profile.clone();
+        if let Err(code) = project_application_policy(
+            record,
+            &ApplicationConfigOverrides::default(),
+            &mut profile,
+        ) {
+            fail_record(record, code, now);
+            return;
+        }
+        record.application_display_overrides = Some(json!({}));
+        record.display_policy_snapshot = Some(display_policy_snapshot(record));
+        record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
+        record.stage = Stage::OpenRtsp;
+    }
+
     fn make_call(&mut self, record: &mut Record, phase: Phase) -> Call {
         if record.rtsp_reconcile == Some(phase) {
             record.rtsp_reconcile = None;
@@ -405,9 +432,7 @@ impl Controller {
                 } else {
                     "unavailable"
                 };
-                if record.state == State::Starting {
-                    record.stage = Stage::PreflightApplication;
-                }
+                self.advance_after_history(record, now);
             }
             Phase::PreflightApplication => match application_preflight_response(record, &payload) {
                 Ok((token, catalog_revision, application_overrides, executable_path))
@@ -679,9 +704,7 @@ impl Controller {
                 }
                 record.history_state = "unavailable";
                 record.history_release_required = false;
-                if record.state == State::Starting {
-                    record.stage = Stage::PreflightApplication;
-                }
+                self.advance_after_history(record, now);
             }
             Phase::ReleaseHistory => {
                 record.cleanup_error = Some("history_release_unavailable");
@@ -736,9 +759,7 @@ impl Controller {
                     record.cleanup_error = None;
                 }
                 record.history_state = "unavailable";
-                if record.state == State::Starting {
-                    record.stage = Stage::PreflightApplication;
-                }
+                self.advance_after_history(record, now);
             }
             Phase::ReleaseHistory => {
                 record.cleanup_error = Some("history_release_unavailable");
@@ -912,7 +933,7 @@ fn next_phase(record: &Record) -> Phase {
         Stage::LaunchApplication => Phase::LaunchApplication,
         Stage::PrepareDisplayAdmission => Phase::PrepareDisplayAdmission,
         Stage::OpenRtsp => Phase::OpenRtsp,
-        Stage::Live if record.monitor_application_next => Phase::MonitorApplication,
+        Stage::Live if !record.desktop && record.monitor_application_next => Phase::MonitorApplication,
         Stage::Live => Phase::MonitorRtsp,
         Stage::Cleanup
             if record.rtsp_requested

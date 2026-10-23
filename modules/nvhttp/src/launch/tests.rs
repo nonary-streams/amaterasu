@@ -11,6 +11,7 @@ fn config() -> StreamingConfig {
             encoder: 0,
             audio_endpoint: "default".into(),
         },
+        desktop: DesktopSettings::default(),
         profile: StreamProfile {
             max_width: 1920,
             max_height: 1080,
@@ -1603,6 +1604,72 @@ fn launch_ready(controller: &mut Controller, broker: &mut Broker, now: Instant) 
     );
     controller.reply_delivered(connection, now);
     assert_eq!(controller.current_game(&peer(1)), 1);
+}
+
+#[test]
+fn desktop_launch_and_cancel_only_manage_rtsp_and_history() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let mut desktop_request = request(91);
+    desktop_request.app_id = DESKTOP_APP_ID;
+
+    assert!(controller.launch(91, desktop_request, peer(91), now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(connection, 91);
+    assert_eq!(reply.status, 200);
+    assert!(String::from_utf8(reply.body).unwrap().contains("rtspenc://"));
+    assert!(!broker.actions().iter().any(|(service, _)| *service == "amaterasu.launch/1"));
+    controller.reply_delivered(connection, now);
+    assert_eq!(controller.current_game(&peer(91)), DESKTOP_APP_ID);
+
+    assert!(controller.cancel(92, &peer(91), now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(connection, 92);
+    assert_eq!(reply.status, 200);
+    assert_eq!(controller.current_game(&peer(91)), 0);
+    assert!(!broker.actions().iter().any(|(service, _)| *service == "amaterasu.launch/1"));
+}
+
+#[test]
+fn desktop_resume_retires_rtsp_then_opens_a_fresh_ticket_without_app_calls() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let client = peer(93);
+    let mut first = request(93);
+    first.app_id = DESKTOP_APP_ID;
+    assert!(controller.launch(93, first, client.clone(), now).is_none());
+    let (connection, _) = poll_until_reply(&mut controller, &mut broker, now);
+    controller.reply_delivered(connection, now);
+
+    let mut resumed = request(93);
+    resumed.app_id = DESKTOP_APP_ID;
+    assert!(controller.resume(94, resumed, &client, now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(connection, 94);
+    assert_eq!(reply.status, 200);
+    assert!(String::from_utf8(reply.body).unwrap().contains("<resume>1</resume>"));
+    let opens = broker.actions().iter()
+        .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+        .count();
+    assert_eq!(opens, 2);
+    assert!(!broker.actions().iter().any(|(service, _)| *service == "amaterasu.launch/1"));
+}
+
+#[test]
+fn desktop_app_id_is_rejected_when_opt_in_is_disabled() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut desktop_request = request(92);
+    desktop_request.app_id = DESKTOP_APP_ID;
+    let reply = controller.launch(92, desktop_request, peer(92), now).unwrap();
+    assert_eq!(reply.status, 400);
+    assert!(!controller.busy());
 }
 
 #[test]

@@ -33,6 +33,7 @@ pub(crate) type Transport = ModuleResult<Response>;
 pub(crate) type Send<'a> = dyn FnMut(Command) -> Transport + 'a;
 
 const MAX_RECORDS: usize = 32;
+pub(crate) const DESKTOP_APP_ID: u32 = i32::MAX as u32;
 const INITIAL_DEADLINE: Duration = Duration::from_secs(40);
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(20);
 const MONITOR_INTERVAL: Duration = Duration::from_millis(250);
@@ -368,11 +369,19 @@ fn fingerprint(certificate: &[u8]) -> String {
         .collect()
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DesktopSettings {
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamingConfig {
     pub capture: CaptureConfig,
     pub profile: StreamProfile,
+    #[serde(default)]
+    pub desktop: DesktopSettings,
 }
 
 impl StreamingConfig {
@@ -492,6 +501,13 @@ impl StreamProfile {
     }
 }
 
+struct PendingResume {
+    connection: u64,
+    record: u64,
+    request: LaunchRequest,
+    peer: PeerIdentity,
+}
+
 pub struct Controller {
     config: Option<StreamingConfig>,
     configured_output_name: Option<String>,
@@ -514,6 +530,7 @@ pub struct Controller {
     global_wgc_pacing_smoothing: bool,
     device_name: String,
     records: BTreeMap<u64, Record>,
+    pending_resume: Option<PendingResume>,
     job: Option<Job>,
     nonce: [u8; 16],
     next_id: u64,
@@ -549,6 +566,7 @@ impl Controller {
             global_wgc_pacing_smoothing: true,
             device_name: "Amaterasu".into(),
             records: BTreeMap::new(),
+            pending_resume: None,
             job: None,
             nonce,
             next_id: 0,
@@ -558,6 +576,12 @@ impl Controller {
 
     pub fn supported(&self) -> bool {
         self.config.is_some()
+    }
+
+    pub(crate) fn desktop_enabled(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| config.desktop.enabled)
     }
 
     pub fn set_output_name_settings(&mut self, ready: bool, configured_output_name: Option<&str>) {
@@ -656,8 +680,10 @@ impl Controller {
         if !peer.paired() {
             return Some(private_error(401, "authenticated paired TLS is required"));
         }
+        let desktop = request.app_id == DESKTOP_APP_ID;
         if request.app_id == 0
             || request.app_id > i32::MAX as u32
+            || (desktop && !config.desktop.enabled)
             || !config.profile.accepts(&request)
             || !matches!(request.audio_channels, 2 | 6 | 8)
             || (request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
@@ -769,6 +795,7 @@ impl Controller {
             connection,
             now + INITIAL_DEADLINE,
         );
+        record.desktop = desktop;
         record.global_display_revision = self.global_display_revision;
         record.global_display_policy = self.global_display_policy.clone();
         self.records.insert(id, record);
@@ -776,6 +803,14 @@ impl Controller {
     }
 
     pub fn cancel(&mut self, connection: u64, peer: &PeerIdentity, now: Instant) -> Option<Reply> {
+        let cancel_pending_resume = self.pending_resume.as_ref().is_some_and(|pending| {
+            self.records.get(&pending.record).is_some_and(|record| {
+                record.peer.certificate == peer.certificate && record.state == State::Stopping
+            })
+        });
+        if cancel_pending_resume {
+            self.pending_resume = None;
+        }
         let Some(record) = self
             .records
             .values_mut()
@@ -786,6 +821,10 @@ impl Controller {
             }
             return Some(cancel_reply());
         };
+        if cancel_pending_resume && record.state == State::Stopping {
+            record.cancel_connection = Some(connection);
+            return None;
+        }
         if record.state == State::Stopping || record.cancel_connection.is_some() {
             return Some(private_error(409, "stream cleanup is already in progress"));
         }
@@ -810,6 +849,58 @@ impl Controller {
         None
     }
 
+    pub(crate) fn resume(
+        &mut self,
+        connection: u64,
+        request: LaunchRequest,
+        peer: &PeerIdentity,
+        now: Instant,
+    ) -> Option<Reply> {
+        let Some(config) = &self.config else {
+            return Some(private_error(503, "streaming is disabled"));
+        };
+        if !config.desktop.enabled || request.app_id != DESKTOP_APP_ID {
+            return Some(private_error(404, "Desktop session is unavailable"));
+        }
+        if !self.output_settings_ready {
+            return Some(private_error(503, "stream settings are loading"));
+        }
+        if !peer.paired() {
+            return Some(private_error(401, "authenticated paired TLS is required"));
+        }
+        if !config.profile.accepts(&request)
+            || !matches!(request.audio_channels, 2 | 6 | 8)
+            || (request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
+            || (request.audio_channels == 8 && config.profile.audio_bitrate < 512_000)
+            || request.device_name.as_deref().is_some_and(|name| !valid_device_name(name))
+        {
+            return Some(private_error(400, "unsupported streaming request"));
+        }
+        if self.pending_resume.is_some() {
+            return Some(private_error(409, "Desktop resume is already in progress"));
+        }
+        if self.records.values().any(|record| {
+            record.request.remote_input_key == request.remote_input_key
+                && (record.peer != *peer || record.request != request)
+        }) {
+            return Some(private_error(409, "launch key conflicts with an existing request"));
+        }
+        let Some(record) = self.records.values_mut().find(|record| {
+            record.desktop && record.peer.certificate == peer.certificate && record.state == State::Ready
+        }) else {
+            return Some(private_error(404, "live Desktop session was not found"));
+        };
+        let id = record.id;
+        record.request_cleanup(None, now + CLEANUP_DEADLINE);
+        self.pending_resume = Some(PendingResume {
+            connection,
+            record: id,
+            request,
+            peer: peer.clone(),
+        });
+        None
+    }
+
     pub fn current_game(&self, peer: &PeerIdentity) -> u32 {
         self.records
             .values()
@@ -826,6 +917,36 @@ impl Controller {
         }
         if self.job.is_none() {
             self.schedule(now);
+        }
+        let resume_ready = self.pending_resume.as_ref().is_some_and(|pending| {
+            self.records.get(&pending.record).is_some_and(|record| {
+                record.state.terminal() || record.state == State::CleanupFailed
+            }) && self.job.is_none()
+        });
+        if resume_ready && let Some(pending) = self.pending_resume.take() {
+            if self.records.get(&pending.record).is_some_and(|record| record.state == State::Stopped) {
+                if let Some(old_record) = self.records.get_mut(&pending.record)
+                    && old_record.request.remote_input_key == pending.request.remote_input_key
+                {
+                    // A resumed RTSP ticket may legitimately reuse Moonlight's key.
+                    // The old record is terminal and no longer owns live input.
+                    old_record.request.remote_input_key = [0; 16];
+                }
+                if let Some(reply) = self.launch(
+                    pending.connection,
+                    pending.request,
+                    pending.peer,
+                    now,
+                ) {
+                    replies.push((pending.connection, reply));
+                } else if let Some(record) = self.records.values_mut().find(|record| {
+                    record.launch_connection == Some(pending.connection)
+                }) {
+                    record.resumed = true;
+                }
+            } else {
+                replies.push((pending.connection, private_error(503, "Desktop cleanup failed")));
+            }
         }
         replies
     }
@@ -854,6 +975,9 @@ impl Controller {
     }
 
     pub fn connection_closed(&mut self, connection: u64, now: Instant) {
+        if self.pending_resume.as_ref().is_some_and(|pending| pending.connection == connection) {
+            self.pending_resume = None;
+        }
         let mut affected = None;
         for record in self.records.values_mut() {
             if record.launch_connection == Some(connection) {
@@ -943,7 +1067,7 @@ fn success_reply(record: &Record) -> Reply {
     let physical_width = record.physical_display_mode.width.to_string();
     let physical_height = record.physical_display_mode.height.to_string();
     let physical_refresh = record.physical_display_mode.refresh_millihz.to_string();
-    let fields = [
+    let mut fields = vec![
         (
             "sessionUrl0",
             record.rtsp_url.as_deref().unwrap_or_default(),
@@ -977,6 +1101,9 @@ fn success_reply(record: &Record) -> Reply {
                 .unwrap_or_default(),
         ),
     ];
+    if record.resumed {
+        fields.push(("resume", "1"));
+    }
     let mut reply = xml::response(200, "OK", &fields);
     reply.requires_paired_tls = true;
     reply

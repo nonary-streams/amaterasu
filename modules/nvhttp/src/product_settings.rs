@@ -3350,6 +3350,7 @@ mod tests {
                     encoder: 0,
                     audio_endpoint: audio_endpoint.into(),
                 },
+                desktop: crate::launch::DesktopSettings::default(),
                 profile: crate::launch::StreamProfile {
                     max_width: 1920,
                     max_height: 1080,

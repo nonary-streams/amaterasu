@@ -132,6 +132,7 @@ owner field:
       "encoder": 0,
       "audio_endpoint": "default"
     },
+    "desktop": { "enabled": false },
     "profile": {
       "max_width": 1920,
       "max_height": 1080,
@@ -152,7 +153,14 @@ owner field:
 }
 ```
 
-Unknown or missing nested fields fail startup. Maximum dimensions must be even and
+The optional `streaming.desktop.enabled` flag defaults to `false`. When enabled,
+NVHTTP advertises a `Desktop` app with reserved Moonlight ID `2147483647`; a catalog
+collision fails the app-list request. Desktop launch, resume, and cancellation still
+require the paired TLS client and use the normal RTSP session path without a catalog
+entry or application process. Resume retires the existing RTSP ticket and opens a
+fresh ticket for that same paired client.
+
+Unknown or missing required nested fields fail startup. Maximum dimensions must be even and
 within 16–3840 by 16–2160; maximum FPS is 1–120. Bitrate, audio, packet duration,
 and reference-frame bounds are validated before listeners start. Video FEC and
 packetization settings are additionally checked by the same packetizer used for

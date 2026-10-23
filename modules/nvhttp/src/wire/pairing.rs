@@ -379,7 +379,7 @@ impl Router {
                 complete(&job, reply, replies);
                 None
             }
-            Purpose::LaunchIdentity { request, peer } => {
+            Purpose::LaunchIdentity { request, peer, resume } => {
                 let connection = job.connection?;
                 let Some(client_id) = payload.get("client_id").and_then(Value::as_str) else {
                     complete(
@@ -435,12 +435,17 @@ impl Router {
                         return None;
                     }
                 };
-                if let Some(reply) = self.launches.launch(connection, request, peer, now) {
+                let reply = if resume {
+                    self.launches.resume(connection, request, &peer, now)
+                } else {
+                    self.launches.launch(connection, request, peer, now)
+                };
+                if let Some(reply) = reply {
                     complete(&job, reply, replies);
                 }
                 None
             }
-            Purpose::Cleanup | Purpose::Applications => None,
+            Purpose::Cleanup | Purpose::Applications { .. } => None,
         }
     }
 
