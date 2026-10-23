@@ -20,7 +20,9 @@ const LAUNCH_FIELDS: &[&str] = &[
     "surroundAudioInfo",
     "remoteControllersBitmap",
     "gcmap",
+    "psmap",
     "gcpersist",
+    "clientVrrRequested",
     "corever",
     "continuousAudio",
 ];
@@ -102,6 +104,11 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
     )?;
     optional_boolean(query, "localAudioPlayMode")?;
     optional_boolean(query, "continuousAudio")?;
+    // Moonlight sends this controller capability mask even when no PS pad is attached.
+    // Amaterasu currently ignores it, but accepts only the 16-bit client mask domain.
+    optional_decimal_mask(query, "psmap", u16::MAX as u32)?;
+    // This is only a client pacing capability hint; accepting it does not enable host VRR.
+    optional_boolean(query, "clientVrrRequested")?;
     for field in ["remoteControllersBitmap", "gcmap", "gcpersist"] {
         require_optional_value(query, field, "0", "controller forwarding is unsupported")?;
     }
@@ -121,6 +128,14 @@ fn optional_boolean(query: &Query, name: &str) -> Result<(), &'static str> {
     match query.get(name) {
         None | Some("0" | "1") => Ok(()),
         Some(_) => Err("invalid boolean query field"),
+    }
+}
+
+fn optional_decimal_mask(query: &Query, name: &str, maximum: u32) -> Result<(), &'static str> {
+    match query.get(name) {
+        None => Ok(()),
+        Some(value) if decimal_u32(value).is_ok_and(|mask| mask <= maximum) => Ok(()),
+        Some(_) => Err("invalid controller capability mask"),
     }
 }
 
@@ -203,7 +218,7 @@ mod tests {
             "&additionalStates=1&sops=0&hdrMode=0&clientHdrCapVersion=0",
             "&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=0",
             "&clientHdrCapDisplayData=&localAudioPlayMode=0&surroundAudioInfo=196610",
-            "&remoteControllersBitmap=0&gcmap=0&gcpersist=0&corever=1"
+            "&remoteControllersBitmap=0&gcmap=0&psmap=0&gcpersist=0&corever=1"
         ))
         .unwrap();
         assert_eq!(request.app_id, 7);
@@ -363,5 +378,35 @@ mod tests {
                 "accepted {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_bounded_playstation_controller_masks_without_claiming_support() {
+        let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
+        for value in ["0", "1", "65535"] {
+            assert!(
+                parse(&format!("{base}&psmap={value}")).is_ok(),
+                "rejected {value}"
+            );
+        }
+        for value in ["65536", "-1", "+1", "1.0", " 1", "1 ", ""] {
+            assert!(parse(&format!("{base}&psmap={value}")).is_err(), "accepted {value:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_optional_vrr_request_hint_but_rejects_malformed_values() {
+        let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
+        assert!(parse(base).is_ok());
+        for value in ["0", "1"] {
+            assert!(parse(&format!("{base}&clientVrrRequested={value}")).is_ok());
+        }
+        for value in ["2", "-1", "", "true"] {
+            assert!(parse(&format!("{base}&clientVrrRequested={value}")).is_err());
+        }
+        assert!(matches!(
+            parse(&format!("{base}&clientVrrRequested=1&vrrUnsupported=1")),
+            Err("unsupported query field")
+        ));
     }
 }
