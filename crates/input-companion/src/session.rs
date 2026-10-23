@@ -13,6 +13,9 @@ const MAX_EVENTS_PER_SECOND: usize = 2048;
 pub trait DeviceSink {
     fn submit(&mut self, event: &InputEvent) -> InputResult<()>;
     fn release_all(&mut self) -> InputResult<()>;
+    fn keep_alive(&mut self) -> InputResult<()> {
+        Ok(())
+    }
 }
 
 /// A single-use grant issued only after independent host policy approval.
@@ -238,7 +241,13 @@ impl<S: DeviceSink> InputSession<S> {
         }
         if now < self.grant.expires_at {
             match self.grant.is_active() {
-                Ok(true) => return Ok(false),
+                Ok(true) => {
+                    if let Err(error) = self.sink.keep_alive() {
+                        let _ = self.revoke();
+                        return Err(error);
+                    }
+                    return Ok(false);
+                }
                 Ok(false) => {}
                 Err(error) => {
                     let _ = self.revoke();

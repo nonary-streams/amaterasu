@@ -1,15 +1,24 @@
-//! Host-owned policy model for a future virtual-input companion.
+//! Host-owned policy model and restricted VHF device adapter for a future
+//! installed virtual-input companion.
 //!
-//! This crate does not authenticate OS connections or open a VHF device. Only a
+//! This crate does not authenticate OS connections. Only a
 //! separately installed companion may use it, after binding `PeerIdentity` to
 //! the accepted OS connection and issuing `InputGrant` from trusted host policy.
-//! Production transport and driver adapters are deliberately absent.
+//! The Windows device adapter is present but no production service/IPC grants
+//! are wired to it yet.
 
 mod model;
 mod session;
+mod vhf;
 
 pub use model::{InputEvent, InputPacket, MouseButton, PROTOCOL_VERSION, PeerIdentity};
 pub use session::{DeviceSink, GrantRegistry, InputGrant, InputSession};
+pub use vhf::{VhfDeviceSink, VhfTransport};
+
+#[cfg(windows)]
+mod windows_vhf;
+#[cfg(windows)]
+pub use windows_vhf::WindowsVhfTransport;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputError {

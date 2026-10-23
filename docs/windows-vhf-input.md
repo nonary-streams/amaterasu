@@ -10,7 +10,7 @@ the Windows service stays in Session 0. Keep these contracts when replacing the
 Windows transport. Linux's backend uses uinput and does not need Windows HID
 mechanics.
 
-There is **no VHF implementation in Amaterasu**. `WindowsBackend` currently uses
+The new VHF device is not installed or selected by the runtime. `WindowsBackend` currently uses
 `SendInput` for keyboard and mouse, ViGEm for controller input, and the
 Synthetic Pointer API for pen/touch. Those paths are current behavior, not the
 chosen new Windows transport.
@@ -36,9 +36,9 @@ of a restricted driver interface. Neither a catalog signature nor a module's own
 request authorizes the privileged companion or its driver access. Ordinary native
 modules must never be loaded into the service or driver.
 
-The Windows target should reuse the proven UMDF2 VHF pattern from the Nonary
-gamepad driver where suitable, in a **separate minimal keyboard/mouse source**
-with a more restricted interface. Microsoft's VHF architecture guide describes
+The new `drivers/windows-vhf-keyboard-mouse` source reuses the proven UMDF2 VHF
+build and lifecycle pattern from the Nonary gamepad driver in a **separate
+keyboard/mouse device** with its own restricted interface. Microsoft's VHF architecture guide describes
 the kernel-mode path, while its `vhf.h` references include user-mode fields;
 the locally built UMDF2 source demonstrates the latter for its supported
 Windows/WDK target. Qualify the chosen driver project against the intended
@@ -67,40 +67,51 @@ Use two independently enforced gates:
 
 The driver owns a bounded report queue or explicitly follows VHF's
 `EvtVhfReadyForNextReadReport` one-report-at-a-time rule. Apply rate limits and
-backpressure before queuing to the driver; preserve release/neutral reports under
-pressure. On expiry or revocation, the companion sends neutral reports for every
-held keyboard, mouse, controller, pen and touch state and waits for completion.
-The driver also maintains a watchdog and neutralizes its own device state if its
-companion handle disappears, then stops submitting and calls `VhfDelete` with
-correct callback and buffer lifetime handling during teardown. Recovery cannot
+backpressure before queuing to the driver; preserve release reports under
+pressure. For the new keyboard/mouse path, the companion destroys its VHF child
+synchronously on revocation, after attempting held-state releases. This avoids
+claiming that queued neutral reports have reached the HID consumer. The driver
+also destroys the child after a missed heartbeat, failed asynchronous report
+submission, a two-second stalled report queue, file close or device stop. Recovery cannot
 depend solely on the replaceable input module.
 
-The first source addition needs reviewed Generic Desktop keyboard and mouse
-collections. The current `WindowsScan` and Moonlight key forms need an explicit
-HID usage mapping; scan codes cannot be copied into keyboard reports. Mouse
-needs fixed reports for buttons, relative motion, and vertical/horizontal
-scrolling. Absolute pointing, pen/touch and controller profiles require their
-own descriptor and consumer qualification before being advertised. The private
-control interface needs fixed-size, versioned query/create, keyboard-state,
-pointer-state, neutralize, and destroy operations, with per-handle ownership
-and exact length/report-ID checks. Reserve implementation-specific IOCTL values
-only when that driver interface is reviewed. Do not add arbitrary descriptor
-or raw-report IOCTLs.
+The source publishes fixed Generic Desktop six-key keyboard and relative mouse
+collections, with five buttons and vertical/horizontal scrolling. Its private
+interface has versioned fixed-size query/create, keyboard-state, pointer-state,
+destroy and heartbeat operations; write IOCTLs require write access.
+The INF grants the deterministic `AmaterasuInputCompanion` service SID device
+read/write access, plus SYSTEM/Administrators and the UMDF host identity. It
+does not grant interactive users access. One file object owns the VHF child;
+close, device stop, or explicit destroy synchronously deletes it. A two-second
+driver watchdog destroys the child and refuses further input when the
+companion stops sending updates or heartbeats, or VHF stops requesting queued
+reports even while heartbeats continue. Its bounded report queue
+rejects additional input instead of dropping a release. This source requires
+VM/device tests before claiming HID consumer behavior or ACL enforcement.
+
+The companion's `VhfDeviceSink` maps a qualified subset of set-1 Windows scan
+codes to HID usages and sends full keyboard/mouse state through a real Windows
+SetupDi/CreateFile/DeviceIoControl transport. Unsupported scan codes and a
+seventh simultaneous non-modifier key fail closed. Moonlight key mapping,
+absolute pointer, high-resolution wheel, pen/touch and controller events remain
+unsupported on this path. Scan codes are never copied directly into reports.
 
 The host-owned `amaterasu-input-companion` crate now provides a typed,
 testable authorization state machine for keyboard/mouse events. It binds a
 synthetic transport peer, set identity, session, lease token and generation;
 permits one active device lease at a time; checks sequence, grants and event
-values; rate-limits nonrelease events; and neutralizes held state on revoke,
+values; rate-limits nonrelease events; and deletes the keyboard/mouse child on revoke,
 expiry or uncertain delivery. The replaceable input module has a narrow
 translator for currently representable events. Moonlight key mapping,
 absolute pointer, high-resolution wheel, pen/touch and controller events fail
 closed in that translator. The crate is **not connected to authenticated
-Windows IPC or a VHF device** and deliberately has no production grant-registry
-constructor. Its exclusivity guarantee is scoped to one registry instance;
-the installed companion must own one exclusive device handle and registry for
-that handle. A production companion must derive peer identity
-from the accepted OS connection and grants from protected host policy, persist
+Windows IPC**; its device sink is connected to the VHF control interface but
+cannot open it without the installed driver and companion service identity.
+There is deliberately no production grant-registry constructor. Its exclusivity
+guarantee is scoped to one registry instance; the installed companion must own
+one exclusive device handle and registry for that handle. A production companion
+must derive peer identity from the accepted OS connection and grants from
+protected host policy, persist
 generation floors, call expiry/close cleanup, and own a driver handle whose
 access is restricted by the installed driver. No production elevated operation
 is enabled by this code; the user worker still uses the current backend.
@@ -113,19 +124,30 @@ selection and API contract should not require end users to compile with Cargo.
 
 ## Validation before enabling
 
-- Build and sign a driver with the WDK and test its INF, VHF lower-filter
-  installation, PnP teardown, descriptor behavior and report parsing in a VM.
-  This checkout has the Windows Kits 10.0.26100.0 `shared/vhf.h`, but the
-  expected `um/x64/VhfUm.lib` was not found in the installed Kits library
-  tree during this slice. No new driver build was attempted.
+- The x64 UMDF DLL builds with VS2022 BuildTools, Windows SDK 10.0.26100.0 and
+  Microsoft's cached WDK NuGet package `Microsoft.Windows.WDK.x64`
+  10.0.26100.6584, which contains `VhfUm.lib` and UMDF 2.15 headers. The base
+  Kits tree alone lacks those WDK pieces. ARM64 was not built. The INF targets
+  Windows 10 build 19041+ and Windows 11 build 22000+ separately; the nearby
+  gamepad INF says 1909 in a comment but its actual Windows 10 decoration is
+  19041. The local build used `/p:LocalBuildWithoutPdb=true` because installed
+  VS PDB components have mismatched versions; a release build should generate
+  symbols with a consistent VS toolchain. Compile success is not driver
+  installation or platform validation.
+- Sign and package the driver and test its INF, VHF lower-filter installation,
+  PnP teardown, descriptor behavior and report parsing in a VM.
 - Test invalid report IDs/sizes/types, IOCTL rights, session spoofing, replay,
   flood/backpressure, companion crash, logout, policy revocation and stuck-key
   release. Verify no user module can open the device directly.
 - Test real keyboard, mouse, pen/touch and controller consumers, including
   multi-session behavior and any XInput compatibility requirement.
 - Integrate the companion only after the elevated broker has authenticated
-  identity-bound grants and explicit privileged-handler approval. Do not install
-  a driver or grant OS privileges as part of ordinary repository activation.
+  identity-bound grants and explicit privileged-handler approval. The dedicated
+  service must run with a service SID matching the INF, authenticate the worker
+  OS token/session and host-confirmed component-set identity, own protected
+  grant and generation state, and poll leases/driver heartbeat. No service IPC,
+  protected grant storage or installation path exists yet. Do not install a
+  driver or grant OS privileges as part of ordinary repository activation.
 
 Microsoft references: [VHF architecture and lifecycle](https://learn.microsoft.com/en-us/windows-hardware/drivers/hid/virtual-hid-framework--vhf-),
 [VhfReadReportSubmit and buffering](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/vhf/nf-vhf-vhfreadreportsubmit),

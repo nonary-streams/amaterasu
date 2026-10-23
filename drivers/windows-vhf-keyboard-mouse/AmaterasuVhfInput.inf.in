@@ -1,0 +1,107 @@
+; Copyright (c) 2026 Chase Payne
+; SPDX-License-Identifier: MIT
+; Substitute $ARCH$ with amd64 or arm64 and package the matching DLL.
+[Version]
+Signature="$Windows NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+CatalogFile=AmaterasuVhfInput.cat
+DriverVer=10/23/2026,0.1.0.0
+PnpLockdown=1
+
+[Manufacturer]
+%Provider%=Devices,NT$ARCH$.10.0...19041,NT$ARCH$.10.0...22000
+
+[Devices.NT$ARCH$.10.0...19041]
+%Device%=Install_Win10,ROOT\AMATERASUVHFINPUT
+
+[Devices.NT$ARCH$.10.0...22000]
+%Device%=Install_Win11,ROOT\AMATERASUVHFINPUT
+
+[Install_Win10.NT]
+Include=hidvhf.inf
+Needs=vhfservice.NT
+CopyFiles=DriverFiles
+
+[Install_Win10.NT.HW]
+Include=hidvhf.inf
+Needs=vhfservice.NT.HW
+AddReg=DeviceSecurity
+
+[Install_Win10.NT.Services]
+Include=hidvhf.inf
+Needs=vhfservice.NT.Services
+AddService=WUDFRd,0x000001f8,WUDFRdService
+
+[Install_Win10.NT.Filters]
+AddFilter=WUDFRd,,WudfUpper
+
+[Install_Win10.NT.Wdf]
+UmdfService=AmaterasuVhfInput,DriverWdf
+UmdfServiceOrder=AmaterasuVhfInput
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfFileObjectPolicy=AllowNullAndUnknownFileObjects
+UmdfFsContextUsePolicy=CannotUseFsContexts
+
+[WudfUpper]
+FilterPosition=Upper
+
+[WUDFRdService]
+DisplayName=%Reflector%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WUDFRd.sys
+
+[Install_Win11.NT]
+Include=WUDFRD.inf,hidvhf.inf
+Needs=WUDFRD_UpperFilter.NT,vhfservice.NT
+CopyFiles=DriverFiles
+
+[Install_Win11.NT.HW]
+Include=WUDFRD.inf,hidvhf.inf
+Needs=WUDFRD_UpperFilter.NT.HW,vhfservice.NT.HW
+AddReg=DeviceSecurity
+
+[Install_Win11.NT.Services]
+Include=WUDFRD.inf,hidvhf.inf
+Needs=WUDFRD_UpperFilter.NT.Services,vhfservice.NT.Services
+
+[Install_Win11.NT.Filters]
+Include=WUDFRD.inf
+Needs=WUDFRD_UpperFilter.NT.Filters
+
+[Install_Win11.NT.Wdf]
+UmdfService=AmaterasuVhfInput,DriverWdf
+UmdfServiceOrder=AmaterasuVhfInput
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfFileObjectPolicy=AllowNullAndUnknownFileObjects
+UmdfFsContextUsePolicy=CannotUseFsContexts
+
+[DeviceSecurity]
+; Dedicated AmaterasuInputCompanion service SID from `sc showsid`.
+; No IU, Users, or Everyone ACE. UD is the UMDF host identity.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;UD)(A;;GRGW;;;S-1-5-80-1629755331-3240451473-1148694758-1037390477-853527049)"
+
+[DriverWdf]
+UmdfLibraryVersion=2.15
+ServiceBinary=%13%\AmaterasuVhfInput.dll
+
+[DriverFiles]
+AmaterasuVhfInput.dll
+
+[DestinationDirs]
+DefaultDestDir=13
+
+[SourceDisksNames]
+1=%Media%,,,
+
+[SourceDisksFiles]
+AmaterasuVhfInput.dll=1
+
+[Strings]
+Provider="Amaterasu"
+Device="Amaterasu Restricted Virtual Keyboard and Mouse"
+Reflector="Windows User-Mode Driver Framework Reflector"
+Media="Amaterasu Virtual Input Driver"

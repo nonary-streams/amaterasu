@@ -23,7 +23,9 @@ An installed bootstrap policy can approve arbitrary namespaced API methods such 
 Windows virtual input will use a separately approved VHF-backed device path with
 a minimal HID source driver and a session-bound companion, as detailed in
 [Windows virtual input boundary](windows-vhf-input.md). The current input backend
-still uses SendInput for keyboard/mouse; VHF has not yet been implemented.
+still uses SendInput for keyboard/mouse. The separate UMDF VHF driver and
+companion device transport now build but are not installed, selected, or
+connected to an authenticated service/grant route.
 
 ## Remaining work and release blockers
 

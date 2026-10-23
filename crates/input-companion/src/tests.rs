@@ -10,6 +10,8 @@ struct FakeDevice {
     releases: usize,
     fail_next: bool,
     fail_release: bool,
+    heartbeats: usize,
+    fail_heartbeat: bool,
 }
 
 impl DeviceSink for FakeDevice {
@@ -24,6 +26,14 @@ impl DeviceSink for FakeDevice {
     fn release_all(&mut self) -> InputResult<()> {
         self.releases += 1;
         if self.fail_release {
+            return Err(InputError::Device);
+        }
+        Ok(())
+    }
+
+    fn keep_alive(&mut self) -> InputResult<()> {
+        self.heartbeats += 1;
+        if self.fail_heartbeat {
             return Err(InputError::Device);
         }
         Ok(())
@@ -291,6 +301,73 @@ fn uncertain_delivery_closes_and_neutralizes_before_another_event() {
     );
     assert_eq!(session.sink.sent.len(), delivered_before_retry);
     assert_eq!(session.sink.releases, 1);
+}
+
+#[test]
+fn companion_tick_heartbeats_live_lease_and_closes_on_watchdog_failure() {
+    let now = Instant::now();
+    let mut session = connect(now, FakeDevice::default());
+    assert_eq!(
+        session.poll_expiry(now + Duration::from_millis(100)),
+        Ok(false)
+    );
+    assert_eq!(session.sink.heartbeats, 1);
+    session.sink.fail_heartbeat = true;
+    assert_eq!(
+        session.poll_expiry(now + Duration::from_millis(200)),
+        Err(InputError::Device)
+    );
+    assert_eq!(session.sink.releases, 1);
+    assert_eq!(
+        session.submit(&packet(1, key(true)), now),
+        Err(InputError::Closed)
+    );
+}
+
+#[test]
+fn already_removed_vhf_child_can_release_lease_for_new_generation() {
+    let now = Instant::now();
+    let identity = peer();
+    let mut registry = GrantRegistry::synthetic();
+    let grant = registry
+        .issue(
+            identity.clone(),
+            "a".repeat(32),
+            7,
+            now + Duration::from_secs(1),
+            true,
+            true,
+        )
+        .unwrap();
+    let mut session = InputSession::connect(
+        &identity,
+        grant,
+        FakeDevice {
+            // The driver removed the child on its own watchdog. A subsequent
+            // heartbeat fails, while idempotent DESTROY succeeds.
+            fail_heartbeat: true,
+            ..Default::default()
+        },
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        session.poll_expiry(now + Duration::from_millis(100)),
+        Err(InputError::Device)
+    );
+    assert_eq!(session.sink.releases, 1);
+    let next = registry
+        .issue(
+            identity.clone(),
+            "b".repeat(32),
+            8,
+            now + Duration::from_secs(1),
+            true,
+            true,
+        )
+        .unwrap();
+    let replacement = InputSession::connect(&identity, next, FakeDevice::default(), now).unwrap();
+    assert!(!replacement.cleanup_required());
 }
 
 #[test]
