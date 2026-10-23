@@ -413,13 +413,6 @@ impl Router {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub fn poll(&mut self, runtime: &RuntimeClient) -> Vec<(u64, Reply)> {
-        self.poll_with(Instant::now(), &mut |command| {
-            runtime.send_ephemeral(command)
-        })
-    }
-
     pub fn poll_with_trust(
         &mut self,
         runtime: &RuntimeClient,
