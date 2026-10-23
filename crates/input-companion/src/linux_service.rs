@@ -7,7 +7,7 @@
 //! sandbox for trusted native modules running in the host process.
 use crate::{
     DeviceSink, GrantRegistry, InputError, InputEvent, InputPacket, InputResult, InputSession,
-    MouseButton, PROTOCOL_VERSION, PeerIdentity, PermitLedger, ProcessIdentity,
+    MouseButton, PROTOCOL_VERSION, PermitLedger, ProcessIdentity,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -259,8 +259,8 @@ impl LinuxInputClient {
     }
 
     fn read_reply(&mut self) -> InputResult<Reply> {
-        read_frame(&mut self.stream)
-            .and_then(|frame| serde_json::from_slice(&frame).map_err(|_| InputError::InvalidEvent))
+        let frame = read_frame(&mut self.stream)?.ok_or(InputError::Closed)?;
+        serde_json::from_slice(&frame).map_err(|_| InputError::InvalidEvent)
     }
 }
 
@@ -285,14 +285,15 @@ fn serve(
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
     let result = (|| {
         while !stop.load(Ordering::Acquire) {
-            workers.retain_mut(|worker| {
+            let mut active_workers = Vec::with_capacity(workers.len());
+            for worker in workers.drain(..) {
                 if worker.is_finished() {
                     let _ = worker.join();
-                    false
                 } else {
-                    true
+                    active_workers.push(worker);
                 }
-            });
+            }
+            workers = active_workers;
             match listener.accept() {
                 Ok((stream, _)) if count.fetch_add(1, Ordering::AcqRel) < MAX_CONNECTIONS => {
                     let ledger = Arc::clone(&ledger);
@@ -525,13 +526,9 @@ impl DeviceSink for LinuxUinputSink {
     fn submit(&mut self, event: &InputEvent) -> InputResult<()> {
         event.validate()?;
         match event {
-            InputEvent::Key {
-                scan_code, pressed, ..
-            } => self
-                .keyboard
-                .as_ref()
-                .ok_or(InputError::PermissionDenied)?
-                .emit(&[(EV_KEY, u16::from(*scan_code), i32::from(*pressed))]),
+            // Windows scan codes have no stable Linux EV_KEY interpretation;
+            // Linux workers must use the explicit evdev key representation.
+            InputEvent::Key { .. } => Err(InputError::InvalidEvent),
             InputEvent::EvdevKey { code, pressed } => self
                 .keyboard
                 .as_ref()
