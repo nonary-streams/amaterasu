@@ -145,7 +145,11 @@ function Assert-TrustedModulePath([string]$path) {
         throw "PowerShell module path contains a reparse point: $path"
     }
     $isDirectory = ($attributes -band [IO.FileAttributes]::Directory) -ne 0
-    $acl = if ($isDirectory) { [IO.Directory]::GetAccessControl($path) } else { [IO.File]::GetAccessControl($path) }
+    $acl = if ($isDirectory) {
+        [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($path))
+    } else {
+        [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($path))
+    }
     $owner = $acl.GetOwner($sidType).Value
     if ($owner -notin $trustedOwners) { throw "PowerShell module path has an untrusted owner: $path" }
     foreach ($rule in $acl.GetAccessRules($true, $true, $sidType)) {
@@ -1237,7 +1241,7 @@ mod tests {
         .unwrap();
 
         let result = powershell(
-            "$null = Get-PnpDevice; Write-Output 'completed'",
+            "$null = Get-Command Get-PnpDevice; Write-Output 'completed'",
             &[
                 ("PSModulePath", &root),
                 ("AMATERASU_TEST_MODULE_MARKER", &marker),
