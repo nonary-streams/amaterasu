@@ -461,7 +461,9 @@ fn catalog_settings(options: &LinuxSessionOptions) -> Value {
     let owner = options.catalog_owner.principal();
     json!({
         "launch_principals": ["amaterasu.launch"],
-        "seed_desktop_entry": true,
+        // NVHTTP advertises the reserved Desktop app ID directly. Do not also
+        // create an ordinary catalog row named Desktop.
+        "seed_desktop_entry": false,
         "export_principals": {"amaterasu.nvhttp": owner},
         "steam_id_export_principals": {"amaterasu.lutris": owner},
         "import_principals": {
@@ -511,6 +513,7 @@ fn streaming_settings(options: &LinuxSessionOptions) -> Value {
             "encrypt_audio": true,
             "permit_legacy_audio_iv_wrap": false,
         },
+        "desktop": {"enabled": true},
     })
 }
 
