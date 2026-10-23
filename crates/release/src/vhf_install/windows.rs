@@ -99,7 +99,12 @@ $writeMask = [Security.AccessControl.FileSystemRights]::WriteData -bor
     [Security.AccessControl.FileSystemRights]::TakeOwnership
 foreach ($rule in $acl.GetAccessRules($true, $true, $sidType)) {
     if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
-        continue
+        # Inherit-only entries do not affect a leaf file. On a directory they
+        # can grant writes to newly created children, except CREATOR OWNER:
+        # that placeholder cannot create a child without an independent ACE.
+        if (-not $item.PSIsContainer -or $rule.IdentityReference.Value -eq 'S-1-3-0') {
+            continue
+        }
     }
     if ($rule.AccessControlType -eq 'Allow' -and
         $rule.IdentityReference.Value -notin @('S-1-5-18', 'S-1-5-32-544', $trustedInstaller) -and
