@@ -204,10 +204,143 @@ fn microsoft_tool(path: &Path, expected_name: &str) -> PackageResult<()> {
     Ok(())
 }
 
+fn windows_powershell_path(system_directory: &Path) -> PathBuf {
+    system_directory
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe")
+}
+
+fn require_system_powershell_path(path: &Path, system_directory: &Path) -> PackageResult<()> {
+    if path != windows_powershell_path(system_directory) {
+        return Err("PowerShell executable is outside the Windows system directory".into());
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct WinTrustFileInfo {
+    size: u32,
+    file_path: *const u16,
+    file: *mut std::ffi::c_void,
+    known_subject: *const std::ffi::c_void,
+}
+
+#[repr(C)]
+struct WinTrustData {
+    size: u32,
+    policy_callback_data: *mut std::ffi::c_void,
+    sip_client_data: *mut std::ffi::c_void,
+    ui_choice: u32,
+    revocation_checks: u32,
+    union_choice: u32,
+    file_info: *mut WinTrustFileInfo,
+    state_action: u32,
+    state_data: *mut std::ffi::c_void,
+    url_reference: *mut u16,
+    provider_flags: u32,
+    ui_context: u32,
+    signature_settings: *mut std::ffi::c_void,
+}
+
+#[repr(C)]
+struct Guid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+fn system_directory() -> PackageResult<PathBuf> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    }
+    use std::os::windows::ffi::OsStringExt;
+    let mut buffer = vec![0u16; 32_768];
+    // SAFETY: buffer is writable and its capacity is passed in UTF-16 units.
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if length == 0 || length as usize >= buffer.len() {
+        return Err("Windows system directory could not be determined".into());
+    }
+    buffer.truncate(length as usize);
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
+}
+
+fn validate_windows_powershell(path: &Path) -> PackageResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+
+    #[link(name = "wintrust")]
+    unsafe extern "system" {
+        fn WinVerifyTrust(
+            window: *mut std::ffi::c_void,
+            action: *const Guid,
+            data: *mut WinTrustData,
+        ) -> i32;
+    }
+
+    let system = system_directory()?;
+    let expected = windows_powershell_path(&system);
+    require_system_powershell_path(path, &system)?;
+    for candidate in [
+        system.join("WindowsPowerShell"),
+        system.join("WindowsPowerShell").join("v1.0"),
+        expected.clone(),
+    ] {
+        let metadata = fs::symlink_metadata(&candidate).map_err(|error| error.to_string())?;
+        if metadata.file_attributes() & 0x400 != 0
+            || if candidate == expected {
+                !metadata.is_file()
+            } else {
+                !metadata.is_dir()
+            }
+        {
+            return Err(
+                "Windows PowerShell path contains a reparse point or unexpected file".into(),
+            );
+        }
+    }
+
+    let file_path: Vec<u16> = expected.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut file_info = WinTrustFileInfo {
+        size: std::mem::size_of::<WinTrustFileInfo>() as u32,
+        file_path: file_path.as_ptr(),
+        file: std::ptr::null_mut(),
+        known_subject: std::ptr::null(),
+    };
+    let mut data = WinTrustData {
+        size: std::mem::size_of::<WinTrustData>() as u32,
+        policy_callback_data: std::ptr::null_mut(),
+        sip_client_data: std::ptr::null_mut(),
+        ui_choice: 2,
+        revocation_checks: 0,
+        union_choice: 1,
+        file_info: &mut file_info,
+        state_action: 0,
+        state_data: std::ptr::null_mut(),
+        url_reference: std::ptr::null_mut(),
+        provider_flags: 0x0000_1000,
+        ui_context: 0,
+        signature_settings: std::ptr::null_mut(),
+    };
+    let action = Guid {
+        data1: 0x00aa_c56b,
+        data2: 0xcd44,
+        data3: 0x11d0,
+        data4: [0x8c, 0xc2, 0x00, 0xc0, 0x4f, 0xc2, 0x95, 0xee],
+    };
+    // SAFETY: WinVerifyTrust reads the valid path and structures above for this call.
+    if unsafe { WinVerifyTrust(-1isize as *mut std::ffi::c_void, &action, &mut data) } != 0 {
+        return Err("Windows PowerShell signature is not trusted".into());
+    }
+    Ok(())
+}
+
 fn powershell(script: &str, environment: &[(&str, &Path)]) -> PackageResult<String> {
-    let program_files =
-        PathBuf::from(std::env::var_os("ProgramFiles").ok_or("ProgramFiles unavailable")?);
-    let mut command = Command::new(program_files.join("PowerShell").join("7").join("pwsh.exe"));
+    let program = windows_powershell_path(&system_directory()?);
+    validate_windows_powershell(&program)?;
+    let mut command = Command::new(program);
     command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     for (name, value) in environment {
         command.env(name, value);
@@ -654,7 +787,7 @@ pub(super) fn grant_command(
     if policy_path.exists() {
         return Err("VHF policy already exists; revoke it before changing grants".into());
     }
-    write_json_atomically(
+    persist_grant_policy(
         &policy_path,
         &InputPolicy {
             schema: 1,
@@ -662,8 +795,43 @@ pub(super) fn grant_command(
             keyboard,
             mouse,
         },
+        seal_machine_private_file,
     )?;
-    seal_machine_private_file(&policy_path)?;
+    Ok(())
+}
+
+fn persist_grant_policy(
+    path: &Path,
+    policy: &InputPolicy<'_>,
+    seal: impl FnOnce(&Path) -> Result<(), String>,
+) -> PackageResult<()> {
+    let parent = path
+        .parent()
+        .ok_or("grant policy has no parent directory")?;
+    let staged_path = parent.join(format!(
+        ".input-companion-policy-{}.pending",
+        amaterasu_storage::random_identifier()?
+    ));
+    write_json_atomically(&staged_path, policy)?;
+    if let Err(error) = seal(&staged_path) {
+        return match fs::remove_file(&staged_path) {
+            Ok(()) => Err(format!(
+                "grant policy ACL seal failed; staged policy removed: {error}"
+            )),
+            Err(cleanup) => Err(format!(
+                "grant policy ACL seal failed: {error}; staged policy cleanup failed: {cleanup}"
+            )),
+        };
+    }
+    fs::rename(&staged_path, path).map_err(|error| {
+        let cleanup = fs::remove_file(&staged_path);
+        match cleanup {
+            Ok(()) => format!("sealed grant policy could not be published: {error}"),
+            Err(cleanup) => format!(
+                "sealed grant policy could not be published: {error}; staged policy cleanup failed: {cleanup}"
+            ),
+        }
+    })?;
     Ok(())
 }
 
@@ -682,6 +850,55 @@ pub(super) fn revoke_command(destination: &Path, runtime: &Path) -> PackageResul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powershell_is_resolved_only_under_the_windows_system_directory() {
+        let system = Path::new(r"C:\Windows\System32");
+        let executable = windows_powershell_path(system);
+        assert_eq!(
+            executable,
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        );
+        assert!(
+            require_system_powershell_path(
+                Path::new(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+                system
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "validates the live Windows inbox PowerShell signature"]
+    fn inbox_powershell_passes_independent_signature_validation() {
+        let path = windows_powershell_path(&system_directory().unwrap());
+        validate_windows_powershell(&path).unwrap();
+    }
+
+    #[test]
+    fn failed_grant_policy_seal_removes_the_active_policy() {
+        let path = std::env::temp_dir().join(format!(
+            "amaterasu-vhf-policy-seal-{}.json",
+            amaterasu_storage::random_identifier().unwrap()
+        ));
+        let digest = "0".repeat(64);
+        let policy = InputPolicy {
+            schema: 1,
+            component_set_digest: &digest,
+            keyboard: true,
+            mouse: false,
+        };
+        let staged_path = std::cell::RefCell::new(None);
+        let result = persist_grant_policy(&path, &policy, |staged| {
+            assert!(!path.exists(), "unsealed policy must not be active");
+            assert!(staged.exists(), "policy should be staged before sealing");
+            *staged_path.borrow_mut() = Some(staged.to_path_buf());
+            Err("synthetic ACL failure".into())
+        });
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert!(!staged_path.borrow().as_ref().unwrap().exists());
+    }
 
     #[test]
     #[ignore = "reads the live Windows service inventory and ACLs"]

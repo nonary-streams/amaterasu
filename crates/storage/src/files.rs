@@ -50,9 +50,9 @@ pub fn create_private_directory(path: &Path) -> StorageResult<()> {
     Ok(())
 }
 
-/// Creates a directory for machine-owned installer data. On Windows its DACL
-/// is protected and grants only LocalSystem and Administrators; descendants
-/// inherit the same boundary for migration backups and transaction journals.
+/// Creates a directory for machine-owned installer data. When called by
+/// LocalSystem on Windows, its owner is Administrators and its protected DACL
+/// grants only LocalSystem and Administrators; descendants inherit that ACL.
 pub fn create_machine_private_directory(path: &Path) -> StorageResult<()> {
     create_private_directory(path)?;
     #[cfg(windows)]
@@ -63,8 +63,9 @@ pub fn create_machine_private_directory(path: &Path) -> StorageResult<()> {
 }
 
 /// Explicit installer operation. Unlike `create_machine_private_directory`,
-/// this seals the directory when called by an elevated administrator too.
-/// The caller must establish that every parent is installer-owned.
+/// this assigns a trusted Administrators owner and seals the directory when
+/// called by an elevated administrator too. The caller must establish that
+/// every parent is installer-owned.
 pub fn seal_machine_private_directory(path: &Path) -> StorageResult<()> {
     create_private_directory(path)?;
     #[cfg(windows)]
@@ -73,7 +74,8 @@ pub fn seal_machine_private_directory(path: &Path) -> StorageResult<()> {
 }
 
 /// Protects an existing regular file containing machine-owned secrets.
-/// On Windows, only LocalSystem applies the installed SY/BA ACL, matching
+/// On Windows, only LocalSystem assigns the trusted Administrators owner and
+/// applies the installed SY/BA ACL, matching
 /// `create_machine_private_directory`; non-SYSTEM development runs retain
 /// their caller-owned ACL. Callers must protect the parent separately.
 pub fn protect_machine_private_file(path: &Path) -> StorageResult<()> {
@@ -104,8 +106,9 @@ pub fn protect_machine_private_file(path: &Path) -> StorageResult<()> {
 }
 
 /// Explicit elevated-installer counterpart to `protect_machine_private_file`.
-/// It sets the SYSTEM/Administrators DACL even when the caller is an admin
-/// rather than LocalSystem. The caller must establish a protected parent.
+/// It assigns ownership to Administrators and sets the SYSTEM/Administrators
+/// DACL even when the caller is an admin rather than LocalSystem. The caller
+/// must establish a protected parent.
 pub fn seal_machine_private_file(path: &Path) -> StorageResult<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -166,8 +169,12 @@ fn set_machine_private_dacl(path: &Path) -> StorageResult<()> {
         fn LocalFree(memory: *mut c_void) -> *mut c_void;
     }
 
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
     const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
-    let sddl: Vec<u16> = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+    // A protected DACL alone is insufficient: the owner can replace it.
+    // Assign ownership to the trusted Administrators group as part of the
+    // same operation, then grant full control only to SYSTEM and Administrators.
+    let sddl: Vec<u16> = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
         .encode_utf16()
         .chain(Some(0))
         .collect();
@@ -188,8 +195,13 @@ fn set_machine_private_dacl(path: &Path) -> StorageResult<()> {
         return Err("machine-private ACL could not be constructed".into());
     }
     // SAFETY: descriptor is allocated by the preceding Windows API call.
-    let applied =
-        unsafe { SetFileSecurityW(target.as_ptr(), DACL_SECURITY_INFORMATION, descriptor) };
+    let applied = unsafe {
+        SetFileSecurityW(
+            target.as_ptr(),
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+    };
     unsafe { LocalFree(descriptor) };
     if applied == 0 {
         return Err("machine-private ACL could not be applied".into());
@@ -336,5 +348,79 @@ mod tests {
             assert!(protect_machine_private_file(&link).is_err());
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an elevated token able to assign Administrators as owner"]
+    fn sealing_machine_private_file_assigns_a_trusted_owner() {
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn GetNamedSecurityInfoW(
+                name: *mut u16,
+                object_type: u32,
+                security_info: u32,
+                owner: *mut *mut c_void,
+                group: *mut *mut c_void,
+                dacl: *mut *mut c_void,
+                sacl: *mut *mut c_void,
+                descriptor: *mut *mut c_void,
+            ) -> u32;
+            fn ConvertSidToStringSidW(sid: *const c_void, string: *mut *mut u16) -> i32;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn LocalFree(memory: *mut c_void) -> *mut c_void;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-machine-seal-{}-{}",
+            std::process::id(),
+            crate::random_identifier().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let file = root.join("policy.json");
+        fs::write(&file, b"machine grant").unwrap();
+        seal_machine_private_file(&file).unwrap();
+
+        let mut path: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut owner = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: path is NUL-terminated; returned owner/descriptor are valid until LocalFree.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                path.as_mut_ptr(),
+                1,
+                0x1,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, 0);
+        let mut owner_text = std::ptr::null_mut();
+        // SAFETY: owner is the SID returned by GetNamedSecurityInfoW.
+        assert_ne!(unsafe { ConvertSidToStringSidW(owner, &mut owner_text) }, 0);
+        let mut length = 0;
+        // SAFETY: owner_text is a NUL-terminated UTF-16 string allocated by Windows.
+        while unsafe { *owner_text.add(length) } != 0 {
+            length += 1;
+        }
+        // SAFETY: owner_text points to `length + 1` readable UTF-16 units.
+        let owner_sid =
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(owner_text, length) });
+        assert_eq!(owner_sid, "S-1-5-32-544");
+        // SAFETY: both allocations were returned by Windows LocalAlloc APIs.
+        unsafe {
+            LocalFree(owner_text.cast());
+            LocalFree(descriptor);
+        }
+        fs::remove_file(file).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 }
