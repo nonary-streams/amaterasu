@@ -115,6 +115,85 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sidType)) {
 Write-Output 'protected'
 "#;
 
+const TRUSTED_MODULE_BOOTSTRAP: &str = r#"
+$ErrorActionPreference = 'Stop'
+$modernModuleRoot = $env:AMATERASU_VHF_MODERN_MODULE_ROOT
+$legacyModuleRoot = $env:AMATERASU_VHF_LEGACY_MODULE_ROOT
+$programFilesDirectory = $env:AMATERASU_VHF_PROGRAM_FILES_DIRECTORY
+$systemDirectory = $env:AMATERASU_VHF_SYSTEM_DIRECTORY
+$expectedModernRoot = [IO.Path]::GetFullPath([IO.Path]::Combine($programFilesDirectory, 'PowerShell', '7', 'Modules'))
+$expectedLegacyRoot = [IO.Path]::GetFullPath([IO.Path]::Combine($systemDirectory, 'WindowsPowerShell', 'v1.0', 'Modules'))
+if (-not [string]::Equals([IO.Path]::GetFullPath($modernModuleRoot), $expectedModernRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    -not [string]::Equals([IO.Path]::GetFullPath($legacyModuleRoot), $expectedLegacyRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'PowerShell module roots are outside the protected directories'
+}
+$env:PSModulePath = [string]::Join([IO.Path]::PathSeparator, @($expectedModernRoot, $expectedLegacyRoot))
+$PSModuleAutoLoadingPreference = 'None'
+$sidType = [Security.Principal.SecurityIdentifier]
+$trustedOwners = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+$writeMask = [Security.AccessControl.FileSystemRights]::WriteData -bor
+    [Security.AccessControl.FileSystemRights]::AppendData -bor
+    [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+    [Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+    [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+    [Security.AccessControl.FileSystemRights]::Delete -bor
+    [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+    [Security.AccessControl.FileSystemRights]::TakeOwnership
+function Assert-TrustedModulePath([string]$path) {
+    $attributes = [IO.File]::GetAttributes($path)
+    if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "PowerShell module path contains a reparse point: $path"
+    }
+    $isDirectory = ($attributes -band [IO.FileAttributes]::Directory) -ne 0
+    $acl = if ($isDirectory) { [IO.Directory]::GetAccessControl($path) } else { [IO.File]::GetAccessControl($path) }
+    $owner = $acl.GetOwner($sidType).Value
+    if ($owner -notin $trustedOwners) { throw "PowerShell module path has an untrusted owner: $path" }
+    foreach ($rule in $acl.GetAccessRules($true, $true, $sidType)) {
+        if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0 -and
+            (-not $isDirectory -or $rule.IdentityReference.Value -eq 'S-1-3-0')) { continue }
+        if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin $trustedOwners -and
+            ($rule.FileSystemRights -band $writeMask) -ne 0) {
+            throw "PowerShell module path permits a nonprivileged writer: $path"
+        }
+    }
+}
+foreach ($rootAndBoundary in @(
+    @{ Root = $expectedModernRoot; Boundary = $programFilesDirectory },
+    @{ Root = $expectedLegacyRoot; Boundary = $systemDirectory }
+)) {
+    $ancestor = $rootAndBoundary.Root
+    $boundary = [IO.Path]::GetFullPath($rootAndBoundary.Boundary)
+    while ($true) {
+        Assert-TrustedModulePath $ancestor
+        if ([string]::Equals($ancestor, $boundary, [StringComparison]::OrdinalIgnoreCase)) { break }
+        $parent = [IO.Directory]::GetParent($ancestor)
+        if ($null -eq $parent) { throw 'PowerShell module root escaped its protected directory' }
+        $ancestor = $parent.FullName
+    }
+}
+$modulePaths = @(
+    [IO.Path]::Combine($expectedModernRoot, 'Microsoft.PowerShell.Management'),
+    [IO.Path]::Combine($expectedModernRoot, 'Microsoft.PowerShell.Utility'),
+    [IO.Path]::Combine($expectedModernRoot, 'Microsoft.PowerShell.Security'),
+    [IO.Path]::Combine($expectedModernRoot, 'CimCmdlets'),
+    [IO.Path]::Combine($expectedLegacyRoot, 'PnpDevice')
+)
+foreach ($modulePath in $modulePaths) {
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $pending.Push($modulePath)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        Assert-TrustedModulePath $current
+        if (([IO.File]::GetAttributes($current) -band [IO.FileAttributes]::Directory) -ne 0) {
+            foreach ($child in [IO.Directory]::GetFileSystemEntries($current)) { $pending.Push($child) }
+        }
+    }
+}
+foreach ($modulePath in $modulePaths) {
+    Import-Module -Name $modulePath -Force -ErrorAction Stop
+}
+"#;
+
 fn run(program: &Path, arguments: &[&str]) -> PackageResult<String> {
     let output = Command::new(program)
         .args(arguments)
@@ -584,21 +663,22 @@ fn powershell(script: &str, environment: &[(&str, &Path)]) -> PackageResult<Stri
     validate_protected_module_path(&legacy_modules.join("PnpDevice"))?;
     validate_protected_module_path(&modern_modules)?;
     let mut command = Command::new(program);
-    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
-    // Do not allow user profile modules to shadow the management cmdlets used
-    // by the privileged installer. The two module roots are OS-protected.
-    let module_paths = std::env::join_paths([modern_modules, legacy_modules])
-        .map_err(|error| error.to_string())?;
-    command.env("PSModulePath", module_paths);
     command.env("SystemRoot", &system_root);
     command.env(
         "PATH",
-        std::env::join_paths([system32, program_files.join("PowerShell").join("7")])
+        std::env::join_paths([&system32, &program_files.join("PowerShell").join("7")])
             .map_err(|error| error.to_string())?,
     );
     for (name, value) in environment {
         command.env(name, value);
     }
+    command
+        .env("AMATERASU_VHF_MODERN_MODULE_ROOT", &modern_modules)
+        .env("AMATERASU_VHF_LEGACY_MODULE_ROOT", &legacy_modules)
+        .env("AMATERASU_VHF_PROGRAM_FILES_DIRECTORY", &program_files)
+        .env("AMATERASU_VHF_SYSTEM_DIRECTORY", &system32);
+    let trusted_script = format!("{TRUSTED_MODULE_BOOTSTRAP}\n{script}");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &trusted_script]);
     let output = command.output().map_err(|error| error.to_string())?;
     if !output.status.success() {
         return Err(format!(
@@ -1138,6 +1218,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.trim(), "Get-PnpDevice");
+    }
+
+    #[test]
+    #[ignore = "runs trusted Windows PowerShell and the system PnP module"]
+    fn user_writable_pnp_module_is_not_loaded_or_executed() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-vhf-user-module-{}",
+            amaterasu_storage::random_identifier().unwrap()
+        ));
+        let malicious_module = root.join("PnpDevice");
+        fs::create_dir_all(&malicious_module).unwrap();
+        let marker = root.join("module-executed.txt");
+        fs::write(
+            malicious_module.join("PnpDevice.psm1"),
+            "[IO.File]::WriteAllText($env:AMATERASU_TEST_MODULE_MARKER, 'executed')\nfunction Get-PnpDevice { @() }\nExport-ModuleMember -Function Get-PnpDevice\n",
+        )
+        .unwrap();
+
+        let result = powershell(
+            "$null = Get-PnpDevice; Write-Output 'completed'",
+            &[
+                ("PSModulePath", &root),
+                ("AMATERASU_TEST_MODULE_MARKER", &marker),
+            ],
+        );
+        assert_eq!(result.unwrap().trim(), "completed");
+        assert!(!marker.exists(), "user module code must not execute");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
