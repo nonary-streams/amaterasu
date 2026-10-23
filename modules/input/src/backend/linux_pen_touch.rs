@@ -335,12 +335,7 @@ impl ContactTracker {
             self.touches.remove(&pointer_id);
             return Ok(());
         }
-        let native_contacts = self
-            .touches
-            .values()
-            .filter(|touch| touch.contact.native_write_attempted)
-            .count();
-        let active_contacts = native_contacts + usize::from(!touch.contact.native_write_attempted);
+        let active_contacts = self.terminal_contact_count(pointer_id);
         let frame = touch_frame(&frame_event, slot, active_contacts, recovering_down)?;
         let mut attempted = false;
         let result = emit(Target::Touch, &frame, &mut attempted);
@@ -393,6 +388,21 @@ impl ContactTracker {
         Ok(TouchSlot { slot, tracking_id })
     }
 
+    /// Counts confirmed contacts plus the current terminal contact if its
+    /// write was uncertain. A different reserved contact whose Down never
+    /// completed must not keep the shared BTN_TOUCH key held.
+    fn terminal_contact_count(&self, pointer_id: u32) -> usize {
+        let confirmed = self
+            .touches
+            .values()
+            .filter(|touch| touch.contact.down_written)
+            .count();
+        let current_uncertain = self.touches.get(&pointer_id).is_some_and(|touch| {
+            !touch.contact.down_written && touch.contact.native_write_attempted
+        });
+        confirmed + usize::from(current_uncertain)
+    }
+
     fn allocate_tracking_id(&mut self) -> i32 {
         let mut candidate = self.next_tracking_id.max(0);
         loop {
@@ -440,13 +450,7 @@ impl ContactTracker {
                 continue;
             }
             let cancel_event = with_phase(&touch.contact.last_event, PenTouchPhase::Cancel);
-            let native_contacts = self
-                .touches
-                .values()
-                .filter(|contact| contact.contact.native_write_attempted)
-                .count();
-            let active_contacts =
-                native_contacts + usize::from(!touch.contact.native_write_attempted);
+            let active_contacts = self.terminal_contact_count(pointer_id);
             let frame = touch_frame(&cancel_event, touch.slot, active_contacts, false)?;
             let mut attempted = false;
             match emit(Target::Touch, &frame, &mut attempted) {
