@@ -83,14 +83,28 @@ impl Fixture {
     }
 
     fn native_set(&self) -> (PathBuf, Candidate) {
-        let output = self.root.join("native-package");
+        self.native_set_variant(
+            "native-package",
+            4,
+            "1.0",
+            b"synthetic library bytes, never loaded",
+        )
+    }
+
+    fn native_set_variant(
+        &self,
+        name: &str,
+        sequence: u64,
+        version: &str,
+        artifact: &[u8],
+    ) -> (PathBuf, Candidate) {
+        let output = self.root.join(name);
         fs::create_dir(&output).unwrap();
-        let artifact = b"synthetic library bytes, never loaded";
         fs::write(output.join("runtime.bin"), artifact).unwrap();
         fs::write(output.join("capture.bin"), artifact).unwrap();
         let component = |id: &str, file: &str, runtime| ComponentManifest {
             id: id.into(),
-            version: "1.0".into(),
+            version: version.into(),
             file: file.into(),
             sha256: sha256(artifact),
             size: artifact.len() as u64,
@@ -103,7 +117,7 @@ impl Fixture {
             schema: 1,
             host_context_schema: 1,
             project: "amaterasu".into(),
-            sequence: 4,
+            sequence,
             expires_unix: 500,
             target: current_target(),
             components: vec![
@@ -118,7 +132,7 @@ impl Fixture {
             Candidate {
                 slot: "amaterasu.capture".into(),
                 implementation: "fixture-capture".into(),
-                version: "1.0".into(),
+                version: version.into(),
                 kind: CandidateKind::NativeSet,
                 manifest_sha256: sha256(&raw),
             },
@@ -565,6 +579,242 @@ fn native_staging_records_publisher_and_replay_floor_without_loading_code() {
     assert!(
         activate_staged_native(&fixture.root, &fixture.bootstrap, &store, &digest, 100).is_err()
     );
+}
+
+fn cache_candidate(
+    store: &RepositoryStore,
+    repository_id: &str,
+    candidate: &Candidate,
+    source: &PathBuf,
+) -> PathBuf {
+    let cached = store
+        .native_candidate_cache_path(repository_id, &candidate.manifest_sha256)
+        .unwrap();
+    fs::create_dir(&cached).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        assert!(entry.file_type().unwrap().is_file());
+        fs::copy(entry.path(), cached.join(entry.file_name())).unwrap();
+    }
+    cached
+}
+
+#[test]
+fn cached_native_stage_and_trial_authorization_are_exact_and_revision_guarded() {
+    let fixture = Fixture::new();
+    let (source, candidate) = fixture.native_set();
+    let (raw, signature) = fixture.signed_catalog(vec![candidate.clone()], 7);
+    let store = RepositoryStore::new(fixture.root.join("approvals-native-cas")).unwrap();
+    store.approve(fixture.approved.clone()).unwrap();
+    store
+        .accept_catalog(
+            &fixture.approved.id,
+            &raw,
+            &signature,
+            &current_target(),
+            100,
+        )
+        .unwrap();
+    let catalog = store
+        .catalog(&fixture.approved.id, &current_target(), 100)
+        .unwrap();
+    cache_candidate(&store, &fixture.approved.id, &candidate, &source);
+    write_json_atomically(
+        &fixture.root.join("selection.json"),
+        &ActivationState::default(),
+    )
+    .unwrap();
+
+    let before = read_native_selection(&fixture.root).unwrap();
+    let staged = stage_cached_native_candidate(
+        &fixture.root,
+        &fixture.bootstrap,
+        &store,
+        &fixture.approved.id,
+        catalog.digest(),
+        &candidate,
+        &before.revision,
+        100,
+    )
+    .unwrap();
+    assert_ne!(staged.revision, before.revision);
+    assert!(staged.active.is_none());
+    assert!(staged.pending.is_none());
+    assert!(
+        package_directory(&fixture.root, &candidate.manifest_sha256)
+            .unwrap()
+            .is_dir()
+    );
+
+    let stale_stage = stage_cached_native_candidate(
+        &fixture.root,
+        &fixture.bootstrap,
+        &store,
+        &fixture.approved.id,
+        catalog.digest(),
+        &candidate,
+        &before.revision,
+        100,
+    )
+    .unwrap_err();
+    assert!(stale_stage.is_conflict());
+    assert_eq!(
+        read_native_selection(&fixture.root).unwrap().revision,
+        staged.revision
+    );
+
+    let pending = authorize_staged_native_trial(
+        &fixture.root,
+        &fixture.bootstrap,
+        &store,
+        &fixture.approved.id,
+        catalog.digest(),
+        &candidate.manifest_sha256,
+        &staged.revision,
+        100,
+    )
+    .unwrap();
+    assert_eq!(
+        pending.pending.as_deref(),
+        Some(candidate.manifest_sha256.as_str())
+    );
+    assert!(pending.active.is_none());
+    assert!(
+        authorize_staged_native_trial(
+            &fixture.root,
+            &fixture.bootstrap,
+            &store,
+            &fixture.approved.id,
+            catalog.digest(),
+            &candidate.manifest_sha256,
+            &staged.revision,
+            100,
+        )
+        .unwrap_err()
+        .is_conflict()
+    );
+}
+
+#[test]
+fn previous_healthy_native_restore_is_trusted_cas_and_keeps_release_floor() {
+    let fixture = Fixture::new();
+    let (first_source, first_candidate) = fixture.native_set();
+    let (second_source, second_candidate) = fixture.native_set_variant(
+        "newer-native-package",
+        5,
+        "1.1",
+        b"different synthetic library bytes, never loaded",
+    );
+    let (raw, signature) =
+        fixture.signed_catalog(vec![first_candidate.clone(), second_candidate.clone()], 7);
+    let store = RepositoryStore::new(fixture.root.join("approvals-native-restore")).unwrap();
+    store.approve(fixture.approved.clone()).unwrap();
+    store
+        .accept_catalog(
+            &fixture.approved.id,
+            &raw,
+            &signature,
+            &current_target(),
+            100,
+        )
+        .unwrap();
+    let catalog = store
+        .catalog(&fixture.approved.id, &current_target(), 100)
+        .unwrap();
+    cache_candidate(
+        &store,
+        &fixture.approved.id,
+        &first_candidate,
+        &first_source,
+    );
+    cache_candidate(
+        &store,
+        &fixture.approved.id,
+        &second_candidate,
+        &second_source,
+    );
+    let initial = read_native_selection(&fixture.root).unwrap();
+    let staged_first = stage_cached_native_candidate(
+        &fixture.root,
+        &fixture.bootstrap,
+        &store,
+        &fixture.approved.id,
+        catalog.digest(),
+        &first_candidate,
+        &initial.revision,
+        100,
+    )
+    .unwrap();
+    let staged_second = stage_cached_native_candidate(
+        &fixture.root,
+        &fixture.bootstrap,
+        &store,
+        &fixture.approved.id,
+        catalog.digest(),
+        &second_candidate,
+        &staged_first.revision,
+        100,
+    )
+    .unwrap();
+
+    let selection_path = fixture.root.join("selection.json");
+    let mut selection: ActivationState = read_json(&selection_path).unwrap();
+    selection.active = Some(second_candidate.manifest_sha256.clone());
+    selection.previous = Some(first_candidate.manifest_sha256.clone());
+    selection.pending = Some(second_candidate.manifest_sha256.clone());
+    selection
+        .healthy_sets
+        .insert(first_candidate.manifest_sha256.clone());
+    selection
+        .healthy_sets
+        .insert(second_candidate.manifest_sha256.clone());
+    let retained_floor = selection.repository_floors[&fixture.approved.fingerprint].clone();
+    write_json_atomically(&selection_path, &selection).unwrap();
+
+    let before_restore = read_native_selection(&fixture.root).unwrap();
+    let restored = restore_previous_healthy_native(
+        &fixture.root,
+        &fixture.bootstrap,
+        &store,
+        Some(&second_candidate.manifest_sha256),
+        &before_restore.revision,
+        100,
+    )
+    .unwrap();
+    assert_eq!(
+        restored.active.as_deref(),
+        Some(first_candidate.manifest_sha256.as_str())
+    );
+    assert_eq!(
+        restored.previous.as_deref(),
+        Some(second_candidate.manifest_sha256.as_str())
+    );
+    assert!(restored.pending.is_none());
+    assert!(restored.trial.is_none());
+    let after_restore: ActivationState = read_json(&selection_path).unwrap();
+    assert_eq!(
+        after_restore.repository_floors[&fixture.approved.fingerprint].sequence,
+        retained_floor.sequence
+    );
+    assert_eq!(
+        after_restore.repository_floors[&fixture.approved.fingerprint].digest,
+        retained_floor.digest
+    );
+    assert_eq!(after_restore.highest_sequence, selection.highest_sequence);
+
+    assert!(
+        restore_previous_healthy_native(
+            &fixture.root,
+            &fixture.bootstrap,
+            &store,
+            Some(&second_candidate.manifest_sha256),
+            &before_restore.revision,
+            100,
+        )
+        .unwrap_err()
+        .is_conflict()
+    );
+    let _ = staged_second;
 }
 
 #[test]

@@ -66,6 +66,29 @@ impl RepositoryStore {
         Ok(Self { directory })
     }
 
+    /// Returns the host-owned cache directory for a candidate manifest digest.
+    /// The repository identity and cache path are never derived from a browser
+    /// supplied filesystem path.
+    pub fn native_candidate_cache_path(
+        &self,
+        repository_id: &str,
+        manifest_sha256: &str,
+    ) -> PackageResult<PathBuf> {
+        if !super::valid_segment(repository_id)
+            || manifest_sha256.len() != 64
+            || manifest_sha256 != manifest_sha256.to_ascii_lowercase()
+            || !manifest_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("invalid native candidate cache digest".into());
+        }
+        create_private_directory(&self.directory)?;
+        let repository_cache = self.directory.join("native-candidates").join(repository_id);
+        create_private_directory(&repository_cache)?;
+        Ok(repository_cache.join(manifest_sha256))
+    }
+
     pub fn approve(&self, approval: ApprovedRepository) -> PackageResult<()> {
         approval.validate()?;
         self.change(|state| {

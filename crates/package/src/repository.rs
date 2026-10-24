@@ -14,7 +14,206 @@ use crate::{
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::Path;
+
+const SELECTION_REVISION_CONFLICT: &str = "selection_revision_conflict";
+
+/// Read-only, privacy-limited view of native activation state. `revision` is
+/// the SHA-256 of the exact persisted selection bytes and is used for CAS.
+#[derive(Clone, Debug, Serialize)]
+pub struct NativeSelectionSnapshot {
+    pub revision: String,
+    pub active: Option<String>,
+    pub previous: Option<String>,
+    pub pending: Option<String>,
+    pub trial: Option<String>,
+    pub highest_sequence: u64,
+}
+
+/// Conflicts are safe to report as a stale revision; all other failures may
+/// have happened after durable work and should be reconciled by reading status.
+#[derive(Debug)]
+pub enum NativeSelectionError {
+    Conflict,
+    Failed(String),
+}
+
+impl NativeSelectionError {
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::Conflict)
+    }
+}
+
+impl fmt::Display for NativeSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Conflict => formatter.write_str(SELECTION_REVISION_CONFLICT),
+            Self::Failed(_) => formatter.write_str("native_selection_operation_failed"),
+        }
+    }
+}
+
+impl std::error::Error for NativeSelectionError {}
+
+fn selection_operation_error(error: String) -> NativeSelectionError {
+    if error == SELECTION_REVISION_CONFLICT {
+        NativeSelectionError::Conflict
+    } else {
+        NativeSelectionError::Failed(error)
+    }
+}
+
+/// Reads activation state and its opaque revision while holding the activation
+/// lock. A missing selection is represented by the default state and the hash
+/// of empty bytes, so it cannot collide with a persisted default document.
+pub fn read_native_selection(root: &Path) -> PackageResult<NativeSelectionSnapshot> {
+    let _lock = RootLock::acquire(root)?;
+    let (selection, revision) = read_selection_with_revision(root)?;
+    Ok(snapshot(&selection, revision))
+}
+
+/// Verifies and stages the exact candidate named by a current approved catalog,
+/// using only the digest-derived cache entry owned by `RepositoryStore`.
+/// Approval lock order is repository store first, then activation root.
+pub fn stage_cached_native_candidate(
+    root: &Path,
+    bootstrap: &BootstrapConfig,
+    store: &RepositoryStore,
+    repository_id: &str,
+    catalog_digest: &str,
+    candidate: &Candidate,
+    expected_revision: &str,
+    now: u64,
+) -> Result<NativeSelectionSnapshot, NativeSelectionError> {
+    let result = (|| {
+        if !bootstrap.development || candidate.kind != CandidateKind::NativeSet {
+            return Err("repository native staging requires a development native choice".into());
+        }
+        validate_revision(expected_revision)?;
+        let cache_path =
+            store.native_candidate_cache_path(repository_id, &candidate.manifest_sha256)?;
+        let metadata = std::fs::symlink_metadata(&cache_path)
+            .map_err(|error| format!("cached native candidate is unavailable: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("cached native candidate is not a private package directory".into());
+        }
+        store.with_current_catalog(
+            repository_id,
+            catalog_digest,
+            &current_target(),
+            now,
+            |approved, catalog| {
+                stage_native_candidate_with_revision(
+                    &cache_path,
+                    root,
+                    bootstrap,
+                    approved,
+                    catalog,
+                    candidate,
+                    now,
+                    Some(expected_revision),
+                )
+            },
+        )
+    })();
+    result.map_err(selection_operation_error)?;
+    read_native_selection(root).map_err(NativeSelectionError::Failed)
+}
+
+/// Authorizes one exact staged digest for the next development worker trial.
+/// It is intentionally separate from staging and never executes native code.
+pub fn authorize_staged_native_trial(
+    root: &Path,
+    bootstrap: &BootstrapConfig,
+    store: &RepositoryStore,
+    repository_id: &str,
+    catalog_digest: &str,
+    digest: &str,
+    expected_revision: &str,
+    now: u64,
+) -> Result<NativeSelectionSnapshot, NativeSelectionError> {
+    let result = (|| {
+        if !bootstrap.development {
+            return Err("production repository native activation is not authorized".into());
+        }
+        validate_revision(expected_revision)?;
+        store.with_current_catalog(
+            repository_id,
+            catalog_digest,
+            &current_target(),
+            now,
+            |approved, catalog| {
+                if !catalog.candidates().iter().any(|candidate| {
+                    candidate.kind == CandidateKind::NativeSet
+                        && candidate.manifest_sha256 == digest
+                }) {
+                    return Err("staged native set is absent from the current catalog".into());
+                }
+                authorize_staged_native_locked(
+                    root,
+                    bootstrap,
+                    approved,
+                    digest,
+                    expected_revision,
+                    now,
+                )
+            },
+        )
+    })();
+    result.map_err(selection_operation_error)?;
+    read_native_selection(root).map_err(NativeSelectionError::Failed)
+}
+
+/// Restores only the automatically recorded previous or a previously healthy
+/// repository set. It preserves publisher floors and requires a caller CAS.
+pub fn restore_previous_healthy_native(
+    root: &Path,
+    bootstrap: &BootstrapConfig,
+    store: &RepositoryStore,
+    expected_active_digest: Option<&str>,
+    expected_revision: &str,
+    now: u64,
+) -> Result<NativeSelectionSnapshot, NativeSelectionError> {
+    let result = (|| {
+        if !bootstrap.development {
+            return Err(
+                "production native recovery requires installed-service authorization".into(),
+            );
+        }
+        validate_revision(expected_revision)?;
+        let repository_id = previous_repository_id(root, expected_revision)?;
+        store.with_active_approval(&repository_id, |approved| {
+            restore_previous_healthy_native_locked(
+                root,
+                bootstrap,
+                approved,
+                expected_active_digest,
+                expected_revision,
+                now,
+            )
+        })
+    })();
+    result.map_err(selection_operation_error)?;
+    read_native_selection(root).map_err(NativeSelectionError::Failed)
+}
+
+fn previous_repository_id(root: &Path, expected_revision: &str) -> PackageResult<String> {
+    let _lock = RootLock::acquire(root)?;
+    let (selection, revision) = read_selection_with_revision(root)?;
+    if revision != expected_revision {
+        return Err(SELECTION_REVISION_CONFLICT.into());
+    }
+    let previous = selection
+        .previous
+        .as_deref()
+        .ok_or("no previous native set is available")?;
+    selection
+        .repository_sets
+        .get(previous)
+        .map(|source| source.repository_id.clone())
+        .ok_or_else(|| "previous native set has no approved publisher provenance".into())
+}
 pub use store::{RepositoryListing, RepositoryStore};
 pub use transport::{HttpsRepository, RepositoryTransport, download_candidate, refresh_catalog};
 
@@ -30,13 +229,31 @@ pub fn stage_native_candidate(
     candidate: &Candidate,
     now: u64,
 ) -> PackageResult<String> {
+    stage_native_candidate_with_revision(
+        source, root, bootstrap, approved, catalog, candidate, now, None,
+    )
+}
+
+fn stage_native_candidate_with_revision(
+    source: &Path,
+    root: &Path,
+    bootstrap: &BootstrapConfig,
+    approved: &ApprovedRepository,
+    catalog: &VerifiedCatalog,
+    candidate: &Candidate,
+    now: u64,
+    expected_revision: Option<&str>,
+) -> PackageResult<String> {
     if !bootstrap.development || candidate.kind != CandidateKind::NativeSet {
         return Err("repository native staging requires a development native choice".into());
     }
     verify_candidate(approved, catalog, candidate, source, bootstrap, now)?;
     let _lock = RootLock::acquire(root)?;
     let selection_path = root.join("selection.json");
-    let mut selection: ActivationState = read_json(&selection_path)?;
+    let (mut selection, revision) = read_selection_with_revision(root)?;
+    if expected_revision.is_some_and(|expected| expected != revision) {
+        return Err(SELECTION_REVISION_CONFLICT.into());
+    }
     let mut restricted = bootstrap.clone();
     restricted.allow_unsigned = false;
     restricted.trusted_keys = approved.keys();
@@ -150,6 +367,158 @@ pub fn activate_staged_native(
         selection.pending = Some(digest.into());
         write_json_atomically(&selection_path, &selection)
     })
+}
+
+fn authorize_staged_native_locked(
+    root: &Path,
+    bootstrap: &BootstrapConfig,
+    approved: &ApprovedRepository,
+    digest: &str,
+    expected_revision: &str,
+    now: u64,
+) -> PackageResult<()> {
+    if !canonical_digest(digest) {
+        return Err("invalid staged native digest".into());
+    }
+    let selection_path = root.join("selection.json");
+    let _lock = RootLock::acquire(root)?;
+    let (mut selection, revision) = read_selection_with_revision(root)?;
+    if revision != expected_revision {
+        return Err(SELECTION_REVISION_CONFLICT.into());
+    }
+    if selection.trial.is_some() {
+        return Err("a native activation trial is already in progress".into());
+    }
+    let source = selection
+        .repository_sets
+        .get(digest)
+        .ok_or("native digest was not staged from an approved repository")?;
+    if source.repository_id != approved.id || source.key_fingerprint != approved.fingerprint {
+        return Err("native publisher approval changed".into());
+    }
+    let floor = selection
+        .repository_floors
+        .get(&approved.fingerprint)
+        .ok_or("native publisher release floor is missing")?;
+    let mut restricted = bootstrap.clone();
+    restricted.allow_unsigned = false;
+    restricted.trusted_keys = approved.keys();
+    let package = verify_package(
+        &package_directory(root, digest)?,
+        &restricted,
+        VerificationPolicy {
+            minimum_sequence: 0,
+            allow_historical: true,
+            now,
+        },
+    )?;
+    if !package.signed
+        || package.digest != digest
+        || package.manifest.host_context_schema != 1
+        || package.manifest.sequence != floor.sequence
+        || package.digest != floor.digest
+    {
+        return Err("staged native set lost accepted publisher provenance".into());
+    }
+    selection.pending = Some(digest.into());
+    write_json_atomically(&selection_path, &selection)
+}
+
+fn restore_previous_healthy_native_locked(
+    root: &Path,
+    bootstrap: &BootstrapConfig,
+    approved: &ApprovedRepository,
+    expected_active_digest: Option<&str>,
+    expected_revision: &str,
+    now: u64,
+) -> PackageResult<()> {
+    let selection_path = root.join("selection.json");
+    let _lock = RootLock::acquire(root)?;
+    let (mut selection, revision) = read_selection_with_revision(root)?;
+    if revision != expected_revision || selection.active.as_deref() != expected_active_digest {
+        return Err(SELECTION_REVISION_CONFLICT.into());
+    }
+    if selection.trial.is_some() {
+        return Err("native activation trial is in progress".into());
+    }
+    let previous = selection
+        .previous
+        .clone()
+        .ok_or("no previous native set is available")?;
+    if selection.active.as_deref() == Some(previous.as_str()) {
+        return Err("previous native set is already active".into());
+    }
+    let provenance = selection
+        .repository_sets
+        .get(&previous)
+        .ok_or("previous native set has no approved publisher provenance")?;
+    if provenance.repository_id != approved.id || provenance.key_fingerprint != approved.fingerprint
+    {
+        return Err("previous native set publisher is no longer approved".into());
+    }
+    if !selection.healthy_sets.contains(&previous) {
+        return Err("previous native set has not passed a worker health trial".into());
+    }
+
+    let mut restricted = bootstrap.clone();
+    restricted.allow_unsigned = false;
+    restricted.trusted_keys = approved.keys();
+    let package = verify_package(
+        &package_directory(root, &previous)?,
+        &restricted,
+        VerificationPolicy {
+            minimum_sequence: 0,
+            allow_historical: true,
+            now,
+        },
+    )?;
+    if !package.signed || package.digest != previous || package.manifest.host_context_schema != 1 {
+        return Err("previous native set is not authenticated".into());
+    }
+    let floor = selection
+        .repository_floors
+        .get(&approved.fingerprint)
+        .ok_or("native publisher release floor is missing")?;
+    if package.manifest.sequence > floor.sequence
+        || package.manifest.sequence == floor.sequence && package.digest != floor.digest
+    {
+        return Err("previous native set exceeds the accepted publisher release floor".into());
+    }
+
+    let old_active = selection.active.replace(previous);
+    selection.previous = old_active;
+    selection.pending = None;
+    selection.trial = None;
+    write_json_atomically(&selection_path, &selection)
+}
+
+fn validate_revision(revision: &str) -> PackageResult<()> {
+    if canonical_digest(revision) {
+        Ok(())
+    } else {
+        Err("invalid native selection revision".into())
+    }
+}
+
+fn read_selection_with_revision(root: &Path) -> PackageResult<(ActivationState, String)> {
+    let path = root.join("selection.json");
+    if !path.try_exists().map_err(|error| error.to_string())? {
+        return Ok((ActivationState::default(), sha256(&[])));
+    }
+    let bytes = read_bounded(&path, 1024 * 1024)?;
+    let selection = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    Ok((selection, sha256(&bytes)))
+}
+
+fn snapshot(selection: &ActivationState, revision: String) -> NativeSelectionSnapshot {
+    NativeSelectionSnapshot {
+        revision,
+        active: selection.active.clone(),
+        previous: selection.previous.clone(),
+        pending: selection.pending.clone(),
+        trial: selection.trial.clone(),
+        highest_sequence: selection.highest_sequence,
+    }
 }
 
 const MAX_CATALOG_BYTES: u64 = 256 * 1024;
