@@ -2122,18 +2122,46 @@ test("focused future-stream audio save sends only audio fields and confirms read
     configured_audio_sink: "monitor.source.id",
     effective_audio_sink: "monitor.source.id",
   };
+  const updated = {
+    ...saved,
+    hostname: "Provider hostname one",
+    address_family: "both",
+    bind_address: "127.0.0.1",
+    http_addresses: ["127.0.0.1"],
+    https_addresses: null,
+    rtsp_addresses: ["127.0.0.1"],
+    active_http_port: null,
+    active_https_port: null,
+    active_rtsp_port: null,
+    listener_error: "listener apply pending",
+    rtsp_listener_error: "RTSP listener apply pending",
+  };
+  const readback = {
+    ...saved,
+    hostname: "Provider hostname two",
+    address_family: "ipv4",
+    bind_address: "0.0.0.0",
+    http_addresses: ["0.0.0.0"],
+    https_addresses: ["0.0.0.0"],
+    rtsp_addresses: ["0.0.0.0"],
+    active_http_port: 47989,
+    active_https_port: 47984,
+    active_rtsp_port: 47989,
+    listener_error: null,
+    rtsp_listener_error: null,
+  };
   const calls = [];
   const api = { async post(route, body = {}) {
     calls.push([route, ordinary(body)]);
-    if (route === "nvhttp/settings_update") return saved;
+    if (route === "nvhttp/settings_update") return updated;
     assert.equal(route, "nvhttp/settings");
-    return saved;
+    return readback;
   } };
   const result = await context.Amaterasu.saveNvhttpAudioSettings(
     api, current, true, "monitor.source.id",
   );
 
-  assert.deepEqual(ordinary(result), saved);
+  assert.deepEqual(ordinary(result), readback);
   assert.deepEqual(calls, [
     ["nvhttp/settings_update", {
       hostname: current.configured_hostname,
@@ -2146,7 +2174,7 @@ test("focused future-stream audio save sends only audio fields and confirms read
   ]);
 });
 
-test("focused audio save rejects changes to unrelated host, security, and listener fields", async () => {
+test("focused audio save rejects changes to persisted host and security fields", async () => {
   const current = nvhttpHostSettings();
   const expectedAudio = {
     ...current,
@@ -2158,8 +2186,6 @@ test("focused audio save rejects changes to unrelated host, security, and listen
     { configured_hostname: "Changed host" },
     { configured_max_bitrate: 12000 },
     { lan_encryption_mode: 2 },
-    { active_http_port: null },
-    { listener_error: "unexpected listener change" },
   ];
   for (const changedFields of unrelatedChanges) {
     const routes = [];
@@ -2171,7 +2197,7 @@ test("focused audio save rejects changes to unrelated host, security, and listen
       return route === "nvhttp/settings_update"
         ? { ...expectedAudio, ...changedFields }
         : expectedAudio;
-    } }, current, true, "monitor.source.id"), /unrelated host settings changing/);
+    } }, current, true, "monitor.source.id"), /persisted host settings changing/);
     assert.deepEqual(routes.map(([route]) => route), ["nvhttp/settings_update"]);
   }
 
@@ -2181,7 +2207,7 @@ test("focused audio save rejects changes to unrelated host, security, and listen
     return route === "nvhttp/settings_update"
       ? expectedAudio
       : { ...expectedAudio, wan_encryption_mode: 0, active_rtsp_port: null };
-  } }, current, true, "monitor.source.id"), /after saving without unrelated host settings changing/);
+  } }, current, true, "monitor.source.id"), /after saving without persisted host settings changing/);
   assert.deepEqual(routes, ["nvhttp/settings_update", "nvhttp/settings"]);
 });
 
