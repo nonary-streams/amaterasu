@@ -71,7 +71,7 @@ active stream. Global accepted counters may include a sink that finished
 concurrently with a close.
 
 The private C adapter owns GDBus/PipeWire structs and worker cleanup. Selection
-uses CreateSession, SelectSources (one monitor/window, hidden cursor) and Start,
+uses CreateSession, SelectSources (one monitor/window, embedded cursor) and Start,
 then opens only the restricted OpenPipeWireRemote FD. Portal
 v6 serial targeting is used when supplied; earlier portals target their returned
 node while the session is alive. One worker iterates its private GLib context and

@@ -92,7 +92,7 @@ int am_pw_probe(struct am_pw_probe *output) {
         g_variant_lookup(properties, "version", "u", &output->version);
         g_variant_lookup(properties, "AvailableSourceTypes", "u", &output->source_types);
         g_variant_lookup(properties, "AvailableCursorModes", "u", &output->cursor_modes);
-        output->available = output->version >= 2 && (output->source_types & 3) != 0 && (output->cursor_modes & 1) != 0;
+        output->available = output->version >= 2 && (output->source_types & 3) != 0 && (output->cursor_modes & 2) != 0;
         g_variant_unref(properties);
         g_variant_unref(reply);
     }
@@ -217,7 +217,8 @@ static gboolean select_portal_source(struct am_pw_session *session, gint64 deadl
     g_variant_builder_add(&builder, "{sv}", "handle_token", g_variant_new_string(select_token));
     g_variant_builder_add(&builder, "{sv}", "types", g_variant_new_uint32(session->source_type));
     g_variant_builder_add(&builder, "{sv}", "multiple", g_variant_new_boolean(FALSE));
-    g_variant_builder_add(&builder, "{sv}", "cursor_mode", g_variant_new_uint32(1));
+    /* Embed the compositor cursor: this CPU provider has no cursor-metadata plane. */
+    g_variant_builder_add(&builder, "{sv}", "cursor_mode", g_variant_new_uint32(2));
     if (session->persist) {
         g_variant_builder_add(&builder, "{sv}", "persist_mode", g_variant_new_uint32(2));
         if (session->restore_token)
@@ -420,7 +421,8 @@ static gboolean connect_pipewire(struct am_pw_session *session) {
         SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
         SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
         SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(3, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRx),
-        SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(&SPA_RECTANGLE(1920, 1080), &SPA_RECTANGLE(1, 1), &SPA_RECTANGLE(8192, 8192)),
+        /* Preserve the compositor's advertised source size. The video module
+         * fits the complete image to the client's requested stream dimensions. */
         SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(30, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(240, 1)));
     gboolean connected = pw_stream_connect(session->stream, PW_DIRECTION_INPUT,
         serial_value ? PW_ID_ANY : atomic_load(&session->node),
