@@ -107,22 +107,23 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
     )?;
     optional_boolean(query, "localAudioPlayMode")?;
     optional_boolean(query, "continuousAudio")?;
-    // Moonlight sends this controller capability mask even when no PS pad is attached.
-    // Amaterasu currently ignores it, but accepts only the 16-bit client mask domain.
-    optional_decimal_mask(query, "psmap", u16::MAX as u32)?;
+    // Slot hints are independent from permission to inject native input. Moonlight
+    // reports player one in single-controller mode even without an attached pad.
+    for field in ["remoteControllersBitmap", "gcmap", "gcpmap", "psmap"] {
+        optional_decimal_mask(query, field, u16::MAX as u32)?;
+    }
+    optional_boolean(query, "gcpersist")?;
     // This is only a client pacing capability hint; accepting it does not enable host VRR.
     optional_boolean(query, "clientVrrRequested")?;
-    for field in ["remoteControllersBitmap", "gcmap", "gcpmap", "gcpersist"] {
-        require_optional_value(query, field, "0", "controller forwarding is unsupported")?;
-    }
     require_optional_value(query, "corever", "1", "unsupported Moonlight core version")
 }
 
 fn surround_audio_channels(value: Option<&str>) -> Result<u32, &'static str> {
     match value {
         None | Some("196610") => Ok(2),
-        Some("393222") => Ok(6),
-        Some("524296") => Ok(8),
+        // Moonlight encodes channel_mask << 16 | channel_count.
+        Some("4128774") => Ok(6),
+        Some("104792072") => Ok(8),
         Some(_) => Err("unsupported surround audio configuration"),
     }
 }
@@ -330,10 +331,10 @@ mod tests {
             "sops=2",
             "surroundAudioInfo=393223",
             "localAudioPlayMode=2",
-            "remoteControllersBitmap=1",
-            "gcmap=1",
-            "gcpmap=1",
-            "gcpersist=1",
+            "remoteControllersBitmap=65536",
+            "gcmap=-1",
+            "gcpmap=65536",
+            "gcpersist=2",
             "corever=2",
             "additionalStates=2",
         ] {
@@ -364,7 +365,9 @@ mod tests {
     fn surround_audio_info_accepts_only_exact_supported_client_layouts() {
         let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
         assert_eq!(parse(base).unwrap().audio_channels, 2);
-        for (value, channels) in [("196610", 2), ("393222", 6), ("524296", 8)] {
+        // AUDIO_CONFIGURATION_* masks and channel counts in Moonlight's Limelight.h.
+        for (mask, channels) in [(0x3_u32, 2), (0x3F, 6), (0x63F, 8)] {
+            let value = (mask << 16) | channels;
             assert_eq!(
                 parse(&format!("{base}&surroundAudioInfo={value}"))
                     .unwrap()
@@ -372,7 +375,9 @@ mod tests {
                 channels
             );
         }
-        for value in ["", "0", "6", "393223", "524294", "+393222", "393222 "] {
+        for value in [
+            "", "0", "6", "393222", "524296", "393223", "524294", "+4128774", "4128774 ",
+        ] {
             assert!(
                 parse(&format!("{base}&surroundAudioInfo={value}")).is_err(),
                 "accepted {value:?}"
@@ -404,19 +409,27 @@ mod tests {
     }
 
     #[test]
-    fn accepts_bounded_playstation_controller_masks_without_claiming_support() {
+    fn accepts_bounded_controller_slot_hints_without_authorizing_input() {
         let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
-        for value in ["0", "1", "65535"] {
-            assert!(
-                parse(&format!("{base}&psmap={value}")).is_ok(),
-                "rejected {value}"
-            );
+        for field in ["remoteControllersBitmap", "gcmap", "gcpmap", "psmap"] {
+            for value in ["0", "1", "65535"] {
+                assert!(
+                    parse(&format!("{base}&{field}={value}")).is_ok(),
+                    "rejected {value}"
+                );
+            }
+            for value in ["65536", "-1", "+1", "1.0", " 1", "1 ", ""] {
+                assert!(
+                    parse(&format!("{base}&{field}={value}")).is_err(),
+                    "accepted {value:?}"
+                );
+            }
         }
-        for value in ["65536", "-1", "+1", "1.0", " 1", "1 ", ""] {
-            assert!(
-                parse(&format!("{base}&psmap={value}")).is_err(),
-                "accepted {value:?}"
-            );
+        for value in ["0", "1"] {
+            assert!(parse(&format!("{base}&gcpersist={value}")).is_ok());
+        }
+        for value in ["2", "-1", "", "true"] {
+            assert!(parse(&format!("{base}&gcpersist={value}")).is_err());
         }
     }
 

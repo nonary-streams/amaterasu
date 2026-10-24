@@ -397,17 +397,21 @@ representation, preserving the bit pattern.
 
 The bounded normal metadata allowlist is `uniqueid`, `uuid`, `additionalStates`,
 `clientName`, `sops`, the `clientHdrCap*` fields, `hdrMode`, `localAudioPlayMode`,
-`surroundAudioInfo`, `remoteControllersBitmap`, `gcmap`, `gcpersist`, and
-`corever`. Unknown fields are rejected, including executable, path, arguments,
+`surroundAudioInfo`, `remoteControllersBitmap`, `gcmap`, `gcpmap`, `psmap`,
+`gcpersist`, `clientVrrRequested`, `continuousAudio`, and `corever`.
+Unknown fields are rejected, including executable, path, arguments,
 environment, or catalog-owner overrides. The current profile accepts SDR,
-stereo remote playback, core version 1, and `sops=0`. `localAudioPlayMode` accepts
+negotiated stereo or surround playback, core version 1, and Boolean `sops` hints.
+`surroundAudioInfo` uses Moonlight's `channel_mask << 16 | channel_count` encoding:
+196610 for stereo, 4128774 for 5.1, and 104792072 for 7.1. Controller slot masks
+are bounded to 16 bits; `gcpersist` is Boolean. These hints do not grant native
+input access or override the configured controller lifecycle. `localAudioPlayMode` accepts
 only `0` or `1` and defaults to `0`; it snapshots whether audio capture should
 prefer host audio, with the Windows audio module applying its Steam-sink fallback
-when host audio is disabled or the ordinary sink is unavailable. HDR, surround
-audio, display optimization, and controller forwarding requests fail before the
-application service is called. `additionalStates` is accepted only as a decimal
-Boolean. These gates prevent successful XML from implying unsupported
-media or input behavior.
+when host audio is disabled or the ordinary sink is unavailable. HDR remains
+unsupported, and SOPS/VRR hints do not apply display or game settings. Actual
+surround capture and encoding still require the selected provider's support.
+`additionalStates` is accepted only as a decimal Boolean.
 
 The lifecycle calls the launch service's exported-app API with only the immutable
 numeric catalog ID and a private operation ID. Catalog policy resolves the trusted
