@@ -1538,6 +1538,8 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "nvenc_spatial_aq",
                     "ping_timeout_ms",
                     "global_preparation",
+                    "lan_encryption_mode",
+                    "wan_encryption_mode",
                 ],
             )?;
             let hostname = text(object, "hostname")?;
@@ -1664,6 +1666,13 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             if let Some(preparation) = object.get("global_preparation") {
                 global_preparation(preparation)?;
             }
+            for key in ["lan_encryption_mode", "wan_encryption_mode"] {
+                if object.get(key).is_some_and(|value| {
+                    !value.is_null() && !value.as_u64().is_some_and(|mode| mode <= 2)
+                }) {
+                    return Err(INVALID);
+                }
+            }
             Ok(())
         }
         _ => Err(INVALID),
@@ -1673,6 +1682,39 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
 #[cfg(test)]
 mod nvhttp_tests {
     use super::*;
+
+    #[test]
+    fn video_encryption_modes_can_be_set_through_authenticated_nvhttp_settings() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        for value in [
+            Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!(2),
+        ] {
+            let body = serde_json::json!({"hostname":"Ama","port":48050,
+                "expected_revision":1,"lan_encryption_mode":value,"wan_encryption_mode":value});
+            assert!(validate(route, body.as_object().unwrap()).is_ok(), "{body}");
+        }
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(3),
+            serde_json::json!("1"),
+            serde_json::json!(true),
+        ] {
+            let body = serde_json::json!({"hostname":"Ama","port":48050,
+                "expected_revision":1,"lan_encryption_mode":value});
+            assert!(
+                validate(route, body.as_object().unwrap()).is_err(),
+                "{body}"
+            );
+        }
+    }
 
     #[test]
     fn nvenc_spatial_aq_update_accepts_optional_nullable_booleans_only() {

@@ -33,6 +33,11 @@ const GLOBAL_RAW_PREPARATION_SETTINGS_VERSION: u64 = 17;
 const FRAME_LIMITER_SETTINGS_VERSION: u64 = 17;
 const ENCRYPTION_MODE_SETTINGS_VERSION: u64 = 17;
 const DISPLAY_POLICY_SETTINGS_VERSION: u64 = 18;
+// The Linux Desktop profile requires video encryption. Its LAN policy must
+// require the same choice on a newly initialized host.
+#[cfg(target_os = "linux")]
+const DEFAULT_LAN_ENCRYPTION_MODE: u8 = 2;
+#[cfg(not(target_os = "linux"))]
 const DEFAULT_LAN_ENCRYPTION_MODE: u8 = 0;
 const DEFAULT_WAN_ENCRYPTION_MODE: u8 = 1;
 const SETTINGS_VERSION: u64 = DISPLAY_POLICY_SETTINGS_VERSION;
@@ -3147,6 +3152,22 @@ fn failure_with_revision(code: &str, message: &str, revision: Option<u64>) -> Va
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn new_linux_host_accepts_encrypted_video_from_its_desktop_profile() {
+        use amaterasu_gamestream::network::{NetworkEncryptionPolicy, VideoEncryptionMode};
+
+        let settings = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        let policy = NetworkEncryptionPolicy {
+            lan_mode: VideoEncryptionMode::try_from(i64::from(settings.lan_encryption_mode()))
+                .unwrap(),
+            wan_mode: VideoEncryptionMode::try_from(i64::from(settings.wan_encryption_mode()))
+                .unwrap(),
+        };
+        assert!(policy.accepts_video_encryption_for_peer("192.168.0.134".parse().unwrap(), true));
+        assert!(!policy.accepts_video_encryption_for_peer("192.168.0.134".parse().unwrap(), false));
+    }
+
     fn v17_update_confirmation(mut payload: Value) -> Value {
         payload["version"] = json!(SETTINGS_VERSION);
         let values = payload["values"]
@@ -5334,8 +5355,8 @@ mod tests {
                     "display_policy_revision":3,
                 }),
                 json!({
-                    "lan_encryption_mode":0,
-                    "wan_encryption_mode":1,
+                    "lan_encryption_mode":DEFAULT_LAN_ENCRYPTION_MODE,
+                    "wan_encryption_mode":DEFAULT_WAN_ENCRYPTION_MODE,
                     "audio_sink_capture_only":false,
                     "configured_external_ip":null,
                 }),
