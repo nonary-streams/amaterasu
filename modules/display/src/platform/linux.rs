@@ -400,7 +400,7 @@ fn validated_outputs(configuration: &Value) -> DisplayResult<Vec<&Value>> {
                 "KScreen mode count exceeds the supported limit",
             ));
         }
-        for mode in modes {
+        for mode in &modes {
             safe_mode_id(string_field(mode, "id")?)?;
             let width = integer_field(mode, "size", "width")?;
             let height = integer_field(mode, "size", "height")?;

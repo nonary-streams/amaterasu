@@ -167,6 +167,7 @@ fn restore_plan_holds_on_disconnect_new_output_or_ambiguous_mode() {
         mode("alternative-b", 1920, 1080, 60.0),
         mode("1280x720@60", 1280, 720, 60.0)
     ]);
+    ambiguous["outputs"][0]["currentModeId"] = json!("alternative-a");
     assert_eq!(
         restoration_arguments(&saved, &ambiguous).unwrap_err().code,
         "topology_changed"
