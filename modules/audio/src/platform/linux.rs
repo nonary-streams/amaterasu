@@ -9,8 +9,8 @@ use crate::{
 use amaterasu_media::{AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, PCM_F32};
 use cleanup_journal::{
     CleanupJournal, CleanupState, RouteIntent, RouteRestoreAction, SinkCleanupAction, SinkIntent,
-    SinkObservation, deactivate_prior_process_sinks, route_restore_action, sink_cleanup_action,
-    sink_cleanup_requested,
+    SinkObservation, can_add_sink_intent, can_start_sink_load, deactivate_prior_process_sinks,
+    has_unquiesced_sink_load, route_restore_action, sink_cleanup_action, sink_cleanup_requested,
 };
 use std::{
     any::Any,
@@ -462,6 +462,18 @@ impl PulseClient {
     }
 
     fn default_sink(&mut self) -> AudioResult<Option<String>> {
+        let result = self.server_info()?;
+        Ok(result.default_sink)
+    }
+
+    /// Completes a server query queued after earlier commands on this context.
+    /// A successful result fences effects submitted earlier on this connection;
+    /// queries on a replacement connection are not equivalent.
+    fn quiesce_prior_commands(&mut self) -> AudioResult<()> {
+        self.server_info().map(|_| ())
+    }
+
+    fn server_info(&mut self) -> AudioResult<Box<ServerInfoResult>> {
         let mut result = Box::new(ServerInfoResult::default());
         // SAFETY: callback userdata points to heap-owned result state retained
         // until completion or until this client's mainloop has been destroyed.
@@ -476,7 +488,7 @@ impl PulseClient {
         if result.failed || !result.completed {
             return Err("audio_backend_failed");
         }
-        Ok(result.default_sink)
+        Ok(result)
     }
 
     fn sinks(&mut self) -> AudioResult<Vec<Sink>> {
@@ -902,6 +914,13 @@ pub(super) struct ManagedVirtualSink {
 
 impl ManagedVirtualSink {
     fn ensure(&self, client: &mut PulseClient) -> AudioResult<()> {
+        if read_cleanup_state()?
+            .sinks
+            .get(&self.name)
+            .is_some_and(|intent| intent.module_index.is_none() && !intent.load_quiesced)
+        {
+            return Err("audio_sink_load_pending");
+        }
         let sinks = client.sinks()?;
         if sinks.iter().any(|sink| {
             sink.endpoint.id == self.name
@@ -913,7 +932,16 @@ impl ManagedVirtualSink {
             return Err("virtual_sink_name_conflict");
         }
         persist_sink_intent(&self.name, &self.owner_token, None, false, true)?;
-        let index = client.load_null_sink(&self.name, self.channels, &self.owner_token)?;
+        let index = match client.load_null_sink(&self.name, self.channels, &self.owner_token) {
+            Ok(index) => index,
+            Err(error) => {
+                if client.quiesce_prior_commands().is_ok() {
+                    let _ = mark_sink_load_quiesced(&self.name, &self.owner_token);
+                }
+                retry_virtual_sink_cleanups_with_client(client, Some(&self.name));
+                return Err(error);
+            }
+        };
         if let Err(error) =
             persist_sink_intent(&self.name, &self.owner_token, Some(index), true, false)
         {
@@ -996,19 +1024,53 @@ fn persist_sink_intent(
     lease_active: bool,
     cleanup_requested: bool,
 ) -> AudioResult<()> {
+    let _guard = cleanup_journal_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let journal = CLEANUP_JOURNAL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let journal = journal
+        .as_ref()
+        .ok_or("audio_cleanup_journal_unavailable")?;
+    let mut state = journal.read()?;
+    if !can_add_sink_intent(&state, name) {
+        return Err("audio_cleanup_journal_capacity_reached");
+    }
+    state.sinks.insert(
+        name.to_owned(),
+        SinkIntent {
+            owner_token: owner_token.to_owned(),
+            module_index,
+            lease_active,
+            cleanup_requested,
+            load_quiesced: module_index.is_some(),
+            unload_submitted: false,
+            unload_confirmed: false,
+            unload_quiesced: false,
+        },
+    );
+    journal.write(&state)
+}
+
+fn mark_sink_load_quiesced(name: &str, owner_token: &str) -> AudioResult<()> {
+    let mut found = false;
     update_cleanup_state(|state| {
-        state.sinks.insert(
-            name.to_owned(),
-            SinkIntent {
-                owner_token: owner_token.to_owned(),
-                module_index,
-                lease_active,
-                cleanup_requested,
-                unload_submitted: false,
-                unload_confirmed: false,
-            },
-        );
-    })
+        if let Some(intent) = state
+            .sinks
+            .get_mut(name)
+            .filter(|intent| intent.owner_token == owner_token && intent.module_index.is_none())
+        {
+            found = true;
+            intent.load_quiesced = true;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
 }
 
 fn request_sink_cleanup(name: &str, owner_token: &str) -> AudioResult<()> {
@@ -1035,6 +1097,26 @@ fn mark_sink_unload_submitted(name: &str, owner_token: &str) -> AudioResult<()> 
             found = true;
             intent.unload_submitted = true;
             intent.unload_confirmed = false;
+            intent.unload_quiesced = false;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn mark_sink_unload_quiesced(name: &str, owner_token: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(intent) = state
+            .sinks
+            .get_mut(name)
+            .filter(|intent| intent.owner_token == owner_token)
+        {
+            found = true;
+            intent.unload_quiesced = true;
         }
     })?;
     if found {
@@ -1081,10 +1163,31 @@ fn persist_route_intent(target_sink: &str, original_sink: &str) -> AudioResult<(
             target_sink: target_sink.to_owned(),
             original_sink: original_sink.to_owned(),
             assignment_confirmed: false,
+            assignment_quiesced: false,
             restoration_submitted: false,
             restoration_confirmed: false,
+            restoration_quiesced: false,
         });
     })
+}
+
+fn mark_route_assignment_quiesced(target_sink: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(route) = state
+            .route
+            .as_mut()
+            .filter(|route| route.target_sink == target_sink)
+        {
+            found = true;
+            route.assignment_quiesced = true;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
 }
 
 fn confirm_route_intent(target_sink: &str) -> AudioResult<()> {
@@ -1117,6 +1220,26 @@ fn mark_route_restoration_submitted(target_sink: &str) -> AudioResult<()> {
             found = true;
             route.restoration_submitted = true;
             route.restoration_confirmed = false;
+            route.restoration_quiesced = false;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn mark_route_restoration_quiesced(target_sink: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(route) = state
+            .route
+            .as_mut()
+            .filter(|route| route.target_sink == target_sink)
+        {
+            found = true;
+            route.restoration_quiesced = true;
         }
     })?;
     if found {
@@ -1219,9 +1342,12 @@ fn retry_virtual_sink_cleanups_with_client(client: &mut PulseClient, name_filter
                     continue;
                 }
                 if client.unload_module(module_index).is_err() {
-                    continue;
-                }
-                if mark_sink_unload_confirmed(&name, &intent.owner_token).is_err() {
+                    if client.quiesce_prior_commands().is_ok() {
+                        let _ = mark_sink_unload_quiesced(&name, &intent.owner_token);
+                    } else {
+                        continue;
+                    }
+                } else if mark_sink_unload_confirmed(&name, &intent.owner_token).is_err() {
                     continue;
                 }
             }
@@ -1276,6 +1402,13 @@ fn managed_virtual_sink(
     if read_cleanup_state()?.sinks.contains_key(&name) {
         return Err("virtual_sink_cleanup_pending");
     }
+    let state = read_cleanup_state()?;
+    if !can_start_sink_load(&state, &name) {
+        if has_unquiesced_sink_load(&state) {
+            return Err("audio_sink_load_pending");
+        }
+        return Err("audio_cleanup_journal_capacity_reached");
+    }
     let registry = VIRTUAL_SINKS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut registry = registry
         .lock()
@@ -1295,6 +1428,9 @@ fn managed_virtual_sink(
     let index = match client.load_null_sink(&name, channels, &token) {
         Ok(index) => index,
         Err(error) => {
+            if client.quiesce_prior_commands().is_ok() {
+                let _ = mark_sink_load_quiesced(&name, &token);
+            }
             retry_virtual_sink_cleanups_with_client(client, Some(&name));
             return Err(error);
         }
@@ -1450,6 +1586,9 @@ fn acquire_route(
         persist_route_intent(endpoint, original_sink)?;
         record_pending_route(&mut registry, endpoint, original);
         if client.set_default_sink(endpoint).is_err() {
+            if client.quiesce_prior_commands().is_ok() {
+                let _ = mark_route_assignment_quiesced(endpoint);
+            }
             retry_route_restore(client, &mut registry);
             return Err("audio_route_failed");
         }
@@ -1526,8 +1665,10 @@ fn retry_route_restore(client: &mut PulseClient, registry: &mut RouteRegistry) {
                 target_sink: active.endpoint.clone(),
                 original_sink,
                 assignment_confirmed: active.assignment_confirmed,
+                assignment_quiesced: false,
                 restoration_submitted: false,
                 restoration_confirmed: false,
+                restoration_quiesced: false,
             }
         }
     };
@@ -1558,6 +1699,9 @@ fn reconcile_route_intent(client: &mut PulseClient, intent: &RouteIntent) -> boo
                         return false;
                     }
                     if client.set_default_sink(&intent.original_sink).is_err() {
+                        if client.quiesce_prior_commands().is_ok() {
+                            let _ = mark_route_restoration_quiesced(&intent.target_sink);
+                        }
                         return false;
                     }
                     if mark_route_restoration_confirmed(&intent.target_sink).is_err() {

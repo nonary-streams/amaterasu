@@ -17,6 +17,7 @@ use std::{
 
 const JOURNAL_VERSION: u64 = 1;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
+pub(super) const MAX_SINK_INTENTS: usize = 64;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
 unsafe extern "C" {
@@ -29,17 +30,20 @@ pub(super) struct CleanupState {
     pub(super) route: Option<RouteIntent>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct SinkIntent {
     pub(super) owner_token: String,
     pub(super) module_index: Option<u32>,
     pub(super) lease_active: bool,
     pub(super) cleanup_requested: bool,
+    /// True only after an ordered same-connection round trip fences the load.
+    pub(super) load_quiesced: bool,
     pub(super) unload_submitted: bool,
     pub(super) unload_confirmed: bool,
+    pub(super) unload_quiesced: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct RouteIntent {
     pub(super) target_sink: String,
     pub(super) original_sink: String,
@@ -47,8 +51,11 @@ pub(super) struct RouteIntent {
     /// tombstone while the current route is not our target because the server
     /// may still apply the request after the client callback has failed.
     pub(super) assignment_confirmed: bool,
+    /// True only after an ordered same-connection round trip fences assignment.
+    pub(super) assignment_quiesced: bool,
     pub(super) restoration_submitted: bool,
     pub(super) restoration_confirmed: bool,
+    pub(super) restoration_quiesced: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -185,8 +192,10 @@ fn encode_state(state: &CleanupState) -> Result<Vec<u8>, &'static str> {
                     "module_index": intent.module_index,
                     "lease_active": intent.lease_active,
                     "cleanup_requested": intent.cleanup_requested,
+                    "load_quiesced": intent.load_quiesced,
                     "unload_submitted": intent.unload_submitted,
                     "unload_confirmed": intent.unload_confirmed,
+                    "unload_quiesced": intent.unload_quiesced,
                 }),
             )
         })
@@ -196,8 +205,10 @@ fn encode_state(state: &CleanupState) -> Result<Vec<u8>, &'static str> {
             "target_sink": intent.target_sink,
             "original_sink": intent.original_sink,
             "assignment_confirmed": intent.assignment_confirmed,
+            "assignment_quiesced": intent.assignment_quiesced,
             "restoration_submitted": intent.restoration_submitted,
             "restoration_confirmed": intent.restoration_confirmed,
+            "restoration_quiesced": intent.restoration_quiesced,
         })
     });
     let value = json!({
@@ -233,7 +244,7 @@ fn decode_state(bytes: &[u8]) -> Result<CleanupState, &'static str> {
         }
         let item = value
             .as_object()
-            .filter(|object| object.len() == 6)
+            .filter(|object| object.len() == 6 || object.len() == 8)
             .ok_or("audio_cleanup_journal_corrupt")?;
         let owner_token = item
             .get("owner_token")
@@ -263,10 +274,12 @@ fn decode_state(bytes: &[u8]) -> Result<CleanupState, &'static str> {
             .get("cleanup_requested")
             .and_then(Value::as_bool)
             .ok_or("audio_cleanup_journal_corrupt")?;
+        let load_quiesced = optional_bool(item, "load_quiesced")?;
         let unload_confirmed = item
             .get("unload_confirmed")
             .and_then(Value::as_bool)
             .ok_or("audio_cleanup_journal_corrupt")?;
+        let unload_quiesced = optional_bool(item, "unload_quiesced")?;
         sinks.insert(
             name.clone(),
             SinkIntent {
@@ -274,8 +287,10 @@ fn decode_state(bytes: &[u8]) -> Result<CleanupState, &'static str> {
                 module_index,
                 lease_active,
                 cleanup_requested,
+                load_quiesced,
                 unload_submitted,
                 unload_confirmed,
+                unload_quiesced,
             },
         );
     }
@@ -284,7 +299,7 @@ fn decode_state(bytes: &[u8]) -> Result<CleanupState, &'static str> {
         Some(value) => {
             let item = value
                 .as_object()
-                .filter(|object| object.len() == 5)
+                .filter(|object| object.len() == 5 || object.len() == 7)
                 .ok_or("audio_cleanup_journal_corrupt")?;
             let target_sink = required_string(item, "target_sink")?;
             let original_sink = required_string(item, "original_sink")?;
@@ -296,16 +311,20 @@ fn decode_state(bytes: &[u8]) -> Result<CleanupState, &'static str> {
                 .get("restoration_submitted")
                 .and_then(Value::as_bool)
                 .ok_or("audio_cleanup_journal_corrupt")?;
+            let assignment_quiesced = optional_bool(item, "assignment_quiesced")?;
             let restoration_confirmed = item
                 .get("restoration_confirmed")
                 .and_then(Value::as_bool)
                 .ok_or("audio_cleanup_journal_corrupt")?;
+            let restoration_quiesced = optional_bool(item, "restoration_quiesced")?;
             Some(RouteIntent {
                 target_sink,
                 original_sink,
                 assignment_confirmed,
+                assignment_quiesced,
                 restoration_submitted,
                 restoration_confirmed,
+                restoration_quiesced,
             })
         }
         None => return Err("audio_cleanup_journal_corrupt"),
@@ -320,6 +339,14 @@ fn required_string(object: &Map<String, Value>, key: &str) -> Result<String, &'s
         .filter(|value| !value.is_empty() && value.len() <= 4096)
         .map(str::to_owned)
         .ok_or("audio_cleanup_journal_corrupt")
+}
+
+fn optional_bool(object: &Map<String, Value>, key: &str) -> Result<bool, &'static str> {
+    match object.get(key) {
+        Some(Value::Bool(value)) => Ok(*value),
+        None => Ok(false),
+        _ => Err("audio_cleanup_journal_corrupt"),
+    }
 }
 
 #[cfg(test)]
@@ -369,8 +396,7 @@ mod tests {
                 module_index: None,
                 lease_active: false,
                 cleanup_requested: true,
-                unload_submitted: false,
-                unload_confirmed: false,
+                ..SinkIntent::default()
             },
         );
         journal.write(&state).unwrap();
@@ -379,6 +405,54 @@ mod tests {
         let restarted = CleanupJournal::open(&root).unwrap();
         assert_eq!(restarted.read().unwrap(), state);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sink_tombstone_retires_only_after_same_connection_fence_and_capacity_is_bounded() {
+        let mut intent = SinkIntent {
+            owner_token: "delayed-load".into(),
+            module_index: None,
+            cleanup_requested: true,
+            ..SinkIntent::default()
+        };
+        // An immediate absent query may precede server-side execution.
+        assert_eq!(
+            sink_cleanup_action(&intent, SinkObservation::Absent),
+            SinkCleanupAction::KeepTombstone
+        );
+        intent.load_quiesced = true;
+        assert_eq!(
+            sink_cleanup_action(&intent, SinkObservation::Absent),
+            SinkCleanupAction::ClearConfirmedAbsent
+        );
+
+        let mut unresolved = CleanupState::default();
+        unresolved.sinks.insert(
+            "indeterminate-attempt".into(),
+            SinkIntent {
+                module_index: None,
+                cleanup_requested: true,
+                load_quiesced: false,
+                ..intent.clone()
+            },
+        );
+        assert!(has_unquiesced_sink_load(&unresolved));
+        assert!(!can_start_sink_load(&unresolved, "another-load"));
+
+        let mut full = CleanupState::default();
+        for index in 0..MAX_SINK_INTENTS {
+            full.sinks.insert(
+                format!("amaterasu_stream_{index}"),
+                SinkIntent {
+                    owner_token: format!("owner-{index}"),
+                    ..SinkIntent::default()
+                },
+            );
+        }
+        assert!(!can_add_sink_intent(&full, "one-more"));
+        assert!(can_add_sink_intent(&full, "amaterasu_stream_0"));
+        full.sinks.remove("amaterasu_stream_0");
+        assert!(can_add_sink_intent(&full, "one-more"));
     }
 
     #[test]
@@ -395,6 +469,7 @@ mod tests {
                 cleanup_requested: true,
                 unload_submitted: true,
                 unload_confirmed: false,
+                ..SinkIntent::default()
             },
         );
         state.route = Some(RouteIntent {
@@ -403,6 +478,7 @@ mod tests {
             assignment_confirmed: false,
             restoration_submitted: false,
             restoration_confirmed: false,
+            ..RouteIntent::default()
         });
         // A disconnected server makes the bounded shutdown pass a no-op; the
         // on-disk intent is the handoff to the next module start.
@@ -431,8 +507,7 @@ mod tests {
             module_index: None,
             lease_active: false,
             cleanup_requested: true,
-            unload_submitted: false,
-            unload_confirmed: false,
+            ..SinkIntent::default()
         };
         assert!(sink_matches_intent("our-operation", &intent, 17));
         assert!(!sink_matches_intent(
@@ -449,8 +524,7 @@ mod tests {
             module_index: Some(31),
             lease_active: true,
             cleanup_requested: false,
-            unload_submitted: false,
-            unload_confirmed: false,
+            ..SinkIntent::default()
         };
         assert!(!sink_cleanup_requested(&active));
 
@@ -472,8 +546,7 @@ mod tests {
                 module_index: Some(3),
                 lease_active: true,
                 cleanup_requested: false,
-                unload_submitted: false,
-                unload_confirmed: false,
+                ..SinkIntent::default()
             },
         );
         deactivate_prior_process_sinks(&mut state);
@@ -489,8 +562,7 @@ mod tests {
             module_index: None,
             lease_active: false,
             cleanup_requested: true,
-            unload_submitted: false,
-            unload_confirmed: false,
+            ..SinkIntent::default()
         };
         assert_eq!(
             sink_cleanup_action(&intent, SinkObservation::Absent),
@@ -525,8 +597,8 @@ mod tests {
             module_index: Some(71),
             lease_active: false,
             cleanup_requested: true,
-            unload_submitted: false,
-            unload_confirmed: false,
+            load_quiesced: true,
+            ..SinkIntent::default()
         };
         assert_eq!(
             sink_cleanup_action(&intent, SinkObservation::Absent),
@@ -562,6 +634,15 @@ mod tests {
             sink_cleanup_action(&confirmed_unload, SinkObservation::Absent),
             SinkCleanupAction::ClearConfirmedAbsent
         );
+        let fenced_unload = SinkIntent {
+            unload_confirmed: false,
+            unload_quiesced: true,
+            ..confirmed_unload
+        };
+        assert_eq!(
+            sink_cleanup_action(&fenced_unload, SinkObservation::Absent),
+            SinkCleanupAction::ClearConfirmedAbsent
+        );
     }
 
     #[test]
@@ -572,6 +653,7 @@ mod tests {
             assignment_confirmed: true,
             restoration_submitted: false,
             restoration_confirmed: false,
+            ..RouteIntent::default()
         };
         assert_eq!(
             route_restore_action(&route, Some("amaterasu-stream")),
@@ -583,7 +665,15 @@ mod tests {
         };
         assert_eq!(
             route_restore_action(&indeterminate_on_target, Some("amaterasu-stream")),
-            RouteRestoreAction::RestoreOriginal
+            RouteRestoreAction::KeepTombstone
+        );
+        let assignment_fenced_on_target = RouteIntent {
+            assignment_quiesced: true,
+            ..indeterminate_on_target.clone()
+        };
+        assert_eq!(
+            route_restore_action(&assignment_fenced_on_target, Some("amaterasu-stream")),
+            RouteRestoreAction::KeepTombstone
         );
         assert_eq!(
             route_restore_action(&route, Some("new-user-choice")),
@@ -599,6 +689,18 @@ mod tests {
             route_restore_action(&indeterminate, Some("new-user-choice")),
             RouteRestoreAction::KeepTombstone
         );
+        let assignment_fenced_without_apply = RouteIntent {
+            assignment_quiesced: true,
+            ..indeterminate
+        };
+        assert_eq!(
+            route_restore_action(&assignment_fenced_without_apply, Some("user-default")),
+            RouteRestoreAction::Release
+        );
+        assert_eq!(
+            route_restore_action(&assignment_fenced_without_apply, Some("new-user-choice")),
+            RouteRestoreAction::Release
+        );
         let uncertain_restore = RouteIntent {
             restoration_submitted: true,
             restoration_confirmed: false,
@@ -607,6 +709,14 @@ mod tests {
         assert_eq!(
             route_restore_action(&uncertain_restore, Some("new-user-choice")),
             RouteRestoreAction::KeepTombstone
+        );
+        let restoration_fenced = RouteIntent {
+            restoration_quiesced: true,
+            ..uncertain_restore.clone()
+        };
+        assert_eq!(
+            route_restore_action(&restoration_fenced, Some("new-user-choice")),
+            RouteRestoreAction::Release
         );
     }
 }
@@ -636,6 +746,21 @@ pub(super) enum SinkCleanupAction {
     Unload(u32),
 }
 
+pub(super) fn can_add_sink_intent(state: &CleanupState, name: &str) -> bool {
+    state.sinks.contains_key(name) || state.sinks.len() < MAX_SINK_INTENTS
+}
+
+pub(super) fn has_unquiesced_sink_load(state: &CleanupState) -> bool {
+    state
+        .sinks
+        .values()
+        .any(|intent| intent.module_index.is_none() && !intent.load_quiesced)
+}
+
+pub(super) fn can_start_sink_load(state: &CleanupState, name: &str) -> bool {
+    can_add_sink_intent(state, name) && !has_unquiesced_sink_load(state)
+}
+
 pub(super) fn route_restore_action(
     intent: &RouteIntent,
     current_default: Option<&str>,
@@ -643,15 +768,40 @@ pub(super) fn route_restore_action(
     if intent.target_sink == intent.original_sink {
         return RouteRestoreAction::Release;
     }
+    if !intent.assignment_confirmed {
+        return match current_default {
+            None => RouteRestoreAction::Wait,
+            Some(current) if intent.assignment_quiesced && current != intent.target_sink => {
+                RouteRestoreAction::Release
+            }
+            // A timed-out assignment that is quiesced but currently points at
+            // the target is ambiguous: the user may have selected that target.
+            // Never restore the original route without a successful callback.
+            Some(_) => RouteRestoreAction::KeepTombstone,
+        };
+    }
     match current_default {
         None => RouteRestoreAction::Wait,
-        Some(current) if current == intent.original_sink && intent.restoration_submitted => {
+        Some(_)
+            if intent.restoration_submitted
+                && !intent.restoration_confirmed
+                && !intent.restoration_quiesced =>
+        {
+            RouteRestoreAction::KeepTombstone
+        }
+        Some(current)
+            if current == intent.original_sink
+                && intent.restoration_submitted
+                && (intent.restoration_confirmed || intent.restoration_quiesced) =>
+        {
             RouteRestoreAction::Release
         }
         Some(current) if current == intent.target_sink => RouteRestoreAction::RestoreOriginal,
         Some(_)
-            if intent.assignment_confirmed
-                && (!intent.restoration_submitted || intent.restoration_confirmed) =>
+            if (intent.assignment_confirmed || intent.assignment_quiesced)
+                && (!intent.restoration_submitted
+                    || intent.restoration_confirmed
+                    || intent.restoration_quiesced) =>
         {
             RouteRestoreAction::Release
         }
@@ -671,8 +821,13 @@ pub(super) fn sink_cleanup_action(
     match observation {
         SinkObservation::Absent
             if intent.module_index.is_some()
-                && (!intent.unload_submitted || intent.unload_confirmed) =>
+                && (!intent.unload_submitted
+                    || intent.unload_confirmed
+                    || intent.unload_quiesced) =>
         {
+            SinkCleanupAction::ClearConfirmedAbsent
+        }
+        SinkObservation::Absent if intent.module_index.is_none() && intent.load_quiesced => {
             SinkCleanupAction::ClearConfirmedAbsent
         }
         SinkObservation::Absent | SinkObservation::Foreign => SinkCleanupAction::KeepTombstone,
