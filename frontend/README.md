@@ -73,6 +73,11 @@ browser API calls.
 - Process inventory and termination with confirmation, plus explicit status refresh.
 - Steam provider refresh, discovery pages, partial-scan warnings, and scan status.
 - Diagnostic records, bounded journal pagination, retention warnings, and counters.
+- Modules & UI reads verified publisher catalogs with `configuration.read`, separating
+  approved, revoked, and currently available choices. The fixed management API does
+  not expose repository mutations or selected/pending package state, so approval,
+  refresh, installation, staging, activation, and recovery remain explicit CLI
+  workflows; the page shows the host recovery/status commands without invoking them.
 - Host logging settings confirm the saved revision and separately read signed
   diagnostics status. The editor distinguishes pending application from healthy,
   disabled, and failed disk delivery; older status replies leave delivery unverified.

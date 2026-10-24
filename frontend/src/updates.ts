@@ -15,6 +15,39 @@ namespace Amaterasu {
     candidates: RepositoryChoice[];
   }
 
+  export interface RepositoryStateSummary {
+    approved: number;
+    revoked: number;
+    verifiedCandidates: number;
+    uiCandidates: number;
+    nativeSetCandidates: number;
+    repositories: { id: string; status: string; candidates: number }[];
+  }
+
+  export function summarizeRepositoryState(
+    repositories: ApprovedRepositoryView[],
+  ): RepositoryStateSummary {
+    const approved = repositories.filter((repository) => !repository.revoked);
+    const revoked = repositories.filter((repository) => repository.revoked);
+    const candidates = approved.flatMap((repository) => repository.candidates);
+    return {
+      approved: approved.length,
+      revoked: revoked.length,
+      verifiedCandidates: candidates.length,
+      uiCandidates: candidates.filter((candidate) => candidate.kind === "web_bundle").length,
+      nativeSetCandidates: candidates.filter((candidate) => candidate.kind === "native_set").length,
+      repositories: repositories.map((repository) => ({
+        id: repository.id,
+        status: repository.revoked
+          ? "Revoked"
+          : repository.candidates.length
+            ? "Verified catalog choices available for this host"
+            : "Approved; no verified choices currently available for this host",
+        candidates: repository.revoked ? 0 : repository.candidates.length,
+      })),
+    };
+  }
+
   export function parseRepositoryList(value: unknown): ApprovedRepositoryView[] {
     if (!value || typeof value !== "object" || Array.isArray(value))
       throw new Error("Repository response is invalid.");
@@ -62,16 +95,31 @@ namespace Amaterasu {
 
   export function renderUpdates(context: PageContext): void {
     const area = el("div");
+    const statusArea = el("div");
+    let loadRequest = 0;
     context.content.append(
       sectionHeading("Modules & UI", "Choose verified implementations from approved publishers.", button("Refresh", load)),
       el("div", "notice",
         el("strong", "", "Publisher authority is broad"),
         el("p", "", "Approving a publisher allows it to supply any native module slot, including management, and the UI. Native modules share their worker's user privileges, while a replacement UI runs in the signed-in browser session and can use its API authority. Approval does not grant elevation. A signature proves source, not safe behavior."),
       ),
+      panel("Read-only repository status", statusArea,
+        el("p", "muted", "The authenticated API exposes repository listing only. It does not report the selected or pending UI/native package, and it has no approve, revoke, refresh, download, stage, install, activate, or restore actions. This page will not run shell commands.")),
       area,
     );
 
     async function load(): Promise<void> {
+      const request = ++loadRequest;
+      if (!context.api.allows("configuration.read")) {
+        statusArea.replaceChildren(empty(
+          "Repository status unavailable",
+          "This session needs configuration.read to inspect approved publishers and their verified catalog choices.",
+        ));
+        area.replaceChildren();
+        return;
+      }
+      statusArea.replaceChildren(el("p", "muted", "Loading verified repository status…"));
+      area.replaceChildren(el("p", "muted", "Loading verified repository choices…"));
       try {
         const byId = new Map<string, ApprovedRepositoryView>();
         let offset = 0;
@@ -89,11 +137,41 @@ namespace Amaterasu {
           if (page.nextOffset <= offset) throw new Error("Repository pagination did not advance.");
           offset = page.nextOffset;
         }
-        if (!area.isConnected) return;
-        renderChoices([...byId.values()]);
+        if (!area.isConnected || request !== loadRequest) return;
+        const repositories = [...byId.values()];
+        renderStatus(repositories);
+        renderChoices(repositories);
       } catch (error) {
-        if (area.isConnected) area.replaceChildren(errorPanel(error, load));
+        if (statusArea.isConnected && request === loadRequest) {
+          statusArea.replaceChildren(errorPanel(error, load));
+          area.replaceChildren();
+        }
       }
+    }
+
+    function renderStatus(repositories: ApprovedRepositoryView[]): void {
+      const summary = summarizeRepositoryState(repositories);
+      statusArea.replaceChildren(
+        el("div", "section-meta",
+          badge(`${summary.approved} approved`, summary.approved ? "good" : ""),
+          badge(`${summary.revoked} revoked`),
+          badge(`${summary.verifiedCandidates} verified choices`),
+          el("span", "muted", `${summary.uiCandidates} UI bundles · ${summary.nativeSetCandidates} native sets for this host`),
+        ),
+        summary.repositories.length
+          ? table(
+              ["Publisher ID", "Read-only status", "Verified choices"],
+              summary.repositories.map((repository) => [
+                repository.id,
+                repository.status,
+                String(repository.candidates),
+              ]),
+            )
+          : empty(
+              "No approved repositories",
+              "To add a publisher, use the explicit development release CLI after independently confirming its public-key fingerprint.",
+            ),
+      );
     }
 
     function renderChoices(repositories: ApprovedRepositoryView[]): void {
@@ -124,7 +202,11 @@ namespace Amaterasu {
         const repository = selectedRepository();
         const choice = selectedChoice();
         if (!repository || !choice) {
-          details.replaceChildren(el("p", "muted", "No verified choice is available for this slot."));
+          details.replaceChildren(el("p", "muted", repository
+            ? "No verified choice is available for this slot in the current host catalog. The repository may not have a current catalog, or its catalog may contain no choices for this host target."
+            : active.length
+              ? "Choose a publisher with a verified catalog candidate."
+              : "No active approved publisher is available. Add or refresh one with the development release CLI."));
           return;
         }
         const command = choice.kind === "web_bundle"
@@ -162,6 +244,11 @@ namespace Amaterasu {
       slotSelect.addEventListener("change", fillImplementations);
       implementationSelect.addEventListener("change", showChoice);
       fillSlots();
+      if (!active.length) {
+        repositorySelect.disabled = true;
+        slotSelect.disabled = true;
+        implementationSelect.disabled = true;
+      }
       area.replaceChildren(
         panel("Approve a publisher",
           el("p", "", "On this development host, use repository-approve with the publisher's public key and a SHA-256 fingerprint confirmed through an independent channel. The repository URL alone cannot establish key identity."),
@@ -169,7 +256,9 @@ namespace Amaterasu {
           el("p", "", "Then run repository-refresh ROOT ID to retrieve the signed catalog. Key rotation uses a new publisher ID; revoke the old ID explicitly."),
         ),
         choices,
-        panel("Recovery", el("p", "", "The host shell can restore retained verified UI or native sets without loading the selected management module. Use `amaterasu web-recover ROOT DIGEST` or `amaterasu native-recover ROOT [DIGEST]`. Release floors remain intact. The management /recovery page also covers UI failures while management is healthy.")),
+        panel("Recovery and selected-package inspection",
+          el("p", "", "The management-owned /recovery page remains available when this UI bundle fails. For the host-owned read-only status and recovery path, use `amaterasu web-recovery-status ROOT`, then `amaterasu web-recover ROOT DIGEST` for a retained verified UI. `amaterasu native-recover ROOT [DIGEST]` restores a retained native set without loading it."),
+          el("p", "muted", "The repository listing cannot show active, previous, pending, or trial selection state. The current endpoint is `POST /v1/repositories/list` (`configuration.read`). `web-recovery-status` inspects UI selection; `web-recover` and `native-recover` restore retained verified sets. There is no management API for native selection status. Release floors stay intact.")),
       );
     }
     void load();
