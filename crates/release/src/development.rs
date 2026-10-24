@@ -11,6 +11,7 @@ use amaterasu_storage::write_atomically;
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::c_void;
 
 use crate::profiles::linux_session::{
     apply_management_bind, linux_session_policy, options::LinuxSessionOptions,
@@ -30,6 +31,7 @@ const PROVISION_JOURNAL: &str = ".installer-provision.json";
 const POLICY_TRANSITION_JOURNAL: &str = ".installer-policy-transition.json";
 const POLICY_TRANSITION_BACKUPS: &str = "installer-policy-backups";
 const MAX_TRANSITION_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const X264_BUILD_MARKER: &[u8] = b"AMATERASU_X264_BUILD=";
 const TLS_BIND_ENV: &str = "AMATERASU_MANAGEMENT_TLS_BIND";
 const TLS_CERT_ENV: &str = "AMATERASU_MANAGEMENT_TLS_CERTIFICATE_PATH";
 const TLS_KEY_ENV: &str = "AMATERASU_MANAGEMENT_TLS_PRIVATE_KEY_PATH";
@@ -2118,6 +2120,90 @@ mod provision_tests {
         assert_eq!(sets, 1);
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn linux_x264_preflight_rejects_encoder_without_compiled_feature() {
+        assert!(
+            validate_linux_x264_inputs(b"feature-disabled encoder", |_| true)
+                .unwrap_err()
+                .contains("lacks an embedded software-x264 ABI marker")
+        );
+    }
+
+    #[test]
+    fn linux_x264_preflight_rejects_missing_or_incompatible_system_runtime() {
+        let error = validate_linux_x264_inputs(b"AMATERASU_X264_BUILD=164\0", |build| {
+            assert_eq!(build, 164);
+            false
+        })
+        .unwrap_err();
+        assert!(error.contains("required system x264 runtime for build 164"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_desktop_x264_preflight_fails_before_package_directory_is_created() {
+        let root = fixture("linux-x264-preflight");
+        let artifacts = root.join("artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"software-x264 feature absent",
+        )
+        .unwrap();
+        let output = root.join("package");
+        let signing_key = SigningKey::from_bytes(&[19; 32]);
+
+        let error = build_signed_package(
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSession,
+            &signing_key,
+            DEVELOPMENT_KEY_ID,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("lacks an embedded software-x264 ABI marker"));
+        assert!(
+            !output.exists(),
+            "failed preflight must not stage a package"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_x264_runtime_fails_before_signed_desktop_package_is_staged() {
+        let root = fixture("linux-x264-runtime-missing");
+        let artifacts = root.join("artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"AMATERASU_X264_BUILD=164\0",
+        )
+        .unwrap();
+        let output = root.join("package");
+        let signing_key = SigningKey::from_bytes(&[20; 32]);
+
+        let error = build_signed_package_with_runtime_probe(
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSession,
+            &signing_key,
+            DEVELOPMENT_KEY_ID,
+            |build| build == 0,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("required system x264 runtime for build 164"));
+        assert!(
+            !output.exists(),
+            "failed preflight must not stage a package"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 fn build_signed_package(
@@ -2128,9 +2214,32 @@ fn build_signed_package(
     signing_key: &SigningKey,
     key_id: &str,
 ) -> PackageResult<()> {
+    build_signed_package_with_runtime_probe(
+        artifacts,
+        output,
+        sequence,
+        profile,
+        signing_key,
+        key_id,
+        x264_runtime_available,
+    )
+}
+
+fn build_signed_package_with_runtime_probe(
+    artifacts: &Path,
+    output: &Path,
+    sequence: u64,
+    profile: PackageProfile,
+    signing_key: &SigningKey,
+    key_id: &str,
+    runtime_available: impl FnOnce(u32) -> bool,
+) -> PackageResult<()> {
     if output.try_exists().map_err(|error| error.to_string())? {
         return Err("package output already exists; use a new directory for each release".into());
     }
+    let linux_x264_encoder = matches!(profile, PackageProfile::LinuxSession)
+        .then(|| preflight_linux_x264(artifacts, runtime_available))
+        .transpose()?;
     create_private_directory(output)?;
 
     let mut components = Vec::new();
@@ -2140,7 +2249,16 @@ fn build_signed_package(
         } else {
             "0.1.0".to_owned()
         };
-        components.push(copy_component(artifacts, output, definition, &version)?);
+        let component = if definition.id == "amaterasu.encode" {
+            if let Some(encoder) = linux_x264_encoder.as_deref() {
+                copy_component_bytes(output, definition, &version, encoder)?
+            } else {
+                copy_component(artifacts, output, definition, &version)?
+            }
+        } else {
+            copy_component(artifacts, output, definition, &version)?
+        };
+        components.push(component);
     }
 
     let manifest = ReleaseManifest {
@@ -2162,21 +2280,134 @@ fn build_signed_package(
     sign_manifest_with_key(output, &manifest, signing_key, key_id)
 }
 
+/// A Linux Desktop package must be built from the x264-enabled encoder and a
+/// host with the matching system runtime. The ABI version is read from a
+/// marker embedded in the exact encoder artifact this function later signs.
+fn preflight_linux_x264(
+    artifacts: &Path,
+    runtime_available: impl FnOnce(u32) -> bool,
+) -> PackageResult<Vec<u8>> {
+    if !cfg!(target_os = "linux") {
+        return Err("Linux Desktop packages must be staged on a Linux build host".into());
+    }
+    let encoder = read_bounded(
+        &artifacts.join(library_filename("amaterasu_encode")),
+        256 * 1024 * 1024,
+    )?;
+    validate_linux_x264_inputs(&encoder, runtime_available)?;
+    Ok(encoder)
+}
+
+fn validate_linux_x264_inputs(
+    encoder: &[u8],
+    runtime_available: impl FnOnce(u32) -> bool,
+) -> PackageResult<()> {
+    let build = embedded_x264_build(encoder)
+        .ok_or("Linux Desktop encoder artifact lacks an embedded software-x264 ABI marker")?;
+    if !runtime_available(build) {
+        return Err(format!(
+            "required system x264 runtime for build {} is unavailable or incompatible",
+            build
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn embedded_x264_build(encoder: &[u8]) -> Option<u32> {
+    let offsets = encoder
+        .windows(X264_BUILD_MARKER.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == X264_BUILD_MARKER).then_some(offset))
+        .collect::<Vec<_>>();
+    let [offset] = offsets.as_slice() else {
+        return None;
+    };
+    let digits = encoder[*offset + X264_BUILD_MARKER.len()..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .copied()
+        .collect::<Vec<_>>();
+    if digits.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(&digits)
+        .ok()?
+        .parse::<u32>()
+        .ok()
+        .filter(|build| *build > 0)
+}
+
+#[cfg(target_os = "linux")]
+fn x264_runtime_available(build: u32) -> bool {
+    let library_names = [format!("libx264.so.{build}"), "libx264.so".into()];
+    for name in library_names {
+        // SAFETY: candidates are fixed system loader names derived from the
+        // embedded x264 ABI marker; no user path or package artifact is loaded.
+        let Ok(library) = (unsafe { libloading::Library::new(name) }) else {
+            continue;
+        };
+        let symbols = [
+            "x264_param_default_preset",
+            "x264_param_apply_profile",
+            "x264_param_cleanup",
+            "x264_picture_init",
+            "x264_encoder_close",
+            "x264_encoder_encode",
+            "x264_encoder_delayed_frames",
+            "x264_encoder_maximum_delayed_frames",
+            "x264_encoder_parameters",
+        ];
+        let symbols_available = symbols.iter().all(|symbol| {
+            // SAFETY: symbol lookup checks presence only; the pointers are not called.
+            unsafe { library.get::<*mut c_void>(symbol.as_bytes()).is_ok() }
+        });
+        let versioned_open = format!("x264_encoder_open_{build}");
+        // SAFETY: symbol lookup checks presence only; the pointer is not called.
+        let open_available = unsafe {
+            library
+                .get::<*mut c_void>(versioned_open.as_bytes())
+                .is_ok()
+        };
+        if symbols_available && open_available {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn x264_runtime_available(_: u32) -> bool {
+    false
+}
+
 fn copy_component(
     artifacts: &Path,
     output: &Path,
     definition: &ComponentDefinition,
     version: &str,
 ) -> PackageResult<ComponentManifest> {
+    let bytes = read_bounded(
+        &artifacts.join(library_filename(definition.library)),
+        256 * 1024 * 1024,
+    )?;
+    copy_component_bytes(output, definition, version, &bytes)
+}
+
+fn copy_component_bytes(
+    output: &Path,
+    definition: &ComponentDefinition,
+    version: &str,
+    bytes: &[u8],
+) -> PackageResult<ComponentManifest> {
     let filename = library_filename(definition.library);
-    let bytes = read_bounded(&artifacts.join(&filename), 256 * 1024 * 1024)?;
-    fs::write(output.join(&filename), &bytes).map_err(|error| error.to_string())?;
+    fs::write(output.join(&filename), bytes).map_err(|error| error.to_string())?;
 
     Ok(ComponentManifest {
         id: definition.id.into(),
         version: version.into(),
         file: filename,
-        sha256: sha256(&bytes),
+        sha256: sha256(bytes),
         size: bytes.len() as u64,
         abi_major: amaterasu_abi::ABI_MAJOR,
         runtime: definition.id == RUNTIME_ID,

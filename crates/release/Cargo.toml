@@ -14,6 +14,7 @@ serde.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 sha2.workspace = true
+libloading.workspace = true
 
 [dev-dependencies]
 amaterasu-runtime = { path = "../runtime" }
