@@ -190,6 +190,7 @@ impl Pipeline {
                 return true;
             }
             if job.cleanup {
+                record.plane = None;
                 if let Some(step) = job.next_cleanup(record) {
                     job.step = step;
                 } else {

@@ -100,6 +100,7 @@ pub(super) struct Record {
     pub capture_geometry: Option<CaptureGeometry>,
     pub input_absolute_pointer: bool,
     pub input_controller_supported: bool,
+    pub client_haptics_requested: bool,
     pub input_pen_touch_supported: bool,
     pub input_native_pen_touch: bool,
     pub touch_port: Option<TouchPort>,
@@ -169,6 +170,7 @@ impl Record {
             capture_geometry: None,
             input_absolute_pointer: false,
             input_controller_supported: false,
+            client_haptics_requested: false,
             input_pen_touch_supported: false,
             input_native_pen_touch: false,
             touch_port: None,
@@ -310,6 +312,11 @@ impl Record {
                 && self.capture_geometry.is_some()
                 && self.input_absolute_pointer,
             "controller_input": self.input_lease.is_some()
+                && self.input_controller_supported,
+            "haptics_feedback_available": self.input_lease.is_some()
+                && self.input_controller_supported,
+            "haptics_feedback_enabled": self.client_haptics_requested
+                && self.input_lease.is_some()
                 && self.input_controller_supported,
             "input_events_sent": self.input_events_sent,
             "input_batches": self.input_batches,

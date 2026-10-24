@@ -5,9 +5,104 @@ fn enable_input(host: &mut Harness) {
     host.pipeline.settings.input_lease_ttl_ms = 1_000;
 }
 
+fn enable_client_haptics(host: &mut Harness, session: u64) {
+    let record = host.pipeline.records.get_mut(&session).unwrap();
+    crate::pipeline::input::queue_control_input(
+        record,
+        amaterasu_gamestream::control::Input::EnableHaptics { enabled: true },
+        true,
+        host.now,
+    )
+    .unwrap();
+}
+
 fn feedback(slot: u16, strong_motor: u16, weak_motor: u16, duration_ms: u16) -> Value {
     json!({"slot":slot,"strong_motor":strong_motor,"weak_motor":weak_motor,
         "duration_ms":duration_ms})
+}
+
+#[test]
+fn haptics_require_client_opt_in_and_an_authorized_gamepad_backend() {
+    for backend_grant in [false, true] {
+        let mut host = Harness::new();
+        enable_input(&mut host);
+        host.broker.input_controller_supported = Some(json!(backend_grant));
+        let session = host.response(1, prepare())["session"].as_u64().unwrap();
+        assert_eq!(host.response(2, start(session))["state"], "active");
+        let status = host.pipeline.records[&session].response();
+        assert_eq!(status["haptics_feedback_available"], backend_grant);
+        assert_eq!(status["haptics_feedback_enabled"], false);
+        for _ in 0..60 {
+            host.tick();
+        }
+        assert!(host.broker.gamepad_poll_times.is_empty());
+
+        enable_client_haptics(&mut host, session);
+        assert_eq!(
+            host.pipeline.records[&session].response()["haptics_feedback_enabled"],
+            backend_grant
+        );
+        assert_eq!(
+            host.pipeline.records[&session].client_haptics_requested,
+            backend_grant
+        );
+        assert_eq!(
+            host.pipeline.records[&session].unsupported_controls,
+            u64::from(!backend_grant)
+        );
+        for _ in 0..60 {
+            host.tick();
+        }
+        assert_eq!(!host.broker.gamepad_poll_times.is_empty(), backend_grant);
+    }
+
+    let mut host = Harness::new();
+    let session = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(session))["state"], "active");
+    let record = host.pipeline.records.get_mut(&session).unwrap();
+    crate::pipeline::input::queue_control_input(
+        record,
+        amaterasu_gamestream::control::Input::EnableHaptics { enabled: true },
+        false,
+        host.now,
+    )
+    .unwrap();
+    assert!(!record.client_haptics_requested);
+    assert_eq!(record.response()["haptics_feedback_available"], false);
+}
+
+#[test]
+fn disabling_client_haptics_stops_active_motor_without_revoking_input() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    host.broker
+        .gamepad_feedback
+        .push_back(feedback(5, 250, 450, 5_000));
+    let session = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(session))["state"], "active");
+    enable_client_haptics(&mut host, session);
+    host.idle();
+    assert!(host.plane.borrow().rumble_commands.iter().any(|command| {
+        command.slot == 5 && command.low_frequency == 250 && command.high_frequency == 450
+    }));
+
+    let record = host.pipeline.records.get_mut(&session).unwrap();
+    crate::pipeline::input::queue_control_input(
+        record,
+        amaterasu_gamestream::control::Input::EnableHaptics { enabled: false },
+        true,
+        host.now,
+    )
+    .unwrap();
+    assert!(!record.client_haptics_requested);
+    assert_eq!(record.response()["haptics_feedback_enabled"], false);
+    assert!(record.rumble_shutdown_deadline.is_none());
+    host.idle();
+    assert!(host.plane.borrow().rumble_commands.iter().any(|command| {
+        command.slot == 5 && command.low_frequency == 0 && command.high_frequency == 0
+    }));
+    assert!(host.pipeline.records[&session].input_lease.is_some());
 }
 
 #[test]
@@ -21,6 +116,7 @@ fn gamepad_feedback_is_polled_at_40ms_and_replacement_expires_with_zero() {
     ]);
     let id = host.response(1, prepare())["session"].as_u64().unwrap();
     assert_eq!(host.response(2, start(id))["state"], "active");
+    enable_client_haptics(&mut host, id);
     host.idle();
 
     let polls = host
@@ -78,6 +174,7 @@ fn stop_attempts_terminal_zero_before_releasing_local_input() {
         .push_back(feedback(1, 500, 900, 5_000));
     let id = host.response(1, prepare())["session"].as_u64().unwrap();
     assert_eq!(host.response(2, start(id))["state"], "active");
+    enable_client_haptics(&mut host, id);
     host.idle();
     assert!(
         host.plane
@@ -119,6 +216,7 @@ fn failed_remote_zero_does_not_retain_local_input_lease() {
         .push_back(feedback(0, 10, 20, 5_000));
     let id = host.response(1, prepare())["session"].as_u64().unwrap();
     assert_eq!(host.response(2, start(id))["state"], "active");
+    enable_client_haptics(&mut host, id);
     host.idle();
     host.plane.borrow_mut().rumble_error = true;
     let result = host.response(3, json!({"action":"stop","session":id}));
@@ -140,6 +238,7 @@ fn busy_control_send_times_out_remote_zero_but_completes_local_cleanup() {
         .push_back(feedback(4, 100, 200, 5_000));
     let id = host.response(1, prepare())["session"].as_u64().unwrap();
     assert_eq!(host.response(2, start(id))["state"], "active");
+    enable_client_haptics(&mut host, id);
     host.idle();
     host.plane.borrow_mut().rumble_busy = true;
 
@@ -167,11 +266,14 @@ fn reused_controller_slot_does_not_inherit_prior_session_motor_state() {
         .push_back(feedback(3, 300, 400, 5_000));
     let first = host.response(1, prepare())["session"].as_u64().unwrap();
     assert_eq!(host.response(2, start(first))["state"], "active");
+    enable_client_haptics(&mut host, first);
     host.idle();
     let stopped = host.response(3, json!({"action":"stop","session":first}));
     assert_eq!(stopped["state"], "stopped");
 
-    let second = host.response(4, prepare())["session"].as_u64().unwrap();
+    let mut new_operation = prepare();
+    new_operation["operation_id"] = json!("rumble-reuse-second-session");
+    let second = host.response(4, new_operation)["session"].as_u64().unwrap();
     assert_eq!(host.response(5, start(second))["state"], "active");
     let record = &host.pipeline.records[&second];
     assert!(record.rumble_active_until.is_empty());

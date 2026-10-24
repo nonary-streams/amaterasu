@@ -98,6 +98,9 @@ impl Job {
         if let Some(plane) = record.plane.as_mut() {
             plane.stop();
         }
+        if record.rumble_pending.is_empty() {
+            record.plane = None;
+        }
         record.audio_recovery_needed = false;
         if let Some(pending) = self.pending.as_mut() {
             pending.cancel();

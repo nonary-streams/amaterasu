@@ -94,9 +94,25 @@ pub(super) fn queue_control_input(
     record: &mut Record,
     input: Input<'_>,
     enabled: bool,
+    now: u64,
 ) -> Result<(), &'static str> {
     if !enabled {
         record.unsupported_controls = record.unsupported_controls.saturating_add(1);
+        return Ok(());
+    }
+    if let Input::EnableHaptics { enabled } = input {
+        if !matches!(record.state, State::Armed | State::Active) {
+            record.rejected_controls = record.rejected_controls.saturating_add(1);
+            return Ok(());
+        }
+        if enabled && (record.input_lease.is_none() || !record.input_controller_supported) {
+            record.unsupported_controls = record.unsupported_controls.saturating_add(1);
+            return Ok(());
+        }
+        record.client_haptics_requested = enabled;
+        if !enabled {
+            queue_rumble_zeros(record, now);
+        }
         return Ok(());
     }
     if record.state != State::Active || record.input_lease.is_none() {
@@ -374,6 +390,7 @@ pub(super) fn clear_input(record: &mut Record) {
     record.feedback_poll_at = 0;
     record.input_absolute_pointer = false;
     record.input_controller_supported = false;
+    record.client_haptics_requested = false;
     record.input_pen_touch_supported = false;
     record.input_native_pen_touch = false;
     record.touch_port = None;
@@ -399,7 +416,7 @@ pub(super) fn queue_rumble_zeros(record: &mut Record, now: u64) {
             ),
         );
     }
-    if !record.rumble_pending.is_empty() {
+    if record.state == State::Stopping && !record.rumble_pending.is_empty() {
         record
             .rumble_shutdown_deadline
             .get_or_insert(now.saturating_add(200));
@@ -453,6 +470,9 @@ pub(super) fn accept_gamepad_feedback(
     let zero = strong == 0 && weak == 0;
     if (duration == 0) != zero {
         return Err("invalid_gamepad_feedback_response");
+    }
+    if !record.client_haptics_requested && !zero {
+        return Ok(());
     }
     if zero {
         // A terminal zero is accepted only for a slot this session already owns.

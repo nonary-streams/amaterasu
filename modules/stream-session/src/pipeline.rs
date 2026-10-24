@@ -411,6 +411,7 @@ impl Pipeline {
                             && (now >= record.input_renew_at
                                 || !record.input_events.is_empty()
                                 || (record.input_controller_supported
+                                    && record.client_haptics_requested
                                     && now >= record.feedback_poll_at)))))
                 || (record.state == State::Armed && now >= record.next_auth_poll)
         };
@@ -438,6 +439,7 @@ impl Pipeline {
             (Step::RecoverAudio, now.saturating_add(5000))
         } else if record.input_lease.is_some()
             && record.input_controller_supported
+            && record.client_haptics_requested
             && now >= record.feedback_poll_at
         {
             (Step::PollGamepadFeedback, now.saturating_add(5000))
@@ -576,6 +578,7 @@ impl Pipeline {
                                     record,
                                     input,
                                     self.settings.enable_input,
+                                    now,
                                 ) {
                                     input::stop_for_input_failure(record, code);
                                 }
