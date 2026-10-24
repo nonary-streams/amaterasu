@@ -54,6 +54,8 @@ const AUDIO_RATE: u32 = 48_000;
 const FRAMES_PER_PACKET: u32 = 480;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_QUERY_FAILURE_LIMIT: u8 = 3;
 const STARTUP_OPEN_MAX_ATTEMPTS: usize = 2;
 const STARTUP_OPEN_RETRY_DELAY: Duration = Duration::from_millis(200);
 const STARTUP_OPEN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1_800);
@@ -268,6 +270,7 @@ struct ServerInfoResult {
 struct PendingServerInfoQuery {
     operation: Operation,
     result: Box<ServerInfoResult>,
+    started_at: Instant,
 }
 
 enum QueryPoll<T> {
@@ -290,6 +293,26 @@ fn pulse_operation_state(state: c_int) -> PulseOperationState {
         PA_OPERATION_CANCELLED => PulseOperationState::Cancelled,
         _ => PulseOperationState::Unknown,
     }
+}
+
+fn default_query_timed_out(started_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(started_at) >= DEFAULT_QUERY_TIMEOUT
+}
+
+fn next_default_query_failure_count(failures: u8) -> u8 {
+    failures.saturating_add(1).min(DEFAULT_QUERY_FAILURE_LIMIT)
+}
+
+fn default_query_failures_after_result(failures: u8, succeeded: bool) -> u8 {
+    if succeeded {
+        0
+    } else {
+        next_default_query_failure_count(failures)
+    }
+}
+
+fn default_queries_disabled(failures: u8) -> bool {
+    failures >= DEFAULT_QUERY_FAILURE_LIMIT
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,6 +461,7 @@ struct PulseClient {
     pending_callback_states: PendingCallbackStates,
     pending_default_query: Option<PendingServerInfoQuery>,
     default_queries_disabled: bool,
+    default_query_failures: u8,
 }
 
 impl PulseClient {
@@ -472,6 +496,7 @@ impl PulseClient {
             pending_callback_states: PendingCallbackStates::default(),
             pending_default_query: None,
             default_queries_disabled: false,
+            default_query_failures: 0,
         };
         // Disable PulseAudio's autospawn behavior: the audio module connects to
         // the user's existing service and never starts or restarts it.
@@ -617,36 +642,64 @@ impl PulseClient {
             )
         };
         if operation.is_null() {
-            self.default_queries_disabled = true;
+            self.note_default_query_failure();
             return Err("audio_backend_failed");
         }
         self.pending_default_query = Some(PendingServerInfoQuery {
             operation: Operation(operation),
             result,
+            started_at: Instant::now(),
         });
         Ok(())
     }
 
     fn poll_default_sink_query(&mut self) -> QueryPoll<Option<String>> {
-        let Some(query) = self.pending_default_query.as_ref() else {
-            return QueryPoll::Pending;
+        let (operation_state, started_at) = {
+            let Some(query) = self.pending_default_query.as_ref() else {
+                return QueryPoll::Pending;
+            };
+            // SAFETY: the pending query uniquely owns a live operation reference.
+            (
+                pulse_operation_state(unsafe { pa_operation_get_state(query.operation.0) }),
+                query.started_at,
+            )
         };
-        // SAFETY: the pending query uniquely owns a live operation reference.
-        match pulse_operation_state(unsafe { pa_operation_get_state(query.operation.0) }) {
-            PulseOperationState::Running | PulseOperationState::Unknown => QueryPoll::Pending,
+        match operation_state {
+            PulseOperationState::Running | PulseOperationState::Unknown
+                if !default_query_timed_out(started_at, Instant::now()) =>
+            {
+                QueryPoll::Pending
+            }
+            PulseOperationState::Running | PulseOperationState::Unknown => {
+                let query = self
+                    .pending_default_query
+                    .take()
+                    .expect("the timed-out default query is still present");
+                // SAFETY: this client exclusively owns the operation and all
+                // Pulse calls run on this thread. Retain userdata because a
+                // callback queued before cancellation can still arrive.
+                unsafe { pa_operation_cancel(query.operation.0) };
+                self.pending_callback_states.retain(query.result);
+                self.note_default_query_failure();
+                QueryPoll::Complete(Err("audio_operation_timeout"))
+            }
             PulseOperationState::Done => {
                 let mut query = self
                     .pending_default_query
                     .take()
                     .expect("the completed default query is still present");
                 if query.result.failed || !query.result.completed {
+                    self.note_default_query_failure();
                     QueryPoll::Complete(Err("audio_backend_failed"))
                 } else {
+                    self.default_query_failures =
+                        default_query_failures_after_result(self.default_query_failures, true);
+                    self.default_queries_disabled =
+                        default_queries_disabled(self.default_query_failures);
                     QueryPoll::Complete(Ok(query.result.default_sink.take()))
                 }
             }
             PulseOperationState::Cancelled => {
-                self.default_queries_disabled = true;
                 let query = self
                     .pending_default_query
                     .take()
@@ -655,9 +708,16 @@ impl PulseClient {
                 // cancellation; retain its userdata until this client's mainloop
                 // is destroyed, matching the synchronous operation path.
                 self.pending_callback_states.retain(query.result);
+                self.note_default_query_failure();
                 QueryPoll::Complete(Err("audio_backend_failed"))
             }
         }
+    }
+
+    fn note_default_query_failure(&mut self) {
+        self.default_query_failures =
+            default_query_failures_after_result(self.default_query_failures, false);
+        self.default_queries_disabled = default_queries_disabled(self.default_query_failures);
     }
 
     /// Completes a server query queued after earlier commands on this context.
@@ -2665,7 +2725,11 @@ mod tests {
             default_route_decision(None, "sink.selected"),
             DefaultRouteDecision::Pending
         );
-        for error in ["audio_operation_timeout", "audio_server_unavailable"] {
+        for error in [
+            "audio_operation_timeout",
+            "audio_server_unavailable",
+            "audio_backend_failed",
+        ] {
             assert_eq!(
                 default_route_decision(Some(Err(error)), "sink.selected"),
                 DefaultRouteDecision::Retry
@@ -2679,6 +2743,39 @@ mod tests {
             default_route_decision(Some(Ok(Some("sink.selected".into()))), "sink.selected"),
             DefaultRouteDecision::Unchanged
         );
+    }
+
+    #[test]
+    fn stalled_default_query_times_out_and_cancellation_retries_are_bounded() {
+        let started_at = Instant::now();
+        assert!(!default_query_timed_out(
+            started_at,
+            started_at + DEFAULT_QUERY_TIMEOUT - Duration::from_nanos(1)
+        ));
+        assert!(default_query_timed_out(
+            started_at,
+            started_at + DEFAULT_QUERY_TIMEOUT
+        ));
+
+        let mut failures = 0;
+        for attempt in 1..=DEFAULT_QUERY_FAILURE_LIMIT {
+            assert_eq!(
+                default_route_decision(Some(Err("audio_backend_failed")), "sink.selected"),
+                DefaultRouteDecision::Retry
+            );
+            failures = default_query_failures_after_result(failures, false);
+            assert_eq!(failures, attempt);
+            assert_eq!(
+                default_queries_disabled(failures),
+                attempt == DEFAULT_QUERY_FAILURE_LIMIT,
+            );
+        }
+
+        // A successful probe after transient failures resets the retry budget
+        // and allows follow-default monitoring to continue checking the route.
+        let failures = default_query_failures_after_result(failures, true);
+        assert_eq!(failures, 0);
+        assert!(!default_queries_disabled(failures));
     }
 
     #[test]
