@@ -43,7 +43,7 @@ The action and all fields are strict. Open fields:
 | `video_port`, `audio_port` | Fixed destination UDP ports, 1–65535; both omitted for discovery |
 | `discovery` | Optional `{video_ping_payload,audio_ping_payload}`; both are distinct 16-character unpadded base64url strings |
 | `video_bind`, `audio_bind` | Optional local socket addresses, normally port zero |
-| `video` | Optional `{packet_size:1024,fec_percentage:20,min_parity_shards:2,max_fec_blocks:1,max_batch_size_kb:64}` |
+| `video` | Optional `{codec:"h264",packet_size:1024,fec_percentage:20,min_parity_shards:2,max_fec_blocks:1,max_batch_size_kb:64}` |
 | `audio` | Required `{packet_ms:5\|10,channels:2,wire_payload_bytes:N,ssrc:0}`; `ssrc` defaults to zero |
 | `stream_audio` | Optional boolean, defaults to `true`; `false` keeps the negotiated audio lane but rejects audio payloads while accepting its EOS marker |
 | `ping_timeout_ms` | Optional discovery timeout in milliseconds, 0–2147483647; defaults to 10000 |
@@ -122,7 +122,9 @@ closes its sockets. These records are in-memory, not durable.
 
 ## Admission, packetization, and delivery
 
-Each video submit contains one complete H.264 Annex B access unit. Consumers
+Each video submit contains one complete Annex B access unit of the negotiated
+`h264` or `hevc` codec. H.264 remains the default; HEVC is a transport input
+contract and does not by itself enable client negotiation or encoder support. Consumers
 must assemble producer fragments before calling; an arbitrary encoder fragment
 is not a frame. Accepted video producer sequences must strictly increase and
 timestamps cannot regress. Wire frame indices start at one and are bounded

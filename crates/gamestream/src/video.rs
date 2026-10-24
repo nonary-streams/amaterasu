@@ -1,4 +1,4 @@
-//! Bounded GameStream H.264 Annex B packetization, with bounded Reed–Solomon parity.
+//! Bounded GameStream Annex B packetization, with bounded Reed–Solomon parity.
 //!
 //! This is the GameStream video framing protocol, not RFC 6184 fragmentation.
 //! See `video/README.md` for receiver references and compatibility limits.
@@ -13,6 +13,13 @@ const MAX_UDP_BYTES: usize = 65_507;
 const MAX_PACKETS: usize = 1023;
 const MAX_ACCESS_UNIT_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_INDEX_MASK: u32 = 0x00ff_ffff;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    Hevc,
+}
 
 /// Negotiated video settings. Unsupported security/recovery modes fail explicitly.
 #[derive(Debug, Clone, Copy)]
@@ -62,12 +69,17 @@ pub struct Reservation {
 /// timestamp from the stream's epoch; both may wrap as unsigned 32-bit values.
 pub struct VideoPacketizer {
     config: VideoConfig,
+    codec: VideoCodec,
     payload_bytes: usize,
     stream_index: u32,
 }
 
 impl VideoPacketizer {
     pub fn new(config: VideoConfig) -> Result<Self, VideoError> {
+        Self::new_with_codec(config, VideoCodec::H264)
+    }
+
+    pub fn new_with_codec(config: VideoConfig, codec: VideoCodec) -> Result<Self, VideoError> {
         if config.encrypted {
             return Err(VideoError::UnsupportedEncryption);
         }
@@ -79,6 +91,7 @@ impl VideoPacketizer {
         }
         Ok(Self {
             config,
+            codec,
             payload_bytes: config.packet_size - NV_BYTES,
             stream_index: 0,
         })
@@ -127,7 +140,7 @@ impl VideoPacketizer {
         if packet_count > MAX_PACKETS {
             return Err(VideoError::TooManyPackets);
         }
-        let is_idr = validate_annex_b(access_unit)?;
+        let is_idr = validate_annex_b(access_unit, self.codec)?;
         let frame_header =
             short_frame_header(is_idr, ((total_bytes - 1) % self.payload_bytes + 1) as u16);
         let mut datagrams = Vec::with_capacity(packet_count);
@@ -198,7 +211,10 @@ fn packet_header(
 }
 
 /// Check Annex B framing and supported NAL headers, not the encoded slice syntax.
-fn validate_annex_b(bytes: &[u8]) -> Result<bool, VideoError> {
+fn validate_annex_b(bytes: &[u8], codec: VideoCodec) -> Result<bool, VideoError> {
+    if codec == VideoCodec::Hevc {
+        return validate_hevc_annex_b(bytes);
+    }
     let mut nal_start = None;
     let mut zero_run = 0;
     let mut has_picture = false;
@@ -232,6 +248,77 @@ fn validate_annex_b(bytes: &[u8]) -> Result<bool, VideoError> {
         return Err(VideoError::InvalidAnnexB);
     }
     Ok(has_idr)
+}
+
+/// Validate the two-byte HEVC NAL header and the recovery-prefix ordering
+/// expected by Moonlight. Initial support accepts closed-GOP IDR only; CRA and
+/// leading pictures require additional recovery handling.
+fn validate_hevc_annex_b(bytes: &[u8]) -> Result<bool, VideoError> {
+    let mut nal_start = None;
+    let mut zero_run = 0usize;
+    let mut prefix = 0u8;
+    let mut picture = None;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if byte == 1 && zero_run >= 2 {
+            if let Some(start) = nal_start {
+                validate_hevc_nal(bytes, start, index - zero_run, &mut prefix, &mut picture)?;
+            } else if index != zero_run {
+                return Err(VideoError::InvalidAnnexB);
+            }
+            nal_start = Some(index + 1);
+        }
+        zero_run = if byte == 0 { zero_run + 1 } else { 0 };
+    }
+    let start = nal_start.ok_or(VideoError::InvalidAnnexB)?;
+    validate_hevc_nal(
+        bytes,
+        start,
+        bytes.len() - zero_run,
+        &mut prefix,
+        &mut picture,
+    )?;
+    let is_idr = picture.ok_or(VideoError::InvalidAnnexB)?;
+    if is_idr && prefix != 3 {
+        return Err(VideoError::InvalidAnnexB);
+    }
+    Ok(is_idr)
+}
+
+fn validate_hevc_nal(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    prefix: &mut u8,
+    picture: &mut Option<bool>,
+) -> Result<(), VideoError> {
+    if end.saturating_sub(start) < 2 {
+        return Err(VideoError::InvalidAnnexB);
+    }
+    let first = bytes[start];
+    let second = bytes[start + 1];
+    let kind = (first >> 1) & 0x3f;
+    if first & 0x80 != 0 || (first & 1) != 0 || second >> 3 != 0 || second & 0x07 == 0 {
+        return Err(VideoError::InvalidAnnexB);
+    }
+    match kind {
+        32 if *prefix == 0 && picture.is_none() => *prefix = 1,
+        33 if *prefix == 1 && picture.is_none() => *prefix = 2,
+        34 if *prefix == 2 && picture.is_none() => *prefix = 3,
+        0..=7 | 19 | 20 => {
+            let idr = matches!(kind, 19 | 20);
+            if picture.is_some_and(|previous| previous != idr)
+                || (idr && *prefix != 3)
+                || (*prefix != 0 && *prefix != 3)
+            {
+                return Err(VideoError::InvalidAnnexB);
+            }
+            *picture = Some(idr);
+        }
+        // Prefix/suffix SEI and access-unit delimiters carry no picture.
+        35 | 39 | 40 => {}
+        _ => return Err(VideoError::InvalidAnnexB),
+    }
+    Ok(())
 }
 
 fn validate_nal(

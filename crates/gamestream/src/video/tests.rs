@@ -11,6 +11,81 @@ fn packetizer(packet_size: usize) -> VideoPacketizer {
     .unwrap()
 }
 
+fn hevc_packetizer(packet_size: usize, fec_percentage: u8) -> VideoPacketizer {
+    VideoPacketizer::new_with_codec(
+        VideoConfig {
+            packet_size,
+            fec_percentage,
+            min_parity_shards: if fec_percentage == 0 { 0 } else { 2 },
+            max_fec_blocks: 4,
+            encrypted: false,
+        },
+        VideoCodec::Hevc,
+    )
+    .unwrap()
+}
+
+fn hevc_nal(kind: u8) -> [u8; 6] {
+    [0, 0, 0, 1, kind << 1, 1]
+}
+
+#[test]
+fn hevc_closed_gop_recovery_keeps_parameter_sets_and_frame_type() {
+    for idr_kind in [19, 20] {
+        let access_unit: Vec<_> = [32, 33, 34, idr_kind]
+            .into_iter()
+            .flat_map(hevc_nal)
+            .collect();
+        for fec in [0, 20] {
+            let packets = hevc_packetizer(1392, fec)
+                .packetize(&access_unit, 1, 90000)
+                .unwrap();
+            assert_eq!(packets[0][35], 2);
+            if fec == 0 {
+                assert_eq!(reassemble(&packets, 1392), access_unit);
+            }
+        }
+    }
+    let ordinary = hevc_nal(1);
+    let packets = hevc_packetizer(1392, 0)
+        .packetize(&ordinary, 2, 93000)
+        .unwrap();
+    assert_eq!(packets[0][35], 1);
+}
+
+#[test]
+fn hevc_invalid_headers_and_open_gop_do_not_consume_sequence() {
+    let valid: Vec<_> = [32, 33, 34, 19].into_iter().flat_map(hevc_nal).collect();
+    let mut sender = hevc_packetizer(1392, 0);
+    let mut invalid = vec![
+        hevc_nal(21).to_vec(), // CRA needs leading-picture recovery semantics.
+        hevc_nal(19).to_vec(), // IDR without ordered parameter sets.
+        [hevc_nal(32), hevc_nal(34), hevc_nal(33), hevc_nal(19)].concat(),
+        [hevc_nal(32), hevc_nal(33), hevc_nal(34)].concat(),
+        [hevc_nal(32), hevc_nal(1)].concat(),
+        [hevc_nal(1), hevc_nal(19)].concat(),
+        vec![0, 0, 1, 19 << 1], // Truncated two-byte header.
+    ];
+    for header in [
+        [0x80 | (19 << 1), 1],
+        [(19 << 1) | 1, 1],
+        [19 << 1, 0],
+        [19 << 1, 0x09],
+    ] {
+        let mut malformed = valid.clone();
+        let last = malformed.len() - 2;
+        malformed[last..].copy_from_slice(&header);
+        invalid.push(malformed);
+    }
+    for access_unit in invalid {
+        assert_eq!(
+            sender.packetize(&access_unit, 1, 0),
+            Err(VideoError::InvalidAnnexB)
+        );
+        assert_eq!(sender.stream_index, 0);
+    }
+}
+
 // Receive-side model of the documented Moonlight layout. This deliberately uses
 // literal wire offsets and decoding operations, not the packetizer's helpers.
 fn reassemble(packets: &[Vec<u8>], negotiated_size: usize) -> Vec<u8> {

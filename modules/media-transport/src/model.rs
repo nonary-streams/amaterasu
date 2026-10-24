@@ -45,12 +45,28 @@ impl Settings {
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoSettings {
+    #[serde(default, skip_serializing_if = "VideoCodec::is_h264")]
+    pub codec: VideoCodec,
     pub packet_size: usize,
     pub fec_percentage: u8,
     pub min_parity_shards: u8,
     pub max_fec_blocks: u8,
     #[serde(default = "default_video_max_batch_size_kb")]
     pub max_batch_size_kb: u8,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    Hevc,
+}
+
+impl VideoCodec {
+    fn is_h264(&self) -> bool {
+        *self == Self::H264
+    }
 }
 
 fn default_video_max_batch_size_kb() -> u8 {
@@ -60,6 +76,7 @@ fn default_video_max_batch_size_kb() -> u8 {
 impl Default for VideoSettings {
     fn default() -> Self {
         Self {
+            codec: VideoCodec::H264,
             packet_size: 1024,
             fec_percentage: 20,
             min_parity_shards: 2,
@@ -470,6 +487,25 @@ mod tests {
                 ..VideoSettings::default()
             }
             .valid_batch_size_kb()
+        );
+    }
+
+    #[test]
+    fn video_codec_defaults_to_h264_and_rejects_unknown_values() {
+        let default: VideoSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(default.codec == VideoCodec::H264);
+        assert!(
+            serde_json::to_value(default)
+                .unwrap()
+                .get("codec")
+                .is_none()
+        );
+        let hevc: VideoSettings =
+            serde_json::from_value(serde_json::json!({"codec":"hevc"})).unwrap();
+        assert!(hevc.codec == VideoCodec::Hevc);
+        assert_eq!(serde_json::to_value(hevc).unwrap()["codec"], "hevc");
+        assert!(
+            serde_json::from_value::<VideoSettings>(serde_json::json!({"codec":"av1"})).is_err()
         );
     }
 

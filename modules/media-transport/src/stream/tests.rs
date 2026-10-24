@@ -68,6 +68,44 @@ pub(crate) fn video_packet(bytes: &[u8], sequence: u64) -> EncodedPacket {
     }
 }
 
+#[test]
+fn negotiated_hevc_accepts_only_hevc_packets_without_consuming_rejected_sequence() {
+    let (video, audio) = receivers();
+    let mut settings = request(&video, &audio, false);
+    settings.video.codec = VideoCodec::Hevc;
+    let mut stream = Stream::open("owner", &settings).unwrap();
+    let access_unit: Vec<_> = [32u8, 33, 34, 19]
+        .into_iter()
+        .flat_map(|kind| [0, 0, 0, 1, kind << 1, 1])
+        .collect();
+    let h264 = video_packet(&access_unit, 0);
+    // SAFETY: the local access unit remains allocated through both calls.
+    assert_eq!(
+        unsafe { stream.submit_video(&h264) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(stream.next_frame_index, Some(1));
+    let hevc = EncodedPacket {
+        codec: CODEC_HEVC,
+        ..h264
+    };
+    // SAFETY: the local access unit remains allocated through the call.
+    assert_eq!(unsafe { stream.submit_video(&hevc) }, STATUS_OK);
+    assert_eq!(stream.next_frame_index, Some(2));
+    let wrong_eos = EncodedPacket {
+        codec: CODEC_H264,
+        flags: FLAG_END_OF_STREAM,
+        len: 0,
+        ..hevc
+    };
+    // SAFETY: EOS has no borrowed payload.
+    assert_eq!(
+        unsafe { stream.submit_video(&wrong_eos) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert!(!stream.video_ended);
+}
+
 pub(crate) fn audio_packet(bytes: &[u8], sequence: u64) -> EncodedAudioPacket {
     EncodedAudioPacket {
         codec: CODEC_OPUS,
@@ -433,6 +471,7 @@ fn one_batch_larger_than_hard_byte_limit_is_invalid_instead_of_permanently_busy(
     let (video, audio) = receivers();
     let mut settings = request(&video, &audio, false);
     settings.video = VideoSettings {
+        codec: VideoCodec::H264,
         packet_size: 65_507 - 16,
         fec_percentage: 0,
         min_parity_shards: 0,

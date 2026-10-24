@@ -5,7 +5,7 @@ use crate::{
 use amaterasu_gamestream::{
     audio::{AudioConfig, AudioError, AudioPacketizer},
     crypto::{AudioIvPolicy, AudioSealer, VIDEO_PREFIX_BYTES, VideoProfile, VideoSealer},
-    video::{VideoConfig, VideoPacketizer},
+    video::{VideoCodec as WireVideoCodec, VideoConfig, VideoPacketizer},
 };
 use amaterasu_media::*;
 use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
@@ -157,6 +157,13 @@ impl Stream {
         }
         if let Err(status) = packet.validate() {
             return status;
+        }
+        let expected_codec = match self.video_settings.codec {
+            VideoCodec::H264 => CODEC_H264,
+            VideoCodec::Hevc => CODEC_HEVC,
+        };
+        if packet.codec != expected_codec {
+            return STATUS_INVALID_ARGUMENT;
         }
         if packet.flags & FLAG_END_OF_STREAM != 0 {
             self.video_ended = true;
@@ -335,13 +342,20 @@ fn packetizers(request: &Open) -> TransportResult<(VideoPacketizer, AudioPacketi
     if encrypted_video && request.video.packet_size > 65_507 - 16 - VIDEO_PREFIX_BYTES {
         return Err("invalid_video_configuration");
     }
-    let video = VideoPacketizer::new(VideoConfig {
-        packet_size: request.video.packet_size,
-        fec_percentage: request.video.fec_percentage,
-        min_parity_shards: request.video.min_parity_shards,
-        max_fec_blocks: request.video.max_fec_blocks,
-        encrypted: false,
-    })
+    let codec = match request.video.codec {
+        VideoCodec::H264 => WireVideoCodec::H264,
+        VideoCodec::Hevc => WireVideoCodec::Hevc,
+    };
+    let video = VideoPacketizer::new_with_codec(
+        VideoConfig {
+            packet_size: request.video.packet_size,
+            fec_percentage: request.video.fec_percentage,
+            min_parity_shards: request.video.min_parity_shards,
+            max_fec_blocks: request.video.max_fec_blocks,
+            encrypted: false,
+        },
+        codec,
+    )
     .map_err(|_| "invalid_video_configuration")?;
     let audio = AudioPacketizer::new(AudioConfig {
         sample_rate: 48_000,

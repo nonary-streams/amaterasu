@@ -1,6 +1,6 @@
-# GameStream H.264 packetization
+# GameStream Annex B packetization
 
-`VideoPacketizer` creates complete UDP payloads from an H.264 Annex B access unit,
+`VideoPacketizer` creates complete UDP payloads from an H.264 or HEVC Annex B access unit,
 with optional systematic Reed–Solomon parity. It has no sockets, encryption keys,
 encoder, pacing loop, or streaming session state. This library alone does not
 make Moonlight streaming available.
@@ -40,10 +40,18 @@ that space before packetization; encrypted video additionally needs its prefix
 bytes per datagram. Reservation does not validate the bitstream contents. SOF/EOF flags mark each block, while block indices distinguish actual frame
 boundaries. Only the first block contains the short frame header.
 
-The header reports IDR when a type-5 NAL is present, otherwise a normal picture,
+For H.264 the header reports IDR when a type-5 NAL is present, otherwise a normal picture,
 and leaves unknown processing latency at zero. Validation checks Annex B framing,
 NAL headers, and the presence of a picture. It is not a decoder or proof that SPS,
 PPS, slice contents, or reference dependencies are valid.
+
+`new_with_codec(..., VideoCodec::Hevc)` selects the separate HEVC header path;
+`new()` remains H.264. HEVC accepts closed-GOP IDR NAL types 19/20 only when VPS,
+SPS and PPS (types 32/33/34) precede the picture in that order. It rejects CRA,
+RASL, mixed access-point types, multilayer headers and malformed two-byte NAL
+headers. It does not parse slice syntax or prove Main profile, color signaling,
+parameter-set references or a single coded picture. HEVC must remain unadvertised
+until encoder output and negotiated session configuration match these limits.
 
 ## FEC and bounds
 
@@ -113,6 +121,6 @@ require the separately compiled pinned C executable; they do not silently pass
 when it is missing.
 
 Actual Moonlight application streaming, the complete C queue/depacketizer,
-encrypted video, HEVC/AV1, long frame headers, and reference-invalidation signalling
+encrypted video, end-to-end HEVC/AV1, long frame headers, and reference-invalidation signalling
 remain unqualified or unimplemented. Successful FEC recovery does not qualify the
 remaining control, transport, audio, timing, or hardware pipeline.

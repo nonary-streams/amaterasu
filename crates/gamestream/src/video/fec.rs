@@ -97,7 +97,7 @@ impl VideoPacketizer {
     ) -> Result<Vec<Vec<u8>>, VideoError> {
         let total_bytes = access_unit.len() + FRAME_BYTES;
         let blocks = plan_blocks(total_bytes.div_ceil(self.payload_bytes), self.config)?;
-        let is_idr = validate_annex_b(access_unit)?;
+        let is_idr = validate_annex_b(access_unit, self.codec)?;
         let mut frame = Vec::with_capacity(total_bytes);
         frame.extend_from_slice(&short_frame_header(
             is_idr,

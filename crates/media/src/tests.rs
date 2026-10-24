@@ -64,6 +64,22 @@ fn packet_validation_distinguishes_payloads_from_end_of_stream() {
         sequence: 1,
     };
     assert!(packet.validate().is_ok());
+    assert!(
+        EncodedPacket {
+            codec: CODEC_HEVC,
+            ..packet
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        EncodedPacket {
+            codec: CODEC_HEVC + 1,
+            ..packet
+        }
+        .validate()
+        .is_err()
+    );
     assert!(EncodedPacket { len: 0, ..packet }.validate().is_err());
     assert!(
         EncodedPacket {

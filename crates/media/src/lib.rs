@@ -29,6 +29,7 @@ pub const CAPTURE_FRAME_FRESH: u32 = 1;
 pub const PIXEL_BGRA8: u32 = 1;
 pub const PIXEL_NV12: u32 = 2;
 pub const CODEC_H264: u32 = 1;
+pub const CODEC_HEVC: u32 = 2;
 pub const FLAG_KEYFRAME: u32 = 1;
 pub const FLAG_END_OF_STREAM: u32 = 2;
 /// Last fragment of one complete coded picture. Earlier fragments share its
@@ -118,7 +119,7 @@ impl FrameSink {
     }
 }
 
-/// H.264 packets use Annex B start codes, not AVCC length prefixes. An encoder
+/// H.264 and HEVC packets use Annex B start codes, not length prefixes. An encoder
 /// may emit several packets for one submitted sequence. The final fragment sets
 /// FLAG_END_OF_ACCESS_UNIT. EOS carries no bytes and cannot terminate a partial AU.
 #[repr(C)]
@@ -134,7 +135,7 @@ pub struct EncodedPacket {
 
 impl EncodedPacket {
     pub fn validate(&self) -> Result<(), Status> {
-        if self.codec != CODEC_H264
+        if !matches!(self.codec, CODEC_H264 | CODEC_HEVC)
             || self.flags & !(FLAG_KEYFRAME | FLAG_END_OF_STREAM | FLAG_END_OF_ACCESS_UNIT) != 0
         {
             return Err(STATUS_INVALID_ARGUMENT);
