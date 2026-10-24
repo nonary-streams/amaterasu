@@ -127,9 +127,9 @@ impl<T: VhfTransport> DeviceSink for VhfDeviceSink<T> {
                 extended,
                 pressed,
             } => self.key(*scan_code, *extended, *pressed),
-            InputEvent::EvdevKey { .. } | InputEvent::EvdevKeyRepeat { .. } => {
-                Err(InputError::InvalidEvent)
-            }
+            InputEvent::EvdevKey { .. }
+            | InputEvent::EvdevKeyRepeat { .. }
+            | InputEvent::Absolute { .. } => Err(InputError::InvalidEvent),
             InputEvent::MouseButton { button, pressed } => {
                 let bit = match button {
                     MouseButton::Left => 0,
@@ -351,6 +351,10 @@ mod tests {
         );
         assert_eq!(
             sink.submit(&InputEvent::EvdevKeyRepeat { code: 30 }),
+            Err(InputError::InvalidEvent)
+        );
+        assert_eq!(
+            sink.submit(&InputEvent::Absolute { x: 0, y: u16::MAX }),
             Err(InputError::InvalidEvent)
         );
         for code in [30, 31, 32, 33, 34, 35] {

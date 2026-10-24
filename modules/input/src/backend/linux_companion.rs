@@ -21,6 +21,10 @@ fn evdev_key_event(code: u16, state: KeyState) -> InputEvent {
     }
 }
 
+fn absolute_pointer_event(x: u16, y: u16) -> InputEvent {
+    InputEvent::Absolute { x, y }
+}
+
 pub struct LinuxCompanionBackend {
     socket_path: String,
     client: Option<LinuxInputClient>,
@@ -75,7 +79,7 @@ impl Backend for LinuxCompanionBackend {
     }
 
     fn absolute_pointer(&self) -> bool {
-        false
+        true
     }
 
     fn pen_touch_supported(&self) -> bool {
@@ -119,12 +123,9 @@ impl Backend for LinuxCompanionBackend {
             }
             Event::Button { .. }
             | Event::Relative { .. }
+            | Event::Absolute { .. }
             | Event::Scroll { .. }
             | Event::ScrollUnits { .. } => Ok(()),
-            Event::Absolute { .. } => Err(InputError::new(
-                "unsupported_event",
-                "Linux absolute pointer mapping is compositor-specific",
-            )),
             Event::PenTouch { .. } => Err(InputError::new(
                 "pen_touch_unavailable",
                 "Linux input companion does not grant pen or touch devices",
@@ -179,6 +180,7 @@ impl Backend for LinuxCompanionBackend {
                 dx: i16::try_from(*dx).map_err(|_| invalid_event())?,
                 dy: i16::try_from(*dy).map_err(|_| invalid_event())?,
             }),
+            Event::Absolute { x, y } => self.send(absolute_pointer_event(*x, *y)),
             Event::Scroll { axis, steps } => {
                 let units = i16::try_from(steps * 120).map_err(|_| invalid_event())?;
                 self.scroll(*axis, units)
@@ -266,7 +268,17 @@ fn companion_error(error: amaterasu_input_companion::InputError) -> InputError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Axis, InputEvent, KeyState, evdev_key_event, scroll_events};
+    use super::{
+        Axis, InputEvent, KeyState, absolute_pointer_event, evdev_key_event, scroll_events,
+    };
+
+    #[test]
+    fn absolute_pointer_mapping_preserves_normalized_coordinate_bounds() {
+        assert_eq!(
+            absolute_pointer_event(0, u16::MAX),
+            InputEvent::Absolute { x: 0, y: u16::MAX }
+        );
+    }
 
     #[test]
     fn key_repeat_uses_evdev_repeat_without_a_transition() {

@@ -2,9 +2,10 @@
 //!
 //! The host keeps `LinuxInputService` and calls `authorize_worker` only after
 //! its signed-set policy permits the worker. The worker receives no device
-//! descriptor; it can submit only bounded keyboard and relative-pointer intent
-//! over a same-user Unix socket. This is an API authorization boundary, not a
-//! sandbox for trusted native modules running in the host process.
+//! descriptor; it can submit only bounded keyboard and relative or normalized
+//! absolute-pointer intent over a same-user Unix socket. This is an API
+//! authorization boundary, not a sandbox for trusted native modules running in
+//! the host process.
 use crate::{
     DeviceSink, GrantRegistry, InputError, InputEvent, InputPacket, InputResult, InputSession,
     MouseButton, PROTOCOL_VERSION, PermitLedger, ProcessIdentity,
@@ -30,6 +31,9 @@ const MAX_SCROLL_DELTA: i32 = 12_000;
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
 const EV_REL: u16 = 2;
+const EV_ABS: u16 = 3;
+const ABS_X: u16 = 0;
+const ABS_Y: u16 = 1;
 const REL_X: u16 = 0;
 const REL_Y: u16 = 1;
 const REL_HWHEEL: u16 = 6;
@@ -37,10 +41,14 @@ const REL_WHEEL: u16 = 8;
 const REL_HWHEEL_HI_RES: u16 = 12;
 const REL_WHEEL_HI_RES: u16 = 11;
 const KEY_UNKNOWN: u32 = 240;
+const INPUT_PROP_POINTER: u32 = 0;
 const UI_SET_EVBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 100);
 const UI_SET_KEYBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 101);
 const UI_SET_RELBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 102);
+const UI_SET_ABSBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 103);
+const UI_SET_PROPBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 110);
 const UI_DEV_SETUP: libc::Ioctl = libc::_IOW::<libc::uinput_setup>(b'U' as u32, 3);
+const UI_ABS_SETUP: libc::Ioctl = libc::_IOW::<libc::uinput_abs_setup>(b'U' as u32, 4);
 const UI_DEV_CREATE: libc::Ioctl = libc::_IO(b'U' as u32, 1);
 const UI_DEV_DESTROY: libc::Ioctl = libc::_IO(b'U' as u32, 2);
 
@@ -723,6 +731,11 @@ impl DeviceSink for LinuxUinputSink {
                 .as_ref()
                 .ok_or(InputError::PermissionDenied)?
                 .emit(&[(EV_KEY, *code, 2)]),
+            InputEvent::Absolute { x, y } => self
+                .pointer
+                .as_ref()
+                .ok_or(InputError::PermissionDenied)?
+                .emit(&absolute_pointer_events(*x, *y)),
             InputEvent::MouseButton { button, pressed } => self
                 .pointer
                 .as_ref()
@@ -835,6 +848,7 @@ impl UinputDevice {
                 }
             }
         } else {
+            set_bit(fd, UI_SET_PROPBIT, INPUT_PROP_POINTER)?;
             for code in 0x110..=0x114 {
                 set_bit(fd, UI_SET_KEYBIT, code)?;
             }
@@ -849,6 +863,9 @@ impl UinputDevice {
             ] {
                 set_bit(fd, UI_SET_RELBIT, u32::from(code))?;
             }
+            set_bit(fd, UI_SET_EVBIT, u32::from(EV_ABS))?;
+            configure_absolute_axis(fd, ABS_X)?;
+            configure_absolute_axis(fd, ABS_Y)?;
         }
         // SAFETY: uinput_setup contains integer fields and a fixed name buffer;
         // it is fully initialized before the kernel reads it.
@@ -1050,6 +1067,27 @@ fn set_bit(fd: RawFd, request: libc::Ioctl, bit: u32) -> InputResult<()> {
     check(unsafe { libc::ioctl(fd, request, bit as libc::c_int) })
 }
 
+fn configure_absolute_axis(fd: RawFd, code: u16) -> InputResult<()> {
+    set_bit(fd, UI_SET_ABSBIT, u32::from(code))?;
+    let setup = libc::uinput_abs_setup {
+        code,
+        absinfo: libc::input_absinfo {
+            value: 0,
+            minimum: 0,
+            maximum: i32::from(u16::MAX),
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+        },
+    };
+    // SAFETY: the initialized integer-only UAPI record stays valid for this ioctl.
+    check(unsafe { libc::ioctl(fd, UI_ABS_SETUP, &setup) })
+}
+
+fn absolute_pointer_events(x: u16, y: u16) -> [(u16, u16, i32); 2] {
+    [(EV_ABS, ABS_X, i32::from(x)), (EV_ABS, ABS_Y, i32::from(y))]
+}
+
 fn check(result: libc::c_int) -> InputResult<()> {
     if result < 0 {
         Err(InputError::Device)
@@ -1094,6 +1132,14 @@ mod tests {
         assert_eq!(
             listener_exit_diagnostic(Ok(Err(InputError::Device))).as_deref(),
             Some("input companion listener ended: Device")
+        );
+    }
+
+    #[test]
+    fn absolute_pointer_events_preserve_normalized_coordinate_bounds() {
+        assert_eq!(
+            absolute_pointer_events(0, u16::MAX),
+            [(EV_ABS, ABS_X, 0), (EV_ABS, ABS_Y, i32::from(u16::MAX))]
         );
     }
 

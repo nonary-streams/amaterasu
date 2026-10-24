@@ -72,6 +72,12 @@ pub enum InputEvent {
     EvdevKeyRepeat {
         code: u16,
     },
+    /// Normalized desktop pointer coordinates in the inclusive 0..=65535 range.
+    /// This is stateless and does not add an entry to the held-input ledger.
+    Absolute {
+        x: u16,
+        y: u16,
+    },
     MouseButton {
         button: MouseButton,
         pressed: bool,

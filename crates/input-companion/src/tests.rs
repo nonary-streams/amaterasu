@@ -359,8 +359,29 @@ fn invalid_events_and_device_grants_do_not_reach_the_sink() {
         ),
         Err(InputError::PermissionDenied)
     );
+    assert_eq!(
+        session.submit(&packet(1, InputEvent::Absolute { x: u16::MAX, y: 0 }), now,),
+        Err(InputError::PermissionDenied)
+    );
     assert!(session.sink.sent.is_empty());
+    assert!(serde_json::from_str::<InputEvent>(r#"{"kind":"absolute","x":65536,"y":0}"#).is_err());
+    assert!(serde_json::from_str::<InputEvent>(r#"{"kind":"absolute","x":0,"y":-1}"#).is_err());
     assert!(serde_json::from_str::<InputPacket>(r#"{"version":1,"generation":7,"sequence":1,"lease_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","event":{"kind":"raw_report","report_id":1}}"#).is_err());
+}
+
+#[test]
+fn absolute_pointer_uses_mouse_grant_without_adding_held_cleanup() {
+    let now = Instant::now();
+    let mut session = connect(now, FakeDevice::default());
+    let absolute = InputEvent::Absolute { x: u16::MAX, y: 0 };
+
+    assert_eq!(absolute.transition(), None);
+    session.submit(&packet(1, absolute.clone()), now).unwrap();
+    assert_eq!(session.sink.sent, [absolute.clone()]);
+    session.revoke().unwrap();
+
+    assert_eq!(session.sink.sent, [absolute]);
+    assert_eq!(session.sink.releases, 1);
 }
 
 #[test]
