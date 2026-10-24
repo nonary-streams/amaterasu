@@ -201,6 +201,25 @@ impl PipeWireState {
     }
 }
 
+pub fn validate_operation_id(id: &str) -> CaptureResult<()> {
+    if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+        Err("invalid_operation_id")
+    } else {
+        Ok(())
+    }
+}
+
+pub fn new_id() -> CaptureResult<u64> {
+    let mut bytes = [0; 8];
+    getrandom::fill(&mut bytes).map_err(|_| "entropy_error")?;
+    let value = u64::from_le_bytes(bytes);
+    if value == 0 {
+        Err("entropy_error")
+    } else {
+        Ok(value)
+    }
+}
+
 #[cfg(test)]
 mod diagnostics_tests {
     use super::*;
@@ -219,24 +238,5 @@ mod diagnostics_tests {
         assert_eq!(SourceStage::from_native(99), None);
         assert_eq!(PipeWireState::from_native(-1), Some(PipeWireState::Error));
         assert_eq!(PipeWireState::from_native(i32::MAX), None);
-    }
-}
-
-pub fn validate_operation_id(id: &str) -> CaptureResult<()> {
-    if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
-        Err("invalid_operation_id")
-    } else {
-        Ok(())
-    }
-}
-
-pub fn new_id() -> CaptureResult<u64> {
-    let mut bytes = [0; 8];
-    getrandom::fill(&mut bytes).map_err(|_| "entropy_error")?;
-    let value = u64::from_le_bytes(bytes);
-    if value == 0 {
-        Err("entropy_error")
-    } else {
-        Ok(value)
     }
 }
