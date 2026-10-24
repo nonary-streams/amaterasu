@@ -2488,6 +2488,9 @@ mod tests {
                 .disk_root
                 .is_none()
         );
+        #[cfg(unix)]
+        fs::remove_file(&child).unwrap();
+        #[cfg(windows)]
         fs::remove_dir(&child).unwrap();
 
         let mut cache = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));

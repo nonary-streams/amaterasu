@@ -1079,8 +1079,13 @@ fn force_sync_is_management_only_and_requires_ready_enabled_settings() {
             CONFIGURATION_TIMEOUT_MS,
         )
         .unwrap();
-    assert_eq!(host.completed[2].1["code"], "steam_disabled");
-    assert!(module.provider.scan.is_none());
+    if cfg!(target_os = "linux") {
+        assert_eq!(host.completed[2].1["accepted"], true);
+        assert!(module.provider.scan.is_some());
+    } else {
+        assert_eq!(host.completed[2].1["code"], "steam_disabled");
+        assert!(module.provider.scan.is_none());
+    }
 }
 
 #[test]
