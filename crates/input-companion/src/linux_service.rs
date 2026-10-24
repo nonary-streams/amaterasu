@@ -1519,7 +1519,7 @@ impl UinputDevice {
                     (EV_UINPUT, UI_FF_ERASE, request_id) if request_id >= 0 => {
                         self.erase_rumble(request_id as u32)?;
                     }
-                    (EV_FF, effect_id, value @ (0 | 1)) => {
+                    (EV_FF, effect_id, value) if value >= 0 => {
                         let effect = self
                             .rumble_effects
                             .get(&(effect_id as i16))
@@ -1527,12 +1527,7 @@ impl UinputDevice {
                             .ok_or(InputError::InvalidEvent)?;
                         push_latest_slot_feedback(
                             &mut feedback,
-                            GamepadFeedback {
-                                slot,
-                                strong_motor: if value == 1 { effect.strong_motor } else { 0 },
-                                weak_motor: if value == 1 { effect.weak_motor } else { 0 },
-                                duration_ms: if value == 1 { effect.duration_ms } else { 0 },
-                            },
+                            rumble_play_feedback(slot, effect, value)?,
                         );
                     }
                     (EV_FF, _, _) | (EV_UINPUT, _, _) => return Err(InputError::InvalidEvent),
@@ -1623,6 +1618,29 @@ impl UinputDevice {
         }
         Ok(())
     }
+}
+
+fn rumble_play_feedback(
+    slot: u16,
+    effect: RumbleEffect,
+    playback_count: i32,
+) -> InputResult<GamepadFeedback> {
+    if playback_count < 0 {
+        return Err(InputError::InvalidEvent);
+    }
+    let playing = playback_count > 0;
+    Ok(GamepadFeedback {
+        slot,
+        strong_motor: if playing { effect.strong_motor } else { 0 },
+        weak_motor: if playing { effect.weak_motor } else { 0 },
+        duration_ms: if playing {
+            (u32::from(effect.duration_ms)
+                * (playback_count as u32).min(u32::from(MAX_RUMBLE_DURATION_MS)))
+            .min(u32::from(MAX_RUMBLE_DURATION_MS)) as u16
+        } else {
+            0
+        },
+    })
 }
 
 fn push_latest_slot_feedback(events: &mut Vec<GamepadFeedback>, feedback: GamepadFeedback) {
@@ -2294,6 +2312,36 @@ mod tests {
         assert!(validated_rumble_effect(effect(FF_RUMBLE, -1, 400, 0)).is_none());
         assert!(validated_rumble_effect(effect(FF_RUMBLE, 16, 400, 0)).is_none());
         assert!(validated_rumble_effect(effect(FF_RUMBLE, 2, 400, 1)).is_none());
+    }
+
+    #[test]
+    fn repeated_rumble_play_counts_are_valid_starts_and_zero_stops() {
+        let effect = RumbleEffect {
+            strong_motor: 500,
+            weak_motor: 250,
+            duration_ms: 400,
+        };
+        for (playback_count, duration_ms) in [(1, 400), (2, 800), (i32::MAX, 10_000)] {
+            assert_eq!(
+                rumble_play_feedback(3, effect, playback_count),
+                Ok(GamepadFeedback {
+                    slot: 3,
+                    strong_motor: 500,
+                    weak_motor: 250,
+                    duration_ms,
+                })
+            );
+        }
+        assert_eq!(
+            rumble_play_feedback(3, effect, 0),
+            Ok(GamepadFeedback {
+                slot: 3,
+                strong_motor: 0,
+                weak_motor: 0,
+                duration_ms: 0,
+            })
+        );
+        assert!(rumble_play_feedback(3, effect, -1).is_err());
     }
 
     #[test]
