@@ -258,6 +258,7 @@ fn stage_native_candidate_with_revision(
     }
     verify_candidate(approved, catalog, candidate, source, bootstrap, now)?;
     let _lock = RootLock::acquire(root)?;
+    require_current_development_bootstrap(root, bootstrap)?;
     let selection_path = root.join("selection.json");
     let (mut selection, revision) = read_selection_with_revision(root)?;
     if expected_revision.is_some_and(|expected| expected != revision) {
@@ -341,6 +342,7 @@ pub fn activate_staged_native(
             return Err("staged native set is absent from the current catalog".into());
         }
         let _lock = RootLock::acquire(root)?;
+        require_current_development_bootstrap(root, bootstrap)?;
         let mut selection: ActivationState = read_json(&selection_path)?;
         let source = selection
             .repository_sets
@@ -391,6 +393,7 @@ fn authorize_staged_native_locked(
     }
     let selection_path = root.join("selection.json");
     let _lock = RootLock::acquire(root)?;
+    require_current_development_bootstrap(root, bootstrap)?;
     let (mut selection, revision) = read_selection_with_revision(root)?;
     if revision != expected_revision {
         return Err(SELECTION_REVISION_CONFLICT.into());
@@ -443,6 +446,7 @@ fn restore_previous_healthy_native_locked(
 ) -> PackageResult<()> {
     let selection_path = root.join("selection.json");
     let _lock = RootLock::acquire(root)?;
+    require_current_development_bootstrap(root, bootstrap)?;
     let (mut selection, revision) = read_selection_with_revision(root)?;
     if revision != expected_revision || selection.active.as_deref() != expected_active_digest {
         return Err(SELECTION_REVISION_CONFLICT.into());
@@ -507,6 +511,30 @@ fn validate_revision(revision: &str) -> PackageResult<()> {
     } else {
         Err("invalid native selection revision".into())
     }
+}
+
+/// Revalidates the host-owned development policy while `RootLock` is held.
+/// This prevents a caller that captured development settings before a root
+/// transition from staging or authorizing against stale policy.
+fn require_current_development_bootstrap(
+    root: &Path,
+    expected: &BootstrapConfig,
+) -> PackageResult<()> {
+    if !expected.development {
+        return Err("repository native operation requires a development root".into());
+    }
+    let current_bytes = read_bounded(&root.join("bootstrap.json"), 1024 * 1024)?;
+    let current: BootstrapConfig =
+        serde_json::from_slice(&current_bytes).map_err(|error| error.to_string())?;
+    if !current.development {
+        return Err("current host bootstrap is not in development mode".into());
+    }
+    let expected_bytes = serde_json::to_vec(expected).map_err(|error| error.to_string())?;
+    let current_bytes = serde_json::to_vec(&current).map_err(|error| error.to_string())?;
+    if current_bytes != expected_bytes {
+        return Err("host bootstrap changed; reload before native package operation".into());
+    }
+    Ok(())
 }
 
 fn read_selection_with_revision(root: &Path) -> PackageResult<(ActivationState, String)> {

@@ -54,6 +54,7 @@ impl Fixture {
             trusted_keys: BTreeMap::new(),
             policy: RuntimeConfig::default(),
         };
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
         Self {
             root,
             signer,
@@ -626,6 +627,31 @@ fn cached_native_stage_and_trial_authorization_are_exact_and_revision_guarded() 
     .unwrap();
 
     let before = read_native_selection(&fixture.root).unwrap();
+    let mut production_bootstrap = fixture.bootstrap.clone();
+    production_bootstrap.development = false;
+    write_json_atomically(&fixture.root.join("bootstrap.json"), &production_bootstrap).unwrap();
+    assert!(
+        stage_cached_native_candidate(
+            &fixture.root,
+            &fixture.bootstrap,
+            &store,
+            &fixture.approved.id,
+            catalog.digest(),
+            &candidate,
+            &before.revision,
+            100,
+        )
+        .is_err()
+    );
+    assert!(
+        !fixture
+            .root
+            .join("sets")
+            .join(&candidate.manifest_sha256)
+            .exists()
+    );
+    write_json_atomically(&fixture.root.join("bootstrap.json"), &fixture.bootstrap).unwrap();
+
     let staged = stage_cached_native_candidate(
         &fixture.root,
         &fixture.bootstrap,
@@ -662,6 +688,31 @@ fn cached_native_stage_and_trial_authorization_are_exact_and_revision_guarded() 
         read_native_selection(&fixture.root).unwrap().revision,
         staged.revision
     );
+
+    let mut changed_bootstrap = fixture.bootstrap.clone();
+    changed_bootstrap.policy.settings.insert(
+        "amaterasu.test-change".into(),
+        serde_json::json!({"changed": true}),
+    );
+    write_json_atomically(&fixture.root.join("bootstrap.json"), &changed_bootstrap).unwrap();
+    assert!(
+        authorize_staged_native_trial(
+            &fixture.root,
+            &fixture.bootstrap,
+            &store,
+            &fixture.approved.id,
+            catalog.digest(),
+            &candidate.manifest_sha256,
+            &staged.revision,
+            100,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        read_native_selection(&fixture.root).unwrap().revision,
+        staged.revision
+    );
+    write_json_atomically(&fixture.root.join("bootstrap.json"), &fixture.bootstrap).unwrap();
 
     let pending = authorize_staged_native_trial(
         &fixture.root,
@@ -782,6 +833,29 @@ fn previous_healthy_native_restore_is_trusted_cas_and_keeps_release_floor() {
     write_json_atomically(&selection_path, &selection).unwrap();
 
     let before_restore = read_native_selection(&fixture.root).unwrap();
+    let mut changed_bootstrap = fixture.bootstrap.clone();
+    changed_bootstrap.policy.settings.insert(
+        "amaterasu.test-change".into(),
+        serde_json::json!({"changed": true}),
+    );
+    write_json_atomically(&fixture.root.join("bootstrap.json"), &changed_bootstrap).unwrap();
+    assert!(
+        restore_previous_healthy_native(
+            &fixture.root,
+            &fixture.bootstrap,
+            &store,
+            Some(&second_candidate.manifest_sha256),
+            &before_restore.revision,
+            100,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        read_native_selection(&fixture.root).unwrap().revision,
+        before_restore.revision
+    );
+    write_json_atomically(&fixture.root.join("bootstrap.json"), &fixture.bootstrap).unwrap();
+
     let restored = restore_previous_healthy_native(
         &fixture.root,
         &fixture.bootstrap,
