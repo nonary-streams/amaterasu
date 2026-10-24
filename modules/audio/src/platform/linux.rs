@@ -3125,6 +3125,59 @@ mod tests {
         let _ = client.unload_module(module_index);
         result.expect("monitor produces silent virtual packets");
     }
+
+    #[test]
+    #[ignore = "60-second native Pulse worker qualification; creates an owned null sink without changing defaults or routing playback"]
+    fn sustains_private_monitor_worker_for_one_minute() {
+        use crate::worker::{Source, Worker};
+        let mut client = PulseClient::connect().expect("user Pulse server is available");
+        let name = format!("amaterasu_qual_{}", std::process::id());
+        let module_index = client
+            .load_null_sink(&name, 2, "sustained-test-owner")
+            .expect("owned null sink loads");
+        // Unwind inside the scope so even assertion failures unload our sink.
+        let result = std::panic::catch_unwind(|| {
+            let (mut worker, endpoint, format) =
+                Worker::open(name.clone(), None, None, None, true, true)
+                    .expect("worker binds only the private monitor");
+            assert_eq!(endpoint, name);
+            assert_eq!(format.sample_rate, 48_000);
+            let started = Instant::now();
+            let mut packets = 0;
+            let mut last_timestamp = None;
+            let mut next_pause = Duration::from_secs(1);
+            while started.elapsed() < Duration::from_secs(60) {
+                for _ in 0..32 {
+                    let Some(packet) = worker.read().expect("native PCM worker remains healthy")
+                    else {
+                        break;
+                    };
+                    assert_eq!(packet.sequence, packets);
+                    if let Some(previous) = last_timestamp {
+                        assert!(packet.timestamp_us >= previous);
+                    }
+                    last_timestamp = Some(packet.timestamp_us);
+                    packets += 1;
+                }
+                assert_eq!(worker.health().failure, None);
+                if started.elapsed() >= next_pause {
+                    // Model ordinary downstream scheduling delay, then catch up.
+                    thread::sleep(Duration::from_millis(100));
+                    next_pause += Duration::from_secs(1);
+                } else {
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+            assert!(packets >= 4_000, "insufficient PCM progress: {packets}");
+            assert_eq!(worker.health().dropped_packets, 0);
+        });
+        client
+            .unload_module(module_index)
+            .expect("owned null sink unloads");
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]

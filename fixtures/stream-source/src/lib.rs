@@ -14,6 +14,7 @@ const METRICS: &str = "test.stream-source/1";
 #[serde(default, deny_unknown_fields)]
 struct Settings {
     desktop_geometry: bool,
+    sustain_ms: u32,
 }
 
 struct StreamSource {
@@ -29,7 +30,13 @@ impl ManagedModule for StreamSource {
         };
         let settings: Settings = serde_json::from_value(payload)
             .map_err(|error| format!("invalid stream source settings: {error}"))?;
-        let state = Arc::new(Mutex::new(Controller::new(settings.desktop_geometry)));
+        if settings.sustain_ms > 300_000 {
+            return Err("fixture sustain_ms exceeds five minutes".into());
+        }
+        let state = Arc::new(Mutex::new(Controller::with_duration(
+            settings.desktop_geometry,
+            settings.sustain_ms,
+        )));
         let factories =
             [Kind::Video, Kind::Audio].map(|kind| native::Factory::new(state.clone(), kind));
         for (kind, factory) in [Kind::Video, Kind::Audio].into_iter().zip(&factories) {

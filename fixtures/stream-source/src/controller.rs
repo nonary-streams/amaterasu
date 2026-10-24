@@ -2,6 +2,7 @@ use amaterasu_media::*;
 use amaterasu_module_sdk::abi::{STATUS_OK, Status};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 pub type Result<T> = std::result::Result<T, &'static str>;
 pub type Reply = (Value, Option<(Kind, u64)>);
@@ -30,6 +31,8 @@ struct Stream {
     eos: bool,
     unsupported_audio: bool,
     geometry_failed: bool,
+    started: Instant,
+    sustain_ms: u32,
 }
 
 impl Stream {
@@ -62,12 +65,19 @@ pub struct Controller {
     video_fragments: u64,
     audio_packets: u64,
     desktop_geometry: bool,
+    sustain_ms: u32,
 }
 
 impl Controller {
+    #[cfg(test)]
     pub fn new(desktop_geometry: bool) -> Self {
+        Self::with_duration(desktop_geometry, 0)
+    }
+
+    pub fn with_duration(desktop_geometry: bool, sustain_ms: u32) -> Self {
         Self {
             desktop_geometry,
+            sustain_ms,
             ..Self::default()
         }
     }
@@ -169,6 +179,8 @@ impl Controller {
                 eos: false,
                 unsupported_audio: payload["endpoint"] == "synthetic-unsupported-format",
                 geometry_failed: false,
+                started: Instant::now(),
+                sustain_ms: self.sustain_ms,
             },
         );
         if let Some(operation) = operation {
@@ -205,7 +217,7 @@ impl Controller {
                 "ok": true, "stream": id,
                 "state": stream.video_state(),
                 "packet_boundaries": true, "supports_packet_boundaries": true,
-                "fixture": true, "decodable_video": false
+                "fixture": true, "decodable_video": stream.sustain_ms != 0
             }),
             Kind::Audio => json!({
                 "ok": true, "stream": id,
@@ -266,7 +278,13 @@ impl Controller {
         if stream.eos {
             return MEDIA_PENDING;
         }
-        if stream.delivered >= FRAMES * 2 {
+        let sustained = stream.sustain_ms != 0;
+        let frame_limit = if sustained {
+            u64::from(stream.sustain_ms) * 30 / 1000
+        } else {
+            FRAMES
+        };
+        if stream.delivered >= frame_limit * 2 || (sustained && stream.draining) {
             if !stream.draining {
                 return MEDIA_PENDING;
             }
@@ -285,12 +303,21 @@ impl Controller {
             return status;
         }
         let sequence = stream.delivered / 2;
+        if sustained && stream.started.elapsed().as_micros() < u128::from(sequence) * 1_000_000 / 30
+        {
+            return MEDIA_PENDING;
+        }
         let last = stream.delivered % 2 == 1;
-        let complete = video_bytes(sequence);
-        let bytes = if last {
-            &complete[850..]
+        let complete = if sustained {
+            include_bytes!("sustained-idr.h264").to_vec()
         } else {
-            &complete[..850]
+            video_bytes(sequence)
+        };
+        let midpoint = complete.len() / 2;
+        let bytes = if last {
+            &complete[midpoint..]
+        } else {
+            &complete[..midpoint]
         };
         let packet = EncodedPacket {
             codec: CODEC_H264,
@@ -301,7 +328,11 @@ impl Controller {
             },
             data: bytes.as_ptr(),
             len: bytes.len(),
-            timestamp_us: sequence * 10_000,
+            timestamp_us: if sustained {
+                sequence * 1_000_000 / 30
+            } else {
+                sequence * 10_000
+            },
             sequence,
         };
         // SAFETY: local packet and initialized bytes remain live until sink returns.
@@ -319,14 +350,24 @@ impl Controller {
         let Ok(stream) = self.owned_mut(owner, Kind::Audio, id) else {
             return MEDIA_CLOSED;
         };
-        if stream.delivered >= FRAMES {
+        let sustained = stream.sustain_ms != 0;
+        let frame_limit = if sustained {
+            u64::from(stream.sustain_ms) / 10
+        } else {
+            FRAMES
+        };
+        if stream.delivered >= frame_limit {
             return MEDIA_PENDING;
         }
         let sequence = stream.delivered;
+        if sustained && stream.started.elapsed().as_micros() < u128::from(sequence) * 10_000 {
+            return MEDIA_PENDING;
+        }
         let frames = if stream.unsupported_audio { 441 } else { 480 };
         let mut bytes = Vec::with_capacity(frames * 4);
         for frame in 0..frames as i16 {
-            let sample = ((frame + sequence as i16 * 13) % 100 - 50) * 100;
+            let sample =
+                ((i64::from(frame) + (sequence % 100) as i64 * 13) % 100 - 50) as i16 * 100;
             bytes.extend_from_slice(&sample.to_le_bytes());
             bytes.extend_from_slice(&(-sample).to_le_bytes());
         }
