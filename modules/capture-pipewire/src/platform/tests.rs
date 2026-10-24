@@ -23,7 +23,7 @@ fn unresponsive_bus_probe_child() {
     );
     // Start a worker against the same silent bus, then cancel authentication.
     // No connection can reach CreateSession or invoke a picker in this test.
-    let selection = backend.select(SourceType::Monitor, 5).unwrap();
+    let selection = backend.select("test", SourceType::Monitor, 5).unwrap();
     thread::sleep(Duration::from_millis(100));
     let diagnostics = selection.diagnostics();
     assert!(diagnostics.pipewire_node.is_none());
@@ -135,6 +135,12 @@ fn memfd_extent_is_checked_without_mapping_or_reading_pixels() {
 #[test]
 fn adapter_callback_copies_pixels_into_the_stable_mailbox_allocation() {
     let mailbox = Arc::new(Mailbox::default());
+    let context = Box::new(CallbackContext {
+        mailbox: mailbox.clone(),
+        store: None,
+        owner: "test".into(),
+        source: SourceType::Monitor,
+    });
     let mut bytes = [42u8; 16];
     let plane = Plane {
         data: bytes.as_ptr(),
@@ -154,7 +160,7 @@ fn adapter_callback_copies_pixels_into_the_stable_mailbox_allocation() {
     assert_eq!(
         unsafe {
             frame_callback(
-                Arc::as_ptr(&mailbox).cast_mut().cast(),
+                (&*context as *const CallbackContext).cast_mut().cast(),
                 &plane,
                 2,
                 2,

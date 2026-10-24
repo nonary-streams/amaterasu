@@ -10,7 +10,7 @@ libraries are distribution prerequisites. Native API grants do not sandbox code.
 Settings default to disabled selection and capture:
 
 ```json
-{"enabled":false,"selection_principals":[],"capture_principals":[],"idle_timeout_seconds":60,"selection_timeout_seconds":120}
+{"enabled":false,"selection_principals":[],"capture_principals":[],"idle_timeout_seconds":60,"selection_timeout_seconds":120,"remember_source":false}
 ```
 
 An administrator-controlled startup policy must enable capture and separately
@@ -25,7 +25,7 @@ version, source and cursor masks only. It never creates a
 session or opens a picker, including when disabled. `native_supported` identifies
 the built adapter; `availability.available` separately reports the startup probe.
 Missing session bus or portal has an explicit reason. No alternate user bus,
-headless source, inherited permission, restore token, or persistent grant is used.
+headless source or inherited permission is used. Persistent permission is opt-in as described below.
 
 All control actions are lower-case:
 
@@ -38,7 +38,7 @@ All control actions are lower-case:
   The optional offset must be zero and limit is 1 through 256.
 - `{"action":"select_source","source_type":"monitor","operation_id":"choose-1"}`
   asynchronously requests a user choice. `window` is also supported. This is the
-  only action that can present a portal picker; disabled or unallowlisted calls
+  normal initial approval action; disabled or unallowlisted calls
   fail before native worker allocation. A successful response initially reports
   `selection_state:"selecting"`. At most one selection or active lease is allowed.
 - `{"action":"poll_selection","operation_id":"choose-1"}` returns the
@@ -53,8 +53,8 @@ All control actions are lower-case:
   do not reopen the picker. Use a new operation ID to request a new choice.
 - `{"action":"open","output":"portal-...","operation_id":"video-1"}`
   requires a capture principal and acquires its single caller-owned native capture lease. Optional `constant_rate`
-  defaults to false; true fails with `unsupported_constant_rate`. Open never
-  presents a picker and fails with `source_selection_required` unless ready.
+  defaults to false; true fails with `unsupported_constant_rate`. Without a ready
+  source or an enabled saved authorization, Open fails with `source_selection_required`.
 - `{"action":"lookup","operation_id":"video-1"}` recovers only that
   caller's live lease. `{"action":"close","stream":123}` is idempotent for
   its owner and closes the source session. Close atomically stops admission of
@@ -71,8 +71,8 @@ active stream. Global accepted counters may include a sink that finished
 concurrently with a close.
 
 The private C adapter owns GDBus/PipeWire structs and worker cleanup. Selection
-uses CreateSession, SelectSources (one monitor/window, hidden cursor, no restore
-token) and Start, then opens only the restricted OpenPipeWireRemote FD. Portal
+uses CreateSession, SelectSources (one monitor/window, hidden cursor) and Start,
+then opens only the restricted OpenPipeWireRemote FD. Portal
 v6 serial targeting is used when supplied; earlier portals target their returned
 node while the session is alive. One worker iterates its private GLib context and
 PipeWire loop. Bus authentication and method I/O have cancellation/deadlines;
@@ -114,3 +114,30 @@ portal geometry and display mapping are not supported by this provider.
 Primary references: [ScreenCast portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html)
 and [PipeWire capture interfaces](https://docs.pipewire.org/page_tutorial5.html).
 The implementation is original; no Vibeshine capture source was copied.
+
+## Remembering a source
+
+Set `remember_source:true` in the trusted capture startup policy to request portal
+`persist_mode=2` on portals version 4 or later. The first selection still requires
+the desktop user's approval. On success, the returned single-use restore token is
+atomically stored in a private 0600 file under the user's 0700
+`$XDG_STATE_HOME/amaterasu/portal` directory (normally `~/.local/state`). Tokens
+never appear in RPC replies or logs. The record is bound to the selecting module
+principal and source type, and only the latest approved source is retained.
+
+A subsequent Open using `portal-selected-session-source` may restore that exact
+authorization when its caller is allowed both capture and selection. The provider
+waits asynchronously for real frames within the caller's existing request deadline;
+it does not report a capture lease before restoration succeeds. Cancellation stops
+a pending restoration. Close and idle expiry still release the native portal
+session; they retain only the authorization for a later stream or process restart.
+An explicit cancel-selection operation also forgets its saved authorization.
+
+Each restoration consumes the old token before requesting the portal and stores
+the replacement returned by Start. Lost completion or a storage error cannot cause
+a token to be replayed; an unavailable saved approval may require a new selection.
+KDE remains responsible for honoring or revoking permission. A removed monitor,
+revoked permission or invalid token may make the portal show its picker again.
+This is persistent permission for the selected source, not automatic approval of
+arbitrary sources or bypass of the desktop's permission system. See the
+[ScreenCast persistence contract](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html#session-persistence).

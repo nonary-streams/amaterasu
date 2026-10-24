@@ -7,7 +7,7 @@ use crate::{
 };
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 pub struct Driver {
@@ -18,6 +18,7 @@ pub struct Driver {
     pub drops: AtomicUsize,
     pub state_reads: AtomicUsize,
     pub revoke_at_read: AtomicUsize,
+    pub restore_available: AtomicBool,
 }
 
 impl Driver {
@@ -51,10 +52,16 @@ pub struct FakeBackend {
 struct FakeSession(Arc<Driver>);
 
 impl Backend for FakeBackend {
+    fn can_restore(&self, _: &str, _: SourceType) -> bool {
+        self.driver.restore_available.load(Ordering::SeqCst)
+    }
+    fn forget(&self, _: &str, _: SourceType) {
+        self.driver.restore_available.store(false, Ordering::SeqCst);
+    }
     fn availability(&self) -> Availability {
         self.availability
     }
-    fn select(&self, _: SourceType, _: u32) -> CaptureResult<Box<dyn SourceSession>> {
+    fn select(&self, _: &str, _: SourceType, _: u32) -> CaptureResult<Box<dyn SourceSession>> {
         self.driver.selections.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(FakeSession(self.driver.clone())))
     }
@@ -89,6 +96,7 @@ pub fn setup(settings: Settings) -> (Controller<FakeBackend>, Arc<Driver>) {
         drops: AtomicUsize::new(0),
         state_reads: AtomicUsize::new(0),
         revoke_at_read: AtomicUsize::new(usize::MAX),
+        restore_available: AtomicBool::new(false),
     });
     let backend = FakeBackend {
         driver: driver.clone(),
@@ -111,5 +119,6 @@ pub fn settings() -> Settings {
         capture_principals: ["amaterasu.video".into()].into(),
         idle_timeout_seconds: 2,
         selection_timeout_seconds: 5,
+        remember_source: false,
     }
 }

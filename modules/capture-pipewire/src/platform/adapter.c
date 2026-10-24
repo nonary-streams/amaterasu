@@ -39,6 +39,9 @@ struct am_pw_session {
     struct spa_hook stream_listener;
     struct spa_hook core_listener;
     am_pw_frame_callback callback;
+    am_pw_token_callback token_callback;
+    char *restore_token;
+    uint32_t persist;
     void *callback_context;
 };
 
@@ -215,7 +218,11 @@ static gboolean select_portal_source(struct am_pw_session *session, gint64 deadl
     g_variant_builder_add(&builder, "{sv}", "types", g_variant_new_uint32(session->source_type));
     g_variant_builder_add(&builder, "{sv}", "multiple", g_variant_new_boolean(FALSE));
     g_variant_builder_add(&builder, "{sv}", "cursor_mode", g_variant_new_uint32(1));
-    /* No restore_token, no persistent permission request. */
+    if (session->persist) {
+        g_variant_builder_add(&builder, "{sv}", "persist_mode", g_variant_new_uint32(2));
+        if (session->restore_token)
+            g_variant_builder_add(&builder, "{sv}", "restore_token", g_variant_new_string(session->restore_token));
+    }
     atomic_store(&session->stage, AM_PW_STAGE_SELECT_SOURCES);
     result = portal_request(session, "SelectSources", select_token,
         g_variant_new("(o@a{sv})", session->session_path, g_variant_builder_end(&builder)), deadline);
@@ -228,6 +235,10 @@ static gboolean select_portal_source(struct am_pw_session *session, gint64 deadl
         g_variant_new("(os@a{sv})", session->session_path, "", options(start_token)), deadline);
     g_free(start_token); g_free(uuid);
     if (!result) return FALSE;
+    const char *restore_token = NULL;
+    if (session->persist && g_variant_lookup(result, "restore_token", "&s", &restore_token)
+        && strlen(restore_token) <= 4096 && session->token_callback)
+        session->token_callback(session->callback_context, restore_token);
     GVariant *streams = g_variant_lookup_value(result, "streams", G_VARIANT_TYPE("a(ua{sv})"));
     valid = streams && g_variant_n_children(streams) == 1;
     if (valid) {
@@ -460,6 +471,7 @@ static gpointer worker(gpointer data) {
 }
 
 struct am_pw_session *am_pw_start(uint32_t source_type, uint32_t timeout_seconds,
+    const char *restore_token, uint32_t persist, am_pw_token_callback token_callback,
     am_pw_frame_callback callback, void *context) {
     if ((source_type != 1 && source_type != 2) || !callback || timeout_seconds < 1 || timeout_seconds > 300) return NULL;
     struct am_pw_session *session = g_new0(struct am_pw_session, 1);
@@ -480,9 +492,12 @@ struct am_pw_session *am_pw_start(uint32_t source_type, uint32_t timeout_seconds
     session->source_type = source_type;
     session->timeout_seconds = timeout_seconds;
     session->callback = callback;
+    session->restore_token = restore_token ? g_strdup(restore_token) : NULL;
+    session->persist = persist;
+    session->token_callback = token_callback;
     session->callback_context = context;
     session->thread = g_thread_try_new("amaterasu-portal", worker, session, NULL);
-    if (!session->thread) { g_object_unref(session->cancel); g_free(session); return NULL; }
+    if (!session->thread) { g_object_unref(session->cancel); g_free(session->restore_token); g_free(session); return NULL; }
     return session;
 }
 
@@ -505,5 +520,6 @@ void am_pw_destroy(struct am_pw_session *session) {
     g_cancellable_cancel(session->cancel);
     g_thread_join(session->thread);
     g_object_unref(session->cancel);
+    g_free(session->restore_token);
     g_free(session);
 }

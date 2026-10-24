@@ -479,3 +479,96 @@ fn settings_and_selection_bounds_fail_before_native_allocation() {
         Err("resource_exhausted")
     ));
 }
+
+#[test]
+fn remembered_selection_restores_only_for_allowed_callers_and_waits_for_real_frames() {
+    let mut policy = settings();
+    policy.remember_source = true;
+    policy.selection_principals.insert("amaterasu.video".into());
+    let (mut controller, driver) = setup(policy);
+    driver.restore_available.store(true, Ordering::SeqCst);
+    let request = || Operation::Open {
+        output: "portal-selected-session-source".into(),
+        operation_id: Some("resume".into()),
+        constant_rate: None,
+    };
+    assert!(matches!(
+        controller.handle("stranger", request(), 0),
+        Err("capture_permission_denied")
+    ));
+    assert_eq!(driver.selections.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        controller.handle("amaterasu.video", request(), 0),
+        Err("source_restore_pending")
+    ));
+    assert!(controller.lease.is_none());
+    assert_eq!(driver.selections.load(Ordering::SeqCst), 1);
+    // A repeated pending open must not launch another picker or consume another token.
+    assert!(matches!(
+        controller.handle("amaterasu.video", request(), 1),
+        Err("source_restore_pending")
+    ));
+    assert_eq!(driver.selections.load(Ordering::SeqCst), 1);
+    driver.frame(50, 1000);
+    *driver.state.lock().unwrap() = SourceState::Ready {
+        node: 42,
+        width: 2,
+        height: 2,
+    };
+    let opened = controller.handle("amaterasu.video", request(), 10).unwrap();
+    assert!(opened.payload["ok"].as_bool().unwrap());
+    let id = opened.payload["stream"].as_u64().unwrap();
+    controller.close("amaterasu.video", id).unwrap();
+    assert!(controller.lease.is_none());
+    assert!(controller.selection.is_none());
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+    // Reconnects reuse an internal record instead of exhausting selection history.
+    for _ in 0..35 {
+        assert!(matches!(
+            controller.handle("amaterasu.video", request(), 20),
+            Err("source_restore_pending")
+        ));
+        let opened = controller.handle("amaterasu.video", request(), 21).unwrap();
+        controller
+            .close(
+                "amaterasu.video",
+                opened.payload["stream"].as_u64().unwrap(),
+            )
+            .unwrap();
+    }
+    assert_eq!(controller.selections.len(), 1);
+}
+
+#[test]
+fn restoration_is_opt_in_and_cancelled_opens_do_not_leave_capture_running() {
+    let (mut controller, driver) = setup(settings());
+    driver.restore_available.store(true, Ordering::SeqCst);
+    let request = || Operation::Open {
+        output: "portal-selected-session-source".into(),
+        operation_id: Some("resume".into()),
+        constant_rate: None,
+    };
+    assert!(matches!(
+        controller.handle("amaterasu.video", request(), 0),
+        Err("source_selection_required")
+    ));
+    assert_eq!(driver.selections.load(Ordering::SeqCst), 0);
+    controller.settings.remember_source = true;
+    assert!(matches!(
+        controller.handle("amaterasu.video", request(), 0),
+        Err("source_selection_required")
+    ));
+    controller
+        .settings
+        .selection_principals
+        .insert("amaterasu.video".into());
+    assert!(matches!(
+        controller.handle("amaterasu.video", request(), 0),
+        Err("source_restore_pending")
+    ));
+    controller.cancel_pending_restore("stranger");
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 0);
+    controller.cancel_pending_restore("amaterasu.video");
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+    assert!(controller.selection.is_none());
+}

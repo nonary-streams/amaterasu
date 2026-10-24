@@ -1,3 +1,4 @@
+mod token_store;
 use super::{Backend, SourceSession};
 use crate::{
     buffers::{Mailbox, Plane},
@@ -7,11 +8,12 @@ use crate::{
     },
 };
 use std::{
-    ffi::c_void,
+    ffi::{CStr, CString, c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr::NonNull,
     sync::Arc,
 };
+use token_store::TokenStore;
 
 #[derive(Default)]
 #[repr(C)]
@@ -43,6 +45,9 @@ unsafe extern "C" {
     fn am_pw_start(
         source_type: u32,
         timeout: u32,
+        restore_token: *const c_char,
+        persist: u32,
+        token_callback: unsafe extern "C" fn(*mut c_void, *const c_char),
         callback: unsafe extern "C" fn(*mut c_void, *const Plane, u32, u32, u32, u64) -> u32,
         context: *mut c_void,
     ) -> *mut c_void;
@@ -52,6 +57,7 @@ unsafe extern "C" {
 
 pub struct NativeBackend {
     availability: Availability,
+    store: Option<Arc<TokenStore>>,
 }
 
 impl NativeBackend {
@@ -60,6 +66,7 @@ impl NativeBackend {
         // SAFETY: private adapter writes only this live, fixed-layout probe slot.
         unsafe { am_pw_probe(&mut probe) };
         Self {
+            store: None,
             availability: Availability {
                 native_supported: true,
                 available: probe.available != 0,
@@ -76,6 +83,10 @@ impl NativeBackend {
             },
         }
     }
+    pub fn configure_persistence(&mut self) -> CaptureResult<()> {
+        self.store = Some(Arc::new(TokenStore::for_user()?));
+        Ok(())
+    }
 }
 
 impl Backend for NativeBackend {
@@ -83,21 +94,66 @@ impl Backend for NativeBackend {
         self.availability
     }
 
-    fn select(&self, source: SourceType, timeout: u32) -> CaptureResult<Box<dyn SourceSession>> {
+    fn can_restore(&self, owner: &str, source: SourceType) -> bool {
+        self.availability.portal_version >= 4
+            && self
+                .store
+                .as_ref()
+                .is_some_and(|store| store.available(owner, source))
+    }
+    fn forget(&self, owner: &str, source: SourceType) {
+        if let Some(store) = &self.store {
+            let _ = store.take(owner, source);
+        }
+    }
+    fn select(
+        &self,
+        owner: &str,
+        source: SourceType,
+        timeout: u32,
+    ) -> CaptureResult<Box<dyn SourceSession>> {
         let mailbox = Arc::new(Mailbox::default());
-        let context = Arc::as_ptr(&mailbox).cast_mut().cast();
+        let context = Box::new(CallbackContext {
+            mailbox: mailbox.clone(),
+            store: self.store.clone(),
+            owner: owner.into(),
+            source,
+        });
+        let pointer = (&*context as *const CallbackContext).cast_mut().cast();
+        let token = self
+            .store
+            .as_ref()
+            .and_then(|store| store.take(owner, source))
+            .and_then(|token| CString::new(token).ok());
         // SAFETY: Arc's allocation has a stable address until session Drop
         // cancels and joins the sole C worker before destroying its mailbox.
-        let native =
-            NonNull::new(unsafe { am_pw_start(source.mask(), timeout, frame_callback, context) })
-                .ok_or("native_worker_unavailable")?;
-        Ok(Box::new(NativeSession { native, mailbox }))
+        let native = NonNull::new(unsafe {
+            am_pw_start(
+                source.mask(),
+                timeout,
+                token
+                    .as_ref()
+                    .map_or(std::ptr::null(), |token| token.as_ptr()),
+                u32::from(self.store.is_some() && self.availability.portal_version >= 4),
+                token_callback,
+                frame_callback,
+                pointer,
+            )
+        })
+        .ok_or("native_worker_unavailable")?;
+        Ok(Box::new(NativeSession { native, context }))
     }
 }
 
 struct NativeSession {
     native: NonNull<c_void>,
+    context: Box<CallbackContext>,
+}
+struct CallbackContext {
     mailbox: Arc<Mailbox>,
+    store: Option<Arc<TokenStore>>,
+    owner: String,
+    source: SourceType,
 }
 // SAFETY: adapter snapshots/cancellation use atomics and a thread-safe GCancellable;
 // only its dedicated worker accesses GIO/PipeWire resources. Drop joins that worker.
@@ -110,7 +166,7 @@ impl SourceSession for NativeSession {
         unsafe { am_pw_snapshot(self.native.as_ptr(), &mut snapshot) };
         match snapshot.state {
             1 => SourceState::Selecting,
-            2 if self.mailbox.has_frame() => SourceState::Ready {
+            2 if self.context.mailbox.has_frame() => SourceState::Ready {
                 node: snapshot.node,
                 width: snapshot.width,
                 height: snapshot.height,
@@ -144,7 +200,7 @@ impl SourceSession for NativeSession {
         }
     }
     fn mailbox(&self) -> Arc<Mailbox> {
-        self.mailbox.clone()
+        self.context.mailbox.clone()
     }
 }
 
@@ -170,10 +226,33 @@ unsafe extern "C" fn frame_callback(
         }
         // SAFETY: adapter retains the Arc allocation and dequeued mapped SPA buffer
         // through this call. Rust validates the descriptor before copying rows.
-        let mailbox = unsafe { &*context.cast::<Mailbox>() };
-        unsafe { mailbox.publish(&*plane, width, height, format, timestamp_us) }
+        let context = unsafe { &*context.cast::<CallbackContext>() };
+        unsafe {
+            context
+                .mailbox
+                .publish(&*plane, width, height, format, timestamp_us)
+        }
     }))
     .unwrap_or(2)
+}
+
+unsafe extern "C" fn token_callback(context: *mut c_void, token: *const c_char) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if context.is_null() || token.is_null() {
+            return;
+        }
+        // SAFETY: the joined adapter worker lends a valid NUL-terminated token
+        // and retains this boxed context until the synchronous callback returns.
+        let context = unsafe { &*context.cast::<CallbackContext>() };
+        let Ok(token) = (unsafe { CStr::from_ptr(token) }).to_str() else {
+            return;
+        };
+        if let Some(store) = &context.store
+            && store.put(&context.owner, context.source, token).is_err()
+        {
+            eprintln!("amaterasu portal persistence failed code=restore_storage_unavailable");
+        }
+    }));
 }
 
 #[cfg(test)]

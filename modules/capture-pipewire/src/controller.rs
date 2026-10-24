@@ -110,6 +110,9 @@ impl<B: Backend> Controller<B> {
             Operation::CancelSelection { operation_id } => {
                 validate_operation_id(&operation_id)?;
                 self.poll_selection(caller, &operation_id)?;
+                if let Some(record) = self.selections.get(&(caller.into(), operation_id.clone())) {
+                    self.backend.forget(caller, record.source_type);
+                }
                 if self.selection.as_ref().is_some_and(|selection| {
                     selection.owner == caller && selection.operation == operation_id
                 }) {
@@ -122,7 +125,13 @@ impl<B: Backend> Controller<B> {
                 output,
                 operation_id,
                 constant_rate,
-            } => self.open(caller, output, operation_id, constant_rate.unwrap_or(false)),
+            } => self.open(
+                caller,
+                output,
+                operation_id,
+                constant_rate.unwrap_or(false),
+                now,
+            ),
             Operation::Lookup { operation_id } => {
                 validate_operation_id(&operation_id)?;
                 self.lease
@@ -176,9 +185,9 @@ impl<B: Backend> Controller<B> {
             return Err("unsupported_source_type");
         }
         let output = format!("portal-{:016x}", new_id()?);
-        let source = self
-            .backend
-            .select(source_type, self.settings.selection_timeout_seconds)?;
+        let source =
+            self.backend
+                .select(caller, source_type, self.settings.selection_timeout_seconds)?;
         self.selections.insert(
             key.clone(),
             SelectionRecord {
@@ -216,6 +225,7 @@ impl<B: Backend> Controller<B> {
         output: String,
         operation: Option<String>,
         constant_rate: bool,
+        now: u64,
     ) -> CaptureResult<Reply> {
         if !self.settings.enabled {
             return Err("capture_disabled");
@@ -225,6 +235,35 @@ impl<B: Backend> Controller<B> {
         }
         if constant_rate {
             return Err("unsupported_constant_rate");
+        }
+        if output == "portal-selected-session-source"
+            && self.selection.is_none()
+            && self.settings.remember_source
+            && self.settings.selection_principals.contains(caller)
+        {
+            // Reuse one internal operation slot across reconnects. Restoration
+            // can only use this caller's previously approved monitor token.
+            if let Some(source) = [SourceType::Monitor, SourceType::Window]
+                .into_iter()
+                .find(|source| self.backend.can_restore(caller, *source))
+            {
+                let operation = "remembered-source".to_owned();
+                self.selections
+                    .remove(&(caller.to_owned(), operation.clone()));
+                self.select(caller, source, operation, now)?;
+            }
+        }
+        if output == "portal-selected-session-source"
+            && self.settings.remember_source
+            && self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.owner == caller)
+            && self
+                .current_record()
+                .is_some_and(|record| record.state == SourceState::Selecting)
+        {
+            return Err("source_restore_pending");
         }
         if let Some(operation) = &operation {
             validate_operation_id(operation)?;
@@ -241,7 +280,7 @@ impl<B: Backend> Controller<B> {
             .current_record()
             .filter(|record| matches!(record.state, SourceState::Ready { .. }))
             .ok_or("source_selection_required")?;
-        if record.output != output {
+        if record.output != output && output != "portal-selected-session-source" {
             return Err("output_not_found");
         }
         if self.lease.is_some() {
@@ -355,6 +394,16 @@ impl<B: Backend> Controller<B> {
         }
     }
 
+    pub fn cancel_pending_restore(&mut self, caller: &str) {
+        if self.lease.is_none()
+            && self.selection.as_ref().is_some_and(|selection| {
+                selection.owner == caller && selection.operation == "remembered-source"
+            })
+        {
+            self.stop_selection(SourceState::Failed("request_ended"));
+        }
+    }
+
     fn stop_selection(&mut self, state: SourceState) {
         if let Some(lease) = self.lease.take() {
             lease.admission.close();
@@ -461,6 +510,7 @@ impl<B: Backend> Controller<B> {
             .collect();
         let availability = self.backend.availability();
         json!({"ok":true,"enabled":self.settings.enabled,"native_supported":availability.native_supported,
+            "remember_source":self.settings.remember_source,
             "availability":availability,"selection_state":phase,"selection":selection_json,
             "selection_choices":self.choices(),"streams":streams,"geometry_supported":false,
             "opened":self.opened,"closed":self.closed.len(),"active":usize::from(self.lease.is_some()),

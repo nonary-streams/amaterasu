@@ -11,6 +11,7 @@ pub struct Settings {
     pub capture_principals: BTreeSet<String>,
     pub idle_timeout_seconds: u32,
     pub selection_timeout_seconds: u32,
+    pub remember_source: bool,
 }
 
 impl Default for Settings {
@@ -21,6 +22,7 @@ impl Default for Settings {
             capture_principals: BTreeSet::new(),
             idle_timeout_seconds: 60,
             selection_timeout_seconds: 120,
+            remember_source: false,
         }
     }
 }
@@ -67,7 +69,7 @@ impl SourceType {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Status,

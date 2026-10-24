@@ -16,9 +16,14 @@ pub trait Backend: Send {
     fn availability(&self) -> Availability;
     fn select(
         &self,
+        owner: &str,
         source: SourceType,
         timeout_seconds: u32,
     ) -> CaptureResult<Box<dyn SourceSession>>;
+    fn can_restore(&self, _owner: &str, _source: SourceType) -> bool {
+        false
+    }
+    fn forget(&self, _owner: &str, _source: SourceType) {}
 }
 
 #[cfg(amaterasu_pipewire)]
@@ -35,6 +40,9 @@ impl NativeBackend {
     pub fn new() -> Self {
         Self
     }
+    pub fn configure_persistence(&mut self) -> CaptureResult<()> {
+        Err(unsupported_reason())
+    }
 }
 
 #[cfg(not(amaterasu_pipewire))]
@@ -42,7 +50,7 @@ impl Backend for NativeBackend {
     fn availability(&self) -> Availability {
         Availability::unsupported(unsupported_reason())
     }
-    fn select(&self, _: SourceType, _: u32) -> CaptureResult<Box<dyn SourceSession>> {
+    fn select(&self, _: &str, _: SourceType, _: u32) -> CaptureResult<Box<dyn SourceSession>> {
         Err(unsupported_reason())
     }
 }

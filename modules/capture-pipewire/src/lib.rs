@@ -24,6 +24,12 @@ struct CaptureModule {
     controller: native::Shared<NativeBackend>,
     _factory: Box<native::Factory<NativeBackend>>,
     epoch: Instant,
+    pending_opens: Vec<PendingOpen>,
+}
+struct PendingOpen {
+    request: u64,
+    caller: String,
+    operation: Operation,
 }
 
 impl ManagedModule for CaptureModule {
@@ -34,7 +40,11 @@ impl ManagedModule for CaptureModule {
         let settings: Settings =
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
         settings.validate().map_err(str::to_owned)?;
-        let controller = Arc::new(Mutex::new(Controller::new(NativeBackend::new(), settings)));
+        let mut backend = NativeBackend::new();
+        if settings.remember_source {
+            backend.configure_persistence().map_err(str::to_owned)?;
+        }
+        let controller = Arc::new(Mutex::new(Controller::new(backend, settings)));
         let factory = native::Factory::new(controller.clone());
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
@@ -47,6 +57,7 @@ impl ManagedModule for CaptureModule {
             controller,
             _factory: factory,
             epoch: Instant::now(),
+            pending_opens: Vec::new(),
         })
     }
 
@@ -56,6 +67,31 @@ impl ManagedModule for CaptureModule {
             .lock()
             .map_err(|_| "PipeWire controller poisoned")?
             .refresh(now);
+        let mut cancelled = Vec::new();
+        for pending in std::mem::take(&mut self.pending_opens) {
+            if matches!(
+                self.runtime.send(Command::CheckRequest {
+                    request: pending.request
+                })?,
+                Response::Ok
+            ) {
+                self.dispatch(pending.request, pending.caller, pending.operation, now)?;
+            } else {
+                cancelled.push(pending.caller);
+            }
+        }
+        for caller in cancelled {
+            if !self
+                .pending_opens
+                .iter()
+                .any(|pending| pending.caller == caller)
+            {
+                self.controller
+                    .lock()
+                    .map_err(|_| "PipeWire controller poisoned")?
+                    .cancel_pending_restore(&caller);
+            }
+        }
         for _ in 0..8 {
             let (id, caller, service, payload) = match self.runtime.send(Command::Poll {})? {
                 Response::Pending => break,
@@ -74,38 +110,58 @@ impl ManagedModule for CaptureModule {
             ) {
                 continue;
             }
-            let reply = if service != SERVICE {
-                Err("invalid_service")
+            if service == SERVICE
+                && let Ok(operation) = serde_json::from_value::<Operation>(payload)
+            {
+                self.dispatch(id, caller, operation, now)?;
             } else {
-                match serde_json::from_value::<Operation>(payload) {
-                    Ok(operation) => self
-                        .controller
-                        .lock()
-                        .map_err(|_| "PipeWire controller poisoned")?
-                        .handle(&caller, operation, now),
-                    Err(_) => Err("invalid_request"),
-                }
-            };
-            let (payload, created) = match reply {
-                Ok(reply) => (reply.payload, reply.created),
-                Err(code) => (
-                    json!({"ok":false,"error":{"code":code,"message":code}}),
-                    None,
-                ),
-            };
-            let completion = self.runtime.send(Command::Complete {
+                self.runtime.send(Command::Complete {request:id,payload:json!({"ok":false,"error":{"code":"invalid_request","message":"invalid_request"}})})?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CaptureModule {
+    fn dispatch(
+        &mut self,
+        id: u64,
+        caller: String,
+        operation: Operation,
+        now: u64,
+    ) -> ModuleResult<()> {
+        let reply = self
+            .controller
+            .lock()
+            .map_err(|_| "PipeWire controller poisoned")?
+            .handle(&caller, operation.clone(), now);
+        if matches!(reply, Err("source_restore_pending")) && self.pending_opens.len() < 8 {
+            self.pending_opens.push(PendingOpen {
                 request: id,
-                payload,
+                caller,
+                operation,
             });
-            if !matches!(completion, Ok(Response::Ok)) {
-                self.controller
-                    .lock()
-                    .map_err(|_| "PipeWire controller poisoned")?
-                    .rollback(&caller, created);
-                if !matches!(completion, Ok(Response::Error { ref code, .. }) if code == "request_ended" || code == "not_found")
-                {
-                    return Err(format!("PipeWire completion failed: {completion:?}"));
-                }
+            return Ok(());
+        }
+        let (payload, created) = match reply {
+            Ok(reply) => (reply.payload, reply.created),
+            Err(code) => (
+                json!({"ok":false,"error":{"code":code,"message":code}}),
+                None,
+            ),
+        };
+        let completion = self.runtime.send(Command::Complete {
+            request: id,
+            payload,
+        });
+        if !matches!(completion, Ok(Response::Ok)) {
+            self.controller
+                .lock()
+                .map_err(|_| "PipeWire controller poisoned")?
+                .rollback(&caller, created);
+            if !matches!(completion, Ok(Response::Error { ref code, .. }) if code == "request_ended" || code == "not_found")
+            {
+                return Err(format!("PipeWire completion failed: {completion:?}"));
             }
         }
         Ok(())
