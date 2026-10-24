@@ -87,6 +87,7 @@ fn negotiated_hevc_accepts_only_hevc_packets_without_consuming_rejected_sequence
     assert_eq!(stream.next_frame_index, Some(1));
     let hevc = EncodedPacket {
         codec: CODEC_HEVC,
+        flags: FLAG_KEYFRAME | FLAG_END_OF_ACCESS_UNIT,
         ..h264
     };
     // SAFETY: the local access unit remains allocated through the call.
@@ -104,6 +105,86 @@ fn negotiated_hevc_accepts_only_hevc_packets_without_consuming_rejected_sequence
         STATUS_INVALID_ARGUMENT
     );
     assert!(!stream.video_ended);
+}
+
+#[test]
+fn hevc_fragments_commit_one_access_unit_only_after_final_boundary() {
+    let (video, audio) = receivers();
+    let mut settings = request(&video, &audio, false);
+    settings.video.codec = VideoCodec::Hevc;
+    settings.video.fec_percentage = 0;
+    settings.video.min_parity_shards = 0;
+    let mut stream = Stream::open("owner", &settings).unwrap();
+    let access_unit: Vec<_> = [32u8, 33, 34, 19]
+        .into_iter()
+        .flat_map(|kind| [0, 0, 0, 1, kind << 1, 1])
+        .collect();
+    let first = EncodedPacket {
+        codec: CODEC_HEVC,
+        flags: FLAG_KEYFRAME,
+        data: access_unit.as_ptr(),
+        len: 9,
+        timestamp_us: 16_667,
+        sequence: 1,
+    };
+    let last = EncodedPacket {
+        flags: FLAG_KEYFRAME | FLAG_END_OF_ACCESS_UNIT,
+        data: access_unit[9..].as_ptr(),
+        len: access_unit.len() - 9,
+        ..first
+    };
+    assert_eq!(unsafe { stream.submit_video(&first) }, STATUS_OK);
+    assert_eq!(stream.next_frame_index, Some(1));
+    assert_eq!(stream.video_sequence, None);
+    assert_eq!(stream.delivery.queued(), 0);
+    let eos = EncodedPacket {
+        flags: FLAG_END_OF_STREAM,
+        data: std::ptr::null(),
+        len: 0,
+        ..first
+    };
+    assert_eq!(
+        unsafe { stream.submit_video(&eos) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(stream.drain(), STATUS_INVALID_ARGUMENT);
+    let wrong_sequence = EncodedPacket {
+        sequence: 2,
+        ..last
+    };
+    assert_eq!(
+        unsafe { stream.submit_video(&wrong_sequence) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        stream.pending_video.as_ref().unwrap().bytes,
+        access_unit[..9]
+    );
+
+    stream
+        .delivery
+        .push(Medium::Video, vec![vec![0]; MAX_DATAGRAMS]);
+    assert_eq!(unsafe { stream.submit_video(&last) }, MEDIA_BUSY);
+    assert_eq!(
+        stream.pending_video.as_ref().unwrap().bytes,
+        access_unit[..9]
+    );
+    assert_eq!(stream.next_frame_index, Some(1));
+    stream.delivery = Delivery::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+        video.local_addr().unwrap(),
+        audio.local_addr().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(unsafe { stream.submit_video(&last) }, STATUS_OK);
+    assert!(stream.pending_video.is_none());
+    assert_eq!(stream.video_sequence, Some(1));
+    assert_eq!(stream.next_frame_index, Some(2));
+    assert_eq!(
+        unsafe { stream.submit_video(&last) },
+        STATUS_INVALID_ARGUMENT
+    );
 }
 
 pub(crate) fn audio_packet(bytes: &[u8], sequence: u64) -> EncodedAudioPacket {

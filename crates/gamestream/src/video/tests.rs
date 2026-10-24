@@ -64,6 +64,15 @@ fn hevc_invalid_headers_and_open_gop_do_not_consume_sequence() {
         [hevc_nal(32), hevc_nal(33), hevc_nal(34)].concat(),
         [hevc_nal(32), hevc_nal(1)].concat(),
         [hevc_nal(1), hevc_nal(19)].concat(),
+        [hevc_nal(0), hevc_nal(1)].concat(),
+        [
+            hevc_nal(32),
+            hevc_nal(33),
+            hevc_nal(34),
+            hevc_nal(19),
+            hevc_nal(20),
+        ]
+        .concat(),
         vec![0, 0, 1, 19 << 1], // Truncated two-byte header.
     ];
     for header in [

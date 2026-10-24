@@ -35,8 +35,15 @@ pub struct Stream {
     video_sequence: Option<u64>,
     audio_sequence: Option<u64>,
     video_timestamp: Option<u64>,
+    pending_video: Option<PendingVideo>,
     next_frame_index: Option<u32>,
     pub discarded_audio_fec_shards: u64,
+}
+
+struct PendingVideo {
+    sequence: u64,
+    timestamp_us: u64,
+    bytes: Vec<u8>,
 }
 
 impl Stream {
@@ -91,6 +98,7 @@ impl Stream {
             video_sequence: None,
             audio_sequence: None,
             video_timestamp: None,
+            pending_video: None,
             next_frame_index: Some(1),
             discarded_audio_fec_shards: 0,
         })
@@ -138,6 +146,9 @@ impl Stream {
         if self.delivery.failure.is_some() {
             return MEDIA_BACKEND_ERROR;
         }
+        if self.pending_video.is_some() {
+            return STATUS_INVALID_ARGUMENT;
+        }
         self.video_ended = true;
         self.audio_ended = true;
         STATUS_OK
@@ -166,22 +177,88 @@ impl Stream {
             return STATUS_INVALID_ARGUMENT;
         }
         if packet.flags & FLAG_END_OF_STREAM != 0 {
+            if self.pending_video.is_some() {
+                return STATUS_INVALID_ARGUMENT;
+            }
             self.video_ended = true;
             return STATUS_OK;
         }
+        // The HEVC encoder may emit several Annex B fragments for one access
+        // unit. Retain only a bounded owned copy until its final fragment;
+        // neither a sequence nor a frame index is committed early. Legacy
+        // H.264 packets without a boundary flag remain complete access units.
+        if self.video_settings.codec == VideoCodec::Hevc {
+            let end = packet.flags & FLAG_END_OF_ACCESS_UNIT != 0;
+            let previous = self.pending_video.as_ref();
+            if previous.is_some_and(|pending| {
+                pending.sequence != packet.sequence || pending.timestamp_us != packet.timestamp_us
+            }) {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            let current_len = previous.map_or(0, |pending| pending.bytes.len());
+            let Some(total_len) = current_len.checked_add(packet.len) else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            if total_len > MAX_QUEUE_BYTES {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            // SAFETY: validated packet bytes are borrowed only during this call.
+            let fragment = unsafe { packet.bytes().unwrap() };
+            if !end {
+                if previous.is_none()
+                    && (self
+                        .video_sequence
+                        .is_some_and(|sequence| packet.sequence <= sequence)
+                        || self
+                            .video_timestamp
+                            .is_some_and(|timestamp| packet.timestamp_us < timestamp))
+                {
+                    return STATUS_INVALID_ARGUMENT;
+                }
+                let pending = self.pending_video.get_or_insert_with(|| PendingVideo {
+                    sequence: packet.sequence,
+                    timestamp_us: packet.timestamp_us,
+                    bytes: Vec::new(),
+                });
+                pending.bytes.extend_from_slice(fragment);
+                return STATUS_OK;
+            }
+            if let Some(pending) = previous {
+                let mut access_unit = Vec::with_capacity(total_len);
+                access_unit.extend_from_slice(&pending.bytes);
+                access_unit.extend_from_slice(fragment);
+                let status =
+                    self.submit_access_unit(&access_unit, packet.sequence, packet.timestamp_us);
+                if status == STATUS_OK {
+                    self.pending_video = None;
+                }
+                return status;
+            }
+        }
+        // SAFETY: caller's packet allocation is borrowed only through packetization.
+        let access_unit = unsafe { packet.bytes().unwrap() };
+        self.submit_access_unit(access_unit, packet.sequence, packet.timestamp_us)
+    }
+
+    fn submit_access_unit(
+        &mut self,
+        access_unit: &[u8],
+        sequence: u64,
+        timestamp_us: u64,
+    ) -> Status {
         if self
             .video_sequence
-            .is_some_and(|previous| packet.sequence <= previous)
+            .is_some_and(|previous| sequence <= previous)
             || self
                 .video_timestamp
-                .is_some_and(|previous| packet.timestamp_us < previous)
+                .is_some_and(|previous| timestamp_us < previous)
         {
             return STATUS_INVALID_ARGUMENT;
         }
         let Some(frame_index) = self.next_frame_index else {
             return self.fail("video_index_exhausted");
         };
-        let reservation = match self.video.reservation(packet.len) {
+        let reservation = match self.video.reservation(access_unit.len()) {
             Ok(reservation) => reservation,
             Err(_) => return STATUS_INVALID_ARGUMENT,
         };
@@ -197,9 +274,7 @@ impl Stream {
         if !self.delivery.can_queue(reservation.datagrams, bytes) {
             return MEDIA_BUSY;
         }
-        // SAFETY: caller's packet allocation is borrowed only through packetization.
-        let access_unit = unsafe { packet.bytes().unwrap() };
-        let clock = (u128::from(packet.timestamp_us) * 90_000 / 1_000_000) as u32;
+        let clock = (u128::from(timestamp_us) * 90_000 / 1_000_000) as u32;
         let datagrams = match self.video.packetize(access_unit, frame_index, clock) {
             Ok(datagrams) => datagrams,
             Err(_) => return STATUS_INVALID_ARGUMENT,
@@ -209,8 +284,8 @@ impl Stream {
             Err(code) => return self.fail(code),
         };
         self.delivery.push_video(frame_index, datagrams);
-        self.video_sequence = Some(packet.sequence);
-        self.video_timestamp = Some(packet.timestamp_us);
+        self.video_sequence = Some(sequence);
+        self.video_timestamp = Some(timestamp_us);
         self.next_frame_index = frame_index.checked_add(1);
         STATUS_OK
     }

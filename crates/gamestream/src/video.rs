@@ -277,7 +277,8 @@ fn validate_hevc_annex_b(bytes: &[u8]) -> Result<bool, VideoError> {
         &mut prefix,
         &mut picture,
     )?;
-    let is_idr = picture.ok_or(VideoError::InvalidAnnexB)?;
+    let picture_type = picture.ok_or(VideoError::InvalidAnnexB)?;
+    let is_idr = matches!(picture_type, 19 | 20);
     if is_idr && prefix != 3 {
         return Err(VideoError::InvalidAnnexB);
     }
@@ -289,7 +290,7 @@ fn validate_hevc_nal(
     start: usize,
     end: usize,
     prefix: &mut u8,
-    picture: &mut Option<bool>,
+    picture: &mut Option<u8>,
 ) -> Result<(), VideoError> {
     if end.saturating_sub(start) < 2 {
         return Err(VideoError::InvalidAnnexB);
@@ -306,13 +307,16 @@ fn validate_hevc_nal(
         34 if *prefix == 2 && picture.is_none() => *prefix = 3,
         0..=7 | 19 | 20 => {
             let idr = matches!(kind, 19 | 20);
-            if picture.is_some_and(|previous| previous != idr)
+            // Distinct VCL NAL types can carry different picture/recovery
+            // semantics. A single access unit must not silently collapse them
+            // to the same short-header IDR bit.
+            if picture.is_some_and(|previous| previous != kind)
                 || (idr && *prefix != 3)
                 || (*prefix != 0 && *prefix != 3)
             {
                 return Err(VideoError::InvalidAnnexB);
             }
-            *picture = Some(idr);
+            *picture = Some(kind);
         }
         // Prefix/suffix SEI and access-unit delimiters carry no picture.
         35 | 39 | 40 => {}
