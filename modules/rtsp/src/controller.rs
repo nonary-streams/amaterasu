@@ -26,6 +26,8 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     net::{IpAddr, SocketAddr, UdpSocket},
+    thread,
+    time::{Duration, Instant},
 };
 
 const PREPARE_BUDGET_MS: u64 = 5_000;
@@ -37,6 +39,10 @@ const MAX_LIVE_TICKETS: usize = 2;
 const MAX_PENDING_NETWORK: usize = 16;
 const MAX_DISPLAY_CLEANUP: usize = 16;
 const STARTUP_RECONCILIATION_TIMEOUT_MS: u64 = 45_000;
+// Leave five seconds for service-manager shutdown overhead (the user service
+// uses TimeoutStopSec=20s); both live RTSP records share this aggregate budget.
+const ORDERLY_SESSION_CLEANUP_BUDGET: Duration = Duration::from_secs(15);
+const ORDERLY_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 struct PendingNetwork {
     connection: u64,
@@ -228,9 +234,10 @@ impl Controller {
         Ok(())
     }
 
-    /// Module unload cannot drive the stream-session provider to terminal state.
-    /// It only makes bounded settlement attempts; provider unload is the backstop.
+    /// Revoke RTSP tickets and make bounded, owner-scoped stop attempts for every
+    /// known stream-session before this module unloads.
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
+        let cleanup_deadline = Instant::now() + ORDERLY_SESSION_CLEANUP_BUDGET;
         if let Some(call) = self.startup_recovery.call.as_mut() {
             call.shutdown(runtime);
         }
@@ -248,10 +255,10 @@ impl Controller {
                 call.shutdown(runtime);
             }
         }
-        self.stop_owned_sessions_on_shutdown(runtime);
+        self.stop_owned_sessions_on_shutdown(runtime, cleanup_deadline);
     }
 
-    fn stop_owned_sessions_on_shutdown(&mut self, runtime: &RuntimeClient) {
+    fn stop_owned_sessions_on_shutdown(&mut self, runtime: &RuntimeClient, deadline: Instant) {
         let tickets: Vec<_> = self.records.keys().copied().collect();
         for ticket in tickets {
             let Some(mut record) = self.records.remove(&ticket) else {
@@ -262,18 +269,24 @@ impl Controller {
             }
             self.revoke_ticket(ticket);
             if !record.cleanup_confirmed {
-                self.stop_owned_session_on_shutdown(runtime, &mut record);
+                self.stop_owned_session_on_shutdown(runtime, &mut record, deadline);
             }
             self.records.insert(ticket, record);
         }
     }
 
-    fn stop_owned_session_on_shutdown(&mut self, runtime: &RuntimeClient, record: &mut Record) {
+    fn stop_owned_session_on_shutdown(
+        &mut self,
+        runtime: &RuntimeClient,
+        record: &mut Record,
+        deadline: Instant,
+    ) {
         if record.session.is_none() && record.needs_lookup {
             let lookup = shutdown_request(
                 runtime,
                 json!({"action":"lookup","operation_id":record.operation()}),
                 format!("{}-module-shutdown-lookup", record.operation()),
+                deadline,
             );
             match lookup {
                 Ok(payload) if payload["ok"] == true => {
@@ -306,6 +319,7 @@ impl Controller {
             runtime,
             json!({"action":"stop","session":session}),
             format!("{}-module-shutdown-stop", record.operation()),
+            deadline,
         );
         match stop {
             Ok(payload) if clean_terminal(record, &payload) => {
@@ -783,8 +797,8 @@ fn shutdown_request(
     runtime: &RuntimeClient,
     payload: Value,
     operation_id: String,
+    deadline: Instant,
 ) -> Result<Value, &'static str> {
-    const MAX_RESULT_POLLS: usize = 8;
     let command = Command::Request {
         service: "amaterasu.stream-session/1".into(),
         payload,
@@ -798,7 +812,7 @@ fn shutdown_request(
         _ => return Err("shutdown_request_unconfirmed"),
     };
 
-    for _ in 0..MAX_RESULT_POLLS {
+    while Instant::now() < deadline {
         match runtime.send_ephemeral(Command::TakeResult { request: id }) {
             Ok(Response::Result { payload }) => {
                 let released = match runtime.send_ephemeral(Command::ReleaseResult { request: id })
@@ -813,7 +827,12 @@ fn shutdown_request(
                     Err("shutdown_result_release_failed")
                 };
             }
-            Ok(Response::Pending) => {}
+            Ok(Response::Pending) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !remaining.is_zero() {
+                    thread::sleep(ORDERLY_SESSION_POLL_INTERVAL.min(remaining));
+                }
+            }
             _ => return Err("shutdown_request_unconfirmed"),
         }
     }

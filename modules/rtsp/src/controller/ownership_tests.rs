@@ -1,7 +1,11 @@
 use super::*;
 use amaterasu_gamestream::{rtsp::Method, sdp::parse_announce};
 use amaterasu_module_sdk::abi::{self, AbiHeader, BorrowedBytes, HostApi, ReplySink};
-use std::{collections::BTreeSet, ffi::c_void};
+use std::{
+    collections::BTreeSet,
+    ffi::c_void,
+    time::{Duration, Instant},
+};
 
 const SESSION: u64 = 23;
 
@@ -26,6 +30,8 @@ struct Endpoint {
     cleanup_fails: bool,
     reject_prepare: bool,
     wrong_history_reply: bool,
+    stop_pending_for: Duration,
+    stop_pending_until: Option<Instant>,
 }
 
 impl Endpoint {
@@ -89,6 +95,14 @@ impl Endpoint {
                     .get(request)
                     .map(String::as_str)
                     .expect("known downstream request");
+                if action == "stop" && !self.stop_pending_for.is_zero() {
+                    let until = *self
+                        .stop_pending_until
+                        .get_or_insert_with(|| Instant::now() + self.stop_pending_for);
+                    if Instant::now() < until {
+                        return Response::Pending;
+                    }
+                }
                 Response::Result {
                     payload: self.downstream_result(*request, action),
                 }
@@ -335,6 +349,28 @@ fn orderly_module_shutdown_requests_replay_safe_stop_for_owned_sessions() {
             .all(|(payload, _, parent)| { payload["session"] == SESSION && parent.is_none() })
     );
     assert_eq!(controller.records[&ticket].state, State::Failed);
+    assert!(controller.records[&ticket].cleanup_confirmed);
+}
+
+#[test]
+fn orderly_module_shutdown_waits_for_delayed_stop_result_within_aggregate_budget() {
+    let pending_for = Duration::from_millis(120);
+    let mut endpoint = Endpoint {
+        stop_pending_for: pending_for,
+        ..Endpoint::default()
+    };
+    endpoint.enqueue(1, "owner", open("module-shutdown-delayed-stop"));
+    let runtime = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+    finish_prepare(&mut controller, &runtime);
+    let ticket = endpoint.completed(1)["ticket"].as_u64().unwrap();
+
+    let started = Instant::now();
+    controller.shutdown(&runtime);
+    let elapsed = started.elapsed();
+
+    assert!(elapsed >= pending_for);
+    assert!(elapsed < Duration::from_secs(2));
     assert!(controller.records[&ticket].cleanup_confirmed);
 }
 
