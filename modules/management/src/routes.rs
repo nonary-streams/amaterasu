@@ -30,6 +30,11 @@ pub fn resolve(path: &str) -> Option<Route> {
             "repository_list",
             Some("configuration.read"),
         ),
+        ("package-selection", "status") => (
+            "amaterasu.management/1",
+            "package_selection_status",
+            Some("configuration.read"),
+        ),
         ("catalog", action) => (
             "amaterasu.catalog/1",
             catalog_action(action)?,
@@ -226,7 +231,9 @@ pub fn resolve(path: &str) -> Option<Route> {
         service,
         action,
         scope,
-        requires_empty_body: domain == "media" || (domain == "steam" && action == "force_sync"),
+        requires_empty_body: domain == "media"
+            || (domain == "steam" && action == "force_sync")
+            || (domain == "package-selection" && action == "status"),
     })
 }
 
@@ -361,6 +368,18 @@ mod tests {
             .is_err()
         );
         assert!(resolve("/v1/capture/open").is_none());
+    }
+
+    #[test]
+    fn package_selection_status_is_an_empty_configuration_read_request() {
+        let route = resolve("/v1/package-selection/status").unwrap();
+        assert_eq!(route.service, "amaterasu.management/1");
+        assert_eq!(route.action, "package_selection_status");
+        assert_eq!(route.scope, Some("configuration.read"));
+        assert!(route.requires_empty_body);
+        assert_eq!(payload(route, br#"{}"#).unwrap()["action"], "package_selection_status");
+        assert!(payload(route, br#"{"package_root":"/unsafe"}"#).is_err());
+        assert!(resolve("/v1/package-selection/select").is_none());
     }
 
     #[test]

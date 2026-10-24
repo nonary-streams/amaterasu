@@ -24,6 +24,9 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
             }
             Ok(())
         }
+        "amaterasu.management/1" if route.action == "package_selection_status" => {
+            fields(object, &[], &[])
+        }
         "amaterasu.authentication/1" => authentication(route.action, object),
         "amaterasu.host-configuration/1" => host_configuration(route.action, object),
         "amaterasu.catalog/1" => catalog(route.action, object),
