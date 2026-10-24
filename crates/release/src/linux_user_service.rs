@@ -441,12 +441,24 @@ fn activatable_name_list_contains(output: &str, expected: &str) -> bool {
     let Some(count) = fields.next().and_then(|value| value.parse::<usize>().ok()) else {
         return false;
     };
-    let names = fields.take(count).filter_map(|field| {
-        field
+    if count > 4096 {
+        return false;
+    }
+    let names: Vec<_> = fields.collect();
+    if names.len() != count {
+        return false;
+    }
+    let mut found = false;
+    for field in names {
+        let Some(name) = field
             .strip_prefix('"')
-            .and_then(|field| field.strip_suffix('"'))
-    });
-    names.into_iter().any(|name| name == expected)
+            .and_then(|name| name.strip_suffix('"'))
+        else {
+            return false;
+        };
+        found |= name == expected;
+    }
+    found
 }
 
 fn check_user_manager_and_unit(uid: u32, bundle_unit: &[u8]) -> PackageResult<()> {
@@ -1515,6 +1527,14 @@ fail_at=0
         ));
         assert!(!activatable_name_list_contains(
             "s \"org.freedesktop.portal.Desktop\"",
+            "org.freedesktop.portal.Desktop"
+        ));
+        assert!(!activatable_name_list_contains(
+            "as 2 \"org.freedesktop.portal.Desktop\"",
+            "org.freedesktop.portal.Desktop"
+        ));
+        assert!(!activatable_name_list_contains(
+            "as 2 \"org.freedesktop.portal.Desktop\" unquoted",
             "org.freedesktop.portal.Desktop"
         ));
     }
