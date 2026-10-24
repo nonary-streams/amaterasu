@@ -34,11 +34,22 @@ pub trait Platform {
             "topology_revision": snapshot.revision()?,
         }))
     }
-    /// Capture a provider-specific baseline that must accompany the classic CCD
-    /// snapshot in the durable recovery journal. Providers without extra state
-    /// keep the legacy journal shape.
+    /// Capture a provider-specific durable recovery baseline. Providers that
+    /// use the legacy CCD model return None and keep its wire format unchanged.
     fn capture_kscreen_snapshot(&mut self) -> DisplayResult<Option<KScreenSnapshot>> {
         Ok(None)
+    }
+    /// Validate a direct KScreen configuration against the durable baseline
+    /// and the provider's currently available modes without changing outputs.
+    fn prepare_kscreen_snapshot(
+        &mut self,
+        _: &Configuration,
+        _: &KScreenSnapshot,
+    ) -> DisplayResult<()> {
+        Err(DisplayError::new(
+            "unsupported_platform",
+            "KScreen configuration preparation is not implemented by this provider",
+        ))
     }
     /// Restore a KScreen journal baseline, including conservative hotplug
     /// reconciliation and readback verification before returning success. This
@@ -58,30 +69,12 @@ pub trait Platform {
     fn apply_kscreen_snapshot(
         &mut self,
         _: &Configuration,
-        _: &Snapshot,
         _: &KScreenSnapshot,
         _: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
         Err(DisplayError::new(
             "unsupported_platform",
             "KScreen apply is not implemented by this provider",
-        ))
-    }
-    /// Apply a KScreen configuration while preserving the selected topology,
-    /// with success contingent on exact requested-state readback verification.
-    fn apply_kscreen_snapshot_preserving(
-        &mut self,
-        _: &Configuration,
-        _: &Snapshot,
-        _: &KScreenSnapshot,
-        _: &str,
-        _: Option<&RouteBinding>,
-        _: TopologyShape,
-        _: &mut dyn FnMut() -> DisplayResult<()>,
-    ) -> DisplayResult<()> {
-        Err(DisplayError::new(
-            "unsupported_platform",
-            "KScreen topology-preserving apply is not implemented by this provider",
         ))
     }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot>;

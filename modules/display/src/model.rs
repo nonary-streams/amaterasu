@@ -530,6 +530,169 @@ impl KScreenSnapshot {
         }
         Ok(format!("{first:016x}{second:016x}"))
     }
+
+    pub fn validate_requested_topology(
+        &self,
+        configuration: &Configuration,
+    ) -> Result<(), DisplayError> {
+        self.validate()?;
+        configuration.validate()?;
+        let active_outputs = self
+            .outputs
+            .iter()
+            .filter(|output| output.connected && output.enabled)
+            .collect::<Vec<_>>();
+        if active_outputs.len() != configuration.displays.len()
+            || configuration.displays.iter().any(|display| {
+                !active_outputs
+                    .iter()
+                    .any(|output| output.id.eq_ignore_ascii_case(&display.id))
+            })
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "KScreen apply currently requires the same connected active outputs",
+            ));
+        }
+        let saved_primary = active_outputs.iter().find(|output| output.primary);
+        let requested_primary = configuration
+            .displays
+            .iter()
+            .find(|display| display.x == 0 && display.y == 0);
+        if saved_primary
+            .zip(requested_primary)
+            .is_none_or(|(saved, requested)| !saved.id.eq_ignore_ascii_case(&requested.id))
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "KScreen direct apply must preserve the current primary output",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn matches_configuration(&self, baseline: &Self, configuration: &Configuration) -> bool {
+        if self.validate_requested_topology(configuration).is_err()
+            || baseline.validate_requested_topology(configuration).is_err()
+        {
+            return false;
+        }
+        if self.outputs.iter().any(|current| {
+            current.connected
+                && !baseline
+                    .outputs
+                    .iter()
+                    .any(|saved| saved.id.eq_ignore_ascii_case(&current.id) && saved.connected)
+        }) {
+            return false;
+        }
+        if baseline.outputs.iter().any(|saved| {
+            let current = self
+                .outputs
+                .iter()
+                .find(|current| current.id.eq_ignore_ascii_case(&saved.id));
+            match current {
+                None => saved.connected,
+                Some(current) if !saved.enabled => {
+                    saved.connected != current.connected
+                        || saved.enabled != current.enabled
+                        || saved.mode != current.mode
+                        || saved.position != current.position
+                        || saved.scale != current.scale
+                        || saved.rotation != current.rotation
+                        || saved.priority != current.priority
+                        || saved.primary != current.primary
+                        || saved.hdr_enabled != current.hdr_enabled
+                }
+                Some(current) => {
+                    saved.connected != current.connected
+                        || saved.enabled != current.enabled
+                        || saved.scale != current.scale
+                        || saved.priority != current.priority
+                        || saved.primary != current.primary
+                }
+            }
+        }) {
+            return false;
+        }
+        configuration.displays.iter().all(|display| {
+            self.outputs
+                .iter()
+                .find(|output| output.id.eq_ignore_ascii_case(&display.id))
+                .is_some_and(|output| {
+                    let rotation = match display.rotation {
+                        Rotation::Identity => 1,
+                        Rotation::Rotate90 => 2,
+                        Rotation::Rotate180 => 4,
+                        Rotation::Rotate270 => 8,
+                    };
+                    output.position.x == display.x
+                        && output.position.y == display.y
+                        && output.rotation == rotation
+                        && output.mode.as_ref().is_some_and(|mode| {
+                            mode.width == display.width
+                                && mode.height == display.height
+                                && (u64::from(display.refresh.numerator) * 1000
+                                    + u64::from(display.refresh.denominator) / 2)
+                                    / u64::from(display.refresh.denominator)
+                                    == u64::from(mode.refresh_millihz)
+                        })
+                        && match display.hdr_enabled {
+                            Some(hdr) => output.hdr_enabled == Some(hdr),
+                            None => baseline
+                                .outputs
+                                .iter()
+                                .find(|saved| saved.id.eq_ignore_ascii_case(&display.id))
+                                .is_some_and(|saved| output.hdr_enabled == saved.hdr_enabled),
+                        }
+                })
+        })
+    }
+
+    /// Compare all saved connector state after restore while tolerating a
+    /// baseline-disconnected connector that remains absent.
+    pub fn matches_restoration(&self, current: &Self) -> bool {
+        if self.validate().is_err() || current.validate().is_err() {
+            return false;
+        }
+        if current.outputs.iter().any(|present| {
+            present.connected
+                && !self
+                    .outputs
+                    .iter()
+                    .any(|saved| saved.id.eq_ignore_ascii_case(&present.id) && saved.connected)
+        }) {
+            return false;
+        }
+        self.outputs.iter().all(|saved| {
+            let Some(present) = current
+                .outputs
+                .iter()
+                .find(|present| present.id.eq_ignore_ascii_case(&saved.id))
+            else {
+                return !saved.connected;
+            };
+            if saved.connected != present.connected {
+                return false;
+            }
+            saved.enabled == present.enabled
+                && match (&saved.mode, &present.mode) {
+                    (Some(saved_mode), Some(present_mode)) => {
+                        saved_mode.width == present_mode.width
+                            && saved_mode.height == present_mode.height
+                            && saved_mode.refresh_millihz == present_mode.refresh_millihz
+                    }
+                    (None, None) => true,
+                    _ => false,
+                }
+                && saved.position == present.position
+                && saved.scale == present.scale
+                && saved.rotation == present.rotation
+                && saved.priority == present.priority
+                && saved.primary == present.primary
+                && saved.hdr_enabled == present.hdr_enabled
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -724,15 +887,31 @@ impl Snapshot {
             })
     }
 }
+
+/// The untagged on-disk shape preserves legacy CCD journal JSON exactly while
+/// allowing Linux leases to store a KScreen-only recovery baseline.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum RecoveryBaseline {
+    Ccd(Snapshot),
+    KScreen(KScreenSnapshot),
+}
+impl RecoveryBaseline {
+    pub fn validate(&self) -> Result<(), DisplayError> {
+        match self {
+            Self::Ccd(snapshot) => snapshot.validate(),
+            Self::KScreen(snapshot) => snapshot.validate(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Journal {
     pub owner: String,
     pub lease: String,
-    pub snapshot: Snapshot,
-    /// Absent in legacy CCD journals; populated by a future KScreen recovery provider.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kscreen: Option<KScreenSnapshot>,
+    /// Legacy CCD objects retain their exact JSON representation.
+    pub snapshot: RecoveryBaseline,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -779,9 +958,6 @@ impl Journal {
                 "invalid_journal",
                 "invalid display journal owner or lease",
             ));
-        }
-        if let Some(kscreen) = &self.kscreen {
-            kscreen.validate()?;
         }
         self.snapshot.validate()
     }

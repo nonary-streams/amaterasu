@@ -1,7 +1,7 @@
 use crate::configuration_option::DisplayConfigurationOption;
 use crate::model::{
-    Configuration, DisplayError, DisplayResult, Journal, Operation, Rational, RouteBinding,
-    Snapshot,
+    Configuration, DisplayError, DisplayResult, Journal, Operation, Rational, RecoveryBaseline,
+    RouteBinding, Snapshot,
 };
 use crate::platform::{Platform, TopologyShape};
 use crate::{JOURNAL_KEY, SERVICE, STATE_SERVICE};
@@ -441,6 +441,32 @@ impl<P: Platform> Pipeline<P> {
                         ),
                     );
                 }
+                let kscreen_baseline = match self.platform.capture_kscreen_snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return complete(send, context.request, error.payload()),
+                };
+                if let Some(kscreen_baseline) = kscreen_baseline {
+                    if mode_policy.is_some() || mode_policies.is_some() {
+                        return complete(
+                            send,
+                            context.request,
+                            failure(
+                                "unsupported_topology",
+                                "KScreen direct apply does not yet support mode or topology policies",
+                            ),
+                        );
+                    }
+                    return self.prepare_kscreen_lease(
+                        context,
+                        revision,
+                        configuration,
+                        expected_topology_revision,
+                        operation_id,
+                        request_identity,
+                        kscreen_baseline,
+                        send,
+                    );
+                }
                 let topology_option = mode_policy
                     .as_ref()
                     .and_then(|policy| policy.configuration_option);
@@ -822,6 +848,114 @@ impl<P: Platform> Pipeline<P> {
             _ => unreachable!("read operations handled before mutation dispatch"),
         }
     }
+    fn prepare_kscreen_lease(
+        &mut self,
+        context: Context,
+        revision: u64,
+        configuration: Configuration,
+        expected_topology_revision: Option<String>,
+        operation_id: Option<String>,
+        request_identity: Value,
+        baseline: crate::model::KScreenSnapshot,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        if let Err(error) = configuration.validate() {
+            return complete(send, context.request, error.payload());
+        }
+        if let Err(error) = baseline.validate_requested_topology(&configuration) {
+            return complete(send, context.request, error.payload());
+        }
+        let baseline_revision = match baseline.revision() {
+            Ok(revision) => revision,
+            Err(error) => return complete(send, context.request, error.payload()),
+        };
+        if expected_topology_revision
+            .as_ref()
+            .is_some_and(|expected| expected != &baseline_revision)
+        {
+            return complete(
+                send,
+                context.request,
+                failure(
+                    "topology_changed",
+                    "KScreen topology changed before journal prepare",
+                ),
+            );
+        }
+        if let Err(error) = self
+            .platform
+            .prepare_kscreen_snapshot(&configuration, &baseline)
+        {
+            return complete(send, context.request, error.payload());
+        }
+        let readback = match self.platform.capture_kscreen_snapshot() {
+            Ok(Some(readback)) => readback,
+            Ok(None) => {
+                return complete(
+                    send,
+                    context.request,
+                    failure(
+                        "unsupported_platform",
+                        "KScreen recovery capability disappeared during preparation",
+                    ),
+                );
+            }
+            Err(error) => return complete(send, context.request, error.payload()),
+        };
+        if readback.revision().as_ref().ok() != Some(&baseline_revision) {
+            return complete(
+                send,
+                context.request,
+                failure(
+                    "topology_changed",
+                    "KScreen topology changed during journal prepare",
+                ),
+            );
+        }
+        let Some(generation) = revision.checked_add(1) else {
+            return complete(
+                send,
+                context.request,
+                failure("resource_exhausted", "display lease generation exhausted"),
+            );
+        };
+        let request_identity = operation_id.as_ref().map(|_| request_identity);
+        let journal = Journal {
+            owner: context.caller.clone(),
+            lease: format!("display-{generation:016x}"),
+            snapshot: RecoveryBaseline::KScreen(baseline),
+            operation_id,
+            requested_configuration: None,
+            request_identity,
+            expected_topology_revision,
+            pending_route: None,
+        };
+        if journal.validate().is_err()
+            || serde_json::to_vec(&journal).map_or(true, |bytes| bytes.len() > 12_000)
+        {
+            return complete(
+                send,
+                context.request,
+                failure(
+                    "resource_exhausted",
+                    "complete display recovery snapshot exceeds journal bounds",
+                ),
+            );
+        }
+        let payload =
+            json!({"action":"set","key":JOURNAL_KEY,"expected_revision":revision,"value":journal});
+        self.submit(
+            context,
+            payload,
+            Stage::Armed {
+                journal,
+                configuration,
+                native_target: None,
+            },
+            send,
+        )
+    }
+
     fn prepare(
         &mut self,
         context: Context,
@@ -880,10 +1014,6 @@ impl<P: Platform> Pipeline<P> {
                 );
             }
         }
-        let kscreen_before = match self.platform.capture_kscreen_snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => return complete(send, context.request, error.payload()),
-        };
         let prepared = match native_target.as_ref() {
             Some((selected, shape)) => self.platform.prepare_preserving(
                 &configuration,
@@ -948,42 +1078,6 @@ impl<P: Platform> Pipeline<P> {
                 ),
             );
         }
-        let kscreen = match self.platform.capture_kscreen_snapshot() {
-            Ok(kscreen_after) => match (kscreen_before, kscreen_after) {
-                (Some(before), Some(after)) => match (before.revision(), after.revision()) {
-                    (Ok(before_revision), Ok(after_revision))
-                        if before_revision == after_revision =>
-                    {
-                        Some(before)
-                    }
-                    (Err(error), _) | (_, Err(error)) => {
-                        return complete(send, context.request, error.payload());
-                    }
-                    _ => {
-                        return complete(
-                            send,
-                            context.request,
-                            failure(
-                                "topology_changed",
-                                "KScreen topology changed during journal prepare",
-                            ),
-                        );
-                    }
-                },
-                (None, None) => None,
-                _ => {
-                    return complete(
-                        send,
-                        context.request,
-                        failure(
-                            "topology_changed",
-                            "KScreen recovery capability changed during journal prepare",
-                        ),
-                    );
-                }
-            },
-            Err(error) => return complete(send, context.request, error.payload()),
-        };
         let Some(generation) = revision.checked_add(1) else {
             return complete(
                 send,
@@ -995,8 +1089,7 @@ impl<P: Platform> Pipeline<P> {
         let journal = Journal {
             owner: context.caller.clone(),
             lease: format!("display-{generation:016x}"),
-            snapshot,
-            kscreen,
+            snapshot: RecoveryBaseline::Ccd(snapshot),
             operation_id,
             requested_configuration: None,
             request_identity,
@@ -1037,37 +1130,31 @@ impl<P: Platform> Pipeline<P> {
         native_target: Option<(String, TopologyShape)>,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
-        let result = match (&journal.kscreen, native_target.as_ref()) {
-            (Some(kscreen), Some((selected, shape))) => {
-                self.platform.apply_kscreen_snapshot_preserving(
+        let result = match (&journal.snapshot, native_target.as_ref()) {
+            (RecoveryBaseline::KScreen(_), Some(_)) => Err(DisplayError::new(
+                "unsupported_topology",
+                "KScreen direct apply cannot use CCD topology-preserving routes",
+            )),
+            (RecoveryBaseline::KScreen(kscreen), None) => {
+                apply_kscreen_transaction(&mut self.platform, kscreen, &configuration, &mut || {
+                    check_request(send, &context)
+                })
+            }
+            (RecoveryBaseline::Ccd(snapshot), Some((selected, shape))) => {
+                self.platform.apply_preserving(
                     &configuration,
-                    &journal.snapshot,
-                    kscreen,
+                    snapshot,
                     selected,
                     journal.pending_route.as_ref(),
                     *shape,
                     &mut || check_request(send, &context),
                 )
             }
-            (Some(kscreen), None) => self.platform.apply_kscreen_snapshot(
-                &configuration,
-                &journal.snapshot,
-                kscreen,
-                &mut || check_request(send, &context),
-            ),
-            (None, Some((selected, shape))) => self.platform.apply_preserving(
-                &configuration,
-                &journal.snapshot,
-                selected,
-                journal.pending_route.as_ref(),
-                *shape,
-                &mut || check_request(send, &context),
-            ),
-            (None, None) => self
-                .platform
-                .apply(&configuration, &journal.snapshot, &mut || {
+            (RecoveryBaseline::Ccd(snapshot), None) => {
+                self.platform.apply(&configuration, snapshot, &mut || {
                     check_request(send, &context)
-                }),
+                })
+            }
         };
         match result {
             Ok(()) => {
@@ -1110,11 +1197,77 @@ fn restore_journal_snapshot<P: Platform>(
     journal: &Journal,
     guard: &mut dyn FnMut() -> DisplayResult<()>,
 ) -> DisplayResult<()> {
-    if let Some(kscreen) = &journal.kscreen {
-        platform.restore_kscreen_snapshot(kscreen, guard)
-    } else {
-        platform.restore(&journal.snapshot, guard)
+    match &journal.snapshot {
+        RecoveryBaseline::Ccd(snapshot) => platform.restore(snapshot, guard),
+        RecoveryBaseline::KScreen(baseline) => {
+            platform.restore_kscreen_snapshot(baseline, guard)?;
+            let current = platform
+                .capture_kscreen_snapshot()
+                .map_err(DisplayError::after_mutation)?
+                .ok_or_else(|| {
+                    DisplayError::new(
+                        "verification_failed",
+                        "KScreen recovery provider disappeared after restore",
+                    )
+                    .after_mutation()
+                })?;
+            if !baseline.matches_restoration(&current) {
+                return Err(DisplayError::new(
+                    "verification_failed",
+                    "KScreen restored topology does not match its durable baseline",
+                )
+                .after_mutation());
+            }
+            Ok(())
+        }
     }
+}
+
+fn apply_kscreen_transaction<P: Platform>(
+    platform: &mut P,
+    baseline: &crate::model::KScreenSnapshot,
+    configuration: &Configuration,
+    guard: &mut dyn FnMut() -> DisplayResult<()>,
+) -> DisplayResult<()> {
+    let current = platform.capture_kscreen_snapshot()?.ok_or_else(|| {
+        DisplayError::new(
+            "unsupported_platform",
+            "KScreen recovery provider disappeared before apply",
+        )
+    })?;
+    if current.revision()? != baseline.revision()? {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "KScreen topology changed after journal arm and before apply",
+        ));
+    }
+    platform.apply_kscreen_snapshot(configuration, baseline, guard)?;
+    verify_kscreen_configuration(platform, baseline, configuration)
+}
+
+fn verify_kscreen_configuration<P: Platform>(
+    platform: &mut P,
+    baseline: &crate::model::KScreenSnapshot,
+    configuration: &Configuration,
+) -> DisplayResult<()> {
+    let current = platform
+        .capture_kscreen_snapshot()
+        .map_err(DisplayError::after_mutation)?
+        .ok_or_else(|| {
+            DisplayError::new(
+                "verification_failed",
+                "KScreen provider disappeared after apply",
+            )
+            .after_mutation()
+        })?;
+    if !current.matches_configuration(baseline, configuration) {
+        return Err(DisplayError::new(
+            "verification_failed",
+            "KScreen readback does not match the requested configuration",
+        )
+        .after_mutation());
+    }
+    Ok(())
 }
 
 fn read_only_apply<P: Platform>(

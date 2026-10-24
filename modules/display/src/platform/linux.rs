@@ -1,7 +1,8 @@
 //! Read-only KDE/KScreen discovery and conservative restoration planning.
 //!
-//! Native display mutations remain unsupported on Linux until the KScreen
-//! topology can be journaled through the display module's existing lease path.
+//! Native display mutations remain unsupported on Linux until journaled
+//! configuration plans, identity-safe restoration, and exact readback are
+//! implemented and centrally verified.
 use super::{Platform, TopologyShape};
 use crate::model::{
     Address, AvailableMode, Configuration, DisplayError, DisplayResult, KScreenModeSnapshot,
@@ -29,8 +30,8 @@ impl Platform for LinuxPlatform {
         "linux_kscreen"
     }
 
-    // KScreen mutation is deliberately not exposed through the existing CCD
-    // transaction API. Linux topology needs its own durable journal format.
+    // KScreen snapshot journaling is available, but output mutations remain
+    // gated until restoration and exact readback are qualified.
     fn supported(&self) -> bool {
         false
     }
@@ -81,6 +82,66 @@ impl Platform for LinuxPlatform {
         Ok(Some(typed_snapshot(&outputs)?))
     }
 
+    fn prepare_kscreen_snapshot(
+        &mut self,
+        requested: &Configuration,
+        baseline: &KScreenSnapshot,
+    ) -> DisplayResult<()> {
+        baseline.validate_requested_topology(requested)?;
+        let current = query_configuration()?;
+        let outputs = validated_outputs(&current)?;
+        if typed_snapshot(&outputs)?.revision()? != baseline.revision()? {
+            return Err(DisplayError::new(
+                "topology_changed",
+                "KScreen topology changed before configuration preparation",
+            ));
+        }
+        for display in &requested.displays {
+            let output = outputs
+                .iter()
+                .copied()
+                .find(|output| {
+                    output_name(output).is_ok_and(|name| name.eq_ignore_ascii_case(&display.id))
+                })
+                .ok_or_else(|| {
+                    DisplayError::new(
+                        "topology_changed",
+                        "requested KScreen output is no longer connected",
+                    )
+                })?;
+            let requested_millihz = ((u64::from(display.refresh.numerator) * 1000
+                + u64::from(display.refresh.denominator) / 2)
+                / u64::from(display.refresh.denominator))
+                as u32;
+            let mode_available = output_modes(output)?.into_iter().any(|mode| {
+                integer_field(mode, "size", "width").ok() == Some(display.width)
+                    && integer_field(mode, "size", "height").ok() == Some(display.height)
+                    && mode_refresh_millihz(mode).ok() == Some(requested_millihz)
+            });
+            if !mode_available {
+                return Err(DisplayError::new(
+                    "unsupported_display",
+                    "requested KScreen mode is unavailable",
+                ));
+            }
+            let saved_hdr = baseline
+                .outputs
+                .iter()
+                .find(|saved| saved.id.eq_ignore_ascii_case(&display.id))
+                .and_then(|saved| saved.hdr_enabled);
+            if display
+                .hdr_enabled
+                .is_some_and(|requested| saved_hdr != Some(requested))
+            {
+                return Err(DisplayError::new(
+                    "unsupported_topology",
+                    "KScreen preparation does not yet support changing HDR state",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn restore_kscreen_snapshot(
         &mut self,
         _: &KScreenSnapshot,
@@ -92,21 +153,7 @@ impl Platform for LinuxPlatform {
     fn apply_kscreen_snapshot(
         &mut self,
         _: &Configuration,
-        _: &Snapshot,
         _: &KScreenSnapshot,
-        _: &mut dyn FnMut() -> DisplayResult<()>,
-    ) -> DisplayResult<()> {
-        Err(unsupported_mutation())
-    }
-
-    fn apply_kscreen_snapshot_preserving(
-        &mut self,
-        _: &Configuration,
-        _: &Snapshot,
-        _: &KScreenSnapshot,
-        _: &str,
-        _: Option<&RouteBinding>,
-        _: TopologyShape,
         _: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
         Err(unsupported_mutation())
@@ -175,7 +222,7 @@ impl Platform for LinuxPlatform {
 fn unsupported_mutation() -> DisplayError {
     DisplayError::new(
         "unsupported_platform",
-        "Linux KScreen enumeration and snapshots are read-only; display mutation requires a journaled KScreen recovery provider",
+        "Linux KScreen mutation requires an identity-safe provider with exact restore and readback verification",
     )
 }
 

@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::{
     Address, DisplayPath, KScreenModeSnapshot, KScreenOutputSnapshot, KScreenPosition,
-    KScreenSnapshot, ModePolicy, Rational, Signal, Snapshot, SourceMode,
+    KScreenSnapshot, ModePolicy, Rational, RecoveryBaseline, Signal, Snapshot, SourceMode,
 };
 
 fn snapshot() -> Snapshot {
@@ -99,6 +99,22 @@ fn kscreen_snapshot() -> KScreenSnapshot {
             },
         ],
     }
+}
+fn kscreen_configuration() -> Value {
+    json!({
+        "displays": [
+            {
+                "id": "DP-1", "width": 1280, "height": 720,
+                "refresh": {"numerator": 60, "denominator": 1},
+                "x": 0, "y": 0
+            },
+            {
+                "id": "DP-2", "width": 1920, "height": 1080,
+                "refresh": {"numerator": 60, "denominator": 1},
+                "x": 1280, "y": 0, "rotation": "rotate90", "hdr_enabled": false
+            }
+        ]
+    })
 }
 fn two_display_snapshot() -> Snapshot {
     let mut before = snapshot();
@@ -651,6 +667,7 @@ struct FakePlatform {
     kscreen_baseline: Option<KScreenSnapshot>,
     kscreen_capture_count: usize,
     kscreen_drift_on_second_capture: bool,
+    kscreen_apply_readback_failure: bool,
     kscreen_restore_blocked: bool,
     kscreen_restore_failure: bool,
     kscreen_restore_readback_failure: bool,
@@ -673,15 +690,53 @@ impl Platform for FakePlatform {
         }
         Ok(Some(baseline))
     }
+    fn prepare_kscreen_snapshot(
+        &mut self,
+        configuration: &Configuration,
+        baseline: &KScreenSnapshot,
+    ) -> DisplayResult<()> {
+        baseline.validate_requested_topology(configuration)
+    }
     fn apply_kscreen_snapshot(
         &mut self,
-        _: &Configuration,
-        _: &Snapshot,
+        configuration: &Configuration,
         baseline: &KScreenSnapshot,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
         baseline.validate()?;
+        configuration.validate()?;
         guard()?;
+        let mut readback = baseline.clone();
+        for display in &configuration.displays {
+            let output = readback
+                .outputs
+                .iter_mut()
+                .find(|output| output.id.eq_ignore_ascii_case(&display.id))
+                .ok_or_else(|| DisplayError::new("unsupported_display", "missing output"))?;
+            output.position.x = display.x;
+            output.position.y = display.y;
+            output.rotation = match display.rotation {
+                crate::model::Rotation::Identity => 1,
+                crate::model::Rotation::Rotate90 => 2,
+                crate::model::Rotation::Rotate180 => 4,
+                crate::model::Rotation::Rotate270 => 8,
+            };
+            if let Some(hdr) = display.hdr_enabled {
+                output.hdr_enabled = Some(hdr);
+            }
+            output.mode = Some(KScreenModeSnapshot {
+                id: format!("{}x{}@60", display.width, display.height),
+                width: display.width,
+                height: display.height,
+                refresh_millihz: 60_000,
+            });
+        }
+        self.kscreen_baseline = Some(readback);
+        if self.kscreen_apply_readback_failure {
+            self.kscreen_baseline.as_mut().unwrap().outputs[0]
+                .position
+                .x = 1;
+        }
         self.effects.push("apply_kscreen");
         if self.apply_failure {
             return Err(DisplayError::new(
@@ -691,18 +746,6 @@ impl Platform for FakePlatform {
             .after_mutation());
         }
         Ok(())
-    }
-    fn apply_kscreen_snapshot_preserving(
-        &mut self,
-        configuration: &Configuration,
-        before: &Snapshot,
-        baseline: &KScreenSnapshot,
-        _: &str,
-        _: Option<&RouteBinding>,
-        _: TopologyShape,
-        guard: &mut dyn FnMut() -> DisplayResult<()>,
-    ) -> DisplayResult<()> {
-        self.apply_kscreen_snapshot(configuration, before, baseline, guard)
     }
     fn restore_kscreen_snapshot(
         &mut self,
@@ -718,8 +761,12 @@ impl Platform for FakePlatform {
             ));
         }
         guard()?;
+        self.kscreen_baseline = Some(baseline.clone());
+        if self.kscreen_restore_readback_failure {
+            self.kscreen_baseline.as_mut().unwrap().outputs[0].scale = 1.75;
+        }
         self.effects.push("restore_kscreen");
-        if self.kscreen_restore_failure || self.kscreen_restore_readback_failure {
+        if self.kscreen_restore_failure {
             return Err(DisplayError::new(
                 "verification_failed",
                 "fake KScreen restoration did not verify",
@@ -3636,8 +3683,7 @@ fn expired_native_boundary_keeps_recovery_without_effects() {
     let journal = Journal {
         owner: "owner".into(),
         lease: "display-0000000000000001".into(),
-        snapshot: snapshot(),
-        kscreen: None,
+        snapshot: RecoveryBaseline::Ccd(snapshot()),
         operation_id: None,
         request_identity: None,
         requested_configuration: None,
@@ -3702,8 +3748,7 @@ fn invalid_journals_and_stale_leases_are_never_overwritten() {
         serde_json::to_value(Journal {
             owner: "owner".into(),
             lease: "current".into(),
-            snapshot: snapshot(),
-            kscreen: None,
+            snapshot: RecoveryBaseline::Ccd(snapshot()),
             operation_id: None,
             request_identity: None,
             requested_configuration: None,
@@ -3729,21 +3774,15 @@ fn versioned_kscreen_journal_roundtrips_without_breaking_legacy_ccd_records() {
         "lease": "legacy-lease",
         "snapshot": serde_json::to_value(snapshot()).unwrap()
     });
-    let legacy: Journal = serde_json::from_value(legacy_value).unwrap();
-    assert!(legacy.kscreen.is_none());
+    let legacy: Journal = serde_json::from_value(legacy_value.clone()).unwrap();
+    assert!(matches!(&legacy.snapshot, RecoveryBaseline::Ccd(_)));
     legacy.validate().unwrap();
-    assert!(
-        serde_json::to_value(&legacy)
-            .unwrap()
-            .get("kscreen")
-            .is_none()
-    );
+    assert_eq!(serde_json::to_value(&legacy).unwrap(), legacy_value);
 
     let journal = Journal {
         owner: "owner".into(),
         lease: "kscreen-lease".into(),
-        snapshot: snapshot(),
-        kscreen: Some(kscreen_snapshot()),
+        snapshot: RecoveryBaseline::KScreen(kscreen_snapshot()),
         operation_id: None,
         requested_configuration: None,
         request_identity: None,
@@ -3754,20 +3793,20 @@ fn versioned_kscreen_journal_roundtrips_without_breaking_legacy_ccd_records() {
     let encoded = serde_json::to_value(&journal).unwrap();
     let bytes = serde_json::to_vec(&journal).unwrap();
     assert!(bytes.len() <= 12_000);
-    assert_eq!(encoded["kscreen"]["version"], 1);
+    assert!(encoded.get("kscreen").is_none());
+    assert!(encoded["snapshot"].get("format_version").is_none());
+    assert_eq!(encoded["snapshot"]["version"], 1);
     let decoded: Journal = serde_json::from_value(encoded.clone()).unwrap();
     decoded.validate().unwrap();
-    assert_eq!(
-        decoded.kscreen.unwrap().outputs[0]
-            .mode
-            .as_ref()
-            .unwrap()
-            .id,
-        "25"
-    );
+    match decoded.snapshot {
+        RecoveryBaseline::KScreen(snapshot) => {
+            assert_eq!(snapshot.outputs[0].mode.as_ref().unwrap().id, "25")
+        }
+        RecoveryBaseline::Ccd(_) => panic!("KScreen recovery baseline decoded as CCD"),
+    }
 
     let mut unknown_version = encoded.clone();
-    unknown_version["kscreen"]["version"] = 2.into();
+    unknown_version["snapshot"]["version"] = 2.into();
     let unknown_version: Journal = serde_json::from_value(unknown_version).unwrap();
     assert_eq!(
         unknown_version.validate().unwrap_err().code,
@@ -3775,7 +3814,7 @@ fn versioned_kscreen_journal_roundtrips_without_breaking_legacy_ccd_records() {
     );
 
     let mut unknown_field = encoded;
-    unknown_field["kscreen"]["outputs"][0]["unexpected"] = true.into();
+    unknown_field["snapshot"]["outputs"][0]["unexpected"] = true.into();
     assert!(serde_json::from_value::<Journal>(unknown_field).is_err());
 }
 
@@ -3813,10 +3852,57 @@ fn kscreen_snapshot_rejects_payloads_over_the_journal_byte_limit() {
 }
 
 #[test]
+fn kscreen_readback_matching_is_identity_and_state_exact_but_order_independent() {
+    let baseline = kscreen_snapshot();
+    let mut restored = baseline.clone();
+    restored.outputs.reverse();
+    assert!(baseline.matches_restoration(&restored));
+
+    let mut drifted = baseline.clone();
+    drifted.outputs[0].scale = 1.75;
+    assert!(!baseline.matches_restoration(&drifted));
+
+    let mut disconnected_baseline = baseline.clone();
+    disconnected_baseline.outputs.push(KScreenOutputSnapshot {
+        id: "DP-3".into(),
+        connected: false,
+        enabled: false,
+        mode: None,
+        position: KScreenPosition { x: 0, y: 0 },
+        scale: 1.0,
+        rotation: 1,
+        priority: 0,
+        primary: false,
+        hdr_enabled: None,
+    });
+    assert!(disconnected_baseline.matches_restoration(&baseline));
+
+    let mut hotplugged = baseline.clone();
+    hotplugged.outputs.push(KScreenOutputSnapshot {
+        id: "DP-3".into(),
+        connected: true,
+        enabled: true,
+        mode: Some(KScreenModeSnapshot {
+            id: "1920x1080@60".into(),
+            width: 1920,
+            height: 1080,
+            refresh_millihz: 60_000,
+        }),
+        position: KScreenPosition { x: 4480, y: 0 },
+        scale: 1.0,
+        rotation: 1,
+        priority: 3,
+        primary: false,
+        hdr_enabled: Some(false),
+    });
+    assert!(!baseline.matches_restoration(&hotplugged));
+}
+
+#[test]
 fn kscreen_baseline_is_persisted_and_apply_retry_is_idempotent() {
     let request = json!({
         "action":"apply",
-        "configuration":configuration(),
+        "configuration":kscreen_configuration(),
         "operation_id":"kscreen-lease-operation"
     });
     let mut state = State::default();
@@ -3830,8 +3916,11 @@ fn kscreen_baseline_is_persisted_and_apply_retry_is_idempotent() {
     let applied = state.run(&mut pipeline, "owner", request.clone());
     assert_eq!(applied["applied"], true, "{applied}");
     let journal: Journal = serde_json::from_value(state.journal.clone().unwrap()).unwrap();
-    assert_eq!(journal.kscreen.unwrap(), kscreen_snapshot());
-    assert_eq!(pipeline.platform.kscreen_capture_count, 2);
+    assert!(matches!(
+        journal.snapshot,
+        RecoveryBaseline::KScreen(ref snapshot) if *snapshot == kscreen_snapshot()
+    ));
+    assert_eq!(pipeline.platform.kscreen_capture_count, 4);
     assert_eq!(pipeline.platform.effects, ["apply_kscreen"]);
 
     let retry = state.run(&mut pipeline, "owner", request);
@@ -3854,11 +3943,58 @@ fn kscreen_topology_drift_before_journal_arm_has_no_native_effects() {
     let result = state.run(
         &mut pipeline,
         "owner",
-        json!({"action":"apply","configuration":configuration()}),
+        json!({"action":"apply","configuration":kscreen_configuration()}),
     );
     assert_eq!(result["error"]["code"], "topology_changed");
     assert!(pipeline.platform.effects.is_empty());
     assert!(state.journal.is_none());
+}
+
+#[test]
+fn kscreen_apply_rejects_added_outputs_and_failed_journal_cas_before_effects() {
+    let mut configuration = kscreen_configuration();
+    configuration["displays"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id":"DP-3", "width":1920, "height":1080,
+            "refresh":{"numerator":60,"denominator":1}, "x":3200, "y":0
+        }));
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            kscreen_baseline: Some(kscreen_snapshot()),
+            ..Default::default()
+        },
+        true,
+    );
+    let added = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"apply","configuration":configuration}),
+    );
+    assert_eq!(added["error"]["code"], "unsupported_topology");
+    assert!(state.journal.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+
+    let mut failed_state = State {
+        fail_save: true,
+        ..Default::default()
+    };
+    let mut failed_pipeline = Pipeline::new(
+        FakePlatform {
+            kscreen_baseline: Some(kscreen_snapshot()),
+            ..Default::default()
+        },
+        true,
+    );
+    let not_armed = failed_state.run(
+        &mut failed_pipeline,
+        "owner",
+        json!({"action":"apply","configuration":kscreen_configuration()}),
+    );
+    assert_eq!(not_armed["ok"], false);
+    assert!(failed_pipeline.platform.effects.is_empty());
 }
 
 #[test]
@@ -3877,7 +4013,7 @@ fn partial_kscreen_apply_rolls_back_from_journal_or_retains_recovery() {
         let result = state.run(
             &mut pipeline,
             "owner",
-            json!({"action":"apply","configuration":configuration()}),
+            json!({"action":"apply","configuration":kscreen_configuration()}),
         );
         assert_eq!(result["ok"], false);
         if kscreen_restore_failure {
@@ -3892,12 +4028,36 @@ fn partial_kscreen_apply_rolls_back_from_journal_or_retains_recovery() {
 }
 
 #[test]
+fn kscreen_apply_readback_mismatch_rolls_back_and_clears_only_after_exact_restore() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            kscreen_baseline: Some(kscreen_snapshot()),
+            kscreen_apply_readback_failure: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"apply","configuration":kscreen_configuration()}),
+    );
+    assert_eq!(result["error"]["code"], "verification_failed");
+    assert_eq!(result.get("recovery_required"), None);
+    assert!(state.journal.is_none());
+    assert_eq!(
+        pipeline.platform.effects,
+        ["apply_kscreen", "restore_kscreen"]
+    );
+}
+
+#[test]
 fn interrupted_kscreen_lease_holds_on_hotplug_and_readback_failure() {
     let journal = Journal {
         owner: "owner".into(),
         lease: "display-kscreen-interrupted".into(),
-        snapshot: snapshot(),
-        kscreen: Some(kscreen_snapshot()),
+        snapshot: RecoveryBaseline::KScreen(kscreen_snapshot()),
         operation_id: Some("kscreen-interrupted-operation".into()),
         request_identity: None,
         requested_configuration: None,
