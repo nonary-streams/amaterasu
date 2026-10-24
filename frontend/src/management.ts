@@ -181,7 +181,8 @@ namespace Amaterasu {
       panel("Management sessions", sessionArea),
     );
 
-    async function loadPairings(): Promise<void> {
+    async function loadPairings(notice?: string): Promise<void> {
+      if (!context.content.isConnected) return;
       const request = ++pairingRequest;
       if (!context.api.allows("pairing.admin")) {
         pairingArea.replaceChildren(
@@ -189,7 +190,10 @@ namespace Amaterasu {
         );
         return;
       }
-      pairingArea.replaceChildren(el("p", "muted", "Loading pending pairing requests…"));
+      pairingArea.replaceChildren(
+        notice ? pairingApprovalNotice(notice) : null,
+        el("p", "muted", "Loading pending pairing requests…"),
+      );
       try {
         const reply = parsePendingPairings(
           await context.api.post<unknown>("pairing/pending"),
@@ -197,13 +201,18 @@ namespace Amaterasu {
         if (!context.content.isConnected || request !== pairingRequest) return;
         if (reply.pending.length === 0) {
           pairingArea.replaceChildren(
+            notice ? pairingApprovalNotice(notice) : null,
             empty("No pending requests", "New device requests will appear here when this host receives them."),
             button("Refresh requests", () => { void loadPairings(); }),
           );
           return;
         }
         const cards = reply.pending.map((pending) => renderPendingPairing(pending));
-        pairingArea.replaceChildren(...cards, button("Refresh requests", () => { void loadPairings(); }));
+        pairingArea.replaceChildren(
+          notice ? pairingApprovalNotice(notice) : null,
+          ...cards,
+          button("Refresh requests", () => { void loadPairings(); }),
+        );
       } catch (error) {
         if (context.content.isConnected && request === pairingRequest)
           pairingArea.replaceChildren(errorPanel(error, loadPairings));
@@ -243,6 +252,7 @@ namespace Amaterasu {
         const form = el("form", "pairing-approval", field("Four-digit PIN", pin), status, approve);
         form.addEventListener("submit", (event) => {
           event.preventDefault();
+          if (approve.disabled) return;
           const submittedPin = pin.value;
           pin.value = "";
           if (!/^\d{4}$/.test(submittedPin)) {
@@ -250,10 +260,19 @@ namespace Amaterasu {
             return;
           }
           void runAction(approve, status, async () => {
-            await context.api.post("pairing/approve_pin", {
-              pairing_id: pending.pairing_id,
-              pin: submittedPin,
-            });
+            try {
+              await context.api.post("pairing/approve_pin", {
+                pairing_id: pending.pairing_id,
+                pin: submittedPin,
+              });
+            } catch {
+              if (!context.content.isConnected) return;
+              const notice = "The approval response was not confirmed. The PIN was cleared and current pairing status was refreshed; review it before trying again.";
+              context.notify("Approval was not confirmed. Current pairing status is being refreshed; the PIN was cleared.");
+              await loadPairings(notice);
+              return;
+            }
+            if (!context.content.isConnected) return;
             context.notify("PIN approval accepted. The device must complete its pairing exchange.");
             await loadPairings();
           });
@@ -354,5 +373,12 @@ namespace Amaterasu {
     void loadHost();
     void loadSessions();
     void loadRuntime();
+  }
+
+  function pairingApprovalNotice(message: string): HTMLElement {
+    const notice = el("div", "notice", el("strong", "", "Approval not confirmed"), el("p", "", message));
+    notice.setAttribute("role", "status");
+    notice.setAttribute("aria-live", "polite");
+    return notice;
   }
 }

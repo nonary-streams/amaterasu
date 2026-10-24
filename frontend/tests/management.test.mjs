@@ -38,6 +38,10 @@ class FakeElement {
 
   setAttribute() {}
 
+  click() {
+    this.listeners.get("click")?.();
+  }
+
   get textContent() {
     return this.children
       .map((child) => typeof child === "string" ? child : child?.textContent ?? "")
@@ -46,8 +50,18 @@ class FakeElement {
 }
 
 function loadManagement() {
+  const storageOperations = [];
+  const storage = {
+    getItem(key) { storageOperations.push(["get", key]); return null; },
+    setItem(key, value) { storageOperations.push(["set", key, value]); },
+    removeItem(key) { storageOperations.push(["remove", key]); },
+    clear() { storageOperations.push(["clear"]); },
+  };
   const context = vm.createContext({
     document: { createElement: (tag) => new FakeElement(tag) },
+    localStorage: storage,
+    sessionStorage: storage,
+    window: { localStorage: storage, sessionStorage: storage },
     Date,
     Error,
     Number,
@@ -65,7 +79,7 @@ function loadManagement() {
     if (source === "src/ui.ts")
       vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
   }
-  return context.Amaterasu;
+  return { module: context.Amaterasu, storageOperations };
 }
 
 function descendants(node, tagName) {
@@ -75,8 +89,45 @@ function descendants(node, tagName) {
   ];
 }
 
-function hostReply() {
+function connectedContent() {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  return content;
+}
+
+function clickButton(root, label) {
+  const button = descendants(root, "button").find((candidate) => candidate.textContent === label);
+  assert.ok(button, `expected button ${label}`);
+  button.click();
+  return button;
+}
+
+function defer() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function request(name, awaitingPin = true) {
   return {
+    pairing_id: "a".repeat(32),
+    client_id: `client-${name.toLowerCase().replaceAll(" ", "-")}`,
+    name,
+    expires_at: 100,
+    awaiting_pin: awaitingPin,
+  };
+}
+
+function pairingReply(...pending) {
+  return { ok: true, pending };
+}
+
+function baseReply(route) {
+  if (route === "nvhttp/settings") return {
     ok: true,
     hostname: "amaterasu-host",
     revision: 4,
@@ -86,36 +137,40 @@ function hostReply() {
     listener_error: null,
     rtsp_listener_error: null,
   };
+  if (route === "session/list") return { ok: true, sessions: [], next_offset: null };
+  if (route === "history/history_status") return { ok: true, status: {
+    available: true, configuration_ready: true, active_streams: 0, failed_operations: 0,
+  } };
+  return { ok: true };
 }
 
-test("pending pairing parser accepts the verified empty and awaiting-PIN shapes", () => {
-  const { parsePendingPairings } = loadManagement();
+async function flushUi() {
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+test("pending pairing parser accepts the empty and awaiting-PIN response shapes", () => {
+  const { parsePendingPairings } = loadManagement().module;
   assert.deepEqual(
     JSON.parse(JSON.stringify(parsePendingPairings({ ok: true, pending: [] }))),
     { ok: true, pending: [] },
   );
   const parsed = parsePendingPairings({ ok: true, pending: [{
-    pairing_id: "a".repeat(32),
-    client_id: "client-7",
-    name: "Living room",
+    ...request("Living room"),
     certificate_id: "b".repeat(64),
-    expires_at: 100,
-    awaiting_pin: true,
   }] });
   assert.equal(parsed.pending[0].name, "Living room");
   assert.equal(parsed.pending[0].awaiting_pin, true);
   for (const value of [null, { ok: false, pending: [] },
-    { ok: true, pending: [{ pairing_id: "bad", client_id: "c", name: "Device", expires_at: 1, awaiting_pin: true }] },
-    { ok: true, pending: [{ pairing_id: "a".repeat(32), client_id: "c", name: "\u0000", expires_at: 1, awaiting_pin: true }] },
+    { ok: true, pending: [{ ...request("Device"), pairing_id: "bad" }] },
+    { ok: true, pending: [{ ...request("\u0000") }] },
   ]) assert.throws(() => parsePendingPairings(value));
 });
 
-test("management page does not call routes outside the signed-in scopes", async () => {
-  const { renderHostManagement } = loadManagement();
-  const content = new FakeElement("main");
-  content.setConnected(true);
+test("management page avoids routes for scopes the signed-in principal lacks", async () => {
+  const { module } = loadManagement();
+  const content = connectedContent();
   const calls = [];
-  renderHostManagement({
+  module.renderHostManagement({
     content,
     api: {
       allows: () => false,
@@ -131,51 +186,195 @@ test("management page does not call routes outside the signed-in scopes", async 
   assert.match(content.textContent, /requires session.read/);
 });
 
-test("pairing approval clears the PIN field before sending the scoped request", async () => {
-  const { renderHostManagement } = loadManagement();
-  const content = new FakeElement("main");
-  content.setConnected(true);
+test("double submit sends one approval and shows protocol progress instead of completion", async () => {
+  const { module, storageOperations } = loadManagement();
+  const content = connectedContent();
+  const calls = [];
+  const approval = defer();
+  let pendingRead = 0;
+  const notifications = [];
+  const api = {
+    allows: () => true,
+    async post(route, payload = {}) {
+      calls.push({ route, payload });
+      if (route === "pairing/pending")
+        return pairingReply(request("Living room", pendingRead++ !== 0));
+      if (route === "pairing/approve_pin") return approval.promise;
+      return baseReply(route);
+    },
+  };
+  module.renderHostManagement({ content, api, notify: (message) => notifications.push(message), navigate() {} });
+  await flushUi();
+
+  const form = descendants(content, "form")[0];
+  const pin = descendants(form, "input")[0];
+  const approve = descendants(form, "button")[0];
+  pin.value = "0427";
+  form.listeners.get("submit")({ preventDefault() {} });
+  assert.equal(approve.disabled, true);
+  form.listeners.get("submit")({ preventDefault() {} });
+  assert.equal(pin.value, "");
+  assert.equal(calls.filter((call) => call.route === "pairing/approve_pin").length, 1);
+  assert.doesNotMatch(content.textContent, /Enter the four-digit PIN shown on the device/);
+  approval.resolve({ ok: true });
+  await flushUi();
+
+  const approvalCall = calls.find((call) => call.route === "pairing/approve_pin");
+  assert.equal(JSON.stringify(approvalCall.payload), JSON.stringify({ pairing_id: "a".repeat(32), pin: "0427" }));
+  assert.match(content.textContent, /Pairing in progress/);
+  assert.match(content.textContent, /must complete its pairing exchange/);
+  assert.doesNotMatch(content.textContent, /0427|paired successfully|pairing complete/i);
+  assert.equal(notifications.includes("PIN approval accepted. The device must complete its pairing exchange."), true);
+  assert.equal(storageOperations.length, 0);
+});
+
+test("interrupted approval refreshes read-only status without replaying the PIN", async () => {
+  const { module, storageOperations } = loadManagement();
+  const content = connectedContent();
   const calls = [];
   let pendingRead = 0;
   const api = {
     allows: () => true,
     async post(route, payload = {}) {
       calls.push({ route, payload });
-      if (route === "pairing/pending") {
-        pendingRead += 1;
-        return { ok: true, pending: pendingRead === 1 ? [{
-          pairing_id: "a".repeat(32),
-          client_id: "client-7",
-          name: "Living room",
-          expires_at: 100,
-          awaiting_pin: true,
-        }] : [] };
-      }
-      if (route === "nvhttp/settings") return hostReply();
-      if (route === "session/list") return { ok: true, sessions: [], next_offset: null };
-      if (route === "history/history_status") return { ok: true, status: {
-        available: true, configuration_ready: true, active_streams: 0, failed_operations: 0,
-      } };
-      if (route === "pairing/approve_pin") return { ok: true };
-      throw new Error(`unexpected route ${route}`);
+      if (route === "pairing/pending")
+        return pairingReply(request("Den room", pendingRead++ !== 0));
+      if (route === "pairing/approve_pin") throw new Error("connection interrupted");
+      return baseReply(route);
     },
   };
-  renderHostManagement({ content, api, notify() {}, navigate() {} });
-  await new Promise((resolve) => setImmediate(resolve));
-
+  module.renderHostManagement({ content, api, notify() {}, navigate() {} });
+  await flushUi();
   const form = descendants(content, "form")[0];
   const pin = descendants(form, "input")[0];
-  pin.value = "0427";
+  pin.value = "9132";
   form.listeners.get("submit")({ preventDefault() {} });
   assert.equal(pin.value, "");
-  await new Promise((resolve) => setImmediate(resolve));
+  await flushUi();
 
-  const approval = calls.find((call) => call.route === "pairing/approve_pin");
-  assert.equal(
-    JSON.stringify(approval.payload),
-    JSON.stringify({ pairing_id: "a".repeat(32), pin: "0427" }),
-  );
+  assert.equal(calls.filter((call) => call.route === "pairing/approve_pin").length, 1);
+  assert.equal(calls.filter((call) => call.route === "pairing/pending").length, 2);
+  assert.match(content.textContent, /Approval not confirmed/);
+  assert.match(content.textContent, /Pairing in progress/);
+  assert.match(content.textContent, /must complete its pairing exchange/);
+  assert.doesNotMatch(content.textContent, /9132|paired successfully|pairing complete/i);
+  assert.equal(descendants(content, "form").length, 0);
+  assert.equal(storageOperations.length, 0);
+});
+
+test("failed approval keeps the request visible with a cleared PIN and no automatic retry", async () => {
+  const { module } = loadManagement();
+  const content = connectedContent();
+  const calls = [];
+  const api = {
+    allows: () => true,
+    async post(route, payload = {}) {
+      calls.push({ route, payload });
+      if (route === "pairing/pending") return pairingReply(request("Office PC"));
+      if (route === "pairing/approve_pin") throw new Error("rejected by host");
+      return baseReply(route);
+    },
+  };
+  module.renderHostManagement({ content, api, notify() {}, navigate() {} });
+  await flushUi();
+  const form = descendants(content, "form")[0];
+  const pin = descendants(form, "input")[0];
+  pin.value = "0001";
+  form.listeners.get("submit")({ preventDefault() {} });
+  await flushUi();
+
+  assert.equal(calls.filter((call) => call.route === "pairing/approve_pin").length, 1);
+  assert.equal(calls.filter((call) => call.route === "pairing/pending").length, 2);
+  assert.match(content.textContent, /Approval not confirmed/);
+  assert.match(content.textContent, /PIN was cleared/);
+  assert.match(content.textContent, /PIN required/);
+  assert.equal(descendants(content, "input")[0].value, "");
+  assert.doesNotMatch(content.textContent, /0001/);
+});
+
+test("newer pending-list results win over older requests", async () => {
+  const { module } = loadManagement();
+  const content = connectedContent();
+  const first = defer();
+  const second = defer();
+  let pairingRead = 0;
+  const api = {
+    allows: () => true,
+    async post(route) {
+      if (route === "pairing/pending") return [first.promise, second.promise][pairingRead++];
+      return baseReply(route);
+    },
+  };
+  module.renderHostManagement({ content, api, notify() {}, navigate() {} });
+  await Promise.resolve();
+  clickButton(content, "Refresh all");
+  await Promise.resolve();
+  second.resolve(pairingReply(request("Current device")));
+  await flushUi();
+  first.resolve(pairingReply(request("Stale device")));
+  await flushUi();
+
+  assert.match(content.textContent, /Current device/);
+  assert.doesNotMatch(content.textContent, /Stale device/);
+});
+
+test("unmounted pairing reads cannot repopulate the page after a reload", async () => {
+  const { module } = loadManagement();
+  const oldContent = connectedContent();
+  const oldRead = defer();
+  let pairingRead = 0;
+  const api = {
+    allows: () => true,
+    async post(route) {
+      if (route === "pairing/pending")
+        return pairingRead++ === 0 ? oldRead.promise : pairingReply(request("After reload"));
+      return baseReply(route);
+    },
+  };
+  module.renderHostManagement({ content: oldContent, api, notify() {}, navigate() {} });
+  await Promise.resolve();
+  oldContent.setConnected(false);
+
+  const newContent = connectedContent();
+  module.renderHostManagement({ content: newContent, api, notify() {}, navigate() {} });
+  await flushUi();
+  oldRead.resolve(pairingReply(request("Before unmount")));
+  await flushUi();
+
+  assert.match(newContent.textContent, /After reload/);
+  assert.doesNotMatch(newContent.textContent, /Before unmount/);
+  assert.match(oldContent.textContent, /Loading pending pairing requests/);
+  assert.doesNotMatch(oldContent.textContent, /Before unmount/);
+});
+
+test("an approval finishing after unmount does not refresh or notify the old page", async () => {
+  const { module } = loadManagement();
+  const content = connectedContent();
+  const approval = defer();
+  const calls = [];
+  const notifications = [];
+  const api = {
+    allows: () => true,
+    async post(route, payload = {}) {
+      calls.push({ route, payload });
+      if (route === "pairing/pending") return pairingReply(request("Bedroom PC"));
+      if (route === "pairing/approve_pin") return approval.promise;
+      return baseReply(route);
+    },
+  };
+  module.renderHostManagement({ content, api, notify: (message) => notifications.push(message), navigate() {} });
+  await flushUi();
+  const form = descendants(content, "form")[0];
+  const pin = descendants(form, "input")[0];
+  pin.value = "7824";
+  form.listeners.get("submit")({ preventDefault() {} });
   assert.equal(pin.value, "");
-  assert.doesNotMatch(content.textContent, /0427/);
-  assert.deepEqual(calls.map((call) => call.route).filter((route) => route === "pairing/approve_pin"), ["pairing/approve_pin"]);
+  content.setConnected(false);
+  approval.resolve({ ok: true });
+  await flushUi();
+
+  assert.equal(calls.filter((call) => call.route === "pairing/approve_pin").length, 1);
+  assert.equal(calls.filter((call) => call.route === "pairing/pending").length, 1);
+  assert.deepEqual(notifications, []);
+  assert.doesNotMatch(content.textContent, /7824/);
 });

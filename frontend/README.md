@@ -48,7 +48,8 @@ browser API calls.
   streaming history health, and management sessions using their existing read
   scopes. PIN input is cleared on submission and is not stored or rendered as
   text. Approval advances the pairing protocol; it does not claim the device
-  completed pairing.
+  completed pairing. If an approval response is interrupted, the page refreshes
+  current request status without replaying the PIN mutation.
 - Catalog list/search with revision-bound next/previous pagination, including empty
   search pages with valid continuations. Create, edit, and delete use expected
   catalog revisions; conflicts require refresh and are never retried silently.
