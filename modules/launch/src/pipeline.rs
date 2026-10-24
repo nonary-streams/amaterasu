@@ -995,6 +995,21 @@ impl Pipeline {
                 job.begin_cleanup(record, Outcome::Failed, Some("playnite_launch_rejected"));
                 return self.retain(job);
             }
+            let code = payload["error"]["code"]
+                .as_str()
+                .or_else(|| payload["code"].as_str())
+                .filter(|code| {
+                    !code.is_empty()
+                        && code.len() <= 64
+                        && code
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                })
+                .unwrap_or("unavailable");
+            eprintln!(
+                "amaterasu launch dependency rejected step={:?} code={code}",
+                job.step
+            );
             return self.dependency_failed(job, "dependency_rejected", send);
         }
         let record = self

@@ -1750,6 +1750,10 @@ fn application_preflight_response(
     payload: &Value,
 ) -> Result<(String, u64, ApplicationConfigOverrides, Option<String>), &'static str> {
     if payload["ok"] != true || payload["app_id"] != app_id(record.request.app_id) {
+        eprintln!(
+            "amaterasu application preflight rejected code={}",
+            safe_rtsp_provider_code(&payload["code"])
+        );
         return Err("invalid_application_preflight_response");
     }
     let token = payload["preflight_token"]

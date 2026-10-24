@@ -19,6 +19,7 @@ struct Backend {
     legacy: Option<Value>,
     fail: bool,
     lose_commit_ack_once: bool,
+    strict_cursors: bool,
 }
 impl Backend {
     fn handle(&mut self, request: Value) -> Value {
@@ -53,6 +54,12 @@ impl Backend {
                     return error("revision_conflict", "stale collection");
                 }
                 let after = request["after"].as_str().unwrap_or("");
+                if self.strict_cursors
+                    && request["after"].is_string()
+                    && !self.entries.contains_key(after)
+                {
+                    return error("invalid_cursor", "collection cursor key is missing");
+                }
                 let mut entries = Vec::new();
                 let mut bytes = 0;
                 let mut more = false;
@@ -2200,6 +2207,7 @@ fn exported_launch_resolution_requires_both_authorities_and_returns_fixed_owner(
         "launch":{"kind":"executable","program":"/games/managed","working_directory":null}
     });
     let mut backend = Backend {
+        strict_cursors: true,
         revision: 4,
         metadata: json!({"revision":2,"next_id":2}),
         entries: BTreeMap::from([("app-0000000000000001".into(), entry)]),

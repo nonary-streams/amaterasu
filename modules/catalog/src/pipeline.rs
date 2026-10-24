@@ -2648,7 +2648,7 @@ impl Pipeline {
                     state_revision,
                     entry_id: entry_id.to_owned(),
                     fingerprint: provider_entry_fingerprint(LUTRIS_IMPORTER, &entry),
-                    after: format!("{}{}:", ENTRY_PREFIX, LUTRIS_IMPORTER),
+                    after: String::new(),
                     scanned: 0,
                     source_id: None,
                     matched: false,
@@ -2717,7 +2717,7 @@ impl Pipeline {
     ) -> ModuleResult<()> {
         let request = json!({
             "action":"collection_page", "collection":context.key,
-            "revision":scan.state_revision, "after":scan.after, "limit":128,
+            "revision":scan.state_revision, "after":(!scan.after.is_empty()).then_some(&scan.after), "limit":128,
         });
         self.submit(context, request, Stage::LaunchMarkerPage(scan), send)
     }
@@ -2747,6 +2747,9 @@ impl Pipeline {
             }
             scan.after = key.to_owned();
             scan.scanned += 1;
+            if key < prefix.as_str() {
+                continue;
+            }
             if !key.starts_with(&prefix) {
                 past_prefix = true;
                 break;
