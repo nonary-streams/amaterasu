@@ -227,6 +227,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "cc",
  "libloading",
+ "pkg-config",
  "serde",
  "serde_json",
  "windows",
