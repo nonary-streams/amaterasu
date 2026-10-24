@@ -6,6 +6,8 @@ struct Provider {
     duplicate: bool,
     invalid_status: bool,
     audio_failed: bool,
+    control_failed: bool,
+    pcm_failed: bool,
 }
 
 struct Host {
@@ -138,8 +140,12 @@ unsafe extern "C" fn video(context: *mut c_void, stream: u64, sink: PacketSink) 
     }
 }
 
-unsafe extern "C" fn pcm(_: *mut c_void, _: u64, _: AudioSink) -> Status {
-    MEDIA_PENDING
+unsafe extern "C" fn pcm(context: *mut c_void, _: u64, _: AudioSink) -> Status {
+    if unsafe { &*context.cast::<Provider>() }.pcm_failed {
+        MEDIA_BACKEND_ERROR
+    } else {
+        MEDIA_PENDING
+    }
 }
 unsafe extern "C" fn audio(context: *mut c_void, _: u64, _: AudioPacketSink) -> Status {
     // SAFETY: the test keeps the boxed provider live for the binding lifetime.
@@ -149,8 +155,12 @@ unsafe extern "C" fn audio(context: *mut c_void, _: u64, _: AudioPacketSink) -> 
         MEDIA_PENDING
     }
 }
-unsafe extern "C" fn control(_: *mut c_void, _: u64, _: ControlMessageSink) -> Status {
-    MEDIA_PENDING
+unsafe extern "C" fn control(context: *mut c_void, _: u64, _: ControlMessageSink) -> Status {
+    if unsafe { &*context.cast::<Provider>() }.control_failed {
+        MEDIA_BACKEND_ERROR
+    } else {
+        MEDIA_PENDING
+    }
 }
 unsafe extern "C" fn submit_pcm(_: *mut c_void, _: u64, _: *const AudioFrame) -> Status {
     MEDIA_BUSY
@@ -243,8 +253,22 @@ fn repeated_callbacks_and_output_with_pending_status_are_protocol_errors() {
     assert_eq!(backend.video().err(), Some("native_multiple_callbacks"));
     host.provider.duplicate = false;
     host.provider.invalid_status = true;
-    assert_eq!(backend.video().err(), Some("native_delivery_failed"));
+    assert_eq!(backend.video().err(), Some("native_delivery_failed_video"));
     drop(backend);
+}
+
+#[test]
+fn native_delivery_failures_identify_the_control_and_pcm_lane() {
+    let mut host = Host::new();
+    let mut backend = NativeBackend::new(&host.runtime(), handles()).unwrap();
+    host.provider.control_failed = true;
+    assert_eq!(
+        backend.control().err(),
+        Some("native_delivery_failed_control")
+    );
+    host.provider.control_failed = false;
+    host.provider.pcm_failed = true;
+    assert_eq!(backend.pcm().err(), Some("native_delivery_failed_pcm"));
 }
 
 #[test]

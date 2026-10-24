@@ -70,7 +70,7 @@ impl Backend for NativeBackend {
                 },
             )
         };
-        output.finish(status)
+        output.finish(status, DeliveryLane::Control)
     }
 
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>> {
@@ -88,7 +88,7 @@ impl Backend for NativeBackend {
                 },
             )
         };
-        output.finish(status)
+        output.finish(status, DeliveryLane::Video)
     }
 
     fn pcm(&mut self) -> PlaneResult<Option<PcmPacket>> {
@@ -108,7 +108,7 @@ impl Backend for NativeBackend {
                 },
             )
         };
-        let packet = output.finish(status)?;
+        let packet = output.finish(status, DeliveryLane::Pcm)?;
         if packet
             .as_ref()
             .is_some_and(|packet| packet.header().channels != self.handles.audio_channels)
@@ -138,7 +138,7 @@ impl Backend for NativeBackend {
         if status == MEDIA_BACKEND_ERROR {
             Err("audio_encoder_failed")
         } else {
-            let packet = output.finish(status)?;
+            let packet = output.finish(status, DeliveryLane::Audio)?;
             if packet
                 .as_ref()
                 .is_some_and(|packet| packet.header().channels != self.handles.audio_channels)
@@ -214,6 +214,34 @@ struct Delivery<T> {
     result: Option<PlaneResult<T>>,
 }
 
+#[derive(Clone, Copy)]
+enum DeliveryLane {
+    Control,
+    Video,
+    Pcm,
+    Audio,
+}
+
+impl DeliveryLane {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Video => "video",
+            Self::Pcm => "pcm",
+            Self::Audio => "audio",
+        }
+    }
+
+    fn failure(self) -> &'static str {
+        match self {
+            Self::Control => "native_delivery_failed_control",
+            Self::Video => "native_delivery_failed_video",
+            Self::Pcm => "native_delivery_failed_pcm",
+            Self::Audio => "native_delivery_failed_audio",
+        }
+    }
+}
+
 impl<T> Default for Delivery<T> {
     fn default() -> Self {
         Self { result: None }
@@ -221,13 +249,24 @@ impl<T> Default for Delivery<T> {
 }
 
 impl<T> Delivery<T> {
-    fn finish(self, status: Status) -> PlaneResult<Option<T>> {
+    fn finish(self, status: Status, lane: DeliveryLane) -> PlaneResult<Option<T>> {
+        let callback = self.result.is_some();
         match (status, self.result) {
             (STATUS_OK, Some(result)) => result.map(Some),
             (MEDIA_BUSY | MEDIA_PENDING, None) => Ok(None),
             (_, Some(Err(error))) => Err(error),
             (MEDIA_CLOSED, _) => Err("native_stream_closed"),
-            _ => Err("native_delivery_failed"),
+            _ => {
+                // Only fixed lane names, numeric ABI status, and callback presence
+                // are logged. No borrowed media, control message, or peer data escapes.
+                eprintln!(
+                    "amaterasu native delivery failed lane={} status={} callback={}",
+                    lane.name(),
+                    status,
+                    callback
+                );
+                Err(lane.failure())
+            }
         }
     }
 }
