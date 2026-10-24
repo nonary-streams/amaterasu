@@ -13,6 +13,8 @@ pub(crate) struct CompanionPolicy {
     component_set_digest: String,
     keyboard: bool,
     mouse: bool,
+    #[serde(default)]
+    gamepad: bool,
 }
 
 impl CompanionPolicy {
@@ -29,7 +31,7 @@ impl CompanionPolicy {
                 .component_set_digest
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || !policy.keyboard && !policy.mouse
+            || !policy.keyboard && !policy.mouse && !policy.gamepad
         {
             return Err(
                 "input companion policy does not authorize this selected component set".into(),
@@ -40,6 +42,9 @@ impl CompanionPolicy {
 
     #[cfg(windows)]
     pub(crate) fn authorize(&self, process_id: u32, creation_time: u64) -> PackageResult<()> {
+        if !self.keyboard && !self.mouse {
+            return Err("Windows input companion does not support gamepad-only policy".into());
+        }
         amaterasu_input_companion::authorize_worker(
             process_id,
             creation_time,
@@ -51,8 +56,8 @@ impl CompanionPolicy {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn capabilities(&self) -> (bool, bool) {
-        (self.keyboard, self.mouse)
+    pub(crate) fn capabilities(&self) -> (bool, bool, bool) {
+        (self.keyboard, self.mouse, self.gamepad)
     }
 }
 
@@ -76,8 +81,29 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(CompanionPolicy::load(&root, &selected).unwrap().is_some());
+        let legacy = CompanionPolicy::load(&root, &selected).unwrap().unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(legacy.capabilities(), (true, false, false));
         assert!(CompanionPolicy::load(&root, &"b".repeat(64)).is_err());
+        std::fs::write(
+            root.join(POLICY_FILE),
+            format!(
+                "{{\"schema\":1,\"component_set_digest\":\"{selected}\",\"keyboard\":false,\"mouse\":false,\"gamepad\":true}}"
+            ),
+        )
+        .unwrap();
+        let gamepad_only = CompanionPolicy::load(&root, &selected).unwrap().unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(gamepad_only.capabilities(), (false, false, true));
+        assert_ne!(legacy, gamepad_only);
+        std::fs::write(
+            root.join(POLICY_FILE),
+            format!(
+                "{{\"schema\":1,\"component_set_digest\":\"{selected}\",\"keyboard\":false,\"mouse\":false,\"gamepad\":false}}"
+            ),
+        )
+        .unwrap();
+        assert!(CompanionPolicy::load(&root, &selected).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

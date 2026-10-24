@@ -85,12 +85,14 @@ impl Supervisor {
         if self.worker.is_some() && self.worker != Some((pid, starttime)) {
             self.revoke();
         }
-        let (keyboard, mouse) = policy.capabilities();
+        let (keyboard, mouse, gamepad) = policy.capabilities();
         let service = self
             .service
             .as_ref()
             .ok_or("Linux input companion permit service was revoked")?;
-        if let Err(error) = service.authorize_worker(pid, starttime, digest, keyboard, mouse) {
+        if let Err(error) =
+            service.authorize_worker(pid, starttime, digest, keyboard, mouse, gamepad)
+        {
             self.revoke();
             return Err(format!(
                 "Linux input companion rejected worker permit: {error:?}"

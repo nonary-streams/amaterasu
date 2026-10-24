@@ -97,14 +97,6 @@ impl PermitLedger {
         gamepad: bool,
         now: Instant,
     ) -> InputResult<()> {
-        let peer = PeerIdentity::from_verified_connection(
-            process.principal.clone(),
-            process.session,
-            digest.clone(),
-        )?;
-        if !keyboard && !mouse && !gamepad || !peer.valid() {
-            return Err(InputError::InvalidGrant);
-        }
         let changed_authorization = self.authorized.as_ref().is_some_and(|previous| {
             previous.process == process
                 && (previous.component_set_digest != digest
@@ -114,6 +106,14 @@ impl PermitLedger {
         });
         if changed_authorization {
             self.revoke(&process);
+            return Err(InputError::InvalidGrant);
+        }
+        let peer = PeerIdentity::from_verified_connection(
+            process.principal.clone(),
+            process.session,
+            digest.clone(),
+        )?;
+        if !keyboard && !mouse && !gamepad || !peer.valid() {
             return Err(InputError::InvalidGrant);
         }
         self.authorized = Some(HostPermit {

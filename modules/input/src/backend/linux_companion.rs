@@ -354,10 +354,6 @@ impl Backend for LinuxCompanionBackend {
                 self.scroll(*axis, units)
             }
             Event::ScrollUnits { axis, amount } => self.scroll(*axis, *amount),
-            _ => Err(InputError::new(
-                "unsupported_event",
-                "unsupported Linux input event",
-            )),
         }
     }
 
