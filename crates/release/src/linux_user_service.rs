@@ -929,10 +929,12 @@ unit_status=$(systemctl --user show --no-pager --property=ActiveState --property
 }
 active_state=
 unit_file_state=
+active_state_seen=0
+unit_file_state_seen=0
 while IFS='=' read -r property value; do
     case "$property" in
-        ActiveState) [ -z "$active_state" ] || { echo "systemd returned duplicate ActiveState; leaving files untouched" >&2; exit 1; }; active_state=$value ;;
-        UnitFileState) [ -z "$unit_file_state" ] || { echo "systemd returned duplicate UnitFileState; leaving files untouched" >&2; exit 1; }; unit_file_state=$value ;;
+        ActiveState) [ "$active_state_seen" -eq 0 ] || { echo "systemd returned duplicate ActiveState; leaving files untouched" >&2; exit 1; }; active_state_seen=1; active_state=$value ;;
+        UnitFileState) [ "$unit_file_state_seen" -eq 0 ] || { echo "systemd returned duplicate UnitFileState; leaving files untouched" >&2; exit 1; }; unit_file_state_seen=1; unit_file_state=$value ;;
     esac
 done <<EOF
 $unit_status
@@ -1102,6 +1104,7 @@ if [ "$*" = "--user show --property=FragmentPath --value amaterasu-linux-session
 elif [ "$*" = "--user show --no-pager --property=ActiveState --property=UnitFileState amaterasu-linux-session.service" ]; then
     status=$(cat "$QUERY_STATUS_FILE")
     [ "$status" -eq 0 ] || exit "$status"
+    [ ! -f "$DUPLICATE_STATUS_FILE" ] || printf 'ActiveState=\n'
     printf 'ActiveState=%s\nUnitFileState=%s\n' "$(cat "$ACTIVE_STATE_FILE")" "$(cat "$IS_ENABLED_STATUS_FILE")"
 elif [ "$*" = "--user enable amaterasu-linux-session.service" ]; then
     mkdir -p "$(dirname -- "$SYSTEMD_WANTED_LINK")"
@@ -1144,6 +1147,7 @@ fail_at=0
         let preflight_count = root.join("preflight-count");
         let preflight_fail_at = root.join("preflight-fail-at");
         let query_status = root.join("query-status");
+        let duplicate_status = root.join("duplicate-status");
         let active_state = root.join("active-state");
         let enabled_status = root.join("enabled-status");
         fs::write(&preflight_fail_at, "0").unwrap();
@@ -1174,6 +1178,7 @@ fail_at=0
                 .env("PREFLIGHT_COUNT_FILE", &preflight_count)
                 .env("PREFLIGHT_FAIL_AT_FILE", &preflight_fail_at)
                 .env("QUERY_STATUS_FILE", &query_status)
+                .env("DUPLICATE_STATUS_FILE", &duplicate_status)
                 .env("ACTIVE_STATE_FILE", &active_state)
                 .env("IS_ENABLED_STATUS_FILE", &enabled_status)
                 .env("SYSTEMD_FRAGMENT", fragment)
@@ -1196,6 +1201,7 @@ fail_at=0
                 .env("PREFLIGHT_COUNT_FILE", &preflight_count)
                 .env("PREFLIGHT_FAIL_AT_FILE", &preflight_fail_at)
                 .env("QUERY_STATUS_FILE", &query_status)
+                .env("DUPLICATE_STATUS_FILE", &duplicate_status)
                 .env("ACTIVE_STATE_FILE", &active_state)
                 .env("IS_ENABLED_STATUS_FILE", &enabled_status)
                 .env("FAIL_PREFLIGHT", "1")
@@ -1258,6 +1264,11 @@ fail_at=0
         assert!(installed.exists());
         assert!(wanted_link.is_symlink());
         fs::write(&active_state, "inactive").unwrap();
+        fs::write(&duplicate_status, "1").unwrap();
+        assert!(!run_script("uninstall-user-service.sh", &expected_fragment, false).success());
+        assert!(installed.exists());
+        assert!(wanted_link.is_symlink());
+        fs::remove_file(&duplicate_status).unwrap();
         let manager_calls = fs::read_to_string(&log).unwrap();
         assert!(!manager_calls.contains("--user stop "));
         assert!(!manager_calls.contains("--user disable "));
