@@ -5259,6 +5259,34 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function parsePackageSelectionStatus(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Package selection response is invalid.");
+        const reply = value;
+        if (reply.ok !== true)
+            throw new Error("Persisted package selection is unavailable.");
+        const digest = (key) => {
+            const candidate = reply[key];
+            if (candidate === null)
+                return null;
+            if (typeof candidate !== "string" || !/^[a-f0-9]{64}$/.test(candidate))
+                throw new Error("Package selection digest is invalid.");
+            return candidate;
+        };
+        const highestSequence = reply.highest_sequence;
+        if (typeof highestSequence !== "string" ||
+            !/^(0|[1-9][0-9]{0,19})$/.test(highestSequence) ||
+            (highestSequence.length === 20 && highestSequence > "18446744073709551615"))
+            throw new Error("Package selection sequence is invalid.");
+        return {
+            active: digest("active"),
+            previous: digest("previous"),
+            pending: digest("pending"),
+            trial: digest("trial"),
+            highestSequence,
+        };
+    }
+    Amaterasu.parsePackageSelectionStatus = parsePackageSelectionStatus;
     function summarizeRepositoryState(repositories) {
         const approved = repositories.filter((repository) => !repository.revoked);
         const revoked = repositories.filter((repository) => repository.revoked);
@@ -5326,17 +5354,21 @@ var Amaterasu;
     function renderUpdates(context) {
         const area = Amaterasu.el("div");
         const statusArea = Amaterasu.el("div");
+        const selectionArea = Amaterasu.el("div");
         let loadRequest = 0;
-        context.content.append(Amaterasu.sectionHeading("Modules & UI", "Choose verified implementations from approved publishers.", Amaterasu.button("Refresh", load)), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Publisher authority is broad"), Amaterasu.el("p", "", "Approving a publisher allows it to supply any native module slot, including management, and the UI. Native modules share their worker's user privileges, while a replacement UI runs in the signed-in browser session and can use its API authority. Approval does not grant elevation. A signature proves source, not safe behavior.")), Amaterasu.panel("Read-only repository status", statusArea, Amaterasu.el("p", "muted", "The authenticated API exposes repository listing only. It does not report the selected or pending UI/native package, and it has no approve, revoke, refresh, download, stage, install, activate, or restore actions. This page will not run shell commands.")), area);
+        context.content.append(Amaterasu.sectionHeading("Modules & UI", "Choose verified implementations from approved publishers.", Amaterasu.button("Refresh", load)), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Publisher authority is broad"), Amaterasu.el("p", "", "Approving a publisher allows it to supply any native module slot, including management, and the UI. Native modules share their worker's user privileges, while a replacement UI runs in the signed-in browser session and can use its API authority. Approval does not grant elevation. A signature proves source, not safe behavior.")), Amaterasu.panel("Persisted package selection", selectionArea, Amaterasu.el("p", "muted", "Read-only activation metadata, refreshed from the host package root. It describes persisted selection phases and is not a live runtime snapshot.")), Amaterasu.panel("Read-only repository status", statusArea, Amaterasu.el("p", "muted", "The authenticated API exposes repository listing only and has no approve, revoke, refresh, download, stage, install, activate, or restore actions. This page will not run shell commands.")), area);
         async function load() {
             const request = ++loadRequest;
             if (!context.api.allows("configuration.read")) {
+                selectionArea.replaceChildren(Amaterasu.empty("Package selection unavailable", "This session needs configuration.read to inspect persisted package selection metadata."));
                 statusArea.replaceChildren(Amaterasu.empty("Repository status unavailable", "This session needs configuration.read to inspect approved publishers and their verified catalog choices."));
                 area.replaceChildren();
                 return;
             }
+            selectionArea.replaceChildren(Amaterasu.el("p", "muted", "Loading persisted package selection…"));
             statusArea.replaceChildren(Amaterasu.el("p", "muted", "Loading verified repository status…"));
             area.replaceChildren(Amaterasu.el("p", "muted", "Loading verified repository choices…"));
+            void loadPackageSelection(request);
             try {
                 const byId = new Map();
                 let offset = 0;
@@ -5367,6 +5399,27 @@ var Amaterasu;
                     statusArea.replaceChildren(Amaterasu.errorPanel(error, load));
                     area.replaceChildren();
                 }
+            }
+        }
+        async function loadPackageSelection(request) {
+            try {
+                const selection = parsePackageSelectionStatus(await context.api.post("package-selection/status", {}));
+                if (!selectionArea.isConnected || request !== loadRequest)
+                    return;
+                const value = (digest) => digest ?? "None";
+                selectionArea.replaceChildren(Amaterasu.table(["Persisted phase", "Package digest"], [
+                    ["Active selection", value(selection.active)],
+                    ["Previous selection", value(selection.previous)],
+                    ["Pending selection", value(selection.pending)],
+                    ["Trial selection", value(selection.trial)],
+                    ["Highest accepted sequence", selection.highestSequence],
+                ]), Amaterasu.el("p", "muted", selection.active
+                    ? "Selection metadata does not confirm which package is currently executing or whether a trial passed."
+                    : "No active package digest is recorded in selection metadata."));
+            }
+            catch (error) {
+                if (selectionArea.isConnected && request === loadRequest)
+                    selectionArea.replaceChildren(Amaterasu.errorPanel(error, load));
             }
         }
         function renderStatus(repositories) {

@@ -48,14 +48,14 @@ const context = vm.createContext({
   Error,
   document: { createElement: (tagName) => new FakeElement(tagName) },
 });
-for (const source of ["src/ui.ts", "src/updates.ts"]) {
+for (const source of ["src/model.ts", "src/ui.ts", "src/updates.ts"]) {
   vm.runInContext(
     ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }),
     context,
   );
-  if (source === "src/ui.ts") vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
+  if (source !== "src/updates.ts") vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
 }
 
 function waitFor(predicate, description) {
@@ -156,7 +156,7 @@ test("repository inventory shows current selection metadata as persisted, not ru
     async post(route, payload) {
       calls.push({ route, payload });
       if (route === "package-selection/status") {
-        assert.deepEqual(payload, {});
+        assert.equal(Object.keys(payload).length, 0);
         return {
           ok: true,
           active: "a".repeat(64),

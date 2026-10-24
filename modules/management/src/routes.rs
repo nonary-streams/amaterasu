@@ -233,7 +233,7 @@ pub fn resolve(path: &str) -> Option<Route> {
         scope,
         requires_empty_body: domain == "media"
             || (domain == "steam" && action == "force_sync")
-            || (domain == "package-selection" && action == "status"),
+            || (domain == "package-selection" && action == "package_selection_status"),
     })
 }
 
@@ -377,7 +377,10 @@ mod tests {
         assert_eq!(route.action, "package_selection_status");
         assert_eq!(route.scope, Some("configuration.read"));
         assert!(route.requires_empty_body);
-        assert_eq!(payload(route, br#"{}"#).unwrap()["action"], "package_selection_status");
+        assert_eq!(
+            payload(route, br#"{}"#).unwrap()["action"],
+            "package_selection_status"
+        );
         assert!(payload(route, br#"{"package_root":"/unsafe"}"#).is_err());
         assert!(resolve("/v1/package-selection/select").is_none());
     }
