@@ -29,3 +29,26 @@ Background work polls live control status at most once per 100 ms per armed sess
 The initial arm checks that its caller request is active and requires confirmed completion before assuming ownership. Cancellation or uncertain completion before acceptance rolls back prepared resources. After a confirmed arm response, background child operations are parentless; cancelling a later status or duplicate arm request does not revoke the accepted lifecycle. Exact arm retries return its current state without opening components again; a changed configuration is rejected. Stop before authentication cancels the scheduled start and releases prepared resources. Failures remain visible through status/lookup, including cleanup uncertainty.
 
 The action does not implement a network RTSP listener or claim that a PLAY response proves successful capture. A transport coordinator can acknowledge its scheduling decision and observe subsequent `armed`, `starting`, `active`, or failure states independently.
+
+
+## Owned Linux displays
+
+A PipeWire start targeting `amaterasu-owned-display` allocates a unique monitor
+through `amaterasu.virtual-display/1` after transport authentication and before
+video capture. Its caller/UUID identity derives from the stable journaled stream
+record. Monitor readiness must match requested timing, active state and the
+returned named capture output. Failed startup cleans up the exact possibly
+committed identity, including lost acknowledgements. The lifecycle journal stores
+only the attempted flag and stable record identity, not a native lease capability.
+
+Normal stop closes capture before removing that monitor and requires confirmed
+absence before clearing the lifecycle journal. On restart, the display provider
+also reconciles its own private ownership journal. A failed removal remains a
+cleanup failure, not a successful stop. Only this stream's display is eligible.
+
+The optional video v1.1 native tail forwards current caller-owned capture geometry.
+It preserves the v1.0 packet prefix and works with older providers that have no
+geometry. Logical Wayland desktop coordinates are kept separate from source image
+pixels. The pointer is centered on the owned output after an authorized mouse
+lease is acquired; later topology updates refresh absolute pointer mapping before
+control packets are translated. Geometry is not inferred from client resolution.

@@ -109,6 +109,8 @@ impl Pipeline {
                                 | Step::ReleaseInput
                                 | Step::FindLimiter
                                 | Step::RestoreLimiter
+                                | Step::FindVirtualDisplay
+                                | Step::RemoveVirtualDisplay
                                 | Step::FindDisplay
                                 | Step::RestoreDisplay
                                 | Step::RecoverDisplay
@@ -216,6 +218,15 @@ impl Pipeline {
         }
         if job.step == Step::ApplyLimiter {
             record.limiter_attempted = true;
+        }
+        if job.step == Step::AcquireOutput
+            && super::virtual_display::requested(record)
+            && record.virtual_display_output.is_none()
+        {
+            job.step = Step::CreateVirtualDisplay;
+        }
+        if job.step == Step::CreateVirtualDisplay {
+            record.virtual_display_attempted = true;
         }
         if job.step == Step::ApplyDisplay {
             record.display_attempted = true;
@@ -378,6 +389,28 @@ impl Pipeline {
             job.fail(record, "display_status_unverified", now);
             return true;
         }
+        if matches!(
+            job.step,
+            Step::CreateVirtualDisplay | Step::FindVirtualDisplay
+        ) {
+            if job.step == Step::CreateVirtualDisplay {
+                if payload["ok"] == true {
+                    job.step = Step::FindVirtualDisplay;
+                } else if !matches!(
+                    payload["error"]["code"].as_str(),
+                    Some("startup_reconciliation_pending" | "busy")
+                ) {
+                    job.fail(record, "virtual_display_create_failed", now);
+                }
+            } else {
+                match super::virtual_display::accept_ready(record, &payload) {
+                    Ok(true) => job.step = Step::AcquireOutput,
+                    Ok(false) => {}
+                    Err(code) => job.fail(record, code, now),
+                }
+            }
+            return true;
+        }
         if payload["ok"] != true {
             if job.step == Step::PersistJournal {
                 self.journal.failed = true;
@@ -502,6 +535,21 @@ impl Pipeline {
             }
             Step::AcquireInput => {
                 accept_input_lease(record, &payload, now)?;
+                if super::virtual_display::requested(record)
+                    && record.input_absolute_pointer
+                    && record
+                        .start
+                        .as_ref()
+                        .is_some_and(|start| start.mouse != Some(false))
+                    && let Some(geometry) = record.capture_geometry
+                {
+                    let bounds = geometry
+                        .normalized_output()
+                        .map_err(|_| "invalid_capture_geometry")?;
+                    record.input_events.push_front(json!({"kind":"absolute",
+                        "x":(u32::from(bounds.left)+u32::from(bounds.right))/2,
+                        "y":(u32::from(bounds.top)+u32::from(bounds.bottom))/2}));
+                }
                 record.state = State::Active;
                 record.history.activated(now);
                 Ok(self.deliver_success(record, job, now, send))

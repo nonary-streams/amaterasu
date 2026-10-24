@@ -38,6 +38,24 @@ struct Snapshot {
     serial_present: u32,
     pipewire_error: i32,
     serial: u64,
+    left: i32,
+    top: i32,
+    logical_width: u32,
+    logical_height: u32,
+    desktop_left: i32,
+    desktop_top: i32,
+    desktop_width: u32,
+    desktop_height: u32,
+}
+
+#[cfg(amaterasu_kwin)]
+unsafe extern "C" {
+    fn am_pw_start_output(
+        output: *const c_char,
+        timeout: u32,
+        callback: unsafe extern "C" fn(*mut c_void, *const Plane, u32, u32, u32, u64) -> u32,
+        context: *mut c_void,
+    ) -> *mut c_void;
 }
 
 unsafe extern "C" {
@@ -92,6 +110,26 @@ impl NativeBackend {
 impl Backend for NativeBackend {
     fn availability(&self) -> Availability {
         self.availability
+    }
+
+    #[cfg(amaterasu_kwin)]
+    fn select_output(&self, output: &str, timeout: u32) -> CaptureResult<Box<dyn SourceSession>> {
+        let output = CString::new(output).map_err(|_| "invalid_named_output")?;
+        let mailbox = Arc::new(Mailbox::default());
+        let context = Box::new(CallbackContext {
+            mailbox,
+            store: None,
+            owner: String::new(),
+            source: SourceType::Monitor,
+        });
+        let pointer = (&*context as *const CallbackContext).cast_mut().cast();
+        // SAFETY: C copies the output name and retains this boxed callback context
+        // only until NativeSession Drop cancels and joins its worker.
+        let native = NonNull::new(unsafe {
+            am_pw_start_output(output.as_ptr(), timeout, frame_callback, pointer)
+        })
+        .ok_or("named_capture_unavailable")?;
+        Ok(Box::new(NativeSession { native, context }))
     }
 
     fn can_restore(&self, owner: &str, source: SourceType) -> bool {
@@ -160,6 +198,30 @@ struct CallbackContext {
 unsafe impl Send for NativeSession {}
 
 impl SourceSession for NativeSession {
+    fn geometry(&self) -> Option<amaterasu_media::CaptureGeometry> {
+        use amaterasu_media::{CaptureGeometry, DesktopRect};
+        let mut snapshot = Snapshot::default();
+        // SAFETY: the joined worker retains its handle; the ABI copies one
+        // coherent geometry record under its short snapshot lock.
+        unsafe { am_pw_snapshot(self.native.as_ptr(), &mut snapshot) };
+        CaptureGeometry::new(
+            DesktopRect::new(
+                snapshot.left,
+                snapshot.top,
+                snapshot.logical_width,
+                snapshot.logical_height,
+            )
+            .ok()?,
+            DesktopRect::new(
+                snapshot.desktop_left,
+                snapshot.desktop_top,
+                snapshot.desktop_width,
+                snapshot.desktop_height,
+            )
+            .ok()?,
+        )
+        .ok()
+    }
     fn state(&self) -> SourceState {
         let mut snapshot = Snapshot::default();
         // SAFETY: this opaque session lives until Drop; output is aligned and writable.
@@ -182,6 +244,7 @@ impl SourceSession for NativeSession {
                 5 => "unsupported_cpu_buffer",
                 6 => "source_mode_changed",
                 7 => "source_selection_timeout",
+                8 => "kwin_output_capture_failed",
                 _ => "capture_failed",
             }),
         }

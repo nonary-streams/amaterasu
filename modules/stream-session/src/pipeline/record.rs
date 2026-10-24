@@ -111,6 +111,8 @@ pub(super) struct Record {
     pub limiter_attempted: bool,
     pub limiter_lease: Option<String>,
     pub limiter_state: String,
+    pub virtual_display_attempted: bool,
+    pub virtual_display_output: Option<String>,
     pub display_attempted: bool,
     pub display_lease: Option<String>,
     pub display_status_verified: bool,
@@ -181,6 +183,8 @@ impl Record {
             limiter_attempted: false,
             limiter_lease: None,
             limiter_state: "not_requested".into(),
+            virtual_display_attempted: false,
+            virtual_display_output: None,
             display_attempted: false,
             display_lease: None,
             display_status_verified: false,
@@ -363,7 +367,7 @@ impl Record {
             }
             Resource::Video => {
                 let start = self.start.as_ref().expect("validated start workflow");
-                json!({"action":"open","capture_provider":start.capture_provider,"output":start.output,
+                json!({"action":"open","capture_provider":start.capture_provider,"output":self.virtual_display_output.as_deref().unwrap_or(&start.output),
                     "constant_rate":start.constant_rate,"minimum_fps_target":start.minimum_fps_target,
                     "wgc_pacing_smoothing":start.wgc_pacing_smoothing,"encoder":start.encoder,
                     "configuration":start.configuration,"packet_boundaries":true})

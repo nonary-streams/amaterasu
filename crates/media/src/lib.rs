@@ -313,5 +313,15 @@ pub struct VideoApi {
     pub receive: unsafe extern "C" fn(*mut c_void, u64, PacketSink) -> Status,
 }
 
+/// v1.1 tail: authoritative current capture geometry for the same owned stream.
+/// The v1.0 receive prefix remains unchanged. STATUS_OK initializes the output;
+/// MEDIA_UNSUPPORTED means the source has no authoritative desktop mapping.
+#[repr(C)]
+pub struct VideoApiV1_1 {
+    pub base: NativeInterface,
+    pub receive: unsafe extern "C" fn(*mut c_void, u64, PacketSink) -> Status,
+    pub geometry: unsafe extern "C" fn(*mut c_void, u64, *mut CaptureGeometry) -> Status,
+}
+
 #[cfg(test)]
 mod tests;

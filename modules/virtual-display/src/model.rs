@@ -1,6 +1,7 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+#[cfg(any(not(amaterasu_libvirtualdisplay), test))]
 use sha2::{Digest, Sha256};
 
 const MAX_PERMANENT_MONITOR_COUNT: u64 = 4;
@@ -168,6 +169,7 @@ pub fn valid_identity(identity: &str) -> bool {
         && identity.bytes().any(|byte| byte != b'0' && byte != b'-')
 }
 
+#[cfg(any(not(amaterasu_libvirtualdisplay), test))]
 pub fn display_id(caller: &str, identity: &str) -> u64 {
     let mut digest = Sha256::new();
     digest.update(b"amaterasu.virtual-display/1\0");

@@ -40,3 +40,7 @@ extern "C" int amaterasu_linux_display_control(const char *socket_path,
         return 0;
     }
 }
+
+extern "C" {
+__attribute__((used)) extern const char amaterasu_linux_vdd_marker[] = "AMATERASU_LINUX_VDD=b2946d02a09bc453d9e6d287623390ca1dedf964";
+}

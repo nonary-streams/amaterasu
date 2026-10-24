@@ -8,6 +8,7 @@ fn journal_with_owned_session(record_id: u64) -> Value {
         owner: "owner".into(),
         attempted_resources: BTreeSet::from(["session".to_owned()]),
         input_attempted: false,
+        virtual_display_attempted: false,
         display_attempted: false,
         limiter_attempted: false,
         limiter_executable_path: None,

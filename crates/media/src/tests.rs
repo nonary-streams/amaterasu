@@ -294,3 +294,14 @@ fn pacing_timestamp_sink_preserves_source_time_and_validates_freshness() {
     assert_eq!(unsafe { sink.send(&frame, 2) }, STATUS_INVALID_ARGUMENT);
     assert_eq!(observed, [123, u64::from(CAPTURE_FRAME_FRESH)]);
 }
+
+#[test]
+fn video_geometry_tail_preserves_every_legacy_prefix_offset() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(offset_of!(VideoApiV1_1, base), offset_of!(VideoApi, base));
+    assert_eq!(
+        offset_of!(VideoApiV1_1, receive),
+        offset_of!(VideoApi, receive)
+    );
+    assert_eq!(offset_of!(VideoApiV1_1, geometry), size_of::<VideoApi>());
+}

@@ -107,6 +107,8 @@ pub struct Broker {
     pub display_apply_recovery_reply: bool,
     pub display_wrong_status_operation: bool,
     pub display_restore_failures: usize,
+    pub virtual_displays: BTreeMap<String, Value>,
+    pub virtual_display_fail_remove: bool,
     pub display_unavailable: bool,
     pub display_race_on_lost_apply: bool,
     pub display_restart_on_lost_apply: bool,
@@ -436,6 +438,28 @@ impl Broker {
         }
         if service == "amaterasu.frame-limiter/1" {
             return self.frame_limiter(action, &call.payload);
+        }
+        if service == "amaterasu.virtual-display/1" {
+            let identity = call.payload["identity"].as_str().unwrap().to_owned();
+            return match action {
+                "create" => {
+                    let index = self.virtual_displays.len() + 2;
+                    let mut specification = call.payload.clone();
+                    specification.as_object_mut().unwrap().remove("action");
+                    let monitor = json!({"specification":specification,"state":"ready","capture_output":format!("kwin:Virtual-{index}"),"ready":{"active":true}});
+                    self.virtual_displays.insert(identity, monitor.clone());
+                    json!({"ok":true,"monitor":monitor})
+                }
+                "status" => {
+                    json!({"ok":true,"monitors":self.virtual_displays.get(&identity).cloned().into_iter().collect::<Vec<_>>()})
+                }
+                "remove" if self.virtual_display_fail_remove => error("broker_unavailable"),
+                "remove" => {
+                    self.virtual_displays.remove(&identity);
+                    json!({"ok":true,"removed":true,"identity":identity})
+                }
+                _ => panic!("unexpected virtual display action"),
+            };
         }
         if service == "amaterasu.display/1" {
             return self.display(action, &call.payload);
@@ -938,6 +962,7 @@ impl Broker {
 #[derive(Default)]
 pub struct PlaneState {
     pub stopping: bool,
+    pub desktop_geometry: Option<amaterasu_media::CaptureGeometry>,
     pub ticks: usize,
     pub media_ticks: usize,
     pub media_ticks_when_stopped: Option<usize>,
@@ -963,6 +988,7 @@ impl Drive for FakePlane {
         state.media_ticks += usize::from(media_active);
         let progress = PlaneProgress {
             controls: std::mem::take(&mut state.controls),
+            desktop_geometry: state.desktop_geometry,
             accepted_video_access_units: std::mem::take(&mut state.accepted_video_access_units),
             accepted_media_payload_bytes: std::mem::take(&mut state.accepted_media_payload_bytes),
             observed_video_sequence_gaps: std::mem::take(&mut state.observed_video_sequence_gaps),

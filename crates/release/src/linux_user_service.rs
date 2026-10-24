@@ -94,13 +94,28 @@ pub fn prepare(
         active_digest,
         &expected_host_digest,
     )?;
-    let artifacts = [
+    let mut artifacts = vec![
         (UNIT_FILE, service_unit),
         ("install-user-service.sh", install_script().into()),
         ("uninstall-user-service.sh", uninstall_script().into()),
         ("preflight-user-service.sh", preflight_script().into()),
         ("README.md", render_readme(active_digest)),
     ];
+    if crate::linux_owned_display::enabled(&verified.runtime_config.settings) {
+        crate::linux_owned_display::validate(
+            &package_path,
+            &verified.manifest.components,
+            &verified.runtime_config.settings,
+        )?;
+        artifacts.push((
+            crate::linux_owned_display::DESKTOP_FILE,
+            crate::linux_owned_display::desktop_entry(&host_executable)?,
+        ));
+        artifacts.push((
+            "install-kwin-capture.sh",
+            crate::linux_owned_display::install_script().into(),
+        ));
+    }
     write_artifact_directory(&output_directory, &artifacts)?;
     println!(
         "Prepared user service artifact for signed LinuxSession package {} at {}.",
@@ -248,6 +263,25 @@ pub fn preflight(
             256 * 1024 * 1024,
         )?)?;
     }
+    crate::linux_owned_display::validate(
+        &package_path,
+        &verified.manifest.components,
+        &verified.runtime_config.settings,
+    )?;
+    let kwin_capture = crate::linux_owned_display::enabled(&verified.runtime_config.settings);
+    if kwin_capture {
+        let declaration = read_bounded(
+            &bundle_directory.join(crate::linux_owned_display::DESKTOP_FILE),
+            64 * 1024,
+        )?;
+        if declaration != crate::linux_owned_display::desktop_entry(&host_executable)?.as_bytes() {
+            return Err("KDE capture declaration does not match this host".into());
+        }
+        require_library("libwayland-client.so.0", &["wl_display_connect"])?;
+        println!(
+            "[ok] linked owned-display features and scoped KDE declaration match the selected host"
+        );
+    }
     let needs = runtime_needs(&verified.runtime_config.settings)?;
     if needs.pulse {
         require_library("libpulse.so.0", &["pa_context_new", "pa_context_connect"])?;
@@ -261,13 +295,19 @@ pub fn preflight(
         require_library("libpipewire-0.3.so.0", &["pw_init", "pw_context_new"])?;
         require_library("libgio-2.0.so.0", &["g_bus_get_sync"])?;
         println!("[ok] PipeWire and GIO portal libraries are loader-visible");
-        match require_portal_available()? {
-            PortalAvailability::Running => println!(
-                "[ok] current-user ScreenCast portal bus name is owned (no portal method or selection prompt was invoked)"
-            ),
-            PortalAvailability::Activatable => println!(
-                "[ok] current-user ScreenCast portal is D-Bus activatable (it was not started and no portal method or selection prompt was invoked)"
-            ),
+        if kwin_capture {
+            println!(
+                "[info] named KWin capture uses the scoped executable declaration; no portal selection is required"
+            );
+        } else {
+            match require_portal_available()? {
+                PortalAvailability::Running => println!(
+                    "[ok] current-user ScreenCast portal bus name is owned (no portal method or selection prompt was invoked)"
+                ),
+                PortalAvailability::Activatable => println!(
+                    "[ok] current-user ScreenCast portal is D-Bus activatable (it was not started and no portal method or selection prompt was invoked)"
+                ),
+            }
         }
     } else {
         println!("[skip] PipeWire/portal runtime checks; signed profile video capture is disabled");
@@ -1132,7 +1172,9 @@ The generated unit records the SHA-256 of the exact host executable bytes suppli
 
 Uninstall from this same bundle with `sh uninstall-user-service.sh`. It stops and disables the user unit only after verifying that the installed unit bytes match this bundle and systemd reports known active and enablement states. A failed or unexpected state query leaves files untouched. It rechecks before removing the file and leaves runtime data and the signed package intact. If the unit was edited or replaced, uninstall refuses to remove it.
 
-The generated scripts affect only the current user service directory selected by `XDG_CONFIG_HOME` (or `$HOME/.config`). They refuse root execution and symlinked service paths, and verify that systemd resolves this exact unit file before enabling or uninstalling it. No service was installed or started when this bundle was generated.
+For a package with owned virtual displays, preparation also emits `org.amaterasu.StreamingHost.desktop` and `install-kwin-capture.sh`. Run the latter as the desktop user before starting the host; it declares only the exact executable's KDE ScreenCast interface and refreshes KDE's cache. It refuses to replace a different declaration. The broker socket must separately grant that user access; connector ownership remains enforced by Unix UID. These capture artifacts are separate from the user service installer.
+
+The generated service scripts affect only the current user service directory selected by `XDG_CONFIG_HOME` (or `$HOME/.config`). They refuse root execution and symlinked service paths, and verify that systemd resolves this exact unit file before enabling or uninstalling it. No service was installed or started when this bundle was generated.
 "#
     )
 }

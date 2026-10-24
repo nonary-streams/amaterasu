@@ -23,6 +23,8 @@ pub(super) struct Entry {
     pub owner: String,
     pub attempted_resources: BTreeSet<String>,
     pub input_attempted: bool,
+    #[serde(default)]
+    pub virtual_display_attempted: bool,
     pub display_attempted: bool,
     pub limiter_attempted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,6 +58,7 @@ impl Entry {
                 .map(|resource| resource.name().to_owned())
                 .collect(),
             input_attempted: record.input_attempted,
+            virtual_display_attempted: record.virtual_display_attempted,
             display_attempted: record.display_attempted,
             limiter_attempted: record.limiter_attempted,
             limiter_executable_path: record
@@ -108,6 +111,7 @@ impl Entry {
             .collect::<Result<_, _>>()?;
         record.input_attempted = self.input_attempted;
         record.input_lookup_required = self.input_attempted;
+        record.virtual_display_attempted = self.virtual_display_attempted;
         record.display_attempted = self.display_attempted;
         record.limiter_attempted = self.limiter_attempted;
         record.config.frame_limiter_executable_path = self.limiter_executable_path.clone();

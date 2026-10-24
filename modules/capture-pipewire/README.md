@@ -1,8 +1,8 @@
-# Current-user portal/PipeWire capture
+# Current-user PipeWire capture
 
 This independently built trusted native library provides control and native
 `amaterasu.capture-pipewire/1`. It requires Linux with system PipeWire, GIO and
-the current user's ScreenCast portal. Build discovery uses pkg-config for
+the current user's ScreenCast portal in the default build. Build discovery uses pkg-config for
 `libpipewire-0.3`, `gio-2.0` and `gio-unix-2.0`; unavailable development libraries
 or cross compilation build an explicit unavailable backend. Runtime shared
 libraries are distribution prerequisites. Native API grants do not sandbox code.
@@ -10,7 +10,7 @@ libraries are distribution prerequisites. Native API grants do not sandbox code.
 Settings default to disabled selection and capture:
 
 ```json
-{"enabled":false,"selection_principals":[],"capture_principals":[],"idle_timeout_seconds":60,"selection_timeout_seconds":120,"remember_source":false}
+{"enabled":false,"selection_principals":[],"capture_principals":[],"idle_timeout_seconds":60,"selection_timeout_seconds":120,"remember_source":false,"allow_named_outputs":false}
 ```
 
 An administrator-controlled startup policy must enable capture and separately
@@ -141,3 +141,26 @@ revoked permission or invalid token may make the portal show its picker again.
 This is persistent permission for the selected source, not automatic approval of
 arbitrary sources or bypass of the desktop's permission system. See the
 [ScreenCast persistence contract](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html#session-persistence).
+
+
+## Owned KDE outputs
+
+The optional `linux-kwin-screencast` feature adds an independent Wayland client
+for KDE's ScreenCast protocol. It uses generated upstream protocol descriptions
+from `third-party/protocols`, plus `wayland-client` and `wayland-scanner` at build
+time. An explicitly enabled `allow_named_outputs` policy lets authorized capture
+callers open `kwin:Virtual-1` through `kwin:Virtual-8` without a portal selection.
+The exact host executable must have KDE's scoped ScreenCast declaration installed;
+missing permission fails this path instead of borrowing a remembered portal source.
+
+Each named output owns its own Wayland/PipeWire worker and bounded frame mailbox.
+Cancellation closes only its pending operation. Active leases are caller-scoped;
+closing one client cannot close another source. Workers embed the compositor
+cursor, preserve source pixel dimensions, and publish current xdg-output logical
+geometry separately from image pixels. This geometry updates when another output
+appears or disappears. PipeWire global initialization is reference-counted across
+these workers, and all workers join before module unload.
+
+The ordinary portal path, saved grants and explicit user selection remain
+independent. Named capture remains a CPU BGRA path; this feature does not provide
+private DRM DMA-BUF / encoder zero-copy transport.

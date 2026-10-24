@@ -12,6 +12,7 @@ mod responses;
 mod rpc;
 #[cfg(test)]
 mod tests;
+mod virtual_display;
 mod workflow;
 
 use crate::{
@@ -177,6 +178,7 @@ impl Pipeline {
             }
             settled &= limiter::shutdown(record, send);
             settled &= display::shutdown(record, send);
+            settled &= virtual_display::shutdown(record, send);
         }
         settled &= self.history_activities.shutdown(send);
         if let Some(pending) = self.job.as_mut().and_then(|job| job.pending.as_mut()) {
@@ -575,6 +577,18 @@ impl Pipeline {
             let result = plane.tick(media_active);
             match result {
                 Ok(progress) => {
+                    if virtual_display::requested(record)
+                        && record.capture_geometry != progress.desktop_geometry
+                    {
+                        record.capture_geometry = progress.desktop_geometry;
+                        if let Err(code) =
+                            input::configure_translator(record, record.input_absolute_pointer)
+                        {
+                            record.error = Some(code);
+                            record.state = State::Stopping;
+                            record.outcome = State::Failed;
+                        }
+                    }
                     record.history.observe_media(
                         progress.accepted_video_access_units,
                         progress.accepted_media_payload_bytes,

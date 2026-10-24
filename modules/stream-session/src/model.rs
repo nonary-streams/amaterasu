@@ -838,6 +838,11 @@ impl StartConfig {
         {
             return Err("invalid_start_configuration");
         }
+        if self.output == "amaterasu-owned-display"
+            && self.capture_provider != CaptureProvider::PipeWire
+        {
+            return Err("owned_display_requires_pipewire");
+        }
         if self.constant_rate && self.capture_provider != CaptureProvider::Wgc {
             return Err("constant_rate_requires_wgc");
         }

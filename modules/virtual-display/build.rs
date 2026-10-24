@@ -56,4 +56,5 @@ fn main() {
     println!("cargo:rustc-link-lib=static=libvirtualdisplay_driver");
     println!("cargo:rustc-link-lib=stdc++");
     println!("cargo:rustc-cfg=amaterasu_libvirtualdisplay");
+    println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined=amaterasu_linux_vdd_marker");
 }

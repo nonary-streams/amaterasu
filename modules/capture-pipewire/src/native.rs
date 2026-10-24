@@ -208,7 +208,15 @@ unsafe extern "C" fn geometry<B: Backend>(
             Err(TryLockError::Poisoned(_)) => return MEDIA_BACKEND_ERROR,
         };
         match controller.reader(&binding.caller, stream) {
-            Ok(_) => MEDIA_UNSUPPORTED,
+            Ok(reader) => match reader.geometry {
+                Some(geometry) => {
+                    // SAFETY: the validated aligned output slot is writable for
+                    // this synchronous native call and geometry is an owned copy.
+                    unsafe { output.write(geometry) };
+                    STATUS_OK
+                }
+                None => MEDIA_UNSUPPORTED,
+            },
             Err("not_found") => MEDIA_CLOSED,
             Err(_) => MEDIA_BACKEND_ERROR,
         }

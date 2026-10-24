@@ -12,6 +12,30 @@ impl Pipeline {
         send: &mut Send<'_>,
     ) -> bool {
         match job.step {
+            Step::FindVirtualDisplay | Step::RemoveVirtualDisplay => {
+                if payload["error"]["code"] == "startup_reconciliation_pending" {
+                    return true;
+                }
+                if super::virtual_display::absent(record, &payload) {
+                    record.virtual_display_attempted = false;
+                    record.virtual_display_output = None;
+                    job.virtual_display_tried = true;
+                } else if payload["ok"] == true {
+                    if payload["monitors"].as_array().is_some_and(|monitors| {
+                        monitors
+                            .iter()
+                            .any(|monitor| monitor["state"] == "cleanup_failed")
+                    }) {
+                        record.cleanup_error = Some("virtual_display_cleanup_failed");
+                        job.virtual_display_tried = true;
+                    } else {
+                        job.virtual_display_removing = true;
+                    }
+                } else {
+                    record.cleanup_error = Some("virtual_display_cleanup_failed");
+                    job.virtual_display_tried = true;
+                }
+            }
             Step::FindDisplay => {
                 if super::display::accept_status(record, &payload) {
                     if record.display_lease.is_none() {
@@ -156,6 +180,11 @@ impl Pipeline {
     ) -> bool {
         record.cleanup_error = Some("component_cleanup_failed");
         match job.step {
+            Step::FindVirtualDisplay | Step::RemoveVirtualDisplay => {
+                record.cleanup_error = Some("virtual_display_cleanup_unavailable");
+                job.virtual_display_tried = true;
+                true
+            }
             Step::FindDisplay | Step::RestoreDisplay | Step::RecoverDisplay => {
                 record.cleanup_error = Some("display_cleanup_unavailable");
                 job.display_tried = true;
@@ -207,6 +236,7 @@ impl Pipeline {
             && record.input_lease.is_none()
             && record.limiter_lease.is_none()
             && !record.limiter_attempted
+            && !record.virtual_display_attempted
             && !record.display_attempted
             && record.display_lease.is_none();
         if clean && self.journal.document.entries.contains_key(&record.id) {

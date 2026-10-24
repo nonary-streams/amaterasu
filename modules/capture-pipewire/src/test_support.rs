@@ -58,6 +58,10 @@ impl Backend for FakeBackend {
     fn forget(&self, _: &str, _: SourceType) {
         self.driver.restore_available.store(false, Ordering::SeqCst);
     }
+    fn select_output(&self, _: &str, _: u32) -> CaptureResult<Box<dyn SourceSession>> {
+        self.driver.selections.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(FakeSession(self.driver.clone())))
+    }
     fn availability(&self) -> Availability {
         self.availability
     }
@@ -120,5 +124,6 @@ pub fn settings() -> Settings {
         idle_timeout_seconds: 2,
         selection_timeout_seconds: 5,
         remember_source: false,
+        allow_named_outputs: false,
     }
 }

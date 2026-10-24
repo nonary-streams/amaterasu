@@ -582,7 +582,10 @@ fn pen_touch_payload(
     Ok(value)
 }
 
-fn configure_translator(record: &mut Record, absolute_pointer: bool) -> Result<(), &'static str> {
+pub(super) fn configure_translator(
+    record: &mut Record,
+    absolute_pointer: bool,
+) -> Result<(), &'static str> {
     record.input_absolute_pointer = absolute_pointer;
     let Some(geometry) = record.capture_geometry.filter(|_| absolute_pointer) else {
         record.input_translator = InputTranslator::default();

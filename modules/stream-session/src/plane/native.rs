@@ -57,6 +57,32 @@ fn bind<T>(runtime: &RuntimeClient, service: &str) -> PlaneResult<NativeBinding>
 }
 
 impl Backend for NativeBackend {
+    fn desktop_geometry(&mut self) -> PlaneResult<Option<CaptureGeometry>> {
+        // SAFETY: the retained binding was validated for the v1.0 prefix. Only
+        // inspect the optional v1.1 tail when both version and size advertise it.
+        let prefix =
+            unsafe { self.video.table::<VideoApi>() }.map_err(|_| "native_layout_mismatch")?;
+        if prefix.base.header.minor < 1 {
+            return Ok(None);
+        }
+        let api =
+            unsafe { self.video.table::<VideoApiV1_1>() }.map_err(|_| "native_layout_mismatch")?;
+        let mut geometry = std::mem::MaybeUninit::uninit();
+        // SAFETY: STATUS_OK initializes this output slot before returning.
+        match unsafe { (api.geometry)(api.base.context, self.handles.video, geometry.as_mut_ptr()) }
+        {
+            STATUS_OK => {
+                let geometry = unsafe { geometry.assume_init() };
+                geometry
+                    .validate()
+                    .map_err(|_| "invalid_capture_geometry")?;
+                Ok(Some(geometry))
+            }
+            MEDIA_BUSY | MEDIA_PENDING | MEDIA_UNSUPPORTED | MEDIA_CLOSED => Ok(None),
+            _ => Err("video_geometry_failed"),
+        }
+    }
+
     fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool> {
         let payload = encode_rumble_feedback(RumbleFeedback {
             slot: command.slot,

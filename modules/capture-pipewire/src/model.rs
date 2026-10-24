@@ -12,6 +12,7 @@ pub struct Settings {
     pub idle_timeout_seconds: u32,
     pub selection_timeout_seconds: u32,
     pub remember_source: bool,
+    pub allow_named_outputs: bool,
 }
 
 impl Default for Settings {
@@ -23,6 +24,7 @@ impl Default for Settings {
             idle_timeout_seconds: 60,
             selection_timeout_seconds: 120,
             remember_source: false,
+            allow_named_outputs: false,
         }
     }
 }

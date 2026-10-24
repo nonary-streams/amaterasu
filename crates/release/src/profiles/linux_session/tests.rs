@@ -226,3 +226,19 @@ fn linux_profile_uses_numeric_nvhttp_encoder_selection() {
     assert!(encoder.is_number());
     assert_eq!(encoder, &json!(0));
 }
+
+#[test]
+fn explicitly_enabled_virtual_displays_select_a_stream_owned_output() {
+    let options = LinuxSessionOptions {
+        enable_virtual_display: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        streaming_settings(&options)["capture"]["output"],
+        "amaterasu-owned-display"
+    );
+    assert_eq!(
+        streaming_settings(&LinuxSessionOptions::default())["capture"]["output"],
+        "portal-selected-session-source"
+    );
+}

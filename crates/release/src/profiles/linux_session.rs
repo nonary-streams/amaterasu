@@ -412,7 +412,11 @@ fn settings(
         VIDEO_COMPONENT_ID,
         json!({"enabled": options.enable_capture, "capture_providers": ["pipewire"]}),
     );
-    insert("amaterasu.capture-pipewire", portal_capture_settings());
+    let mut capture_settings = portal_capture_settings();
+    if options.enable_virtual_display {
+        capture_settings["allow_named_outputs"] = json!(true);
+    }
+    insert("amaterasu.capture-pipewire", capture_settings);
     insert("amaterasu.audio", json!({"enabled": options.enable_audio}));
     insert(
         "amaterasu.virtual-display",
@@ -478,7 +482,7 @@ fn streaming_settings(options: &LinuxSessionOptions) -> Value {
     json!({
         "capture": {
             "capture_provider": "pipewire",
-            "output": "portal-selected-session-source",
+            "output": if options.enable_virtual_display { "amaterasu-owned-display" } else { "portal-selected-session-source" },
             // NVHTTP's bootstrap schema selects encoders with a numeric ID;
             // zero delegates encoder choice to its runtime probe.
             "encoder": 0,

@@ -77,6 +77,10 @@ impl ManagedModule for CaptureModule {
             ) {
                 self.dispatch(pending.request, pending.caller, pending.operation, now)?;
             } else {
+                self.controller
+                    .lock()
+                    .map_err(|_| "PipeWire controller poisoned")?
+                    .cancel_pending_open(&pending.caller, &pending.operation);
                 cancelled.push(pending.caller);
             }
         }
@@ -135,7 +139,11 @@ impl CaptureModule {
             .lock()
             .map_err(|_| "PipeWire controller poisoned")?
             .handle(&caller, operation.clone(), now);
-        if matches!(reply, Err("source_restore_pending")) && self.pending_opens.len() < 8 {
+        if matches!(
+            reply,
+            Err("source_restore_pending" | "named_source_pending")
+        ) && self.pending_opens.len() < 8
+        {
             self.pending_opens.push(PendingOpen {
                 request: id,
                 caller,

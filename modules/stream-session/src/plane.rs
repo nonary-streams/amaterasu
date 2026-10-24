@@ -41,6 +41,7 @@ pub struct RumbleCommand {
 #[derive(Debug, Default)]
 pub struct Progress {
     pub controls: Vec<ControlRecord>,
+    pub desktop_geometry: Option<CaptureGeometry>,
     /// Complete non-EOS access units admitted to the local transport queue.
     pub accepted_video_access_units: u64,
     /// Encoded audio and video payload bytes admitted to the local transport queue.
@@ -95,6 +96,9 @@ impl Plane {
 }
 
 trait Backend {
+    fn desktop_geometry(&mut self) -> PlaneResult<Option<CaptureGeometry>> {
+        Ok(None)
+    }
     fn control(&mut self) -> PlaneResult<Option<ControlRecord>>;
     fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool>;
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>>;
@@ -171,6 +175,13 @@ impl<B: Backend> Pump<B> {
         // Check the authenticated provider before any media effect. A failed or
         // closed control stream ends pumping; routing metadata grants no authority.
         let mut progress = Progress::default();
+        progress.desktop_geometry =
+            self.backend
+                .desktop_geometry()
+                .map_err(|code| TickFailure {
+                    code,
+                    progress: Progress::default(),
+                })?;
         for _ in 0..READ_BUDGET {
             let message = match self.backend.control() {
                 Ok(message) => message,

@@ -5,6 +5,9 @@ use crate::{
 use std::sync::Arc;
 
 pub trait SourceSession: Send {
+    fn geometry(&self) -> Option<amaterasu_media::CaptureGeometry> {
+        None
+    }
     fn state(&self) -> SourceState;
     fn diagnostics(&self) -> SourceDiagnostics {
         SourceDiagnostics::default()
@@ -22,6 +25,9 @@ pub trait Backend: Send {
     ) -> CaptureResult<Box<dyn SourceSession>>;
     fn can_restore(&self, _owner: &str, _source: SourceType) -> bool {
         false
+    }
+    fn select_output(&self, _output: &str, _timeout: u32) -> CaptureResult<Box<dyn SourceSession>> {
+        Err("named_capture_unavailable")
     }
     fn forget(&self, _owner: &str, _source: SourceType) {}
 }

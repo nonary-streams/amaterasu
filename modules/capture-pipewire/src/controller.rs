@@ -1,3 +1,4 @@
+mod direct;
 use crate::{
     admission::Admission,
     backend::{Backend, SourceSession},
@@ -62,10 +63,12 @@ impl Reply {
 pub struct Reader {
     pub mailbox: Arc<Mailbox>,
     pub admission: Arc<Admission>,
+    pub geometry: Option<amaterasu_media::CaptureGeometry>,
 }
 
 pub struct Controller<B: Backend> {
     backend: B,
+    direct: direct::DirectSources,
     settings: Settings,
     selection: Option<Selection>,
     selections: BTreeMap<(String, String), SelectionRecord>,
@@ -81,6 +84,7 @@ impl<B: Backend> Controller<B> {
     pub fn new(backend: B, settings: Settings) -> Self {
         Self {
             backend,
+            direct: direct::DirectSources::default(),
             settings,
             selection: None,
             selections: BTreeMap::new(),
@@ -134,6 +138,9 @@ impl<B: Backend> Controller<B> {
             ),
             Operation::Lookup { operation_id } => {
                 validate_operation_id(&operation_id)?;
+                if let Some(response) = self.direct.lookup(caller, &operation_id) {
+                    return Ok(Reply::existing(response));
+                }
                 self.lease
                     .as_ref()
                     .filter(|lease| {
@@ -236,6 +243,19 @@ impl<B: Backend> Controller<B> {
         if constant_rate {
             return Err("unsupported_constant_rate");
         }
+        if output.starts_with("kwin:") {
+            if !self.settings.allow_named_outputs {
+                return Err("named_capture_disabled");
+            }
+            return self.direct.open(
+                &self.backend,
+                caller,
+                output,
+                operation,
+                now,
+                self.settings.selection_timeout_seconds,
+            );
+        }
         if output == "portal-selected-session-source"
             && self.selection.is_none()
             && self.settings.remember_source
@@ -311,6 +331,9 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn reader(&self, caller: &str, stream: u64) -> CaptureResult<Reader> {
+        if let Some(reader) = self.direct.reader(caller, stream) {
+            return reader;
+        }
         let lease = self
             .lease
             .as_ref()
@@ -326,10 +349,14 @@ impl<B: Backend> Controller<B> {
         Ok(Reader {
             mailbox: selection.source.mailbox(),
             admission: lease.admission.clone(),
+            geometry: selection.source.geometry(),
         })
     }
 
     pub fn close(&mut self, caller: &str, id: u64) -> CaptureResult<()> {
+        if self.direct.close(caller, id) {
+            return Ok(());
+        }
         if self.closed.get(&id).is_some_and(|owner| owner == caller) {
             return Ok(());
         }
@@ -362,6 +389,8 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn refresh(&mut self, now: u64) {
+        self.direct
+            .refresh(now, self.settings.selection_timeout_seconds);
         let Some(selection) = self.selection.as_mut() else {
             return;
         };
@@ -394,6 +423,15 @@ impl<B: Backend> Controller<B> {
         }
     }
 
+    pub fn cancel_pending_open(&mut self, caller: &str, operation: &Operation) {
+        if let Operation::Open {
+            operation_id: Some(operation),
+            ..
+        } = operation
+        {
+            self.direct.cancel_pending(caller, operation);
+        }
+    }
     pub fn cancel_pending_restore(&mut self, caller: &str) {
         if self.lease.is_none()
             && self.selection.as_ref().is_some_and(|selection| {
@@ -497,7 +535,7 @@ impl<B: Backend> Controller<B> {
         let copied = mailbox
             .as_ref()
             .map_or(0, |mailbox| mailbox.copied.load(Ordering::Relaxed));
-        let streams: Vec<_> = self
+        let mut streams: Vec<_> = self
             .lease
             .as_ref()
             .filter(|lease| lease.owner == caller)
@@ -508,17 +546,20 @@ impl<B: Backend> Controller<B> {
             })
             .into_iter()
             .collect();
+        streams.extend(self.direct.streams(caller));
         let availability = self.backend.availability();
         json!({"ok":true,"enabled":self.settings.enabled,"native_supported":availability.native_supported,
             "remember_source":self.settings.remember_source,
             "availability":availability,"selection_state":phase,"selection":selection_json,
             "selection_choices":self.choices(),"streams":streams,"geometry_supported":false,
-            "opened":self.opened,"closed":self.closed.len(),"active":usize::from(self.lease.is_some()),
+            "opened":self.opened,"closed":self.closed.len(),"active":usize::from(self.lease.is_some()) + self.direct.active_count(),
+            "named_outputs_enabled":self.settings.allow_named_outputs,"named_capture_linked":cfg!(amaterasu_kwin),
             "frames_copied":self.frames_copied + copied,"frames_accepted":self.frames_accepted + accepted})
     }
 
     pub fn shutdown(&mut self) {
         self.settings.enabled = false;
+        self.direct.shutdown();
         self.stop_selection(SourceState::Failed("capture_shutdown"));
     }
 }

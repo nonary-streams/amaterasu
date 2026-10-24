@@ -18,6 +18,9 @@ pub(super) enum Step {
     RecoverDisplay,
     FindLimiter,
     RestoreLimiter,
+    CreateVirtualDisplay,
+    FindVirtualDisplay,
+    RemoveVirtualDisplay,
     AcquireOutput,
     AcquireAudio,
     Activate,
@@ -54,6 +57,8 @@ pub(super) struct Job {
     pub tried: std::collections::BTreeSet<Resource>,
     pub input_tried: bool,
     pub limiter_tried: bool,
+    pub virtual_display_tried: bool,
+    pub virtual_display_removing: bool,
     pub display_tried: bool,
     pub journal_resume: Option<Step>,
     pub journal_document: Option<Document>,
@@ -76,6 +81,8 @@ impl Job {
             tried: Default::default(),
             input_tried: false,
             limiter_tried: false,
+            virtual_display_tried: false,
+            virtual_display_removing: false,
             display_tried: false,
             journal_resume: None,
             journal_document: None,
@@ -143,6 +150,13 @@ impl Job {
             }
             self.tried.insert(resource);
         }
+        if !self.virtual_display_tried && record.virtual_display_attempted {
+            return Some(if self.virtual_display_removing {
+                Step::FindVirtualDisplay
+            } else {
+                Step::RemoveVirtualDisplay
+            });
+        }
         if !self.limiter_tried {
             if record.limiter_attempted && record.limiter_lease.is_none() {
                 return Some(Step::FindLimiter);
@@ -198,6 +212,18 @@ impl Job {
             Step::MediaReady => (
                 Resource::Media.service(),
                 json!({"action":"status","stream":record.resources[&Resource::Media]}),
+            ),
+            Step::CreateVirtualDisplay => (
+                "amaterasu.virtual-display/1".into(),
+                super::virtual_display::create(record),
+            ),
+            Step::FindVirtualDisplay => (
+                "amaterasu.virtual-display/1".into(),
+                super::virtual_display::status(record),
+            ),
+            Step::RemoveVirtualDisplay => (
+                "amaterasu.virtual-display/1".into(),
+                super::virtual_display::remove(record),
             ),
             Step::ApplyLimiter => (
                 "amaterasu.frame-limiter/1".into(),

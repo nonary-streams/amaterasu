@@ -572,3 +572,46 @@ fn restoration_is_opt_in_and_cancelled_opens_do_not_leave_capture_running() {
     assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
     assert!(controller.selection.is_none());
 }
+
+#[test]
+fn named_outputs_have_independent_capture_leases_and_cancel_does_not_close_a_peer() {
+    let mut settings = crate::test_support::settings();
+    settings.allow_named_outputs = true;
+    let (mut controller, driver) = crate::test_support::setup(settings);
+    let open = |output: &str, operation: &str| Operation::Open {
+        output: output.into(),
+        operation_id: Some(operation.into()),
+        constant_rate: None,
+    };
+    assert!(matches!(
+        controller.handle("amaterasu.video", open("kwin:Virtual-2", "first"), 0),
+        Err("named_source_pending")
+    ));
+    *driver.state.lock().unwrap() = SourceState::Ready {
+        node: 1,
+        width: 2,
+        height: 2,
+    };
+    driver.frame(42, 1);
+    let first = controller
+        .handle("amaterasu.video", open("kwin:Virtual-2", "first"), 1)
+        .unwrap()
+        .payload["stream"]
+        .as_u64()
+        .unwrap();
+    let second = controller
+        .handle("amaterasu.video", open("kwin:Virtual-3", "second"), 1)
+        .unwrap()
+        .payload["stream"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(first, second);
+    controller.close("amaterasu.video", first).unwrap();
+    assert!(controller.reader("amaterasu.video", first).is_err());
+    assert!(controller.reader("amaterasu.video", second).is_ok());
+    assert!(controller.reader("other.module", second).is_err());
+    controller.cancel_pending_restore("amaterasu.video");
+    assert!(controller.reader("amaterasu.video", second).is_ok());
+    controller.shutdown();
+    assert!(controller.reader("amaterasu.video", second).is_err());
+}

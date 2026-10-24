@@ -22,6 +22,10 @@ struct am_pw_snapshot {
     uint32_t node_present, serial_present;
     int32_t pipewire_error;
     uint64_t serial;
+    int32_t left, top;
+    uint32_t logical_width, logical_height;
+    int32_t desktop_left, desktop_top;
+    uint32_t desktop_width, desktop_height;
 };
 struct am_pw_plane {
     const uint8_t *data;
