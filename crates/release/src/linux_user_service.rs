@@ -465,10 +465,10 @@ fn parse_fragment_path(output: &str) -> PackageResult<(String, Option<String>)> 
             if load_state.replace(value).is_some() {
                 return Err("systemd returned duplicate LoadState fields".into());
             }
-        } else if let Some(value) = line.strip_prefix("FragmentPath=") {
-            if fragment.replace(value).is_some() {
-                return Err("systemd returned duplicate FragmentPath fields".into());
-            }
+        } else if let Some(value) = line.strip_prefix("FragmentPath=")
+            && fragment.replace(value).is_some()
+        {
+            return Err("systemd returned duplicate FragmentPath fields".into());
         }
     }
     let load_state = load_state
