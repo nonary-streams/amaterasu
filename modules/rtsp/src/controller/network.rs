@@ -30,7 +30,13 @@ impl Controller {
                     connection,
                     ticket,
                     reason,
-                } => self.disconnected(connection, ticket, reason),
+                } => {
+                    eprintln!(
+                        "amaterasu rtsp connection closed reason={reason} authenticated={}",
+                        ticket.is_some()
+                    );
+                    self.disconnected(connection, ticket, reason);
+                }
             }
         }
     }
@@ -48,6 +54,7 @@ impl Controller {
         request: Request,
         now: u64,
     ) {
+        eprintln!("amaterasu rtsp request method={:?}", request.method);
         let Some(mut record) = self.records.remove(&ticket) else {
             self.reply_status(connection, request.cseq, 454);
             return;
@@ -143,6 +150,11 @@ impl Controller {
                 });
             }
             Err(error) => {
+                eprintln!(
+                    "amaterasu rtsp rejection method={:?} status={} reason={error:?}",
+                    request.method,
+                    error.status()
+                );
                 let replied = self.reply_status(connection, request.cseq, error.status());
                 record.close(Some("negotiation_failed"));
                 if replied {

@@ -261,8 +261,10 @@ impl Negotiation {
                 if request.header("content-type") != Some("application/sdp") {
                     return Err(Error::InvalidHeaders);
                 }
-                let announce =
-                    sdp::parse_announce(&request.body).map_err(|_| Error::UnsupportedMedia)?;
+                let announce = sdp::parse_announce(&request.body).map_err(|error| {
+                    eprintln!("amaterasu rtsp announce parse rejection reason={error:?}");
+                    Error::UnsupportedMedia
+                })?;
                 validation::media(&announce, &self.capabilities)?;
                 Ok((action(request, Action::Announce(announce)), State::Play))
             }

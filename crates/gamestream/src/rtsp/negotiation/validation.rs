@@ -126,7 +126,10 @@ pub(super) fn transport(value: Option<&str>) -> Result<(), Error> {
 pub(super) fn media(value: &sdp::Announce, capabilities: &Capabilities) -> Result<(), Error> {
     value
         .check_support(&capabilities.transport)
-        .map_err(|_| Error::UnsupportedMedia)?;
+        .map_err(|error| {
+            eprintln!("amaterasu rtsp announce capability rejection reason={error:?}");
+            Error::UnsupportedMedia
+        })?;
     if value.control != sdp::ControlProtocol::EncryptedEnet
         || !value.encryption.control_v2
         || value.video.color != capabilities.color
@@ -137,6 +140,18 @@ pub(super) fn media(value: &sdp::Announce, capabilities: &Capabilities) -> Resul
         || (capabilities.require_video_encryption && !value.encryption.video)
         || (capabilities.require_audio_encryption && !value.encryption.audio)
     {
+        eprintln!(
+            "amaterasu rtsp announce profile rejection control={} control_v2={} color={} geometry={} fps={} bitrate={} video_encryption={} audio_encryption={}",
+            value.control == sdp::ControlProtocol::EncryptedEnet,
+            value.encryption.control_v2,
+            value.video.color == capabilities.color,
+            value.video.width <= capabilities.max_width
+                && value.video.height <= capabilities.max_height,
+            value.video.fps <= capabilities.max_fps,
+            value.video.bitrate_kbps <= capabilities.max_bitrate_kbps,
+            !capabilities.require_video_encryption || value.encryption.video,
+            !capabilities.require_audio_encryption || value.encryption.audio,
+        );
         return Err(Error::UnsupportedMedia);
     }
     Ok(())
