@@ -8,6 +8,7 @@ use amaterasu_package::{
     verify_package,
 };
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -231,10 +232,14 @@ pub fn preflight(
         require_library("libpipewire-0.3.so.0", &["pw_init", "pw_context_new"])?;
         require_library("libgio-2.0.so.0", &["g_bus_get_sync"])?;
         println!("[ok] PipeWire and GIO portal libraries are loader-visible");
-        require_portal_owner()?;
-        println!(
-            "[ok] current-user ScreenCast portal bus name is owned (no portal method or selection prompt was invoked)"
-        );
+        match require_portal_available()? {
+            PortalAvailability::Running => println!(
+                "[ok] current-user ScreenCast portal bus name is owned (no portal method or selection prompt was invoked)"
+            ),
+            PortalAvailability::Activatable => println!(
+                "[ok] current-user ScreenCast portal is D-Bus activatable (it was not started and no portal method or selection prompt was invoked)"
+            ),
+        }
     } else {
         println!("[skip] PipeWire/portal runtime checks; signed profile video capture is disabled");
     }
@@ -367,8 +372,18 @@ fn validate_private_user_directory(path: &Path, uid: u32, description: &str) -> 
     Ok(())
 }
 
-fn require_portal_owner() -> PackageResult<()> {
-    let output = Command::new("busctl")
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PortalAvailability {
+    Running,
+    Activatable,
+}
+
+fn require_portal_available() -> PackageResult<PortalAvailability> {
+    require_portal_available_with(OsStr::new("busctl"))
+}
+
+fn require_portal_available_with(busctl: &OsStr) -> PackageResult<PortalAvailability> {
+    let output = Command::new(busctl)
         .args(["--user", "--no-pager", "--no-legend", "list"])
         .output()
         .map_err(|error| format!("could not query the current user's D-Bus name list: {error}"))?;
@@ -379,13 +394,59 @@ fn require_portal_owner() -> PackageResult<()> {
         ));
     }
     let names = String::from_utf8(output.stdout).map_err(|_| "D-Bus name list is not UTF-8")?;
-    if !names
+    if portal_name_owned(&names) {
+        return Ok(PortalAvailability::Running);
+    }
+
+    // Listing D-Bus activation candidates is a read-only query. It does not
+    // request the portal name or trigger its service activation.
+    let output = Command::new(busctl)
+        .args([
+            "--user",
+            "--no-pager",
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "ListActivatableNames",
+        ])
+        .output()
+        .map_err(|error| format!("could not query D-Bus activatable names: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "current user's D-Bus activation query failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let names = String::from_utf8(output.stdout)
+        .map_err(|_| "current user's activatable D-Bus names are not UTF-8")?;
+    if activatable_name_list_contains(&names, "org.freedesktop.portal.Desktop") {
+        Ok(PortalAvailability::Activatable)
+    } else {
+        Err("current user's ScreenCast portal is neither running nor D-Bus activatable".into())
+    }
+}
+
+fn portal_name_owned(output: &str) -> bool {
+    output
         .lines()
         .any(|line| line.split_whitespace().next() == Some("org.freedesktop.portal.Desktop"))
-    {
-        return Err("current user's org.freedesktop.portal.Desktop service is not running".into());
+}
+
+fn activatable_name_list_contains(output: &str, expected: &str) -> bool {
+    let mut fields = output.split_whitespace();
+    if fields.next() != Some("as") {
+        return false;
     }
-    Ok(())
+    let Some(count) = fields.next().and_then(|value| value.parse::<usize>().ok()) else {
+        return false;
+    };
+    let names = fields.take(count).filter_map(|field| {
+        field
+            .strip_prefix('"')
+            .and_then(|field| field.strip_suffix('"'))
+    });
+    names.into_iter().any(|name| name == expected)
 }
 
 fn check_user_manager_and_unit(uid: u32, bundle_unit: &[u8]) -> PackageResult<()> {
@@ -991,7 +1052,7 @@ fn render_readme(digest: &str) -> String {
 
 This bundle was generated for signed active package `{digest}`. The unit runs under the current user manager and never requests root or system service privileges. Its `ExecStart` pins this digest; a different active package fails closed until a new bundle is generated and reviewed.
 
-Before installing or starting, run `sh preflight-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE` as the target non-root user. The script calls `amaterasu-release preflight-linux-user-service` (or `$AMATERASU_RELEASE_BIN`) to reverify the active signature and digest, check loader-visible x264 and optional FFmpeg encoder ABI plus Pulse/PipeWire/GIO libraries, verify the current user manager's unit resolution, and confirm the current user's portal bus name when capture is enabled. The check only queries systemd and lists D-Bus names; it does not enable/start a unit or request portal consent. It requires the release CLI to be available on the target host. It checks library loading, not the NVENC device/driver, Pulse server connectivity, the ScreenCast interface response, user consent, or an actual capture/audio stream.
+Before installing or starting, run `sh preflight-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE` as the target non-root user. The script calls `amaterasu-release preflight-linux-user-service` (or `$AMATERASU_RELEASE_BIN`) to reverify the active signature and digest, check loader-visible x264 and optional FFmpeg encoder ABI plus Pulse/PipeWire/GIO libraries, verify the current user manager's unit resolution, and confirm the current user's portal name is either owned or D-Bus activatable when capture is enabled. The D-Bus activation query is read-only; it does not start the portal. The check does not enable/start the Amaterasu unit or request portal consent. It requires the release CLI to be available on the target host. It checks library loading, not the NVENC device/driver, Pulse server connectivity, the ScreenCast interface response, user consent, or an actual capture/audio stream.
 
 Review `amaterasu-linux-session.service`, then install it for this user with `sh install-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE`. The installer runs the same read-only preflight before it writes, immediately before enabling, and after enabling. If the active selection or prerequisites change, it removes only the enable link and unit file created by that attempt. Installation enables the unit for `graphical-session.target` but does not start it. For a manual start, run the standalone preflight immediately beforehand, then use `systemctl --user start amaterasu-linux-session.service`.
 
@@ -1435,6 +1496,64 @@ fail_at=0
                 pipewire_portal: true
             }
         );
+    }
+
+    #[test]
+    fn portal_preflight_accepts_running_or_dbus_activatable_portals() {
+        assert!(portal_name_owned(
+            "org.freedesktop.portal.Desktop 1234 xdg-desktop-portal\norg.example.Other 5678 other\n"
+        ));
+        assert!(!portal_name_owned("org.example.Other 5678 other\n"));
+
+        assert!(activatable_name_list_contains(
+            "as 2 \"org.example.Other\" \"org.freedesktop.portal.Desktop\"",
+            "org.freedesktop.portal.Desktop"
+        ));
+        assert!(!activatable_name_list_contains(
+            "as 1 \"org.example.Other\"",
+            "org.freedesktop.portal.Desktop"
+        ));
+        assert!(!activatable_name_list_contains(
+            "s \"org.freedesktop.portal.Desktop\"",
+            "org.freedesktop.portal.Desktop"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portal_preflight_accepts_dbus_activation_without_starting_the_portal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-portal-preflight-{}-{}",
+            std::process::id(),
+            random_identifier().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let busctl = root.join("busctl");
+        fs::write(
+            &busctl,
+            r##"#!/bin/sh
+printf '%s\n' "$*" >> "$(dirname -- "$0")/calls"
+case "$*" in
+    "--user --no-pager --no-legend list") printf 'org.example.Other 1234 other\n' ;;
+    "--user --no-pager call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ListActivatableNames") printf 'as 1 "org.freedesktop.portal.Desktop"\n' ;;
+    *) exit 9 ;;
+esac
+"##,
+        )
+        .unwrap();
+        fs::set_permissions(&busctl, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            require_portal_available_with(busctl.as_os_str()).unwrap(),
+            PortalAvailability::Activatable
+        );
+        let calls = fs::read_to_string(root.join("calls")).unwrap();
+        assert_eq!(calls.lines().count(), 2);
+        assert!(calls.contains("ListActivatableNames"));
+        assert!(!calls.contains("org.freedesktop.portal.Desktop /"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
