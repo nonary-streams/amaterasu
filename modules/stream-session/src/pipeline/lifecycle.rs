@@ -308,6 +308,11 @@ impl Pipeline {
                 }
                 return true;
             }
+            eprintln!(
+                "amaterasu session dependency rejected step={:?} code={}",
+                job.step,
+                safe_dependency_code(&payload),
+            );
             job.fail(record, "dependency_rejected", now);
             return true;
         }
@@ -645,5 +650,45 @@ impl Pipeline {
     ) -> bool {
         job.fail(record, code, now);
         true
+    }
+}
+
+fn safe_dependency_code(payload: &serde_json::Value) -> &str {
+    payload["code"]
+        .as_str()
+        .or_else(|| payload["error"]["code"].as_str())
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .unwrap_or("unavailable")
+}
+
+#[cfg(test)]
+mod diagnostic_code_tests {
+    use super::safe_dependency_code;
+    use serde_json::json;
+
+    #[test]
+    fn dependency_code_trace_accepts_only_bounded_status_tokens() {
+        assert_eq!(
+            safe_dependency_code(&json!({"code":"backend_unavailable"})),
+            "backend_unavailable"
+        );
+        assert_eq!(
+            safe_dependency_code(&json!({"error":{"code":"codec_unavailable"}})),
+            "codec_unavailable"
+        );
+        assert_eq!(
+            safe_dependency_code(&json!({"code":"key_hex=secret"})),
+            "unavailable"
+        );
+        assert_eq!(
+            safe_dependency_code(&json!({"code":"a".repeat(65)})),
+            "unavailable"
+        );
     }
 }
