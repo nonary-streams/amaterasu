@@ -2771,16 +2771,15 @@ var Amaterasu;
         if (typeof streamAudio !== "boolean")
             throw new Error("Choose whether future streams should include host audio.");
         const configuredAudioSink = parseAudioSinkSelection(audioSink);
-        const preservedSettings = (reply) => {
-            const values = { ...reply };
-            for (const field of ["revision", "stream_audio", "configured_audio_sink", "effective_audio_sink"])
-                delete values[field];
-            return values;
-        };
+        const preservedPolicyFields = [
+            "port", "audio_sink_capture_only", "nvenc_spatial_aq", "lan_encryption_mode", "wan_encryption_mode",
+        ];
+        const persistedHostSettings = (reply) => Object.fromEntries(Object.entries(reply).filter(([field]) => (field.startsWith("configured_") && field !== "configured_audio_sink") ||
+            preservedPolicyFields.includes(field)));
         const confirms = (reply) => reply.revision === current.revision + 1 &&
             reply.stream_audio === streamAudio &&
             reply.configured_audio_sink === configuredAudioSink &&
-            sameConfigurationValue(preservedSettings(reply), preservedSettings(current));
+            sameConfigurationValue(persistedHostSettings(reply), persistedHostSettings(current));
         const updated = parseNvhttpSettingsReply(await api.post("nvhttp/settings_update", {
             hostname: current.configured_hostname,
             port: current.port,
@@ -2789,10 +2788,10 @@ var Amaterasu;
             audio_sink: configuredAudioSink,
         }));
         if (!confirms(updated))
-            throw new Error("Audio preferences could not be confirmed without unrelated host settings changing. Refresh and check the current values.");
+            throw new Error("Audio preferences could not be confirmed without persisted host settings changing. Refresh and check the current values.");
         const saved = parseNvhttpSettingsReply(await api.post("nvhttp/settings"));
         if (!confirms(saved))
-            throw new Error("Audio preferences could not be confirmed after saving without unrelated host settings changing. Refresh and check the current values.");
+            throw new Error("Audio preferences could not be confirmed after saving without persisted host settings changing. Refresh and check the current values.");
         return saved;
     }
     Amaterasu.saveNvhttpAudioSettings = saveNvhttpAudioSettings;
