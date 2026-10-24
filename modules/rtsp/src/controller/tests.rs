@@ -270,7 +270,7 @@ fn restart_reconciliation_stops_old_lease_before_fresh_resume_open() {
     assert!(!endpoint.commands.iter().any(|command| matches!(command,
         Command::Request { payload, .. } if payload["action"] == "prepare")));
 
-    for now in [1, 2, 3, 4] {
+    for now in [1, 2, 3, 4, 5] {
         controller.advance_startup_recovery(&runtime, now);
     }
     assert!(controller.startup_recovery.ready());
@@ -283,11 +283,11 @@ fn restart_reconciliation_stops_old_lease_before_fresh_resume_open() {
             deadline: 10_000,
             display_preflight_deadline: None,
         },
-        5,
+        6,
         &runtime,
         false,
     );
-    for now in 6..10 {
+    for now in 7..11 {
         controller.advance_job(&runtime, now);
     }
 
