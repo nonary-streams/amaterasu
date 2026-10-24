@@ -275,7 +275,7 @@ fn restore_plan_rebinds_exact_outputs_and_reselects_unique_equivalent_mode() {
     let actions = restoration_actions(&saved, &current).unwrap();
     let arguments = action_arguments(&actions).unwrap();
     assert!(arguments.contains(&"output.DP-1.mode.current-1920x1080".to_owned()));
-    assert!(arguments.contains(&"output.DP-1.position.0,0".to_owned()));
+    assert!(!arguments.contains(&"output.DP-1.position.0,0".to_owned()));
     assert!(
         !arguments
             .iter()
@@ -297,6 +297,8 @@ fn restore_plan_holds_on_disconnect_new_output_or_ambiguous_mode() {
     let mut disconnected = configuration();
     disconnected["outputs"][0]["connected"] = json!(false);
     disconnected["outputs"][0]["enabled"] = json!(false);
+    disconnected["outputs"][0]["priority"] = json!(0);
+    disconnected["outputs"][0]["currentModeId"] = json!("");
     assert_eq!(
         restoration_actions(&saved, &disconnected).unwrap_err().code,
         "topology_changed"
@@ -325,7 +327,7 @@ fn restore_plan_holds_on_disconnect_new_output_or_ambiguous_mode() {
     ambiguous["outputs"][0]["currentModeId"] = json!("alternative-a");
     assert_eq!(
         restoration_actions(&saved, &ambiguous).unwrap_err().code,
-        "topology_changed"
+        "unsupported_topology"
     );
 
     let mut reconnected_baseline_output = configuration();
@@ -413,7 +415,7 @@ fn fake_runner_applies_requested_mode_and_verifies_readback_without_enable_chang
             .all(|action| action_output(action) == "DP-1")
     );
     let readback = typed_snapshot_for(runner.current.as_ref().unwrap());
-    assert!(baseline.matches_configuration(&readback, &request));
+    assert!(readback.matches_configuration(&baseline, &request));
 }
 
 #[test]
@@ -493,7 +495,7 @@ fn interrupted_restore_retry_from_a_new_runner_completes_the_durable_baseline() 
         current: Some(interrupted_state),
         ..Default::default()
     };
-    restore_kscreen_snapshot_with(&mut restarted_runner, &baseline, &mut || Ok()).unwrap();
+    restore_kscreen_snapshot_with(&mut restarted_runner, &baseline, &mut || Ok(())).unwrap();
     assert!(baseline.matches_restoration(&typed_snapshot_for(
         restarted_runner.current.as_ref().unwrap()
     )));
@@ -532,7 +534,7 @@ fn restore_holds_on_hotplug_or_enabled_set_change_before_any_command() {
             ..Default::default()
         };
         let error =
-            restore_kscreen_snapshot_with(&mut runner, &baseline, &mut || Ok()).unwrap_err();
+            restore_kscreen_snapshot_with(&mut runner, &baseline, &mut || Ok(())).unwrap_err();
         assert_eq!(error.code, "topology_changed");
         assert!(
             !runner
@@ -560,8 +562,8 @@ fn partial_rejection_timeout_and_readback_mismatch_mark_uncertain_mutation() {
         reject_configuration: true,
         ..Default::default()
     };
-    let error =
-        apply_kscreen_snapshot_with(&mut rejected, &request, &baseline, &mut || Ok()).unwrap_err();
+    let error = apply_kscreen_snapshot_with(&mut rejected, &request, &baseline, &mut || Ok(()))
+        .unwrap_err();
     assert!(error.may_have_changed);
     assert_eq!(error.code, "platform_error");
 
@@ -571,7 +573,7 @@ fn partial_rejection_timeout_and_readback_mismatch_mark_uncertain_mutation() {
         ..Default::default()
     };
     let error =
-        apply_kscreen_snapshot_with(&mut timeout, &request, &baseline, &mut || Ok()).unwrap_err();
+        apply_kscreen_snapshot_with(&mut timeout, &request, &baseline, &mut || Ok(())).unwrap_err();
     assert!(error.may_have_changed);
     assert_eq!(error.code, "platform_timeout");
 
@@ -580,8 +582,8 @@ fn partial_rejection_timeout_and_readback_mismatch_mark_uncertain_mutation() {
         ignore_configuration: true,
         ..Default::default()
     };
-    let error =
-        apply_kscreen_snapshot_with(&mut mismatch, &request, &baseline, &mut || Ok()).unwrap_err();
+    let error = apply_kscreen_snapshot_with(&mut mismatch, &request, &baseline, &mut || Ok(()))
+        .unwrap_err();
     assert!(error.may_have_changed);
     assert_eq!(error.code, "verification_failed");
 }

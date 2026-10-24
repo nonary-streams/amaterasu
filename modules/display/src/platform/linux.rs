@@ -522,6 +522,7 @@ fn run_configuration_with(
     Ok(())
 }
 
+#[cfg(test)]
 fn action_arguments(actions: &[KScreenAction]) -> DisplayResult<Vec<String>> {
     actions.iter().map(KScreenAction::argument).collect()
 }
