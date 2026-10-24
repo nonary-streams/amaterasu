@@ -24,6 +24,21 @@ impl Pipeline {
         remaining: u64,
         send: &mut Send<'_>,
     ) {
+        let opens_session = matches!(
+            &operation,
+            Operation::Prepare(_)
+                | Operation::Start { .. }
+                | Operation::StartWhenAuthenticated { .. }
+        );
+        if opens_session
+            && (!self.journal.loaded
+                || self.journal.failed
+                || !self.recovery_ready
+                || self.recovery_blocked)
+        {
+            rpc::complete(send, request, error("restart_recovery_unconfirmed"));
+            return;
+        }
         if matches!(
             operation,
             Operation::Prepare(_)

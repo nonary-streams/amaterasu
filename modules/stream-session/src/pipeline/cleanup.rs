@@ -196,20 +196,29 @@ impl Pipeline {
     }
 
     pub(super) fn finish_cleanup(
-        &self,
+        &mut self,
         record: &mut Record,
-        job: &Job,
+        job: &mut Job,
         send: &mut Send<'_>,
     ) -> bool {
-        record.state = if record.attempted.is_empty()
+        let clean = record.attempted.is_empty()
             && record.uncertain.is_none()
             && !record.input_attempted
             && record.input_lease.is_none()
             && record.limiter_lease.is_none()
             && !record.limiter_attempted
             && !record.display_attempted
-            && record.display_lease.is_none()
-        {
+            && record.display_lease.is_none();
+        if clean && self.journal.document.entries.contains_key(&record.id) {
+            let document = self.journal.without_record(record.id);
+            job.journal_resume = Some(Step::WaitDrain);
+            job.journal_payload = Some(self.journal.set_payload(&document));
+            job.journal_document = Some(document);
+            job.journal_operation_id = Some(self.journal.op_id(self.sequence.saturating_add(1)));
+            job.step = Step::PersistJournal;
+            return true;
+        }
+        record.state = if clean {
             record.cleanup_error = None;
             record.outcome
         } else {

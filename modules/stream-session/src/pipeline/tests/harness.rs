@@ -46,6 +46,7 @@ pub struct Broker {
     pub fail_cancel: bool,
     pub fail_open: Option<String>,
     pub fail_close: Option<String>,
+    pub fail_session_stop: bool,
     pub fail_audio_recover: bool,
     pub malformed_audio_recover: bool,
     pub authenticated: bool,
@@ -107,6 +108,9 @@ pub struct Broker {
     pub display_restart_on_lost_apply: bool,
     pub display_inactive_target: Option<String>,
     pub display_active_ids: Vec<String>,
+    pub state_revision: u64,
+    pub state_value: Option<Value>,
+    pub state_fail_set: bool,
 }
 
 impl Broker {
@@ -152,6 +156,31 @@ impl Broker {
             .iter()
             .filter(|call| call.service == "amaterasu.session-history/1")
             .count()
+    }
+
+    pub fn seed_state(&mut self, value: Value, revision: u64) {
+        self.state_value = Some(value);
+        self.state_revision = revision;
+    }
+
+    pub fn seed_session(&mut self, key: &str) {
+        self.next += 1;
+        self.allocations.insert(
+            ("amaterasu.session/1".into(), key.into()),
+            Allocation {
+                id: self.next,
+                key: key.into(),
+                state: "active".into(),
+                leases: Default::default(),
+                request: json!({}),
+            },
+        );
+    }
+
+    pub fn session_is_stopped_without_leases(&self, key: &str) -> bool {
+        self.allocations
+            .get(&("amaterasu.session/1".into(), key.into()))
+            .is_some_and(|allocation| allocation.state == "stopped" && allocation.leases.is_empty())
     }
 
     pub fn send(&mut self, command: Command) -> ModuleResult<Response> {
@@ -316,6 +345,22 @@ impl Broker {
     fn execute(&mut self, call: &Call) -> Value {
         let action = call.payload["action"].as_str().unwrap();
         let service = call.service.as_str();
+        if service == "amaterasu.state/1" {
+            return match action {
+                "get" => json!({"ok":true,"revision":self.state_revision,
+                    "found":self.state_value.is_some(),"value":self.state_value.clone()}),
+                "set" if self.state_fail_set => error("state_write_unavailable"),
+                "set" if call.payload["expected_revision"] != self.state_revision => {
+                    error("revision_conflict")
+                }
+                "set" => {
+                    self.state_value = Some(call.payload["value"].clone());
+                    self.state_revision += 1;
+                    json!({"ok":true,"revision":self.state_revision})
+                }
+                _ => panic!("unexpected state action"),
+            };
+        }
         if service == "amaterasu.session-history/1" {
             return match action {
                 "stream_activity_begin" => {
@@ -476,6 +521,9 @@ impl Broker {
             return json!({"ok":true,"stream":if self.malformed_audio_recover {id + 1} else {id},"packet_bytes":160});
         }
         if service == "amaterasu.session/1" {
+            if action == "stop" && self.fail_session_stop {
+                return error("stop_failed");
+            }
             let allocation = self.allocations.get_mut(&key).unwrap();
             match action {
                 "acquire" => {
@@ -927,7 +975,7 @@ pub struct Harness {
 impl Harness {
     pub fn new() -> Self {
         Self {
-            pipeline: Pipeline::new(Settings {
+            pipeline: Pipeline::new_for_test(Settings {
                 enabled: true,
                 allowed_principals: vec!["owner".into()],
                 ..Settings::default()
@@ -937,6 +985,17 @@ impl Harness {
             plane: Rc::new(RefCell::new(PlaneState::default())),
             now: 0,
         }
+    }
+    pub fn with_restart_state(document: Value, revision: u64) -> Self {
+        let mut host = Self::new();
+        host.pipeline = Pipeline::new_for_restart_test(Settings {
+            enabled: true,
+            allowed_principals: vec!["owner".into()],
+            ..Settings::default()
+        })
+        .unwrap();
+        host.broker.seed_state(document, revision);
+        host
     }
     pub fn tick(&mut self) {
         self.now += 1;

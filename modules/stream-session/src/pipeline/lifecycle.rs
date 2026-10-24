@@ -42,6 +42,14 @@ impl Pipeline {
                     return true;
                 }
                 rpc::Progress::Unresolved => {
+                    if job.step == Step::PersistJournal {
+                        self.journal.failed = true;
+                        self.recovery_blocked = true;
+                        record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
+                        record.state = State::CleanupFailed;
+                        self.reply(record, job, send);
+                        return false;
+                    }
                     if job.step == Step::ApplyLimiter {
                         let settled = pending.shutdown(send);
                         if !settled {
@@ -72,6 +80,18 @@ impl Pipeline {
                     return self.consume(record, job, payload, now, send, factory);
                 }
                 rpc::Progress::Failed => {
+                    if job.step == Step::PersistJournal {
+                        self.journal.failed = true;
+                        self.recovery_blocked = true;
+                        if job.cleanup {
+                            record.cleanup_error = Some("lifecycle_journal_write_failed");
+                            record.state = State::CleanupFailed;
+                            self.reply(record, job, send);
+                            return false;
+                        }
+                        job.fail(record, "lifecycle_journal_write_failed", now);
+                        return true;
+                    }
                     if job.settling_allocation {
                         job.settling_allocation = false;
                         return true;
@@ -187,6 +207,21 @@ impl Pipeline {
         if job.step == Step::InputBatch {
             record.input_inflight = next_input_batch_size(record);
         }
+        if !job.cleanup && job.step != Step::PersistJournal && !self.journal.matches_record(record)
+        {
+            let document = match self.journal.with_record(record) {
+                Ok(document) => document,
+                Err(code) => {
+                    job.fail(record, code, now);
+                    return true;
+                }
+            };
+            job.journal_resume = Some(job.step);
+            job.journal_payload = Some(self.journal.set_payload(&document));
+            job.journal_document = Some(document);
+            job.journal_operation_id = Some(self.journal.op_id(self.sequence.saturating_add(1)));
+            job.step = Step::PersistJournal;
+        }
         let (service, payload) = job.command(record);
         self.sequence = match self.sequence.checked_add(1) {
             Some(value) => value,
@@ -200,12 +235,11 @@ impl Pipeline {
         } else {
             job.request
         };
-        let pending = rpc::Pending::new(
-            &service,
-            payload,
-            format!("ss-{:x}-{}", record.id, self.sequence),
-            parent,
-        );
+        let operation_id = job
+            .journal_operation_id
+            .clone()
+            .unwrap_or_else(|| format!("ss-{:x}-{}", record.id, self.sequence));
+        let pending = rpc::Pending::new(&service, payload, operation_id, parent);
         job.pending = Some(if job.step == Step::RecoverAudio {
             pending.retry_uncertain_admission()
         } else {
@@ -223,6 +257,24 @@ impl Pipeline {
         send: &mut Send<'_>,
         factory: &mut Factory<'_>,
     ) -> bool {
+        if job.step == Step::PersistJournal {
+            let Some(document) = job.journal_document.take() else {
+                self.journal.failed = true;
+                return self.journal_write_failed(record, job, now, send);
+            };
+            if self
+                .journal
+                .validate_saved_response(&payload, document)
+                .is_err()
+            {
+                self.journal.failed = true;
+                return self.journal_write_failed(record, job, now, send);
+            }
+            job.journal_payload = None;
+            job.journal_operation_id = None;
+            job.step = job.journal_resume.take().unwrap_or(Step::WaitDrain);
+            return true;
+        }
         if job.cleanup {
             return self.consume_cleanup(record, job, payload, now, send);
         }
@@ -300,6 +352,10 @@ impl Pipeline {
             return true;
         }
         if payload["ok"] != true {
+            if job.step == Step::PersistJournal {
+                self.journal.failed = true;
+                return self.journal_write_failed(record, job, now, send);
+            }
             if job.step == Step::InputBatch && payload["error"]["code"] == "controller_unavailable"
             {
                 match accept_controller_batch_failure(record, &payload) {
@@ -649,6 +705,23 @@ impl Pipeline {
         now: u64,
     ) -> bool {
         job.fail(record, code, now);
+        true
+    }
+
+    fn journal_write_failed(
+        &mut self,
+        record: &mut Record,
+        job: &mut Job,
+        now: u64,
+        send: &mut Send<'_>,
+    ) -> bool {
+        record.cleanup_error = Some("lifecycle_journal_write_failed");
+        if job.cleanup {
+            record.state = State::CleanupFailed;
+            self.reply(record, job, send);
+            return false;
+        }
+        job.fail(record, "lifecycle_journal_write_failed", now);
         true
     }
 }

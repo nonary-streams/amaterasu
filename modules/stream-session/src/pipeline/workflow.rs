@@ -1,4 +1,5 @@
 use super::{
+    journal::Document,
     record::{Record, Resource, State},
     rpc,
 };
@@ -36,6 +37,7 @@ pub(super) enum Step {
     FinishSession,
     ForceIdr,
     RecoverAudio,
+    PersistJournal,
 }
 
 pub(super) struct Job {
@@ -51,6 +53,10 @@ pub(super) struct Job {
     pub input_tried: bool,
     pub limiter_tried: bool,
     pub display_tried: bool,
+    pub journal_resume: Option<Step>,
+    pub journal_document: Option<Document>,
+    pub journal_payload: Option<Value>,
+    pub journal_operation_id: Option<String>,
 }
 
 impl Job {
@@ -68,6 +74,10 @@ impl Job {
             input_tried: false,
             limiter_tried: false,
             display_tried: false,
+            journal_resume: None,
+            journal_document: None,
+            journal_payload: None,
+            journal_operation_id: None,
         }
     }
 
@@ -159,6 +169,12 @@ impl Job {
     pub fn command(&self, record: &Record) -> (String, Value) {
         let session = || record.resources[&Resource::Session];
         match self.step {
+            Step::PersistJournal => (
+                "amaterasu.state/1".into(),
+                self.journal_payload
+                    .clone()
+                    .expect("journal write step owns a payload"),
+            ),
             Step::Open(resource) => (resource.service(), record.open(resource)),
             Step::Authenticate => (
                 Resource::Control.service(),

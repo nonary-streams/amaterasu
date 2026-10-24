@@ -4,6 +4,7 @@ mod harness;
 mod history;
 mod input;
 mod limiter;
+mod restart;
 use super::*;
 use harness::*;
 
