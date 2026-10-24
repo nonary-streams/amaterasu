@@ -10,6 +10,7 @@ fn journal_with_owned_session(record_id: u64) -> Value {
         input_attempted: false,
         display_attempted: false,
         limiter_attempted: false,
+        limiter_executable_path: None,
     };
     let mut document = Document::default();
     document.entries.insert(record_id, entry);
@@ -43,6 +44,62 @@ fn restart_reconciles_only_exact_journaled_session_then_allows_relaunch() {
 
     let prepared = host.response(1, prepare());
     assert_eq!(prepared["state"], "prepared", "{prepared}");
+}
+
+#[test]
+fn restart_restores_only_the_journaled_limiter_executable() {
+    const RECORD_ID: u64 = 0xabcd;
+    const EXECUTABLE: &str = r"C:\Games\Example.exe";
+    let mut document: Document =
+        serde_json::from_value(journal_with_owned_session(RECORD_ID)).unwrap();
+    let entry = document.entries.get_mut(&RECORD_ID).unwrap();
+    entry.attempted_resources.clear();
+    entry.limiter_attempted = true;
+    entry.limiter_executable_path = Some(EXECUTABLE.into());
+    let mut host = Harness::with_restart_state(serde_json::to_value(document).unwrap(), 7);
+    host.broker.limiter_session = Some(format!("stream-{RECORD_ID:016x}"));
+    host.broker.limiter_lease = Some("owned-limiter-lease".into());
+    host.broker.limiter_executable_path = Some(EXECUTABLE.into());
+
+    host.idle();
+
+    assert!(host.broker.limiter_lease.is_none());
+    assert_eq!(host.broker.state_revision, 8);
+    assert_eq!(
+        host.broker.state_value.as_ref().unwrap()["entries"],
+        json!({})
+    );
+    assert!(host.broker.calls.iter().any(|call| {
+        call.service == "amaterasu.frame-limiter/1"
+            && call.payload["action"] == "restore"
+            && call.payload["lease"] == "owned-limiter-lease"
+    }));
+    assert_eq!(host.response(1, prepare())["state"], "prepared");
+}
+
+#[test]
+fn legacy_limiter_intent_without_identity_blocks_recovery() {
+    let mut document = journal_with_owned_session(0xabcd);
+    document["entries"]["43981"]["attempted_resources"] = json!([]);
+    document["entries"]["43981"]["limiter_attempted"] = json!(true);
+    let mut host = Harness::with_restart_state(document, 7);
+    host.broker.limiter_session = Some("stream-000000000000abcd".into());
+    host.broker.limiter_lease = Some("unverified-limiter".into());
+
+    host.idle();
+
+    assert_eq!(host.broker.state_revision, 7);
+    assert_eq!(
+        host.broker.limiter_lease.as_deref(),
+        Some("unverified-limiter")
+    );
+    assert_eq!(
+        host.response(1, prepare())["code"],
+        "restart_recovery_unconfirmed"
+    );
+    assert!(!host.broker.calls.iter().any(|call| {
+        call.service == "amaterasu.frame-limiter/1" && call.payload["action"] == "restore"
+    }));
 }
 
 #[test]

@@ -25,6 +25,8 @@ pub(super) struct Entry {
     pub input_attempted: bool,
     pub display_attempted: bool,
     pub limiter_attempted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limiter_executable_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -56,6 +58,10 @@ impl Entry {
             input_attempted: record.input_attempted,
             display_attempted: record.display_attempted,
             limiter_attempted: record.limiter_attempted,
+            limiter_executable_path: record
+                .limiter_attempted
+                .then(|| record.config.frame_limiter_executable_path.clone())
+                .flatten(),
         }
     }
 
@@ -64,6 +70,10 @@ impl Entry {
             && !self.owner.is_empty()
             && self.owner.len() <= 128
             && !self.owner.chars().any(char::is_control)
+            && (self.limiter_attempted == self.limiter_executable_path.is_some())
+            && self.limiter_executable_path.as_ref().is_none_or(|path| {
+                !path.trim().is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control)
+            })
             && self.attempted_resources.len() <= 6
             && self.attempted_resources.iter().all(|resource| {
                 matches!(
@@ -100,6 +110,7 @@ impl Entry {
         record.input_lookup_required = self.input_attempted;
         record.display_attempted = self.display_attempted;
         record.limiter_attempted = self.limiter_attempted;
+        record.config.frame_limiter_executable_path = self.limiter_executable_path.clone();
         record.state = super::record::State::Stopping;
         record.outcome = super::record::State::Failed;
         record.error = Some("host_restart_recovery");
@@ -357,6 +368,13 @@ mod tests {
         assert!(!entry.validate());
         let mut entry = Entry::from_record(&record());
         entry.attempted_resources.insert("unknown-provider".into());
+        assert!(!entry.validate());
+        let mut entry = Entry::from_record(&record());
+        entry.limiter_attempted = true;
+        assert!(!entry.validate());
+        entry.limiter_executable_path = Some("bad\npath".into());
+        assert!(!entry.validate());
+        entry.limiter_executable_path = Some("x".repeat(4097));
         assert!(!entry.validate());
     }
 
