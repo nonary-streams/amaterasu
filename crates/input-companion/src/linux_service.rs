@@ -10,6 +10,7 @@ use crate::{
     MouseButton, PROTOCOL_VERSION, PermitLedger, ProcessIdentity,
 };
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -66,46 +67,51 @@ pub struct LinuxInputService {
     host: ProcessIdentity,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<InputResult<()>>>,
-    socket_path: PathBuf,
-    socket_identity: (u64, u64),
+    socket_cleanup: BoundSocketPath,
+    _socket_lock: SocketPathLock,
 }
 
 impl LinuxInputService {
     /// Starts an unprivileged listener using only the current process's
     /// existing access to `uinput_path`. The socket parent must be an existing
     /// directory owned by the effective UID and not writable by group/others.
-    /// The socket is created with mode 0600. `uinput_path` must already be a
+    /// The socket is created with mode 0600; a same-user lock file remains in
+    /// that directory to serialize service instances and permit stale-socket
+    /// recovery. `uinput_path` must already be a
     /// writable character device, normally `/dev/uinput`; no permissions are
     /// changed and no service is installed. A host should call this only when
     /// its input companion policy opts in the exact selected component digest.
     pub fn start(socket_path: &Path, uinput_path: &Path) -> InputResult<Self> {
         validate_socket_parent(socket_path)?;
         validate_uinput_access(uinput_path)?;
-        let listener = UnixListener::bind(socket_path).map_err(system_error)?;
-        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(system_error)?;
-        listener.set_nonblocking(true).map_err(system_error)?;
-        let metadata = std::fs::symlink_metadata(socket_path).map_err(system_error)?;
-        if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
-            let _ = std::fs::remove_file(socket_path);
-            return Err(InputError::PermissionDenied);
-        }
+        let socket_lock = SocketPathLock::acquire(socket_path)?;
         let host = inspect_process(std::process::id())?;
         let registry = GrantRegistry::session_only();
         let ledger = Arc::new(Mutex::new(PermitLedger::new(registry)));
         let stop = Arc::new(AtomicBool::new(false));
+        remove_stale_socket(socket_path, &socket_lock)?;
+        let listener = UnixListener::bind(socket_path).map_err(system_error)?;
+        let socket_cleanup = BoundSocketPath::capture(socket_path)?;
+        socket_cleanup.ensure_current()?;
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(system_error)?;
+        socket_cleanup.refresh_change_time()?;
+        listener.set_nonblocking(true).map_err(system_error)?;
+        socket_cleanup.ensure_current()?;
         let thread_ledger = Arc::clone(&ledger);
         let thread_stop = Arc::clone(&stop);
         let device_path = uinput_path.to_path_buf();
-        let join =
-            std::thread::spawn(move || serve(listener, &device_path, thread_ledger, thread_stop));
+        let join = std::thread::Builder::new()
+            .name("amaterasu-input-listener".into())
+            .spawn(move || serve(listener, &device_path, thread_ledger, thread_stop))
+            .map_err(system_error)?;
         Ok(Self {
             ledger,
             host,
             stop,
             join: Some(join),
-            socket_path: socket_path.to_path_buf(),
-            socket_identity: (metadata.dev(), metadata.ino()),
+            socket_cleanup,
+            _socket_lock: socket_lock,
         })
     }
 
@@ -161,11 +167,181 @@ impl Drop for LinuxInputService {
                 eprintln!("{diagnostic}");
             }
         }
-        if let Ok(metadata) = std::fs::symlink_metadata(&self.socket_path)
-            && metadata.file_type().is_socket()
-            && (metadata.dev(), metadata.ino()) == self.socket_identity
+    }
+}
+
+/// Serializes cooperating owners of one socket path. The lock file is kept in
+/// the protected socket directory and is deliberately not removed on drop:
+/// unlinking a locked file could let another process lock a replacement inode.
+struct SocketPathLock {
+    _file: File,
+}
+
+impl SocketPathLock {
+    fn acquire(socket_path: &Path) -> InputResult<Self> {
+        let path = socket_lock_path(socket_path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(system_error)?;
+        let metadata = file.metadata().map_err(system_error)?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o077 != 0
         {
-            let _ = std::fs::remove_file(&self.socket_path);
+            return Err(InputError::PermissionDenied);
+        }
+        // SAFETY: flock only changes advisory lock state for this open file
+        // description; the descriptor remains owned by this guard.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::WouldBlock {
+                Err(InputError::ResourceExhausted)
+            } else {
+                Err(system_error(error))
+            };
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+fn socket_lock_path(socket_path: &Path) -> InputResult<PathBuf> {
+    let parent = socket_path.parent().ok_or(InputError::InvalidPeer)?;
+    let name = socket_path.file_name().ok_or(InputError::InvalidPeer)?;
+    let mut lock_name = OsString::from(".");
+    lock_name.push(name);
+    lock_name.push(".lock");
+    Ok(parent.join(lock_name))
+}
+
+/// Removes a stale socket only while holding its path lock. A live endpoint,
+/// foreign-owned socket, symlink, or other filesystem object is preserved.
+fn remove_stale_socket(socket_path: &Path, _lock: &SocketPathLock) -> InputResult<()> {
+    for _ in 0..3 {
+        let metadata = match std::fs::symlink_metadata(socket_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(system_error(error)),
+        };
+        if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(InputError::PermissionDenied);
+        }
+
+        match UnixStream::connect(socket_path) {
+            Ok(_connection) => return Err(InputError::ResourceExhausted),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(system_error(error)),
+        }
+
+        if unlink_if_same_socket(socket_path, &metadata)? {
+            return Ok(());
+        }
+    }
+    Err(InputError::ResourceExhausted)
+}
+
+/// The final inode check narrows replacement races between the liveness probe
+/// and unlink. The per-path flock serializes all companion instances.
+fn unlink_if_same_socket(path: &Path, expected: &std::fs::Metadata) -> InputResult<bool> {
+    let current = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(system_error(error)),
+    };
+    if !current.file_type().is_socket()
+        || current.uid() != unsafe { libc::geteuid() }
+        || current.dev() != expected.dev()
+        || current.ino() != expected.ino()
+        || current.ctime() != expected.ctime()
+        || current.ctime_nsec() != expected.ctime_nsec()
+    {
+        return Ok(false);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(system_error(error)),
+    }
+}
+
+/// Owns the exact filesystem socket inode created by bind. It is installed
+/// immediately after bind, so every later startup error path removes only that
+/// inode; a replacement path is never unlinked.
+struct BoundSocketPath {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    uid: u32,
+    change_time: i64,
+    change_time_nanoseconds: i64,
+}
+
+impl BoundSocketPath {
+    fn capture(path: &Path) -> InputResult<Self> {
+        let metadata = std::fs::symlink_metadata(path).map_err(system_error)?;
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.file_type().is_socket() || metadata.uid() != uid {
+            return Err(InputError::PermissionDenied);
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid,
+            change_time: metadata.ctime(),
+            change_time_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+
+    fn ensure_current(&self) -> InputResult<()> {
+        let metadata = std::fs::symlink_metadata(&self.path).map_err(system_error)?;
+        if self.matches(&metadata) {
+            Ok(())
+        } else {
+            Err(InputError::PermissionDenied)
+        }
+    }
+
+    fn refresh_change_time(&mut self) -> InputResult<()> {
+        let metadata = std::fs::symlink_metadata(&self.path).map_err(system_error)?;
+        if !self.matches_inode(&metadata) {
+            return Err(InputError::PermissionDenied);
+        }
+        self.change_time = metadata.ctime();
+        self.change_time_nanoseconds = metadata.ctime_nsec();
+        Ok(())
+    }
+
+    fn matches(&self, metadata: &std::fs::Metadata) -> bool {
+        self.matches_inode(metadata)
+            && metadata.ctime() == self.change_time
+            && metadata.ctime_nsec() == self.change_time_nanoseconds
+    }
+
+    fn matches_inode(&self, metadata: &std::fs::Metadata) -> bool {
+        metadata.file_type().is_socket()
+            && metadata.uid() == self.uid
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+    }
+}
+
+impl Drop for BoundSocketPath {
+    fn drop(&mut self) {
+        let Ok(metadata) = std::fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if self.matches(&metadata)
+            && let Err(error) = std::fs::remove_file(&self.path)
+        {
+            eprintln!("could not remove owned input socket: {error}");
         }
     }
 }
@@ -894,6 +1070,18 @@ fn button_code(button: MouseButton) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn socket_test_directory() -> PathBuf {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "amaterasu-input-socket-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
 
     #[test]
     fn listener_cleanup_failure_is_reported_on_join() {
@@ -902,6 +1090,158 @@ mod tests {
             listener_exit_diagnostic(Ok(Err(InputError::Device))).as_deref(),
             Some("input companion listener ended: Device")
         );
+    }
+
+    #[test]
+    fn stale_owned_socket_is_removed_before_rebind() {
+        let directory = socket_test_directory();
+        let path = directory.join("input.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        drop(listener);
+
+        let lock = SocketPathLock::acquire(&path).unwrap();
+        remove_stale_socket(&path, &lock).unwrap();
+        assert!(std::fs::symlink_metadata(&path).is_err());
+
+        let replacement = UnixListener::bind(&path).unwrap();
+        drop(replacement);
+        drop(lock);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn live_owned_socket_is_never_unlinked() {
+        let directory = socket_test_directory();
+        let path = directory.join("input.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let identity = std::fs::symlink_metadata(&path).unwrap();
+        let lock = SocketPathLock::acquire(&path).unwrap();
+
+        assert_eq!(
+            remove_stale_socket(&path, &lock),
+            Err(InputError::ResourceExhausted)
+        );
+        let current = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (current.dev(), current.ino()),
+            (identity.dev(), identity.ino())
+        );
+        let connection = UnixStream::connect(&path).unwrap();
+
+        drop(connection);
+        drop(listener);
+        drop(lock);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stale_probe_does_not_unlink_a_replacement_socket() {
+        let directory = socket_test_directory();
+        let path = directory.join("input.sock");
+        let stale_listener = UnixListener::bind(&path).unwrap();
+        let stale_identity = std::fs::symlink_metadata(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let live_listener = UnixListener::bind(&path).unwrap();
+        let live_identity = std::fs::symlink_metadata(&path).unwrap();
+        drop(stale_listener);
+        let lock = SocketPathLock::acquire(&path).unwrap();
+        assert!(!unlink_if_same_socket(&path, &stale_identity).unwrap());
+        let current = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (current.dev(), current.ino()),
+            (live_identity.dev(), live_identity.ino())
+        );
+        let connection = UnixStream::connect(&path).unwrap();
+
+        drop(connection);
+        drop(live_listener);
+        drop(lock);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn non_socket_path_is_preserved_during_recovery() {
+        let directory = socket_test_directory();
+        let path = directory.join("input.sock");
+        std::fs::write(&path, b"owned regular file").unwrap();
+        let lock = SocketPathLock::acquire(&path).unwrap();
+
+        assert_eq!(
+            remove_stale_socket(&path, &lock),
+            Err(InputError::PermissionDenied)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"owned regular file");
+
+        drop(lock);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn symlink_to_live_socket_is_preserved_during_recovery() {
+        let directory = socket_test_directory();
+        let target = directory.join("foreign.sock");
+        let path = directory.join("input.sock");
+        let listener = UnixListener::bind(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let lock = SocketPathLock::acquire(&path).unwrap();
+
+        assert_eq!(
+            remove_stale_socket(&path, &lock),
+            Err(InputError::PermissionDenied)
+        );
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        let connection = UnixStream::connect(&target).unwrap();
+
+        drop(connection);
+        drop(listener);
+        drop(lock);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn post_bind_cleanup_removes_only_the_captured_socket_inode() {
+        let directory = socket_test_directory();
+        let path = directory.join("input.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let startup = (|| {
+            let _cleanup = BoundSocketPath::capture(&path)?;
+            Err::<(), _>(InputError::Device)
+        })();
+        assert_eq!(startup, Err(InputError::Device));
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        drop(listener);
+
+        let old_listener = UnixListener::bind(&path).unwrap();
+        let old_cleanup = BoundSocketPath::capture(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let replacement = UnixListener::bind(&path).unwrap();
+        let replacement_identity = std::fs::symlink_metadata(&path).unwrap();
+        drop(old_listener);
+        drop(old_cleanup);
+        let current = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (current.dev(), current.ino()),
+            (replacement_identity.dev(), replacement_identity.ino())
+        );
+        let connection = UnixStream::connect(&path).unwrap();
+
+        drop(connection);
+        drop(replacement);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn socket_lock_prevents_two_companion_startups_from_racing() {
+        let directory = socket_test_directory();
+        let path = directory.join("input.sock");
+        let first_lock = SocketPathLock::acquire(&path).unwrap();
+        assert!(matches!(
+            SocketPathLock::acquire(&path),
+            Err(InputError::ResourceExhausted)
+        ));
+        drop(first_lock);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
