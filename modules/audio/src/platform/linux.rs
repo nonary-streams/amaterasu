@@ -585,7 +585,6 @@ impl PulseClient {
                 self.pending_callback_states.retain(query.result);
                 QueryPoll::Complete(Err("audio_backend_failed"))
             }
-            _ => QueryPoll::Pending,
         }
     }
 
