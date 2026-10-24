@@ -26,6 +26,8 @@ pub(super) enum Step {
     ReleaseInput,
     RenewInput,
     InputBatch,
+    PollGamepadFeedback,
+    RumbleDrain,
     DrainVideo,
     CloseCapture,
     WaitDrain,
@@ -57,6 +59,7 @@ pub(super) struct Job {
     pub journal_document: Option<Document>,
     pub journal_payload: Option<Value>,
     pub journal_operation_id: Option<String>,
+    pub rumble_tried: bool,
 }
 
 impl Job {
@@ -78,6 +81,7 @@ impl Job {
             journal_document: None,
             journal_payload: None,
             journal_operation_id: None,
+            rumble_tried: false,
         }
     }
 
@@ -90,7 +94,10 @@ impl Job {
         };
         record.history.stopping(code);
         record.state = State::Stopping;
-        record.plane = None;
+        super::input::queue_rumble_zeros(record, now);
+        if let Some(plane) = record.plane.as_mut() {
+            plane.stop();
+        }
         record.audio_recovery_needed = false;
         if let Some(pending) = self.pending.as_mut() {
             pending.cancel();
@@ -101,6 +108,11 @@ impl Job {
     }
 
     pub fn next_cleanup(&mut self, record: &Record) -> Option<Step> {
+        if !self.rumble_tried
+            && (!record.rumble_active_until.is_empty() || !record.rumble_pending.is_empty())
+        {
+            return Some(Step::RumbleDrain);
+        }
         if !self.input_tried {
             if record.input_lookup_required {
                 return Some(Step::FindInput);
@@ -250,6 +262,11 @@ impl Job {
                 "amaterasu.input/1".into(),
                 json!({"action":"batch","lease":record.input_lease,"events":record.input_events.iter().take(record.input_inflight).collect::<Vec<_>>() }),
             ),
+            Step::PollGamepadFeedback => (
+                "amaterasu.input/1".into(),
+                json!({"action":"poll_gamepad_feedback","lease":record.input_lease}),
+            ),
+            Step::RumbleDrain => (String::new(), Value::Null),
             Step::DrainVideo => (
                 Resource::Video.service(),
                 json!({"action":"drain","stream":record.resources[&Resource::Video]}),

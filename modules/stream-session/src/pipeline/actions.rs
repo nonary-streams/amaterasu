@@ -333,6 +333,10 @@ impl Pipeline {
         record.history.stopping("stop_requested");
         record.state = State::Stopping;
         record.cleanup_error = None;
+        input::queue_rumble_zeros(record, now);
+        if !record.rumble_pending.is_empty() {
+            job.step = Step::RumbleDrain;
+        }
         if let Some(plane) = record.plane.as_mut() {
             plane.stop();
         } else {

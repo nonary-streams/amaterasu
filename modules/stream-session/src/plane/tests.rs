@@ -31,6 +31,10 @@ impl Backend for Fake {
             Ok(None)
         }
     }
+
+    fn send_rumble(&mut self, _command: RumbleCommand) -> PlaneResult<bool> {
+        Ok(true)
+    }
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>> {
         self.video_reads += 1;
         if self.video_failure_after_submit && !self.videos_sent.is_empty() {

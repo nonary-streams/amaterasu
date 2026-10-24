@@ -1,6 +1,8 @@
 //! Native calls borrow copied headers only synchronously. Bindings are retained
 //! until every pending call and callback has returned, then released by the SDK.
 use super::*;
+use amaterasu_gamestream::control::{RUMBLE_MESSAGE_TYPE, RumbleFeedback, encode_rumble_feedback};
+use amaterasu_media::{CONTROL_RELIABLE, ControlMessage};
 use amaterasu_module_sdk::{NativeBinding, abi::*};
 use std::{
     ffi::c_void,
@@ -55,6 +57,36 @@ fn bind<T>(runtime: &RuntimeClient, service: &str) -> PlaneResult<NativeBinding>
 }
 
 impl Backend for NativeBackend {
+    fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool> {
+        let payload = encode_rumble_feedback(RumbleFeedback {
+            slot: command.slot,
+            low_frequency: command.low_frequency,
+            high_frequency: command.high_frequency,
+        })
+        .map_err(|_| "invalid_rumble_feedback")?;
+        let message = ControlMessage {
+            message_type: u32::from(RUMBLE_MESSAGE_TYPE),
+            channel: 0,
+            delivery: CONTROL_RELIABLE,
+            reserved: 0,
+            data: payload.as_ptr(),
+            len: payload.len(),
+            sequence: 0,
+        };
+        // SAFETY: the authenticated control provider copies this bounded stack
+        // payload synchronously and owns encryption/sequence assignment.
+        let api = unsafe { self.control.table::<ControlTransportApi>() }
+            .map_err(|_| "native_layout_mismatch")?;
+        let status = unsafe {
+            (api.send)(
+                self.control.context(),
+                self.handles.control_transport,
+                &message,
+            )
+        };
+        accepted(status)
+    }
+
     fn control(&mut self) -> PlaneResult<Option<ControlRecord>> {
         let mut output = Delivery::default();
         // SAFETY: the owned binding and stack sink remain live for one callback.

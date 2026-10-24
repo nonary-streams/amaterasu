@@ -1,7 +1,7 @@
 use super::record::{Record, State};
 use amaterasu_gamestream::control::{
-    AbsoluteViewport, Input, InputEvent, InputTranslator, MouseButton, PenTouch, PointerDevice,
-    PointerEvent, ScrollAxis, TranslatedKeyState, TranslationError,
+    AbsoluteViewport, Input, InputEvent, InputTranslator, MAX_CONTROLLER_SLOT, MouseButton,
+    PenTouch, PointerDevice, PointerEvent, ScrollAxis, TranslatedKeyState, TranslationError,
 };
 use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
@@ -214,6 +214,7 @@ pub(super) fn accept_input_lease(
     };
     record.input_lease = Some(lease.to_owned());
     record.input_controller_supported = controller_input_supported;
+    record.feedback_poll_at = now.saturating_add(40);
     record.input_pen_touch_supported = optional_bool(payload, "pen_touch_supported")?;
     record.input_native_pen_touch = optional_bool(payload, "native_pen_touch")?;
     record.input_expires_at = now.saturating_add(expires_in_ms).min(
@@ -365,9 +366,12 @@ pub(super) fn clear_input(record: &mut Record) {
     record.input_attempted = false;
     record.input_lookup_required = false;
     record.input_lease = None;
+    record.rumble_active_until.clear();
+    record.rumble_pending.clear();
     record.input_request_started_at = 0;
     record.input_expires_at = 0;
     record.input_renew_at = 0;
+    record.feedback_poll_at = 0;
     record.input_absolute_pointer = false;
     record.input_controller_supported = false;
     record.input_pen_touch_supported = false;
@@ -376,6 +380,115 @@ pub(super) fn clear_input(record: &mut Record) {
     record.input_events.clear();
     record.input_inflight = 0;
     record.input_translator = Default::default();
+}
+
+pub(super) fn queue_rumble_zeros(record: &mut Record, now: u64) {
+    let mut slots: std::collections::BTreeSet<u16> =
+        record.rumble_active_until.keys().copied().collect();
+    slots.extend(record.rumble_pending.keys().copied());
+    for slot in slots {
+        record.rumble_pending.insert(
+            slot,
+            (
+                crate::plane::RumbleCommand {
+                    slot,
+                    low_frequency: 0,
+                    high_frequency: 0,
+                },
+                None,
+            ),
+        );
+    }
+    if !record.rumble_pending.is_empty() {
+        record
+            .rumble_shutdown_deadline
+            .get_or_insert(now.saturating_add(200));
+    }
+}
+
+pub(super) fn accept_gamepad_feedback(
+    record: &mut Record,
+    payload: &Value,
+    now: u64,
+) -> Result<(), &'static str> {
+    if !record.input_controller_supported
+        || record.input_lease.is_none()
+        || payload["ok"] != true
+        || payload["lease"] != json!(record.input_lease)
+    {
+        return Err("invalid_gamepad_feedback_response");
+    }
+    if payload.as_object().is_none_or(|object| object.len() != 3) {
+        return Err("invalid_gamepad_feedback_response");
+    }
+    record.feedback_poll_at = now.saturating_add(40);
+    let Some(feedback) = payload.get("feedback") else {
+        return Err("invalid_gamepad_feedback_response");
+    };
+    if feedback.is_null() {
+        return Ok(());
+    }
+    let object = feedback
+        .as_object()
+        .ok_or("invalid_gamepad_feedback_response")?;
+    if object.len() != 4 {
+        return Err("invalid_gamepad_feedback_response");
+    }
+    let slot = feedback["slot"]
+        .as_u64()
+        .filter(|slot| *slot < u64::from(MAX_CONTROLLER_SLOT))
+        .ok_or("invalid_gamepad_feedback_response")? as u16;
+    let strong = feedback["strong_motor"]
+        .as_u64()
+        .filter(|value| *value <= u16::MAX as u64)
+        .ok_or("invalid_gamepad_feedback_response")? as u16;
+    let weak = feedback["weak_motor"]
+        .as_u64()
+        .filter(|value| *value <= u16::MAX as u64)
+        .ok_or("invalid_gamepad_feedback_response")? as u16;
+    let duration = feedback["duration_ms"]
+        .as_u64()
+        .filter(|value| *value <= 10_000)
+        .ok_or("invalid_gamepad_feedback_response")?;
+    let zero = strong == 0 && weak == 0;
+    if (duration == 0) != zero {
+        return Err("invalid_gamepad_feedback_response");
+    }
+    if zero {
+        // A terminal zero is accepted only for a slot this session already owns.
+        if !record.rumble_active_until.contains_key(&slot)
+            && !record.rumble_pending.contains_key(&slot)
+        {
+            return Ok(());
+        }
+        record.rumble_active_until.remove(&slot);
+        record.rumble_pending.insert(
+            slot,
+            (
+                crate::plane::RumbleCommand {
+                    slot,
+                    low_frequency: 0,
+                    high_frequency: 0,
+                },
+                None,
+            ),
+        );
+    } else {
+        let expires = now.saturating_add(duration);
+        record.rumble_active_until.insert(slot, expires);
+        record.rumble_pending.insert(
+            slot,
+            (
+                crate::plane::RumbleCommand {
+                    slot,
+                    low_frequency: strong,
+                    high_frequency: weak,
+                },
+                Some(expires),
+            ),
+        );
+    }
+    Ok(())
 }
 
 fn optional_bool(payload: &Value, name: &str) -> Result<bool, &'static str> {

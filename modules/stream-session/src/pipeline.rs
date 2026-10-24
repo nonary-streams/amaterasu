@@ -31,6 +31,7 @@ use workflow::{Job, Step};
 
 trait Drive {
     fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure>;
+    fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str>;
     fn stop(&mut self);
     fn is_drained(&self) -> bool;
     fn recover_audio(&mut self);
@@ -39,6 +40,9 @@ trait Drive {
 impl Drive for Plane {
     fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure> {
         Plane::tick(self, media_active)
+    }
+    fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str> {
+        Plane::send_rumble(self, command)
     }
     fn stop(&mut self) {
         Plane::stop(self);
@@ -404,7 +408,10 @@ impl Pipeline {
                 || (record.state == State::Active
                     && (record.force_idr
                         || (record.input_lease.is_some()
-                            && (now >= record.input_renew_at || !record.input_events.is_empty()))))
+                            && (now >= record.input_renew_at
+                                || !record.input_events.is_empty()
+                                || (record.input_controller_supported
+                                    && now >= record.feedback_poll_at)))))
                 || (record.state == State::Armed && now >= record.next_auth_poll)
         };
         let next = self
@@ -429,6 +436,11 @@ impl Pipeline {
             )
         } else if record.audio_recovery_needed {
             (Step::RecoverAudio, now.saturating_add(5000))
+        } else if record.input_lease.is_some()
+            && record.input_controller_supported
+            && now >= record.feedback_poll_at
+        {
+            (Step::PollGamepadFeedback, now.saturating_add(5000))
         } else if record.input_lease.is_some() && now >= record.input_renew_at {
             (
                 Step::RenewInput,
@@ -464,6 +476,28 @@ impl Pipeline {
             crypto::Direction,
         };
         for record in self.records.values_mut() {
+            for slot in record
+                .rumble_active_until
+                .iter()
+                .filter_map(|(slot, expires)| (*expires <= now).then_some(*slot))
+                .collect::<Vec<_>>()
+            {
+                record.rumble_active_until.remove(&slot);
+                record.rumble_pending.insert(
+                    slot,
+                    (
+                        crate::plane::RumbleCommand {
+                            slot,
+                            low_frequency: 0,
+                            high_frequency: 0,
+                        },
+                        None,
+                    ),
+                );
+            }
+            if record.state == State::Stopping && record.rumble_shutdown_deadline.is_none() {
+                input::queue_rumble_zeros(record, now);
+            }
             if matches!(record.state, State::Prepared | State::Armed)
                 && now >= record.prepared_until
             {
@@ -480,6 +514,34 @@ impl Pipeline {
             let Some(plane) = record.plane.as_mut() else {
                 continue;
             };
+            if let Some((slot, (command, expires_at))) = record
+                .rumble_pending
+                .first_key_value()
+                .map(|(slot, value)| (*slot, *value))
+            {
+                match plane.send_rumble(command) {
+                    Ok(true) => {
+                        record.rumble_pending.remove(&slot);
+                        if command.low_frequency == 0 && command.high_frequency == 0 {
+                            record.rumble_active_until.remove(&slot);
+                            record.rumble_stop_unconfirmed = true;
+                        } else if let Some(expires_at) = expires_at {
+                            record.rumble_active_until.insert(slot, expires_at);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        record.rumble_stop_unconfirmed = true;
+                        record.rumble_pending.clear();
+                        record.rumble_active_until.clear();
+                        record.error.get_or_insert("rumble_delivery_failed");
+                        record.outcome = State::Failed;
+                        record.state = State::Stopping;
+                        record.rumble_shutdown_deadline = Some(now);
+                        plane.stop();
+                    }
+                }
+            }
             let media_active = matches!(record.state, State::Active | State::Stopping);
             let result = plane.tick(media_active);
             match result {

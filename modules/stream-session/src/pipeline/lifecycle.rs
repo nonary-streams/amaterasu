@@ -175,6 +175,30 @@ impl Pipeline {
             };
             job.step = step;
         }
+        if job.step == Step::RumbleDrain {
+            if record.rumble_pending.is_empty() {
+                job.rumble_tried = true;
+            } else if record
+                .rumble_shutdown_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                record.rumble_stop_unconfirmed = true;
+                record.rumble_pending.clear();
+                record.rumble_active_until.clear();
+                job.rumble_tried = true;
+            } else {
+                return true;
+            }
+            if job.cleanup {
+                if let Some(step) = job.next_cleanup(record) {
+                    job.step = step;
+                } else {
+                    return self.finish_cleanup(record, job, send);
+                }
+            } else {
+                job.step = Step::ReleaseInput;
+            }
+        }
         if job.step == Step::WaitDrain {
             if record
                 .plane
@@ -487,6 +511,12 @@ impl Pipeline {
             }
             Step::InputBatch => {
                 accept_input_batch(record, &payload)?;
+                Ok(false)
+            }
+            Step::PollGamepadFeedback => {
+                if let Err(code) = accept_gamepad_feedback(record, &payload, now) {
+                    return Err(code);
+                }
                 Ok(false)
             }
             Step::ReleaseInput => {

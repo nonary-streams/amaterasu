@@ -41,6 +41,9 @@ pub struct Broker {
     next: u64,
     pub replies: BTreeMap<u64, Value>,
     pub calls: Vec<Call>,
+    pub timeline: Rc<RefCell<Vec<&'static str>>>,
+    pub now: u64,
+    pub gamepad_poll_times: Vec<u64>,
     pub commands: Vec<Command>,
     pub fault: Option<(String, Fault)>,
     pub fail_cancel: bool,
@@ -64,6 +67,7 @@ pub struct Broker {
     pub input_ttl_ms: u64,
     pub input_terminal: bool,
     pub input_events: Vec<Value>,
+    pub gamepad_feedback: VecDeque<Value>,
     pub fail_input_batch: bool,
     pub fail_controller_input: bool,
     pub input_cleanup_required: bool,
@@ -772,6 +776,14 @@ impl Broker {
                 self.input_ttl_ms = payload["ttl_ms"].as_u64().unwrap();
                 json!({"ok":true,"lease":self.input_lease,"ttl_ms":self.input_ttl_ms})
             }
+            "poll_gamepad_feedback" => {
+                self.gamepad_poll_times.push(self.now);
+                if payload["lease"] != json!(self.input_lease) {
+                    return json!({"ok":false,"error":{"code":"permission_denied"}});
+                }
+                json!({"ok":true,"lease":self.input_lease,
+                    "feedback":self.gamepad_feedback.pop_front().unwrap_or(Value::Null)})
+            }
             "batch" => {
                 if payload["lease"] != json!(self.input_lease) {
                     return json!({"ok":false,"error":{"code":"permission_denied"}});
@@ -802,6 +814,7 @@ impl Broker {
                 }
                 self.input_lease = None;
                 self.input_terminal = true;
+                self.timeline.borrow_mut().push("input_release");
                 json!({"ok":true,"released":true})
             }
             _ => panic!("unexpected input action"),
@@ -931,6 +944,10 @@ pub struct PlaneState {
     pub accepted_video_access_units: u64,
     pub accepted_media_payload_bytes: u64,
     pub observed_video_sequence_gaps: u64,
+    pub rumble_commands: Vec<crate::plane::RumbleCommand>,
+    pub rumble_error: bool,
+    pub rumble_busy: bool,
+    pub timeline: Rc<RefCell<Vec<&'static str>>>,
 }
 struct FakePlane(Rc<RefCell<PlaneState>>);
 impl Drive for FakePlane {
@@ -951,6 +968,20 @@ impl Drive for FakePlane {
             return Err(PlaneFailure { code, progress });
         }
         Ok(progress)
+    }
+    fn send_rumble(&mut self, _command: crate::plane::RumbleCommand) -> Result<bool, &'static str> {
+        let mut state = self.0.borrow_mut();
+        if state.rumble_error {
+            return Err("native_stream_closed");
+        }
+        if state.rumble_busy {
+            return Ok(false);
+        }
+        state.rumble_commands.push(_command);
+        if _command.low_frequency == 0 && _command.high_frequency == 0 {
+            state.timeline.borrow_mut().push("rumble_zero");
+        }
+        Ok(true)
     }
     fn stop(&mut self) {
         let mut state = self.0.borrow_mut();
@@ -979,6 +1010,11 @@ pub struct Harness {
 }
 impl Harness {
     pub fn new() -> Self {
+        let timeline = Rc::new(RefCell::new(Vec::new()));
+        let mut broker = Broker::new();
+        broker.timeline = timeline.clone();
+        let mut plane_state = PlaneState::default();
+        plane_state.timeline = timeline;
         Self {
             pipeline: Pipeline::new_for_test(Settings {
                 enabled: true,
@@ -986,8 +1022,8 @@ impl Harness {
                 ..Settings::default()
             })
             .unwrap(),
-            broker: Broker::new(),
-            plane: Rc::new(RefCell::new(PlaneState::default())),
+            broker,
+            plane: Rc::new(RefCell::new(plane_state)),
             now: 0,
         }
     }
@@ -1004,6 +1040,7 @@ impl Harness {
     }
     pub fn tick(&mut self) {
         self.now += 1;
+        self.broker.now = self.now;
         let state = self.plane.clone();
         self.pipeline
             .tick_with(

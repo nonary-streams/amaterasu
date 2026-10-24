@@ -5,6 +5,175 @@ fn enable_input(host: &mut Harness) {
     host.pipeline.settings.input_lease_ttl_ms = 1_000;
 }
 
+fn feedback(slot: u16, strong_motor: u16, weak_motor: u16, duration_ms: u16) -> Value {
+    json!({"slot":slot,"strong_motor":strong_motor,"weak_motor":weak_motor,
+        "duration_ms":duration_ms})
+}
+
+#[test]
+fn gamepad_feedback_is_polled_at_40ms_and_replacement_expires_with_zero() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    host.broker.gamepad_feedback.extend([
+        feedback(2, 0x1234, 0x5678, 100),
+        feedback(2, 0x2222, 0x3333, 60),
+    ]);
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.idle();
+
+    let polls = host
+        .broker
+        .calls
+        .iter()
+        .filter(|call| {
+            call.service == "amaterasu.input/1" && call.payload["action"] == "poll_gamepad_feedback"
+        })
+        .count();
+    assert!(
+        polls >= 3,
+        "40 ms cadence should continue while the gamepad lease is active"
+    );
+    assert!(
+        host.broker.gamepad_poll_times.windows(2).all(|pair| {
+            let interval = pair[1] - pair[0];
+            (40..=50).contains(&interval)
+        }),
+        "observed poll times: {:?}",
+        host.broker.gamepad_poll_times
+    );
+    let commands = &host.plane.borrow().rumble_commands;
+    let first = commands
+        .iter()
+        .position(|command| {
+            command.slot == 2 && command.low_frequency == 0x1234 && command.high_frequency == 0x5678
+        })
+        .expect("first effect sent");
+    let replacement = commands
+        .iter()
+        .position(|command| {
+            command.slot == 2 && command.low_frequency == 0x2222 && command.high_frequency == 0x3333
+        })
+        .expect("replacement effect sent");
+    assert!(first < replacement);
+    assert!(
+        !commands[first + 1..replacement]
+            .iter()
+            .any(|command| { command.low_frequency == 0 && command.high_frequency == 0 }),
+        "the newer effect replaces the earlier effect before expiry"
+    );
+    assert!(commands.iter().any(|command| command.slot == 2
+        && command.low_frequency == 0
+        && command.high_frequency == 0));
+}
+
+#[test]
+fn stop_attempts_terminal_zero_before_releasing_local_input() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    host.broker
+        .gamepad_feedback
+        .push_back(feedback(1, 500, 900, 5_000));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.idle();
+    assert!(
+        host.plane
+            .borrow()
+            .rumble_commands
+            .iter()
+            .any(|command| command.low_frequency == 500)
+    );
+
+    let response = host.response(3, json!({"action":"stop","session":id}));
+    assert_eq!(response["state"], "stopped", "{response}");
+    let timeline = host.broker.timeline.borrow();
+    let zero_index = timeline
+        .iter()
+        .position(|event| *event == "rumble_zero")
+        .expect("terminal zero attempted");
+    let release_index = timeline
+        .iter()
+        .position(|event| *event == "input_release")
+        .expect("local input release");
+    assert!(zero_index < release_index);
+    assert_eq!(
+        response["remote_rumble_stop_unconfirmed"], true,
+        "provider acceptance is not a client acknowledgement"
+    );
+}
+
+#[test]
+fn failed_remote_zero_does_not_retain_local_input_lease() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    host.broker
+        .gamepad_feedback
+        .push_back(feedback(0, 10, 20, 5_000));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.idle();
+    host.plane.borrow_mut().rumble_error = true;
+    let result = host.response(3, json!({"action":"stop","session":id}));
+    assert_eq!(result["state"], "failed", "{result}");
+    assert!(
+        host.broker.input_lease.is_none(),
+        "local input is always released"
+    );
+    assert_eq!(result["remote_rumble_stop_unconfirmed"], true);
+}
+
+#[test]
+fn busy_control_send_times_out_remote_zero_but_completes_local_cleanup() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    host.broker
+        .gamepad_feedback
+        .push_back(feedback(4, 100, 200, 5_000));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.idle();
+    host.plane.borrow_mut().rumble_busy = true;
+
+    let stopped = host.response(3, json!({"action":"stop","session":id}));
+    assert_eq!(stopped["state"], "stopped", "{stopped}");
+    assert_eq!(stopped["remote_rumble_stop_unconfirmed"], true);
+    assert!(
+        host.broker.input_lease.is_none(),
+        "local lease is released after the bounded send window"
+    );
+    assert!(
+        host.now < 2_000,
+        "cleanup must not wait indefinitely: {} ms",
+        host.now
+    );
+}
+
+#[test]
+fn reused_controller_slot_does_not_inherit_prior_session_motor_state() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    host.broker
+        .gamepad_feedback
+        .push_back(feedback(3, 300, 400, 5_000));
+    let first = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(first))["state"], "active");
+    host.idle();
+    let stopped = host.response(3, json!({"action":"stop","session":first}));
+    assert_eq!(stopped["state"], "stopped");
+
+    let second = host.response(4, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(5, start(second))["state"], "active");
+    let record = &host.pipeline.records[&second];
+    assert!(record.rumble_active_until.is_empty());
+    assert!(record.rumble_pending.is_empty());
+}
+
 fn keyboard(pressed: bool, virtual_key: u8) -> crate::plane::ControlRecord {
     keyboard_packet(pressed, u16::from(virtual_key) | 0x8000, 0)
 }

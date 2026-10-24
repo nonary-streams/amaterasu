@@ -1,5 +1,6 @@
 use super::input::TouchPort;
 use super::{Drive, rpc};
+use crate::plane::RumbleCommand;
 use crate::{
     model::{PrepareConfig, StartConfig},
     plane::Handles,
@@ -116,6 +117,11 @@ pub(super) struct Record {
     pub input_request_started_at: u64,
     pub input_expires_at: u64,
     pub input_renew_at: u64,
+    pub feedback_poll_at: u64,
+    pub rumble_pending: BTreeMap<u16, (RumbleCommand, Option<u64>)>,
+    pub rumble_active_until: BTreeMap<u16, u64>,
+    pub rumble_shutdown_deadline: Option<u64>,
+    pub rumble_stop_unconfirmed: bool,
     pub input_events: VecDeque<Value>,
     pub input_inflight: usize,
     pub input_events_sent: u64,
@@ -180,6 +186,11 @@ impl Record {
             input_request_started_at: 0,
             input_expires_at: 0,
             input_renew_at: 0,
+            feedback_poll_at: 0,
+            rumble_pending: BTreeMap::new(),
+            rumble_active_until: BTreeMap::new(),
+            rumble_shutdown_deadline: None,
+            rumble_stop_unconfirmed: false,
             input_events: VecDeque::new(),
             input_inflight: 0,
             input_events_sent: 0,
@@ -294,6 +305,7 @@ impl Record {
             "unsupported_controls": self.unsupported_controls,
             "rejected_controls": self.rejected_controls,
             "input_active": self.input_lease.is_some(),
+            "remote_rumble_stop_unconfirmed": self.rumble_stop_unconfirmed,
             "absolute_input": self.input_lease.is_some()
                 && self.capture_geometry.is_some()
                 && self.input_absolute_pointer,

@@ -31,6 +31,13 @@ pub struct ControlRecord {
     pub sequence: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RumbleCommand {
+    pub slot: u16,
+    pub low_frequency: u16,
+    pub high_frequency: u16,
+}
+
 #[derive(Debug, Default)]
 pub struct Progress {
     pub controls: Vec<ControlRecord>,
@@ -67,6 +74,10 @@ impl Plane {
         self.pump.tick(media_active)
     }
 
+    pub fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool> {
+        self.pump.backend.send_rumble(command)
+    }
+
     /// Stops new PCM capture. The pipeline separately drains the video provider.
     pub fn stop(&mut self) {
         self.pump.stopping = true;
@@ -85,6 +96,7 @@ impl Plane {
 
 trait Backend {
     fn control(&mut self) -> PlaneResult<Option<ControlRecord>>;
+    fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool>;
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>>;
     fn pcm(&mut self) -> PlaneResult<Option<PcmPacket>>;
     fn audio(&mut self) -> PlaneResult<Option<AudioPacket>>;
