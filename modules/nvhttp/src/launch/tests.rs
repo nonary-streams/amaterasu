@@ -2366,6 +2366,16 @@ fn global_max_bitrate_is_sent_as_encoder_cap_and_snapshotted_at_admission() {
             .expect("RTSP open request");
         assert_eq!(rtsp_open["profile"]["bitrate_kbps"], 10_000);
         assert_eq!(rtsp_open["max_bitrate_kbps"], json!(expected));
+        assert_eq!(
+            rtsp_open["negotiation_bounds"],
+            json!({
+                "max_width": 1920,
+                "max_height": 1080,
+                "max_fps": 60,
+                "max_bitrate_kbps": expected.unwrap_or(10_000).min(10_000),
+                "max_reference_frames": 1,
+            })
+        );
     }
 }
 

@@ -112,6 +112,7 @@ fn record(state: State) -> Record {
         negotiation: None,
         negotiated_encryption: None,
         negotiated_color: None,
+        negotiated_video: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -812,6 +813,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         negotiation: None,
         negotiated_encryption: None,
         negotiated_color: None,
+        negotiated_video: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -1646,6 +1648,56 @@ fn accepted_color_survives_authenticated_start() {
 }
 
 #[test]
+fn negotiated_video_is_owned_by_its_rtsp_ticket() {
+    let (mut low_ticket, mut low_announce) = announced_profile_record();
+    low_ticket.id = 5;
+    low_ticket.session = Some(23);
+    low_ticket.config.profile.width = 1280;
+    low_ticket.config.profile.height = 720;
+    low_ticket.config.profile.fps = 30;
+    low_ticket.config.max_bitrate_kbps = Some(8_000);
+    low_ticket.config.negotiation_bounds = Some(crate::model::NegotiationBounds {
+        max_width: 1280,
+        max_height: 720,
+        max_fps: 30,
+        max_bitrate_kbps: 8_000,
+        max_reference_frames: 1,
+    });
+    low_announce.video.width = 1280;
+    low_announce.video.height = 720;
+    low_announce.video.fps = 30;
+    low_announce.video.bitrate_kbps = 8_000;
+    low_announce.video.max_reference_frames = 0;
+
+    let (mut high_ticket, high_announce) = announced_profile_record();
+    high_ticket.id = 6;
+    high_ticket.session = Some(24);
+    high_ticket.config.negotiation_bounds = Some(crate::model::NegotiationBounds {
+        max_width: 2560,
+        max_height: 1440,
+        max_fps: 120,
+        max_bitrate_kbps: 20_000,
+        max_reference_frames: 1,
+    });
+
+    assert!(low_ticket.accept_announce(&low_announce));
+    assert!(high_ticket.accept_announce(&high_announce));
+    let low_start = low_ticket.authenticated_start_payload(23).unwrap();
+    let high_start = high_ticket.authenticated_start_payload(24).unwrap();
+    assert_eq!(
+        low_start["configuration"]["configuration"],
+        json!({"width":1280,"height":720,"fps":30,"bitrate":8_000_000,"max_reference_frames":0,"color_mode":"bt709_limited"})
+    );
+    assert_eq!(high_start["configuration"]["configuration"]["width"], 1920);
+    assert_eq!(high_start["configuration"]["configuration"]["height"], 1080);
+    assert_eq!(high_start["configuration"]["configuration"]["fps"], 60);
+
+    assert!(!low_ticket.accept_announce(&high_announce));
+    assert!(low_ticket.authenticated_start_payload(23).is_none());
+    assert!(high_ticket.authenticated_start_payload(24).is_some());
+}
+
+#[test]
 fn rejected_announce_cannot_produce_an_authenticated_play_start() {
     let (mut record, announce) = announced_profile_record();
     record.config.profile.encrypt_audio = false;
@@ -1657,6 +1709,7 @@ fn rejected_announce_cannot_produce_an_authenticated_play_start() {
     assert!(!record.accept_announce(&announce));
     assert!(record.negotiated_encryption.is_none());
     assert!(record.negotiated_color.is_none());
+    assert!(record.negotiated_video.is_none());
     assert!(record.authenticated_start_payload(23).is_none());
 }
 
@@ -1684,6 +1737,13 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
             audio: false,
         });
         record.negotiated_color = Some(amaterasu_gamestream::sdp::ColorMode::Bt709Limited);
+        record.negotiated_video = Some(crate::model::NegotiatedVideo {
+            width: record.config.profile.width,
+            height: record.config.profile.height,
+            fps: record.config.profile.fps,
+            bitrate_kbps: record.config.profile.bitrate_kbps,
+            max_reference_frames: record.config.profile.max_reference_frames,
+        });
         record.config.frame_limiter_settings = Some(snapshot.clone());
         record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());
         record.config.application_operation_id = Some("launch-one".into());

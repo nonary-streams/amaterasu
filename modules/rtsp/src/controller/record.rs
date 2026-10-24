@@ -28,6 +28,7 @@ pub(super) struct Record {
     pub negotiation: Option<Negotiation>,
     pub negotiated_encryption: Option<crate::model::EncryptionSnapshot>,
     pub negotiated_color: Option<amaterasu_gamestream::sdp::ColorMode>,
+    pub negotiated_video: Option<crate::model::NegotiatedVideo>,
     pub url: String,
     pub session_token: String,
     pub udp_discovery: Option<UdpDiscovery>,
@@ -61,7 +62,8 @@ impl Record {
         &mut self,
         announce: &amaterasu_gamestream::sdp::Announce,
     ) -> bool {
-        let accepted = self.config.matches_announce(announce);
+        let negotiated_video = self.config.negotiate_announce(announce);
+        let accepted = negotiated_video.is_some();
         if !accepted {
             let expected = self.config.effective_profile();
             eprintln!(
@@ -92,13 +94,22 @@ impl Record {
             audio: announce.encryption.audio,
         });
         self.negotiated_color = accepted.then_some(announce.video.color);
+        self.negotiated_video = negotiated_video;
         accepted
     }
 
     pub(super) fn authenticated_start_payload(&self, session: u64) -> Option<Value> {
         let encryption = self.negotiated_encryption?;
         let color = self.negotiated_color?;
+        let video = self.negotiated_video?;
+        let bitrate = video.bitrate_kbps.checked_mul(1_000)?;
         let mut payload = self.config.arm_with_encryption(session, encryption);
+        payload["configuration"]["configuration"]["width"] = serde_json::json!(video.width);
+        payload["configuration"]["configuration"]["height"] = serde_json::json!(video.height);
+        payload["configuration"]["configuration"]["fps"] = serde_json::json!(video.fps);
+        payload["configuration"]["configuration"]["bitrate"] = serde_json::json!(bitrate);
+        payload["configuration"]["configuration"]["max_reference_frames"] =
+            serde_json::json!(video.max_reference_frames);
         payload["configuration"]["configuration"]["color_mode"] = serde_json::json!(match color {
             amaterasu_gamestream::sdp::ColorMode::Bt601Limited => "bt601_limited",
             amaterasu_gamestream::sdp::ColorMode::Bt601Full => "bt601_full",
@@ -133,6 +144,7 @@ impl Record {
 
     pub fn capabilities(&self) -> Capabilities {
         let effective_profile = self.config.effective_profile();
+        let bounds = self.config.negotiation_bounds;
         Capabilities {
             transport: amaterasu_gamestream::sdp::TransportSupport {
                 stereo_audio: true,
@@ -154,10 +166,12 @@ impl Record {
             } else {
                 vec![amaterasu_gamestream::sdp::ColorMode::Bt709Limited]
             },
-            max_width: effective_profile.width,
-            max_height: effective_profile.height,
-            max_fps: effective_profile.fps,
-            max_bitrate_kbps: effective_profile.bitrate_kbps,
+            max_width: bounds.map_or(effective_profile.width, |bounds| bounds.max_width),
+            max_height: bounds.map_or(effective_profile.height, |bounds| bounds.max_height),
+            max_fps: bounds.map_or(effective_profile.fps, |bounds| bounds.max_fps),
+            max_bitrate_kbps: bounds.map_or(effective_profile.bitrate_kbps, |bounds| {
+                bounds.max_bitrate_kbps
+            }),
             require_video_encryption: effective_profile.encrypt_video,
             require_audio_encryption: effective_profile.encrypt_audio,
         }

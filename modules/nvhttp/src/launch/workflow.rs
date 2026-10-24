@@ -293,6 +293,17 @@ impl Controller {
                     "encrypt_audio": config.profile.encrypt_audio,
                     "permit_legacy_audio_iv_wrap": config.profile.permit_legacy_audio_iv_wrap,
                 });
+                let negotiation_bounds = json!({
+                    "max_width": config.profile.max_width,
+                    "max_height": config.profile.max_height,
+                    "max_fps": config.profile.max_fps,
+                    "max_bitrate_kbps": record.effective_max_bitrate_kbps
+                        .filter(|maximum| *maximum > 0)
+                        .map_or(config.profile.bitrate_kbps, |maximum| {
+                            maximum.min(config.profile.bitrate_kbps)
+                        }),
+                    "max_reference_frames": config.profile.max_reference_frames,
+                });
                 (
                     RTSP_SERVICE,
                     json!({
@@ -333,6 +344,7 @@ impl Controller {
                         "display_request": record.display_request,
                         "capture": capture,
                         "profile": profile,
+                        "negotiation_bounds": negotiation_bounds,
                     }),
                     15_000,
                 )

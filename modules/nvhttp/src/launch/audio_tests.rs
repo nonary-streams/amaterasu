@@ -34,7 +34,10 @@ fn owner_launch_and_retry_preserve_512000_audio_bitrate_on_rtsp_open() {
     let (connection, first) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(connection, 10);
     assert_eq!(first.status, 200);
-    assert_eq!(opened_rtsp_payload(&broker)["profile"]["audio_bitrate"], 512_000);
+    assert_eq!(
+        opened_rtsp_payload(&broker)["profile"]["audio_bitrate"],
+        512_000
+    );
     assert_eq!(opened_rtsp_payload(&broker)["profile"]["packet_ms"], 5);
     controller.reply_delivered(connection, now);
 
@@ -51,4 +54,31 @@ fn owner_launch_and_retry_preserve_512000_audio_bitrate_on_rtsp_open() {
         .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
         .count();
     assert_eq!(rtsp_opens, 1);
+}
+
+#[test]
+fn owner_launch_exports_signed_video_ceilings_and_effective_bitrate_bound() {
+    let now = Instant::now();
+    let mut streaming = config();
+    streaming.profile.max_width = 2560;
+    streaming.profile.max_height = 1440;
+    streaming.profile.max_fps = 120;
+    streaming.profile.bitrate_kbps = 20_000;
+    let mut controller = Controller::new(Some(streaming)).unwrap();
+    controller.set_global_max_bitrate_kbps(Some(8_000));
+    let mut broker = Broker::default();
+
+    assert!(controller.launch(10, request(41), peer(41), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+    assert_eq!(
+        opened_rtsp_payload(&broker)["negotiation_bounds"],
+        json!({
+            "max_width":2560,
+            "max_height":1440,
+            "max_fps":120,
+            "max_bitrate_kbps":8000,
+            "max_reference_frames":1,
+        })
+    );
 }

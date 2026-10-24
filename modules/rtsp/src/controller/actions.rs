@@ -228,6 +228,7 @@ impl Controller {
             negotiation: None,
             negotiated_encryption: None,
             negotiated_color: None,
+            negotiated_video: None,
             url,
             session_token,
             udp_discovery,

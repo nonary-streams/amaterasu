@@ -26,6 +26,44 @@ fn negotiated_color_reaches_video_open_unchanged() {
 }
 
 #[test]
+fn negotiated_video_geometry_and_rate_are_allocated_only_at_authenticated_start() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let session = prepared["session"].as_u64().expect("prepared session");
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::Video.service()
+                && call.payload["action"] == "open")
+    );
+
+    let mut request = start(session);
+    request["configuration"]["configuration"] = json!({
+        "width": 1280,
+        "height": 720,
+        "fps": 30,
+        "bitrate": 8_000_000,
+        "max_reference_frames": 0,
+    });
+    let started = host.response(2, request);
+    assert_eq!(started["state"], "active", "{started}");
+
+    let video = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("video opens after authenticated start");
+    assert_eq!(video.payload["configuration"]["width"], 1280);
+    assert_eq!(video.payload["configuration"]["height"], 720);
+    assert_eq!(video.payload["configuration"]["fps"], 30);
+    assert_eq!(video.payload["configuration"]["bitrate"], 8_000_000);
+    assert_eq!(video.payload["configuration"]["max_reference_frames"], 0);
+}
+
+#[test]
 fn stereo_512k_prepare_reaches_encoder_with_bounded_packet_size() {
     for (packet_ms, packet_bytes) in [(5, 320), (10, 640)] {
         let mut host = Harness::new();
