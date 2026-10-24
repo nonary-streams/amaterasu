@@ -3,7 +3,8 @@ use crate::{
     backend::{Backend, SourceSession},
     buffers::Mailbox,
     model::{
-        CaptureResult, Operation, Settings, SourceState, SourceType, new_id, validate_operation_id,
+        CaptureResult, Operation, Settings, SourceDiagnostics, SourceState, SourceType, new_id,
+        validate_operation_id,
     },
 };
 use serde_json::{Value, json};
@@ -20,6 +21,7 @@ struct SelectionRecord {
     source_type: SourceType,
     output: String,
     state: SourceState,
+    diagnostics: SourceDiagnostics,
 }
 
 struct Selection {
@@ -183,6 +185,7 @@ impl<B: Backend> Controller<B> {
                 source_type,
                 output,
                 state: SourceState::Selecting,
+                diagnostics: SourceDiagnostics::default(),
             },
         );
         self.last_selection = Some(key);
@@ -324,6 +327,7 @@ impl<B: Backend> Controller<B> {
             return;
         };
         let mut state = selection.source.state();
+        let diagnostics = selection.source.diagnostics();
         if matches!(state, SourceState::Ready { .. }) {
             let ready = *selection.ready_at.get_or_insert(now);
             if self.lease.is_none()
@@ -337,10 +341,12 @@ impl<B: Backend> Controller<B> {
         {
             state = SourceState::Failed("source_selection_timeout");
         }
-        self.selections
+        let record = self
+            .selections
             .get_mut(&(selection.owner.clone(), selection.operation.clone()))
-            .expect("selected record")
-            .state = state;
+            .expect("selected record");
+        record.state = state;
+        record.diagnostics = diagnostics;
         if matches!(
             state,
             SourceState::Denied | SourceState::Failed(_) | SourceState::Revoked
@@ -483,6 +489,7 @@ fn state_name(state: SourceState) -> &'static str {
 fn selection_reply(record: &SelectionRecord, operation: Option<&str>) -> Value {
     json!({"ok":true,"operation_id":operation,"source_type":record.source_type,
         "selection_state":state_name(record.state),"output":output_metadata(record),
+        "diagnostics":record.diagnostics,
         "error":match record.state { SourceState::Failed(error) => Some(error), SourceState::Revoked => Some("source_revoked"),
             SourceState::Denied => Some("source_selection_denied"), _ => None }})
 }

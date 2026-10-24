@@ -131,6 +131,97 @@ pub enum SourceState {
     Revoked,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct SourceDiagnostics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<SourceStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipewire_node: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipewire_serial: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipewire_state: Option<PipeWireState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipewire_error: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adapter_error_code: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStage {
+    ConnectingSessionBus,
+    CreateSession,
+    SelectSources,
+    Start,
+    #[serde(rename = "open_pipewire_remote")]
+    OpenPipeWireRemote,
+    #[serde(rename = "connect_pipewire")]
+    ConnectPipeWire,
+    WaitingForFrames,
+    FrameReceived,
+}
+
+impl SourceStage {
+    pub fn from_native(value: u32) -> Option<Self> {
+        Some(match value {
+            1 => Self::ConnectingSessionBus,
+            2 => Self::CreateSession,
+            3 => Self::SelectSources,
+            4 => Self::Start,
+            5 => Self::OpenPipeWireRemote,
+            6 => Self::ConnectPipeWire,
+            7 => Self::WaitingForFrames,
+            8 => Self::FrameReceived,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PipeWireState {
+    Unconnected,
+    Connecting,
+    Paused,
+    Streaming,
+    Error,
+}
+
+impl PipeWireState {
+    pub fn from_native(value: u32) -> Option<Self> {
+        Some(match value {
+            0 => Self::Unconnected,
+            1 => Self::Connecting,
+            2 => Self::Paused,
+            3 => Self::Streaming,
+            4 => Self::Error,
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn native_diagnostic_codes_map_to_safe_status_tokens() {
+        assert_eq!(SourceStage::from_native(4), Some(SourceStage::Start));
+        assert_eq!(
+            SourceStage::from_native(5),
+            Some(SourceStage::OpenPipeWireRemote)
+        );
+        assert_eq!(
+            SourceStage::from_native(6),
+            Some(SourceStage::ConnectPipeWire)
+        );
+        assert_eq!(SourceStage::from_native(99), None);
+        assert_eq!(PipeWireState::from_native(4), Some(PipeWireState::Error));
+        assert_eq!(PipeWireState::from_native(u32::MAX), None);
+    }
+}
+
 pub fn validate_operation_id(id: &str) -> CaptureResult<()> {
     if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
         Err("invalid_operation_id")

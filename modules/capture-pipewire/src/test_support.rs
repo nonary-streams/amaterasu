@@ -3,7 +3,7 @@ use crate::{
     backend::{Backend, SourceSession},
     buffers::{Mailbox, Plane},
     controller::Controller,
-    model::{Availability, CaptureResult, Settings, SourceState, SourceType},
+    model::{Availability, CaptureResult, Settings, SourceDiagnostics, SourceState, SourceType},
 };
 use std::sync::{
     Arc, Mutex,
@@ -12,6 +12,7 @@ use std::sync::{
 
 pub struct Driver {
     pub state: Mutex<SourceState>,
+    pub diagnostics: Mutex<SourceDiagnostics>,
     pub mailbox: Arc<Mailbox>,
     pub selections: AtomicUsize,
     pub drops: AtomicUsize,
@@ -66,6 +67,9 @@ impl SourceSession for FakeSession {
         }
         *self.0.state.lock().unwrap()
     }
+    fn diagnostics(&self) -> SourceDiagnostics {
+        *self.0.diagnostics.lock().unwrap()
+    }
     fn mailbox(&self) -> Arc<Mailbox> {
         self.0.mailbox.clone()
     }
@@ -79,6 +83,7 @@ impl Drop for FakeSession {
 pub fn setup(settings: Settings) -> (Controller<FakeBackend>, Arc<Driver>) {
     let driver = Arc::new(Driver {
         state: Mutex::new(SourceState::Selecting),
+        diagnostics: Mutex::new(SourceDiagnostics::default()),
         mailbox: Arc::new(Mailbox::default()),
         selections: AtomicUsize::new(0),
         drops: AtomicUsize::new(0),

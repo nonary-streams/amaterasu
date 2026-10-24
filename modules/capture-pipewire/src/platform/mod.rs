@@ -1,7 +1,10 @@
 use super::{Backend, SourceSession};
 use crate::{
     buffers::{Mailbox, Plane},
-    model::{Availability, CaptureResult, SourceState, SourceType},
+    model::{
+        Availability, CaptureResult, PipeWireState, SourceDiagnostics, SourceStage, SourceState,
+        SourceType,
+    },
 };
 use std::{
     ffi::c_void,
@@ -22,11 +25,17 @@ struct Probe {
 #[repr(C)]
 struct Snapshot {
     state: u32,
+    stage: u32,
     node: u32,
     width: u32,
     height: u32,
     format: u32,
     error: u32,
+    pipewire_state: u32,
+    node_present: u32,
+    serial_present: u32,
+    pipewire_error: i32,
+    serial: u64,
 }
 
 unsafe extern "C" {
@@ -119,6 +128,19 @@ impl SourceSession for NativeSession {
                 7 => "source_selection_timeout",
                 _ => "capture_failed",
             }),
+        }
+    }
+    fn diagnostics(&self) -> SourceDiagnostics {
+        let mut snapshot = Snapshot::default();
+        // SAFETY: this opaque session lives until Drop; output is aligned and writable.
+        unsafe { am_pw_snapshot(self.native.as_ptr(), &mut snapshot) };
+        SourceDiagnostics {
+            stage: SourceStage::from_native(snapshot.stage),
+            pipewire_node: (snapshot.node_present != 0).then_some(snapshot.node),
+            pipewire_serial: (snapshot.serial_present != 0).then_some(snapshot.serial),
+            pipewire_state: PipeWireState::from_native(snapshot.pipewire_state),
+            pipewire_error: (snapshot.pipewire_error != 0).then_some(snapshot.pipewire_error),
+            adapter_error_code: (snapshot.error != 0).then_some(snapshot.error),
         }
     }
     fn mailbox(&self) -> Arc<Mailbox> {

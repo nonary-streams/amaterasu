@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::Availability;
+use crate::model::{Availability, PipeWireState, SourceDiagnostics, SourceStage};
 use crate::test_support::{Driver, FakeBackend, settings, setup};
 use std::sync::atomic::Ordering;
 
@@ -380,6 +380,64 @@ fn deny_revoke_and_timeout_release_sessions_and_active_leases() {
         .unwrap()
         .payload;
     assert_eq!(result["error"], "source_selection_timeout");
+}
+
+#[test]
+fn timeout_status_distinguishes_waiting_for_start_from_pipewire_connection_failure() {
+    let (mut controller, driver) = setup(settings());
+    select(&mut controller, "administrator", "start-timeout", 0).unwrap();
+    *driver.diagnostics.lock().unwrap() = SourceDiagnostics {
+        stage: Some(SourceStage::Start),
+        ..SourceDiagnostics::default()
+    };
+    controller.refresh(5000);
+    let timed_out = controller
+        .handle(
+            "administrator",
+            Operation::PollSelection {
+                operation_id: "start-timeout".into(),
+            },
+            5001,
+        )
+        .unwrap()
+        .payload;
+    assert_eq!(timed_out["error"], "source_selection_timeout");
+    assert_eq!(timed_out["diagnostics"]["stage"], "start");
+    assert!(timed_out["diagnostics"].get("pipewire_node").is_none());
+    assert!(timed_out["diagnostics"].get("pipewire_serial").is_none());
+    assert!(timed_out["diagnostics"].get("pipewire_state").is_none());
+
+    let (mut controller, driver) = setup(settings());
+    select(&mut controller, "administrator", "pipewire-error", 0).unwrap();
+    *driver.diagnostics.lock().unwrap() = SourceDiagnostics {
+        stage: Some(SourceStage::ConnectPipeWire),
+        pipewire_node: Some(93),
+        pipewire_serial: Some(98),
+        pipewire_state: Some(PipeWireState::Error),
+        pipewire_error: Some(-2),
+        adapter_error_code: Some(4),
+    };
+    *driver.state.lock().unwrap() = SourceState::Failed("pipewire_failed");
+    controller.refresh(10);
+    let failed = controller
+        .handle(
+            "administrator",
+            Operation::PollSelection {
+                operation_id: "pipewire-error".into(),
+            },
+            11,
+        )
+        .unwrap()
+        .payload;
+    assert_eq!(failed["diagnostics"]["stage"], "connect_pipe_wire");
+    assert_eq!(failed["diagnostics"]["pipewire_node"], 93);
+    assert_eq!(failed["diagnostics"]["pipewire_serial"], 98);
+    assert_eq!(failed["diagnostics"]["pipewire_state"], "error");
+    assert_eq!(failed["diagnostics"]["pipewire_error"], -2);
+    assert_eq!(failed["diagnostics"]["adapter_error_code"], 4);
+    assert!(failed["diagnostics"].get("session_path").is_none());
+    assert!(failed["diagnostics"].get("fd").is_none());
+    assert!(failed["diagnostics"].get("token").is_none());
 }
 
 #[test]

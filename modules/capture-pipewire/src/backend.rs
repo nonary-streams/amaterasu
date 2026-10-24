@@ -1,11 +1,14 @@
 use crate::{
     buffers::Mailbox,
-    model::{Availability, CaptureResult, SourceState, SourceType},
+    model::{Availability, CaptureResult, SourceDiagnostics, SourceState, SourceType},
 };
 use std::sync::Arc;
 
 pub trait SourceSession: Send {
     fn state(&self) -> SourceState;
+    fn diagnostics(&self) -> SourceDiagnostics {
+        SourceDiagnostics::default()
+    }
     fn mailbox(&self) -> Arc<Mailbox>;
 }
 

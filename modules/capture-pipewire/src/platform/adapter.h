@@ -6,7 +6,21 @@
 /* Private ABI only. SPA/PipeWire/GIO structs never cross this boundary. */
 enum am_pw_state { AM_PW_SELECTING = 1, AM_PW_READY, AM_PW_DENIED, AM_PW_FAILED, AM_PW_REVOKED };
 struct am_pw_probe { uint32_t available, version, source_types, cursor_modes; };
-struct am_pw_snapshot { uint32_t state, node, width, height, format, error; };
+enum am_pw_stage {
+    AM_PW_STAGE_CONNECTING_SESSION_BUS = 1,
+    AM_PW_STAGE_CREATE_SESSION,
+    AM_PW_STAGE_SELECT_SOURCES,
+    AM_PW_STAGE_START,
+    AM_PW_STAGE_OPEN_PIPEWIRE_REMOTE,
+    AM_PW_STAGE_CONNECT_PIPEWIRE,
+    AM_PW_STAGE_WAITING_FOR_FRAMES,
+    AM_PW_STAGE_FRAME_RECEIVED,
+};
+struct am_pw_snapshot {
+    uint32_t state, stage, node, width, height, format, error, pipewire_state, node_present, serial_present;
+    int32_t pipewire_error;
+    uint64_t serial;
+};
 struct am_pw_plane {
     const uint8_t *data;
     uint32_t memory_type, flags, max_size, chunk_offset, chunk_size;
