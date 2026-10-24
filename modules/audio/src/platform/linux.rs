@@ -321,6 +321,7 @@ enum DefaultRouteDecision {
     Unchanged,
     Changed,
     Retry,
+    Reopen,
     Failed(&'static str),
 }
 
@@ -337,11 +338,16 @@ fn transient_default_query_error(error: &str) -> bool {
 fn default_route_decision(
     result: Option<AudioResult<Option<String>>>,
     expected_sink: &str,
+    retries_exhausted: bool,
 ) -> DefaultRouteDecision {
     match result {
+        None if retries_exhausted => DefaultRouteDecision::Reopen,
         None => DefaultRouteDecision::Pending,
         Some(Ok(Some(current))) if current == expected_sink => DefaultRouteDecision::Unchanged,
         Some(Ok(_)) => DefaultRouteDecision::Changed,
+        Some(Err(error)) if transient_default_query_error(error) && retries_exhausted => {
+            DefaultRouteDecision::Reopen
+        }
         Some(Err(error)) if transient_default_query_error(error) => DefaultRouteDecision::Retry,
         Some(Err(error)) => DefaultRouteDecision::Failed(error),
     }
@@ -2328,17 +2334,32 @@ impl Capture {
         }
         if self.follow_console_default {
             let decision = if let Some(error) = query_start_error {
-                default_route_decision(Some(Err(error)), &self.endpoint)
+                default_route_decision(
+                    Some(Err(error)),
+                    &self.endpoint,
+                    self.client.default_queries_disabled,
+                )
             } else {
                 match self.client.poll_default_sink_query() {
-                    QueryPoll::Pending => DefaultRouteDecision::Pending,
-                    QueryPoll::Complete(result) => {
-                        default_route_decision(Some(result), &self.endpoint)
-                    }
+                    QueryPoll::Pending => default_route_decision(
+                        None,
+                        &self.endpoint,
+                        self.client.default_queries_disabled,
+                    ),
+                    QueryPoll::Complete(result) => default_route_decision(
+                        Some(result),
+                        &self.endpoint,
+                        self.client.default_queries_disabled,
+                    ),
                 }
             };
             match decision {
                 DefaultRouteDecision::Changed => return Err("default_endpoint_changed"),
+                // Reopen the same follow-default capture through its existing
+                // recovery path after the bounded probe budget is exhausted.
+                // That drops this client and its retained callbacks, then
+                // resolves the current default without mutating the route.
+                DefaultRouteDecision::Reopen => return Err("default_endpoint_changed"),
                 DefaultRouteDecision::Retry => {
                     // A failed control-plane probe does not establish that the
                     // monitor stream failed. Keep capturing and retry later;
@@ -2722,7 +2743,7 @@ mod tests {
     #[test]
     fn default_route_probe_keeps_capture_live_while_query_is_pending_or_fails() {
         assert_eq!(
-            default_route_decision(None, "sink.selected"),
+            default_route_decision(None, "sink.selected", false),
             DefaultRouteDecision::Pending
         );
         for error in [
@@ -2731,16 +2752,24 @@ mod tests {
             "audio_backend_failed",
         ] {
             assert_eq!(
-                default_route_decision(Some(Err(error)), "sink.selected"),
+                default_route_decision(Some(Err(error)), "sink.selected", false),
                 DefaultRouteDecision::Retry
             );
         }
         assert_eq!(
-            default_route_decision(Some(Err("audio_server_access_denied")), "sink.selected"),
+            default_route_decision(
+                Some(Err("audio_server_access_denied")),
+                "sink.selected",
+                false
+            ),
             DefaultRouteDecision::Failed("audio_server_access_denied")
         );
         assert_eq!(
-            default_route_decision(Some(Ok(Some("sink.selected".into()))), "sink.selected"),
+            default_route_decision(
+                Some(Ok(Some("sink.selected".into()))),
+                "sink.selected",
+                false
+            ),
             DefaultRouteDecision::Unchanged
         );
     }
@@ -2760,7 +2789,7 @@ mod tests {
         let mut failures = 0;
         for attempt in 1..=DEFAULT_QUERY_FAILURE_LIMIT {
             assert_eq!(
-                default_route_decision(Some(Err("audio_backend_failed")), "sink.selected"),
+                default_route_decision(Some(Err("audio_backend_failed")), "sink.selected", false),
                 DefaultRouteDecision::Retry
             );
             failures = default_query_failures_after_result(failures, false);
@@ -2776,6 +2805,26 @@ mod tests {
         let failures = default_query_failures_after_result(failures, true);
         assert_eq!(failures, 0);
         assert!(!default_queries_disabled(failures));
+        assert_eq!(
+            default_route_decision(None, "sink.selected", false),
+            DefaultRouteDecision::Pending
+        );
+        assert_eq!(
+            default_route_decision(None, "sink.selected", true),
+            DefaultRouteDecision::Reopen
+        );
+        assert_eq!(
+            default_route_decision(Some(Err("audio_backend_failed")), "sink.selected", true),
+            DefaultRouteDecision::Reopen
+        );
+        assert_eq!(
+            default_route_decision(
+                Some(Err("audio_server_access_denied")),
+                "sink.selected",
+                true
+            ),
+            DefaultRouteDecision::Failed("audio_server_access_denied")
+        );
     }
 
     #[test]
@@ -2798,11 +2847,15 @@ mod tests {
     #[test]
     fn default_route_probe_only_reopens_when_a_completed_query_observes_a_change() {
         assert_eq!(
-            default_route_decision(Some(Ok(Some("sink.user_choice".into()))), "sink.selected"),
+            default_route_decision(
+                Some(Ok(Some("sink.user_choice".into()))),
+                "sink.selected",
+                false
+            ),
             DefaultRouteDecision::Changed
         );
         assert_eq!(
-            default_route_decision(Some(Ok(None)), "sink.selected"),
+            default_route_decision(Some(Ok(None)), "sink.selected", false),
             DefaultRouteDecision::Changed
         );
     }
