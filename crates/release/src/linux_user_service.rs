@@ -257,10 +257,11 @@ struct RuntimeNeeds {
 fn runtime_needs(
     settings: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> PackageResult<RuntimeNeeds> {
-    let video_enabled = setting_enabled(settings, "amaterasu.video");
+    let video_enabled =
+        setting_enabled(settings, crate::profiles::linux_session::VIDEO_COMPONENT_ID);
     if video_enabled
         && (!settings
-            .get("amaterasu.video")
+            .get(crate::profiles::linux_session::VIDEO_COMPONENT_ID)
             .and_then(|value| value.get("capture_providers"))
             .and_then(serde_json::Value::as_array)
             .is_some_and(|providers| providers.iter().any(|provider| provider == "pipewire"))
@@ -1291,7 +1292,7 @@ exit 0
         );
 
         settings.insert(
-            "amaterasu.video".into(),
+            crate::profiles::linux_session::VIDEO_COMPONENT_ID.into(),
             serde_json::json!({"enabled":true,"capture_providers":["pipewire"]}),
         );
         assert!(runtime_needs(&settings).is_err());
@@ -1306,6 +1307,44 @@ exit 0
                 pipewire_portal: true
             }
         );
+    }
+
+    #[test]
+    fn loader_checks_follow_actual_linux_session_capture_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-linux-session-preflight-settings-{}-{}",
+            std::process::id(),
+            random_identifier().unwrap()
+        ));
+        let disabled_policy = crate::profiles::linux_session::linux_session_policy(
+            &root.join("disabled"),
+            &crate::profiles::linux_session::options::LinuxSessionOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_needs(&disabled_policy.settings).unwrap(),
+            RuntimeNeeds {
+                pulse: false,
+                pipewire_portal: false
+            }
+        );
+
+        let enabled_policy = crate::profiles::linux_session::linux_session_policy(
+            &root.join("enabled"),
+            &crate::profiles::linux_session::options::LinuxSessionOptions {
+                enable_capture: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_needs(&enabled_policy.settings).unwrap(),
+            RuntimeNeeds {
+                pulse: false,
+                pipewire_portal: true
+            }
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
