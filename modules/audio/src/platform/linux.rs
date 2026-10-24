@@ -43,6 +43,7 @@ const PA_ERR_ACCESS: c_int = 1;
 const PA_ERR_TIMEOUT: c_int = 8;
 const PA_ERR_AUTHKEY: c_int = 9;
 const PA_ERR_INVALIDSERVER: c_int = 13;
+const PA_OPERATION_RUNNING: c_int = 0;
 const PA_OPERATION_DONE: c_int = 1;
 const PA_OPERATION_CANCELLED: c_int = 2;
 const PA_STREAM_READY: c_int = 2;
@@ -268,6 +269,23 @@ struct PendingServerInfoQuery {
 enum QueryPoll<T> {
     Pending,
     Complete(AudioResult<T>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PulseOperationState {
+    Running,
+    Done,
+    Cancelled,
+    Unknown,
+}
+
+fn pulse_operation_state(state: c_int) -> PulseOperationState {
+    match state {
+        PA_OPERATION_RUNNING => PulseOperationState::Running,
+        PA_OPERATION_DONE => PulseOperationState::Done,
+        PA_OPERATION_CANCELLED => PulseOperationState::Cancelled,
+        _ => PulseOperationState::Unknown,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -542,9 +560,9 @@ impl PulseClient {
             return QueryPoll::Pending;
         };
         // SAFETY: the pending query uniquely owns a live operation reference.
-        match unsafe { pa_operation_get_state(query.operation.0) } {
-            PA_OPERATION_RUNNING => QueryPoll::Pending,
-            PA_OPERATION_DONE => {
+        match pulse_operation_state(unsafe { pa_operation_get_state(query.operation.0) }) {
+            PulseOperationState::Running | PulseOperationState::Unknown => QueryPoll::Pending,
+            PulseOperationState::Done => {
                 let mut query = self
                     .pending_default_query
                     .take()
@@ -555,7 +573,7 @@ impl PulseClient {
                     QueryPoll::Complete(Ok(query.result.default_sink.take()))
                 }
             }
-            PA_OPERATION_CANCELLED => {
+            PulseOperationState::Cancelled => {
                 self.default_queries_disabled = true;
                 let query = self
                     .pending_default_query
@@ -2467,6 +2485,23 @@ mod tests {
             default_route_decision(Some(Ok(Some("sink.selected".into()))), "sink.selected"),
             DefaultRouteDecision::Unchanged
         );
+    }
+
+    #[test]
+    fn pulse_operation_state_mapping_distinguishes_running_done_and_cancelled() {
+        assert_eq!(
+            pulse_operation_state(PA_OPERATION_RUNNING),
+            PulseOperationState::Running
+        );
+        assert_eq!(
+            pulse_operation_state(PA_OPERATION_DONE),
+            PulseOperationState::Done
+        );
+        assert_eq!(
+            pulse_operation_state(PA_OPERATION_CANCELLED),
+            PulseOperationState::Cancelled
+        );
+        assert_eq!(pulse_operation_state(-1), PulseOperationState::Unknown);
     }
 
     #[test]
