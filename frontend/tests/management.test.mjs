@@ -198,7 +198,7 @@ test("double submit sends one approval and shows protocol progress instead of co
     async post(route, payload = {}) {
       calls.push({ route, payload });
       if (route === "pairing/pending")
-        return pairingReply(request("Living room", pendingRead++ !== 0));
+        return pairingReply(request("Living room", pendingRead++ === 0));
       if (route === "pairing/approve_pin") return approval.promise;
       return baseReply(route);
     },
@@ -238,7 +238,7 @@ test("interrupted approval refreshes read-only status without replaying the PIN"
     async post(route, payload = {}) {
       calls.push({ route, payload });
       if (route === "pairing/pending")
-        return pairingReply(request("Den room", pendingRead++ !== 0));
+        return pairingReply(request("Den room", pendingRead++ === 0));
       if (route === "pairing/approve_pin") throw new Error("connection interrupted");
       return baseReply(route);
     },
