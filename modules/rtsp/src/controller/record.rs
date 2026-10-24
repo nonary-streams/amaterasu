@@ -112,6 +112,9 @@ impl Record {
         payload["configuration"]["configuration"]["bitrate"] = serde_json::json!(bitrate);
         payload["configuration"]["configuration"]["max_reference_frames"] =
             serde_json::json!(video.max_reference_frames);
+        if video.codec == amaterasu_media::VideoCodec::Hevc {
+            payload["configuration"]["configuration"]["codec"] = serde_json::json!("hevc");
+        }
         payload["configuration"]["configuration"]["color_mode"] = serde_json::json!(match color {
             amaterasu_gamestream::sdp::ColorMode::Bt601Limited => "bt601_limited",
             amaterasu_gamestream::sdp::ColorMode::Bt601Full => "bt601_full",

@@ -315,6 +315,11 @@ pub enum CaptureProvider {
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
+    #[serde(
+        default,
+        skip_serializing_if = "amaterasu_media::VideoCodec::is_default"
+    )]
+    pub codec: amaterasu_media::VideoCodec,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -341,6 +346,7 @@ pub(crate) struct EncryptionSnapshot {
 impl Default for Profile {
     fn default() -> Self {
         Self {
+            codec: amaterasu_media::VideoCodec::H264,
             width: 1920,
             height: 1080,
             fps: 60,
@@ -383,7 +389,8 @@ impl Profile {
     }
 
     fn matches_video(&self, announce: &Announce) -> bool {
-        announce.video.width == self.width
+        sdp_codec(announce.video.codec) == self.codec
+            && announce.video.width == self.width
             && announce.video.height == self.height
             && announce.video.fps == self.fps
             && announce.video.bitrate_kbps == self.bitrate_kbps
@@ -425,7 +432,11 @@ impl Profile {
             return Err("invalid_profile");
         }
 
-        amaterasu_gamestream::video::VideoPacketizer::new(
+        let codec = match self.codec {
+            amaterasu_media::VideoCodec::H264 => amaterasu_gamestream::video::VideoCodec::H264,
+            amaterasu_media::VideoCodec::Hevc => amaterasu_gamestream::video::VideoCodec::Hevc,
+        };
+        amaterasu_gamestream::video::VideoPacketizer::new_with_codec(
             amaterasu_gamestream::video::VideoConfig {
                 packet_size: self.packet_size,
                 fec_percentage: self.fec_percentage,
@@ -434,9 +445,17 @@ impl Profile {
                 // Encryption is applied by media transport after packetization.
                 encrypted: false,
             },
+            codec,
         )
         .map_err(|_| "invalid_profile")?;
         Ok(())
+    }
+}
+
+fn sdp_codec(codec: amaterasu_gamestream::sdp::VideoCodec) -> amaterasu_media::VideoCodec {
+    match codec {
+        amaterasu_gamestream::sdp::VideoCodec::H264 => amaterasu_media::VideoCodec::H264,
+        amaterasu_gamestream::sdp::VideoCodec::Hevc => amaterasu_media::VideoCodec::Hevc,
     }
 }
 
@@ -468,6 +487,7 @@ impl NegotiationBounds {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NegotiatedVideo {
+    pub codec: amaterasu_media::VideoCodec,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -755,6 +775,7 @@ impl Open {
                 && announce.audio.channel_mask == audio_channel_mask(channels)
         };
         let video = NegotiatedVideo {
+            codec: sdp_codec(announce.video.codec),
             width: announce.video.width,
             height: announce.video.height,
             fps: announce.video.fps,
@@ -762,7 +783,8 @@ impl Open {
             max_reference_frames: announce.video.max_reference_frames,
         };
         let video_matches = if let Some(bounds) = self.negotiation_bounds {
-            video.validate()
+            video.codec == profile.codec
+                && video.validate()
                 && video.width <= bounds.max_width
                 && video.height <= bounds.max_height
                 && video.fps <= bounds.max_fps
@@ -902,6 +924,9 @@ impl Open {
             "encrypt_audio": self.profile.encrypt_audio,
             "permit_legacy_audio_iv_wrap": self.profile.permit_legacy_audio_iv_wrap,
         });
+        if self.profile.codec == amaterasu_media::VideoCodec::Hevc {
+            payload["video"]["codec"] = serde_json::json!("hevc");
+        }
         if let Some(channels @ (6 | 8)) = self.channels {
             payload["audio"]["channels"] = serde_json::json!(channels);
             payload["audio"]["channel_mask"] = serde_json::json!(audio_channel_mask(channels));
@@ -2793,6 +2818,23 @@ mod tests {
     }
 
     #[test]
+    fn signed_codec_is_kept_from_announce_through_prepare_and_start() {
+        let mut request = bounded_video_open();
+        let mut h264 = encrypted_announce();
+        assert!(request.negotiate_announce(&h264).is_some());
+        request.profile.codec = amaterasu_media::VideoCodec::Hevc;
+        assert!(request.negotiate_announce(&h264).is_none());
+        h264.video.codec = amaterasu_gamestream::sdp::VideoCodec::Hevc;
+        h264.video.color = amaterasu_gamestream::sdp::ColorMode::Bt709Limited;
+        let selected = request.negotiate_announce(&h264).unwrap();
+        assert_eq!(selected.codec, amaterasu_media::VideoCodec::Hevc);
+        assert_eq!(
+            request.prepare("hevc-codec-ticket", None)["video"]["codec"],
+            "hevc"
+        );
+    }
+
+    #[test]
     fn signed_bounds_accept_client_selected_video_values_and_preserve_prepare_transport() {
         let request = bounded_video_open();
         assert!(request.validate(false).is_ok());
@@ -2815,6 +2857,7 @@ mod tests {
         assert_eq!(
             request.negotiate_announce(&announce),
             Some(NegotiatedVideo {
+                codec: amaterasu_media::VideoCodec::H264,
                 width: 1280,
                 height: 720,
                 fps: 30,

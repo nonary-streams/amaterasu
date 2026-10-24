@@ -13,6 +13,7 @@ fn config() -> StreamingConfig {
         },
         desktop: DesktopSettings::default(),
         profile: StreamProfile {
+            codec: amaterasu_media::VideoCodec::H264,
             max_width: 1920,
             max_height: 1080,
             max_fps: 60,
@@ -29,6 +30,24 @@ fn config() -> StreamingConfig {
             permit_legacy_audio_iv_wrap: false,
         },
     }
+}
+
+#[test]
+fn signed_stream_profile_codec_defaults_to_h264_and_serializes_hevc_explicitly() {
+    let mut configured = config();
+    let legacy = serde_json::to_value(&configured).unwrap();
+    assert!(legacy["profile"].get("codec").is_none());
+    assert_eq!(
+        serde_json::from_value::<StreamingConfig>(legacy)
+            .unwrap()
+            .profile
+            .codec,
+        amaterasu_media::VideoCodec::H264
+    );
+    configured.profile.codec = amaterasu_media::VideoCodec::Hevc;
+    assert!(configured.validate().is_ok());
+    let selected = serde_json::to_value(&configured).unwrap();
+    assert_eq!(selected["profile"]["codec"], "hevc");
 }
 
 #[test]

@@ -385,6 +385,7 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-gamestream",
  "amaterasu-identity",
+ "amaterasu-media",
  "amaterasu-module-sdk",
  "getrandom 0.3.4",
  "httparse",
@@ -464,6 +465,7 @@ name = "amaterasu-rtsp"
 version = "0.1.0"
 dependencies = [
  "amaterasu-gamestream",
+ "amaterasu-media",
  "amaterasu-module-sdk",
  "getrandom 0.3.4",
  "serde",

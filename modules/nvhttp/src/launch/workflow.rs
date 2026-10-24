@@ -276,7 +276,7 @@ impl Controller {
                     "audio_endpoint":record.audio_endpoint,
                     "host_audio_enabled":record.request.host_audio_enabled,
                 });
-                let profile = json!({
+                let mut profile = json!({
                     "width": record.request.width,
                     "height": record.request.height,
                     "fps": record.request.fps,
@@ -293,6 +293,9 @@ impl Controller {
                     "encrypt_audio": config.profile.encrypt_audio,
                     "permit_legacy_audio_iv_wrap": config.profile.permit_legacy_audio_iv_wrap,
                 });
+                if config.profile.codec == amaterasu_media::VideoCodec::Hevc {
+                    profile["codec"] = json!("hevc");
+                }
                 let negotiation_bounds = json!({
                     "max_width": config.profile.max_width,
                     "max_height": config.profile.max_height,

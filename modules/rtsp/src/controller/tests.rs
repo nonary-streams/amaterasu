@@ -1981,6 +1981,21 @@ fn negotiated_video_is_owned_by_its_rtsp_ticket() {
 }
 
 #[test]
+fn authenticated_start_keeps_the_exact_ticket_codec() {
+    let (mut record, mut announce) = announced_profile_record();
+    record.config.profile.codec = amaterasu_media::VideoCodec::Hevc;
+    announce.video.codec = amaterasu_gamestream::sdp::VideoCodec::Hevc;
+    announce.video.color = amaterasu_gamestream::sdp::ColorMode::Bt709Limited;
+    assert!(record.accept_announce(&announce));
+    let start = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(start["configuration"]["configuration"]["codec"], "hevc");
+    assert_eq!(
+        record.config.prepare("hevc-prepare", None)["video"]["codec"],
+        "hevc"
+    );
+}
+
+#[test]
 fn rejected_announce_cannot_produce_an_authenticated_play_start() {
     let (mut record, announce) = announced_profile_record();
     record.config.profile.encrypt_audio = false;
@@ -2021,6 +2036,7 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
         });
         record.negotiated_color = Some(amaterasu_gamestream::sdp::ColorMode::Bt709Limited);
         record.negotiated_video = Some(crate::model::NegotiatedVideo {
+            codec: amaterasu_media::VideoCodec::H264,
             width: record.config.profile.width,
             height: record.config.profile.height,
             fps: record.config.profile.fps,

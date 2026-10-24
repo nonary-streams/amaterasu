@@ -468,6 +468,11 @@ pub enum CaptureProvider {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamProfile {
+    #[serde(
+        default,
+        skip_serializing_if = "amaterasu_media::VideoCodec::is_default"
+    )]
+    pub codec: amaterasu_media::VideoCodec,
     pub max_width: u32,
     pub max_height: u32,
     pub max_fps: u32,
@@ -498,7 +503,11 @@ impl StreamProfile {
         {
             return Err("invalid_streaming_profile");
         }
-        amaterasu_gamestream::video::VideoPacketizer::new(
+        let codec = match self.codec {
+            amaterasu_media::VideoCodec::H264 => amaterasu_gamestream::video::VideoCodec::H264,
+            amaterasu_media::VideoCodec::Hevc => amaterasu_gamestream::video::VideoCodec::Hevc,
+        };
+        amaterasu_gamestream::video::VideoPacketizer::new_with_codec(
             amaterasu_gamestream::video::VideoConfig {
                 packet_size: self.packet_size,
                 fec_percentage: self.fec_percentage,
@@ -506,6 +515,7 @@ impl StreamProfile {
                 max_fec_blocks: self.max_fec_blocks,
                 encrypted: false,
             },
+            codec,
         )
         .map_err(|_| "invalid_streaming_profile")?;
         Ok(())

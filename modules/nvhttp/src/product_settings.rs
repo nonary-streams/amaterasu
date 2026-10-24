@@ -3374,6 +3374,7 @@ mod tests {
                 },
                 desktop: crate::launch::DesktopSettings::default(),
                 profile: crate::launch::StreamProfile {
+                    codec: amaterasu_media::VideoCodec::H264,
                     max_width: 1920,
                     max_height: 1080,
                     max_fps: 60,
