@@ -429,7 +429,7 @@ fn timeout_status_distinguishes_waiting_for_start_from_pipewire_connection_failu
         )
         .unwrap()
         .payload;
-    assert_eq!(failed["diagnostics"]["stage"], "connect_pipe_wire");
+    assert_eq!(failed["diagnostics"]["stage"], "connect_pipewire");
     assert_eq!(failed["diagnostics"]["pipewire_node"], 93);
     assert_eq!(failed["diagnostics"]["pipewire_serial"], 98);
     assert_eq!(failed["diagnostics"]["pipewire_state"], "error");

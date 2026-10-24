@@ -189,13 +189,13 @@ pub enum PipeWireState {
 }
 
 impl PipeWireState {
-    pub fn from_native(value: u32) -> Option<Self> {
+    pub fn from_native(value: i32) -> Option<Self> {
         Some(match value {
             0 => Self::Unconnected,
             1 => Self::Connecting,
             2 => Self::Paused,
             3 => Self::Streaming,
-            4 => Self::Error,
+            -1 => Self::Error,
             _ => return None,
         })
     }
@@ -217,8 +217,8 @@ mod diagnostics_tests {
             Some(SourceStage::ConnectPipeWire)
         );
         assert_eq!(SourceStage::from_native(99), None);
-        assert_eq!(PipeWireState::from_native(4), Some(PipeWireState::Error));
-        assert_eq!(PipeWireState::from_native(u32::MAX), None);
+        assert_eq!(PipeWireState::from_native(-1), Some(PipeWireState::Error));
+        assert_eq!(PipeWireState::from_native(i32::MAX), None);
     }
 }
 

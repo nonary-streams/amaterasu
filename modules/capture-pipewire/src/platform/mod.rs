@@ -31,7 +31,7 @@ struct Snapshot {
     height: u32,
     format: u32,
     error: u32,
-    pipewire_state: u32,
+    pipewire_state: i32,
     node_present: u32,
     serial_present: u32,
     pipewire_error: i32,

@@ -17,8 +17,8 @@ enum am_pw_stage {
     AM_PW_STAGE_FRAME_RECEIVED,
 };
 struct am_pw_snapshot {
-    uint32_t state, stage, node, width, height, format, error, pipewire_state, node_present, serial_present;
-    int32_t pipewire_error;
+    uint32_t state, stage, node, width, height, format, error, node_present, serial_present;
+    int32_t pipewire_state, pipewire_error;
     uint64_t serial;
 };
 struct am_pw_plane {

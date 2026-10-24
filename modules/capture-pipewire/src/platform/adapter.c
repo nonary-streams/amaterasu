@@ -28,8 +28,8 @@ struct am_pw_session {
     char *request_path;
     guint closed_subscription;
     atomic_bool stopped;
-    atomic_uint state, stage, node, width, height, format, error, pipewire_state, node_present, serial_present;
-    atomic_int pipewire_error;
+    atomic_uint state, stage, node, width, height, format, error, node_present, serial_present;
+    atomic_int pipewire_state, pipewire_error;
     uint32_t source_type, timeout_seconds;
     atomic_uint_fast64_t serial;
     struct pw_main_loop *loop;
@@ -255,7 +255,7 @@ static void stream_state_changed(void *data, enum pw_stream_state previous,
     enum pw_stream_state state, const char *error) {
     (void)previous; (void)error;
     struct am_pw_session *session = data;
-    atomic_store(&session->pipewire_state, (uint32_t)state);
+    atomic_store(&session->pipewire_state, (int)state);
     if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED) {
         if (state == PW_STREAM_STATE_ERROR) atomic_store(&session->pipewire_error, -1);
         fail(session, 4);
@@ -471,7 +471,7 @@ struct am_pw_session *am_pw_start(uint32_t source_type, uint32_t timeout_seconds
     atomic_init(&session->height, 0);
     atomic_init(&session->format, 0);
     atomic_init(&session->error, 0);
-    atomic_init(&session->pipewire_state, UINT32_MAX);
+    atomic_init(&session->pipewire_state, INT32_MAX);
     atomic_init(&session->pipewire_error, 0);
     atomic_init(&session->node_present, 0);
     atomic_init(&session->serial_present, 0);
