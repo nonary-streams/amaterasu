@@ -25,6 +25,37 @@ fn absolute_pointer_event(x: u16, y: u16) -> InputEvent {
     InputEvent::Absolute { x, y }
 }
 
+fn companion_gamepad_event(event: &Event) -> InputResult<InputEvent> {
+    let Event::Controller {
+        number,
+        active_mask,
+        buttons,
+        left_trigger,
+        right_trigger,
+        left_x,
+        left_y,
+        right_x,
+        right_y,
+    } = event
+    else {
+        return Err(invalid_event());
+    };
+    if *number >= 16 || *buttons & !SUPPORTED_GAMEPAD_BUTTONS != 0 {
+        return Err(invalid_event());
+    }
+    Ok(InputEvent::Gamepad {
+        number: *number,
+        active_mask: *active_mask,
+        buttons: *buttons,
+        left_trigger: *left_trigger,
+        right_trigger: *right_trigger,
+        left_x: *left_x,
+        left_y: *left_y,
+        right_x: *right_x,
+        right_y: *right_y,
+    })
+}
+
 #[derive(Default)]
 struct SingleTouchAsMouse {
     active_pointer: Option<u32>,
@@ -201,20 +232,26 @@ impl Backend for LinuxCompanionBackend {
     }
 
     fn controller_input_supported(&self) -> bool {
-        false
+        self.client
+            .as_ref()
+            .is_some_and(LinuxInputClient::gamepad_enabled)
+            && matches!(self.profile, GamepadProfile::Auto | GamepadProfile::Xone)
     }
 
     fn gamepad_unavailable_reason(&self) -> Option<&str> {
-        Some(match self.profile {
-            GamepadProfile::Auto | GamepadProfile::Xone => {
-                "Linux companion currently grants keyboard and mouse input only"
+        match self.profile {
+            GamepadProfile::Auto | GamepadProfile::Xone if self.controller_input_supported() => {
+                None
             }
-            _ => "selected Linux gamepad profile is unavailable through the input companion",
-        })
+            GamepadProfile::Auto | GamepadProfile::Xone => {
+                Some("Linux gamepad input requires the host-owned digest-bound gamepad grant")
+            }
+            _ => Some("selected Linux gamepad profile is unavailable through the input companion"),
+        }
     }
 
     fn supported_gamepad_profiles(&self) -> &'static [&'static str] {
-        &["auto"]
+        &["auto", "xone"]
     }
 
     fn key_encoding(&self) -> &'static str {
@@ -237,10 +274,24 @@ impl Backend for LinuxCompanionBackend {
             | Event::Scroll { .. }
             | Event::ScrollUnits { .. } => Ok(()),
             Event::PenTouch { .. } => touch_mouse_fields(event).map(|_| ()),
-            Event::Controller { .. } => Err(InputError::new(
-                "controller_unavailable",
-                "Linux input companion currently grants keyboard and mouse input only",
-            )),
+            Event::Controller {
+                number, buttons, ..
+            } => {
+                if *number >= 16 || *buttons & !SUPPORTED_GAMEPAD_BUTTONS != 0 {
+                    return Err(invalid_event());
+                }
+                if !matches!(self.profile, GamepadProfile::Auto | GamepadProfile::Xone)
+                    || !self.controller_input_supported()
+                {
+                    return Err(InputError::new(
+                        "controller_unavailable",
+                        self.gamepad_unavailable_reason()
+                            .unwrap_or("Linux gamepad input is unavailable")
+                            .to_owned(),
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -289,6 +340,7 @@ impl Backend for LinuxCompanionBackend {
                 dy: i16::try_from(*dy).map_err(|_| invalid_event())?,
             }),
             Event::Absolute { x, y } => self.send(absolute_pointer_event(*x, *y)),
+            Event::Controller { .. } => self.send(companion_gamepad_event(event)?),
             Event::PenTouch { .. } => {
                 let (intents, next_pointer) = self.touch_as_mouse.plan(event)?;
                 for intent in intents {
@@ -318,7 +370,24 @@ impl Backend for LinuxCompanionBackend {
     }
 
     fn disable_controller_input(&mut self) -> InputResult<()> {
-        Ok(())
+        if !self
+            .client
+            .as_ref()
+            .is_some_and(LinuxInputClient::gamepad_enabled)
+        {
+            return Ok(());
+        }
+        self.send(InputEvent::Gamepad {
+            number: 0,
+            active_mask: 0,
+            buttons: 0,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        })
     }
 
     fn stop(&mut self) -> InputResult<()> {
@@ -330,6 +399,8 @@ impl Backend for LinuxCompanionBackend {
         client.close().map_err(companion_error)
     }
 }
+
+const SUPPORTED_GAMEPAD_BUTTONS: u32 = ((1 << 11) - 1) | ((1 << 22) - (1 << 12));
 
 impl LinuxCompanionBackend {
     fn scroll(&mut self, axis: Axis, amount: i16) -> InputResult<()> {
@@ -387,8 +458,10 @@ fn companion_error(error: amaterasu_input_companion::InputError) -> InputError {
 mod tests {
     use super::{
         Axis, Backend, InputEvent, KeyState, LinuxCompanionBackend, SingleTouchAsMouse,
-        absolute_pointer_event, evdev_key_event, left_button_event, scroll_events,
+        absolute_pointer_event, companion_gamepad_event, evdev_key_event, left_button_event,
+        scroll_events,
     };
+    use crate::gamepad_profile::GamepadProfile;
     use crate::model::{Event, PenTouchDevice, PenTouchPhase};
     use amaterasu_input_companion::{
         DeviceSink, GrantRegistry, InputError as CompanionError, InputPacket, InputResult,
@@ -754,6 +827,67 @@ mod tests {
                     horizontal: 1_000,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn gamepad_event_maps_slot_buttons_triggers_and_axes_without_widening_input() {
+        let event = Event::Controller {
+            number: 2,
+            active_mask: 1 << 2,
+            buttons: (1 << 1) | (1 << 12),
+            left_trigger: u8::MAX,
+            right_trigger: 64,
+            left_x: i16::MIN,
+            left_y: i16::MAX,
+            right_x: -1,
+            right_y: 1,
+        };
+        assert_eq!(
+            companion_gamepad_event(&event).unwrap(),
+            InputEvent::Gamepad {
+                number: 2,
+                active_mask: 1 << 2,
+                buttons: (1 << 1) | (1 << 12),
+                left_trigger: u8::MAX,
+                right_trigger: 64,
+                left_x: i16::MIN,
+                left_y: i16::MAX,
+                right_x: -1,
+                right_y: 1,
+            }
+        );
+        let mut invalid = event;
+        if let Event::Controller { buttons, .. } = &mut invalid {
+            *buttons = 1 << 11;
+        }
+        assert_eq!(
+            companion_gamepad_event(&invalid).unwrap_err().code,
+            "invalid_event"
+        );
+    }
+
+    #[test]
+    fn gamepad_capability_is_closed_until_a_host_grant_is_returned() {
+        let mut backend = LinuxCompanionBackend::new("unused.sock".into());
+        backend.set_gamepad_profile(GamepadProfile::Auto);
+        assert!(!backend.controller_input_supported());
+        assert_eq!(
+            backend
+                .validate(&Event::Controller {
+                    number: 0,
+                    active_mask: 1,
+                    buttons: 0,
+                    left_trigger: 0,
+                    right_trigger: 0,
+                    left_x: 0,
+                    left_y: 0,
+                    right_x: 0,
+                    right_y: 0,
+                })
+                .unwrap_err()
+                .code,
+            "controller_unavailable"
         );
     }
 }

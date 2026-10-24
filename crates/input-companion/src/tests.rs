@@ -1,6 +1,6 @@
 use crate::{
     DeviceSink, GrantRegistry, InputError, InputEvent, InputPacket, InputResult, InputSession,
-    MouseButton, PROTOCOL_VERSION, PeerIdentity,
+    MouseButton, PROTOCOL_VERSION, PeerIdentity, PermitLedger, ProcessIdentity,
 };
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,20 @@ fn key(pressed: bool) -> InputEvent {
         scan_code: 30,
         extended: false,
         pressed,
+    }
+}
+
+fn gamepad_event() -> InputEvent {
+    InputEvent::Gamepad {
+        number: 0,
+        active_mask: 1,
+        buttons: 1 << 12,
+        left_trigger: 0,
+        right_trigger: 0,
+        left_x: i16::MIN,
+        left_y: i16::MAX,
+        right_x: 0,
+        right_y: 0,
     }
 }
 
@@ -674,4 +688,133 @@ fn rate_limit_never_blocks_release_of_a_held_key() {
         Err(InputError::ResourceExhausted)
     );
     session.submit(&packet(2049, key(false)), now).unwrap();
+}
+
+#[test]
+fn gamepad_requires_an_explicit_host_grant_and_revoke_releases_its_session_device() {
+    let now = Instant::now();
+    let identity = peer();
+    let mut registry = GrantRegistry::synthetic();
+    let grant = registry
+        .issue(
+            identity.clone(),
+            "a".repeat(32),
+            7,
+            now + Duration::from_secs(1),
+            true,
+            true,
+        )
+        .unwrap();
+    let mut session = InputSession::connect(&identity, grant, FakeDevice::default(), now).unwrap();
+
+    assert_eq!(
+        session.submit(&packet(1, gamepad_event()), now),
+        Err(InputError::PermissionDenied)
+    );
+    assert!(session.sink.sent.is_empty());
+
+    let mut granted_registry = GrantRegistry::synthetic();
+    let grant = granted_registry
+        .issue_with_capabilities(
+            identity.clone(),
+            "a".repeat(32),
+            7,
+            now + Duration::from_secs(1),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+    let mut granted = InputSession::connect(&identity, grant, FakeDevice::default(), now).unwrap();
+    granted.submit(&packet(1, gamepad_event()), now).unwrap();
+    granted.revoke().unwrap();
+
+    assert_eq!(granted.sink.sent, vec![gamepad_event()]);
+    assert_eq!(granted.sink.releases, 1);
+}
+
+#[test]
+fn gamepad_policy_change_revokes_an_existing_host_permit() {
+    let now = Instant::now();
+    let process = ProcessIdentity::new("uid:1000".into(), 3, 11, 12356).unwrap();
+    let mut ledger = PermitLedger::new(GrantRegistry::synthetic());
+    ledger
+        .refresh_from_host_with_gamepad(process.clone(), "a".repeat(64), false, false, true, now)
+        .unwrap();
+    let lease = ledger.claim(&process, now).unwrap();
+    assert!(lease.grant.gamepad_enabled());
+
+    assert_eq!(
+        ledger.refresh_from_host_with_gamepad(
+            process.clone(),
+            "a".repeat(64),
+            false,
+            false,
+            false,
+            now,
+        ),
+        Err(InputError::InvalidGrant)
+    );
+    assert!(!ledger.is_current(&process, now));
+}
+
+#[test]
+fn failed_gamepad_report_closes_the_lease_and_runs_device_cleanup() {
+    let now = Instant::now();
+    let identity = peer();
+    let grant = GrantRegistry::synthetic()
+        .issue_with_capabilities(
+            identity.clone(),
+            "a".repeat(32),
+            7,
+            now + Duration::from_secs(1),
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+    let device = FakeDevice {
+        fail_next: true,
+        ..FakeDevice::default()
+    };
+    let mut session = InputSession::connect(&identity, grant, device, now).unwrap();
+
+    assert_eq!(
+        session.submit(&packet(1, gamepad_event()), now),
+        Err(InputError::Device)
+    );
+    assert!(session.sink.sent.contains(&gamepad_event()));
+    assert_eq!(session.sink.releases, 1);
+    assert!(!session.cleanup_required());
+    assert_eq!(
+        session.submit(&packet(2, gamepad_event()), now),
+        Err(InputError::Closed)
+    );
+}
+
+#[test]
+fn gamepad_reports_reject_out_of_range_slots_and_reserved_button_bits() {
+    gamepad_event().validate().unwrap();
+    let mut invalid_slot = gamepad_event();
+    if let InputEvent::Gamepad { number, .. } = &mut invalid_slot {
+        *number = 16;
+    }
+    assert_eq!(invalid_slot.validate(), Err(InputError::InvalidEvent));
+    let mut invalid_button = gamepad_event();
+    if let InputEvent::Gamepad { buttons, .. } = &mut invalid_button {
+        *buttons = 1 << 11;
+    }
+    assert_eq!(invalid_button.validate(), Err(InputError::InvalidEvent));
+}
+
+#[test]
+fn gamepad_protocol_round_trips_the_normalized_snapshot_fields() {
+    let event = gamepad_event();
+    let encoded = serde_json::to_value(&event).unwrap();
+
+    assert_eq!(encoded["kind"], "gamepad");
+    assert_eq!(
+        serde_json::from_value::<InputEvent>(encoded).unwrap(),
+        event
+    );
 }

@@ -32,6 +32,7 @@ pub struct InputGrant {
     expires_at: Instant,
     keyboard: bool,
     mouse: bool,
+    gamepad: bool,
     registry: Arc<Mutex<RegistryState>>,
 }
 
@@ -117,6 +118,18 @@ impl GrantRegistry {
         keyboard: bool,
         mouse: bool,
     ) -> InputResult<(u64, InputGrant)> {
+        self.issue_next_with_capabilities(peer, lease_token, expires_at, keyboard, mouse, false)
+    }
+
+    pub fn issue_next_with_capabilities(
+        &mut self,
+        peer: PeerIdentity,
+        lease_token: String,
+        expires_at: Instant,
+        keyboard: bool,
+        mouse: bool,
+        gamepad: bool,
+    ) -> InputResult<(u64, InputGrant)> {
         let next = {
             let state = self.state.lock().map_err(|_| InputError::InvalidGrant)?;
             state
@@ -124,7 +137,15 @@ impl GrantRegistry {
                 .checked_add(1)
                 .ok_or(InputError::InvalidSequence)?
         };
-        let grant = self.issue(peer, lease_token, next, expires_at, keyboard, mouse)?;
+        let grant = self.issue_with_capabilities(
+            peer,
+            lease_token,
+            next,
+            expires_at,
+            keyboard,
+            mouse,
+            gamepad,
+        )?;
         Ok((next, grant))
     }
 
@@ -137,10 +158,31 @@ impl GrantRegistry {
         keyboard: bool,
         mouse: bool,
     ) -> InputResult<InputGrant> {
+        self.issue_with_capabilities(
+            peer,
+            lease_token,
+            generation,
+            expires_at,
+            keyboard,
+            mouse,
+            false,
+        )
+    }
+
+    pub fn issue_with_capabilities(
+        &mut self,
+        peer: PeerIdentity,
+        lease_token: String,
+        generation: u64,
+        expires_at: Instant,
+        keyboard: bool,
+        mouse: bool,
+        gamepad: bool,
+    ) -> InputResult<InputGrant> {
         if lease_token.len() != 32
             || !lease_token.bytes().all(|byte| byte.is_ascii_hexdigit())
             || generation == 0
-            || !keyboard && !mouse
+            || !keyboard && !mouse && !gamepad
         {
             return Err(InputError::InvalidGrant);
         }
@@ -167,6 +209,7 @@ impl GrantRegistry {
             expires_at,
             keyboard,
             mouse,
+            gamepad,
             registry: Arc::clone(&self.state),
         })
     }
@@ -238,7 +281,8 @@ impl<S: DeviceSink> InputSession<S> {
         }
         packet.event.validate()?;
         if packet.event.keyboard() && !self.grant.keyboard
-            || !packet.event.keyboard() && !self.grant.mouse
+            || packet.event.gamepad() && !self.grant.gamepad
+            || !packet.event.keyboard() && !packet.event.gamepad() && !self.grant.mouse
         {
             return Err(InputError::PermissionDenied);
         }
@@ -390,6 +434,10 @@ impl InputGrant {
 
     pub fn mouse_enabled(&self) -> bool {
         self.mouse
+    }
+
+    pub fn gamepad_enabled(&self) -> bool {
+        self.gamepad
     }
 
     fn activate(&self) -> InputResult<()> {

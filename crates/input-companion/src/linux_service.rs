@@ -2,8 +2,8 @@
 //!
 //! The host keeps `LinuxInputService` and calls `authorize_worker` only after
 //! its signed-set policy permits the worker. The worker receives no device
-//! descriptor; it can submit only bounded keyboard and relative or normalized
-//! absolute-pointer intent over a same-user Unix socket. This is an API
+//! descriptor; it can submit only bounded keyboard, pointer, and explicitly
+//! granted gamepad intent over a same-user Unix socket. This is an API
 //! authorization boundary, not a sandbox for trusted native modules running in
 //! the host process.
 use crate::{
@@ -11,6 +11,7 @@ use crate::{
     MouseButton, PROTOCOL_VERSION, PermitLedger, ProcessIdentity,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -34,6 +35,12 @@ const EV_REL: u16 = 2;
 const EV_ABS: u16 = 3;
 const ABS_X: u16 = 0;
 const ABS_Y: u16 = 1;
+const GAMEPAD_ABS_X: u16 = 0;
+const GAMEPAD_ABS_Y: u16 = 1;
+const GAMEPAD_ABS_Z: u16 = 2;
+const GAMEPAD_ABS_RX: u16 = 3;
+const GAMEPAD_ABS_RY: u16 = 4;
+const GAMEPAD_ABS_RZ: u16 = 5;
 const REL_X: u16 = 0;
 const REL_Y: u16 = 1;
 const REL_HWHEEL: u16 = 6;
@@ -51,6 +58,29 @@ const UI_DEV_SETUP: libc::Ioctl = libc::_IOW::<libc::uinput_setup>(b'U' as u32, 
 const UI_ABS_SETUP: libc::Ioctl = libc::_IOW::<libc::uinput_abs_setup>(b'U' as u32, 4);
 const UI_DEV_CREATE: libc::Ioctl = libc::_IO(b'U' as u32, 1);
 const UI_DEV_DESTROY: libc::Ioctl = libc::_IO(b'U' as u32, 2);
+const GAMEPAD_BUTTONS: [(u32, u16); 21] = [
+    (1 << 0, 0x220),
+    (1 << 1, 0x221),
+    (1 << 2, 0x222),
+    (1 << 3, 0x223),
+    (1 << 4, 0x13b),
+    (1 << 5, 0x13a),
+    (1 << 6, 0x13d),
+    (1 << 7, 0x13e),
+    (1 << 8, 0x136),
+    (1 << 9, 0x137),
+    (1 << 10, 0x13c),
+    (1 << 12, 0x130),
+    (1 << 13, 0x131),
+    (1 << 14, 0x134),
+    (1 << 15, 0x133),
+    (1 << 16, 0x2c0),
+    (1 << 17, 0x2c1),
+    (1 << 18, 0x2c2),
+    (1 << 19, 0x2c3),
+    (1 << 20, 0x2c4),
+    (1 << 21, 0x2c5),
+];
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -64,7 +94,11 @@ enum Request {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Reply {
     Ok,
-    Granted { generation: u64, token: String },
+    Granted {
+        generation: u64,
+        token: String,
+        gamepad: bool,
+    },
     Denied,
 }
 
@@ -127,6 +161,8 @@ impl LinuxInputService {
     /// time are re-read from `/proc`; on Linux `creation_time` is stat field 22
     /// (process starttime in clock ticks). Caller-supplied identity strings are
     /// not accepted. `digest` must come from the host's verified active package.
+    /// `gamepad` is an independent host-policy grant and defaults to false in
+    /// host policy documents that predate this capability.
     pub fn authorize_worker(
         &self,
         process_id: u32,
@@ -134,6 +170,7 @@ impl LinuxInputService {
         digest: &str,
         keyboard: bool,
         mouse: bool,
+        gamepad: bool,
     ) -> InputResult<()> {
         let process = inspect_process(process_id)?;
         if !process.matches_instance(process_id, creation_time)
@@ -145,7 +182,14 @@ impl LinuxInputService {
         self.ledger
             .lock()
             .map_err(|_| InputError::Closed)?
-            .refresh_from_host(process, digest.to_owned(), keyboard, mouse, Instant::now())
+            .refresh_from_host_with_gamepad(
+                process,
+                digest.to_owned(),
+                keyboard,
+                mouse,
+                gamepad,
+                Instant::now(),
+            )
     }
 
     /// Revokes immediately; the active worker loop observes this before its
@@ -369,6 +413,7 @@ pub struct LinuxInputClient {
     token: String,
     generation: u64,
     next_sequence: u64,
+    gamepad_enabled: bool,
     closed: bool,
 }
 
@@ -386,11 +431,17 @@ impl LinuxInputClient {
             token: String::new(),
             generation: 0,
             next_sequence: 1,
+            gamepad_enabled: false,
             closed: false,
         };
         client.write_request(&Request::WorkerStart)?;
         let reply = client.read_reply()?;
-        let Reply::Granted { generation, token } = reply else {
+        let Reply::Granted {
+            generation,
+            token,
+            gamepad,
+        } = reply
+        else {
             return Err(InputError::PermissionDenied);
         };
         if generation == 0
@@ -401,7 +452,13 @@ impl LinuxInputClient {
         }
         client.generation = generation;
         client.token = token;
+        client.gamepad_enabled = gamepad;
         Ok(client)
+    }
+
+    /// Reports the separate gamepad bit returned for this authenticated lease.
+    pub fn gamepad_enabled(&self) -> bool {
+        self.gamepad_enabled
     }
 
     pub fn send(&mut self, event: InputEvent) -> InputResult<()> {
@@ -556,7 +613,8 @@ fn serve_worker(
         .claim(&process, Instant::now())?;
     let keyboard = lease.grant.keyboard_enabled();
     let mouse = lease.grant.mouse_enabled();
-    let sink = match LinuxUinputSink::create(uinput_path, keyboard, mouse) {
+    let gamepad = lease.grant.gamepad_enabled();
+    let sink = match LinuxUinputSink::create(uinput_path, keyboard, mouse, gamepad) {
         Ok(sink) => sink,
         Err(error) => {
             ledger
@@ -582,6 +640,7 @@ fn serve_worker(
         &Reply::Granted {
             generation: lease.generation,
             token: lease.token,
+            gamepad,
         },
     ) {
         let cleanup = session.revoke();
@@ -682,14 +741,17 @@ fn run_worker<S: DeviceSink>(
 }
 
 struct LinuxUinputSink {
+    uinput_path: PathBuf,
     keyboard: Option<UinputDevice>,
     pointer: Option<UinputDevice>,
+    gamepads: HashMap<u16, UinputGamepad>,
+    gamepad_enabled: bool,
     vertical_remainder: i32,
     horizontal_remainder: i32,
 }
 
 impl LinuxUinputSink {
-    fn create(path: &Path, keyboard: bool, mouse: bool) -> InputResult<Self> {
+    fn create(path: &Path, keyboard: bool, mouse: bool, gamepad: bool) -> InputResult<Self> {
         let keyboard = keyboard
             .then(|| UinputDevice::create(path, true))
             .transpose()?;
@@ -706,8 +768,11 @@ impl LinuxUinputSink {
             false => None,
         };
         Ok(Self {
+            uinput_path: path.to_path_buf(),
             keyboard,
             pointer,
+            gamepads: HashMap::new(),
+            gamepad_enabled: gamepad,
             vertical_remainder: 0,
             horizontal_remainder: 0,
         })
@@ -763,6 +828,29 @@ impl DeviceSink for LinuxUinputSink {
                 self.horizontal_remainder = horizontal_remainder;
                 Ok(())
             }
+            InputEvent::Gamepad {
+                number,
+                active_mask,
+                buttons,
+                left_trigger,
+                right_trigger,
+                left_x,
+                left_y,
+                right_x,
+                right_y,
+            } => self.gamepad(
+                *number,
+                *active_mask,
+                GamepadSnapshot {
+                    buttons: *buttons,
+                    left_trigger: *left_trigger,
+                    right_trigger: *right_trigger,
+                    left_x: *left_x,
+                    left_y: *left_y,
+                    right_x: *right_x,
+                    right_y: *right_y,
+                },
+            ),
         }
     }
 
@@ -779,13 +867,185 @@ impl DeviceSink for LinuxUinputSink {
         if pointer.is_ok() {
             self.pointer = None;
         }
-        keyboard?;
-        pointer?;
-        Ok(())
+        let mut first_error = keyboard.err().or_else(|| pointer.err());
+        let slots = self.gamepads.keys().copied().collect::<Vec<_>>();
+        for slot in slots {
+            if let Some(gamepad) = self.gamepads.get_mut(&slot)
+                && let Err(error) = gamepad.release()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            if self
+                .gamepads
+                .get(&slot)
+                .is_some_and(|gamepad| gamepad.device.is_none())
+            {
+                self.gamepads.remove(&slot);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn keep_alive(&mut self) -> InputResult<()> {
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GamepadSnapshot {
+    buttons: u32,
+    left_trigger: u8,
+    right_trigger: u8,
+    left_x: i16,
+    left_y: i16,
+    right_x: i16,
+    right_y: i16,
+}
+
+struct UinputGamepad {
+    device: Option<UinputDevice>,
+    state: GamepadSnapshot,
+    report_uncertain: bool,
+}
+
+impl UinputGamepad {
+    fn create(path: &Path, number: u8) -> InputResult<Self> {
+        Ok(Self {
+            device: Some(UinputDevice::create_gamepad(path, number)?),
+            state: GamepadSnapshot::default(),
+            report_uncertain: false,
+        })
+    }
+
+    fn update(&mut self, next: GamepadSnapshot) -> InputResult<()> {
+        if self.report_uncertain {
+            return Err(InputError::Device);
+        }
+        let events = gamepad_state_events(self.state, next);
+        if !events.is_empty() {
+            let device = self.device.as_ref().ok_or(InputError::Device)?;
+            if let Err(error) = device.emit(&events) {
+                // uinput writes can have an accepted prefix. Detach the entire
+                // per-session device during revoke rather than replaying an
+                // uncertain state into it.
+                self.report_uncertain = true;
+                return Err(error);
+            }
+        }
+        self.state = next;
+        Ok(())
+    }
+
+    fn release(&mut self) -> InputResult<()> {
+        let Some(device) = self.device.as_mut() else {
+            return Ok(());
+        };
+        if let Some(neutral) = gamepad_neutralization_frame(self.state, self.report_uncertain) {
+            if !neutral.is_empty() {
+                if device.emit(&neutral).is_err() {
+                    self.report_uncertain = true;
+                }
+            }
+        }
+        device.destroy()?;
+        self.device = None;
+        self.state = GamepadSnapshot::default();
+        self.report_uncertain = false;
+        Ok(())
+    }
+}
+
+fn gamepad_state_events(previous: GamepadSnapshot, next: GamepadSnapshot) -> Vec<(u16, u16, i32)> {
+    let mut events = Vec::with_capacity(GAMEPAD_BUTTONS.len() + 8);
+    for (mask, code) in GAMEPAD_BUTTONS {
+        let was_pressed = previous.buttons & mask != 0;
+        let is_pressed = next.buttons & mask != 0;
+        if was_pressed != is_pressed {
+            events.push((EV_KEY, code, i32::from(is_pressed)));
+        }
+    }
+    for (was_pressed, is_pressed, code) in [
+        (previous.left_trigger != 0, next.left_trigger != 0, 0x138),
+        (previous.right_trigger != 0, next.right_trigger != 0, 0x139),
+    ] {
+        if was_pressed != is_pressed {
+            events.push((EV_KEY, code, i32::from(is_pressed)));
+        }
+    }
+    for (previous_value, next_value, code) in [
+        (previous.left_x, next.left_x, GAMEPAD_ABS_X),
+        (previous.left_y, next.left_y, GAMEPAD_ABS_Y),
+        (
+            i16::from(previous.left_trigger),
+            i16::from(next.left_trigger),
+            GAMEPAD_ABS_Z,
+        ),
+        (previous.right_x, next.right_x, GAMEPAD_ABS_RX),
+        (previous.right_y, next.right_y, GAMEPAD_ABS_RY),
+        (
+            i16::from(previous.right_trigger),
+            i16::from(next.right_trigger),
+            GAMEPAD_ABS_RZ,
+        ),
+    ] {
+        if previous_value != next_value {
+            events.push((EV_ABS, code, i32::from(next_value)));
+        }
+    }
+    events
+}
+
+fn gamepad_neutralization_frame(
+    state: GamepadSnapshot,
+    report_uncertain: bool,
+) -> Option<Vec<(u16, u16, i32)>> {
+    (!report_uncertain).then(|| gamepad_state_events(state, GamepadSnapshot::default()))
+}
+
+impl LinuxUinputSink {
+    fn gamepad(&mut self, number: u16, active_mask: u16, next: GamepadSnapshot) -> InputResult<()> {
+        if !self.gamepad_enabled {
+            return Err(InputError::PermissionDenied);
+        }
+        let inactive = self
+            .gamepads
+            .keys()
+            .copied()
+            .filter(|slot| active_mask & (1u16 << *slot) == 0)
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for slot in inactive {
+            if let Some(gamepad) = self.gamepads.get_mut(&slot)
+                && let Err(error) = gamepad.release()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            if self
+                .gamepads
+                .get(&slot)
+                .is_some_and(|gamepad| gamepad.device.is_none())
+            {
+                self.gamepads.remove(&slot);
+            }
+        }
+        if active_mask & (1u16 << number) == 0 {
+            return first_error.map_or(Ok(()), Err);
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if !self.gamepads.contains_key(&number) {
+            self.gamepads.insert(
+                number,
+                UinputGamepad::create(&self.uinput_path, number as u8)?,
+            );
+        }
+        self.gamepads
+            .get_mut(&number)
+            .ok_or(InputError::Device)?
+            .update(next)
     }
 }
 
@@ -890,6 +1150,51 @@ impl UinputDevice {
         })
     }
 
+    fn create_gamepad(path: &Path, number: u8) -> InputResult<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(system_error)?;
+        if !file
+            .metadata()
+            .map_err(system_error)?
+            .file_type()
+            .is_char_device()
+        {
+            return Err(InputError::Device);
+        }
+        let fd = file.as_raw_fd();
+        set_bit(fd, UI_SET_EVBIT, u32::from(EV_KEY))?;
+        for (_, code) in GAMEPAD_BUTTONS {
+            set_bit(fd, UI_SET_KEYBIT, u32::from(code))?;
+        }
+        for code in [0x138, 0x139] {
+            set_bit(fd, UI_SET_KEYBIT, code)?;
+        }
+        set_bit(fd, UI_SET_EVBIT, u32::from(EV_ABS))?;
+        for (code, minimum, maximum) in [
+            (GAMEPAD_ABS_X, i16::MIN as i32, i16::MAX as i32),
+            (GAMEPAD_ABS_Y, i16::MIN as i32, i16::MAX as i32),
+            (GAMEPAD_ABS_Z, 0, i32::from(u8::MAX)),
+            (GAMEPAD_ABS_RX, i16::MIN as i32, i16::MAX as i32),
+            (GAMEPAD_ABS_RY, i16::MIN as i32, i16::MAX as i32),
+            (GAMEPAD_ABS_RZ, 0, i32::from(u8::MAX)),
+        ] {
+            configure_gamepad_axis(fd, code, minimum, maximum)?;
+        }
+        let mut setup = device_setup(&format!("Amaterasu gamepad {number}"));
+        // SAFETY: fd is a live owned uinput descriptor and setup remains valid
+        // for the exact uinput_setup structure size encoded by UI_DEV_SETUP.
+        check(unsafe { libc::ioctl(fd, UI_DEV_SETUP, &mut setup) })?;
+        // SAFETY: this owned fd creates only its own virtual gamepad device.
+        check(unsafe { libc::ioctl(fd, UI_DEV_CREATE) })?;
+        Ok(Self {
+            file,
+            created: true,
+        })
+    }
+
     fn emit(&self, values: &[(u16, u16, i32)]) -> InputResult<()> {
         let mut frame = values
             .iter()
@@ -929,6 +1234,34 @@ impl UinputDevice {
         }
         Ok(())
     }
+}
+
+fn device_setup(name: &str) -> libc::uinput_setup {
+    // SAFETY: uinput_setup contains integer fields and a fixed name buffer;
+    // it is initialized before any field is written or passed to the kernel.
+    let mut setup: libc::uinput_setup = unsafe { std::mem::zeroed() };
+    setup.id.bustype = 0x06;
+    for (target, source) in setup.name.iter_mut().zip(name.as_bytes()) {
+        *target = *source as libc::c_char;
+    }
+    setup
+}
+
+fn configure_gamepad_axis(fd: RawFd, code: u16, minimum: i32, maximum: i32) -> InputResult<()> {
+    set_bit(fd, UI_SET_ABSBIT, u32::from(code))?;
+    let setup = libc::uinput_abs_setup {
+        code,
+        absinfo: libc::input_absinfo {
+            value: 0,
+            minimum,
+            maximum,
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+        },
+    };
+    // SAFETY: the integer-only setup remains valid through the ioctl.
+    check(unsafe { libc::ioctl(fd, UI_ABS_SETUP, &setup) })
 }
 
 impl Drop for UinputDevice {
@@ -1317,5 +1650,68 @@ mod tests {
             read_frame_timeout(&mut reader, Duration::from_millis(50)),
             Err(InputError::Closed)
         );
+    }
+
+    #[test]
+    fn gamepad_report_maps_bounded_buttons_triggers_and_axes_then_neutralizes() {
+        let neutral = GamepadSnapshot::default();
+        let pressed = GamepadSnapshot {
+            buttons: (1 << 1) | (1 << 12),
+            left_trigger: u8::MAX,
+            right_trigger: 1,
+            left_x: i16::MIN,
+            left_y: i16::MAX,
+            right_x: -1,
+            right_y: 1,
+        };
+        let down = gamepad_state_events(neutral, pressed);
+        assert!(down.contains(&(EV_KEY, 0x221, 1)));
+        assert!(down.contains(&(EV_KEY, 0x130, 1)));
+        assert!(down.contains(&(EV_KEY, 0x138, 1)));
+        assert!(down.contains(&(EV_KEY, 0x139, 1)));
+        assert!(down.contains(&(EV_ABS, GAMEPAD_ABS_X, i32::from(i16::MIN))));
+        assert!(down.contains(&(EV_ABS, GAMEPAD_ABS_Y, i32::from(i16::MAX))));
+        assert!(down.contains(&(EV_ABS, GAMEPAD_ABS_Z, i32::from(u8::MAX))));
+        assert!(down.contains(&(EV_ABS, GAMEPAD_ABS_RX, -1)));
+        assert!(down.contains(&(EV_ABS, GAMEPAD_ABS_RY, 1)));
+
+        let release = gamepad_state_events(pressed, neutral);
+        assert!(release.contains(&(EV_KEY, 0x221, 0)));
+        assert!(release.contains(&(EV_KEY, 0x130, 0)));
+        assert!(release.contains(&(EV_KEY, 0x138, 0)));
+        assert!(release.contains(&(EV_KEY, 0x139, 0)));
+        assert!(release.contains(&(EV_ABS, GAMEPAD_ABS_X, 0)));
+        assert!(release.contains(&(EV_ABS, GAMEPAD_ABS_Y, 0)));
+        assert!(release.contains(&(EV_ABS, GAMEPAD_ABS_Z, 0)));
+        assert!(release.contains(&(EV_ABS, GAMEPAD_ABS_RX, 0)));
+        assert!(release.contains(&(EV_ABS, GAMEPAD_ABS_RY, 0)));
+        assert!(release.contains(&(EV_ABS, GAMEPAD_ABS_RZ, 0)));
+    }
+
+    #[test]
+    fn uncertain_gamepad_report_skips_replay_and_relies_on_device_detach() {
+        let held = GamepadSnapshot {
+            buttons: 1 << 12,
+            left_x: i16::MAX,
+            ..GamepadSnapshot::default()
+        };
+        assert_eq!(
+            gamepad_neutralization_frame(held, false).unwrap(),
+            vec![(EV_KEY, 0x130, 0), (EV_ABS, GAMEPAD_ABS_X, 0)]
+        );
+        assert!(gamepad_neutralization_frame(held, true).is_none());
+    }
+
+    #[test]
+    fn granted_handshake_carries_the_host_gamepad_capability() {
+        let reply = Reply::Granted {
+            generation: 7,
+            token: "a".repeat(32),
+            gamepad: true,
+        };
+        let encoded = serde_json::to_vec(&reply).unwrap();
+        let decoded: Reply = serde_json::from_slice(&encoded).unwrap();
+
+        assert!(matches!(decoded, Reply::Granted { gamepad: true, .. }));
     }
 }

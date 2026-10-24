@@ -48,6 +48,7 @@ struct HostPermit {
     component_set_digest: String,
     keyboard: bool,
     mouse: bool,
+    gamepad: bool,
     deadline: Instant,
 }
 
@@ -84,19 +85,32 @@ impl PermitLedger {
         mouse: bool,
         now: Instant,
     ) -> InputResult<()> {
+        self.refresh_from_host_with_gamepad(process, digest, keyboard, mouse, false, now)
+    }
+
+    pub fn refresh_from_host_with_gamepad(
+        &mut self,
+        process: ProcessIdentity,
+        digest: String,
+        keyboard: bool,
+        mouse: bool,
+        gamepad: bool,
+        now: Instant,
+    ) -> InputResult<()> {
         let peer = PeerIdentity::from_verified_connection(
             process.principal.clone(),
             process.session,
             digest.clone(),
         )?;
-        if !keyboard && !mouse || !peer.valid() {
+        if !keyboard && !mouse && !gamepad || !peer.valid() {
             return Err(InputError::InvalidGrant);
         }
         let changed_authorization = self.authorized.as_ref().is_some_and(|previous| {
             previous.process == process
                 && (previous.component_set_digest != digest
                     || previous.keyboard != keyboard
-                    || previous.mouse != mouse)
+                    || previous.mouse != mouse
+                    || previous.gamepad != gamepad)
         });
         if changed_authorization {
             self.revoke(&process);
@@ -107,6 +121,7 @@ impl PermitLedger {
             component_set_digest: digest,
             keyboard,
             mouse,
+            gamepad,
             deadline: now + HOST_HEARTBEAT,
         });
         Ok(())
@@ -129,12 +144,13 @@ impl PermitLedger {
             permit.component_set_digest.clone(),
         )?;
         let token = amaterasu_storage::random_identifier().map_err(|_| InputError::Storage)?;
-        let (generation, grant) = self.registry.issue_next(
+        let (generation, grant) = self.registry.issue_next_with_capabilities(
             peer.clone(),
             token.clone(),
             now + MAX_SESSION,
             permit.keyboard,
             permit.mouse,
+            permit.gamepad,
         )?;
         self.active = Some(process.clone());
         Ok(WorkerLease {
@@ -223,6 +239,7 @@ mod tests {
         ));
         let lease = ledger.claim(&process(11), now).unwrap();
         assert_eq!(lease.generation, 1);
+        assert!(!lease.grant.gamepad_enabled());
         assert!(!ledger.is_current(&process(11), now + Duration::from_secs(2)));
         ledger.release(&process(11));
         assert!(matches!(

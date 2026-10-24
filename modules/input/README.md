@@ -147,6 +147,17 @@ Each input lease accepts an optional signed `back_button_timeout` in its acquire
 request. NVHTTP resolves the certificate-bound client value before the
 application value; when both are absent, input uses the durable global policy.
 
+When the Linux companion backend is selected, its host-owned
+`input-companion-policy.json` must also authorize `gamepad:true` for the exact
+verified component-set digest. Missing `gamepad` fields retain the old
+keyboard/mouse policy behavior and grant no gamepad capability. The module's
+`controller` setting remains a separate event gate. The companion creates a
+uinput gamepad only when an authorized controller slot first becomes active;
+inactive slots, worker disconnect, permit revocation, and service teardown
+neutralize and destroy companion-owned devices. This policy document is
+digest-bound by the host but is not itself a cryptographically signed profile
+field.
+
 Input captures the effective value when the lease starts, so a global settings
 change during a stream affects the next lease and does not change the current
 stream's controller behavior.

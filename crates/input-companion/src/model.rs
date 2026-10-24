@@ -90,6 +90,19 @@ pub enum InputEvent {
         vertical: i16,
         horizontal: i16,
     },
+    /// Complete normalized state for one controller slot. The companion maps
+    /// only the documented button bits and axes to its session-owned device.
+    Gamepad {
+        number: u16,
+        active_mask: u16,
+        buttons: u32,
+        left_trigger: u8,
+        right_trigger: u8,
+        left_x: i16,
+        left_y: i16,
+        right_x: i16,
+        right_y: i16,
+    },
 }
 
 impl InputEvent {
@@ -115,6 +128,11 @@ impl InputEvent {
             } if vertical.abs_diff(0) > 12_000 || horizontal.abs_diff(0) > 12_000 => {
                 Err(InputError::InvalidEvent)
             }
+            Self::Gamepad {
+                number, buttons, ..
+            } if *number >= 16 || *buttons & !GAMEPAD_BUTTON_MASK != 0 => {
+                Err(InputError::InvalidEvent)
+            }
             _ => Ok(()),
         }
     }
@@ -124,6 +142,10 @@ impl InputEvent {
             self,
             Self::Key { .. } | Self::EvdevKey { .. } | Self::EvdevKeyRepeat { .. }
         )
+    }
+
+    pub(crate) fn gamepad(&self) -> bool {
+        matches!(self, Self::Gamepad { .. })
     }
 
     pub(crate) fn transition(&self) -> Option<(HeldInput, bool)> {
@@ -141,6 +163,10 @@ impl InputEvent {
         }
     }
 }
+
+/// Button bits consumed by the normalized Moonlight gamepad event. Reserved
+/// bits are rejected instead of being forwarded or silently reinterpreted.
+pub(crate) const GAMEPAD_BUTTON_MASK: u32 = ((1 << 11) - 1) | ((1 << 22) - (1 << 12));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeldInput {
