@@ -585,9 +585,9 @@ mod tests {
             weak_motor: 12000,
             duration_ms: 500,
         };
-        assert_eq!(feedback_belongs_to_active_slot(feedback, 1 << 3), Ok(true));
-        assert_eq!(feedback_belongs_to_active_slot(feedback, 1 << 2), Ok(false));
-        assert_eq!(
+        assert!(feedback_belongs_to_active_slot(feedback, 1 << 3).unwrap());
+        assert!(!feedback_belongs_to_active_slot(feedback, 1 << 2).unwrap());
+        assert!(
             feedback_belongs_to_active_slot(
                 GamepadFeedback {
                     strong_motor: 0,
@@ -596,8 +596,8 @@ mod tests {
                     ..feedback
                 },
                 0,
-            ),
-            Ok(true)
+            )
+            .unwrap()
         );
         assert!(
             feedback_belongs_to_active_slot(

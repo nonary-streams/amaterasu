@@ -1170,6 +1170,7 @@ impl GamepadFeedbackQueue {
         } else if event.duration_ms == 0 {
             return;
         }
+        let capacity_available = self.events.len() < MAX_FEEDBACK_QUEUE;
         match self.events.get_mut(&event.slot) {
             Some(queued) => {
                 queued.event = event;
@@ -1179,7 +1180,7 @@ impl GamepadFeedbackQueue {
                     self.pending.push_back(event.slot);
                 }
             }
-            None if self.events.len() < MAX_FEEDBACK_QUEUE => {
+            None if capacity_available => {
                 self.events.insert(
                     event.slot,
                     QueuedFeedback {
