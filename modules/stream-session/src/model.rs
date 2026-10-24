@@ -46,6 +46,11 @@ impl Settings {
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoWire {
+    #[serde(
+        default,
+        skip_serializing_if = "amaterasu_media::VideoCodec::is_default"
+    )]
+    pub codec: amaterasu_media::VideoCodec,
     pub packet_size: usize,
     pub fec_percentage: u8,
     pub min_parity_shards: u8,
@@ -59,6 +64,7 @@ fn default_video_max_batch_size_kb() -> u8 {
 impl Default for VideoWire {
     fn default() -> Self {
         Self {
+            codec: amaterasu_media::VideoCodec::H264,
             packet_size: 1024,
             fec_percentage: 20,
             min_parity_shards: 2,
@@ -635,7 +641,11 @@ impl VideoWire {
         if self.max_batch_size_kb > 64 {
             return Err("invalid_video_configuration");
         }
-        amaterasu_gamestream::video::VideoPacketizer::new(
+        let codec = match self.codec {
+            amaterasu_media::VideoCodec::H264 => amaterasu_gamestream::video::VideoCodec::H264,
+            amaterasu_media::VideoCodec::Hevc => amaterasu_gamestream::video::VideoCodec::Hevc,
+        };
+        amaterasu_gamestream::video::VideoPacketizer::new_with_codec(
             amaterasu_gamestream::video::VideoConfig {
                 packet_size: self.packet_size,
                 fec_percentage: self.fec_percentage,
@@ -643,6 +653,7 @@ impl VideoWire {
                 max_fec_blocks: self.max_fec_blocks,
                 encrypted: false,
             },
+            codec,
         )
         .map_err(|_| "invalid_video_configuration")?;
         Ok(())
@@ -670,6 +681,11 @@ pub enum CaptureProvider {
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VideoConfiguration {
+    #[serde(
+        default,
+        skip_serializing_if = "amaterasu_media::VideoCodec::is_default"
+    )]
+    pub codec: amaterasu_media::VideoCodec,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -761,6 +777,10 @@ pub enum EncoderBackend {
     Auto,
 }
 impl StartConfig {
+    pub fn matches_prepared_codec(&self, prepared: &PrepareConfig) -> bool {
+        self.configuration.codec == prepared.video.codec
+    }
+
     pub fn matches_prepared_frame_limiter(&self, prepared: &PrepareConfig) -> bool {
         prepared
             .frame_limiter_settings
@@ -1436,7 +1456,7 @@ mod tests {
             assert!(serde_json::from_value::<PrepareConfig>(config).is_err());
         }
         let mut config = start_json();
-        config["configuration"]["codec"] = json!("hevc");
+        config["configuration"]["codec"] = json!("av1");
         assert!(serde_json::from_value::<StartConfig>(config).is_err());
         let mut config = start_json();
         config["capture_provider"] = json!("arbitrary/service");

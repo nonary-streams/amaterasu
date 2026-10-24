@@ -54,6 +54,32 @@ fn negotiated_color_reaches_video_open_unchanged() {
 }
 
 #[test]
+fn authenticated_start_codec_must_match_prepared_transport_codec() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["video"]["codec"] = json!("hevc");
+    let prepared = host.response(1, request);
+    let session = prepared["session"].as_u64().expect("prepared session");
+    let rejected = host.response(2, start(session));
+    assert_eq!(rejected["code"], "video_codec_mismatch");
+    assert!(!host.broker.calls.iter().any(|call| {
+        call.service == Resource::Video.service() && call.payload["action"] == "open"
+    }));
+
+    let mut matching = start(session);
+    matching["configuration"]["configuration"]["codec"] = json!("hevc");
+    let accepted = host.response(3, matching);
+    assert_eq!(accepted["state"], "active", "{accepted}");
+    let video = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("video opened only for matching codec");
+    assert_eq!(video.payload["configuration"]["codec"], "hevc");
+}
+
+#[test]
 fn negotiated_video_geometry_and_rate_are_allocated_only_at_authenticated_start() {
     let mut host = Harness::new();
     let prepared = host.response(1, prepare());

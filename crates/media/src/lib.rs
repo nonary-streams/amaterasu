@@ -11,6 +11,8 @@ mod control;
 pub use control::*;
 mod color;
 pub use color::*;
+mod codec;
+pub use codec::*;
 mod geometry;
 pub use geometry::*;
 mod transport;

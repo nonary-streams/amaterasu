@@ -1,4 +1,5 @@
 use amaterasu_gamestream::network::{NetworkEncryptionPolicy, VideoEncryptionMode};
+use amaterasu_media::VideoCodec;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -45,7 +46,7 @@ impl Settings {
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoSettings {
-    #[serde(default, skip_serializing_if = "VideoCodec::is_h264")]
+    #[serde(default, skip_serializing_if = "VideoCodec::is_default")]
     pub codec: VideoCodec,
     pub packet_size: usize,
     pub fec_percentage: u8,
@@ -53,20 +54,6 @@ pub struct VideoSettings {
     pub max_fec_blocks: u8,
     #[serde(default = "default_video_max_batch_size_kb")]
     pub max_batch_size_kb: u8,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VideoCodec {
-    #[default]
-    H264,
-    Hevc,
-}
-
-impl VideoCodec {
-    fn is_h264(&self) -> bool {
-        *self == Self::H264
-    }
 }
 
 fn default_video_max_batch_size_kb() -> u8 {

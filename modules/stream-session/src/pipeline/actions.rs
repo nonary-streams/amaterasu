@@ -230,6 +230,10 @@ impl Pipeline {
             rpc::complete(send, request, error("audio_configuration_mismatch"));
             return;
         }
+        if !configuration.matches_prepared_codec(&record.config) {
+            rpc::complete(send, request, error("video_codec_mismatch"));
+            return;
+        }
         if !configuration.matches_prepared_frame_limiter(&record.config) {
             rpc::complete(send, request, error("frame_limiter_configuration_mismatch"));
             return;
