@@ -75,6 +75,9 @@ pub enum Operation {
         lease: String,
         events: Vec<Event>,
     },
+    PollGamepadFeedback {
+        lease: String,
+    },
     Release {
         lease: String,
     },

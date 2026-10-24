@@ -7,7 +7,9 @@ mod permit;
 mod session;
 mod vhf;
 
-pub use model::{InputEvent, InputPacket, MouseButton, PROTOCOL_VERSION, PeerIdentity};
+pub use model::{
+    GamepadFeedback, InputEvent, InputPacket, MouseButton, PROTOCOL_VERSION, PeerIdentity,
+};
 pub use permit::{PermitLedger, ProcessIdentity, WorkerLease};
 pub use session::{DeviceSink, GrantRegistry, InputGrant, InputSession};
 pub use vhf::{VhfDeviceSink, VhfTransport};

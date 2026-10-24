@@ -37,6 +37,7 @@ struct FakeBackend {
     fail_controller_disable: bool,
     controller_disable_calls: usize,
     active_controller_slots: BTreeSet<u16>,
+    gamepad_feedback: Option<amaterasu_input_companion::GamepadFeedback>,
     full_advances: usize,
     pen_touch_advances: usize,
 }
@@ -190,6 +191,11 @@ impl Backend for FakeBackend {
         self.active_controller_slots.clear();
         Ok(())
     }
+    fn poll_gamepad_feedback(
+        &mut self,
+    ) -> InputResult<Option<amaterasu_input_companion::GamepadFeedback>> {
+        Ok(self.gamepad_feedback.take())
+    }
     fn stop(&mut self) -> InputResult<()> {
         self.stops += 1;
         if self.fail_stop {
@@ -272,6 +278,98 @@ fn acquire_operation() -> Operation {
         key_repeat_delay: None,
         key_repeat_frequency: None,
     }
+}
+
+#[test]
+fn gamepad_feedback_poll_requires_the_lease_owner_and_enabled_backend() {
+    let feedback = amaterasu_input_companion::GamepadFeedback {
+        slot: 1,
+        strong_motor: 32000,
+        weak_motor: 16000,
+        duration_ms: 250,
+    };
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            gamepad_feedback: Some(feedback),
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let lease = acquire(&mut controller, now);
+
+    let denied = controller.handle(
+        "other",
+        Operation::PollGamepadFeedback {
+            lease: lease.clone(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(denied["error"]["code"], "permission_denied");
+
+    let failed_delivery = controller.handle(
+        "owner",
+        Operation::PollGamepadFeedback {
+            lease: lease.clone(),
+        },
+        now,
+        &mut || Err(InputError::new("cancelled", "request ended before poll")),
+    );
+    assert_eq!(failed_delivery["error"]["code"], "cancelled");
+    assert_eq!(controller.backend.gamepad_feedback, Some(feedback));
+
+    let received = controller.handle(
+        "owner",
+        Operation::PollGamepadFeedback {
+            lease: lease.clone(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(received["ok"], true);
+    assert_eq!(received["lease"], lease);
+    assert_eq!(received["feedback"]["slot"], 1);
+    assert_eq!(received["feedback"]["strong_motor"], 32000);
+
+    controller.backend.controller_input_supported = false;
+    let unavailable = controller.handle(
+        "owner",
+        Operation::PollGamepadFeedback { lease },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(unavailable["feedback"], serde_json::Value::Null);
+}
+
+#[test]
+fn controller_disable_still_allows_terminal_rumble_zero_to_flush() {
+    let terminal_zero = amaterasu_input_companion::GamepadFeedback {
+        slot: 1,
+        strong_motor: 0,
+        weak_motor: 0,
+        duration_ms: 0,
+    };
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            gamepad_feedback: Some(terminal_zero),
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let lease = acquire(&mut controller, now);
+    controller.set_controller_enabled(false, now).unwrap();
+
+    let response = controller.handle(
+        "owner",
+        Operation::PollGamepadFeedback { lease },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(response["feedback"]["duration_ms"], 0);
 }
 
 #[test]

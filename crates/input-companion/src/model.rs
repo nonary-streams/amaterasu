@@ -53,6 +53,17 @@ pub enum MouseButton {
     Forward,
 }
 
+/// A bounded local rumble notification emitted by a granted virtual gamepad.
+/// This is a companion API only; it is not a Moonlight wire message.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GamepadFeedback {
+    pub slot: u16,
+    pub strong_motor: u16,
+    pub weak_motor: u16,
+    pub duration_ms: u16,
+}
+
 /// Normalized intent, never a raw HID report or arbitrary device descriptor.
 /// The companion and driver must independently map and validate reports.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

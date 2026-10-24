@@ -1,7 +1,8 @@
 use crate::{
-    DeviceSink, GrantRegistry, InputError, InputEvent, InputPacket, InputResult, InputSession,
-    MouseButton, PROTOCOL_VERSION, PeerIdentity, PermitLedger, ProcessIdentity,
+    DeviceSink, GamepadFeedback, GrantRegistry, InputError, InputEvent, InputPacket, InputResult,
+    InputSession, MouseButton, PROTOCOL_VERSION, PeerIdentity, PermitLedger, ProcessIdentity,
 };
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
@@ -12,6 +13,7 @@ struct FakeDevice {
     fail_release: bool,
     heartbeats: usize,
     fail_heartbeat: bool,
+    feedback: VecDeque<GamepadFeedback>,
 }
 
 impl DeviceSink for FakeDevice {
@@ -25,6 +27,7 @@ impl DeviceSink for FakeDevice {
 
     fn release_all(&mut self) -> InputResult<()> {
         self.releases += 1;
+        self.feedback.clear();
         if self.fail_release {
             return Err(InputError::Device);
         }
@@ -38,6 +41,101 @@ impl DeviceSink for FakeDevice {
         }
         Ok(())
     }
+
+    fn poll_gamepad_feedback(&mut self) -> InputResult<Option<GamepadFeedback>> {
+        Ok(self.feedback.pop_front())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn feedback_poll_is_bound_to_the_current_gamepad_grant_and_revoke_clears_it() {
+    let now = Instant::now();
+    let mut ungranted = connect(
+        now,
+        FakeDevice {
+            feedback: VecDeque::from([GamepadFeedback {
+                slot: 0,
+                strong_motor: 1,
+                weak_motor: 1,
+                duration_ms: 1,
+            }]),
+            ..FakeDevice::default()
+        },
+    );
+    assert_eq!(
+        ungranted.poll_gamepad_feedback(7, &"a".repeat(32)),
+        Err(InputError::PermissionDenied)
+    );
+    ungranted.revoke().unwrap();
+
+    let identity = peer();
+    let feedback = GamepadFeedback {
+        slot: 2,
+        strong_motor: u16::MAX,
+        weak_motor: 17,
+        duration_ms: 10_000,
+    };
+    let mut registry = GrantRegistry::synthetic();
+    let grant = registry
+        .issue_with_capabilities(
+            identity.clone(),
+            "a".repeat(32),
+            7,
+            now + Duration::from_secs(1),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+    let mut session = InputSession::connect(
+        &identity,
+        grant,
+        FakeDevice {
+            feedback: VecDeque::from([feedback]),
+            ..FakeDevice::default()
+        },
+        now,
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.poll_gamepad_feedback(7, &"a".repeat(32)),
+        Ok(Some(feedback))
+    );
+    assert_eq!(session.poll_gamepad_feedback(7, &"a".repeat(32)), Ok(None));
+    assert_eq!(
+        session.poll_gamepad_feedback(8, &"a".repeat(32)),
+        Err(InputError::PermissionDenied)
+    );
+    assert_eq!(
+        session.poll_gamepad_feedback(7, &"b".repeat(32)),
+        Err(InputError::PermissionDenied)
+    );
+    session.revoke().unwrap();
+    assert_eq!(
+        session.poll_gamepad_feedback(7, &"a".repeat(32)),
+        Err(InputError::PermissionDenied)
+    );
+
+    let replacement = registry
+        .issue_with_capabilities(
+            identity.clone(),
+            "c".repeat(32),
+            8,
+            now + Duration::from_secs(1),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+    let mut replacement_session =
+        InputSession::connect(&identity, replacement, FakeDevice::default(), now).unwrap();
+    assert_eq!(
+        replacement_session.poll_gamepad_feedback(8, &"c".repeat(32)),
+        Ok(None)
+    );
+    replacement_session.revoke().unwrap();
 }
 
 fn peer() -> PeerIdentity {

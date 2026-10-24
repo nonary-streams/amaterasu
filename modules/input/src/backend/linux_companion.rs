@@ -25,6 +25,21 @@ fn absolute_pointer_event(x: u16, y: u16) -> InputEvent {
     InputEvent::Absolute { x, y }
 }
 
+fn feedback_belongs_to_active_slot(
+    feedback: amaterasu_input_companion::GamepadFeedback,
+    active_slots: u16,
+) -> InputResult<bool> {
+    let terminal_zero = feedback.strong_motor == 0 && feedback.weak_motor == 0;
+    if feedback.slot >= 16
+        || feedback.duration_ms > 10_000
+        || terminal_zero && feedback.duration_ms != 0
+        || !terminal_zero && feedback.duration_ms == 0
+    {
+        return Err(invalid_event());
+    }
+    Ok(terminal_zero || active_slots & (1u16 << feedback.slot) != 0)
+}
+
 fn companion_gamepad_event(event: &Event) -> InputResult<InputEvent> {
     let Event::Controller {
         number,
@@ -167,6 +182,7 @@ pub struct LinuxCompanionBackend {
     key_rightalt_to_key_win: bool,
     profile: GamepadProfile,
     touch_as_mouse: SingleTouchAsMouse,
+    active_gamepad_slots: u16,
 }
 
 impl LinuxCompanionBackend {
@@ -178,6 +194,7 @@ impl LinuxCompanionBackend {
             key_rightalt_to_key_win: false,
             profile: GamepadProfile::Auto,
             touch_as_mouse: SingleTouchAsMouse::default(),
+            active_gamepad_slots: 0,
         }
     }
 
@@ -203,6 +220,20 @@ impl LinuxCompanionBackend {
     fn send(&mut self, event: InputEvent) -> InputResult<()> {
         let client = self.client.as_mut().ok_or_else(not_started)?;
         client.send(event).map_err(companion_error)
+    }
+
+    fn poll_feedback(&mut self) -> InputResult<Option<amaterasu_input_companion::GamepadFeedback>> {
+        let client = self.client.as_mut().ok_or_else(not_started)?;
+        if !client.gamepad_enabled() {
+            return Ok(None);
+        }
+        let Some(feedback) = client.poll_gamepad_feedback().map_err(companion_error)? else {
+            return Ok(None);
+        };
+        if !feedback_belongs_to_active_slot(feedback, self.active_gamepad_slots)? {
+            return Ok(None);
+        }
+        Ok(Some(feedback))
     }
 }
 
@@ -306,6 +337,7 @@ impl Backend for LinuxCompanionBackend {
             Some(LinuxInputClient::connect(Path::new(&self.socket_path)).map_err(companion_error)?);
         self.held_virtual_keycodes.clear();
         self.touch_as_mouse.reset();
+        self.active_gamepad_slots = 0;
         Ok(())
     }
 
@@ -340,7 +372,11 @@ impl Backend for LinuxCompanionBackend {
                 dy: i16::try_from(*dy).map_err(|_| invalid_event())?,
             }),
             Event::Absolute { x, y } => self.send(absolute_pointer_event(*x, *y)),
-            Event::Controller { .. } => self.send(companion_gamepad_event(event)?),
+            Event::Controller { active_mask, .. } => {
+                self.send(companion_gamepad_event(event)?)?;
+                self.active_gamepad_slots = *active_mask;
+                Ok(())
+            }
             Event::PenTouch { .. } => {
                 let (intents, next_pointer) = self.touch_as_mouse.plan(event)?;
                 for intent in intents {
@@ -371,6 +407,7 @@ impl Backend for LinuxCompanionBackend {
             .as_ref()
             .is_some_and(LinuxInputClient::gamepad_enabled)
         {
+            self.active_gamepad_slots = 0;
             return Ok(());
         }
         self.send(InputEvent::Gamepad {
@@ -383,7 +420,15 @@ impl Backend for LinuxCompanionBackend {
             left_y: 0,
             right_x: 0,
             right_y: 0,
-        })
+        })?;
+        self.active_gamepad_slots = 0;
+        Ok(())
+    }
+
+    fn poll_gamepad_feedback(
+        &mut self,
+    ) -> InputResult<Option<amaterasu_input_companion::GamepadFeedback>> {
+        self.poll_feedback()
     }
 
     fn stop(&mut self) -> InputResult<()> {
@@ -392,6 +437,7 @@ impl Backend for LinuxCompanionBackend {
         };
         self.held_virtual_keycodes.clear();
         self.touch_as_mouse.reset();
+        self.active_gamepad_slots = 0;
         client.close().map_err(companion_error)
     }
 }
@@ -454,14 +500,15 @@ fn companion_error(error: amaterasu_input_companion::InputError) -> InputError {
 mod tests {
     use super::{
         Axis, Backend, InputEvent, KeyState, LinuxCompanionBackend, SingleTouchAsMouse,
-        absolute_pointer_event, companion_gamepad_event, evdev_key_event, left_button_event,
-        scroll_events,
+        absolute_pointer_event, companion_gamepad_event, evdev_key_event,
+        feedback_belongs_to_active_slot, left_button_event, scroll_events,
     };
     use crate::gamepad_profile::GamepadProfile;
     use crate::model::{Event, PenTouchDevice, PenTouchPhase};
     use amaterasu_input_companion::{
-        DeviceSink, GrantRegistry, InputError as CompanionError, InputPacket, InputResult,
-        InputSession, MouseButton as CompanionMouseButton, PROTOCOL_VERSION, PeerIdentity,
+        DeviceSink, GamepadFeedback, GrantRegistry, InputError as CompanionError, InputPacket,
+        InputResult, InputSession, MouseButton as CompanionMouseButton, PROTOCOL_VERSION,
+        PeerIdentity,
     };
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -527,6 +574,50 @@ mod tests {
                 InputEvent::Absolute { x: 0, y: u16::MAX },
                 left_button_event(false),
             ]
+        );
+    }
+
+    #[test]
+    fn rumble_feedback_is_returned_only_for_a_current_bounded_slot() {
+        let feedback = GamepadFeedback {
+            slot: 3,
+            strong_motor: 40000,
+            weak_motor: 12000,
+            duration_ms: 500,
+        };
+        assert_eq!(feedback_belongs_to_active_slot(feedback, 1 << 3), Ok(true));
+        assert_eq!(feedback_belongs_to_active_slot(feedback, 1 << 2), Ok(false));
+        assert_eq!(
+            feedback_belongs_to_active_slot(
+                GamepadFeedback {
+                    strong_motor: 0,
+                    weak_motor: 0,
+                    duration_ms: 0,
+                    ..feedback
+                },
+                0,
+            ),
+            Ok(true)
+        );
+        assert!(
+            feedback_belongs_to_active_slot(
+                GamepadFeedback {
+                    slot: 16,
+                    ..feedback
+                },
+                u16::MAX,
+            )
+            .is_err()
+        );
+        assert!(
+            feedback_belongs_to_active_slot(
+                GamepadFeedback {
+                    duration_ms: 10_001,
+                    ..feedback
+                },
+                1 << 3,
+            )
+            .is_err()
         );
     }
 

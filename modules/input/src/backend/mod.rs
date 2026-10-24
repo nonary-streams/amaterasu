@@ -61,6 +61,13 @@ pub trait Backend {
     fn disable_controller_input(&mut self) -> InputResult<()> {
         Ok(())
     }
+    /// Returns one local, session-owned rumble event when the backend supports
+    /// reverse feedback. It is not a client-protocol capability by itself.
+    fn poll_gamepad_feedback(
+        &mut self,
+    ) -> InputResult<Option<amaterasu_input_companion::GamepadFeedback>> {
+        Ok(None)
+    }
     fn stop(&mut self) -> InputResult<()>;
 }
 #[cfg(windows)]

@@ -1,4 +1,6 @@
-use crate::model::{HeldInput, InputEvent, InputPacket, PROTOCOL_VERSION, PeerIdentity};
+use crate::model::{
+    GamepadFeedback, HeldInput, InputEvent, InputPacket, PROTOCOL_VERSION, PeerIdentity,
+};
 use crate::{InputError, InputResult};
 use amaterasu_storage::{
     create_machine_private_directory, protect_machine_private_file, read_json,
@@ -20,6 +22,9 @@ pub trait DeviceSink {
     fn release_all(&mut self) -> InputResult<()>;
     fn keep_alive(&mut self) -> InputResult<()> {
         Ok(())
+    }
+    fn poll_gamepad_feedback(&mut self) -> InputResult<Option<GamepadFeedback>> {
+        Ok(None)
     }
 }
 
@@ -228,6 +233,31 @@ pub struct InputSession<S: DeviceSink> {
 }
 
 impl<S: DeviceSink> InputSession<S> {
+    /// Reads one feedback event only for the current gamepad-enabled lease.
+    /// Generation and token are checked independently of the Unix peer check.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn poll_gamepad_feedback(
+        &mut self,
+        generation: u64,
+        token: &str,
+    ) -> InputResult<Option<GamepadFeedback>> {
+        if self.closed || !self.grant.gamepad {
+            return Err(InputError::PermissionDenied);
+        }
+        if generation != self.grant.generation || token != self.grant.lease_token {
+            return Err(InputError::PermissionDenied);
+        }
+        let registry = self
+            .grant
+            .registry
+            .lock()
+            .map_err(|_| InputError::InvalidGrant)?;
+        if registry.active.as_ref() != Some(&(self.grant.peer.clone(), self.grant.generation)) {
+            return Err(InputError::PermissionDenied);
+        }
+        self.sink.poll_gamepad_feedback()
+    }
+
     /// Called only while the separate host permit is current. This keeps a
     /// long-running authorized worker from hitting its original one-hour cap.
     pub(crate) fn refresh_host_authorized_expiry(&mut self, now: Instant) -> InputResult<()> {

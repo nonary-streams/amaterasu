@@ -232,12 +232,36 @@ impl<B: Backend> Controller<B> {
             Operation::Batch { lease, events } => {
                 return self.batch(caller, &lease, events, now, guard);
             }
+            Operation::PollGamepadFeedback { lease } => {
+                self.poll_gamepad_feedback(caller, &lease, guard)
+            }
             Operation::Release { lease } => self.authorize(caller, &lease, true).and_then(|()| {
                 self.finish_lease(now, "released")?;
                 Ok(json!({"ok":true,"released":true}))
             }),
         };
         result.unwrap_or_else(|error| self.failure(error))
+    }
+
+    fn poll_gamepad_feedback(
+        &mut self,
+        caller: &str,
+        token: &str,
+        guard: &mut impl FnMut() -> InputResult<()>,
+    ) -> InputResult<Value> {
+        self.authorize(caller, token, false)?;
+        guard()?;
+        if !self.backend.controller_input_supported() {
+            return Ok(json!({"ok":true,"lease":token,"feedback":null}));
+        }
+        let feedback = self.backend.poll_gamepad_feedback()?;
+        let terminal_zero = feedback.is_some_and(|event| {
+            event.strong_motor == 0 && event.weak_motor == 0 && event.duration_ms == 0
+        });
+        if !self.controller_enabled && !terminal_zero {
+            return Ok(json!({"ok":true,"lease":token,"feedback":null}));
+        }
+        Ok(json!({"ok":true,"lease":token,"feedback":feedback}))
     }
     pub fn expire(&mut self, now: Instant) {
         self.terminal_acquires

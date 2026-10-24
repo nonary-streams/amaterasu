@@ -7,11 +7,11 @@
 //! authorization boundary, not a sandbox for trusted native modules running in
 //! the host process.
 use crate::{
-    DeviceSink, GrantRegistry, InputError, InputEvent, InputPacket, InputResult, InputSession,
-    MouseButton, PROTOCOL_VERSION, PermitLedger, ProcessIdentity,
+    DeviceSink, GamepadFeedback, GrantRegistry, InputError, InputEvent, InputPacket, InputResult,
+    InputSession, MouseButton, PROTOCOL_VERSION, PermitLedger, ProcessIdentity,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -33,6 +33,15 @@ const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
 const EV_REL: u16 = 2;
 const EV_ABS: u16 = 3;
+const EV_FF: u16 = 0x15;
+const EV_UINPUT: u16 = 0x0101;
+const FF_RUMBLE: u16 = 0x50;
+const UI_FF_UPLOAD: u16 = 1;
+const UI_FF_ERASE: u16 = 2;
+const MAX_FF_EFFECTS: u32 = 16;
+const MAX_RUMBLE_DURATION_MS: u16 = 10_000;
+const MAX_FEEDBACK_QUEUE: usize = 16;
+const MAX_FF_EVENTS_PER_POLL: usize = 64;
 const ABS_X: u16 = 0;
 const ABS_Y: u16 = 1;
 const GAMEPAD_ABS_X: u16 = 0;
@@ -53,11 +62,16 @@ const UI_SET_EVBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 100);
 const UI_SET_KEYBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 101);
 const UI_SET_RELBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 102);
 const UI_SET_ABSBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 103);
+const UI_SET_FFBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 107);
 const UI_SET_PROPBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 110);
 const UI_DEV_SETUP: libc::Ioctl = libc::_IOW::<libc::uinput_setup>(b'U' as u32, 3);
 const UI_ABS_SETUP: libc::Ioctl = libc::_IOW::<libc::uinput_abs_setup>(b'U' as u32, 4);
 const UI_DEV_CREATE: libc::Ioctl = libc::_IO(b'U' as u32, 1);
 const UI_DEV_DESTROY: libc::Ioctl = libc::_IO(b'U' as u32, 2);
+const UI_BEGIN_FF_UPLOAD: libc::Ioctl = libc::_IOWR::<UinputFfUpload>(b'U' as u32, 200);
+const UI_END_FF_UPLOAD: libc::Ioctl = libc::_IOW::<UinputFfUpload>(b'U' as u32, 201);
+const UI_BEGIN_FF_ERASE: libc::Ioctl = libc::_IOWR::<UinputFfErase>(b'U' as u32, 202);
+const UI_END_FF_ERASE: libc::Ioctl = libc::_IOW::<UinputFfErase>(b'U' as u32, 203);
 const GAMEPAD_BUTTONS: [(u32, u16); 21] = [
     (1 << 0, 0x220),
     (1 << 1, 0x221),
@@ -87,6 +101,7 @@ const GAMEPAD_BUTTONS: [(u32, u16); 21] = [
 enum Request {
     WorkerStart,
     WorkerEvent { packet: InputPacket },
+    WorkerFeedbackPoll { generation: u64, token: String },
     WorkerClose,
 }
 
@@ -100,6 +115,9 @@ enum Reply {
         gamepad: bool,
     },
     Denied,
+    Feedback {
+        event: Option<GamepadFeedback>,
+    },
 }
 
 /// Host-owned server handle. The host must retain it while a worker can submit
@@ -483,6 +501,22 @@ impl LinuxInputClient {
         }
     }
 
+    /// Polls one local rumble event from a session-owned gamepad. This stays
+    /// separate from the Moonlight protocol until a host feedback route exists.
+    pub fn poll_gamepad_feedback(&mut self) -> InputResult<Option<GamepadFeedback>> {
+        if self.closed {
+            return Err(InputError::Closed);
+        }
+        self.write_request(&Request::WorkerFeedbackPoll {
+            generation: self.generation,
+            token: self.token.clone(),
+        })?;
+        match self.read_reply()? {
+            Reply::Feedback { event } => Ok(event),
+            _ => Err(InputError::PermissionDenied),
+        }
+    }
+
     pub fn close(&mut self) -> InputResult<()> {
         if self.closed {
             return Ok(());
@@ -731,6 +765,17 @@ fn run_worker<S: DeviceSink>(
                 write_reply_to(reader.get_ref(), &Reply::Ok)?;
                 break;
             }
+            Ok(Request::WorkerFeedbackPoll { generation, token }) => {
+                let permit = ledger.lock().map_err(|_| InputError::Closed)?;
+                if !permit.is_current(process, Instant::now()) {
+                    drop(permit);
+                    write_reply_to(reader.get_ref(), &Reply::Denied)?;
+                    break;
+                }
+                let event = session.poll_gamepad_feedback(generation, &token)?;
+                drop(permit);
+                write_reply_to(reader.get_ref(), &Reply::Feedback { event })?;
+            }
             _ => {
                 write_reply_to(reader.get_ref(), &Reply::Denied)?;
                 break;
@@ -746,6 +791,7 @@ struct LinuxUinputSink {
     pointer: Option<UinputDevice>,
     gamepads: HashMap<u16, UinputGamepad>,
     gamepad_enabled: bool,
+    feedback: GamepadFeedbackQueue,
     vertical_remainder: i32,
     horizontal_remainder: i32,
 }
@@ -773,6 +819,7 @@ impl LinuxUinputSink {
             pointer,
             gamepads: HashMap::new(),
             gamepad_enabled: gamepad,
+            feedback: GamepadFeedbackQueue::default(),
             vertical_remainder: 0,
             horizontal_remainder: 0,
         })
@@ -855,6 +902,7 @@ impl DeviceSink for LinuxUinputSink {
     }
 
     fn release_all(&mut self) -> InputResult<()> {
+        self.feedback.clear();
         let keyboard = self
             .keyboard
             .as_mut()
@@ -889,6 +937,10 @@ impl DeviceSink for LinuxUinputSink {
 
     fn keep_alive(&mut self) -> InputResult<()> {
         Ok(())
+    }
+
+    fn poll_gamepad_feedback(&mut self) -> InputResult<Option<GamepadFeedback>> {
+        LinuxUinputSink::poll_gamepad_feedback(self)
     }
 }
 
@@ -1004,6 +1056,21 @@ fn gamepad_neutralization_frame(
 }
 
 impl LinuxUinputSink {
+    fn poll_gamepad_feedback(&mut self) -> InputResult<Option<GamepadFeedback>> {
+        if !self.gamepad_enabled {
+            self.feedback.clear();
+            return Err(InputError::PermissionDenied);
+        }
+        for (slot, gamepad) in &mut self.gamepads {
+            if let Some(device) = gamepad.device.as_mut() {
+                for feedback in device.read_gamepad_feedback(*slot)? {
+                    self.feedback.push(feedback);
+                }
+            }
+        }
+        Ok(self.feedback.pop(Instant::now()))
+    }
+
     fn gamepad(&mut self, number: u16, active_mask: u16, next: GamepadSnapshot) -> InputResult<()> {
         if !self.gamepad_enabled {
             return Err(InputError::PermissionDenied);
@@ -1016,6 +1083,7 @@ impl LinuxUinputSink {
             .collect::<Vec<_>>();
         let mut first_error = None;
         for slot in inactive {
+            self.feedback.discard_slot(slot);
             if let Some(gamepad) = self.gamepads.get_mut(&slot)
                 && let Err(error) = gamepad.release()
                 && first_error.is_none()
@@ -1079,9 +1147,216 @@ impl LinuxUinputSink {
     }
 }
 
+struct QueuedFeedback {
+    event: GamepadFeedback,
+    pending: bool,
+    published: bool,
+    expires_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct GamepadFeedbackQueue {
+    events: HashMap<u16, QueuedFeedback>,
+    pending: VecDeque<u16>,
+}
+
+impl GamepadFeedbackQueue {
+    fn push(&mut self, mut event: GamepadFeedback) {
+        if event.slot >= MAX_FEEDBACK_QUEUE as u16 || event.duration_ms > MAX_RUMBLE_DURATION_MS {
+            return;
+        }
+        if event.strong_motor == 0 && event.weak_motor == 0 {
+            event.duration_ms = 0;
+        } else if event.duration_ms == 0 {
+            return;
+        }
+        match self.events.get_mut(&event.slot) {
+            Some(queued) => {
+                queued.event = event;
+                queued.expires_at = None;
+                if !queued.pending {
+                    queued.pending = true;
+                    self.pending.push_back(event.slot);
+                }
+            }
+            None if self.events.len() < MAX_FEEDBACK_QUEUE => {
+                self.events.insert(
+                    event.slot,
+                    QueuedFeedback {
+                        event,
+                        pending: true,
+                        published: false,
+                        expires_at: None,
+                    },
+                );
+                self.pending.push_back(event.slot);
+            }
+            None => {}
+        }
+    }
+
+    fn pop(&mut self, now: Instant) -> Option<GamepadFeedback> {
+        self.queue_expired_zeros(now);
+        let slot = self.pending.pop_front()?;
+        let event = {
+            let queued = self.events.get_mut(&slot)?;
+            queued.pending = false;
+            let event = queued.event;
+            if event.strong_motor != 0 || event.weak_motor != 0 {
+                queued.published = true;
+                queued.expires_at = Some(now + Duration::from_millis(u64::from(event.duration_ms)));
+            }
+            event
+        };
+        if event.strong_motor == 0 && event.weak_motor == 0 {
+            self.events.remove(&slot);
+        }
+        Some(event)
+    }
+
+    fn queue_expired_zeros(&mut self, now: Instant) {
+        let expired = self
+            .events
+            .iter()
+            .filter_map(|(&slot, queued)| {
+                (!queued.pending
+                    && queued.published
+                    && queued.expires_at.is_some_and(|at| now >= at))
+                .then_some(slot)
+            })
+            .collect::<Vec<_>>();
+        for slot in expired {
+            if let Some(queued) = self.events.get_mut(&slot) {
+                queued.event = GamepadFeedback {
+                    slot,
+                    strong_motor: 0,
+                    weak_motor: 0,
+                    duration_ms: 0,
+                };
+                queued.expires_at = None;
+                queued.pending = true;
+                self.pending.push_back(slot);
+            }
+        }
+    }
+
+    fn discard_slot(&mut self, slot: u16) {
+        let Some(published) = self.events.get(&slot).map(|queued| queued.published) else {
+            return;
+        };
+        if published {
+            let queued = self.events.get_mut(&slot).expect("slot was just inspected");
+            queued.event = GamepadFeedback {
+                slot,
+                strong_motor: 0,
+                weak_motor: 0,
+                duration_ms: 0,
+            };
+            queued.expires_at = None;
+            if !queued.pending {
+                queued.pending = true;
+                self.pending.push_back(slot);
+            }
+        } else {
+            self.events.remove(&slot);
+            self.pending.retain(|pending_slot| *pending_slot != slot);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.events.clear();
+        self.pending.clear();
+    }
+}
+
 struct UinputDevice {
     file: File,
     created: bool,
+    rumble_effects: HashMap<i16, RumbleEffect>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FfTrigger {
+    button: u16,
+    interval: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FfReplay {
+    length: u16,
+    delay: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FfRumble {
+    strong_magnitude: u16,
+    weak_magnitude: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union FfEffectData {
+    rumble: FfRumble,
+    #[cfg(target_pointer_width = "64")]
+    _padding: [u64; 4],
+    #[cfg(target_pointer_width = "32")]
+    _padding: [u32; 7],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FfEffect {
+    kind: u16,
+    id: i16,
+    _direction: u16,
+    trigger: FfTrigger,
+    replay: FfReplay,
+    data: FfEffectData,
+}
+
+#[repr(C)]
+struct UinputFfUpload {
+    request_id: u32,
+    retval: i32,
+    effect: FfEffect,
+    _old: FfEffect,
+}
+
+#[repr(C)]
+struct UinputFfErase {
+    request_id: u32,
+    retval: i32,
+    effect_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RumbleEffect {
+    strong_motor: u16,
+    weak_motor: u16,
+    duration_ms: u16,
+}
+
+fn validated_rumble_effect(effect: FfEffect) -> Option<RumbleEffect> {
+    if effect.kind != FF_RUMBLE
+        || effect.id < 0
+        || effect.id >= MAX_FF_EFFECTS as i16
+        || effect.trigger.button != 0
+        || effect.trigger.interval != 0
+        || effect.replay.delay != 0
+        || !(1..=MAX_RUMBLE_DURATION_MS).contains(&effect.replay.length)
+    {
+        return None;
+    }
+    // SAFETY: effect.kind is FF_RUMBLE, so the union member is FfRumble.
+    let rumble = unsafe { effect.data.rumble };
+    Some(RumbleEffect {
+        strong_motor: rumble.strong_magnitude,
+        weak_motor: rumble.weak_magnitude,
+        duration_ms: effect.replay.length,
+    })
 }
 
 impl UinputDevice {
@@ -1147,11 +1422,13 @@ impl UinputDevice {
         Ok(Self {
             file,
             created: true,
+            rumble_effects: HashMap::new(),
         })
     }
 
     fn create_gamepad(path: &Path, number: u8) -> InputResult<Self> {
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
@@ -1183,7 +1460,10 @@ impl UinputDevice {
         ] {
             configure_gamepad_axis(fd, code, minimum, maximum)?;
         }
+        set_bit(fd, UI_SET_EVBIT, u32::from(EV_FF))?;
+        set_bit(fd, UI_SET_FFBIT, u32::from(FF_RUMBLE))?;
         let mut setup = device_setup(&format!("Amaterasu gamepad {number}"));
+        setup.ff_effects_max = MAX_FF_EFFECTS;
         // SAFETY: fd is a live owned uinput descriptor and setup remains valid
         // for the exact uinput_setup structure size encoded by UI_DEV_SETUP.
         check(unsafe { libc::ioctl(fd, UI_DEV_SETUP, &mut setup) })?;
@@ -1192,7 +1472,115 @@ impl UinputDevice {
         Ok(Self {
             file,
             created: true,
+            rumble_effects: HashMap::new(),
         })
+    }
+
+    fn read_gamepad_feedback(&mut self, slot: u16) -> InputResult<Vec<GamepadFeedback>> {
+        let mut feedback = Vec::new();
+        let mut events_processed = 0;
+        loop {
+            // SAFETY: input_event is a C UAPI record; zeroed storage is valid
+            // for its integer and timestamp fields while the kernel fills it.
+            let mut events: [libc::input_event; 32] = unsafe { std::mem::zeroed() };
+            let event_size = std::mem::size_of::<libc::input_event>();
+            let buffer_size = std::mem::size_of_val(&events);
+            let bytes_to_read =
+                buffer_size.min((MAX_FF_EVENTS_PER_POLL - events_processed) * event_size);
+            // SAFETY: the array is writable for exactly buffer_size bytes.
+            let bytes_read = unsafe {
+                libc::read(
+                    self.file.as_raw_fd(),
+                    events.as_mut_ptr().cast(),
+                    bytes_to_read,
+                )
+            };
+            if bytes_read < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    break;
+                }
+                return Err(system_error(error));
+            }
+            if bytes_read == 0 {
+                break;
+            }
+            let bytes_read = bytes_read as usize;
+            if !bytes_read.is_multiple_of(event_size) {
+                return Err(InputError::Device);
+            }
+            let event_count = bytes_read / event_size;
+            for event in events.iter().take(event_count) {
+                match (event.type_, event.code, event.value) {
+                    (EV_UINPUT, UI_FF_UPLOAD, request_id) if request_id >= 0 => {
+                        self.upload_rumble(request_id as u32)?;
+                    }
+                    (EV_UINPUT, UI_FF_ERASE, request_id) if request_id >= 0 => {
+                        self.erase_rumble(request_id as u32)?;
+                    }
+                    (EV_FF, effect_id, value @ (0 | 1)) => {
+                        let effect = self
+                            .rumble_effects
+                            .get(&(effect_id as i16))
+                            .copied()
+                            .ok_or(InputError::InvalidEvent)?;
+                        push_latest_slot_feedback(
+                            &mut feedback,
+                            GamepadFeedback {
+                                slot,
+                                strong_motor: if value == 1 { effect.strong_motor } else { 0 },
+                                weak_motor: if value == 1 { effect.weak_motor } else { 0 },
+                                duration_ms: if value == 1 { effect.duration_ms } else { 0 },
+                            },
+                        );
+                    }
+                    (EV_FF, _, _) | (EV_UINPUT, _, _) => return Err(InputError::InvalidEvent),
+                    _ => {}
+                }
+            }
+            events_processed += event_count;
+            if bytes_read < bytes_to_read || events_processed == MAX_FF_EVENTS_PER_POLL {
+                break;
+            }
+        }
+        Ok(feedback)
+    }
+
+    fn upload_rumble(&mut self, request_id: u32) -> InputResult<()> {
+        // SAFETY: the request structure is zeroed and stays alive through both
+        // ioctl calls; request_id is supplied by the kernel event queue.
+        let mut request: UinputFfUpload = unsafe { std::mem::zeroed() };
+        request.request_id = request_id;
+        check(unsafe { libc::ioctl(self.file.as_raw_fd(), UI_BEGIN_FF_UPLOAD, &mut request) })?;
+        let effect = request.effect;
+        let replacement = self.rumble_effects.contains_key(&effect.id);
+        let upload_result = if let Some(rumble) = validated_rumble_effect(effect)
+            && (replacement || self.rumble_effects.len() < MAX_FF_EFFECTS as usize)
+        {
+            self.rumble_effects.insert(effect.id, rumble);
+            request.retval = 0;
+            Ok(())
+        } else {
+            request.retval = -libc::EINVAL;
+            Err(InputError::InvalidEvent)
+        };
+        // Always complete a begun request so the kernel callback is released.
+        check(unsafe { libc::ioctl(self.file.as_raw_fd(), UI_END_FF_UPLOAD, &request) })?;
+        upload_result
+    }
+
+    fn erase_rumble(&mut self, request_id: u32) -> InputResult<()> {
+        // SAFETY: the request structure is zeroed and stays alive through both
+        // ioctl calls; request_id is supplied by the kernel event queue.
+        let mut request: UinputFfErase = unsafe { std::mem::zeroed() };
+        request.request_id = request_id;
+        check(unsafe { libc::ioctl(self.file.as_raw_fd(), UI_BEGIN_FF_ERASE, &mut request) })?;
+        let result = i16::try_from(request.effect_id)
+            .ok()
+            .and_then(|effect_id| self.rumble_effects.remove(&effect_id))
+            .map_or(-libc::EINVAL, |_| 0);
+        request.retval = result;
+        check(unsafe { libc::ioctl(self.file.as_raw_fd(), UI_END_FF_ERASE, &request) })
     }
 
     fn emit(&self, values: &[(u16, u16, i32)]) -> InputResult<()> {
@@ -1233,6 +1621,14 @@ impl UinputDevice {
             self.created = false;
         }
         Ok(())
+    }
+}
+
+fn push_latest_slot_feedback(events: &mut Vec<GamepadFeedback>, feedback: GamepadFeedback) {
+    if let Some(existing) = events.iter_mut().find(|event| event.slot == feedback.slot) {
+        *existing = feedback;
+    } else if events.len() < MAX_FEEDBACK_QUEUE {
+        events.push(feedback);
     }
 }
 
@@ -1686,6 +2082,217 @@ mod tests {
         assert!(release.contains(&(EV_ABS, GAMEPAD_ABS_RX, 0)));
         assert!(release.contains(&(EV_ABS, GAMEPAD_ABS_RY, 0)));
         assert!(release.contains(&(EV_ABS, GAMEPAD_ABS_RZ, 0)));
+    }
+
+    #[test]
+    fn feedback_queue_emits_terminal_zero_at_effect_expiry() {
+        let mut queue = GamepadFeedbackQueue::default();
+        let started = Instant::now();
+        let rumble = GamepadFeedback {
+            slot: 3,
+            strong_motor: 100,
+            weak_motor: 200,
+            duration_ms: 500,
+        };
+        queue.push(rumble);
+
+        assert_eq!(queue.pop(started), Some(rumble));
+        assert_eq!(queue.pop(started + Duration::from_millis(499)), None);
+        assert_eq!(
+            queue.pop(started + Duration::from_millis(500)),
+            Some(GamepadFeedback {
+                slot: 3,
+                strong_motor: 0,
+                weak_motor: 0,
+                duration_ms: 0,
+            })
+        );
+        assert_eq!(queue.pop(started + Duration::from_millis(501)), None);
+    }
+
+    #[test]
+    fn feedback_expiry_zero_survives_an_unconfirmed_start_send() {
+        let mut queue = GamepadFeedbackQueue::default();
+        let started = Instant::now();
+        queue.push(GamepadFeedback {
+            slot: 1,
+            strong_motor: 1,
+            weak_motor: 2,
+            duration_ms: 100,
+        });
+
+        let start = queue.pop(started).unwrap();
+        assert_eq!(start.strong_motor, 1);
+        // Simulate an ambiguous downstream send: the consumer does not
+        // acknowledge the update, but the bounded effect still expires.
+        assert_eq!(
+            queue
+                .pop(started + Duration::from_millis(100))
+                .unwrap()
+                .strong_motor,
+            0
+        );
+    }
+
+    #[test]
+    fn replacement_rumble_refreshes_the_deadline_and_latest_magnitudes() {
+        let mut queue = GamepadFeedbackQueue::default();
+        let started = Instant::now();
+        queue.push(GamepadFeedback {
+            slot: 2,
+            strong_motor: 100,
+            weak_motor: 200,
+            duration_ms: 100,
+        });
+        assert_eq!(queue.pop(started).unwrap().strong_motor, 100);
+
+        queue.push(GamepadFeedback {
+            slot: 2,
+            strong_motor: 300,
+            weak_motor: 400,
+            duration_ms: 200,
+        });
+        assert_eq!(
+            queue.pop(started + Duration::from_millis(50)).unwrap(),
+            GamepadFeedback {
+                slot: 2,
+                strong_motor: 300,
+                weak_motor: 400,
+                duration_ms: 200,
+            }
+        );
+        assert_eq!(queue.pop(started + Duration::from_millis(100)), None);
+        assert_eq!(
+            queue
+                .pop(started + Duration::from_millis(250))
+                .unwrap()
+                .strong_motor,
+            0
+        );
+    }
+
+    #[test]
+    fn feedback_queue_replaces_state_and_stays_bounded_under_slot_pressure() {
+        let mut queue = GamepadFeedbackQueue::default();
+        let now = Instant::now();
+        for slot in 0..MAX_FEEDBACK_QUEUE as u16 {
+            queue.push(GamepadFeedback {
+                slot,
+                strong_motor: u16::MAX,
+                weak_motor: 10,
+                duration_ms: MAX_RUMBLE_DURATION_MS,
+            });
+        }
+        queue.push(GamepadFeedback {
+            slot: 3,
+            strong_motor: 7,
+            weak_motor: 8,
+            duration_ms: 100,
+        });
+        queue.push(GamepadFeedback {
+            slot: 16,
+            strong_motor: 1,
+            weak_motor: 1,
+            duration_ms: 100,
+        });
+
+        assert_eq!(queue.events.len(), MAX_FEEDBACK_QUEUE);
+        assert_eq!(queue.pending.len(), MAX_FEEDBACK_QUEUE);
+        let slot_three = queue.pending.iter().position(|slot| *slot == 3).unwrap();
+        assert_eq!(slot_three, 3);
+        for _ in 0..3 {
+            queue.pop(now).unwrap();
+        }
+        assert_eq!(queue.pop(now).unwrap().slot, 3);
+        assert!(queue.events.len() <= MAX_FEEDBACK_QUEUE);
+    }
+
+    #[test]
+    fn slot_removal_emits_zero_and_reused_slot_has_only_new_state() {
+        let mut queue = GamepadFeedbackQueue::default();
+        let now = Instant::now();
+        let old_state = GamepadFeedback {
+            slot: 3,
+            strong_motor: 500,
+            weak_motor: 600,
+            duration_ms: 5000,
+        };
+        queue.push(old_state);
+        assert_eq!(queue.pop(now), Some(old_state));
+
+        queue.discard_slot(3);
+        assert_eq!(
+            queue.pop(now),
+            Some(GamepadFeedback {
+                slot: 3,
+                strong_motor: 0,
+                weak_motor: 0,
+                duration_ms: 0,
+            })
+        );
+
+        let new_state = GamepadFeedback {
+            strong_motor: 900,
+            weak_motor: 100,
+            ..old_state
+        };
+        queue.push(new_state);
+        assert_eq!(queue.pop(now), Some(new_state));
+        queue.clear();
+        assert_eq!(queue.pop(now + Duration::from_secs(10)), None);
+    }
+
+    #[test]
+    fn rumble_ioctl_records_match_the_linux_uapi_layout() {
+        assert_eq!(
+            std::mem::size_of::<FfEffect>(),
+            std::mem::size_of::<libc::ff_effect>()
+        );
+        assert_eq!(
+            std::mem::size_of::<UinputFfUpload>(),
+            std::mem::size_of::<libc::uinput_ff_upload>()
+        );
+        assert_eq!(
+            std::mem::size_of::<UinputFfErase>(),
+            std::mem::size_of::<libc::uinput_ff_erase>()
+        );
+    }
+
+    #[test]
+    fn rumble_upload_validation_accepts_only_bounded_simple_rumble() {
+        let effect = |kind, id, duration_ms, trigger_button| FfEffect {
+            kind,
+            id,
+            _direction: 0,
+            trigger: FfTrigger {
+                button: trigger_button,
+                interval: 0,
+            },
+            replay: FfReplay {
+                length: duration_ms,
+                delay: 0,
+            },
+            data: FfEffectData {
+                rumble: FfRumble {
+                    strong_magnitude: 500,
+                    weak_magnitude: 250,
+                },
+            },
+        };
+        assert_eq!(
+            validated_rumble_effect(effect(FF_RUMBLE, 2, 400, 0)),
+            Some(RumbleEffect {
+                strong_motor: 500,
+                weak_motor: 250,
+                duration_ms: 400,
+            })
+        );
+        assert!(validated_rumble_effect(effect(FF_RUMBLE, 2, 0, 0)).is_none());
+        assert!(validated_rumble_effect(effect(FF_RUMBLE, 2, 10_001, 0)).is_none());
+        assert!(validated_rumble_effect(effect(0x52, 2, 400, 0)).is_none());
+        assert!(validated_rumble_effect(effect(FF_RUMBLE, -1, 400, 0)).is_none());
+        assert!(validated_rumble_effect(effect(FF_RUMBLE, 16, 400, 0)).is_none());
+        assert!(validated_rumble_effect(effect(FF_RUMBLE, 2, 400, 1)).is_none());
     }
 
     #[test]
