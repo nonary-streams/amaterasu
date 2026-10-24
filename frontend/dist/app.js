@@ -5577,7 +5577,7 @@ var Amaterasu;
                     ? Amaterasu.messageOf(snapshot.reason)
                     : "Responded to the latest refresh",
             ]);
-            area.replaceChildren(hero, metrics, Amaterasu.panel("Service access", Amaterasu.table(["Service", "Status", "Details"], serviceRows)), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Streaming is still being built"), Amaterasu.el("p", "", "Client pairing, capture, and stream connections are not available in this release. The management tools shown here are live.")));
+            area.replaceChildren(hero, metrics, Amaterasu.panel("Service access", Amaterasu.table(["Service", "Status", "Details"], serviceRows)), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Streaming is still being built"), Amaterasu.el("p", "", "Review pending device pairing from Host & devices. Capture controls and a browser streaming view are not available in this release.")));
         }
         void load();
     }
@@ -6385,8 +6385,298 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function parsePendingPairings(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Pending pairing response is invalid.");
+        const reply = value;
+        if (reply.ok !== true || !Array.isArray(reply.pending))
+            throw new Error("Pending pairing response is invalid.");
+        const pending = reply.pending.map((item) => {
+            if (!item || typeof item !== "object" || Array.isArray(item))
+                throw new Error("Pending pairing entry is invalid.");
+            const entry = item;
+            if (typeof entry.pairing_id !== "string" ||
+                !/^[a-f0-9]{32}$/.test(entry.pairing_id) ||
+                typeof entry.client_id !== "string" ||
+                entry.client_id.length < 1 ||
+                entry.client_id.length > 64 ||
+                /[\u0000-\u001f\u007f-\u009f]/.test(entry.client_id) ||
+                typeof entry.name !== "string" ||
+                entry.name.length < 1 ||
+                entry.name.length > 128 ||
+                /[\u0000-\u001f\u007f-\u009f]/.test(entry.name) ||
+                !Number.isSafeInteger(entry.expires_at) ||
+                entry.expires_at < 0 ||
+                typeof entry.awaiting_pin !== "boolean")
+                throw new Error("Pending pairing entry is invalid.");
+            return {
+                pairing_id: entry.pairing_id,
+                client_id: entry.client_id,
+                name: entry.name,
+                expires_at: entry.expires_at,
+                awaiting_pin: entry.awaiting_pin,
+            };
+        });
+        return { ok: true, pending };
+    }
+    Amaterasu.parsePendingPairings = parsePendingPairings;
+    function parseHostStatus(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Host status response is invalid.");
+        const reply = value;
+        if (reply.ok !== true ||
+            typeof reply.hostname !== "string" ||
+            !Number.isSafeInteger(reply.revision) ||
+            !nullablePort(reply.active_http_port) ||
+            !nullablePort(reply.active_https_port) ||
+            !nullablePort(reply.active_rtsp_port) ||
+            !nullableText(reply.listener_error) ||
+            !nullableText(reply.rtsp_listener_error))
+            throw new Error("Host status response is invalid.");
+        return reply;
+    }
+    function nullablePort(value) {
+        return value === null ||
+            (Number.isSafeInteger(value) && value >= 1 && value <= 65535);
+    }
+    function nullableText(value) {
+        return value === null || typeof value === "string";
+    }
+    function parseSessionStatus(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Session status response is invalid.");
+        const reply = value;
+        if (reply.ok !== true ||
+            !Array.isArray(reply.sessions) ||
+            !(reply.next_offset === null ||
+                (Number.isSafeInteger(reply.next_offset) && reply.next_offset >= 0)))
+            throw new Error("Session status response is invalid.");
+        for (const item of reply.sessions) {
+            if (!item || typeof item !== "object" || Array.isArray(item))
+                throw new Error("Session status entry is invalid.");
+            const session = item;
+            if (!Number.isSafeInteger(session.id) ||
+                session.id < 0 ||
+                typeof session.key !== "string" ||
+                typeof session.state !== "string" ||
+                !["preparing", "active", "stopping", "stopped"].includes(session.state) ||
+                !(session.outcome === null || session.outcome === undefined ||
+                    ["completed", "cancelled", "failed"].includes(String(session.outcome))) ||
+                !(session.lease_count === undefined ||
+                    (Number.isSafeInteger(session.lease_count) && session.lease_count >= 0)))
+                throw new Error("Session status entry is invalid.");
+        }
+        return reply;
+    }
+    function parseRuntimeStatus(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Streaming status response is invalid.");
+        const reply = value;
+        if (!reply.status || typeof reply.status !== "object" || Array.isArray(reply.status))
+            throw new Error("Streaming status response is invalid.");
+        const status = reply.status;
+        if (reply.ok !== true ||
+            typeof status.available !== "boolean" ||
+            typeof status.configuration_ready !== "boolean" ||
+            !Number.isSafeInteger(status.active_streams) ||
+            status.active_streams < 0 ||
+            !Number.isSafeInteger(status.failed_operations) ||
+            status.failed_operations < 0)
+            throw new Error("Streaming status response is invalid.");
+        return reply;
+    }
+    function renderHostManagement(context) {
+        const pairingArea = Amaterasu.el("div");
+        const hostArea = Amaterasu.el("div");
+        const sessionArea = Amaterasu.el("div");
+        const runtimeArea = Amaterasu.el("div");
+        let pairingRequest = 0;
+        let hostRequest = 0;
+        let sessionRequest = 0;
+        let runtimeRequest = 0;
+        context.content.append(Amaterasu.sectionHeading("Host & devices", "Review pending device access and the status reported by this host.", Amaterasu.button("Refresh all", () => {
+            void loadPairings();
+            void loadHost();
+            void loadSessions();
+            void loadRuntime();
+        })), Amaterasu.panel("Pending device pairing", pairingArea), Amaterasu.panel("Host listeners", hostArea), Amaterasu.panel("Streaming status", runtimeArea), Amaterasu.panel("Management sessions", sessionArea));
+        async function loadPairings(notice) {
+            if (!context.content.isConnected)
+                return;
+            const request = ++pairingRequest;
+            if (!context.api.allows("pairing.admin")) {
+                pairingArea.replaceChildren(Amaterasu.el("p", "muted", "This account does not have permission to review or approve device pairing requests."));
+                return;
+            }
+            pairingArea.replaceChildren(...(notice ? [pairingApprovalNotice(notice)] : []), Amaterasu.el("p", "muted", "Loading pending pairing requests…"));
+            try {
+                const reply = parsePendingPairings(await context.api.post("pairing/pending"));
+                if (!context.content.isConnected || request !== pairingRequest)
+                    return;
+                if (reply.pending.length === 0) {
+                    pairingArea.replaceChildren(...(notice ? [pairingApprovalNotice(notice)] : []), Amaterasu.empty("No pending requests", "New device requests will appear here when this host receives them."), Amaterasu.button("Refresh requests", () => { void loadPairings(); }));
+                    return;
+                }
+                const cards = reply.pending.map((pending) => renderPendingPairing(pending));
+                pairingArea.replaceChildren(...(notice ? [pairingApprovalNotice(notice)] : []), ...cards, Amaterasu.button("Refresh requests", () => { void loadPairings(); }));
+            }
+            catch (error) {
+                if (context.content.isConnected && request === pairingRequest)
+                    pairingArea.replaceChildren(Amaterasu.errorPanel(error, loadPairings));
+            }
+        }
+        function renderPendingPairing(pending) {
+            const card = Amaterasu.el("article", "panel pairing-request");
+            const description = Amaterasu.el("p", "muted", pending.awaiting_pin
+                ? "Enter the four-digit PIN shown on the requesting device to approve this pairing step."
+                : "PIN approval was accepted. The device must complete its pairing exchange.");
+            const status = Amaterasu.el("div");
+            status.setAttribute("aria-live", "polite");
+            const details = Amaterasu.el("div", "pairing-details", Amaterasu.el("strong", "", pending.name), Amaterasu.el("small", "muted block", `Client ${pending.client_id}`), Amaterasu.el("small", "muted block", `Request expires ${new Date(pending.expires_at * 1000).toLocaleString()}`), Amaterasu.badge(pending.awaiting_pin ? "PIN required" : "Pairing in progress", pending.awaiting_pin ? "accent" : "good"));
+            card.append(details, description);
+            if (pending.awaiting_pin) {
+                const pin = Amaterasu.input("pairing_pin", "", "password");
+                pin.autocomplete = "off";
+                pin.spellcheck = false;
+                pin.inputMode = "numeric";
+                pin.maxLength = 4;
+                pin.pattern = "[0-9]{4}";
+                pin.required = true;
+                const approve = Amaterasu.el("button", "button primary", "Approve PIN");
+                approve.type = "submit";
+                const form = Amaterasu.el("form", "pairing-approval", Amaterasu.field("Four-digit PIN", pin), status, approve);
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    if (approve.disabled)
+                        return;
+                    const submittedPin = pin.value;
+                    pin.value = "";
+                    if (!/^\d{4}$/.test(submittedPin)) {
+                        status.replaceChildren(Amaterasu.errorPanel(new Error("Enter the four-digit PIN shown on the device.")));
+                        return;
+                    }
+                    void Amaterasu.runAction(approve, status, async () => {
+                        try {
+                            await context.api.post("pairing/approve_pin", {
+                                pairing_id: pending.pairing_id,
+                                pin: submittedPin,
+                            });
+                        }
+                        catch {
+                            if (!context.content.isConnected)
+                                return;
+                            const notice = "The approval response was not confirmed. The PIN was cleared and current pairing status was refreshed; review it before trying again.";
+                            context.notify("Approval was not confirmed. Current pairing status is being refreshed; the PIN was cleared.");
+                            await loadPairings(notice);
+                            return;
+                        }
+                        if (!context.content.isConnected)
+                            return;
+                        context.notify("PIN approval accepted. The device must complete its pairing exchange.");
+                        await loadPairings();
+                    });
+                });
+                card.append(form);
+            }
+            else {
+                card.append(status);
+            }
+            return card;
+        }
+        async function loadHost() {
+            const request = ++hostRequest;
+            if (!context.api.allows("configuration.read")) {
+                hostArea.replaceChildren(Amaterasu.el("p", "muted", "Host settings status requires configuration.read permission."));
+                return;
+            }
+            hostArea.replaceChildren(Amaterasu.el("p", "muted", "Loading host listener status…"));
+            try {
+                const host = parseHostStatus(await context.api.post("nvhttp/settings"));
+                if (!context.content.isConnected || request !== hostRequest)
+                    return;
+                const listener = (label, port, error) => [
+                    Amaterasu.el("strong", "", label),
+                    port === null
+                        ? Amaterasu.badge(error ? "Error reported" : "Not confirmed")
+                        : Amaterasu.badge(`Active · port ${port}`, "good"),
+                ];
+                const rows = [
+                    listener("HTTP", host.active_http_port, host.listener_error),
+                    listener("HTTPS", host.active_https_port, host.listener_error),
+                    listener("RTSP", host.active_rtsp_port, host.rtsp_listener_error),
+                ];
+                hostArea.replaceChildren(Amaterasu.el("p", "muted", `Host ${host.hostname} · settings revision ${host.revision}`), Amaterasu.table(["Listener", "Reported status"], rows), Amaterasu.button("Refresh host status", () => { void loadHost(); }));
+            }
+            catch (error) {
+                if (context.content.isConnected && request === hostRequest)
+                    hostArea.replaceChildren(Amaterasu.errorPanel(error, loadHost));
+            }
+        }
+        async function loadSessions() {
+            const request = ++sessionRequest;
+            if (!context.api.allows("session.read")) {
+                sessionArea.replaceChildren(Amaterasu.el("p", "muted", "Management session status requires session.read permission."));
+                return;
+            }
+            sessionArea.replaceChildren(Amaterasu.el("p", "muted", "Loading management sessions…"));
+            try {
+                const reply = parseSessionStatus(await context.api.post("session/list", { limit: 16 }));
+                if (!context.content.isConnected || request !== sessionRequest)
+                    return;
+                const rows = reply.sessions.map((session) => [
+                    Amaterasu.el("strong", "", session.key),
+                    Amaterasu.badge(session.state, session.state === "active" ? "good" : ""),
+                    String(session.lease_count ?? Object.keys(session.leases ?? {}).length),
+                    session.outcome ?? "—",
+                ]);
+                sessionArea.replaceChildren(rows.length
+                    ? Amaterasu.table(["Session", "State", "Leases", "Outcome"], rows)
+                    : Amaterasu.empty("No management sessions", "Sessions created through the management API will appear here."), reply.next_offset === null
+                    ? Amaterasu.el("p", "muted", `Showing ${reply.sessions.length} session${reply.sessions.length === 1 ? "" : "s"}.`)
+                    : Amaterasu.el("p", "muted", `Showing the first ${reply.sessions.length} sessions; more are available.`), Amaterasu.button("Refresh sessions", () => { void loadSessions(); }));
+            }
+            catch (error) {
+                if (context.content.isConnected && request === sessionRequest)
+                    sessionArea.replaceChildren(Amaterasu.errorPanel(error, loadSessions));
+            }
+        }
+        async function loadRuntime() {
+            const request = ++runtimeRequest;
+            if (!context.api.allows("session.read")) {
+                runtimeArea.replaceChildren(Amaterasu.el("p", "muted", "Streaming status requires session.read permission."));
+                return;
+            }
+            runtimeArea.replaceChildren(Amaterasu.el("p", "muted", "Loading streaming status…"));
+            try {
+                const reply = parseRuntimeStatus(await context.api.post("history/history_status"));
+                if (!context.content.isConnected || request !== runtimeRequest)
+                    return;
+                const state = reply.status;
+                runtimeArea.replaceChildren(Amaterasu.badge(state.available && state.configuration_ready ? "History service available" : "History service unavailable", state.available && state.configuration_ready ? "good" : ""), Amaterasu.el("p", "muted", `${state.active_streams} active stream${state.active_streams === 1 ? "" : "s"} reported · ${state.failed_operations} failed storage operation${state.failed_operations === 1 ? "" : "s"} since service start.`), Amaterasu.button("Refresh streaming status", () => { void loadRuntime(); }));
+            }
+            catch (error) {
+                if (context.content.isConnected && request === runtimeRequest)
+                    runtimeArea.replaceChildren(Amaterasu.errorPanel(error, loadRuntime));
+            }
+        }
+        void loadPairings();
+        void loadHost();
+        void loadSessions();
+        void loadRuntime();
+    }
+    Amaterasu.renderHostManagement = renderHostManagement;
+    function pairingApprovalNotice(message) {
+        const notice = Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Approval not confirmed"), Amaterasu.el("p", "", message));
+        notice.setAttribute("role", "status");
+        notice.setAttribute("aria-live", "polite");
+        return notice;
+    }
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     const pageNames = {
         overview: "Overview",
+        host: "Host & devices",
         catalog: "Library",
         settings: "Settings",
         updates: "Modules & UI",
@@ -6397,6 +6687,7 @@ var Amaterasu;
     };
     const pageIcons = {
         updates: "+",
+        host: "⌂",
         overview: "▦",
         catalog: "⊞",
         settings: "≡",
@@ -6640,6 +6931,7 @@ var Amaterasu;
             };
             const renderers = {
                 overview: Amaterasu.renderOverview,
+                host: Amaterasu.renderHostManagement,
                 catalog: Amaterasu.renderCatalog,
                 settings: Amaterasu.renderSettings,
                 updates: Amaterasu.renderUpdates,
