@@ -207,6 +207,16 @@ pub fn preflight(
     println!(
         "[ok] signed active LinuxSession package {active_digest} verified; x264 ABI {x264_build} is loader-visible"
     );
+    if let Some((avcodec, avutil)) = crate::development::embedded_ffmpeg_abi(&encoder_bytes)? {
+        if !crate::development::ffmpeg_runtime_available(avcodec, avutil) {
+            return Err(format!(
+                "loader cannot find compatible system FFmpeg runtimes for avcodec {avcodec} and avutil {avutil}"
+            ));
+        }
+        println!(
+            "[ok] optional FFmpeg NVENC encoder ABI avcodec {avcodec}/avutil {avutil} is loader-visible"
+        );
+    }
 
     let needs = runtime_needs(&verified.runtime_config.settings)?;
     if needs.pulse {
@@ -981,7 +991,7 @@ fn render_readme(digest: &str) -> String {
 
 This bundle was generated for signed active package `{digest}`. The unit runs under the current user manager and never requests root or system service privileges. Its `ExecStart` pins this digest; a different active package fails closed until a new bundle is generated and reviewed.
 
-Before installing or starting, run `sh preflight-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE` as the target non-root user. The script calls `amaterasu-release preflight-linux-user-service` (or `$AMATERASU_RELEASE_BIN`) to reverify the active signature and digest, check loader-visible x264/Pulse/PipeWire/GIO libraries, verify the current user manager's unit resolution, and confirm the current user's portal bus name when capture is enabled. The check only queries systemd and lists D-Bus names; it does not enable/start a unit or request portal consent. It requires the release CLI to be available on the target host. It checks Pulse library loading, not server connectivity, and checks portal bus ownership, not the ScreenCast interface response, user consent, or an actual capture/audio stream.
+Before installing or starting, run `sh preflight-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE` as the target non-root user. The script calls `amaterasu-release preflight-linux-user-service` (or `$AMATERASU_RELEASE_BIN`) to reverify the active signature and digest, check loader-visible x264 and optional FFmpeg encoder ABI plus Pulse/PipeWire/GIO libraries, verify the current user manager's unit resolution, and confirm the current user's portal bus name when capture is enabled. The check only queries systemd and lists D-Bus names; it does not enable/start a unit or request portal consent. It requires the release CLI to be available on the target host. It checks library loading, not the NVENC device/driver, Pulse server connectivity, the ScreenCast interface response, user consent, or an actual capture/audio stream.
 
 Review `amaterasu-linux-session.service`, then install it for this user with `sh install-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE`. The installer runs the same read-only preflight before it writes, immediately before enabling, and after enabling. If the active selection or prerequisites change, it removes only the enable link and unit file created by that attempt. Installation enables the unit for `graphical-session.target` but does not start it. For a manual start, run the standalone preflight immediately beforehand, then use `systemctl --user start amaterasu-linux-session.service`.
 

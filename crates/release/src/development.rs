@@ -32,6 +32,7 @@ const POLICY_TRANSITION_JOURNAL: &str = ".installer-policy-transition.json";
 const POLICY_TRANSITION_BACKUPS: &str = "installer-policy-backups";
 const MAX_TRANSITION_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const X264_BUILD_MARKER: &[u8] = b"AMATERASU_X264_BUILD=";
+const FFMPEG_ABI_MARKER: &[u8] = b"AMATERASU_FFMPEG_ABI=";
 const TLS_BIND_ENV: &str = "AMATERASU_MANAGEMENT_TLS_BIND";
 const TLS_CERT_ENV: &str = "AMATERASU_MANAGEMENT_TLS_CERTIFICATE_PATH";
 const TLS_KEY_ENV: &str = "AMATERASU_MANAGEMENT_TLS_PRIVATE_KEY_PATH";
@@ -2140,6 +2141,43 @@ mod provision_tests {
         assert!(error.contains("required system x264 runtime for build 164"));
     }
 
+    #[test]
+    fn optional_ffmpeg_abi_preflight_checks_only_marked_encoder_artifacts() {
+        assert_eq!(
+            validate_optional_linux_ffmpeg_inputs(b"x264-only artifact", |_, _| panic!(
+                "unmarked artifact must not require FFmpeg"
+            ))
+            .unwrap(),
+            None
+        );
+        let marked = b"AMATERASU_FFMPEG_ABI=63,61\0";
+        assert_eq!(
+            validate_optional_linux_ffmpeg_inputs(marked, |avcodec, avutil| {
+                avcodec == 63 && avutil == 61
+            })
+            .unwrap(),
+            Some((63, 61))
+        );
+        assert!(
+            validate_optional_linux_ffmpeg_inputs(marked, |_, _| false)
+                .unwrap_err()
+                .contains("required system FFmpeg runtime")
+        );
+    }
+
+    #[test]
+    fn malformed_or_duplicate_ffmpeg_abi_markers_fail_closed() {
+        for artifact in [
+            b"AMATERASU_FFMPEG_ABI=63,\0".as_slice(),
+            b"AMATERASU_FFMPEG_ABI=0,61\0".as_slice(),
+            b"AMATERASU_FFMPEG_ABI=63,61,1\0".as_slice(),
+            b"AMATERASU_FFMPEG_ABI=63,61".as_slice(),
+            b"AMATERASU_FFMPEG_ABI=63,61\0AMATERASU_FFMPEG_ABI=63,61\0".as_slice(),
+        ] {
+            assert!(embedded_ffmpeg_abi(artifact).is_err());
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_desktop_x264_preflight_fails_before_package_directory_is_created() {
@@ -2295,7 +2333,110 @@ fn preflight_linux_x264(
         256 * 1024 * 1024,
     )?;
     validate_linux_x264_inputs(&encoder, runtime_available)?;
+    validate_optional_linux_ffmpeg_inputs(&encoder, ffmpeg_runtime_available)?;
     Ok(encoder)
+}
+
+fn validate_optional_linux_ffmpeg_inputs(
+    encoder: &[u8],
+    runtime_available: impl FnOnce(u32, u32) -> bool,
+) -> PackageResult<Option<(u32, u32)>> {
+    let Some((avcodec, avutil)) = embedded_ffmpeg_abi(encoder)? else {
+        return Ok(None);
+    };
+    if !runtime_available(avcodec, avutil) {
+        return Err(format!(
+            "required system FFmpeg runtime for avcodec {avcodec} and avutil {avutil} is unavailable or incompatible"
+        ));
+    }
+    Ok(Some((avcodec, avutil)))
+}
+
+pub(crate) fn embedded_ffmpeg_abi(encoder: &[u8]) -> PackageResult<Option<(u32, u32)>> {
+    let offsets = encoder
+        .windows(FFMPEG_ABI_MARKER.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == FFMPEG_ABI_MARKER).then_some(offset))
+        .collect::<Vec<_>>();
+    let [offset] = offsets.as_slice() else {
+        return if offsets.is_empty() {
+            Ok(None)
+        } else {
+            Err("encoder has duplicate FFmpeg ABI markers".into())
+        };
+    };
+    let suffix = &encoder[*offset + FFMPEG_ABI_MARKER.len()..];
+    let end = suffix
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or("encoder FFmpeg ABI marker is unterminated")?;
+    if end == 0 || end > 24 {
+        return Err("encoder FFmpeg ABI marker is malformed".into());
+    }
+    let marker = std::str::from_utf8(&suffix[..end])
+        .map_err(|_| "encoder FFmpeg ABI marker is malformed")?;
+    let (avcodec, avutil) = marker
+        .split_once(',')
+        .ok_or("encoder FFmpeg ABI marker is malformed")?;
+    let parse_major = |value: &str| -> PackageResult<u32> {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("encoder FFmpeg ABI marker is malformed".into());
+        }
+        value
+            .parse::<u32>()
+            .ok()
+            .filter(|major| *major > 0)
+            .ok_or_else(|| "encoder FFmpeg ABI marker is malformed".into())
+    };
+    Ok(Some((parse_major(avcodec)?, parse_major(avutil)?)))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn ffmpeg_runtime_available(avcodec: u32, avutil: u32) -> bool {
+    let required = [
+        (
+            format!("libavcodec.so.{avcodec}"),
+            &[
+                "avcodec_find_encoder_by_name",
+                "avcodec_alloc_context3",
+                "avcodec_open2",
+                "avcodec_send_frame",
+                "avcodec_receive_packet",
+                "avcodec_free_context",
+                "av_packet_alloc",
+                "av_packet_unref",
+                "av_packet_free",
+            ][..],
+        ),
+        (
+            format!("libavutil.so.{avutil}"),
+            &[
+                "av_frame_alloc",
+                "av_frame_free",
+                "av_frame_get_buffer",
+                "av_frame_make_writable",
+                "av_dict_set",
+                "av_dict_free",
+            ][..],
+        ),
+    ];
+    required.into_iter().all(|(name, symbols)| {
+        // SAFETY: names contain only bounded positive ABI majors from the
+        // signed encoder artifact. Only system loader candidates are opened;
+        // retrieved pointers are checked for presence and never called.
+        let Ok(library) = (unsafe { libloading::Library::new(name) }) else {
+            return false;
+        };
+        symbols.iter().all(|symbol| {
+            // SAFETY: symbol lookup checks presence only; the pointer is not called.
+            unsafe { library.get::<*mut c_void>(symbol.as_bytes()).is_ok() }
+        })
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn ffmpeg_runtime_available(_: u32, _: u32) -> bool {
+    false
 }
 
 fn validate_linux_x264_inputs(
