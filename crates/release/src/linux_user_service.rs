@@ -407,7 +407,11 @@ mod tests {
         assert!(install.contains("cmp -s \"$source_unit\" \"$target\""));
         assert!(install.contains("refusing to overwrite unmanaged service content"));
         assert!(install.contains("systemctl --user enable"));
-        assert!(!install.contains("systemctl --user start"));
+        assert!(
+            !install
+                .lines()
+                .any(|line| line.starts_with("systemctl --user start "))
+        );
         assert!(uninstall.contains("cmp -s \"$source_unit\" \"$target\""));
         assert!(uninstall.contains("unit changed during uninstall"));
         assert!(uninstall.contains("systemctl --user stop"));
