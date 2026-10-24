@@ -2113,6 +2113,107 @@ test("Moonlight host editor confirms signed update and GET with canonical prepar
   ]);
 });
 
+test("focused future-stream audio save sends only audio fields and confirms readback", async () => {
+  const current = nvhttpHostSettings();
+  const saved = {
+    ...current,
+    revision: current.revision + 1,
+    stream_audio: true,
+    configured_audio_sink: "monitor.source.id",
+  };
+  const calls = [];
+  const api = { async post(route, body = {}) {
+    calls.push([route, ordinary(body)]);
+    if (route === "nvhttp/settings_update") return saved;
+    assert.equal(route, "nvhttp/settings");
+    return saved;
+  } };
+  const result = await context.Amaterasu.saveNvhttpAudioSettings(
+    api, current, true, "monitor.source.id",
+  );
+
+  assert.deepEqual(ordinary(result), saved);
+  assert.deepEqual(calls, [
+    ["nvhttp/settings_update", {
+      hostname: current.configured_hostname,
+      port: current.port,
+      expected_revision: current.revision,
+      stream_audio: true,
+      audio_sink: "monitor.source.id",
+    }],
+    ["nvhttp/settings", {}],
+  ]);
+});
+
+test("focused future-stream audio save validates selectors and rejects mismatched readback", async () => {
+  const current = nvhttpHostSettings();
+  let calls = 0;
+  const api = { async post() { calls += 1; return current; } };
+  for (const [streamAudio, sink] of [
+    ["yes", ""],
+    [true, "bad\nendpoint"],
+    [true, "é".repeat(2049)],
+  ])
+    await assert.rejects(context.Amaterasu.saveNvhttpAudioSettings(api, current, streamAudio, sink));
+  assert.equal(calls, 0);
+
+  const updated = { ...current, revision: current.revision + 1, stream_audio: true,
+    configured_audio_sink: null };
+  await assert.rejects(context.Amaterasu.saveNvhttpAudioSettings({ async post(route) {
+    return route === "nvhttp/settings_update" ? updated : current;
+  } }, current, true, ""), /could not be confirmed after saving/);
+});
+
+test("focused future-stream audio editor gates writes by configuration permission", () => {
+  class Element {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.listeners = new Map();
+      this.isConnected = true;
+      this.value = "";
+    }
+    append(...children) { this.children.push(...children.filter((child) => child != null)); }
+    replaceChildren(...children) { this.children = [...children]; }
+    addEventListener(name, callback) { this.listeners.set(name, callback); }
+    setAttribute() {}
+    reportValidity() { return true; }
+    get options() { return this.children.filter((child) => child?.tagName === "option"); }
+    get textContent() { return this.children.map((child) => typeof child === "string" ? child : child.textContent).join(""); }
+    set textContent(value) { this.replaceChildren(value); }
+    fire(name, event) { this.listeners.get(name)?.(event); }
+  }
+  const find = (node, predicate) => {
+    if (predicate(node)) return node;
+    for (const child of node.children ?? []) {
+      if (typeof child === "string") continue;
+      const result = find(child, predicate);
+      if (result) return result;
+    }
+    return null;
+  };
+  const dom = vm.createContext({ TextEncoder, URL, Error,
+    document: { createElement: (name) => new Element(name) } });
+  for (const source of ["src/types.ts", "src/ui.ts", "src/settings.ts"]) {
+    vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
+    vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+  }
+  let writes = 0;
+  const panel = dom.Amaterasu.renderNvhttpAudioSettings({
+    content: new Element("main"),
+    api: { allows: () => false, async post() { writes += 1; throw new Error("must not write"); } },
+    notify() {},
+    navigate() {},
+  }, nvhttpHostSettings(), [], "Listing audio endpoints requires media.read.", async () => {});
+  const form = find(panel, (node) => node.tagName === "form");
+  const save = find(form, (node) => node.tagName === "button");
+  assert.ok(form);
+  assert.equal(save.disabled, true);
+  assert.match(panel.textContent, /requires configuration.write permission/);
+  form.fire("submit", { preventDefault() {} });
+  assert.equal(writes, 0);
+});
+
 test("Moonlight host editor rejects mismatched configured or unrelated fields and concurrent readback", async () => {
   const current = nvhttpHostSettings();
   const values = nvhttpHostUpdate();

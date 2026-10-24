@@ -396,6 +396,43 @@ namespace Amaterasu {
     return saved;
   }
 
+  export async function saveNvhttpAudioSettings(
+    api: Pick<Api, "post">,
+    current: NvhttpSettings,
+    streamAudio: boolean,
+    audioSink: string,
+  ): Promise<NvhttpSettings> {
+    if (!Number.isSafeInteger(current.revision) || current.revision < 0 || current.revision >= Number.MAX_SAFE_INTEGER ||
+        typeof current.configured_hostname !== "string" || current.configured_hostname.length > 128 ||
+        /[\u0000-\u001f\u007f-\u009f]/.test(current.configured_hostname) ||
+        !Number.isSafeInteger(current.port) || current.port < 1029 || current.port > 65514 ||
+        typeof current.stream_audio !== "boolean" ||
+        !(current.configured_audio_sink === null || typeof current.configured_audio_sink === "string"))
+      throw new Error("Current Moonlight host settings cannot be safely updated.");
+    if (current.configured_audio_sink !== null)
+      parseAudioSinkSelection(current.configured_audio_sink);
+    if (typeof streamAudio !== "boolean")
+      throw new Error("Choose whether future streams should include host audio.");
+    const configuredAudioSink = parseAudioSinkSelection(audioSink);
+    const confirms = (reply: NvhttpSettings): boolean =>
+      reply.revision === current.revision + 1 &&
+      reply.stream_audio === streamAudio &&
+      reply.configured_audio_sink === configuredAudioSink;
+    const updated = parseNvhttpSettingsReply(await api.post<unknown>("nvhttp/settings_update", {
+      hostname: current.configured_hostname,
+      port: current.port,
+      expected_revision: current.revision,
+      stream_audio: streamAudio,
+      audio_sink: configuredAudioSink,
+    }));
+    if (!confirms(updated))
+      throw new Error("Audio preferences could not be confirmed. Refresh and check the current values.");
+    const saved = parseNvhttpSettingsReply(await api.post<unknown>("nvhttp/settings"));
+    if (!confirms(saved))
+      throw new Error("Audio preferences could not be confirmed after saving. Refresh and check the current values.");
+    return saved;
+  }
+
   export class NvhttpSettingsLoadGate {
     private generation = 0;
 
@@ -417,6 +454,82 @@ namespace Amaterasu {
         throw error;
       }
     }
+  }
+
+  export function renderNvhttpAudioSettings(
+    context: PageContext,
+    settings: NvhttpSettings,
+    endpoints: Array<{ id: string; name: string; default_multimedia: boolean }>,
+    discoveryIssue: string | null,
+    reload: () => Promise<void>,
+  ): HTMLElement {
+    const form = el("form", "settings-form");
+    const streamAudio = input("stream_audio_preference", "", "checkbox");
+    streamAudio.checked = settings.stream_audio;
+    const audioSink = el("select");
+    audioSink.name = "audio_sink_preference";
+    const automatic = el("option", "", "Automatic (host startup endpoint)");
+    automatic.value = "";
+    audioSink.append(automatic);
+    for (const endpoint of endpoints) {
+      if (!endpoint.name || endpoint.name.length > 512 || /[\u0000-\u001f\u007f-\u009f]/.test(endpoint.name))
+        continue;
+      const option = el("option", "", `${endpoint.name}${endpoint.default_multimedia ? " (default)" : ""} (${endpoint.id})`);
+      option.value = endpoint.id;
+      audioSink.append(option);
+    }
+    const configuredAudioSink = settings.configured_audio_sink;
+    if (configuredAudioSink !== null && !endpoints.some(({ id }) => id === configuredAudioSink)) {
+      try {
+        if (parseAudioSinkSelection(configuredAudioSink) === configuredAudioSink) {
+          const saved = el("option", "", `Saved endpoint (not currently listed): ${configuredAudioSink}`);
+          saved.value = configuredAudioSink;
+          audioSink.append(saved);
+        }
+      } catch {
+        // Keep an invalid saved ID out of the editable control; it cannot be submitted.
+      }
+    }
+    audioSink.value = configuredAudioSink ?? "";
+    const status = el("div");
+    const save = el("button", "button primary", "Save audio preferences");
+    save.type = "submit";
+    save.disabled = !context.api.allows("configuration.write");
+    form.append(
+      field("Include host audio in future streams", streamAudio,
+        "Applications and paired-device overrides may choose a different value."),
+      field("Audio capture endpoint", audioSink,
+        "Automatic follows the host startup endpoint. A named endpoint applies to future streams."),
+      ...(discoveryIssue ? [el("p", "muted", discoveryIssue)] : []),
+      ...(!context.api.allows("configuration.write")
+        ? [el("p", "muted", "Saving audio preferences requires configuration.write permission.")]
+        : []),
+      status,
+      el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+    );
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (!form.reportValidity()) return;
+      void runAction(save, status, async () => {
+        if (!context.api.allows("configuration.write")) {
+          status.replaceChildren(el("p", "error", "Saving audio preferences requires configuration.write permission."));
+          return;
+        }
+        try {
+          await saveNvhttpAudioSettings(context.api, settings, streamAudio.checked, audioSink.value);
+        } catch (error) {
+          if (error instanceof ApiError && error.code === "revision_conflict") {
+            await reload();
+            context.notify("Host settings changed elsewhere. Review the latest audio preferences before saving again.");
+            return;
+          }
+          throw error;
+        }
+        await reload();
+        context.notify("Audio preferences saved and read back. They apply to future streams.");
+      });
+    });
+    return panel("Future stream audio", form);
   }
 
   export async function recoverNvhttpSaveFailure(
@@ -3213,6 +3326,7 @@ namespace Amaterasu {
         automaticAudioSink.value = "";
         audioSink.append(automaticAudioSink);
         let audioDiscoveryIssue: string | null = null;
+        const audioEndpoints: Array<{ id: string; name: string; default_multimedia: boolean }> = [];
         if (context.api.allows("media.read")) {
           try {
             const discovered = await context.api.post<{
@@ -3221,8 +3335,12 @@ namespace Amaterasu {
             if (!context.content.isConnected || !hostLoads.isCurrent(generation)) return;
             for (const endpoint of discovered.endpoints) {
               try {
-                if (!endpoint.id || parseAudioSinkSelection(endpoint.id) !== endpoint.id)
+                if (!endpoint.id || typeof endpoint.name !== "string" ||
+                    typeof endpoint.default_multimedia !== "boolean" ||
+                    parseAudioSinkSelection(endpoint.id) !== endpoint.id ||
+                    audioEndpoints.some((current) => current.id === endpoint.id))
                   continue;
+                audioEndpoints.push(endpoint);
                 const option = el("option", "", `${endpoint.name}${endpoint.default_multimedia ? " (default)" : ""} (${endpoint.id})`);
                 option.value = endpoint.id;
                 audioSink.append(option);
@@ -3448,7 +3566,10 @@ namespace Amaterasu {
           });
         });
         if (hostLoads.isCurrent(generation))
-          hostArea.replaceChildren(panel("Moonlight host settings", form));
+          hostArea.replaceChildren(
+            panel("Moonlight host settings", form),
+            renderNvhttpAudioSettings(context, settings, audioEndpoints, audioDiscoveryIssue, loadHost),
+          );
       } catch (error) {
         if (context.content.isConnected && (generation === null || hostLoads.isCurrent(generation)))
           hostArea.replaceChildren(errorPanel(error, loadHost));
