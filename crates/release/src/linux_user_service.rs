@@ -842,30 +842,45 @@ else
     trap - EXIT HUP INT TERM
     created=1
 fi
-rollback_new_unit() {
+rollback_install_changes() {
+    changed=0
+    if [ "$wanted_preexisting" -eq 0 ] && [ -L "$wanted_link" ] && [ "$(readlink -- "$wanted_link")" = "../$unit_name" ]; then
+        rm -- "$wanted_link"
+        changed=1
+    fi
     if [ "$created" -eq 1 ] && [ -f "$target" ] && [ ! -L "$target" ] && cmp -s "$source_unit" "$target"; then
-        if [ "$wanted_preexisting" -eq 0 ] && [ -L "$wanted_link" ] && [ "$(readlink -- "$wanted_link")" = "../$unit_name" ]; then
-            rm -- "$wanted_link"
-        fi
         rm -- "$target"
+        changed=1
+    fi
+    if [ "$changed" -eq 1 ]; then
         systemctl --user daemon-reload >/dev/null 2>&1 || true
     fi
 }
 if ! systemctl --user daemon-reload; then
-    rollback_new_unit
+    rollback_install_changes
     echo "systemd user manager could not reload; new unit rolled back" >&2
     exit 1
 fi
 expected_fragment=$(readlink -f -- "$target")
 selected_fragment=$(systemctl --user show --property=FragmentPath --value "$unit_name" 2>/dev/null || true)
 if [ "$selected_fragment" != "$expected_fragment" ]; then
-    rollback_new_unit
+    rollback_install_changes
     echo "systemd user manager did not resolve the generated unit; new unit rolled back" >&2
     exit 1
 fi
+if ! "$release_cli" preflight-linux-user-service "$1" "$2" "$bundle_dir"; then
+    rollback_install_changes
+    echo "active signed package or desktop prerequisites changed before enable; new unit rolled back" >&2
+    exit 1
+fi
 if ! systemctl --user enable "$unit_name"; then
-    rollback_new_unit
+    rollback_install_changes
     echo "systemd user manager could not enable the unit; new unit rolled back" >&2
+    exit 1
+fi
+if ! "$release_cli" preflight-linux-user-service "$1" "$2" "$bundle_dir"; then
+    rollback_install_changes
+    echo "active signed package or desktop prerequisites changed during enable; new unit changes rolled back" >&2
     exit 1
 fi
 echo "Enabled $unit_name for this user; it will start with graphical-session.target."
@@ -909,10 +924,33 @@ selected_fragment=$(systemctl --user show --property=FragmentPath --value "$unit
 [ "$selected_fragment" = "$expected_fragment" ] || {
     echo "user manager resolves a different unit named $unit_name; leaving it untouched" >&2; exit 1;
 }
-if systemctl --user is-active --quiet "$unit_name"; then
+unit_status=$(systemctl --user show --no-pager --property=ActiveState --property=UnitFileState "$unit_name" 2>/dev/null) || {
+    echo "could not query active and enablement state for $unit_name; leaving files untouched" >&2; exit 1;
+}
+active_state=
+unit_file_state=
+while IFS='=' read -r property value; do
+    case "$property" in
+        ActiveState) [ -z "$active_state" ] || { echo "systemd returned duplicate ActiveState; leaving files untouched" >&2; exit 1; }; active_state=$value ;;
+        UnitFileState) [ -z "$unit_file_state" ] || { echo "systemd returned duplicate UnitFileState; leaving files untouched" >&2; exit 1; }; unit_file_state=$value ;;
+    esac
+done <<EOF
+$unit_status
+EOF
+case "$active_state" in
+    active) active=1 ;;
+    inactive|failed) active=0 ;;
+    *) echo "systemd returned uncertain ActiveState '$active_state'; leaving files untouched" >&2; exit 1 ;;
+esac
+case "$unit_file_state" in
+    enabled) enabled=1 ;;
+    disabled) enabled=0 ;;
+    *) echo "systemd returned uncertain UnitFileState '$unit_file_state'; leaving files untouched" >&2; exit 1 ;;
+esac
+if [ "$active" -eq 1 ]; then
     systemctl --user stop "$unit_name"
 fi
-if systemctl --user is-enabled --quiet "$unit_name"; then
+if [ "$enabled" -eq 1 ]; then
     systemctl --user disable "$unit_name"
 fi
 [ -f "$target" ] && [ ! -L "$target" ] && cmp -s "$source_unit" "$target" || {
@@ -943,11 +981,13 @@ This bundle was generated for signed active package `{digest}`. The unit runs un
 
 Before installing or starting, run `sh preflight-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE` as the target non-root user. The script calls `amaterasu-release preflight-linux-user-service` (or `$AMATERASU_RELEASE_BIN`) to reverify the active signature and digest, check loader-visible x264/Pulse/PipeWire/GIO libraries, verify the current user manager's unit resolution, and confirm the current user's portal bus name when capture is enabled. The check only queries systemd and lists D-Bus names; it does not enable/start a unit or request portal consent. It requires the release CLI to be available on the target host. It checks Pulse library loading, not server connectivity, and checks portal bus ownership, not the ScreenCast interface response, user consent, or an actual capture/audio stream.
 
-Review `amaterasu-linux-session.service`, then install it for this user with `sh install-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE`. The installer runs the same read-only preflight before it writes or enables the unit. Installation enables the unit for `graphical-session.target` but does not start it. For a manual start, run the standalone preflight immediately beforehand, then use `systemctl --user start amaterasu-linux-session.service`.
+Review `amaterasu-linux-session.service`, then install it for this user with `sh install-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE`. The installer runs the same read-only preflight before it writes, immediately before enabling, and after enabling. If the active selection or prerequisites change, it removes only the enable link and unit file created by that attempt. Installation enables the unit for `graphical-session.target` but does not start it. For a manual start, run the standalone preflight immediately beforehand, then use `systemctl --user start amaterasu-linux-session.service`.
 
 The host verifies the production bootstrap, trusted package signature, active selection, and pinned digest on every start. A module tick or health failure exits the service; systemd restarts it after a fixed five-second delay and the next start re-verifies the same digest. SIGTERM triggers orderly component teardown and Linux input revocation. A forced kill is recovered by the same fresh verification and load on restart.
 
-Uninstall from this same bundle with `sh uninstall-user-service.sh`. It stops and disables the user unit only after verifying that the installed unit bytes match this bundle, rechecks before removing the file, and leaves runtime data and the signed package intact. If the unit was edited or replaced, uninstall refuses to remove it.
+The preflight checks that the supplied host executable exists and is executable, but it does not authenticate that executable's identity or bind it to a digest. Use a host binary from a trusted distribution and protect its filesystem path.
+
+Uninstall from this same bundle with `sh uninstall-user-service.sh`. It stops and disables the user unit only after verifying that the installed unit bytes match this bundle and systemd reports known active and enablement states. A failed or unexpected state query leaves files untouched. It rechecks before removing the file and leaves runtime data and the signed package intact. If the unit was edited or replaced, uninstall refuses to remove it.
 
 The generated scripts affect only the current user service directory selected by `XDG_CONFIG_HOME` (or `$HOME/.config`). They refuse root execution and symlinked service paths, and verify that systemd resolves this exact unit file before enabling or uninstalling it. No service was installed or started when this bundle was generated.
 "#
@@ -1003,6 +1043,15 @@ mod tests {
             install.find("preflight-linux-user-service") < install.find("mkdir -p \"$user_dir\"")
         );
         assert!(install.contains("systemctl --user enable"));
+        assert_eq!(
+            install.matches("preflight-linux-user-service").count(),
+            3,
+            "installer must qualify before writes, immediately before enable, and after enable"
+        );
+        assert!(uninstall.contains("UnitFileState"));
+        assert!(uninstall.contains("leaving files untouched"));
+        assert!(!uninstall.contains("is-active --quiet"));
+        assert!(!uninstall.contains("is-enabled --quiet"));
         assert!(
             !install
                 .lines()
@@ -1050,16 +1099,16 @@ printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
 if [ "$*" = "--user show --property=FragmentPath --value amaterasu-linux-session.service" ]; then
     if [ "$SYSTEMD_FRAGMENT" = "$SYSTEMD_EXPECTED_FRAGMENT" ] && [ ! -e "$SYSTEMD_UNIT_PATH" ]; then exit 1; fi
     printf '%s\n' "$SYSTEMD_FRAGMENT"
+elif [ "$*" = "--user show --no-pager --property=ActiveState --property=UnitFileState amaterasu-linux-session.service" ]; then
+    status=$(cat "$QUERY_STATUS_FILE")
+    [ "$status" -eq 0 ] || exit "$status"
+    printf 'ActiveState=%s\nUnitFileState=%s\n' "$(cat "$ACTIVE_STATE_FILE")" "$(cat "$IS_ENABLED_STATUS_FILE")"
 elif [ "$*" = "--user enable amaterasu-linux-session.service" ]; then
     mkdir -p "$(dirname -- "$SYSTEMD_WANTED_LINK")"
     [ -L "$SYSTEMD_WANTED_LINK" ] || ln -s ../amaterasu-linux-session.service "$SYSTEMD_WANTED_LINK"
     [ "${FAIL_ENABLE:-0}" = 1 ] && exit 1
 elif [ "$*" = "--user disable amaterasu-linux-session.service" ]; then
     rm -f -- "$SYSTEMD_WANTED_LINK"
-elif [ "$*" = "--user is-active --quiet amaterasu-linux-session.service" ]; then
-    exit 1
-elif [ "$*" = "--user is-enabled --quiet amaterasu-linux-session.service" ]; then
-    [ -L "$SYSTEMD_WANTED_LINK" ] && exit 0 || exit 1
 fi
 exit 0
 "#,
@@ -1069,7 +1118,16 @@ exit 0
         let fake_release = bin.join("amaterasu-release");
         fs::write(
             &fake_release,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$RELEASE_LOG\"\n[ \"${FAIL_PREFLIGHT:-0}\" = 0 ]\n",
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$RELEASE_LOG"
+count=0
+[ ! -f "$PREFLIGHT_COUNT_FILE" ] || count=$(cat "$PREFLIGHT_COUNT_FILE")
+count=$((count + 1))
+printf '%s\n' "$count" > "$PREFLIGHT_COUNT_FILE"
+fail_at=0
+[ ! -f "$PREFLIGHT_FAIL_AT_FILE" ] || fail_at=$(cat "$PREFLIGHT_FAIL_AT_FILE")
+[ "${FAIL_PREFLIGHT:-0}" = 0 ] && [ "$count" -ne "$fail_at" ]
+"#,
         )
         .unwrap();
         fs::set_permissions(&fake_release, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1083,6 +1141,15 @@ exit 0
 
         let log = root.join("systemctl.log");
         let release_log = root.join("release.log");
+        let preflight_count = root.join("preflight-count");
+        let preflight_fail_at = root.join("preflight-fail-at");
+        let query_status = root.join("query-status");
+        let active_state = root.join("active-state");
+        let enabled_status = root.join("enabled-status");
+        fs::write(&preflight_fail_at, "0").unwrap();
+        fs::write(&query_status, "0").unwrap();
+        fs::write(&active_state, "inactive").unwrap();
+        fs::write(&enabled_status, "enabled").unwrap();
         let user_dir = home.join(".config/systemd/user");
         let installed = user_dir.join(UNIT_FILE);
         let wanted_link = user_dir
@@ -1104,6 +1171,11 @@ exit 0
                 .env("PATH", &path)
                 .env("SYSTEMCTL_LOG", &log)
                 .env("RELEASE_LOG", &release_log)
+                .env("PREFLIGHT_COUNT_FILE", &preflight_count)
+                .env("PREFLIGHT_FAIL_AT_FILE", &preflight_fail_at)
+                .env("QUERY_STATUS_FILE", &query_status)
+                .env("ACTIVE_STATE_FILE", &active_state)
+                .env("IS_ENABLED_STATUS_FILE", &enabled_status)
                 .env("SYSTEMD_FRAGMENT", fragment)
                 .env("SYSTEMD_EXPECTED_FRAGMENT", &expected_fragment)
                 .env("SYSTEMD_UNIT_PATH", &installed)
@@ -1121,6 +1193,11 @@ exit 0
                 .env("PATH", &path)
                 .env("SYSTEMCTL_LOG", &log)
                 .env("RELEASE_LOG", &release_log)
+                .env("PREFLIGHT_COUNT_FILE", &preflight_count)
+                .env("PREFLIGHT_FAIL_AT_FILE", &preflight_fail_at)
+                .env("QUERY_STATUS_FILE", &query_status)
+                .env("ACTIVE_STATE_FILE", &active_state)
+                .env("IS_ENABLED_STATUS_FILE", &enabled_status)
                 .env("FAIL_PREFLIGHT", "1")
                 .status()
                 .unwrap()
@@ -1142,6 +1219,22 @@ exit 0
         assert!(!installed.exists());
         assert!(!wanted_link.exists());
 
+        fs::write(&log, "").unwrap();
+        fs::write(&preflight_count, "0").unwrap();
+        fs::write(&preflight_fail_at, "2").unwrap();
+        assert!(!run_script("install-user-service.sh", &expected_fragment, false).success());
+        assert!(!installed.exists());
+        assert!(!wanted_link.exists());
+        assert!(!fs::read_to_string(&log).unwrap().contains("--user enable "));
+
+        fs::write(&log, "").unwrap();
+        fs::write(&preflight_count, "0").unwrap();
+        fs::write(&preflight_fail_at, "3").unwrap();
+        assert!(!run_script("install-user-service.sh", &expected_fragment, false).success());
+        assert!(!installed.exists());
+        assert!(!wanted_link.exists());
+        fs::write(&preflight_fail_at, "0").unwrap();
+
         assert!(run_script("install-user-service.sh", &expected_fragment, false).success());
         assert!(run_script("install-user-service.sh", &expected_fragment, false).success());
         assert_eq!(fs::read(&installed).unwrap(), unit.as_bytes());
@@ -1154,6 +1247,20 @@ exit 0
             .join("graphical-session.target.wants")
             .join("other.service");
         std::os::unix::fs::symlink("../other.service", &unrelated_link).unwrap();
+
+        fs::write(&query_status, "5").unwrap();
+        assert!(!run_script("uninstall-user-service.sh", &expected_fragment, false).success());
+        assert!(installed.exists());
+        assert!(wanted_link.is_symlink());
+        fs::write(&query_status, "0").unwrap();
+        fs::write(&active_state, "unknown").unwrap();
+        assert!(!run_script("uninstall-user-service.sh", &expected_fragment, false).success());
+        assert!(installed.exists());
+        assert!(wanted_link.is_symlink());
+        fs::write(&active_state, "inactive").unwrap();
+        let manager_calls = fs::read_to_string(&log).unwrap();
+        assert!(!manager_calls.contains("--user stop "));
+        assert!(!manager_calls.contains("--user disable "));
 
         assert!(!run_script("uninstall-user-service.sh", &other_unit, false).success());
         assert!(installed.exists());
