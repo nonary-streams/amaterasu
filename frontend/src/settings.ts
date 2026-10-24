@@ -3099,7 +3099,7 @@ namespace Amaterasu {
           field(
             "Native pen and touch policy",
             nativePenTouch,
-            "Windows-only global preference. Native pen/touch event transport and platform support are not implemented; saving this value does not activate pen or touch events.",
+            "On Linux, the companion can map one Touch contact to mouse emulation when this setting is enabled and the caller has the mouse grant. Native Linux Pen events and multitouch are unsupported; this does not create a native touch device. Windows native pen/touch support depends on backend capability.",
           ),
           field(
             "High-resolution scrolling",
