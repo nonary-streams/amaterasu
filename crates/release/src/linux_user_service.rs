@@ -262,6 +262,16 @@ check_no_symlinks "$user_dir"
 mkdir -p "$user_dir"
 check_no_symlinks "$user_dir"
 target="$user_dir/$unit_name"
+selected_fragment=$(systemctl --user show --property=FragmentPath --value "$unit_name" 2>/dev/null || true)
+if [ -n "$selected_fragment" ]; then
+    [ -f "$target" ] && [ ! -L "$target" ] || {
+        echo "refusing to shadow a different user unit named $unit_name: $selected_fragment" >&2; exit 1;
+    }
+    expected_fragment=$(readlink -f -- "$target")
+    [ "$selected_fragment" = "$expected_fragment" ] || {
+        echo "refusing to modify a different user unit named $unit_name: $selected_fragment" >&2; exit 1;
+    }
+fi
 wanted_dir="$user_dir/graphical-session.target.wants"
 wanted_link="$wanted_dir/$unit_name"
 wanted_preexisting=0
@@ -300,6 +310,13 @@ rollback_new_unit() {
 if ! systemctl --user daemon-reload; then
     rollback_new_unit
     echo "systemd user manager could not reload; new unit rolled back" >&2
+    exit 1
+fi
+expected_fragment=$(readlink -f -- "$target")
+selected_fragment=$(systemctl --user show --property=FragmentPath --value "$unit_name" 2>/dev/null || true)
+if [ "$selected_fragment" != "$expected_fragment" ]; then
+    rollback_new_unit
+    echo "systemd user manager did not resolve the generated unit; new unit rolled back" >&2
     exit 1
 fi
 if ! systemctl --user enable "$unit_name"; then
@@ -343,6 +360,11 @@ target="$user_dir/$unit_name"
 [ -f "$target" ] && [ ! -L "$target" ] && cmp -s "$source_unit" "$target" || {
     echo "installed unit is absent or differs from the managed artifact; leaving it untouched" >&2; exit 1;
 }
+expected_fragment=$(readlink -f -- "$target")
+selected_fragment=$(systemctl --user show --property=FragmentPath --value "$unit_name" 2>/dev/null || true)
+[ "$selected_fragment" = "$expected_fragment" ] || {
+    echo "user manager resolves a different unit named $unit_name; leaving it untouched" >&2; exit 1;
+}
 if systemctl --user is-active --quiet "$unit_name"; then
     systemctl --user stop "$unit_name"
 fi
@@ -360,7 +382,7 @@ echo "Removed the verified Amaterasu user unit. Runtime data and signed package 
 
 fn render_readme(digest: &str) -> String {
     format!(
-        "# Amaterasu LinuxSession user service\n\nThis bundle was generated for signed active package `{digest}`. The unit runs under the current user manager and never requests root or system service privileges. Its `ExecStart` pins this digest; a different active package fails closed until a new bundle is generated and reviewed.\n\nReview `amaterasu-linux-session.service`, then install it for this user with `sh install-user-service.sh`. Installation enables the unit for `graphical-session.target` but does not start it. Start it explicitly with `systemctl --user start amaterasu-linux-session.service`, or let the graphical session start it.\n\nThe host verifies the production bootstrap, trusted package signature, active selection, and pinned digest on every start. A module tick or health failure exits the service; systemd restarts it after a fixed five-second delay and the next start re-verifies the same digest. SIGTERM triggers orderly component teardown and Linux input revocation. A forced kill is recovered by the same fresh verification and load on restart.\n\nUninstall from this same bundle with `sh uninstall-user-service.sh`. It stops and disables the user unit only after verifying that the installed unit bytes match this bundle, rechecks before removing the file, and leaves runtime data and the signed package intact. If the unit was edited or replaced, uninstall refuses to remove it.\n\nThe generated scripts affect only the current user service directory selected by `XDG_CONFIG_HOME` (or `$HOME/.config`). They refuse root execution and symlinked service paths. No service was installed or started when this bundle was generated.\n"
+        "# Amaterasu LinuxSession user service\n\nThis bundle was generated for signed active package `{digest}`. The unit runs under the current user manager and never requests root or system service privileges. Its `ExecStart` pins this digest; a different active package fails closed until a new bundle is generated and reviewed.\n\nReview `amaterasu-linux-session.service`, then install it for this user with `sh install-user-service.sh`. Installation enables the unit for `graphical-session.target` but does not start it. Start it explicitly with `systemctl --user start amaterasu-linux-session.service`, or let the graphical session start it.\n\nThe host verifies the production bootstrap, trusted package signature, active selection, and pinned digest on every start. A module tick or health failure exits the service; systemd restarts it after a fixed five-second delay and the next start re-verifies the same digest. SIGTERM triggers orderly component teardown and Linux input revocation. A forced kill is recovered by the same fresh verification and load on restart.\n\nUninstall from this same bundle with `sh uninstall-user-service.sh`. It stops and disables the user unit only after verifying that the installed unit bytes match this bundle, rechecks before removing the file, and leaves runtime data and the signed package intact. If the unit was edited or replaced, uninstall refuses to remove it.\n\nThe generated scripts affect only the current user service directory selected by `XDG_CONFIG_HOME` (or `$HOME/.config`). They refuse root execution and symlinked service paths, and verify that systemd resolves this exact unit file before enabling or uninstalling it. No service was installed or started when this bundle was generated.\n"
     )
 }
 
@@ -406,6 +428,8 @@ mod tests {
         let uninstall = uninstall_script();
         assert!(install.contains("cmp -s \"$source_unit\" \"$target\""));
         assert!(install.contains("refusing to overwrite unmanaged service content"));
+        assert!(install.contains("FragmentPath"));
+        assert!(install.contains("refusing to shadow a different user unit"));
         assert!(install.contains("systemctl --user enable"));
         assert!(
             !install
@@ -413,6 +437,7 @@ mod tests {
                 .any(|line| line.starts_with("systemctl --user start "))
         );
         assert!(uninstall.contains("cmp -s \"$source_unit\" \"$target\""));
+        assert!(uninstall.contains("user manager resolves a different unit"));
         assert!(uninstall.contains("unit changed during uninstall"));
         assert!(uninstall.contains("systemctl --user stop"));
     }
@@ -448,7 +473,24 @@ mod tests {
         let systemctl = bin.join("systemctl");
         fs::write(
             &systemctl,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SYSTEMCTL_LOG\"\ncase \"$*\" in 'is-active --quiet '*|'is-enabled --quiet '*) exit 1 ;; esac\nexit 0\n",
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+if [ "$*" = "--user show --property=FragmentPath --value amaterasu-linux-session.service" ]; then
+    if [ "$SYSTEMD_FRAGMENT" = "$SYSTEMD_EXPECTED_FRAGMENT" ] && [ ! -e "$SYSTEMD_UNIT_PATH" ]; then exit 1; fi
+    printf '%s\n' "$SYSTEMD_FRAGMENT"
+elif [ "$*" = "--user enable amaterasu-linux-session.service" ]; then
+    mkdir -p "$(dirname -- "$SYSTEMD_WANTED_LINK")"
+    [ -L "$SYSTEMD_WANTED_LINK" ] || ln -s ../amaterasu-linux-session.service "$SYSTEMD_WANTED_LINK"
+    [ "${FAIL_ENABLE:-0}" = 1 ] && exit 1
+elif [ "$*" = "--user disable amaterasu-linux-session.service" ]; then
+    rm -f -- "$SYSTEMD_WANTED_LINK"
+elif [ "$*" = "--user is-active --quiet amaterasu-linux-session.service" ]; then
+    exit 1
+elif [ "$*" = "--user is-enabled --quiet amaterasu-linux-session.service" ]; then
+    [ -L "$SYSTEMD_WANTED_LINK" ] && exit 0 || exit 1
+fi
+exit 0
+"#,
         )
         .unwrap();
         fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o700)).unwrap();
@@ -461,37 +503,86 @@ mod tests {
         fs::set_permissions(&fake_id, fs::Permissions::from_mode(0o700)).unwrap();
 
         let log = root.join("systemctl.log");
+        let user_dir = home.join(".config/systemd/user");
+        let installed = user_dir.join(UNIT_FILE);
+        let wanted_link = user_dir
+            .join("graphical-session.target.wants")
+            .join(UNIT_FILE);
+        let expected_fragment = home
+            .canonicalize()
+            .unwrap()
+            .join(".config/systemd/user")
+            .join(UNIT_FILE)
+            .to_string_lossy()
+            .into_owned();
         let path = format!("{}:/usr/bin:/bin", bin.display());
-        let run_script = |name: &str| {
+        let run_script = |name: &str, fragment: &str, fail_enable: bool| {
             Command::new("sh")
                 .arg(bundle.join(name))
                 .env("HOME", &home)
                 .env("PATH", &path)
                 .env("SYSTEMCTL_LOG", &log)
+                .env("SYSTEMD_FRAGMENT", fragment)
+                .env("SYSTEMD_EXPECTED_FRAGMENT", &expected_fragment)
+                .env("SYSTEMD_UNIT_PATH", &installed)
+                .env("SYSTEMD_WANTED_LINK", &wanted_link)
+                .env("FAIL_ENABLE", if fail_enable { "1" } else { "0" })
                 .status()
                 .unwrap()
         };
 
-        assert!(run_script("install-user-service.sh").success());
-        let installed = home.join(".config/systemd/user").join(UNIT_FILE);
+        let other_unit = root
+            .join("other-user-unit.service")
+            .to_string_lossy()
+            .into_owned();
+        assert!(!run_script("install-user-service.sh", &other_unit, false).success());
+        assert!(!installed.exists());
+
+        assert!(!run_script("install-user-service.sh", &expected_fragment, true).success());
+        assert!(!installed.exists());
+        assert!(!wanted_link.exists());
+
+        assert!(run_script("install-user-service.sh", &expected_fragment, false).success());
+        assert!(run_script("install-user-service.sh", &expected_fragment, false).success());
         assert_eq!(fs::read(&installed).unwrap(), unit.as_bytes());
+        assert!(wanted_link.is_symlink());
         assert!(!fs::read_to_string(&log).unwrap().contains("start "));
 
+        let unrelated_unit = user_dir.join("other.service");
+        fs::write(&unrelated_unit, "unrelated content").unwrap();
+        let unrelated_link = user_dir
+            .join("graphical-session.target.wants")
+            .join("other.service");
+        std::os::unix::fs::symlink("../other.service", &unrelated_link).unwrap();
+
+        assert!(!run_script("uninstall-user-service.sh", &other_unit, false).success());
+        assert!(installed.exists());
+        assert!(wanted_link.is_symlink());
+        let manager_calls = fs::read_to_string(&log).unwrap();
+        assert!(!manager_calls.contains("--user stop "));
+        assert!(!manager_calls.contains("--user disable "));
+
         fs::write(&installed, "unmanaged replacement").unwrap();
-        assert!(!run_script("install-user-service.sh").success());
+        assert!(!run_script("install-user-service.sh", &expected_fragment, false).success());
         assert_eq!(
             fs::read_to_string(&installed).unwrap(),
             "unmanaged replacement"
         );
-        assert!(!run_script("uninstall-user-service.sh").success());
+        assert!(!run_script("uninstall-user-service.sh", &expected_fragment, false).success());
         assert_eq!(
             fs::read_to_string(&installed).unwrap(),
             "unmanaged replacement"
         );
 
         fs::write(&installed, &unit).unwrap();
-        assert!(run_script("uninstall-user-service.sh").success());
+        assert!(run_script("uninstall-user-service.sh", &expected_fragment, false).success());
         assert!(!installed.exists());
+        assert!(!wanted_link.exists());
+        assert_eq!(
+            fs::read_to_string(&unrelated_unit).unwrap(),
+            "unrelated content"
+        );
+        assert!(unrelated_link.is_symlink());
         assert!(!fs::read_to_string(&log).unwrap().contains("start "));
         let _ = fs::remove_dir_all(root);
     }
