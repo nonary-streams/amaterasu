@@ -377,7 +377,10 @@ fn absolute_pointer_uses_mouse_grant_without_adding_held_cleanup() {
 
     assert_eq!(absolute.transition(), None);
     session.submit(&packet(1, absolute.clone()), now).unwrap();
-    assert_eq!(session.sink.sent, [absolute.clone()]);
+    assert_eq!(
+        session.sink.sent.as_slice(),
+        std::slice::from_ref(&absolute)
+    );
     session.revoke().unwrap();
 
     assert_eq!(session.sink.sent, [absolute]);
