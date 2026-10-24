@@ -2308,8 +2308,7 @@ fn validate_linux_x264_inputs(
         return Err(format!(
             "required system x264 runtime for build {} is unavailable or incompatible",
             build
-        )
-        .into());
+        ));
     }
     Ok(())
 }
