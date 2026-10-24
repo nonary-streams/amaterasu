@@ -60,7 +60,11 @@ fn negotiated_video_geometry_and_rate_are_allocated_only_at_authenticated_start(
     assert_eq!(video.payload["configuration"]["height"], 720);
     assert_eq!(video.payload["configuration"]["fps"], 30);
     assert_eq!(video.payload["configuration"]["bitrate"], 8_000_000);
-    assert_eq!(video.payload["configuration"]["max_reference_frames"], 0);
+    assert!(video.payload["configuration"]["max_reference_frames"].is_null());
+    let forwarded_configuration: crate::model::VideoConfiguration =
+        serde_json::from_value(video.payload["configuration"].clone())
+            .expect("omitted zero uses the encoder's default reference selection");
+    assert_eq!(forwarded_configuration.max_reference_frames, 0);
 }
 
 #[test]

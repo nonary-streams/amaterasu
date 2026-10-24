@@ -2801,6 +2801,7 @@ mod tests {
             ("x-nv-video[0].clientViewportWd", "1280"),
             ("x-nv-video[0].clientViewportHt", "720"),
             ("x-nv-video[0].maxFPS", "30"),
+            ("x-nv-video[0].clientRefreshRateX100", "3000"),
             ("x-nv-video[0].initialBitrateKbps", "8000"),
             ("x-nv-video[0].initialPeakBitrateKbps", "8000"),
             ("x-nv-vqos[0].bw.minimumBitrateKbps", "8000"),
