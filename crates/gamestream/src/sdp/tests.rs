@@ -55,6 +55,21 @@ fn primary_client_shape_negotiates_exact_h264_sdr_requirements() {
 }
 
 #[test]
+fn client_csc_modes_have_distinct_matrix_and_range() {
+    for (wire, expected) in [
+        ("0", ColorMode::Bt601Limited),
+        ("1", ColorMode::Bt601Full),
+        ("2", ColorMode::Bt709Limited),
+        ("3", ColorMode::Bt709Full),
+    ] {
+        let parsed = parse_announce(changed("x-nv-video[0].encoderCscMode", wire).as_bytes())
+            .expect("supported color mode");
+        assert_eq!(parsed.video.color, expected);
+    }
+    assert!(parse_announce(changed("x-nv-video[0].encoderCscMode", "4").as_bytes()).is_err());
+}
+
+#[test]
 fn surround_audio_requires_exact_channel_mask_and_enable_pair() {
     for (channels, mask) in [(6, 63), (8, 1599)] {
         let announce = changed("x-nv-audio.surround.numChannels", &channels.to_string());

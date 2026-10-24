@@ -27,6 +27,7 @@ pub(super) struct Record {
     pub session: Option<u64>,
     pub negotiation: Option<Negotiation>,
     pub negotiated_encryption: Option<crate::model::EncryptionSnapshot>,
+    pub negotiated_color: Option<amaterasu_gamestream::sdp::ColorMode>,
     pub url: String,
     pub session_token: String,
     pub udp_discovery: Option<UdpDiscovery>,
@@ -90,12 +91,21 @@ impl Record {
             video: announce.encryption.video,
             audio: announce.encryption.audio,
         });
+        self.negotiated_color = accepted.then_some(announce.video.color);
         accepted
     }
 
     pub(super) fn authenticated_start_payload(&self, session: u64) -> Option<Value> {
         let encryption = self.negotiated_encryption?;
-        Some(self.config.arm_with_encryption(session, encryption))
+        let color = self.negotiated_color?;
+        let mut payload = self.config.arm_with_encryption(session, encryption);
+        payload["configuration"]["configuration"]["color_mode"] = serde_json::json!(match color {
+            amaterasu_gamestream::sdp::ColorMode::Bt601Limited => "bt601_limited",
+            amaterasu_gamestream::sdp::ColorMode::Bt601Full => "bt601_full",
+            amaterasu_gamestream::sdp::ColorMode::Bt709Limited => "bt709_limited",
+            amaterasu_gamestream::sdp::ColorMode::Bt709Full => "bt709_full",
+        });
+        Some(payload)
     }
 
     pub fn operation(&self) -> String {
@@ -134,7 +144,16 @@ impl Record {
                 encrypted_audio: true,
                 fec: true,
             },
-            color: amaterasu_gamestream::sdp::ColorMode::Bt709Limited,
+            supported_colors: if cfg!(target_os = "linux") {
+                vec![
+                    amaterasu_gamestream::sdp::ColorMode::Bt601Limited,
+                    amaterasu_gamestream::sdp::ColorMode::Bt601Full,
+                    amaterasu_gamestream::sdp::ColorMode::Bt709Limited,
+                    amaterasu_gamestream::sdp::ColorMode::Bt709Full,
+                ]
+            } else {
+                vec![amaterasu_gamestream::sdp::ColorMode::Bt709Limited]
+            },
             max_width: effective_profile.width,
             max_height: effective_profile.height,
             max_fps: effective_profile.fps,

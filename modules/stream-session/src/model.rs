@@ -678,6 +678,9 @@ pub struct VideoConfiguration {
     /// single H.264 reference frame.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_reference_frames: u32,
+    /// Negotiated SDP color matrix and range, carried unchanged to the encoder.
+    #[serde(default)]
+    pub color_mode: amaterasu_media::ColorMode,
 }
 
 fn is_zero(value: &u32) -> bool {

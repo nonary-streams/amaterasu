@@ -388,7 +388,7 @@ impl Profile {
             && announce.video.fps == self.fps
             && announce.video.bitrate_kbps == self.bitrate_kbps
             && announce.video.max_reference_frames == self.max_reference_frames
-            && announce.video.color == ColorMode::Bt709Limited
+            && supported_color(announce.video.color)
             && announce.encryption.video == self.encrypt_video
     }
 
@@ -437,6 +437,19 @@ impl Profile {
         )
         .map_err(|_| "invalid_profile")?;
         Ok(())
+    }
+}
+fn supported_color(color: ColorMode) -> bool {
+    if cfg!(target_os = "linux") {
+        matches!(
+            color,
+            ColorMode::Bt601Limited
+                | ColorMode::Bt601Full
+                | ColorMode::Bt709Limited
+                | ColorMode::Bt709Full
+        )
+    } else {
+        color == ColorMode::Bt709Limited
     }
 }
 

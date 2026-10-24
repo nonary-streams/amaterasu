@@ -8,6 +8,24 @@ use super::*;
 use harness::*;
 
 #[test]
+fn negotiated_color_reaches_video_open_unchanged() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let session = prepared["session"].as_u64().expect("prepared session");
+    let mut request = start(session);
+    request["configuration"]["configuration"]["color_mode"] = json!("bt601_full");
+    let started = host.response(2, request);
+    assert_eq!(started["state"], "active", "{started}");
+    let video = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("video opened");
+    assert_eq!(video.payload["configuration"]["color_mode"], "bt601_full");
+}
+
+#[test]
 fn stereo_512k_prepare_reaches_encoder_with_bounded_packet_size() {
     for (packet_ms, packet_bytes) in [(5, 320), (10, 640)] {
         let mut host = Harness::new();

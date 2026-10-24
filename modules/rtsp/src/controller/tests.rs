@@ -111,6 +111,7 @@ fn record(state: State) -> Record {
         session: Some(23),
         negotiation: None,
         negotiated_encryption: None,
+        negotiated_color: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -810,6 +811,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         session: None,
         negotiation: None,
         negotiated_encryption: None,
+        negotiated_color: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -1612,9 +1614,33 @@ fn accepted_announce_encryption_flows_into_authenticated_play_start() {
         payload["configuration"]["encrypt_audio"],
         announce.encryption.audio
     );
+    assert_eq!(
+        payload["configuration"]["configuration"]["color_mode"],
+        "bt709_limited"
+    );
     assert!(
         record.config.arm(23)["configuration"]
             .get("encrypt_video")
+            .is_none()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn accepted_color_survives_authenticated_start() {
+    let (mut record, mut announce) = announced_profile_record();
+    announce.video.color = amaterasu_gamestream::sdp::ColorMode::Bt601Full;
+    assert!(record.accept_announce(&announce));
+    let payload = record
+        .authenticated_start_payload(23)
+        .expect("accepted color");
+    assert_eq!(
+        payload["configuration"]["configuration"]["color_mode"],
+        "bt601_full"
+    );
+    assert!(
+        record.config.arm(23)["configuration"]["configuration"]
+            .get("color_mode")
             .is_none()
     );
 }
@@ -1630,6 +1656,7 @@ fn rejected_announce_cannot_produce_an_authenticated_play_start() {
 
     assert!(!record.accept_announce(&announce));
     assert!(record.negotiated_encryption.is_none());
+    assert!(record.negotiated_color.is_none());
     assert!(record.authenticated_start_payload(23).is_none());
 }
 
@@ -1656,6 +1683,7 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
             video: true,
             audio: false,
         });
+        record.negotiated_color = Some(amaterasu_gamestream::sdp::ColorMode::Bt709Limited);
         record.config.frame_limiter_settings = Some(snapshot.clone());
         record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());
         record.config.application_operation_id = Some("launch-one".into());

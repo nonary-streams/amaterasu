@@ -24,7 +24,7 @@ fn negotiation() -> Negotiation {
                 encrypted_audio: true,
                 fec: true,
             },
-            color: sdp::ColorMode::Bt709Limited,
+            supported_colors: vec![sdp::ColorMode::Bt709Limited],
             max_width: 1920,
             max_height: 1080,
             max_fps: 60,
@@ -322,6 +322,29 @@ fn unsupported_media_cannot_reach_backend_actions() {
         input.body = body.replace(before, after).into_bytes();
         assert_eq!(machine.handle(7, &input), Err(Error::UnsupportedMedia));
         assert_eq!(machine.state(), State::Announce);
+    }
+}
+
+#[test]
+fn announced_color_requires_an_explicit_supported_mode() {
+    let mut machine = negotiation();
+    let mut announced = sdp::parse_announce(&announce().body).expect("valid ANNOUNCE");
+    for mode in [
+        sdp::ColorMode::Bt601Limited,
+        sdp::ColorMode::Bt601Full,
+        sdp::ColorMode::Bt709Limited,
+        sdp::ColorMode::Bt709Full,
+    ] {
+        announced.video.color = mode;
+        machine.capabilities.supported_colors = vec![mode];
+        assert_eq!(validation::media(&announced, &machine.capabilities), Ok(()));
+        machine.capabilities.supported_colors = vec![sdp::ColorMode::Bt709Limited];
+        if mode != sdp::ColorMode::Bt709Limited {
+            assert_eq!(
+                validation::media(&announced, &machine.capabilities),
+                Err(Error::UnsupportedMedia)
+            );
+        }
     }
 }
 

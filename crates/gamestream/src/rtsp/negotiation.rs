@@ -27,7 +27,8 @@ pub struct UdpDiscovery {
 
 pub struct Capabilities {
     pub transport: sdp::TransportSupport,
-    pub color: sdp::ColorMode,
+    /// Color modes implemented by the selected capture-to-encoder path.
+    pub supported_colors: Vec<sdp::ColorMode>,
     pub max_width: u32,
     pub max_height: u32,
     pub max_fps: u32,

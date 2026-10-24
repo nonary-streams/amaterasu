@@ -97,6 +97,7 @@ impl Controller {
                 );
                 if !completed {
                     record.negotiated_encryption = None;
+                    record.negotiated_color = None;
                 }
             }
             Ok(NegotiationStep::Action {

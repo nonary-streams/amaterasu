@@ -25,6 +25,7 @@ pub(super) fn launch(launch: &TrustedLaunch, capabilities: &Capabilities) -> Res
         || !(16..=2160).contains(&capabilities.max_height)
         || !(1..=120).contains(&capabilities.max_fps)
         || !(100..=100000).contains(&capabilities.max_bitrate_kbps)
+        || capabilities.supported_colors.is_empty()
     {
         return Err(Error::InvalidLaunch);
     }
@@ -132,7 +133,7 @@ pub(super) fn media(value: &sdp::Announce, capabilities: &Capabilities) -> Resul
         })?;
     if value.control != sdp::ControlProtocol::EncryptedEnet
         || !value.encryption.control_v2
-        || value.video.color != capabilities.color
+        || !capabilities.supported_colors.contains(&value.video.color)
         || value.video.width > capabilities.max_width
         || value.video.height > capabilities.max_height
         || value.video.fps > capabilities.max_fps
@@ -144,7 +145,7 @@ pub(super) fn media(value: &sdp::Announce, capabilities: &Capabilities) -> Resul
             "amaterasu rtsp announce profile rejection control={} control_v2={} color={} geometry={} fps={} bitrate={} video_encryption={} audio_encryption={}",
             value.control == sdp::ControlProtocol::EncryptedEnet,
             value.encryption.control_v2,
-            value.video.color == capabilities.color,
+            capabilities.supported_colors.contains(&value.video.color),
             value.video.width <= capabilities.max_width
                 && value.video.height <= capabilities.max_height,
             value.video.fps <= capabilities.max_fps,
@@ -154,7 +155,7 @@ pub(super) fn media(value: &sdp::Announce, capabilities: &Capabilities) -> Resul
         );
         eprintln!(
             "amaterasu rtsp announce color requested={:?} supported={:?}",
-            value.video.color, capabilities.color
+            value.video.color, capabilities.supported_colors
         );
         return Err(Error::UnsupportedMedia);
     }

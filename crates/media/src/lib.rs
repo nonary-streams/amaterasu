@@ -9,6 +9,8 @@ mod audio_encoder;
 pub use audio_encoder::*;
 mod control;
 pub use control::*;
+mod color;
+pub use color::*;
 mod geometry;
 pub use geometry::*;
 mod transport;
