@@ -267,6 +267,126 @@ fn finish_prepare(controller: &mut Controller, runtime: &RuntimeClient) {
     }
 }
 
+#[test]
+fn authenticated_disconnect_revokes_ticket_and_stops_its_session() {
+    let mut endpoint = Endpoint::default();
+    endpoint.enqueue(1, "owner", open("disconnect-cleanup"));
+    let runtime = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+    finish_prepare(&mut controller, &runtime);
+    let ticket = endpoint.completed(1)["ticket"].as_u64().unwrap();
+
+    controller.disconnected(77, Some(ticket), "peer_closed");
+    assert_eq!(controller.records[&ticket].state, State::Closing);
+    for now in 3..10 {
+        tick(&mut controller, &runtime, now);
+    }
+
+    let stops: Vec<_> = endpoint
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.stream-session/1" && payload["action"] == "stop" => {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stops.len(), 1);
+    assert_eq!(stops[0]["session"], SESSION);
+    assert!(controller.records[&ticket].cleanup_confirmed);
+    assert_eq!(controller.records[&ticket].state, State::Failed);
+}
+
+#[test]
+fn orderly_module_shutdown_requests_replay_safe_stop_for_owned_sessions() {
+    let mut endpoint = Endpoint::default();
+    endpoint.enqueue(1, "owner", open("module-shutdown-cleanup"));
+    let runtime = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+    finish_prepare(&mut controller, &runtime);
+    let ticket = endpoint.completed(1)["ticket"].as_u64().unwrap();
+
+    controller.shutdown(&runtime);
+    controller.shutdown(&runtime);
+
+    let stops: Vec<_> = endpoint
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service,
+                payload,
+                operation_id,
+                parent,
+                ..
+            } if service == "amaterasu.stream-session/1" && payload["action"] == "stop" => {
+                Some((payload, operation_id, parent))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stops.len(), 1);
+    assert!(
+        stops
+            .iter()
+            .all(|(payload, _, parent)| { payload["session"] == SESSION && parent.is_none() })
+    );
+    assert_eq!(controller.records[&ticket].state, State::Failed);
+    assert!(controller.records[&ticket].cleanup_confirmed);
+}
+
+#[test]
+fn orderly_module_shutdown_keeps_cleanup_failed_when_provider_stop_is_uncertain() {
+    let mut endpoint = Endpoint {
+        cleanup_fails: true,
+        ..Endpoint::default()
+    };
+    endpoint.enqueue(1, "owner", open("module-shutdown-failure"));
+    let runtime = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+    finish_prepare(&mut controller, &runtime);
+    let ticket = endpoint.completed(1)["ticket"].as_u64().unwrap();
+
+    controller.shutdown(&runtime);
+
+    assert!(!controller.records[&ticket].cleanup_confirmed);
+    assert_eq!(controller.records[&ticket].state, State::CleanupFailed);
+    assert_eq!(
+        controller.records[&ticket].cleanup_error,
+        Some("shutdown_stop_rejected")
+    );
+}
+
+#[test]
+fn orderly_module_shutdown_recovers_and_stops_an_uncertain_prepare() {
+    let mut endpoint = Endpoint::default();
+    endpoint.enqueue(1, "owner", open("interrupted-prepare"));
+    let runtime = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+    tick(&mut controller, &runtime, 0);
+    tick(&mut controller, &runtime, 1);
+    let ticket = *controller.records.keys().next().expect("preparing ticket");
+    assert!(controller.records[&ticket].needs_lookup);
+
+    controller.shutdown(&runtime);
+
+    assert!(controller.records[&ticket].cleanup_confirmed);
+    assert_eq!(controller.records[&ticket].state, State::Failed);
+    assert_eq!(
+        endpoint
+            .downstream_requests()
+            .iter()
+            .map(|entry| entry.0)
+            .collect::<Vec<_>>(),
+        ["prepare", "lookup", "stop"]
+    );
+    assert_eq!(endpoint.downstream_requests()[1].2, None);
+    assert_eq!(endpoint.downstream_requests()[2].2, None);
+}
+
 fn surround_announcement(channels: u32, packet_ms: u32) -> String {
     let (mask, enabled) = match channels {
         6 => (63, 1),

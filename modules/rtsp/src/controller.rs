@@ -248,6 +248,81 @@ impl Controller {
                 call.shutdown(runtime);
             }
         }
+        self.stop_owned_sessions_on_shutdown(runtime);
+    }
+
+    fn stop_owned_sessions_on_shutdown(&mut self, runtime: &RuntimeClient) {
+        let tickets: Vec<_> = self.records.keys().copied().collect();
+        for ticket in tickets {
+            let Some(mut record) = self.records.remove(&ticket) else {
+                continue;
+            };
+            if !record.state.terminal() && record.state != State::Closing {
+                record.close(Some("module_stopping"));
+            }
+            self.revoke_ticket(ticket);
+            if !record.cleanup_confirmed {
+                self.stop_owned_session_on_shutdown(runtime, &mut record);
+            }
+            self.records.insert(ticket, record);
+        }
+    }
+
+    fn stop_owned_session_on_shutdown(&mut self, runtime: &RuntimeClient, record: &mut Record) {
+        if record.session.is_none() && record.needs_lookup {
+            let lookup = shutdown_request(
+                runtime,
+                json!({"action":"lookup","operation_id":record.operation()}),
+                format!("{}-module-shutdown-lookup", record.operation()),
+            );
+            match lookup {
+                Ok(payload) if payload["ok"] == true => {
+                    record.session = response_session(&payload);
+                    if record.session.is_none() {
+                        record.state = State::CleanupFailed;
+                        record.cleanup_error = Some("shutdown_lookup_invalid");
+                        return;
+                    }
+                }
+                Ok(payload) if payload["code"] == "session_not_found" => {
+                    record.state = State::CleanupFailed;
+                    record.cleanup_error = Some("shutdown_lookup_not_found");
+                    return;
+                }
+                _ => {
+                    record.state = State::CleanupFailed;
+                    record.cleanup_error = Some("shutdown_lookup_unconfirmed");
+                    return;
+                }
+            }
+        }
+
+        let Some(session) = record.session else {
+            record.cleanup_confirmed = true;
+            finish_record(record);
+            return;
+        };
+        let stop = shutdown_request(
+            runtime,
+            json!({"action":"stop","session":session}),
+            format!("{}-module-shutdown-stop", record.operation()),
+        );
+        match stop {
+            Ok(payload) if clean_terminal(record, &payload) => {
+                record.stream_state = stream_state(&payload).map(str::to_owned);
+                record.cleanup_confirmed = true;
+                record.cleanup_error = None;
+                finish_record(record);
+            }
+            Ok(_) => {
+                record.state = State::CleanupFailed;
+                record.cleanup_error = Some("shutdown_stop_rejected");
+            }
+            Err(code) => {
+                record.state = State::CleanupFailed;
+                record.cleanup_error = Some(code);
+            }
+        }
     }
 
     fn advance_startup_recovery(&mut self, runtime: &RuntimeClient, now: u64) {
@@ -702,6 +777,47 @@ fn clean_terminal(record: &Record, payload: &Value) -> bool {
             Some("stopped" | "failed" | "cancelled")
         )
         && payload["cleanup_error"].is_null()
+}
+
+fn shutdown_request(
+    runtime: &RuntimeClient,
+    payload: Value,
+    operation_id: String,
+) -> Result<Value, &'static str> {
+    const MAX_RESULT_POLLS: usize = 8;
+    let command = Command::Request {
+        service: "amaterasu.stream-session/1".into(),
+        payload,
+        operation_id,
+        parent: None,
+        timeout_ms: CLEANUP_BUDGET_MS,
+    };
+    let id = match runtime.send_ephemeral(command) {
+        Ok(Response::Accepted { id }) => id,
+        Ok(Response::Error { .. }) => return Err("shutdown_request_unavailable"),
+        _ => return Err("shutdown_request_unconfirmed"),
+    };
+
+    for _ in 0..MAX_RESULT_POLLS {
+        match runtime.send_ephemeral(Command::TakeResult { request: id }) {
+            Ok(Response::Result { payload }) => {
+                let released = match runtime.send_ephemeral(Command::ReleaseResult { request: id })
+                {
+                    Ok(Response::Ok) => true,
+                    Ok(Response::Error { code, .. }) if code == "not_found" => true,
+                    _ => false,
+                };
+                return if released {
+                    Ok(payload)
+                } else {
+                    Err("shutdown_result_release_failed")
+                };
+            }
+            Ok(Response::Pending) => {}
+            _ => return Err("shutdown_request_unconfirmed"),
+        }
+    }
+    Err("shutdown_request_unconfirmed")
 }
 
 fn stream_state(payload: &Value) -> Option<&'static str> {
