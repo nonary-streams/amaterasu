@@ -25,6 +25,10 @@ fn unresponsive_bus_probe_child() {
     // No connection can reach CreateSession or invoke a picker in this test.
     let selection = backend.select(SourceType::Monitor, 5).unwrap();
     thread::sleep(Duration::from_millis(100));
+    let diagnostics = selection.diagnostics();
+    assert!(diagnostics.pipewire_node.is_none());
+    assert!(diagnostics.pipewire_serial.is_none());
+    assert!(diagnostics.pipewire_state.is_none());
     let cancel_started = Instant::now();
     drop(selection);
     assert!(cancel_started.elapsed() < Duration::from_secs(1));
