@@ -1809,6 +1809,35 @@ fn route_registry() -> &'static Mutex<RouteRegistry> {
     ROUTES.get_or_init(|| Mutex::new(RouteRegistry::default()))
 }
 
+// PipeWire's PulseAudio compatibility server can acknowledge a default change
+// before policy has published it through server info. Observe that transition;
+// never submit a second write or wait through a third-party route change.
+fn wait_for_route_readback(
+    desired: &str,
+    previous: &str,
+    timeout: Duration,
+    mut read: impl FnMut(Duration) -> AudioResult<Option<String>>,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match read(remaining.min(Duration::from_millis(50))) {
+            Ok(Some(current)) if current == desired => return true,
+            Ok(Some(current)) if current != previous => return false,
+            Err(_) => return false,
+            _ => {}
+        }
+        thread::park_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(5)),
+        );
+    }
+}
+
 fn acquire_route(
     client: &mut PulseClient,
     endpoint: &str,
@@ -1870,8 +1899,9 @@ fn acquire_route(
         // Durable intent precedes the global route mutation. If the callback
         // is lost, a restart can check the target before attempting restore.
         persist_route_intent(endpoint, original_sink)?;
-        record_pending_route(&mut registry, endpoint, original);
+        record_pending_route(&mut registry, endpoint, original.clone());
         if client.set_default_sink(endpoint).is_err() {
+            eprintln!("Amaterasu audio route assignment was not acknowledged");
             if client.quiesce_prior_commands().is_ok() {
                 let _ = mark_route_assignment_quiesced(endpoint);
             }
@@ -1885,10 +1915,15 @@ fn acquire_route(
         if let Some(active) = registry.active.as_mut() {
             active.assignment_confirmed = true;
         }
-        if !client
-            .default_sink()
-            .is_ok_and(|current| current.as_deref() == Some(endpoint))
-        {
+        if !wait_for_route_readback(
+            endpoint,
+            original
+                .as_deref()
+                .expect("assignment requires a previous route"),
+            Duration::from_millis(250),
+            |timeout| client.default_sink_with_timeout(timeout),
+        ) {
+            eprintln!("Amaterasu audio route assignment acknowledged but readback differs");
             retry_route_restore(client, &mut registry);
             return Err("audio_route_failed");
         }
@@ -1993,10 +2028,12 @@ fn reconcile_route_intent(client: &mut PulseClient, intent: &RouteIntent) -> boo
                     if mark_route_restoration_confirmed(&intent.target_sink).is_err() {
                         return false;
                     }
-                    if client
-                        .default_sink()
-                        .is_ok_and(|current| current.as_deref() == Some(&intent.original_sink))
-                    {
+                    if wait_for_route_readback(
+                        &intent.original_sink,
+                        &intent.target_sink,
+                        Duration::from_millis(250),
+                        |timeout| client.default_sink_with_timeout(timeout),
+                    ) {
                         clear_route_intent(&intent.target_sink).is_ok()
                     } else {
                         false
@@ -2612,6 +2649,59 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acknowledged_route_can_publish_after_stale_server_info() {
+        let mut observations = [None, Some("old"), Some("new")].into_iter();
+        assert!(wait_for_route_readback(
+            "new",
+            "old",
+            Duration::from_millis(100),
+            |_| Ok(observations
+                .next()
+                .expect("bounded sequence")
+                .map(str::to_owned)),
+        ));
+        assert!(observations.next().is_none());
+    }
+
+    #[test]
+    fn route_confirmation_stops_at_a_user_change_or_backend_failure() {
+        for observation in [
+            Ok(Some("user-selected".to_owned())),
+            Err("audio_backend_failed"),
+        ] {
+            let mut reads = 0;
+            assert!(!wait_for_route_readback(
+                "new",
+                "old",
+                Duration::from_millis(100),
+                |_| {
+                    reads += 1;
+                    observation.clone()
+                },
+            ));
+            assert_eq!(reads, 1);
+        }
+    }
+
+    #[test]
+    fn unchanged_route_confirmation_has_a_deadline() {
+        let started = Instant::now();
+        let mut reads = 0;
+        assert!(!wait_for_route_readback(
+            "new",
+            "old",
+            Duration::from_millis(15),
+            |budget| {
+                assert!(budget <= Duration::from_millis(15));
+                reads += 1;
+                Ok(Some("old".into()))
+            },
+        ));
+        assert!(reads > 0);
+        assert!(started.elapsed() >= Duration::from_millis(15));
+    }
 
     #[test]
     fn failed_operation_wait_keeps_userdata_valid_for_a_late_callback() {
