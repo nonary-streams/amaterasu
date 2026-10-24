@@ -77,6 +77,13 @@ const candidate = {
   kind: "web_bundle",
   manifest_sha256: "a".repeat(64),
 };
+const nativeCandidate = {
+  ...candidate,
+  slot: "amaterasu.management",
+  implementation: "management.runtime",
+  version: "2",
+  kind: "native_set",
+};
 const repository = {
   id: "publisher",
   location: "https://updates.example.test",
@@ -168,16 +175,23 @@ test("repository inventory shows current selection metadata as persisted, not ru
         };
       }
       assert.equal(route, "repositories/list");
-      return { ok: true, repositories: [repository], next_offset: null };
+      return {
+        ok: true,
+        repositories: [{ ...repository, candidates: [candidate, nativeCandidate] }],
+        next_offset: null,
+      };
     },
   } });
   await waitFor(() => content.textContent.includes("Verified catalog choices available for this host") &&
     content.textContent.includes("Highest accepted sequence"), "verified repository inventory and package selection");
   assert.match(content.textContent, /1 approved/);
-  assert.match(content.textContent, /1 UI bundles · 0 native sets/);
+  assert.match(content.textContent, /1 UI bundles · 1 native sets/);
   assert.match(content.textContent, /not a live runtime snapshot/);
   assert.match(content.textContent, /Active selection/);
   assert.match(content.textContent, /Pending selection/);
+  assert.match(content.textContent, /publisher: management\.runtime 2/);
+  assert.match(content.textContent, /Absent from the current approved catalog/);
+  assert.match(content.textContent, /do not establish which publisher supplied the staged package/);
   assert.doesNotMatch(content.textContent, /must not be rendered|package_root/);
   assert.match(content.textContent, /web-recovery-status ROOT/);
   assert.match(content.textContent, /web-recover ROOT DIGEST/);
