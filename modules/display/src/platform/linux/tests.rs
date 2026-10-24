@@ -26,9 +26,39 @@ fn output(
         "pos": { "x": pos.0, "y": pos.1 },
         "rotation": 1,
         "scale": 1.25,
-        "priority": if pos == (0, 0) { 1 } else { 2 },
+        "priority": if connected && enabled { if pos == (0, 0) { 1 } else { 2 } } else { 0 },
         "hdr": false
     })
+}
+
+fn reference_kde_configuration() -> Value {
+    // Field shape and representative values match the DP-1/DP-2 KScreen
+    // restore-policy fixture in Vibeshine's Linux test suite.
+    let mut first = output(
+        "DP-1",
+        true,
+        true,
+        "25",
+        (0, 0),
+        vec![mode("25", 2560, 1440, 60.0)],
+    );
+    first["size"] = json!({ "width": 2560, "height": 1440 });
+    first["scale"] = json!(1.5);
+    first["rotation"] = json!(1);
+    first["hdr"] = json!(true);
+    let mut second = output(
+        "DP-2",
+        true,
+        true,
+        "31",
+        (2560, 0),
+        vec![mode("31", 1920, 1080, 60.0)],
+    );
+    second["size"] = json!({ "width": 1920, "height": 1080 });
+    second["scale"] = json!(1.0);
+    second["rotation"] = json!(2);
+    second["hdr"] = json!(false);
+    json!({ "outputs": [first, second] })
 }
 
 fn configuration() -> Value {
@@ -117,9 +147,30 @@ fn topology_revision_is_independent_of_kscreen_output_array_order() {
 }
 
 #[test]
+fn kscreen_snapshot_retains_reference_output_identity_mode_and_layout_fields() {
+    let raw = reference_kde_configuration();
+    let snapshot = configuration_snapshot(&raw, "linux_kscreen").unwrap();
+    let saved: KScreenSnapshot = serde_json::from_value(snapshot["session_state"].clone()).unwrap();
+    assert_eq!(saved.version, 1);
+    assert_eq!(saved.outputs.len(), 2);
+    assert_eq!(saved.outputs[0].id, "DP-1");
+    assert_eq!(saved.outputs[0].mode.as_ref().unwrap().id, "25");
+    assert_eq!(saved.outputs[0].mode.as_ref().unwrap().width, 2560);
+    assert_eq!(saved.outputs[0].position.x, 0);
+    assert_eq!(saved.outputs[0].scale, 1.5);
+    assert_eq!(saved.outputs[0].rotation, 1);
+    assert!(saved.outputs[0].primary);
+    assert_eq!(saved.outputs[0].hdr_enabled, Some(true));
+    assert_eq!(saved.outputs[1].priority, 2);
+    assert!(!saved.outputs[1].primary);
+}
+
+#[test]
 fn restore_plan_rebinds_exact_outputs_and_reselects_unique_equivalent_mode() {
-    let saved =
-        configuration_snapshot(&configuration(), "linux_kscreen").unwrap()["session_state"].clone();
+    let saved: KScreenSnapshot = serde_json::from_value(
+        configuration_snapshot(&configuration(), "linux_kscreen").unwrap()["session_state"].clone(),
+    )
+    .unwrap();
     let mut current = configuration();
     current["outputs"][0]["currentModeId"] = json!("1280x720@60");
     current["outputs"][0]["modes"] = json!([
@@ -135,8 +186,10 @@ fn restore_plan_rebinds_exact_outputs_and_reselects_unique_equivalent_mode() {
 
 #[test]
 fn restore_plan_holds_on_disconnect_new_output_or_ambiguous_mode() {
-    let saved =
-        configuration_snapshot(&configuration(), "linux_kscreen").unwrap()["session_state"].clone();
+    let saved: KScreenSnapshot = serde_json::from_value(
+        configuration_snapshot(&configuration(), "linux_kscreen").unwrap()["session_state"].clone(),
+    )
+    .unwrap();
     let mut disconnected = configuration();
     disconnected["outputs"][0]["connected"] = json!(false);
     disconnected["outputs"][0]["enabled"] = json!(false);
@@ -170,6 +223,22 @@ fn restore_plan_holds_on_disconnect_new_output_or_ambiguous_mode() {
     ambiguous["outputs"][0]["currentModeId"] = json!("alternative-a");
     assert_eq!(
         restoration_arguments(&saved, &ambiguous).unwrap_err().code,
+        "topology_changed"
+    );
+
+    let mut reconnected_baseline_output = configuration();
+    reconnected_baseline_output["outputs"][2] = output(
+        "DP-3",
+        true,
+        false,
+        "",
+        (0, 0),
+        vec![mode("1920x1080@60", 1920, 1080, 60.0)],
+    );
+    assert_eq!(
+        restoration_arguments(&saved, &reconnected_baseline_output)
+            .unwrap_err()
+            .code,
         "topology_changed"
     );
 }

@@ -956,6 +956,7 @@ impl<P: Platform> Pipeline<P> {
             owner: context.caller.clone(),
             lease: format!("display-{generation:016x}"),
             snapshot,
+            kscreen: None,
             operation_id,
             requested_configuration: None,
             request_identity,

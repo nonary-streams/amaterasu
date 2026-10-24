@@ -384,6 +384,154 @@ pub struct DisplayPath {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hdr_enabled: Option<bool>,
 }
+
+/// Versioned KScreen session state retained beside the CCD snapshot in a
+/// display journal. Legacy CCD journals omit this optional field.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct KScreenSnapshot {
+    pub version: u32,
+    pub outputs: Vec<KScreenOutputSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct KScreenOutputSnapshot {
+    pub id: String,
+    pub connected: bool,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<KScreenModeSnapshot>,
+    pub position: KScreenPosition,
+    pub scale: f64,
+    /// KScreen's rotation bit, retained without translating it to degrees.
+    pub rotation: u16,
+    pub priority: u32,
+    pub primary: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KScreenModeSnapshot {
+    pub id: String,
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KScreenPosition {
+    pub x: i32,
+    pub y: i32,
+}
+
+const KSCREEN_SNAPSHOT_VERSION: u32 = 1;
+const MAX_KSCREEN_OUTPUTS: usize = 64;
+const MAX_KSCREEN_SNAPSHOT_BYTES: usize = 12_000;
+
+impl KScreenSnapshot {
+    pub fn validate(&self) -> Result<(), DisplayError> {
+        if self.version != KSCREEN_SNAPSHOT_VERSION {
+            return Err(DisplayError::new(
+                "unsupported_snapshot_version",
+                "unsupported KScreen journal snapshot version",
+            ));
+        }
+        if self.outputs.len() > MAX_KSCREEN_OUTPUTS {
+            return Err(DisplayError::new(
+                "resource_exhausted",
+                "KScreen journal contains too many outputs",
+            ));
+        }
+
+        let mut ids = BTreeSet::new();
+        let mut active_count = 0;
+        let mut primary_count = 0;
+        for output in &self.outputs {
+            if output.id.is_empty()
+                || output.id.len() > 128
+                || !output
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                || !ids.insert(output.id.to_ascii_lowercase())
+                || (output.enabled && !output.connected)
+                || output.position.x.abs_diff(0) > 65_536
+                || output.position.y.abs_diff(0) > 65_536
+                || !output.scale.is_finite()
+                || !(0.25..=5.0).contains(&output.scale)
+                || !matches!(output.rotation, 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128)
+                || output.priority > 64
+                || output.primary != (output.priority == 1)
+                || (output.primary && (!output.connected || !output.enabled))
+                || (output.enabled && output.priority == 0)
+                || (output.enabled && output.mode.is_none())
+            {
+                return Err(DisplayError::new(
+                    "invalid_snapshot",
+                    "invalid KScreen output identity or topology state",
+                ));
+            }
+            if output.connected && output.enabled {
+                active_count += 1;
+                if output.primary {
+                    primary_count += 1;
+                }
+            }
+            if let Some(mode) = &output.mode {
+                if mode.id.is_empty()
+                    || mode.id.len() > 128
+                    || !mode.id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'_' | b'-' | b'.' | b'@' | b'x')
+                    })
+                    || !(1..=16_384).contains(&mode.width)
+                    || !(1..=16_384).contains(&mode.height)
+                    || !(1_000..=10_000_000).contains(&mode.refresh_millihz)
+                {
+                    return Err(DisplayError::new(
+                        "invalid_snapshot",
+                        "invalid KScreen mode identity or timing",
+                    ));
+                }
+            }
+        }
+        if primary_count > 1 || (active_count > 0 && primary_count != 1) {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "KScreen snapshot must have exactly one primary enabled output",
+            ));
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| DisplayError::new("invalid_snapshot", error.to_string()))?;
+        if encoded.len() > MAX_KSCREEN_SNAPSHOT_BYTES {
+            return Err(DisplayError::new(
+                "resource_exhausted",
+                "KScreen journal snapshot exceeds its size limit",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn revision(&self) -> Result<String, DisplayError> {
+        self.validate()?;
+        let mut outputs = self.outputs.clone();
+        outputs.sort_by(|left, right| left.id.cmp(&right.id));
+        let bytes = serde_json::to_vec(&(self.version, outputs))
+            .map_err(|error| DisplayError::new("invalid_snapshot", error.to_string()))?;
+        let mut first = 0xcbf29ce484222325_u64;
+        let mut second = 0x84222325cbf29ce4_u64;
+        for byte in bytes {
+            first = (first ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            second = (second ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+        Ok(format!("{first:016x}{second:016x}"))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
@@ -582,6 +730,9 @@ pub struct Journal {
     pub owner: String,
     pub lease: String,
     pub snapshot: Snapshot,
+    /// Absent in legacy CCD journals; populated by a future KScreen recovery provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kscreen: Option<KScreenSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -628,6 +779,9 @@ impl Journal {
                 "invalid_journal",
                 "invalid display journal owner or lease",
             ));
+        }
+        if let Some(kscreen) = &self.kscreen {
+            kscreen.validate()?;
         }
         self.snapshot.validate()
     }

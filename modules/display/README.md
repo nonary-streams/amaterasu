@@ -27,13 +27,17 @@ include normalized active `Configuration` rows, a topology revision, and the
 validated KScreen output state needed to preserve session settings such as
 scale, rotation, HDR state, priority, and exact mode identity.
 
-`native_supported` remains false for Linux mutations. The current Windows CCD
-journal cannot represent KScreen output state without losing restoration data,
-so Linux `apply`, `restore`, and recovery fail closed. A source-only restoration
+`native_supported` remains false for Linux mutations. A source-only restoration
 planner has behavioral fixtures for stable output identity, equivalent mode
-selection, hotplug, and ambiguous modes; wiring that plan into a durable
-KScreen lease and verified user-session restore is a follow-up slice. This
-does not qualify KScreen, Plasma, or any virtual-output driver for runtime use.
+selection, hotplug, and ambiguous modes. The journal model has a separate,
+version-1 KScreen payload; legacy CCD records omit it and continue to decode.
+The payload preserves connector identity, mode timing and ID, position, scale,
+rotation, enabled/connected and primary state, priority, and optional HDR state.
+The existing pipeline validates the complete bounded journal and persists it
+through its state revision-CAS boundary before native effects. Linux does not
+yet populate this payload in a runtime lease or execute restoration; those
+paths remain disabled. This does not qualify KScreen, Plasma, or any
+virtual-output driver for runtime use.
 
 ## Refresh-rate option model
 

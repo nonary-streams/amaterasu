@@ -4,8 +4,8 @@
 //! topology can be journaled through the display module's existing lease path.
 use super::{Platform, TopologyShape};
 use crate::model::{
-    Address, AvailableMode, Configuration, DisplayError, DisplayResult, Rational, RouteBinding,
-    Snapshot,
+    Address, AvailableMode, Configuration, DisplayError, DisplayResult, KScreenModeSnapshot,
+    KScreenOutputSnapshot, KScreenPosition, KScreenSnapshot, Rational, RouteBinding, Snapshot,
 };
 use serde_json::{Value, json};
 #[cfg(test)]
@@ -269,23 +269,8 @@ fn enumeration_rows(configuration: &Value, display: Option<&str>) -> DisplayResu
 
 fn configuration_snapshot(configuration: &Value, platform: &str) -> DisplayResult<Value> {
     let outputs = validated_outputs(configuration)?;
-    let mut canonical_outputs = outputs
-        .iter()
-        .copied()
-        .map(restorable_output_state)
-        .collect::<DisplayResult<Vec<_>>>()?;
-    canonical_outputs.sort_by(|left, right| {
-        left.get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .cmp(
-                right
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )
-    });
-    let revision = topology_revision(&canonical_outputs)?;
+    let kscreen = typed_snapshot(&outputs)?;
+    let revision = kscreen.revision()?;
     let mut displays = outputs
         .iter()
         .copied()
@@ -306,9 +291,7 @@ fn configuration_snapshot(configuration: &Value, platform: &str) -> DisplayResul
         "platform": platform,
         "configuration": { "displays": displays },
         "topology_revision": revision,
-        // Retain the validated native state needed for a later journal-format
-        // migration without copying each output's full supported-mode list.
-        "session_state": { "outputs": canonical_outputs }
+        "session_state": kscreen
     });
     let encoded_size = serde_json::to_vec(&snapshot)
         .map_err(|error| DisplayError::new("platform_error", error.to_string()))?
@@ -322,39 +305,64 @@ fn configuration_snapshot(configuration: &Value, platform: &str) -> DisplayResul
     Ok(snapshot)
 }
 
-fn restorable_output_state(output: &Value) -> DisplayResult<Value> {
-    let mut state = serde_json::Map::new();
-    state.insert("name".into(), json!(output_name(output)?));
-    state.insert("connected".into(), json!(bool_field(output, "connected")?));
-    state.insert("enabled".into(), json!(bool_field(output, "enabled")?));
-    state.insert(
-        "pos".into(),
-        output.get("pos").cloned().ok_or_else(|| {
+fn typed_snapshot(outputs: &[&Value]) -> DisplayResult<KScreenSnapshot> {
+    let mut saved = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let position = output.get("pos").ok_or_else(|| {
             DisplayError::new("platform_error", "KScreen output position is missing")
-        })?,
-    );
-    state.insert(
-        "rotation".into(),
-        output.get("rotation").cloned().unwrap_or(json!(1)),
-    );
-    state.insert(
-        "scale".into(),
-        output.get("scale").cloned().unwrap_or(json!(1.0)),
-    );
-    state.insert(
-        "priority".into(),
-        output.get("priority").cloned().unwrap_or(json!(0)),
-    );
-    if let Some(hdr) = output.get("hdr") {
-        state.insert("hdr".into(), hdr.clone());
+        })?;
+        let priority = output
+            .get("priority")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(0);
+        let mode = match output.get("currentModeId").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => {
+                let candidate = output_modes(output)?
+                    .into_iter()
+                    .find(|mode| mode.get("id").and_then(Value::as_str) == Some(id))
+                    .ok_or_else(|| {
+                        DisplayError::new(
+                            "unsupported_topology",
+                            "KScreen current mode identity has no matching mode record",
+                        )
+                    })?;
+                let refresh_millihz = mode_refresh_millihz(candidate)?;
+                Some(KScreenModeSnapshot {
+                    id: id.to_owned(),
+                    width: integer_field(candidate, "size", "width")?,
+                    height: integer_field(candidate, "size", "height")?,
+                    refresh_millihz,
+                })
+            }
+            _ => None,
+        };
+        saved.push(KScreenOutputSnapshot {
+            id: output_name(output)?.to_owned(),
+            connected: bool_field(output, "connected")?,
+            enabled: bool_field(output, "enabled")?,
+            mode,
+            position: KScreenPosition {
+                x: bounded_integer(position, "x", -65_536, 65_536)?,
+                y: bounded_integer(position, "y", -65_536, 65_536)?,
+            },
+            scale: output.get("scale").and_then(Value::as_f64).unwrap_or(1.0),
+            rotation: output
+                .get("rotation")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(1),
+            priority,
+            primary: priority == 1,
+            hdr_enabled: output.get("hdr").and_then(Value::as_bool),
+        });
     }
-    if bool_field(output, "connected")? && bool_field(output, "enabled")? {
-        let mode = current_mode(output)?;
-        let id = string_field(mode, "id")?;
-        state.insert("currentModeId".into(), json!(id));
-        state.insert("modes".into(), json!([mode]));
-    }
-    Ok(Value::Object(state))
+    let snapshot = KScreenSnapshot {
+        version: 1,
+        outputs: saved,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
 }
 
 fn require_user_session() -> DisplayResult<()> {
@@ -385,7 +393,7 @@ fn validated_outputs(configuration: &Value) -> DisplayResult<Vec<&Value>> {
     let mut names = BTreeSet::new();
     for output in outputs {
         let name = output_name(output)?;
-        if !names.insert(name) {
+        if !names.insert(name.to_ascii_lowercase()) {
             return Err(DisplayError::new(
                 "platform_error",
                 "KScreen response contains duplicate output identities",
@@ -422,7 +430,12 @@ fn validated_outputs(configuration: &Value) -> DisplayResult<Vec<&Value>> {
             .ok_or_else(|| DisplayError::new("platform_error", "KScreen output has no position"))?;
         bounded_integer(position, "x", -65_536, 65_536)?;
         bounded_integer(position, "y", -65_536, 65_536)?;
-        let scale = output.get("scale").and_then(Value::as_f64).unwrap_or(1.0);
+        let scale = match output.get("scale") {
+            Some(value) => value.as_f64().ok_or_else(|| {
+                DisplayError::new("platform_error", "KScreen output scale is not numeric")
+            })?,
+            None => 1.0,
+        };
         if !scale.is_finite() || !(0.25..=5.0).contains(&scale) {
             return Err(DisplayError::new(
                 "platform_error",
@@ -433,10 +446,18 @@ fn validated_outputs(configuration: &Value) -> DisplayResult<Vec<&Value>> {
             let rotation = rotation.as_i64().ok_or_else(|| {
                 DisplayError::new("platform_error", "KScreen rotation is not an integer")
             })?;
-            if ![1, 2, 4, 8].contains(&rotation) {
+            if ![1, 2, 4, 8, 16, 32, 64, 128].contains(&rotation) {
                 return Err(DisplayError::new(
                     "unsupported_topology",
-                    "reflected KScreen rotations cannot be represented by the current configuration contract",
+                    "KScreen rotation has an unknown compositor value",
+                ));
+            }
+        }
+        if let Some(priority) = output.get("priority") {
+            if priority.as_u64().is_none_or(|value| value > 64) {
+                return Err(DisplayError::new(
+                    "platform_error",
+                    "KScreen output priority is outside the supported range",
                 ));
             }
         }
@@ -575,6 +596,22 @@ fn refresh_rational(mode: &Value) -> DisplayResult<Rational> {
     })
 }
 
+fn mode_refresh_millihz(mode: &Value) -> DisplayResult<u32> {
+    let refresh = mode
+        .get("refreshRate")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| {
+            DisplayError::new("platform_error", "KScreen mode refresh rate is invalid")
+        })?;
+    if !refresh.is_finite() || !(1.0..=10_000.0).contains(&refresh) {
+        return Err(DisplayError::new(
+            "platform_error",
+            "KScreen mode refresh rate is outside the supported range",
+        ));
+    }
+    Ok((refresh * 1000.0).round() as u32)
+}
+
 fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
     while right != 0 {
         (left, right) = (right, left % right);
@@ -647,46 +684,42 @@ fn output_configuration_row(output: &Value) -> DisplayResult<Value> {
     }))
 }
 
-fn topology_revision(outputs: &[Value]) -> DisplayResult<String> {
-    let bytes = serde_json::to_vec(outputs)
-        .map_err(|error| DisplayError::new("platform_error", error.to_string()))?;
-    let mut first = 0xcbf29ce484222325_u64;
-    let mut second = 0x84222325cbf29ce4_u64;
-    for byte in bytes {
-        first = (first ^ u64::from(byte)).wrapping_mul(0x100000001b3);
-        second = (second ^ u64::from(byte)).wrapping_mul(0x100000001b3);
-    }
-    Ok(format!("{first:016x}{second:016x}"))
-}
-
 /// Produce a restoration request only when every enabled baseline output is
-/// still connected and no unknown connected output appeared. The caller must
-/// journal this baseline and check request ownership immediately before use.
+/// still connected and no unknown connected output appeared. It is fixture-only
+/// until the existing lease pipeline accepts KScreen journal records.
 #[cfg(test)]
-fn restoration_arguments(saved: &Value, current: &Value) -> DisplayResult<Vec<String>> {
-    let saved_outputs = validated_outputs(saved)?;
+fn restoration_arguments(saved: &KScreenSnapshot, current: &Value) -> DisplayResult<Vec<String>> {
+    saved.validate()?;
     let current_outputs = validated_outputs(current)?;
     let current_by_name: BTreeMap<_, _> = current_outputs
         .iter()
         .map(|output| (output_name(output).expect("validated output name"), *output))
         .collect();
-    let saved_by_name: BTreeMap<_, _> = saved_outputs
+    let saved_by_name: BTreeMap<_, _> = saved
+        .outputs
         .iter()
-        .map(|output| (output_name(output).expect("validated output name"), *output))
+        .map(|output| (output.id.as_str(), output))
         .collect();
 
-    for saved_output in &saved_outputs {
-        if bool_field(saved_output, "connected")? && bool_field(saved_output, "enabled")? {
-            let name = output_name(saved_output)?;
-            if current_by_name
-                .get(name)
-                .is_none_or(|present| !bool_field(present, "connected").unwrap_or(false))
-            {
+    for saved_output in &saved.outputs {
+        match (
+            saved_output.connected,
+            current_by_name.get(saved_output.id.as_str()),
+        ) {
+            (true, Some(present)) if bool_field(present, "connected")? => {}
+            (false, Some(present)) if bool_field(present, "connected")? => {
                 return Err(DisplayError::new(
                     "topology_changed",
-                    "a saved active output is disconnected; restoration is held for recovery",
+                    "a previously disconnected output appeared; restoration is held for recovery",
                 ));
             }
+            (true, _) => {
+                return Err(DisplayError::new(
+                    "topology_changed",
+                    "a saved connected output is unavailable; restoration is held for recovery",
+                ));
+            }
+            _ => {}
         }
     }
     for present in &current_outputs {
@@ -704,51 +737,60 @@ fn restoration_arguments(saved: &Value, current: &Value) -> DisplayResult<Vec<St
     for name in sorted_names {
         let saved_output = saved_by_name[name];
         let present = current_by_name.get(name).copied();
-        if present.is_none_or(|output| !bool_field(output, "connected").unwrap_or(false)) {
+        if !saved_output.connected {
             continue;
         }
+        let present = present.ok_or_else(|| {
+            DisplayError::new(
+                "topology_changed",
+                "saved output is missing during restore planning",
+            )
+        })?;
         let prefix = format!("output.{name}.");
-        if !bool_field(saved_output, "enabled")? {
+        if !saved_output.enabled {
             arguments.push(format!("{prefix}disable"));
             continue;
         }
-        let saved_mode = current_mode(saved_output)?;
-        let saved_width = integer_field(saved_mode, "size", "width")?;
-        let saved_height = integer_field(saved_mode, "size", "height")?;
-        let saved_refresh = refresh_rational(saved_mode)?;
-        let saved_id = string_field(saved_mode, "id")?;
-        let present_modes = output_modes(present.expect("checked output presence"))?;
-        let same_mode = |mode: &Value| {
-            integer_field(mode, "size", "width").ok() == Some(saved_width)
-                && integer_field(mode, "size", "height").ok() == Some(saved_height)
-                && refresh_rational(mode).ok() == Some(saved_refresh)
-        };
+        let saved_mode = saved_output.mode.as_ref().ok_or_else(|| {
+            DisplayError::new(
+                "invalid_snapshot",
+                "enabled KScreen output has no saved mode",
+            )
+        })?;
+        let present_modes = output_modes(present)?;
         let matches: Vec<_> = present_modes
             .into_iter()
-            .filter(|mode| same_mode(mode))
+            .filter(|mode| {
+                integer_field(mode, "size", "width").ok() == Some(saved_mode.width)
+                    && integer_field(mode, "size", "height").ok() == Some(saved_mode.height)
+                    && mode_refresh_millihz(mode).ok() == Some(saved_mode.refresh_millihz)
+            })
             .collect();
         let mode = matches
             .iter()
             .copied()
-            .find(|mode| mode.get("id").and_then(Value::as_str) == Some(saved_id))
+            .find(|mode| mode.get("id").and_then(Value::as_str) == Some(saved_mode.id.as_str()))
             .or_else(|| (matches.len() == 1).then(|| matches[0]))
-            .ok_or_else(|| DisplayError::new(
-            "topology_changed",
-            "the saved mode is no longer uniquely available; restoration is held for recovery",
-        ))?;
+            .ok_or_else(|| {
+                DisplayError::new(
+                    "topology_changed",
+                    "the saved mode is no longer uniquely available; restoration is held for recovery",
+                )
+            })?;
         let mode_id = string_field(mode, "id")?;
         safe_mode_id(mode_id)?;
         arguments.push(format!("{prefix}enable"));
         arguments.push(format!("{prefix}mode.{mode_id}"));
-        let rotation = saved_output
-            .get("rotation")
-            .and_then(Value::as_i64)
-            .unwrap_or(1);
+        let rotation = i64::from(saved_output.rotation);
         let rotation_name = match rotation {
             1 => "none",
             2 => "left",
             4 => "inverted",
             8 => "right",
+            16 => "flipped",
+            32 => "flipped90",
+            64 => "flipped180",
+            128 => "flipped270",
             _ => {
                 return Err(DisplayError::new(
                     "unsupported_topology",
@@ -757,25 +799,15 @@ fn restoration_arguments(saved: &Value, current: &Value) -> DisplayResult<Vec<St
             }
         };
         arguments.push(format!("{prefix}rotation.{rotation_name}"));
-        let scale = saved_output
-            .get("scale")
-            .and_then(Value::as_f64)
-            .unwrap_or(1.0);
-        arguments.push(format!("{prefix}scale.{scale}"));
-        let pos = saved_output.get("pos").ok_or_else(|| {
-            DisplayError::new("invalid_snapshot", "saved output position is missing")
-        })?;
+        arguments.push(format!("{prefix}scale.{}", saved_output.scale));
         arguments.push(format!(
             "{prefix}position.{},{}",
-            bounded_integer(pos, "x", -65_536, 65_536)?,
-            bounded_integer(pos, "y", -65_536, 65_536)?
+            saved_output.position.x, saved_output.position.y
         ));
-        if let Some(priority) = saved_output.get("priority").and_then(Value::as_i64)
-            && (1..=64).contains(&priority)
-        {
-            arguments.push(format!("{prefix}priority.{priority}"));
+        if saved_output.priority > 0 {
+            arguments.push(format!("{prefix}priority.{}", saved_output.priority));
         }
-        if let Some(hdr) = saved_output.get("hdr").and_then(Value::as_bool) {
+        if let Some(hdr) = saved_output.hdr_enabled {
             arguments.push(format!(
                 "{prefix}hdr.{}",
                 if hdr { "enable" } else { "disable" }

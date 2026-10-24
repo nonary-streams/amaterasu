@@ -1,5 +1,8 @@
 use super::*;
-use crate::model::{Address, DisplayPath, ModePolicy, Rational, Signal, Snapshot, SourceMode};
+use crate::model::{
+    Address, DisplayPath, KScreenModeSnapshot, KScreenOutputSnapshot, KScreenPosition,
+    KScreenSnapshot, ModePolicy, Rational, Signal, Snapshot, SourceMode,
+};
 
 fn snapshot() -> Snapshot {
     Snapshot {
@@ -54,6 +57,47 @@ fn snapshot() -> Snapshot {
             path_flags: 1,
             hdr_enabled: Some(false),
         }],
+    }
+}
+fn kscreen_snapshot() -> KScreenSnapshot {
+    KScreenSnapshot {
+        version: 1,
+        outputs: vec![
+            KScreenOutputSnapshot {
+                id: "DP-1".into(),
+                connected: true,
+                enabled: true,
+                mode: Some(KScreenModeSnapshot {
+                    id: "25".into(),
+                    width: 2560,
+                    height: 1440,
+                    refresh_millihz: 60_000,
+                }),
+                position: KScreenPosition { x: 0, y: 0 },
+                scale: 1.5,
+                rotation: 1,
+                priority: 1,
+                primary: true,
+                hdr_enabled: Some(true),
+            },
+            KScreenOutputSnapshot {
+                id: "DP-2".into(),
+                connected: true,
+                enabled: true,
+                mode: Some(KScreenModeSnapshot {
+                    id: "31".into(),
+                    width: 1920,
+                    height: 1080,
+                    refresh_millihz: 60_000,
+                }),
+                position: KScreenPosition { x: 2560, y: 0 },
+                scale: 1.0,
+                rotation: 2,
+                priority: 2,
+                primary: false,
+                hdr_enabled: Some(false),
+            },
+        ],
     }
 }
 fn two_display_snapshot() -> Snapshot {
@@ -3521,6 +3565,7 @@ fn expired_native_boundary_keeps_recovery_without_effects() {
         owner: "owner".into(),
         lease: "display-0000000000000001".into(),
         snapshot: snapshot(),
+        kscreen: None,
         operation_id: None,
         request_identity: None,
         requested_configuration: None,
@@ -3586,6 +3631,7 @@ fn invalid_journals_and_stale_leases_are_never_overwritten() {
             owner: "owner".into(),
             lease: "current".into(),
             snapshot: snapshot(),
+            kscreen: None,
             operation_id: None,
             request_identity: None,
             requested_configuration: None,
@@ -3602,4 +3648,94 @@ fn invalid_journals_and_stale_leases_are_never_overwritten() {
     assert_eq!(result["error"]["code"], "permission_denied");
     assert!(state.journal.is_some());
     assert!(pipeline.platform.effects.is_empty());
+}
+
+#[test]
+fn versioned_kscreen_journal_roundtrips_without_breaking_legacy_ccd_records() {
+    let legacy_value = json!({
+        "owner": "owner",
+        "lease": "legacy-lease",
+        "snapshot": serde_json::to_value(snapshot()).unwrap()
+    });
+    let legacy: Journal = serde_json::from_value(legacy_value).unwrap();
+    assert!(legacy.kscreen.is_none());
+    legacy.validate().unwrap();
+    assert!(
+        serde_json::to_value(&legacy)
+            .unwrap()
+            .get("kscreen")
+            .is_none()
+    );
+
+    let journal = Journal {
+        owner: "owner".into(),
+        lease: "kscreen-lease".into(),
+        snapshot: snapshot(),
+        kscreen: Some(kscreen_snapshot()),
+        operation_id: None,
+        requested_configuration: None,
+        request_identity: None,
+        expected_topology_revision: None,
+        pending_route: None,
+    };
+    journal.validate().unwrap();
+    let encoded = serde_json::to_value(&journal).unwrap();
+    let bytes = serde_json::to_vec(&journal).unwrap();
+    assert!(bytes.len() <= 12_000);
+    assert_eq!(encoded["kscreen"]["version"], 1);
+    let decoded: Journal = serde_json::from_value(encoded.clone()).unwrap();
+    decoded.validate().unwrap();
+    assert_eq!(
+        decoded.kscreen.unwrap().outputs[0]
+            .mode
+            .as_ref()
+            .unwrap()
+            .id,
+        "25"
+    );
+
+    let mut unknown_version = encoded.clone();
+    unknown_version["kscreen"]["version"] = 2.into();
+    let unknown_version: Journal = serde_json::from_value(unknown_version).unwrap();
+    assert_eq!(
+        unknown_version.validate().unwrap_err().code,
+        "unsupported_snapshot_version"
+    );
+
+    let mut unknown_field = encoded;
+    unknown_field["kscreen"]["outputs"][0]["unexpected"] = true.into();
+    assert!(serde_json::from_value::<Journal>(unknown_field).is_err());
+}
+
+#[test]
+fn kscreen_snapshot_rejects_oversized_output_lists_before_journal_write() {
+    let mut snapshot = kscreen_snapshot();
+    while snapshot.outputs.len() <= 64 {
+        let mut output = snapshot.outputs[1].clone();
+        output.id = format!("DP-{}", snapshot.outputs.len() + 1);
+        output.priority = 0;
+        output.primary = false;
+        snapshot.outputs.push(output);
+    }
+    assert_eq!(snapshot.validate().unwrap_err().code, "resource_exhausted");
+}
+
+#[test]
+fn kscreen_snapshot_rejects_payloads_over_the_journal_byte_limit() {
+    let mut snapshot = kscreen_snapshot();
+    for index in 0..62 {
+        snapshot.outputs.push(KScreenOutputSnapshot {
+            id: format!("DISPLAY-{}-{index}", "x".repeat(105)),
+            connected: false,
+            enabled: false,
+            mode: None,
+            position: KScreenPosition { x: 0, y: 0 },
+            scale: 1.0,
+            rotation: 1,
+            priority: 0,
+            primary: false,
+            hdr_enabled: None,
+        });
+    }
+    assert_eq!(snapshot.validate().unwrap_err().code, "resource_exhausted");
 }
