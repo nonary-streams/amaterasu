@@ -151,7 +151,7 @@ impl Stream {
         if let Err(error) = self.peer.poll(now)
             && error != PeerError::Busy
         {
-            self.fail("peer_poll_failed");
+            self.fail(peer_poll_failure(error));
         }
         self.collect_messages(now);
         self.flush_socket();
@@ -263,10 +263,10 @@ impl Stream {
                 return MEDIA_BACKEND_ERROR;
             }
         };
-        if self.peer.send(channel, &encrypted, delivery, now).is_err() {
+        if let Err(error) = self.peer.send(channel, &encrypted, delivery, now) {
             // Admission and enqueue are exclusive under one controller lock. Any
             // unexpected failure after sealing ends the stream; never rewind a nonce.
-            self.fail("peer_enqueue_failed");
+            self.fail(peer_enqueue_failure(error));
             return MEDIA_BACKEND_ERROR;
         }
         self.sent_messages = self.sent_messages.saturating_add(1);
@@ -311,11 +311,40 @@ impl Stream {
     fn fail(&mut self, code: &'static str) {
         if self.failure.is_none() {
             self.failure = Some(code);
+            // `code` comes only from fixed internal call sites and never includes
+            // peer addresses, control payloads, keys, or other session material.
+            eprintln!("amaterasu control transport failed code={code}");
         }
         self.socket = None;
         self.pending_datagram = None;
         self.incoming.clear();
         self.incoming_bytes = 0;
+    }
+}
+
+fn peer_poll_failure(error: PeerError) -> &'static str {
+    match error {
+        PeerError::InvalidConfig => "peer_poll_invalid_config",
+        PeerError::InvalidChannel => "peer_poll_invalid_channel",
+        PeerError::MessageTooLarge => "peer_poll_message_too_large",
+        PeerError::Busy => "peer_poll_busy",
+        PeerError::NotConnected => "peer_poll_not_connected",
+        PeerError::InvalidPacket => "peer_poll_invalid_packet",
+        PeerError::ClockRegression => "peer_poll_clock_regression",
+        PeerError::Unsupported => "peer_poll_unsupported",
+    }
+}
+
+fn peer_enqueue_failure(error: PeerError) -> &'static str {
+    match error {
+        PeerError::InvalidConfig => "peer_enqueue_invalid_config",
+        PeerError::InvalidChannel => "peer_enqueue_invalid_channel",
+        PeerError::MessageTooLarge => "peer_enqueue_message_too_large",
+        PeerError::Busy => "peer_enqueue_busy_after_admission",
+        PeerError::NotConnected => "peer_enqueue_not_connected",
+        PeerError::InvalidPacket => "peer_enqueue_invalid_packet",
+        PeerError::ClockRegression => "peer_enqueue_clock_regression",
+        PeerError::Unsupported => "peer_enqueue_unsupported",
     }
 }
 
