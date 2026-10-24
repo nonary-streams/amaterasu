@@ -27,7 +27,7 @@ impl Default for Settings {
 
 impl Settings {
     pub fn validate(&self) -> CaptureResult<()> {
-        if !(1..=300).contains(&self.idle_timeout_seconds)
+        if !(1..=600).contains(&self.idle_timeout_seconds)
             || !(1..=300).contains(&self.selection_timeout_seconds)
             || !valid_principals(&self.selection_principals)
             || !valid_principals(&self.capture_principals)

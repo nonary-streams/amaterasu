@@ -18,9 +18,10 @@ allowlist authenticated immediate callers in `selection_principals` and
 `capture_principals`. The first set may request the portal picker; the second may
 enumerate selected metadata and open a capture lease. A picker caller and capture
 caller can differ, so runtime call/native grants must independently authorize the
-video module that receives frames. Each list permits at most 16 principals. Both
-timeouts accept 1 through 300 seconds. The startup availability
-probe reads portal version, source and cursor masks only. It never creates a
+video module that receives frames. Each list permits at most 16 principals. The
+selection timeout accepts 1 through 300 seconds and the ready idle timeout
+accepts 1 through 600 seconds. The startup availability probe reads portal
+version, source and cursor masks only. It never creates a
 session or opens a picker, including when disabled. `native_supported` identifies
 the built adapter; `availability.available` separately reports the startup probe.
 Missing session bus or portal has an explicit reason. No alternate user bus,

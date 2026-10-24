@@ -444,6 +444,11 @@ fn timeout_status_distinguishes_waiting_for_start_from_pipewire_connection_failu
 fn settings_and_selection_bounds_fail_before_native_allocation() {
     assert!(Settings::default().validate().is_ok());
     let mut policy = settings();
+    policy.idle_timeout_seconds = 600;
+    assert!(policy.validate().is_ok());
+    policy.idle_timeout_seconds = 601;
+    assert_eq!(policy.validate(), Err("invalid_settings"));
+    policy.idle_timeout_seconds = 60;
     policy.selection_timeout_seconds = 301;
     assert_eq!(policy.validate(), Err("invalid_settings"));
     let (mut controller, driver) = setup(settings());

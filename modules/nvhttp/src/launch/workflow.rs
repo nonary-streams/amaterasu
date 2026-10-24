@@ -1880,6 +1880,10 @@ fn rtsp_response<'a>(
     payload: &'a Value,
 ) -> Result<(u64, &'a str, &'a str, bool), &'static str> {
     if payload["ok"] != true {
+        eprintln!(
+            "amaterasu launch rtsp provider rejected code={}",
+            safe_rtsp_provider_code(&payload["code"])
+        );
         return Err(match payload["code"].as_str() {
             Some("ticket_not_found") => "ticket_not_found",
             _ => "invalid_rtsp_response",
@@ -1935,6 +1939,19 @@ fn rtsp_response<'a>(
         })
         .ok_or("invalid_rtsp_response")?;
     Ok((ticket, url, state, payload["cleanup_error"].is_null()))
+}
+
+fn safe_rtsp_provider_code(value: &Value) -> &str {
+    value
+        .as_str()
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .unwrap_or("unavailable")
 }
 
 fn clean_rtsp_terminal(record: &Record, payload: &Value) -> bool {
@@ -2056,5 +2073,28 @@ fn reply_failure(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
             connection,
             private_error(503, "stream cleanup is incomplete"),
         ));
+    }
+}
+
+#[cfg(test)]
+mod rtsp_provider_code_tests {
+    use super::safe_rtsp_provider_code;
+    use serde_json::json;
+
+    #[test]
+    fn provider_code_trace_retains_bounded_codes_without_reflecting_sensitive_fields() {
+        assert_eq!(
+            safe_rtsp_provider_code(&json!("source_selection_expired")),
+            "source_selection_expired"
+        );
+        assert_eq!(
+            safe_rtsp_provider_code(&json!("key_hex=secret")),
+            "unavailable"
+        );
+        assert_eq!(
+            safe_rtsp_provider_code(&json!("a".repeat(65))),
+            "unavailable"
+        );
+        assert_eq!(safe_rtsp_provider_code(&json!(null)), "unavailable");
     }
 }
