@@ -157,6 +157,12 @@ impl Controller {
         record.session = response_session(payload).or(record.session);
         let prepared = (|| {
             if payload["ok"] != true || payload["state"] != "prepared" {
+                eprintln!(
+                    "amaterasu rtsp prepare not ready state={} code={} error={}",
+                    safe_provider_code(&payload["state"]),
+                    safe_provider_code(&payload["code"]),
+                    safe_provider_code(&payload["error"]),
+                );
                 return Err("prepare_rejected");
             }
             if record
@@ -239,6 +245,7 @@ impl Controller {
             Ok(())
         })();
         if let Err(code) = prepared {
+            eprintln!("amaterasu rtsp prepare failed code={code}");
             record.close(Some(code));
             self.revoke_ticket(record.id);
             self.schedule_cleanup(record, job.caller, now);
@@ -570,4 +577,17 @@ impl Controller {
         self.sequence = self.sequence.saturating_add(1);
         format!("{}-{phase}-{:016x}", record.operation(), self.sequence)
     }
+}
+
+fn safe_provider_code(value: &Value) -> &str {
+    value
+        .as_str()
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .unwrap_or("unavailable")
 }

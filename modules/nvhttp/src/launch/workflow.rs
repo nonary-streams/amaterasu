@@ -629,7 +629,12 @@ impl Controller {
                         complete_launch(record, now, replies);
                     }
                 }
-                Ok((ticket, _, _, _)) => {
+                Ok((ticket, _, state, healthy)) => {
+                    eprintln!(
+                        "amaterasu launch rtsp not ready state={state} healthy={healthy} failure={} cleanup_error={}",
+                        safe_rtsp_provider_code(&payload["failure"]),
+                        safe_rtsp_provider_code(&payload["cleanup_error"]),
+                    );
                     record.rtsp_ticket = Some(ticket);
                     record.request_cleanup(None, now + CLEANUP_DEADLINE);
                 }
