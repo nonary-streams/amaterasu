@@ -36,6 +36,10 @@ fn run() -> PackageResult<()> {
     match arguments.as_slice() {
         [command, root] if command == "serve" => service::serve(Path::new(root))?,
         [command, root] if command == "service" => service::service(Path::new(root))?,
+        #[cfg(target_os = "linux")]
+        [command, root, digest] if command == "service-user" => {
+            service::user_service(Path::new(root), digest)?
+        }
         [command, root] if command == "service-ready" => {
             service::probe_service_readiness(Path::new(root))?;
             println!("service ready");
@@ -87,7 +91,7 @@ fn run() -> PackageResult<()> {
         }
         _ => {
             return Err(
-                "usage: amaterasu probe ROOT [CONTROL_MESSAGE_JSON] | service-ready ROOT | operational-ready ROOT | web-recovery-status ROOT | web-recover ROOT DIGEST | native-recover ROOT [DIGEST] | serve ROOT | service ROOT"
+                "usage: amaterasu probe ROOT [CONTROL_MESSAGE_JSON] | service-ready ROOT | operational-ready ROOT | web-recovery-status ROOT | web-recover ROOT DIGEST | native-recover ROOT [DIGEST] | serve ROOT | service ROOT | service-user ROOT ACTIVE_DIGEST (Linux user service)"
                     .into(),
             );
         }
