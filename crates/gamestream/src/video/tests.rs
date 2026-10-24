@@ -54,6 +54,24 @@ fn hevc_closed_gop_recovery_keeps_parameter_sets_and_frame_type() {
 }
 
 #[test]
+fn decoder_valid_x265_access_unit_survives_wire_packetization() {
+    // One synthetic 64x64 blue frame, generated with FFmpeg/libx265 4.3.
+    // An independent FFmpeg HEVC decode succeeded before this fixture was
+    // committed. This qualifies Annex B framing, not the eventual Main-only
+    // encoder capability or a Moonlight session.
+    let access_unit = include_bytes!("fixtures/x265_blue_64.hevc");
+    for fec in [0, 20] {
+        let packets = hevc_packetizer(1392, fec)
+            .packetize(access_unit, 1, 90_000)
+            .unwrap();
+        assert_eq!(packets[0][35], 2);
+        if fec == 0 {
+            assert_eq!(reassemble(&packets, 1392), access_unit);
+        }
+    }
+}
+
+#[test]
 fn hevc_invalid_headers_and_open_gop_do_not_consume_sequence() {
     let valid: Vec<_> = [32, 33, 34, 19].into_iter().flat_map(hevc_nal).collect();
     let mut sender = hevc_packetizer(1392, 0);

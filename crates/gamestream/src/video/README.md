@@ -124,3 +124,10 @@ Actual Moonlight application streaming, the complete C queue/depacketizer,
 encrypted video, end-to-end HEVC/AV1, long frame headers, and reference-invalidation signalling
 remain unqualified or unimplemented. Successful FEC recovery does not qualify the
 remaining control, transport, audio, timing, or hardware pipeline.
+
+`fixtures/x265_blue_64.hevc` is a decoder-valid, synthetic 64×64 blue frame
+generated with FFmpeg/libx265 4.3 using closed-GOP IDR, repeated headers and
+BT.709 limited VUI. FFmpeg decoded it successfully before check-in; the fixture
+SHA-256 is `e500284a82df01185bdf4b89971177fd643784c1329f1f431c5ec715713c16a4`.
+Its FFprobe profile is Rext, so this packetizer fixture does not qualify the
+planned Main-only encoder capability or a Moonlight playback session.
