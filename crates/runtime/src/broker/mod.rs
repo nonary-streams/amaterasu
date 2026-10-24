@@ -90,6 +90,20 @@ impl Broker {
                     ),
                 }
             }
+            Command::GetRunningPackageDigest {} => {
+                if caller != "amaterasu.management" {
+                    return errors::permission_denied();
+                }
+                match &self.configuration.host_context.running_package_digest {
+                    Some(digest) => Response::Result {
+                        payload: serde_json::json!({"digest": digest}),
+                    },
+                    None => Response::error(
+                        "running_package_unavailable",
+                        "host did not supply a loaded package digest",
+                    ),
+                }
+            }
             Command::Register { service } => {
                 if self.api.owns_service(&service) {
                     errors::permission_denied()

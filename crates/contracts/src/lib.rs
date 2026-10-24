@@ -132,6 +132,10 @@ pub struct RuntimeHostContext {
     /// Only the management principal may request it from the runtime broker.
     #[serde(default)]
     pub package_root: Option<String>,
+    /// Verified package digest loaded into this worker, overwritten by the host.
+    /// Only management may request it; persisted selection can differ.
+    #[serde(default)]
+    pub running_package_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -157,6 +161,8 @@ pub enum Command {
     GetHostContext {},
     /// Returns the host-owned package root only to the management principal.
     GetPackageRoot {},
+    /// Returns the verified package digest actually loaded by this worker.
+    GetRunningPackageDigest {},
     Register {
         service: String,
     },

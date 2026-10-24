@@ -36,6 +36,23 @@ fn inject_package_root(
     Ok(())
 }
 
+fn inject_running_package_digest(
+    runtime_config: &mut amaterasu_contracts::RuntimeConfig,
+    digest: &str,
+) -> PackageResult<()> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("verified package digest is invalid".into());
+    }
+    // A signed package may carry host-context fields, so overwrite the value
+    // only after package verification with the digest of these loaded bytes.
+    runtime_config.host_context.running_package_digest = Some(digest.into());
+    Ok(())
+}
+
 pub struct LoadedComponents {
     // Fields drop in declaration order: modules must stop before their runtime disappears.
     modules: Vec<FeatureLibrary>,
@@ -71,6 +88,7 @@ impl LoadedComponents {
         runtime_config.host_context.schema = 1;
         runtime_config.host_context.state_root = Some(state_root_string.clone());
         inject_package_root(&mut runtime_config, root)?;
+        inject_running_package_digest(&mut runtime_config, &package.digest)?;
         if package
             .manifest
             .components
@@ -430,8 +448,8 @@ fn require_success(status: Status, operation: &str) -> PackageResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        inject_host_configuration_root, inject_package_root, inject_steam_artwork_cache_parent,
-        path_to_unicode_string,
+        inject_host_configuration_root, inject_package_root, inject_running_package_digest,
+        inject_steam_artwork_cache_parent, path_to_unicode_string,
     };
     use amaterasu_contracts::RuntimeConfig;
     use serde_json::json;
@@ -452,6 +470,23 @@ mod tests {
             root.canonicalize().unwrap().to_str()
         );
         std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn running_digest_overrides_package_controlled_host_context() {
+        let mut config = RuntimeConfig::default();
+        config.host_context.running_package_digest = Some("package-controlled".into());
+        let digest = "a".repeat(64);
+        inject_running_package_digest(&mut config, &digest).unwrap();
+        assert_eq!(
+            config.host_context.running_package_digest.as_deref(),
+            Some(digest.as_str())
+        );
+        assert!(inject_running_package_digest(&mut config, "invalid").is_err());
+        assert_eq!(
+            config.host_context.running_package_digest.as_deref(),
+            Some(digest.as_str())
+        );
     }
 
     #[test]

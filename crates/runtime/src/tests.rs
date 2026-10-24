@@ -80,6 +80,7 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
         schema: 1,
         state_root: Some(r"C:\\ProgramData\\Amaterasu\\runtime\\user-state\\S-1-5-21-1".into()),
         package_root: Some(r"C:\\ProgramData\\Amaterasu\\packages".into()),
+        running_package_digest: Some("a".repeat(64)),
     };
     let state_root = configuration.host_context.state_root.clone();
     let mut broker = Broker::new(configuration).unwrap();
@@ -119,12 +120,35 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
         payload["package_root"],
         r"C:\\ProgramData\\Amaterasu\\packages"
     );
+    let Response::Result { payload } =
+        broker.dispatch("amaterasu.management", Command::GetRunningPackageDigest {})
+    else {
+        panic!("management did not receive the running package digest");
+    };
+    assert_eq!(payload, serde_json::json!({"digest":"a".repeat(64)}));
     for caller in ["amaterasu.state", "amaterasu.audio", "other"] {
         assert!(matches!(
             broker.dispatch(caller, Command::GetPackageRoot {}),
             Response::Error { code, .. } if code == "permission_denied"
         ));
+        assert!(matches!(
+            broker.dispatch(caller, Command::GetRunningPackageDigest {}),
+            Response::Error { code, .. } if code == "permission_denied"
+        ));
     }
+}
+
+#[test]
+fn running_package_digest_is_unavailable_without_host_injection() {
+    let mut configuration = RuntimeConfig::default();
+    configuration
+        .principals
+        .insert("amaterasu.management".into(), Grants::default());
+    let mut broker = Broker::new(configuration).unwrap();
+    assert!(matches!(
+        broker.dispatch("amaterasu.management", Command::GetRunningPackageDigest {}),
+        Response::Error { code, .. } if code == "running_package_unavailable"
+    ));
 }
 fn request(operation: &str) -> Command {
     Command::Request {
