@@ -191,6 +191,36 @@ fn stream_session_opens_portal_capture_only_through_video() {
 }
 
 #[test]
+fn signed_linux_session_policy_advertises_reserved_desktop_without_catalog_row() {
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-linux-session-policy-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let policy = linux_session_policy(&root, &LinuxSessionOptions::default()).unwrap();
+    assert_eq!(
+        PackageProfile::LinuxSession.components().len(),
+        COMPONENTS.len()
+    );
+    assert_eq!(
+        policy.settings["amaterasu.nvhttp"]["streaming"]["desktop"]["enabled"],
+        true
+    );
+    assert_eq!(
+        policy.settings["amaterasu.catalog"]["seed_desktop_entry"],
+        false
+    );
+    assert!(
+        !COMPONENTS
+            .iter()
+            .any(|component| matches!(component.id, "amaterasu.steam" | "amaterasu.lutris"))
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn linux_profile_uses_numeric_nvhttp_encoder_selection() {
     let encoder = &streaming_settings(&LinuxSessionOptions::default())["capture"]["encoder"];
     assert!(encoder.is_number());
