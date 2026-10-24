@@ -10,6 +10,7 @@ use amaterasu_package::{
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 const UNIT_FILE: &str = "amaterasu-linux-session.service";
 
@@ -87,6 +88,7 @@ pub fn prepare(
         (UNIT_FILE, service_unit),
         ("install-user-service.sh", install_script().into()),
         ("uninstall-user-service.sh", uninstall_script().into()),
+        ("preflight-user-service.sh", preflight_script().into()),
         ("README.md", render_readme(active_digest)),
     ];
     write_artifact_directory(&output_directory, &artifacts)?;
@@ -95,6 +97,543 @@ pub fn prepare(
         verified.digest,
         output_directory.display()
     );
+    Ok(())
+}
+
+/// Read-only qualification for a generated user-service bundle. It verifies the
+/// active package again and queries only the current user's systemd/D-Bus state.
+pub fn preflight(
+    runtime_root: &Path,
+    host_executable: &Path,
+    bundle_directory: &Path,
+) -> PackageResult<()> {
+    let uid = current_user_uid()?;
+    if uid == 0 {
+        return Err("user-service preflight must run as the target non-root user".into());
+    }
+    let runtime_root = existing_path(runtime_root, "runtime root", true)?;
+    if runtime_root == Path::new("/") {
+        return Err("runtime root cannot be the filesystem root".into());
+    }
+    validate_private_user_directory(&runtime_root, uid, "runtime root")?;
+    let state_root = existing_path(&runtime_root.join("data/state"), "runtime state root", true)?;
+    validate_private_user_directory(&state_root, uid, "runtime state root")?;
+    let host_executable = existing_path(host_executable, "host executable", false)?;
+    validate_executable(&host_executable)?;
+    let bundle_directory = existing_path(bundle_directory, "service bundle", true)?;
+    let unit_path = existing_path(&bundle_directory.join(UNIT_FILE), "service unit", false)?;
+    let unit_bytes = read_bounded(&unit_path, 64 * 1024)?;
+    let unit = std::str::from_utf8(&unit_bytes).map_err(|_| "service unit is not UTF-8")?;
+
+    let bootstrap_path = existing_path(&runtime_root.join("bootstrap.json"), "bootstrap", false)?;
+    let selection_path = existing_path(&runtime_root.join("selection.json"), "selection", false)?;
+    let bootstrap_bytes = read_bounded(&bootstrap_path, 1024 * 1024)?;
+    let bootstrap: BootstrapConfig =
+        serde_json::from_slice(&bootstrap_bytes).map_err(|error| error.to_string())?;
+    if bootstrap.development || bootstrap.allow_unsigned || bootstrap.trusted_keys.is_empty() {
+        return Err("preflight requires a production bootstrap with trusted signers".into());
+    }
+    let selection_bytes = read_bounded(&selection_path, 1024 * 1024)?;
+    let selection: ActivationState =
+        serde_json::from_slice(&selection_bytes).map_err(|error| error.to_string())?;
+    let active_digest = selection
+        .active
+        .as_deref()
+        .ok_or("runtime root has no active signed package")?;
+    if !valid_digest(active_digest)
+        || selection.pending.is_some()
+        || selection.trial.is_some()
+        || selection.highest_sequence == 0
+    {
+        return Err("runtime root has an invalid or transitional active selection".into());
+    }
+
+    let package_path = existing_path(
+        &package_directory(&runtime_root, active_digest)?,
+        "active package directory",
+        true,
+    )?;
+    if !package_path.starts_with(runtime_root.join("sets")) {
+        return Err("active package path escapes the runtime root".into());
+    }
+    let verified = verify_package(
+        &package_path,
+        &bootstrap,
+        VerificationPolicy {
+            minimum_sequence: selection.highest_sequence,
+            allow_historical: false,
+            now: unix_timestamp(),
+        },
+    )?;
+    if !verified.signed
+        || verified.digest != active_digest
+        || verified.manifest.host_context_schema != 1
+        || verified.manifest.target != current_target()
+    {
+        return Err("active package is not the selected signed LinuxSession package".into());
+    }
+    validate_linux_session_composition(&verified.manifest.components)?;
+    let expected_unit = render_service_unit(&host_executable, &runtime_root, active_digest)?;
+    if unit != expected_unit.as_str() {
+        return Err(
+            "service unit does not match the active signed package, root, and executable".into(),
+        );
+    }
+    if sha256(&read_bounded(&selection_path, 1024 * 1024)?) != sha256(&selection_bytes)
+        || sha256(&read_bounded(&bootstrap_path, 1024 * 1024)?) != sha256(&bootstrap_bytes)
+    {
+        return Err("runtime trust or active selection changed during preflight".into());
+    }
+    let manager_environment = read_user_manager_environment()?;
+    validate_manager_runtime_environment(&manager_environment, &current_runtime_environment())?;
+    println!(
+        "[ok] loader and desktop session environment matches the target user's systemd manager"
+    );
+
+    let encoder = verified
+        .manifest
+        .components
+        .iter()
+        .find(|component| component.id == "amaterasu.encode")
+        .ok_or("signed LinuxSession package has no encoder component")?;
+    let encoder_bytes = read_bounded(&package_path.join(&encoder.file), 256 * 1024 * 1024)?;
+    let x264_build = crate::development::embedded_x264_build(&encoder_bytes)
+        .ok_or("active encoder has no embedded software-x264 ABI marker")?;
+    if !crate::development::x264_runtime_available(x264_build) {
+        return Err(format!(
+            "loader cannot find a compatible system x264 runtime for build {x264_build}"
+        ));
+    }
+    println!(
+        "[ok] signed active LinuxSession package {active_digest} verified; x264 ABI {x264_build} is loader-visible"
+    );
+
+    let needs = runtime_needs(&verified.runtime_config.settings)?;
+    if needs.pulse {
+        require_library("libpulse.so.0", &["pa_context_new", "pa_context_connect"])?;
+        println!("[ok] libpulse.so.0 and required audio symbols are loader-visible");
+        println!("[info] Pulse server connectivity was not tested; no audio stream was opened");
+    } else {
+        println!("[skip] PulseAudio runtime check; signed profile audio is disabled");
+    }
+
+    if needs.pipewire_portal {
+        require_library("libpipewire-0.3.so.0", &["pw_init", "pw_context_new"])?;
+        require_library("libgio-2.0.so.0", &["g_bus_get_sync"])?;
+        println!("[ok] PipeWire and GIO portal libraries are loader-visible");
+        require_portal_owner()?;
+        println!(
+            "[ok] current-user ScreenCast portal bus name is owned (no portal method or selection prompt was invoked)"
+        );
+    } else {
+        println!("[skip] PipeWire/portal runtime checks; signed profile video capture is disabled");
+    }
+
+    check_user_manager_and_unit(uid, &unit_bytes)?;
+    println!(
+        "[ok] current user's systemd manager is available and the unit name resolves without collision"
+    );
+    println!("Preflight passed. No service was enabled, started, installed, or modified.");
+    Ok(())
+}
+
+fn setting_enabled(
+    settings: &std::collections::BTreeMap<String, serde_json::Value>,
+    component: &str,
+) -> bool {
+    settings
+        .get(component)
+        .and_then(|value| value.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeNeeds {
+    pulse: bool,
+    pipewire_portal: bool,
+}
+
+fn runtime_needs(
+    settings: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> PackageResult<RuntimeNeeds> {
+    let video_enabled = setting_enabled(settings, "amaterasu.video");
+    if video_enabled
+        && (!settings
+            .get("amaterasu.video")
+            .and_then(|value| value.get("capture_providers"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|providers| providers.iter().any(|provider| provider == "pipewire"))
+            || !setting_enabled(settings, "amaterasu.capture-pipewire"))
+    {
+        return Err("signed video settings do not enable the PipeWire portal provider".into());
+    }
+    Ok(RuntimeNeeds {
+        pulse: setting_enabled(settings, "amaterasu.audio"),
+        pipewire_portal: video_enabled,
+    })
+}
+
+fn require_library(name: &str, symbols: &[&str]) -> PackageResult<()> {
+    // SAFETY: only fixed system sonames are loaded; this checks loader resolution
+    // and symbol presence without calling into the library or loading a package.
+    let library = unsafe { libloading::Library::new(name) }
+        .map_err(|_| format!("loader cannot find required system library {name}"))?;
+    for symbol in symbols {
+        // SAFETY: lookup only tests that the fixed ABI symbol is exported.
+        unsafe { library.get::<*mut std::ffi::c_void>(symbol.as_bytes()) }
+            .map_err(|_| format!("system library {name} lacks required symbol {symbol}"))?;
+    }
+    Ok(())
+}
+
+fn current_user_uid() -> PackageResult<u32> {
+    let output = Command::new("id")
+        .arg("-u")
+        .output()
+        .map_err(|error| format!("could not determine target user identity: {error}"))?;
+    if !output.status.success() {
+        return Err("could not determine target user identity".into());
+    }
+    let uid = String::from_utf8(output.stdout).map_err(|_| "target user identity is not UTF-8")?;
+    uid.trim()
+        .parse::<u32>()
+        .map_err(|_| "target user identity is invalid".into())
+}
+
+const SESSION_RUNTIME_ENVIRONMENT: [&str; 9] = [
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "WAYLAND_DISPLAY",
+    "PULSE_SERVER",
+];
+
+fn current_runtime_environment() -> std::collections::BTreeMap<String, String> {
+    SESSION_RUNTIME_ENVIRONMENT
+        .iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| ((*name).to_owned(), value))
+        })
+        .collect()
+}
+
+fn validate_manager_runtime_environment(
+    manager_environment: &str,
+    process_environment: &std::collections::BTreeMap<String, String>,
+) -> PackageResult<()> {
+    let manager_environment = manager_environment
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for name in SESSION_RUNTIME_ENVIRONMENT {
+        if manager_environment.get(name).copied()
+            != process_environment.get(name).map(String::as_str)
+        {
+            return Err(format!(
+                "current process and systemd manager differ in {name}; rerun preflight in the target user's desktop session"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_user_directory(path: &Path, uid: u32, description: &str) -> PackageResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{description} must be a user-owned directory without group/world write access"
+        ));
+    }
+    Ok(())
+}
+
+fn require_portal_owner() -> PackageResult<()> {
+    let output = Command::new("busctl")
+        .args(["--user", "--no-pager", "--no-legend", "list"])
+        .output()
+        .map_err(|error| format!("could not query the current user's D-Bus name list: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "current user's D-Bus name query failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let names = String::from_utf8(output.stdout).map_err(|_| "D-Bus name list is not UTF-8")?;
+    if !names
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("org.freedesktop.portal.Desktop"))
+    {
+        return Err("current user's org.freedesktop.portal.Desktop service is not running".into());
+    }
+    Ok(())
+}
+
+fn check_user_manager_and_unit(uid: u32, bundle_unit: &[u8]) -> PackageResult<()> {
+    let target = user_unit_target_path(uid)?;
+    let unit_files = query_systemctl(&[
+        "--user",
+        "list-unit-files",
+        "--all",
+        "--no-legend",
+        "--no-pager",
+    ])?;
+    let loaded_units = query_systemctl(&[
+        "--user",
+        "list-units",
+        "--all",
+        "--plain",
+        "--no-legend",
+        "--no-pager",
+    ])?;
+    let unit_is_listed = listing_contains_unit(&unit_files) || listing_contains_unit(&loaded_units);
+    let (load_state, fragment) = if unit_is_listed {
+        let resolution = query_systemctl(&[
+            "--user",
+            "show",
+            "--no-pager",
+            "--property=LoadState",
+            "--property=FragmentPath",
+            UNIT_FILE,
+        ])?;
+        parse_fragment_path(&resolution)?
+    } else {
+        ("not-found".to_owned(), None)
+    };
+    let installed = match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err("user unit target exists but is not a regular managed file".into());
+        }
+        Ok(_) => Some(read_bounded(&target, 64 * 1024)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    if installed.is_some() && !unit_is_listed {
+        return Err(
+            "unit file exists but the user's systemd manager has not resolved it yet".into(),
+        );
+    }
+    if let Some(installed) = installed.as_deref()
+        && installed != bundle_unit
+    {
+        return Err("existing user unit target differs from the generated bundle".into());
+    }
+    let expected = if target.exists() {
+        target.canonicalize().map_err(|error| error.to_string())?
+    } else {
+        target.clone()
+    };
+    let expected = expected.to_string_lossy();
+    let resolved = fragment
+        .as_deref()
+        .map(|path| {
+            Path::new(path)
+                .canonicalize()
+                .map(|path| path.to_string_lossy().into_owned())
+                .map_err(|_| "systemd resolved the unit to an unavailable path".into())
+        })
+        .transpose()?;
+    validate_manager_resolution(
+        load_state.as_str(),
+        resolved.as_deref(),
+        &expected,
+        installed.is_some(),
+    )?;
+    println!("[ok] target user UID {uid}; systemd --user manager query succeeded");
+    if installed.is_some() {
+        println!("[ok] exact generated unit bytes already exist in the user's unit directory");
+    } else {
+        println!("[ok] no existing unit file or resolved unit-name collision");
+    }
+    Ok(())
+}
+
+fn parse_fragment_path(output: &str) -> PackageResult<(String, Option<String>)> {
+    let mut load_state = None;
+    let mut fragment = None;
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("LoadState=") {
+            if load_state.replace(value).is_some() {
+                return Err("systemd returned duplicate LoadState fields".into());
+            }
+        } else if let Some(value) = line.strip_prefix("FragmentPath=") {
+            if fragment.replace(value).is_some() {
+                return Err("systemd returned duplicate FragmentPath fields".into());
+            }
+        }
+    }
+    let load_state = load_state
+        .ok_or("systemd response omitted LoadState")?
+        .to_owned();
+    let fragment = fragment.filter(|path| !path.is_empty()).map(str::to_owned);
+    Ok((load_state, fragment))
+}
+
+fn validate_manager_resolution(
+    load_state: &str,
+    fragment_path: Option<&str>,
+    expected_path: &str,
+    target_file_exists: bool,
+) -> PackageResult<()> {
+    match load_state {
+        "not-found" if fragment_path.is_none() && !target_file_exists => Ok(()),
+        "not-found" => Err("systemd failed to load an existing unit file".into()),
+        "loaded" => {
+            let fragment_path =
+                fragment_path.ok_or("systemd loaded the unit without a FragmentPath")?;
+            if fragment_path != expected_path {
+                return Err(format!(
+                    "unit name collision: systemd resolves {} from {}, expected {}",
+                    UNIT_FILE, fragment_path, expected_path
+                ));
+            }
+            if !target_file_exists {
+                return Err(
+                    "systemd resolves the user-service name but the expected unit file is absent"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+        state => Err(format!(
+            "user unit has unexpected systemd load state {state}"
+        )),
+    }
+}
+
+fn listing_contains_unit(output: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(UNIT_FILE))
+}
+
+fn query_systemctl(arguments: &[&str]) -> PackageResult<String> {
+    let output = Command::new("systemctl")
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("could not query current user's systemd manager: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemd user-manager query failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|_| "systemd user-manager output is not UTF-8".into())
+}
+
+fn read_user_manager_environment() -> PackageResult<String> {
+    let output = Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+        .map_err(|error| format!("could not query the current user's systemd manager: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "current user's systemd manager is unavailable: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| "current user's systemd environment is not UTF-8".into())
+}
+
+fn user_unit_target_path(uid: u32) -> PackageResult<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or("HOME is unavailable for user-service preflight")?;
+    let home = existing_path(Path::new(&home), "user home", true)?;
+    use std::os::unix::fs::MetadataExt;
+    let home_metadata = fs::metadata(&home).map_err(|error| error.to_string())?;
+    if home == Path::new("/") || home_metadata.uid() != uid || home_metadata.mode() & 0o022 != 0 {
+        return Err("HOME must be a private directory owned by the target user".into());
+    }
+    let config_home = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(config_home) => {
+            let config_home = PathBuf::from(config_home);
+            if !config_home.is_absolute()
+                || config_home
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+                || !config_home.starts_with(&home)
+            {
+                return Err(
+                    "XDG_CONFIG_HOME must be an absolute normalized path under HOME".into(),
+                );
+            }
+            optional_directory_path(&config_home, &home)?
+        }
+        None => home.join(".config"),
+    };
+    validate_user_directory_chain(&config_home, &home, uid)?;
+    let user_unit_directory = config_home.join("systemd/user");
+    check_existing_ancestors_for_symlinks(&user_unit_directory)?;
+    validate_user_directory_chain(&user_unit_directory, &home, uid)?;
+    let target = user_unit_directory.join(UNIT_FILE);
+    Ok(target)
+}
+
+fn validate_user_directory_chain(path: &Path, home: &Path, uid: u32) -> PackageResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let relative = path
+        .strip_prefix(home)
+        .map_err(|_| "user-service directory escapes HOME")?;
+    let mut current = home.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err("user-service directory path is not normalized".into());
+        };
+        current.push(name);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != uid
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(format!(
+                "user-service directory {} must be a non-writable directory owned by the target user",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn optional_directory_path(path: &Path, home: &Path) -> PackageResult<PathBuf> {
+    check_existing_ancestors_for_symlinks(path)?;
+    match path.canonicalize() {
+        Ok(canonical) if canonical.starts_with(home) => Ok(canonical),
+        Ok(_) => Err("XDG_CONFIG_HOME resolves outside HOME".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn check_existing_ancestors_for_symlinks(path: &Path) -> PackageResult<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "user-service path contains symlink {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
     Ok(())
 }
 
@@ -234,10 +773,14 @@ fn install_script() -> &'static str {
     r#"#!/bin/sh
 set -eu
 unit_name=amaterasu-linux-session.service
+[ "$#" -eq 2 ] || { echo "usage: sh install-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE" >&2; exit 2; }
 bundle_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 source_unit="$bundle_dir/$unit_name"
 [ -f "$source_unit" ] && [ ! -L "$source_unit" ] || { echo "service artifact is missing or unsafe" >&2; exit 1; }
 [ "$(id -u)" -ne 0 ] || { echo "refusing to install a user service as root" >&2; exit 1; }
+release_cli=${AMATERASU_RELEASE_BIN:-amaterasu-release}
+command -v "$release_cli" >/dev/null 2>&1 || { echo "amaterasu-release must be available, or set AMATERASU_RELEASE_BIN" >&2; exit 1; }
+"$release_cli" preflight-linux-user-service "$1" "$2" "$bundle_dir"
 command -v systemctl >/dev/null 2>&1 || { echo "systemctl is required for a user unit" >&2; exit 1; }
 systemctl --user show-environment >/dev/null 2>&1 || { echo "current user systemd manager is unavailable" >&2; exit 1; }
 [ -n "${HOME:-}" ] && [ "${HOME#/}" != "$HOME" ] || { echo "HOME must be an absolute path" >&2; exit 1; }
@@ -380,9 +923,33 @@ echo "Removed the verified Amaterasu user unit. Runtime data and signed package 
 "#
 }
 
+fn preflight_script() -> &'static str {
+    r#"#!/bin/sh
+set -eu
+[ "$#" -eq 2 ] || { echo "usage: sh preflight-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE" >&2; exit 2; }
+bundle_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+release_cli=${AMATERASU_RELEASE_BIN:-amaterasu-release}
+command -v "$release_cli" >/dev/null 2>&1 || { echo "amaterasu-release must be available, or set AMATERASU_RELEASE_BIN" >&2; exit 1; }
+exec "$release_cli" preflight-linux-user-service "$1" "$2" "$bundle_dir"
+"#
+}
+
 fn render_readme(digest: &str) -> String {
     format!(
-        "# Amaterasu LinuxSession user service\n\nThis bundle was generated for signed active package `{digest}`. The unit runs under the current user manager and never requests root or system service privileges. Its `ExecStart` pins this digest; a different active package fails closed until a new bundle is generated and reviewed.\n\nReview `amaterasu-linux-session.service`, then install it for this user with `sh install-user-service.sh`. Installation enables the unit for `graphical-session.target` but does not start it. Start it explicitly with `systemctl --user start amaterasu-linux-session.service`, or let the graphical session start it.\n\nThe host verifies the production bootstrap, trusted package signature, active selection, and pinned digest on every start. A module tick or health failure exits the service; systemd restarts it after a fixed five-second delay and the next start re-verifies the same digest. SIGTERM triggers orderly component teardown and Linux input revocation. A forced kill is recovered by the same fresh verification and load on restart.\n\nUninstall from this same bundle with `sh uninstall-user-service.sh`. It stops and disables the user unit only after verifying that the installed unit bytes match this bundle, rechecks before removing the file, and leaves runtime data and the signed package intact. If the unit was edited or replaced, uninstall refuses to remove it.\n\nThe generated scripts affect only the current user service directory selected by `XDG_CONFIG_HOME` (or `$HOME/.config`). They refuse root execution and symlinked service paths, and verify that systemd resolves this exact unit file before enabling or uninstalling it. No service was installed or started when this bundle was generated.\n"
+        r#"# Amaterasu LinuxSession user service
+
+This bundle was generated for signed active package `{digest}`. The unit runs under the current user manager and never requests root or system service privileges. Its `ExecStart` pins this digest; a different active package fails closed until a new bundle is generated and reviewed.
+
+Before installing or starting, run `sh preflight-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE` as the target non-root user. The script calls `amaterasu-release preflight-linux-user-service` (or `$AMATERASU_RELEASE_BIN`) to reverify the active signature and digest, check loader-visible x264/Pulse/PipeWire/GIO libraries, verify the current user manager's unit resolution, and confirm the current user's portal bus name when capture is enabled. The check only queries systemd and lists D-Bus names; it does not enable/start a unit or request portal consent. It requires the release CLI to be available on the target host. It checks Pulse library loading, not server connectivity, and checks portal bus ownership, not the ScreenCast interface response, user consent, or an actual capture/audio stream.
+
+Review `amaterasu-linux-session.service`, then install it for this user with `sh install-user-service.sh RUNTIME_ROOT HOST_EXECUTABLE`. The installer runs the same read-only preflight before it writes or enables the unit. Installation enables the unit for `graphical-session.target` but does not start it. For a manual start, run the standalone preflight immediately beforehand, then use `systemctl --user start amaterasu-linux-session.service`.
+
+The host verifies the production bootstrap, trusted package signature, active selection, and pinned digest on every start. A module tick or health failure exits the service; systemd restarts it after a fixed five-second delay and the next start re-verifies the same digest. SIGTERM triggers orderly component teardown and Linux input revocation. A forced kill is recovered by the same fresh verification and load on restart.
+
+Uninstall from this same bundle with `sh uninstall-user-service.sh`. It stops and disables the user unit only after verifying that the installed unit bytes match this bundle, rechecks before removing the file, and leaves runtime data and the signed package intact. If the unit was edited or replaced, uninstall refuses to remove it.
+
+The generated scripts affect only the current user service directory selected by `XDG_CONFIG_HOME` (or `$HOME/.config`). They refuse root execution and symlinked service paths, and verify that systemd resolves this exact unit file before enabling or uninstalling it. No service was installed or started when this bundle was generated.
+"#
     )
 }
 
@@ -430,6 +997,10 @@ mod tests {
         assert!(install.contains("refusing to overwrite unmanaged service content"));
         assert!(install.contains("FragmentPath"));
         assert!(install.contains("refusing to shadow a different user unit"));
+        assert!(install.contains("preflight-linux-user-service"));
+        assert!(
+            install.find("preflight-linux-user-service") < install.find("mkdir -p \"$user_dir\"")
+        );
         assert!(install.contains("systemctl --user enable"));
         assert!(
             !install
@@ -494,6 +1065,13 @@ exit 0
         )
         .unwrap();
         fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o700)).unwrap();
+        let fake_release = bin.join("amaterasu-release");
+        fs::write(
+            &fake_release,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$RELEASE_LOG\"\n[ \"${FAIL_PREFLIGHT:-0}\" = 0 ]\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_release, fs::Permissions::from_mode(0o700)).unwrap();
         let fake_id = bin.join("id");
         fs::write(
             &fake_id,
@@ -503,6 +1081,7 @@ exit 0
         fs::set_permissions(&fake_id, fs::Permissions::from_mode(0o700)).unwrap();
 
         let log = root.join("systemctl.log");
+        let release_log = root.join("release.log");
         let user_dir = home.join(".config/systemd/user");
         let installed = user_dir.join(UNIT_FILE);
         let wanted_link = user_dir
@@ -519,9 +1098,11 @@ exit 0
         let run_script = |name: &str, fragment: &str, fail_enable: bool| {
             Command::new("sh")
                 .arg(bundle.join(name))
+                .args([root.join("runtime"), root.join("amaterasu")])
                 .env("HOME", &home)
                 .env("PATH", &path)
                 .env("SYSTEMCTL_LOG", &log)
+                .env("RELEASE_LOG", &release_log)
                 .env("SYSTEMD_FRAGMENT", fragment)
                 .env("SYSTEMD_EXPECTED_FRAGMENT", &expected_fragment)
                 .env("SYSTEMD_UNIT_PATH", &installed)
@@ -530,6 +1111,24 @@ exit 0
                 .status()
                 .unwrap()
         };
+
+        assert!(
+            !Command::new("sh")
+                .arg(bundle.join("install-user-service.sh"))
+                .args([root.join("runtime"), root.join("amaterasu")])
+                .env("HOME", &home)
+                .env("PATH", &path)
+                .env("SYSTEMCTL_LOG", &log)
+                .env("RELEASE_LOG", &release_log)
+                .env("FAIL_PREFLIGHT", "1")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            !log.exists(),
+            "preflight failure must precede systemctl queries"
+        );
 
         let other_unit = root
             .join("other-user-unit.service")
@@ -592,6 +1191,145 @@ exit 0
         assert!(valid_digest(&"a".repeat(64)));
         assert!(!valid_digest("../bootstrap.json"));
         assert!(!valid_digest(&"g".repeat(64)));
+    }
+
+    #[test]
+    fn systemd_resolution_parser_handles_missing_and_loaded_units() {
+        assert_eq!(
+            parse_fragment_path("LoadState=not-found\nFragmentPath=\n").unwrap(),
+            ("not-found".into(), None)
+        );
+        assert_eq!(
+            parse_fragment_path("LoadState=loaded\nFragmentPath=/home/user/.config/systemd/user/amaterasu-linux-session.service\n").unwrap(),
+            (
+                "loaded".into(),
+                Some("/home/user/.config/systemd/user/amaterasu-linux-session.service".into())
+            )
+        );
+        assert!(parse_fragment_path("FragmentPath=/tmp/foreign.service\n").is_err());
+        assert!(parse_fragment_path("LoadState=loaded\nLoadState=loaded\n").is_err());
+    }
+
+    #[test]
+    fn manager_preflight_allows_only_the_bundle_unit_path() {
+        let expected = "/home/user/.config/systemd/user/amaterasu-linux-session.service";
+        assert!(validate_manager_resolution("not-found", None, expected, false).is_ok());
+        assert!(validate_manager_resolution("loaded", Some(expected), expected, true).is_ok());
+        assert!(
+            validate_manager_resolution(
+                "loaded",
+                Some("/usr/lib/systemd/user/amaterasu-linux-session.service"),
+                expected,
+                true
+            )
+            .is_err()
+        );
+        assert!(validate_manager_resolution("loaded", None, expected, true).is_err());
+        assert!(validate_manager_resolution("not-found", None, expected, true).is_err());
+    }
+
+    #[test]
+    fn unit_listing_matches_the_exact_name_only() {
+        assert!(listing_contains_unit(
+            "amaterasu-linux-session.service disabled enabled\n"
+        ));
+        assert!(listing_contains_unit(
+            "amaterasu-linux-session.service loaded active running\n"
+        ));
+        assert!(!listing_contains_unit(
+            "amaterasu-linux-session.service.custom disabled enabled\n"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_unit_directory_chain_must_be_owned_and_not_group_or_world_writable() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-user-unit-chain-{}-{}",
+            std::process::id(),
+            random_identifier().unwrap()
+        ));
+        let home = root.join("home");
+        let config = home.join(".config");
+        fs::create_dir_all(&config).unwrap();
+        let uid = fs::metadata(&home).unwrap().uid();
+        assert!(validate_user_directory_chain(&config, &home, uid).is_ok());
+
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(validate_user_directory_chain(&config, &home, uid).is_err());
+
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = home.join("linked-config");
+        std::os::unix::fs::symlink(&config, &link).unwrap();
+        assert!(validate_user_directory_chain(&link, &home, uid).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loader_checks_follow_signed_audio_and_capture_settings() {
+        let mut settings = std::collections::BTreeMap::new();
+        assert_eq!(
+            runtime_needs(&settings).unwrap(),
+            RuntimeNeeds {
+                pulse: false,
+                pipewire_portal: false
+            }
+        );
+
+        settings.insert(
+            "amaterasu.audio".into(),
+            serde_json::json!({"enabled":true}),
+        );
+        assert_eq!(
+            runtime_needs(&settings).unwrap(),
+            RuntimeNeeds {
+                pulse: true,
+                pipewire_portal: false
+            }
+        );
+
+        settings.insert(
+            "amaterasu.video".into(),
+            serde_json::json!({"enabled":true,"capture_providers":["pipewire"]}),
+        );
+        assert!(runtime_needs(&settings).is_err());
+        settings.insert(
+            "amaterasu.capture-pipewire".into(),
+            serde_json::json!({"enabled":true}),
+        );
+        assert_eq!(
+            runtime_needs(&settings).unwrap(),
+            RuntimeNeeds {
+                pulse: true,
+                pipewire_portal: true
+            }
+        );
+    }
+
+    #[test]
+    fn preflight_requires_runtime_environment_to_match_the_user_manager() {
+        let mut current = std::collections::BTreeMap::new();
+        current.insert("XDG_RUNTIME_DIR".into(), "/run/user/1000".into());
+        current.insert(
+            "PULSE_SERVER".into(),
+            "unix:/run/user/1000/pulse/native".into(),
+        );
+        let manager =
+            "XDG_RUNTIME_DIR=/run/user/1000\nPULSE_SERVER=unix:/run/user/1000/pulse/native\n";
+        assert!(validate_manager_runtime_environment(manager, &current).is_ok());
+
+        current.insert("PULSE_SERVER".into(), "unix:/tmp/other.sock".into());
+        assert!(validate_manager_runtime_environment(manager, &current).is_err());
+    }
+
+    #[test]
+    fn generated_read_only_preflight_script_does_not_install_or_start() {
+        let script = preflight_script();
+        assert!(script.contains("preflight-linux-user-service"));
+        assert!(!script.contains("systemctl --user enable"));
+        assert!(!script.contains("systemctl --user start"));
     }
 
     #[test]

@@ -2313,7 +2313,7 @@ fn validate_linux_x264_inputs(
     Ok(())
 }
 
-fn embedded_x264_build(encoder: &[u8]) -> Option<u32> {
+pub(crate) fn embedded_x264_build(encoder: &[u8]) -> Option<u32> {
     let offsets = encoder
         .windows(X264_BUILD_MARKER.len())
         .enumerate()
@@ -2338,7 +2338,7 @@ fn embedded_x264_build(encoder: &[u8]) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn x264_runtime_available(build: u32) -> bool {
+pub(crate) fn x264_runtime_available(build: u32) -> bool {
     let library_names = [format!("libx264.so.{build}"), "libx264.so".into()];
     for name in library_names {
         // SAFETY: candidates are fixed system loader names derived from the
@@ -2376,7 +2376,7 @@ fn x264_runtime_available(build: u32) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn x264_runtime_available(_: u32) -> bool {
+pub(crate) fn x264_runtime_available(_: u32) -> bool {
     false
 }
 
