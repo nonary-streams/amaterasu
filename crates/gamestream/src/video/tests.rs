@@ -55,11 +55,11 @@ fn hevc_closed_gop_recovery_keeps_parameter_sets_and_frame_type() {
 
 #[test]
 fn decoder_valid_x265_access_unit_survives_wire_packetization() {
-    // One synthetic 64x64 blue frame from FFmpeg/libx265, explicitly encoded
-    // as Main, 8-bit 4:2:0, limited-range BT.709. FFprobe verified those
-    // properties and FFmpeg decoded the frame before it was committed. This
-    // qualifies wire framing, not Ama's x265 backend or a Moonlight session.
-    let access_unit = include_bytes!("fixtures/x265_main_blue_64.hevc");
+    // One black 64x64 frame from Ama's feature-gated software x265 shim.
+    // FFprobe verified Main, 8-bit 4:2:0, limited-range BT.709; FFmpeg
+    // decoded the exact access unit. This qualifies the encoder-to-wire
+    // bytes, not a Moonlight session.
+    let access_unit = include_bytes!("fixtures/x265_shim_main_black_64.hevc");
     for fec in [0, 20] {
         let packets = hevc_packetizer(1392, fec)
             .packetize(access_unit, 1, 90_000)
