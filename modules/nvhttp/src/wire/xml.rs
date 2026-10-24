@@ -60,7 +60,13 @@ pub fn server_info(
             (
                 "appversion",
                 if streaming_supported {
-                    "7.1.431.0"
+                    if cfg!(target_os = "linux") {
+                        // Moonlight uses a negative fourth component to enable
+                        // Sunshine-compatible RTSP encryption negotiation.
+                        "7.1.431.-1"
+                    } else {
+                        "7.1.431.0"
+                    }
                 } else {
                     "7.1.0.0"
                 },

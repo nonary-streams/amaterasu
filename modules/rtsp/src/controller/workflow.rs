@@ -293,6 +293,14 @@ impl Controller {
             && response_session(payload) == record.session
             && matches!(state, Some("armed" | "starting" | "active"))
             && payload["cleanup_error"].is_null();
+        if !valid {
+            eprintln!(
+                "amaterasu rtsp arm rejected state={} code={} error={}",
+                safe_provider_code(&payload["state"]),
+                safe_provider_code(&payload["code"]),
+                safe_provider_code(&payload["error"]),
+            );
+        }
         if let Some(state) = state {
             record.stream_state = Some(state.into());
         }

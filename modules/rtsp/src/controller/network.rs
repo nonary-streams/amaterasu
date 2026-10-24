@@ -255,6 +255,7 @@ impl Controller {
         action_ticket: u64,
         failure: &'static str,
     ) {
+        eprintln!("amaterasu rtsp action failed reason={failure}");
         let reply = record
             .negotiation
             .as_mut()

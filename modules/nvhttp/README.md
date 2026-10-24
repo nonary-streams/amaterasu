@@ -351,11 +351,13 @@ BMP noncharacters U+FFFE/U+FFFF and controls.
   reported as implemented by replaying a fresh launch.
 
 Without streaming configuration, server info advertises `appversion=7.1.0.0` and
-`StreamingSupported=0`. Configured streaming advertises `appversion=7.1.431.0` and
+`StreamingSupported=0`. Configured Linux streaming advertises
+`appversion=7.1.431.-1` so Moonlight enables the Sunshine-compatible RTSP
+encryption exchange; Windows retains `7.1.431.0`. Configured streaming advertises
 `StreamingSupported=1`. This reports accepted startup policy; it is not a runtime
-GPU, encoder, or capture probe. `ServerCodecModeSupport` and unavailable hardware
-fields remain zero rather than claiming codecs, HDR, a public IP, or a hardware
-MAC. `state` is globally busy while any owned launch remains active or has
+GPU, encoder, or capture probe. `ServerCodecModeSupport` advertises only H.264
+for configured streaming; unavailable hardware and HDR fields remain zero.
+`state` is globally busy while any owned launch remains active or has
 unconfirmed cleanup. `currentgame` contains the app ID only for the owning paired
 certificate and remains zero for other clients.
 

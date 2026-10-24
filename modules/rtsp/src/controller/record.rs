@@ -61,6 +61,31 @@ impl Record {
         announce: &amaterasu_gamestream::sdp::Announce,
     ) -> bool {
         let accepted = self.config.matches_announce(announce);
+        if !accepted {
+            let expected = self.config.effective_profile();
+            eprintln!(
+                "amaterasu rtsp announce prepared-profile mismatch width={} height={} fps={} bitrate={} packet_size={} packet_ms={} refs={} parity={} color={:?} video_encryption={} audio_encryption={} expected_width={} expected_height={} expected_fps={} expected_bitrate={} expected_packet_size={} expected_packet_ms={} expected_refs={} expected_parity={}",
+                announce.video.width,
+                announce.video.height,
+                announce.video.fps,
+                announce.video.bitrate_kbps,
+                announce.packet_size,
+                announce.audio.packet_duration_ms,
+                announce.video.max_reference_frames,
+                announce.fec.minimum_packets,
+                announce.video.color,
+                announce.encryption.video,
+                announce.encryption.audio,
+                expected.width,
+                expected.height,
+                expected.fps,
+                expected.bitrate_kbps,
+                expected.packet_size,
+                expected.packet_ms,
+                expected.max_reference_frames,
+                expected.min_parity_shards,
+            );
+        }
         self.negotiated_encryption = accepted.then_some(crate::model::EncryptionSnapshot {
             video: announce.encryption.video,
             audio: announce.encryption.audio,

@@ -152,6 +152,10 @@ pub(super) fn media(value: &sdp::Announce, capabilities: &Capabilities) -> Resul
             !capabilities.require_video_encryption || value.encryption.video,
             !capabilities.require_audio_encryption || value.encryption.audio,
         );
+        eprintln!(
+            "amaterasu rtsp announce color requested={:?} supported={:?}",
+            value.video.color, capabilities.color
+        );
         return Err(Error::UnsupportedMedia);
     }
     Ok(())
