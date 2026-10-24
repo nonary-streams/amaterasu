@@ -1,8 +1,8 @@
 //! Recovery of a retained native set is owned by the fixed host shell, not a
 //! replaceable management or feature library. No candidate code is loaded here.
 use amaterasu_package::{
-    ActivationState, BootstrapConfig, PackageResult, ReleaseManifest, RootLock,
-    VerifiedPackage, current_target, read_bounded, read_json, write_json_atomically,
+    ActivationState, BootstrapConfig, PackageResult, RootLock, VerifiedPackage, read_bounded,
+    read_json, write_json_atomically,
 };
 use std::path::Path;
 
@@ -87,7 +87,7 @@ fn require_current_development_bootstrap(
 mod tests {
     use super::*;
     use amaterasu_contracts::RuntimeConfig;
-    use amaterasu_package::{random_identifier, write_json_atomically};
+    use amaterasu_package::{ReleaseManifest, current_target, random_identifier, write_json_atomically};
     use std::collections::BTreeMap;
     use std::fs;
 
