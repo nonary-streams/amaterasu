@@ -998,7 +998,6 @@ impl DisplayError {
             message: message.into(),
         }
     }
-    #[cfg(any(windows, test))]
     pub fn after_mutation(mut self) -> Self {
         self.may_have_changed = true;
         self
