@@ -67,6 +67,11 @@ pub enum InputEvent {
         code: u16,
         pressed: bool,
     },
+    /// Emits an evdev repeat value for a key already held by this session.
+    /// It never changes the companion's held-input ledger.
+    EvdevKeyRepeat {
+        code: u16,
+    },
     MouseButton {
         button: MouseButton,
         pressed: bool,
@@ -90,6 +95,9 @@ impl InputEvent {
             Self::EvdevKey { code, .. } if !(1..=248).contains(code) || *code == 240 => {
                 Err(InputError::InvalidEvent)
             }
+            Self::EvdevKeyRepeat { code } if !(1..=248).contains(code) || *code == 240 => {
+                Err(InputError::InvalidEvent)
+            }
             Self::Relative { dx: 0, dy: 0 }
             | Self::Scroll {
                 vertical: 0,
@@ -106,7 +114,10 @@ impl InputEvent {
     }
 
     pub(crate) fn keyboard(&self) -> bool {
-        matches!(self, Self::Key { .. } | Self::EvdevKey { .. })
+        matches!(
+            self,
+            Self::Key { .. } | Self::EvdevKey { .. } | Self::EvdevKeyRepeat { .. }
+        )
     }
 
     pub(crate) fn transition(&self) -> Option<(HeldInput, bool)> {

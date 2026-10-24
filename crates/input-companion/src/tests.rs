@@ -335,6 +335,8 @@ fn invalid_events_and_device_grants_do_not_reach_the_sink() {
             code: 240,
             pressed: true,
         },
+        InputEvent::EvdevKeyRepeat { code: 0 },
+        InputEvent::EvdevKeyRepeat { code: 240 },
         InputEvent::Relative { dx: 4, dy: 0 },
         InputEvent::Scroll {
             vertical: 12_001,
@@ -359,6 +361,56 @@ fn invalid_events_and_device_grants_do_not_reach_the_sink() {
     );
     assert!(session.sink.sent.is_empty());
     assert!(serde_json::from_str::<InputPacket>(r#"{"version":1,"generation":7,"sequence":1,"lease_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","event":{"kind":"raw_report","report_id":1}}"#).is_err());
+}
+
+#[test]
+fn evdev_repeat_requires_an_owned_key_and_does_not_change_cleanup_state() {
+    let now = Instant::now();
+    let mut session = connect(now, FakeDevice::default());
+    let repeat = InputEvent::EvdevKeyRepeat { code: 30 };
+
+    assert_eq!(
+        session.submit(&packet(1, repeat.clone()), now),
+        Err(InputError::InvalidSequence)
+    );
+    assert!(session.sink.sent.is_empty());
+
+    let down = InputEvent::EvdevKey {
+        code: 30,
+        pressed: true,
+    };
+    let up = InputEvent::EvdevKey {
+        code: 30,
+        pressed: false,
+    };
+    session.submit(&packet(1, down.clone()), now).unwrap();
+    session.submit(&packet(2, repeat.clone()), now).unwrap();
+    session.submit(&packet(3, up.clone()), now).unwrap();
+    assert_eq!(
+        session.submit(&packet(4, repeat.clone()), now),
+        Err(InputError::InvalidSequence)
+    );
+    assert_eq!(session.sink.sent, [down, repeat, up]);
+    session.revoke().unwrap();
+    assert_eq!(session.sink.releases, 1);
+}
+
+#[test]
+fn evdev_repeat_keeps_one_held_owner_until_disconnect_cleanup() {
+    let now = Instant::now();
+    let mut session = connect(now, FakeDevice::default());
+    let down = InputEvent::EvdevKey {
+        code: 30,
+        pressed: true,
+    };
+    session.submit(&packet(1, down.clone()), now).unwrap();
+    session
+        .submit(&packet(2, InputEvent::EvdevKeyRepeat { code: 30 }), now)
+        .unwrap();
+
+    session.revoke().unwrap();
+    assert_eq!(session.sink.sent, [down]);
+    assert_eq!(session.sink.releases, 1);
 }
 
 #[test]

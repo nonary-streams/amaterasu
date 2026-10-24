@@ -718,6 +718,11 @@ impl DeviceSink for LinuxUinputSink {
                 .as_ref()
                 .ok_or(InputError::PermissionDenied)?
                 .emit(&[(EV_KEY, *code, i32::from(*pressed))]),
+            InputEvent::EvdevKeyRepeat { code } => self
+                .keyboard
+                .as_ref()
+                .ok_or(InputError::PermissionDenied)?
+                .emit(&[(EV_KEY, *code, 2)]),
             InputEvent::MouseButton { button, pressed } => self
                 .pointer
                 .as_ref()

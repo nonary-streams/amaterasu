@@ -11,6 +11,16 @@ use std::path::Path;
 
 const MAX_COMPANION_SCROLL_DELTA: i32 = 12_000;
 
+fn evdev_key_event(code: u16, state: KeyState) -> InputEvent {
+    match state {
+        KeyState::Repeat => InputEvent::EvdevKeyRepeat { code },
+        KeyState::Down | KeyState::Up => InputEvent::EvdevKey {
+            code,
+            pressed: state == KeyState::Down,
+        },
+    }
+}
+
 pub struct LinuxCompanionBackend {
     socket_path: String,
     client: Option<LinuxInputClient>,
@@ -144,18 +154,12 @@ impl Backend for LinuxCompanionBackend {
         match event {
             Event::Key { key, state } => {
                 let code = self.event_keycode(key, *state)?;
-                if *state == KeyState::Repeat {
-                    return Ok(());
-                }
                 if let Key::MoonlightVk { code: identity, .. } = key
                     && *state == KeyState::Down
                 {
                     self.held_virtual_keycodes.insert(*identity, code);
                 }
-                self.send(InputEvent::EvdevKey {
-                    code,
-                    pressed: *state == KeyState::Down,
-                })?;
+                self.send(evdev_key_event(code, *state))?;
                 if let (Key::MoonlightVk { code: identity, .. }, KeyState::Up) = (key, state) {
                     self.held_virtual_keycodes.remove(identity);
                 }
@@ -262,7 +266,29 @@ fn companion_error(error: amaterasu_input_companion::InputError) -> InputError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Axis, InputEvent, scroll_events};
+    use super::{Axis, InputEvent, KeyState, evdev_key_event, scroll_events};
+
+    #[test]
+    fn key_repeat_uses_evdev_repeat_without_a_transition() {
+        assert_eq!(
+            evdev_key_event(30, KeyState::Repeat),
+            InputEvent::EvdevKeyRepeat { code: 30 }
+        );
+        assert_eq!(
+            evdev_key_event(30, KeyState::Down),
+            InputEvent::EvdevKey {
+                code: 30,
+                pressed: true,
+            }
+        );
+        assert_eq!(
+            evdev_key_event(30, KeyState::Up),
+            InputEvent::EvdevKey {
+                code: 30,
+                pressed: false,
+            }
+        );
+    }
 
     #[test]
     fn high_resolution_scroll_chunks_stay_within_companion_limit_and_preserve_sum() {

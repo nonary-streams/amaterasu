@@ -243,7 +243,7 @@ impl<S: DeviceSink> InputSession<S> {
             return Err(InputError::PermissionDenied);
         }
         let transition = packet.event.transition();
-        self.validate_transition(transition)?;
+        self.validate_transition(&packet.event, transition)?;
         self.check_rate(now, transition)?;
 
         // Keep issuance of a newer generation serialized with device I/O.
@@ -284,7 +284,16 @@ impl<S: DeviceSink> InputSession<S> {
         Ok(())
     }
 
-    fn validate_transition(&self, transition: Option<(HeldInput, bool)>) -> InputResult<()> {
+    fn validate_transition(
+        &self,
+        event: &InputEvent,
+        transition: Option<(HeldInput, bool)>,
+    ) -> InputResult<()> {
+        if let InputEvent::EvdevKeyRepeat { code } = event
+            && !self.held.contains(&HeldInput::EvdevKey(*code))
+        {
+            return Err(InputError::InvalidSequence);
+        }
         match transition {
             Some((held, true)) if self.held.contains(&held) => Err(InputError::InvalidSequence),
             Some((_, true)) if self.held.len() >= MAX_HELD => Err(InputError::ResourceExhausted),
