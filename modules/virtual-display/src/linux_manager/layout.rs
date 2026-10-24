@@ -70,20 +70,45 @@ impl Layout {
             .max(0)
     }
     pub fn next_priority(&self) -> u32 {
-        self.outputs
+        self.outputs.iter().filter(|output| output.enabled).count() as u32 + 1
+    }
+    fn normalized_outputs(&self, current: &Value) -> Vec<Output> {
+        let mut outputs: Vec<_> = self
+            .outputs
             .iter()
-            .filter(|o| o.enabled)
-            .map(|o| o.priority)
-            .max()
-            .unwrap_or(0)
-            + 1
+            .filter(|expected| {
+                current["outputs"].as_array().is_some_and(|outputs| {
+                    outputs.iter().any(|actual| {
+                        actual["connected"] == true && actual["name"] == expected.name
+                    })
+                })
+            })
+            .cloned()
+            .collect();
+        outputs.sort_by(|left, right| {
+            (!left.enabled, left.priority, &left.name).cmp(&(
+                !right.enabled,
+                right.priority,
+                &right.name,
+            ))
+        });
+        // KDE ranks enabled outputs densely. Removing priority two necessarily
+        // makes the old priority three become two; preserve order, not the gap.
+        for (index, output) in outputs
+            .iter_mut()
+            .filter(|output| output.enabled)
+            .enumerate()
+        {
+            output.priority = index as u32 + 1;
+        }
+        outputs
     }
     pub fn arguments(&self, current: &Value) -> Result<Vec<String>, String> {
         let outputs = current["outputs"]
             .as_array()
             .ok_or("missing current outputs")?;
         let mut arguments = Vec::new();
-        for expected in &self.outputs {
+        for expected in self.normalized_outputs(current) {
             if let Some(actual) = outputs
                 .iter()
                 .find(|o| o["connected"] == true && o["name"] == expected.name)
@@ -95,7 +120,7 @@ impl Layout {
         Ok(arguments)
     }
     pub fn matches(&self, current: &Value) -> bool {
-        self.outputs.iter().all(|expected| {
+        self.normalized_outputs(current).iter().all(|expected| {
             // An independently unplugged monitor is never reconnected by us.
             current["outputs"]
                 .as_array()
@@ -243,6 +268,22 @@ mod tests {
     use serde_json::json;
     fn desktop() -> Value {
         json!({"outputs":[{"name":"Virtual-1","connected":true,"enabled":true,"currentModeId":"1","modes":[{"id":"1","size":{"width":2560,"height":1440},"refreshRate":120}],"pos":{"x":0,"y":0},"scale":2.5,"rotation":1,"hdr":false,"wcg":true,"priority":1}]})
+    }
+    #[test]
+    fn removing_a_middle_output_preserves_relative_priority_without_an_unrestorable_gap() {
+        let mut before = desktop();
+        let mut peer = before["outputs"][0].clone();
+        peer["name"] = json!("Virtual-3");
+        peer["priority"] = json!(3);
+        before["outputs"].as_array_mut().unwrap().push(peer);
+        let layout = Layout::capture(&before, "Virtual-2").unwrap();
+        let mut after = before.clone();
+        after["outputs"][1]["priority"] = json!(2);
+        assert!(layout.matches(&after));
+        assert!(layout.arguments(&after).unwrap().is_empty());
+        // A pending durable snapshot can also outlive another peer's removal.
+        after["outputs"].as_array_mut().unwrap().remove(1);
+        assert!(layout.matches(&after));
     }
     #[test]
     fn fractional_refresh_uses_current_mode_id_and_corrupt_coordinates_are_rejected() {
