@@ -1009,6 +1009,37 @@ fn caller_isolation_retry_conflicts_and_terminal_tombstones() {
 }
 
 #[test]
+fn duplicate_stale_session_stop_cannot_stop_a_reconnected_session() {
+    let mut host = Harness::new();
+    let stale = host.response(1, prepare())["session"]
+        .as_u64()
+        .expect("original session");
+    assert_eq!(
+        host.response(2, json!({"action":"stop","session":stale}))["state"],
+        "stopped"
+    );
+
+    let mut resumed_prepare = prepare();
+    resumed_prepare["operation_id"] = json!("fresh-resume-operation");
+    let fresh = host.response(3, resumed_prepare)["session"]
+        .as_u64()
+        .expect("fresh session");
+    assert_ne!(stale, fresh);
+
+    // A delayed duplicate cleanup from the interrupted RTSP instance remains
+    // bound to its old session ID and is idempotent at the stream-session owner.
+    assert_eq!(
+        host.response(4, json!({"action":"stop","session":stale}))["state"],
+        "stopped"
+    );
+    assert_eq!(host.pipeline.records[&fresh].state, State::Prepared);
+    assert_eq!(
+        host.response(5, json!({"action":"status","session":fresh}))["state"],
+        "prepared"
+    );
+}
+
+#[test]
 fn unauthenticated_start_is_retryable_without_hardware_or_new_allocations() {
     let mut host = Harness::new();
     host.broker.authenticated = false;

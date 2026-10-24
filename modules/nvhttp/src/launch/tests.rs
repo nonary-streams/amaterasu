@@ -1759,12 +1759,24 @@ fn desktop_resume_retires_rtsp_then_opens_a_fresh_ticket_without_app_calls() {
             .unwrap()
             .contains("<resume>1</resume>")
     );
-    let opens = broker
-        .actions()
+    let open_payloads: Vec<_> = broker
+        .commands
         .iter()
-        .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
-        .count();
-    assert_eq!(opens, 2);
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(open_payloads.len(), 2);
+    assert_ne!(
+        open_payloads[0]["operation_id"],
+        open_payloads[1]["operation_id"],
+        "authenticated /resume must receive a fresh RTSP operation identity"
+    );
     assert!(
         !broker
             .actions()

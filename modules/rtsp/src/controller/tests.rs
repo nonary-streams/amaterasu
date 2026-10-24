@@ -215,6 +215,126 @@ fn startup_reconciliation_clean_status_admits_new_launch_without_stop() {
 }
 
 #[test]
+fn restart_reconciliation_stops_old_lease_before_fresh_resume_open() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled":true,
+        "bind":"127.0.0.1:0",
+        "allowed_principals":["amaterasu.nvhttp"]
+    }))
+    .unwrap();
+    let mut controller = Controller::new(settings).unwrap();
+    // A new RTSP controller instance has no ticket records. The stream-session
+    // broker still owns the previous in-memory Desktop lease.
+    startup_recovery_pending(&mut controller, 45_000);
+    let mut endpoint = Endpoint {
+        active_request: true,
+        recovery_results: VecDeque::from([
+            Some(listed_stream_sessions(
+                json!([{"session":23,"state":"active","cleanup_error":null}]),
+                1,
+            )),
+            Some(json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})),
+            Some(json!({
+                "ok":true,
+                "session":24,
+                "state":"prepared",
+                "audio_local":"127.0.0.1:51000",
+                "video_local":"127.0.0.1:51002",
+                "control_local":"127.0.0.1:51004",
+                "history_activity_id":null,
+                "rtsp_operation_id":null
+            })),
+        ]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+
+    let mut resumed = open();
+    resumed.operation_id = "nvhttp-resume-fresh".into();
+    controller.open(
+        OpenRequest {
+            request: 19,
+            caller: "amaterasu.nvhttp".into(),
+            config: resumed.clone(),
+            deadline: 10_000,
+            display_preflight_deadline: None,
+        },
+        0,
+        &runtime,
+        false,
+    );
+    assert_eq!(
+        endpoint.completions.last().unwrap().1["code"],
+        "startup_reconciliation_pending"
+    );
+    assert!(!endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { payload, .. } if payload["action"] == "prepare")));
+
+    for now in [1, 2, 3, 4] {
+        controller.advance_startup_recovery(&runtime, now);
+    }
+    assert!(controller.startup_recovery.ready());
+
+    controller.open(
+        OpenRequest {
+            request: 20,
+            caller: "amaterasu.nvhttp".into(),
+            config: resumed,
+            deadline: 10_000,
+            display_preflight_deadline: None,
+        },
+        5,
+        &runtime,
+        false,
+    );
+    for now in 6..10 {
+        controller.advance_job(&runtime, now);
+    }
+
+    assert_eq!(endpoint.completions.last().unwrap().0, 20);
+    assert_eq!(endpoint.completions.last().unwrap().1["ok"], true);
+    let requests: Vec<_> = endpoint
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service,
+                payload,
+                operation_id,
+                ..
+            } if service == "amaterasu.stream-session/1" => Some((payload, operation_id.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].0["action"], "status");
+    assert_eq!(requests[1].0["action"], "stop");
+    assert_eq!(requests[1].0["session"], 23);
+    assert_eq!(requests[2].0["action"], "prepare");
+    let new_ticket = controller
+        .records
+        .values()
+        .find(|record| record.config.operation_id == "nvhttp-resume-fresh")
+        .expect("fresh resume ticket")
+        .id;
+    assert_eq!(
+        requests[2].0["operation_id"],
+        format!("rtsp-{new_ticket:016x}")
+    );
+    assert_ne!(requests[1].1, requests[2].1);
+    assert!(controller.records.values().any(|record| {
+        record.config.operation_id == "nvhttp-resume-fresh"
+            && record.session == Some(24)
+            && record.state == State::Ready
+    }));
+    assert!(
+        !requests
+            .iter()
+            .any(|(payload, _)| payload["action"] == "stop" && payload["session"] == 24)
+    );
+}
+
+#[test]
 fn startup_reconciliation_timeout_after_partial_stop_keeps_launch_fail_closed() {
     let mut controller = Controller::new(Settings::default()).unwrap();
     startup_recovery_pending(&mut controller, 300);
