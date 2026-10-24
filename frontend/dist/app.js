@@ -5259,6 +5259,28 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function summarizeRepositoryState(repositories) {
+        const approved = repositories.filter((repository) => !repository.revoked);
+        const revoked = repositories.filter((repository) => repository.revoked);
+        const candidates = approved.flatMap((repository) => repository.candidates);
+        return {
+            approved: approved.length,
+            revoked: revoked.length,
+            verifiedCandidates: candidates.length,
+            uiCandidates: candidates.filter((candidate) => candidate.kind === "web_bundle").length,
+            nativeSetCandidates: candidates.filter((candidate) => candidate.kind === "native_set").length,
+            repositories: repositories.map((repository) => ({
+                id: repository.id,
+                status: repository.revoked
+                    ? "Revoked"
+                    : repository.candidates.length
+                        ? "Verified catalog choices available for this host"
+                        : "Approved; no verified choices currently available for this host",
+                candidates: repository.revoked ? 0 : repository.candidates.length,
+            })),
+        };
+    }
+    Amaterasu.summarizeRepositoryState = summarizeRepositoryState;
     function parseRepositoryList(value) {
         if (!value || typeof value !== "object" || Array.isArray(value))
             throw new Error("Repository response is invalid.");
@@ -5303,8 +5325,18 @@ var Amaterasu;
     Amaterasu.parseRepositoryPage = parseRepositoryPage;
     function renderUpdates(context) {
         const area = Amaterasu.el("div");
-        context.content.append(Amaterasu.sectionHeading("Modules & UI", "Choose verified implementations from approved publishers.", Amaterasu.button("Refresh", load)), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Publisher authority is broad"), Amaterasu.el("p", "", "Approving a publisher allows it to supply any native module slot, including management, and the UI. Native modules share their worker's user privileges, while a replacement UI runs in the signed-in browser session and can use its API authority. Approval does not grant elevation. A signature proves source, not safe behavior.")), area);
+        const statusArea = Amaterasu.el("div");
+        let loadRequest = 0;
+        context.content.append(Amaterasu.sectionHeading("Modules & UI", "Choose verified implementations from approved publishers.", Amaterasu.button("Refresh", load)), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Publisher authority is broad"), Amaterasu.el("p", "", "Approving a publisher allows it to supply any native module slot, including management, and the UI. Native modules share their worker's user privileges, while a replacement UI runs in the signed-in browser session and can use its API authority. Approval does not grant elevation. A signature proves source, not safe behavior.")), Amaterasu.panel("Read-only repository status", statusArea, Amaterasu.el("p", "muted", "The authenticated API exposes repository listing only. It does not report the selected or pending UI/native package, and it has no approve, revoke, refresh, download, stage, install, activate, or restore actions. This page will not run shell commands.")), area);
         async function load() {
+            const request = ++loadRequest;
+            if (!context.api.allows("configuration.read")) {
+                statusArea.replaceChildren(Amaterasu.empty("Repository status unavailable", "This session needs configuration.read to inspect approved publishers and their verified catalog choices."));
+                area.replaceChildren();
+                return;
+            }
+            statusArea.replaceChildren(Amaterasu.el("p", "muted", "Loading verified repository status…"));
+            area.replaceChildren(Amaterasu.el("p", "muted", "Loading verified repository choices…"));
             try {
                 const byId = new Map();
                 let offset = 0;
@@ -5324,14 +5356,28 @@ var Amaterasu;
                         throw new Error("Repository pagination did not advance.");
                     offset = page.nextOffset;
                 }
-                if (!area.isConnected)
+                if (!area.isConnected || request !== loadRequest)
                     return;
-                renderChoices([...byId.values()]);
+                const repositories = [...byId.values()];
+                renderStatus(repositories);
+                renderChoices(repositories);
             }
             catch (error) {
-                if (area.isConnected)
-                    area.replaceChildren(Amaterasu.errorPanel(error, load));
+                if (statusArea.isConnected && request === loadRequest) {
+                    statusArea.replaceChildren(Amaterasu.errorPanel(error, load));
+                    area.replaceChildren();
+                }
             }
+        }
+        function renderStatus(repositories) {
+            const summary = summarizeRepositoryState(repositories);
+            statusArea.replaceChildren(Amaterasu.el("div", "section-meta", Amaterasu.badge(`${summary.approved} approved`, summary.approved ? "good" : ""), Amaterasu.badge(`${summary.revoked} revoked`), Amaterasu.badge(`${summary.verifiedCandidates} verified choices`), Amaterasu.el("span", "muted", `${summary.uiCandidates} UI bundles · ${summary.nativeSetCandidates} native sets for this host`)), summary.repositories.length
+                ? Amaterasu.table(["Publisher ID", "Read-only status", "Verified choices"], summary.repositories.map((repository) => [
+                    repository.id,
+                    repository.status,
+                    String(repository.candidates),
+                ]))
+                : Amaterasu.empty("No approved repositories", "To add a publisher, use the explicit development release CLI after independently confirming its public-key fingerprint."));
         }
         function renderChoices(repositories) {
             const active = repositories.filter((repository) => !repository.revoked);
@@ -5355,7 +5401,11 @@ var Amaterasu;
                 const repository = selectedRepository();
                 const choice = selectedChoice();
                 if (!repository || !choice) {
-                    details.replaceChildren(Amaterasu.el("p", "muted", "No verified choice is available for this slot."));
+                    details.replaceChildren(Amaterasu.el("p", "muted", repository
+                        ? "No verified choice is available for this slot in the current host catalog. The repository may not have a current catalog, or its catalog may contain no choices for this host target."
+                        : active.length
+                            ? "Choose a publisher with a verified catalog candidate."
+                            : "No active approved publisher is available. Add or refresh one with the development release CLI."));
                     return;
                 }
                 const command = choice.kind === "web_bundle"
@@ -5385,7 +5435,12 @@ var Amaterasu;
             slotSelect.addEventListener("change", fillImplementations);
             implementationSelect.addEventListener("change", showChoice);
             fillSlots();
-            area.replaceChildren(Amaterasu.panel("Approve a publisher", Amaterasu.el("p", "", "On this development host, use repository-approve with the publisher's public key and a SHA-256 fingerprint confirmed through an independent channel. The repository URL alone cannot establish key identity."), Amaterasu.el("code", "", "amaterasu-release repository-approve ROOT ID HTTPS_URL PUBLIC_KEY_HEX CONFIRMED_SHA256"), Amaterasu.el("p", "", "Then run repository-refresh ROOT ID to retrieve the signed catalog. Key rotation uses a new publisher ID; revoke the old ID explicitly.")), choices, Amaterasu.panel("Recovery", Amaterasu.el("p", "", "The host shell can restore retained verified UI or native sets without loading the selected management module. Use `amaterasu web-recover ROOT DIGEST` or `amaterasu native-recover ROOT [DIGEST]`. Release floors remain intact. The management /recovery page also covers UI failures while management is healthy.")));
+            if (!active.length) {
+                repositorySelect.disabled = true;
+                slotSelect.disabled = true;
+                implementationSelect.disabled = true;
+            }
+            area.replaceChildren(Amaterasu.panel("Approve a publisher", Amaterasu.el("p", "", "On this development host, use repository-approve with the publisher's public key and a SHA-256 fingerprint confirmed through an independent channel. The repository URL alone cannot establish key identity."), Amaterasu.el("code", "", "amaterasu-release repository-approve ROOT ID HTTPS_URL PUBLIC_KEY_HEX CONFIRMED_SHA256"), Amaterasu.el("p", "", "Then run repository-refresh ROOT ID to retrieve the signed catalog. Key rotation uses a new publisher ID; revoke the old ID explicitly.")), choices, Amaterasu.panel("Recovery and selected-package inspection", Amaterasu.el("p", "", "The management-owned /recovery page remains available when this UI bundle fails. For the host-owned read-only status and recovery path, use `amaterasu web-recovery-status ROOT`, then `amaterasu web-recover ROOT DIGEST` for a retained verified UI. `amaterasu native-recover ROOT [DIGEST]` restores a retained native set without loading it."), Amaterasu.el("p", "muted", "The repository listing cannot show active, previous, pending, or trial selection state. The current endpoint is `POST /v1/repositories/list` (`configuration.read`). `web-recovery-status` inspects UI selection; `web-recover` and `native-recover` restore retained verified sets. There is no management API for native selection status. Release floors stay intact.")));
         }
         void load();
     }
