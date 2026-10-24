@@ -330,7 +330,7 @@ impl UserServiceSignals {
         let previous_term = unsafe {
             libc::signal(
                 libc::SIGTERM,
-                request_user_service_stop as libc::sighandler_t,
+                request_user_service_stop as *const () as libc::sighandler_t,
             )
         };
         if previous_term == libc::SIG_ERR {
@@ -341,7 +341,7 @@ impl UserServiceSignals {
         let previous_int = unsafe {
             libc::signal(
                 libc::SIGINT,
-                request_user_service_stop as libc::sighandler_t,
+                request_user_service_stop as *const () as libc::sighandler_t,
             )
         };
         if previous_int == libc::SIG_ERR {

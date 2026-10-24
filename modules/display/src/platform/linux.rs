@@ -440,13 +440,13 @@ fn validated_outputs(configuration: &Value) -> DisplayResult<Vec<&Value>> {
                 ));
             }
         }
-        if let Some(hdr) = output.get("hdr") {
-            if !hdr.is_boolean() {
-                return Err(DisplayError::new(
-                    "platform_error",
-                    "KScreen HDR state is not boolean",
-                ));
-            }
+        if let Some(hdr) = output.get("hdr")
+            && !hdr.is_boolean()
+        {
+            return Err(DisplayError::new(
+                "platform_error",
+                "KScreen HDR state is not boolean",
+            ));
         }
         if bool_field(output, "enabled")? && bool_field(output, "connected")? {
             let current_mode = string_field(output, "currentModeId")?;
@@ -770,10 +770,10 @@ fn restoration_arguments(saved: &Value, current: &Value) -> DisplayResult<Vec<St
             bounded_integer(pos, "x", -65_536, 65_536)?,
             bounded_integer(pos, "y", -65_536, 65_536)?
         ));
-        if let Some(priority) = saved_output.get("priority").and_then(Value::as_i64) {
-            if (1..=64).contains(&priority) {
-                arguments.push(format!("{prefix}priority.{priority}"));
-            }
+        if let Some(priority) = saved_output.get("priority").and_then(Value::as_i64)
+            && (1..=64).contains(&priority)
+        {
+            arguments.push(format!("{prefix}priority.{priority}"));
         }
         if let Some(hdr) = saved_output.get("hdr").and_then(Value::as_bool) {
             arguments.push(format!(

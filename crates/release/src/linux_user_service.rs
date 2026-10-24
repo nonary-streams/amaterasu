@@ -54,7 +54,7 @@ pub fn prepare(
         "active package directory",
         true,
     )?;
-    if !package_path.starts_with(&runtime_root.join("sets")) {
+    if !package_path.starts_with(runtime_root.join("sets")) {
         return Err("active package path escapes the runtime root".into());
     }
     let verified = verify_package(
@@ -87,7 +87,7 @@ pub fn prepare(
         (UNIT_FILE, service_unit),
         ("install-user-service.sh", install_script().into()),
         ("uninstall-user-service.sh", uninstall_script().into()),
-        ("README.md", render_readme(active_digest).into()),
+        ("README.md", render_readme(active_digest)),
     ];
     write_artifact_directory(&output_directory, &artifacts)?;
     println!(
