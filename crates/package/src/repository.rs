@@ -76,6 +76,9 @@ pub fn read_native_selection(root: &Path) -> PackageResult<NativeSelectionSnapsh
 /// Verifies and stages the exact candidate named by a current approved catalog,
 /// using only the digest-derived cache entry owned by `RepositoryStore`.
 /// Approval lock order is repository store first, then activation root.
+// These parameters are the explicit trust and CAS context for one operation;
+// bundling them would obscure which host-owned values authorize the mutation.
+#[allow(clippy::too_many_arguments)]
 pub fn stage_cached_native_candidate(
     root: &Path,
     bootstrap: &BootstrapConfig,
@@ -123,6 +126,9 @@ pub fn stage_cached_native_candidate(
 
 /// Authorizes one exact staged digest for the next development worker trial.
 /// It is intentionally separate from staging and never executes native code.
+// Keep the caller, approval, catalog and revision inputs visible at this
+// security boundary instead of hiding them in a loosely scoped context object.
+#[allow(clippy::too_many_arguments)]
 pub fn authorize_staged_native_trial(
     root: &Path,
     bootstrap: &BootstrapConfig,
@@ -234,6 +240,9 @@ pub fn stage_native_candidate(
     )
 }
 
+// This internal implementation receives the same explicit verification context
+// as the public stage operation so the revision check stays adjacent to writes.
+#[allow(clippy::too_many_arguments)]
 fn stage_native_candidate_with_revision(
     source: &Path,
     root: &Path,
@@ -502,8 +511,12 @@ fn validate_revision(revision: &str) -> PackageResult<()> {
 
 fn read_selection_with_revision(root: &Path) -> PackageResult<(ActivationState, String)> {
     let path = root.join("selection.json");
-    if !path.try_exists().map_err(|error| error.to_string())? {
-        return Ok((ActivationState::default(), sha256(&[])));
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((ActivationState::default(), sha256(&[])));
+        }
+        Err(error) => return Err(error.to_string()),
     }
     let bytes = read_bounded(&path, 1024 * 1024)?;
     let selection = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;

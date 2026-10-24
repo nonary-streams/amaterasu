@@ -695,6 +695,16 @@ fn cached_native_stage_and_trial_authorization_are_exact_and_revision_guarded() 
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn dangling_selection_symlink_is_not_treated_as_an_empty_selection() {
+    let fixture = Fixture::new();
+    let selection = fixture.root.join("selection.json");
+    std::os::unix::fs::symlink(fixture.root.join("missing-selection.json"), &selection).unwrap();
+
+    assert!(read_native_selection(&fixture.root).is_err());
+}
+
 #[test]
 fn previous_healthy_native_restore_is_trusted_cas_and_keeps_release_floor() {
     let fixture = Fixture::new();
