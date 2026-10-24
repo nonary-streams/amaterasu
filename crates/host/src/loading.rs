@@ -23,6 +23,19 @@ pub(crate) fn path_to_unicode_string(path: &Path) -> Result<String, String> {
         .ok_or_else(|| "native path cannot be represented as Unicode".to_owned())
 }
 
+fn inject_package_root(
+    runtime_config: &mut amaterasu_contracts::RuntimeConfig,
+    root: &Path,
+) -> PackageResult<()> {
+    let package_root = root.canonicalize().map_err(|error| error.to_string())?;
+    if !package_root.is_dir() {
+        return Err("package root is not a directory".into());
+    }
+    // Overwrite every package-supplied host-context value after verification.
+    runtime_config.host_context.package_root = Some(path_to_unicode_string(&package_root)?);
+    Ok(())
+}
+
 pub struct LoadedComponents {
     // Fields drop in declaration order: modules must stop before their runtime disappears.
     modules: Vec<FeatureLibrary>,
@@ -39,6 +52,7 @@ impl Drop for LoadedComponents {
 
 impl LoadedComponents {
     pub fn load(
+        root: &Path,
         directory: &Path,
         package: &VerifiedPackage,
         state_root: &Path,
@@ -56,6 +70,7 @@ impl LoadedComponents {
         let mut runtime_config = package.runtime_config.clone();
         runtime_config.host_context.schema = 1;
         runtime_config.host_context.state_root = Some(state_root_string.clone());
+        inject_package_root(&mut runtime_config, root)?;
         if package
             .manifest
             .components
@@ -415,10 +430,29 @@ fn require_success(status: Status, operation: &str) -> PackageResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        inject_host_configuration_root, inject_steam_artwork_cache_parent, path_to_unicode_string,
+        inject_host_configuration_root, inject_package_root, inject_steam_artwork_cache_parent,
+        path_to_unicode_string,
     };
     use amaterasu_contracts::RuntimeConfig;
     use serde_json::json;
+
+    #[test]
+    fn package_root_overrides_package_controlled_host_context() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-host-package-root-{}-{}",
+            std::process::id(),
+            amaterasu_package::random_identifier().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut config = RuntimeConfig::default();
+        config.host_context.package_root = Some("package-controlled".into());
+        inject_package_root(&mut config, &root).unwrap();
+        assert_eq!(
+            config.host_context.package_root.as_deref(),
+            root.canonicalize().unwrap().to_str()
+        );
+        std::fs::remove_dir(&root).unwrap();
+    }
 
     #[test]
     fn host_configuration_root_overrides_signed_component_settings() {

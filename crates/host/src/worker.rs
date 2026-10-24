@@ -142,7 +142,7 @@ fn load_components(
                 return Err("production package has an incompatible host context ABI".into());
             }
             let mut loaded = |index| progress.borrow_mut()(StartupProgress::Component(index));
-            LoadedComponents::load(&directory, &package, state_root, &mut loaded)
+            LoadedComponents::load(root, &directory, &package, state_root, &mut loaded)
         },
     )
 }

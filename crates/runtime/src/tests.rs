@@ -73,9 +73,13 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
     configuration
         .principals
         .insert("other".into(), Grants::default());
+    configuration
+        .principals
+        .insert("amaterasu.management".into(), Grants::default());
     configuration.host_context = RuntimeHostContext {
         schema: 1,
         state_root: Some(r"C:\\ProgramData\\Amaterasu\\runtime\\user-state\\S-1-5-21-1".into()),
+        package_root: Some(r"C:\\ProgramData\\Amaterasu\\packages".into()),
     };
     let state_root = configuration.host_context.state_root.clone();
     let mut broker = Broker::new(configuration).unwrap();
@@ -85,6 +89,7 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
         panic!("state service did not receive host context");
     };
     assert_eq!(payload["schema"], 1);
+    assert!(payload.get("package_root").is_none());
     let audio_context = broker.dispatch("amaterasu.audio", Command::GetHostContext {});
     if cfg!(target_os = "linux") {
         let Response::Result { payload } = audio_context else {
@@ -101,6 +106,25 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
         broker.dispatch("other", Command::GetHostContext {}),
         Response::Error { code, .. } if code == "permission_denied"
     ));
+    assert!(matches!(
+        broker.dispatch("amaterasu.management", Command::GetHostContext {}),
+        Response::Error { code, .. } if code == "permission_denied"
+    ));
+    let Response::Result { payload } =
+        broker.dispatch("amaterasu.management", Command::GetPackageRoot {})
+    else {
+        panic!("management did not receive the host-owned package root");
+    };
+    assert_eq!(
+        payload["package_root"],
+        r"C:\\ProgramData\\Amaterasu\\packages"
+    );
+    for caller in ["amaterasu.state", "amaterasu.audio", "other"] {
+        assert!(matches!(
+            broker.dispatch(caller, Command::GetPackageRoot {}),
+            Response::Error { code, .. } if code == "permission_denied"
+        ));
+    }
 }
 fn request(operation: &str) -> Command {
     Command::Request {

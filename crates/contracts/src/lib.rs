@@ -128,6 +128,10 @@ pub struct RuntimeHostContext {
     pub schema: u32,
     #[serde(default)]
     pub state_root: Option<String>,
+    /// The verified package root is injected by the host, never by package settings.
+    /// Only the management principal may request it from the runtime broker.
+    #[serde(default)]
+    pub package_root: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,6 +155,8 @@ pub enum Command {
     /// module for its restart-safe cleanup journal. This prevents a module
     /// policy from impersonating a host decision through `GetSettings`.
     GetHostContext {},
+    /// Returns the host-owned package root only to the management principal.
+    GetPackageRoot {},
     Register {
         service: String,
     },

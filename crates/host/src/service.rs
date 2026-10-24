@@ -474,6 +474,7 @@ fn run_linux_user_service(root: &Path, expected_digest: &str) -> PackageResult<(
                 let mut package = package;
                 logging.inject(&mut package.runtime_config)?;
                 crate::loading::LoadedComponents::load(
+                    root,
                     &package_path,
                     &package,
                     &state_root,

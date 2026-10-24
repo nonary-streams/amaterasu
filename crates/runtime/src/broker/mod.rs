@@ -70,8 +70,24 @@ impl Broker {
                     return errors::permission_denied();
                 }
                 Response::Result {
-                    payload: serde_json::to_value(&self.configuration.host_context)
-                        .expect("host context is serializable"),
+                    payload: serde_json::json!({
+                        "schema": self.configuration.host_context.schema,
+                        "state_root": self.configuration.host_context.state_root,
+                    }),
+                }
+            }
+            Command::GetPackageRoot {} => {
+                if caller != "amaterasu.management" {
+                    return errors::permission_denied();
+                }
+                match &self.configuration.host_context.package_root {
+                    Some(package_root) => Response::Result {
+                        payload: serde_json::json!({"package_root":package_root}),
+                    },
+                    None => Response::error(
+                        "package_root_unavailable",
+                        "host did not supply a package root",
+                    ),
                 }
             }
             Command::Register { service } => {
