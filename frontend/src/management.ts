@@ -191,7 +191,7 @@ namespace Amaterasu {
         return;
       }
       pairingArea.replaceChildren(
-        notice ? pairingApprovalNotice(notice) : null,
+        ...(notice ? [pairingApprovalNotice(notice)] : []),
         el("p", "muted", "Loading pending pairing requests…"),
       );
       try {
@@ -201,7 +201,7 @@ namespace Amaterasu {
         if (!context.content.isConnected || request !== pairingRequest) return;
         if (reply.pending.length === 0) {
           pairingArea.replaceChildren(
-            notice ? pairingApprovalNotice(notice) : null,
+            ...(notice ? [pairingApprovalNotice(notice)] : []),
             empty("No pending requests", "New device requests will appear here when this host receives them."),
             button("Refresh requests", () => { void loadPairings(); }),
           );
@@ -209,7 +209,7 @@ namespace Amaterasu {
         }
         const cards = reply.pending.map((pending) => renderPendingPairing(pending));
         pairingArea.replaceChildren(
-          notice ? pairingApprovalNotice(notice) : null,
+          ...(notice ? [pairingApprovalNotice(notice)] : []),
           ...cards,
           button("Refresh requests", () => { void loadPairings(); }),
         );
