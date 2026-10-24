@@ -1127,6 +1127,16 @@ impl Controller {
 }
 
 fn private_error(status: u16, message: &str) -> Reply {
+    let reason = if message.len() <= 64
+        && message
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'_' | b' '))
+    {
+        message
+    } else {
+        "redacted"
+    };
+    eprintln!("amaterasu launch rejection status={status} reason={reason}");
     let mut reply = xml::error(status, message);
     reply.requires_paired_tls = true;
     reply

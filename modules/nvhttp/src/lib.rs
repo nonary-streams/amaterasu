@@ -383,6 +383,13 @@ impl ManagedModule for NvhttpModule {
                                 .as_ref()
                                 .is_some_and(|identity| identity.trusted(certificate))
                         });
+                if incoming.request.target.split('?').next() == Some("/launch") {
+                    // Deliberately omit the query: Moonlight sends session keys there.
+                    eprintln!(
+                        "amaterasu nvhttp launch request secure={} trusted={trusted}",
+                        incoming.secure
+                    );
+                }
                 if let Some(reply) = router.dispatch(
                     incoming.id,
                     incoming.request,

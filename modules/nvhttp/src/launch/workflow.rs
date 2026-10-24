@@ -1383,6 +1383,10 @@ fn display_enumeration(
 }
 
 fn fail_record(record: &mut Record, code: &'static str, now: Instant) {
+    eprintln!(
+        "amaterasu launch workflow failed stage={:?} code={code}",
+        record.stage
+    );
     record.request_cleanup(Some(code), now + CLEANUP_DEADLINE);
 }
 

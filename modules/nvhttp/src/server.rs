@@ -591,6 +591,9 @@ impl Connection {
         } else {
             reply
         };
+        if reply.status >= 400 {
+            eprintln!("amaterasu nvhttp response status={}", reply.status);
+        }
         let reason = match reply.status {
             200 => "OK",
             400 => "Bad Request",
