@@ -403,13 +403,17 @@ fn evdev_repeat_keeps_one_held_owner_until_disconnect_cleanup() {
         code: 30,
         pressed: true,
     };
+    let repeat = InputEvent::EvdevKeyRepeat { code: 30 };
+    let neutralizing_up = InputEvent::EvdevKey {
+        code: 30,
+        pressed: false,
+    };
     session.submit(&packet(1, down.clone()), now).unwrap();
-    session
-        .submit(&packet(2, InputEvent::EvdevKeyRepeat { code: 30 }), now)
-        .unwrap();
+    session.submit(&packet(2, repeat.clone()), now).unwrap();
 
     session.revoke().unwrap();
-    assert_eq!(session.sink.sent, [down]);
+    session.revoke().unwrap();
+    assert_eq!(session.sink.sent, [down, repeat, neutralizing_up]);
     assert_eq!(session.sink.releases, 1);
 }
 
