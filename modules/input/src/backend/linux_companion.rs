@@ -25,12 +25,116 @@ fn absolute_pointer_event(x: u16, y: u16) -> InputEvent {
     InputEvent::Absolute { x, y }
 }
 
+#[derive(Default)]
+struct SingleTouchAsMouse {
+    active_pointer: Option<u32>,
+}
+
+impl SingleTouchAsMouse {
+    fn translate(&mut self, event: &Event) -> InputResult<Vec<InputEvent>> {
+        let (intents, next_pointer) = self.plan(event)?;
+        self.active_pointer = next_pointer;
+        Ok(intents)
+    }
+
+    fn plan(&self, event: &Event) -> InputResult<(Vec<InputEvent>, Option<u32>)> {
+        let (pointer_id, phase, x, y) = touch_mouse_fields(event)?;
+        let absolute = absolute_pointer_event(x, y);
+        match phase {
+            crate::model::PenTouchPhase::Down => {
+                if self.active_pointer.is_some() {
+                    return Err(invalid_touch_sequence(
+                        "only one touch contact may be active",
+                    ));
+                }
+                Ok((vec![absolute, left_button_event(true)], Some(pointer_id)))
+            }
+            crate::model::PenTouchPhase::Move => {
+                self.require_active_pointer(pointer_id)?;
+                Ok((vec![absolute], self.active_pointer))
+            }
+            crate::model::PenTouchPhase::Up | crate::model::PenTouchPhase::Cancel => {
+                self.require_active_pointer(pointer_id)?;
+                Ok((vec![absolute, left_button_event(false)], None))
+            }
+        }
+    }
+
+    fn require_active_pointer(&self, pointer_id: u32) -> InputResult<()> {
+        if self.active_pointer == Some(pointer_id) {
+            Ok(())
+        } else {
+            Err(invalid_touch_sequence(
+                "touch move or release requires the active pointer",
+            ))
+        }
+    }
+
+    fn reset(&mut self) {
+        self.active_pointer = None;
+    }
+}
+
+fn touch_mouse_fields(event: &Event) -> InputResult<(u32, crate::model::PenTouchPhase, u16, u16)> {
+    event.validate()?;
+    let Event::PenTouch {
+        pointer_id,
+        device,
+        phase,
+        x,
+        y,
+        pressure,
+        contact_area_major,
+        contact_area_minor,
+        rotation_degrees,
+        pen_tool,
+        pen_buttons,
+        tilt,
+    } = event
+    else {
+        return Err(unsupported_touch_event());
+    };
+    if *device != PenTouchDevice::Touch {
+        return Err(unsupported_touch_event());
+    }
+    if pressure.is_some()
+        || contact_area_major.is_some()
+        || contact_area_minor.is_some()
+        || rotation_degrees.is_some()
+        || pen_tool.is_some()
+        || pen_buttons.is_some()
+        || tilt.is_some()
+    {
+        return Err(unsupported_touch_event());
+    }
+    Ok((*pointer_id, *phase, *x, *y))
+}
+
+fn left_button_event(pressed: bool) -> InputEvent {
+    InputEvent::MouseButton {
+        button: amaterasu_input_companion::MouseButton::Left,
+        pressed,
+    }
+}
+
+fn invalid_touch_sequence(message: &'static str) -> InputError {
+    InputError::new("invalid_sequence", message)
+}
+
+fn unsupported_touch_event() -> InputError {
+    InputError::new(
+        "unsupported_event",
+        "Linux companion maps one coordinate-only touch contact to a mouse button; native pen, multitouch, and touch metadata are unsupported",
+    )
+}
+
 pub struct LinuxCompanionBackend {
     socket_path: String,
     client: Option<LinuxInputClient>,
     held_virtual_keycodes: HashMap<u8, u16>,
     key_rightalt_to_key_win: bool,
     profile: GamepadProfile,
+    touch_as_mouse: SingleTouchAsMouse,
 }
 
 impl LinuxCompanionBackend {
@@ -41,6 +145,7 @@ impl LinuxCompanionBackend {
             held_virtual_keycodes: HashMap::new(),
             key_rightalt_to_key_win: false,
             profile: GamepadProfile::Auto,
+            touch_as_mouse: SingleTouchAsMouse::default(),
         }
     }
 
@@ -71,7 +176,7 @@ impl LinuxCompanionBackend {
 
 impl Backend for LinuxCompanionBackend {
     fn name(&self) -> &'static str {
-        "linux_uinput_companion"
+        "linux_uinput_companion_touch_as_mouse"
     }
 
     fn supported(&self) -> bool {
@@ -83,11 +188,14 @@ impl Backend for LinuxCompanionBackend {
     }
 
     fn pen_touch_supported(&self) -> bool {
-        false
+        true
     }
 
-    fn pen_touch_max_contacts(&self, _: PenTouchDevice) -> Option<usize> {
-        None
+    fn pen_touch_max_contacts(&self, device: PenTouchDevice) -> Option<usize> {
+        Some(match device {
+            PenTouchDevice::Touch => 1,
+            PenTouchDevice::Pen => 0,
+        })
     }
 
     fn controller_input_supported(&self) -> bool {
@@ -126,10 +234,7 @@ impl Backend for LinuxCompanionBackend {
             | Event::Absolute { .. }
             | Event::Scroll { .. }
             | Event::ScrollUnits { .. } => Ok(()),
-            Event::PenTouch { .. } => Err(InputError::new(
-                "pen_touch_unavailable",
-                "Linux input companion does not grant pen or touch devices",
-            )),
+            Event::PenTouch { .. } => touch_mouse_fields(event).map(|_| ()),
             Event::Controller { .. } => Err(InputError::new(
                 "controller_unavailable",
                 "Linux input companion currently grants keyboard and mouse input only",
@@ -147,6 +252,7 @@ impl Backend for LinuxCompanionBackend {
         self.client =
             Some(LinuxInputClient::connect(Path::new(&self.socket_path)).map_err(companion_error)?);
         self.held_virtual_keycodes.clear();
+        self.touch_as_mouse.reset();
         Ok(())
     }
 
@@ -181,6 +287,14 @@ impl Backend for LinuxCompanionBackend {
                 dy: i16::try_from(*dy).map_err(|_| invalid_event())?,
             }),
             Event::Absolute { x, y } => self.send(absolute_pointer_event(*x, *y)),
+            Event::PenTouch { .. } => {
+                let (intents, next_pointer) = self.touch_as_mouse.plan(event)?;
+                for intent in intents {
+                    self.send(intent)?;
+                }
+                self.touch_as_mouse.active_pointer = next_pointer;
+                Ok(())
+            }
             Event::Scroll { axis, steps } => {
                 let units = i16::try_from(steps * 120).map_err(|_| invalid_event())?;
                 self.scroll(*axis, units)
@@ -210,6 +324,7 @@ impl Backend for LinuxCompanionBackend {
             return Ok(());
         };
         self.held_virtual_keycodes.clear();
+        self.touch_as_mouse.reset();
         client.close().map_err(companion_error)
     }
 }
@@ -269,8 +384,302 @@ fn companion_error(error: amaterasu_input_companion::InputError) -> InputError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Axis, InputEvent, KeyState, absolute_pointer_event, evdev_key_event, scroll_events,
+        Axis, Backend, InputEvent, KeyState, LinuxCompanionBackend, SingleTouchAsMouse,
+        absolute_pointer_event, evdev_key_event, scroll_events,
     };
+    use crate::model::{Event, PenTouchDevice, PenTouchPhase};
+    use amaterasu_input_companion::{
+        DeviceSink, GrantRegistry, InputError as CompanionError, InputPacket, InputResult,
+        InputSession, MouseButton as CompanionMouseButton, PROTOCOL_VERSION, PeerIdentity,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn touch(pointer_id: u32, phase: PenTouchPhase, x: u16, y: u16) -> Event {
+        Event::PenTouch {
+            pointer_id,
+            device: PenTouchDevice::Touch,
+            phase,
+            x,
+            y,
+            pressure: None,
+            contact_area_major: None,
+            contact_area_minor: None,
+            rotation_degrees: None,
+            pen_tool: None,
+            pen_buttons: None,
+            tilt: None,
+        }
+    }
+
+    #[test]
+    fn one_touch_contact_maps_down_move_up_and_cancel_in_order() {
+        let mut translator = SingleTouchAsMouse::default();
+        assert_eq!(
+            translator
+                .translate(&touch(4, PenTouchPhase::Down, 100, 200))
+                .unwrap(),
+            [
+                InputEvent::Absolute { x: 100, y: 200 },
+                left_button_event(true),
+            ]
+        );
+        assert_eq!(
+            translator
+                .translate(&touch(4, PenTouchPhase::Move, 300, 400))
+                .unwrap(),
+            [InputEvent::Absolute { x: 300, y: 400 }]
+        );
+        assert_eq!(
+            translator
+                .translate(&touch(4, PenTouchPhase::Up, 500, 600))
+                .unwrap(),
+            [
+                InputEvent::Absolute { x: 500, y: 600 },
+                left_button_event(false),
+            ]
+        );
+        assert_eq!(
+            translator
+                .translate(&touch(5, PenTouchPhase::Down, 0, u16::MAX))
+                .unwrap(),
+            [
+                InputEvent::Absolute { x: 0, y: u16::MAX },
+                left_button_event(true),
+            ]
+        );
+        assert_eq!(
+            translator
+                .translate(&touch(5, PenTouchPhase::Cancel, 0, u16::MAX))
+                .unwrap(),
+            [
+                InputEvent::Absolute { x: 0, y: u16::MAX },
+                left_button_event(false),
+            ]
+        );
+    }
+
+    #[test]
+    fn second_or_duplicate_touch_pointer_is_rejected_without_losing_owner() {
+        let mut translator = SingleTouchAsMouse::default();
+        translator
+            .translate(&touch(4, PenTouchPhase::Down, 100, 200))
+            .unwrap();
+
+        assert!(
+            translator
+                .translate(&touch(4, PenTouchPhase::Down, 100, 200))
+                .is_err()
+        );
+        assert!(
+            translator
+                .translate(&touch(5, PenTouchPhase::Down, 100, 200))
+                .is_err()
+        );
+        assert!(
+            translator
+                .translate(&touch(5, PenTouchPhase::Move, 300, 400))
+                .is_err()
+        );
+        assert_eq!(
+            translator
+                .translate(&touch(4, PenTouchPhase::Up, 100, 200))
+                .unwrap(),
+            [
+                InputEvent::Absolute { x: 100, y: 200 },
+                left_button_event(false),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_pen_and_touch_metadata_are_explicitly_unsupported() {
+        let mut translator = SingleTouchAsMouse::default();
+        let mut pen = touch(0, PenTouchPhase::Down, 0, 0);
+        if let Event::PenTouch { device, .. } = &mut pen {
+            *device = PenTouchDevice::Pen;
+        }
+        assert!(translator.translate(&pen).is_err());
+
+        let mut pressure_touch = touch(0, PenTouchPhase::Down, 0, 0);
+        if let Event::PenTouch { pressure, .. } = &mut pressure_touch {
+            *pressure = Some(0.5);
+        }
+        assert!(translator.translate(&pressure_touch).is_err());
+
+        let mut area_touch = touch(0, PenTouchPhase::Down, 0, 0);
+        if let Event::PenTouch {
+            contact_area_major,
+            contact_area_minor,
+            ..
+        } = &mut area_touch
+        {
+            *contact_area_major = Some(0.5);
+            *contact_area_minor = Some(0.5);
+        }
+        assert!(translator.translate(&area_touch).is_err());
+
+        let mut rotated_touch = touch(0, PenTouchPhase::Down, 0, 0);
+        if let Event::PenTouch {
+            rotation_degrees, ..
+        } = &mut rotated_touch
+        {
+            *rotation_degrees = Some(90);
+        }
+        assert!(translator.translate(&rotated_touch).is_err());
+        assert_eq!(
+            translator
+                .translate(&touch(0, PenTouchPhase::Down, 0, 0))
+                .unwrap(),
+            vec![InputEvent::Absolute { x: 0, y: 0 }, left_button_event(true)]
+        );
+    }
+
+    #[test]
+    fn backend_reports_one_mouse_mapped_touch_contact_and_no_pen_contacts() {
+        let backend = LinuxCompanionBackend::new("unused.sock".into());
+        assert_eq!(backend.name(), "linux_uinput_companion_touch_as_mouse");
+        assert!(backend.pen_touch_supported());
+        assert_eq!(
+            backend.pen_touch_max_contacts(PenTouchDevice::Touch),
+            Some(1)
+        );
+        assert_eq!(backend.pen_touch_max_contacts(PenTouchDevice::Pen), Some(0));
+    }
+
+    #[derive(Default)]
+    struct ObservedCompanion {
+        submitted: Vec<InputEvent>,
+        releases: usize,
+        fail_on_left_down: bool,
+    }
+
+    struct FakeCompanionDevice(Arc<Mutex<ObservedCompanion>>);
+
+    impl DeviceSink for FakeCompanionDevice {
+        fn submit(&mut self, event: &InputEvent) -> InputResult<()> {
+            let mut observed = self.0.lock().expect("companion fixture lock");
+            observed.submitted.push(event.clone());
+            if observed.fail_on_left_down
+                && matches!(
+                    event,
+                    InputEvent::MouseButton {
+                        button: CompanionMouseButton::Left,
+                        pressed: true,
+                    }
+                )
+            {
+                observed.fail_on_left_down = false;
+                return Err(CompanionError::Device);
+            }
+            Ok(())
+        }
+
+        fn release_all(&mut self) -> InputResult<()> {
+            self.0.lock().expect("companion fixture lock").releases += 1;
+            Ok(())
+        }
+    }
+
+    fn companion_session(
+        fail_on_left_down: bool,
+    ) -> (
+        InputSession<FakeCompanionDevice>,
+        Arc<Mutex<ObservedCompanion>>,
+        Instant,
+    ) {
+        let now = Instant::now();
+        let peer = PeerIdentity::from_verified_connection("test-worker".into(), 1, "a".repeat(64))
+            .unwrap();
+        let mut registry = GrantRegistry::session_only();
+        let grant = registry
+            .issue(
+                peer.clone(),
+                "b".repeat(32),
+                1,
+                now + Duration::from_secs(10),
+                false,
+                true,
+            )
+            .unwrap();
+        let observed = Arc::new(Mutex::new(ObservedCompanion {
+            fail_on_left_down,
+            ..Default::default()
+        }));
+        let session = InputSession::connect(
+            &peer,
+            grant,
+            FakeCompanionDevice(Arc::clone(&observed)),
+            now,
+        )
+        .unwrap();
+        (session, observed, now)
+    }
+
+    fn submit_intents(
+        session: &mut InputSession<FakeCompanionDevice>,
+        events: Vec<InputEvent>,
+        first_sequence: u64,
+        now: Instant,
+    ) -> InputResult<()> {
+        for (offset, event) in events.into_iter().enumerate() {
+            let packet = InputPacket {
+                version: PROTOCOL_VERSION,
+                generation: 1,
+                sequence: first_sequence + offset as u64,
+                lease_token: "b".repeat(32),
+                event,
+            };
+            session.submit(&packet, now)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn companion_revoke_releases_the_touch_mapped_left_button() {
+        let mut translator = SingleTouchAsMouse::default();
+        let down = translator
+            .translate(&touch(4, PenTouchPhase::Down, 100, 200))
+            .unwrap();
+        let (mut session, observed, now) = companion_session(false);
+        submit_intents(&mut session, down, 1, now).unwrap();
+        session.revoke().unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed.submitted,
+            [
+                InputEvent::Absolute { x: 100, y: 200 },
+                left_button_event(true),
+                left_button_event(false),
+            ]
+        );
+        assert_eq!(observed.releases, 1);
+    }
+
+    #[test]
+    fn partial_touch_down_failure_triggers_companion_button_cleanup() {
+        let mut translator = SingleTouchAsMouse::default();
+        let down = translator
+            .translate(&touch(4, PenTouchPhase::Down, 100, 200))
+            .unwrap();
+        let (mut session, observed, now) = companion_session(true);
+
+        assert!(matches!(
+            submit_intents(&mut session, down, 1, now),
+            Err(CompanionError::Device)
+        ));
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed.submitted,
+            [
+                InputEvent::Absolute { x: 100, y: 200 },
+                left_button_event(true),
+                left_button_event(false),
+            ]
+        );
+        assert_eq!(observed.releases, 1);
+    }
 
     #[test]
     fn absolute_pointer_mapping_preserves_normalized_coordinate_bounds() {
