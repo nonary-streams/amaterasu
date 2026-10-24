@@ -525,6 +525,30 @@ mod tests {
     }
 
     #[test]
+    fn production_capture_queue_is_bounded_and_preserves_fifo_on_overflow() {
+        let (sender, receiver) = mpsc::sync_channel(QUEUE_PACKETS);
+        let health = Mutex::new(Health::default());
+
+        for sequence in 0..QUEUE_PACKETS as u64 {
+            assert!(enqueue(&sender, &health, packet(sequence, sequence)));
+        }
+        assert!(!enqueue(
+            &sender,
+            &health,
+            packet(QUEUE_PACKETS as u64, QUEUE_PACKETS as u64)
+        ));
+
+        let health = health.lock().unwrap();
+        assert_eq!(health.failure, Some("audio_queue_overflow"));
+        assert_eq!(health.dropped_packets, 1);
+        drop(health);
+        for sequence in 0..QUEUE_PACKETS as u64 {
+            assert_eq!(receiver.try_recv().unwrap().sequence, sequence);
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn overflow_drains_accepted_pcm_without_counting_dropped_discontinuity() {
         let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
         let drops = Arc::new(AtomicUsize::new(0));

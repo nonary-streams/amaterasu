@@ -52,7 +52,7 @@ const PA_SAMPLE_FLOAT32LE: c_int = 5;
 const AUDIO_RATE: u32 = 48_000;
 const FRAMES_PER_PACKET: u32 = 480;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_CAPTURE_CHUNK: usize = 1024 * 1024;
 static NEXT_MANAGED_SINK: AtomicU64 = AtomicU64::new(1);
 static NEXT_SINK_CLEANUP_SLOT: AtomicU64 = AtomicU64::new(0);
@@ -260,6 +260,48 @@ struct ServerInfoResult {
     default_sink: Option<String>,
 }
 
+struct PendingServerInfoQuery {
+    operation: Operation,
+    result: Box<ServerInfoResult>,
+}
+
+enum QueryPoll<T> {
+    Pending,
+    Complete(AudioResult<T>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefaultRouteDecision {
+    Pending,
+    Unchanged,
+    Changed,
+    Retry,
+    Failed(&'static str),
+}
+
+fn transient_default_query_error(error: &str) -> bool {
+    matches!(
+        error,
+        "audio_operation_timeout"
+            | "audio_server_timeout"
+            | "audio_server_unavailable"
+            | "audio_backend_failed"
+    )
+}
+
+fn default_route_decision(
+    result: Option<AudioResult<Option<String>>>,
+    expected_sink: &str,
+) -> DefaultRouteDecision {
+    match result {
+        None => DefaultRouteDecision::Pending,
+        Some(Ok(Some(current))) if current == expected_sink => DefaultRouteDecision::Unchanged,
+        Some(Ok(_)) => DefaultRouteDecision::Changed,
+        Some(Err(error)) if transient_default_query_error(error) => DefaultRouteDecision::Retry,
+        Some(Err(error)) => DefaultRouteDecision::Failed(error),
+    }
+}
+
 #[derive(Default)]
 struct SinkListResult {
     completed: bool,
@@ -321,6 +363,8 @@ struct PulseClient {
     mainloop: *mut PaMainloop,
     context: *mut PaContext,
     pending_callback_states: PendingCallbackStates,
+    pending_default_query: Option<PendingServerInfoQuery>,
+    default_queries_disabled: bool,
 }
 
 impl PulseClient {
@@ -349,6 +393,8 @@ impl PulseClient {
             mainloop,
             context,
             pending_callback_states: PendingCallbackStates::default(),
+            pending_default_query: None,
+            default_queries_disabled: false,
         };
         // Disable PulseAudio's autospawn behavior: the audio module connects to
         // the user's existing service and never starts or restarts it.
@@ -464,6 +510,65 @@ impl PulseClient {
     fn default_sink(&mut self) -> AudioResult<Option<String>> {
         let result = self.server_info()?;
         Ok(result.default_sink)
+    }
+
+    fn start_default_sink_query(&mut self) -> AudioResult<()> {
+        if self.pending_default_query.is_some() || self.default_queries_disabled {
+            return Ok(());
+        }
+        let mut result = Box::new(ServerInfoResult::default());
+        // SAFETY: callback userdata remains owned by this client until the
+        // query completes or the mainloop is destroyed during client teardown.
+        let operation = unsafe {
+            pa_context_get_server_info(
+                self.context,
+                Some(server_info_callback),
+                (&mut *result as *mut ServerInfoResult).cast(),
+            )
+        };
+        if operation.is_null() {
+            self.default_queries_disabled = true;
+            return Err("audio_backend_failed");
+        }
+        self.pending_default_query = Some(PendingServerInfoQuery {
+            operation: Operation(operation),
+            result,
+        });
+        Ok(())
+    }
+
+    fn poll_default_sink_query(&mut self) -> QueryPoll<Option<String>> {
+        let Some(query) = self.pending_default_query.as_ref() else {
+            return QueryPoll::Pending;
+        };
+        // SAFETY: the pending query uniquely owns a live operation reference.
+        match unsafe { pa_operation_get_state(query.operation.0) } {
+            PA_OPERATION_RUNNING => QueryPoll::Pending,
+            PA_OPERATION_DONE => {
+                let mut query = self
+                    .pending_default_query
+                    .take()
+                    .expect("the completed default query is still present");
+                if query.result.failed || !query.result.completed {
+                    QueryPoll::Complete(Err("audio_backend_failed"))
+                } else {
+                    QueryPoll::Complete(Ok(query.result.default_sink.take()))
+                }
+            }
+            PA_OPERATION_CANCELLED => {
+                self.default_queries_disabled = true;
+                let query = self
+                    .pending_default_query
+                    .take()
+                    .expect("the cancelled default query is still present");
+                // A callback already queued by libpulse can still run after
+                // cancellation; retain its userdata until this client's mainloop
+                // is destroyed, matching the synchronous operation path.
+                self.pending_callback_states.retain(query.result);
+                QueryPoll::Complete(Err("audio_backend_failed"))
+            }
+            _ => QueryPoll::Pending,
+        }
     }
 
     /// Completes a server query queued after earlier commands on this context.
@@ -657,6 +762,11 @@ impl Drop for PulseClient {
         // remains alive through this body, including mainloop teardown, before
         // Rust drops that field after this method returns.
         unsafe {
+            if let Some(query) = &self.pending_default_query {
+                // SAFETY: the pending query uniquely owns this operation and
+                // callback userdata remains in the query until teardown ends.
+                pa_operation_cancel(query.operation.0);
+            }
             if !self.context.is_null() {
                 pa_context_disconnect(self.context);
                 pa_context_unref(self.context);
@@ -1944,10 +2054,32 @@ impl Capture {
         ) {
             return Err("device_lost");
         }
+        let mut query_start_error = None;
         if self.follow_console_default && Instant::now() >= self.next_default_check {
             self.next_default_check = Instant::now() + DEFAULT_CHECK_INTERVAL;
-            if self.client.default_sink()?.as_deref() != Some(self.endpoint.as_str()) {
-                return Err("default_endpoint_changed");
+            query_start_error = self.client.start_default_sink_query().err();
+        }
+        if self.follow_console_default {
+            let decision = if let Some(error) = query_start_error {
+                default_route_decision(Some(Err(error)), &self.endpoint)
+            } else {
+                match self.client.poll_default_sink_query() {
+                    QueryPoll::Pending => DefaultRouteDecision::Pending,
+                    QueryPoll::Complete(result) => {
+                        default_route_decision(Some(result), &self.endpoint)
+                    }
+                }
+            };
+            match decision {
+                DefaultRouteDecision::Changed => return Err("default_endpoint_changed"),
+                DefaultRouteDecision::Retry => {
+                    // A failed control-plane probe does not establish that the
+                    // monitor stream failed. Keep capturing and retry later;
+                    // Pulse context/stream loss is detected independently above.
+                    self.next_default_check = Instant::now() + DEFAULT_CHECK_INTERVAL;
+                }
+                DefaultRouteDecision::Failed(error) => return Err(error),
+                DefaultRouteDecision::Pending | DefaultRouteDecision::Unchanged => {}
             }
         }
         let frame_bytes = self.format.packet_bytes(FRAMES_PER_PACKET)?;
@@ -2312,6 +2444,40 @@ mod tests {
         assert_eq!(
             capture_channel_layout(STEREO_POSITIONS, Some(2), Some(requested)),
             Err("invalid_capture_format")
+        );
+    }
+
+    #[test]
+    fn default_route_probe_keeps_capture_live_while_query_is_pending_or_fails() {
+        assert_eq!(
+            default_route_decision(None, "sink.selected"),
+            DefaultRouteDecision::Pending
+        );
+        for error in ["audio_operation_timeout", "audio_server_unavailable"] {
+            assert_eq!(
+                default_route_decision(Some(Err(error)), "sink.selected"),
+                DefaultRouteDecision::Retry
+            );
+        }
+        assert_eq!(
+            default_route_decision(Some(Err("audio_server_access_denied")), "sink.selected"),
+            DefaultRouteDecision::Failed("audio_server_access_denied")
+        );
+        assert_eq!(
+            default_route_decision(Some(Ok(Some("sink.selected".into()))), "sink.selected"),
+            DefaultRouteDecision::Unchanged
+        );
+    }
+
+    #[test]
+    fn default_route_probe_only_reopens_when_a_completed_query_observes_a_change() {
+        assert_eq!(
+            default_route_decision(Some(Ok(Some("sink.user_choice".into()))), "sink.selected"),
+            DefaultRouteDecision::Changed
+        );
+        assert_eq!(
+            default_route_decision(Some(Ok(None)), "sink.selected"),
+            DefaultRouteDecision::Changed
         );
     }
 
