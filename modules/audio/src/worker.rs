@@ -15,7 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const QUEUE_PACKETS: usize = 16;
+// Capture produces 10 ms packets independently of video encoding. Allow a
+// bounded 1.28 seconds of scheduling slack before declaring a terminal lag.
+pub const QUEUE_PACKETS: usize = 128;
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
 
@@ -237,6 +239,7 @@ impl Drop for Worker {
 }
 
 fn fail(health: &Mutex<Health>, error: &'static str) {
+    eprintln!("amaterasu audio capture failed code={error}");
     if let Ok(mut health) = health.lock() {
         health.failure = Some(error);
         health.recovering = false;
@@ -386,6 +389,7 @@ fn enqueue(sender: &SyncSender<Packet>, health: &Mutex<Health>, packet: Packet) 
             true
         }
         Err(TrySendError::Full(_)) => {
+            eprintln!("amaterasu audio capture failed code=audio_queue_overflow");
             if let Ok(mut health) = health.lock() {
                 health.failure = Some("audio_queue_overflow");
                 health.recovering = false;

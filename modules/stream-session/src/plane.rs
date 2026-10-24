@@ -9,6 +9,9 @@ use packets::{AudioPacket, PcmPacket, VideoAssembly, VideoPacket};
 
 pub type PlaneResult<T> = Result<T, &'static str>;
 const READ_BUDGET: usize = 4;
+// A 10 ms PCM source must be drained faster than video frames arrive. Keep
+// this bounded so one active session cannot monopolize the module tick.
+const PCM_READ_BUDGET: usize = 32;
 
 #[derive(Clone, Copy)]
 pub struct Handles {
@@ -273,46 +276,36 @@ impl<B: Backend> Pump<B> {
         }
 
         // Output backpressure stops both encoder polling and further PCM capture.
-        for _ in 0..READ_BUDGET {
-            if let Some(packet) = &self.pending_audio {
-                let header = packet.header();
-                if header.channels != self.audio_channels {
-                    return Err("unsupported_audio_channels");
+        // Drain several PCM packets per tick: video encoding may make ticks far
+        // slower than the capture device's 10 ms packet cadence.
+        for _ in 0..PCM_READ_BUDGET {
+            for _ in 0..READ_BUDGET {
+                if let Some(packet) = &self.pending_audio {
+                    let header = packet.header();
+                    if header.channels != self.audio_channels {
+                        return Err("unsupported_audio_channels");
+                    }
+                    if !self.backend.submit_audio(&header)? {
+                        return Ok(());
+                    }
+                    self.record_audio_admission(&header, progress);
+                    self.audio_ended = header.flags == AUDIO_PACKET_END_OF_STREAM;
+                    self.pending_audio = None;
                 }
-                if !self.backend.submit_audio(&header)? {
+                if self.audio_ended {
                     return Ok(());
                 }
-                self.record_audio_admission(&header, progress);
-                self.audio_ended = header.flags == AUDIO_PACKET_END_OF_STREAM;
-                self.pending_audio = None;
+                let Some(packet) = self.backend.audio()? else {
+                    break;
+                };
+                self.pending_audio = Some(packet);
             }
-            if self.audio_ended {
-                return Ok(());
+            if self.pending_pcm.is_none() && !self.stopping {
+                self.pending_pcm = self.backend.pcm()?;
             }
-            let Some(packet) = self.backend.audio()? else {
+            let Some(packet) = &self.pending_pcm else {
                 break;
             };
-            self.pending_audio = Some(packet);
-        }
-        if let Some(packet) = &self.pending_audio {
-            let header = packet.header();
-            if header.channels != self.audio_channels {
-                return Err("unsupported_audio_channels");
-            }
-            if !self.backend.submit_audio(&header)? {
-                return Ok(());
-            }
-            self.record_audio_admission(&header, progress);
-            self.audio_ended = header.flags == AUDIO_PACKET_END_OF_STREAM;
-            self.pending_audio = None;
-        }
-        if self.audio_ended {
-            return Ok(());
-        }
-        if self.pending_pcm.is_none() && !self.stopping {
-            self.pending_pcm = self.backend.pcm()?;
-        }
-        if let Some(packet) = &self.pending_pcm {
             if packet.header().channels != self.audio_channels {
                 return Err("unsupported_audio_channels");
             }

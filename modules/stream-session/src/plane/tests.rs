@@ -136,6 +136,32 @@ fn pcm() -> PcmPacket {
 }
 
 #[test]
+fn a_video_tick_drains_multiple_queued_pcm_packets_without_losing_order() {
+    let mut backend = Fake::default();
+    backend.pcms.extend((0..25).map(|_| pcm()));
+    let mut pump = Pump::with_audio(backend, true, 2);
+
+    pump.tick(true).unwrap();
+    assert_eq!(pump.backend.pcm_sent, 25);
+    assert_eq!(pump.backend.pcm_reads, 26); // The empty poll ends the batch.
+    assert_eq!(pump.backend.audio_reads, 26);
+}
+
+#[test]
+fn pcm_drain_is_bounded_per_video_tick() {
+    let mut backend = Fake::default();
+    backend
+        .pcms
+        .extend((0..(PCM_READ_BUDGET + 1)).map(|_| pcm()));
+    let mut pump = Pump::with_audio(backend, true, 2);
+
+    pump.tick(true).unwrap();
+    assert_eq!(pump.backend.pcm_sent, PCM_READ_BUDGET);
+    pump.tick(true).unwrap();
+    assert_eq!(pump.backend.pcm_sent, PCM_READ_BUDGET + 1);
+}
+
+#[test]
 fn surround_pcm_and_encoded_packets_cross_plane_and_drain() {
     for channels in [6, 8] {
         let pcm_bytes = vec![0; 480 * channels as usize * 4];
