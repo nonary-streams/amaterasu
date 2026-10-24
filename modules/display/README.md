@@ -27,9 +27,17 @@ include normalized active `Configuration` rows, a topology revision, and the
 validated KScreen output state needed to preserve session settings such as
 scale, rotation, HDR state, priority, and exact mode identity.
 
-`native_supported` remains false for Linux mutations. A source-only restoration
-planner has behavioral fixtures for stable output identity, equivalent mode
-selection, hotplug, and ambiguous modes. The journal's untagged `snapshot`
+`native_supported` remains false for Linux mutations. The provider now contains
+a bounded, direct-argv KScreen apply/restore transaction behind that capability
+gate. It resolves journaled connector names against fresh session output state,
+rejects changed connector or enabled-output sets, selects only a unique saved
+mode (or the exact saved mode ID), and verifies a fresh post-command snapshot.
+It never enables or disables outputs, so this slice cannot turn off the last
+active display. Command timeout, KScreen rejection, and readback uncertainty
+are marked as possible mutations so the existing pipeline retains its recovery
+journal. Fake-runner fixtures cover argument construction, apply/readback,
+restoration, idempotency, hotplug, ambiguous modes, timeouts, and rejection.
+The journal's untagged `snapshot`
 baseline preserves legacy CCD JSON exactly while allowing a version-1 KScreen-
 only object. That payload preserves connector identity, mode timing and ID,
 position, scale, rotation, enabled/connected and primary state, priority, and
@@ -37,12 +45,10 @@ optional HDR state.
 The existing pipeline captures and rechecks provider-specific KScreen state
 around journal preparation, then persists it through the state revision-CAS
 boundary before native effects. Restore and rollback verify KScreen readback
-before they clear the journal. Linux supplies read-only capture and preflight
-hooks, but remains `native_supported:false`; its apply and restore hooks fail
-closed, so no Linux lease can currently reach mutation. The fake-platform
-transaction fixtures cover journal interruption, retries, hotplug holds, and
-restore readback failures. This does not qualify KScreen, Plasma, or any
-virtual-output driver for runtime use.
+before they clear the journal. Linux remains `native_supported:false`, so the
+pipeline cannot reach these operations yet. Central review and qualification
+are still required before enabling the capability. This does not qualify
+KScreen, Plasma, or any virtual-output driver for runtime use.
 
 ## Refresh-rate option model
 

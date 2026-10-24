@@ -1,17 +1,14 @@
-//! Read-only KDE/KScreen discovery and conservative restoration planning.
+//! KDE/KScreen discovery and a capability-gated, conservative transaction path.
 //!
-//! Native display mutations remain unsupported on Linux until journaled
-//! configuration plans, identity-safe restoration, and exact readback are
-//! implemented and centrally verified.
+//! Native display mutations remain unsupported on Linux until the journaled
+//! apply/restore path is centrally tested and its platform behavior reviewed.
 use super::{Platform, TopologyShape};
 use crate::model::{
     Address, AvailableMode, Configuration, DisplayError, DisplayResult, KScreenModeSnapshot,
     KScreenOutputSnapshot, KScreenPosition, KScreenSnapshot, Rational, RouteBinding, Snapshot,
 };
 use serde_json::{Value, json};
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -21,6 +18,228 @@ const MAX_CONFIGURATION_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUTS: usize = 64;
 const MAX_MODES_PER_OUTPUT: usize = 1024;
 const KSCREEN_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const KSCREEN_MUTATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Debug, PartialEq)]
+enum KScreenAction {
+    Mode { output: String, mode: String },
+    Position { output: String, x: i32, y: i32 },
+    Scale { output: String, scale: f64 },
+    Rotation { output: String, rotation: u16 },
+    Priority { output: String, priority: u32 },
+    Hdr { output: String, enabled: bool },
+}
+
+impl KScreenAction {
+    fn argument(&self) -> DisplayResult<String> {
+        let output = match self {
+            Self::Mode { output, .. }
+            | Self::Position { output, .. }
+            | Self::Scale { output, .. }
+            | Self::Rotation { output, .. }
+            | Self::Priority { output, .. }
+            | Self::Hdr { output, .. } => output,
+        };
+        validate_output_id(output)?;
+        let prefix = format!("output.{output}.");
+        Ok(match self {
+            Self::Mode { mode, .. } => {
+                safe_mode_id(mode)?;
+                format!("{prefix}mode.{mode}")
+            }
+            Self::Position { x, y, .. } => {
+                if x.abs_diff(0) > 65_536 || y.abs_diff(0) > 65_536 {
+                    return Err(DisplayError::new(
+                        "invalid_snapshot",
+                        "KScreen position is out of range",
+                    ));
+                }
+                format!("{prefix}position.{x},{y}")
+            }
+            Self::Scale { scale, .. } => {
+                if !scale.is_finite() || !(0.25..=5.0).contains(scale) {
+                    return Err(DisplayError::new(
+                        "invalid_snapshot",
+                        "KScreen scale is out of range",
+                    ));
+                }
+                format!("{prefix}scale.{scale}")
+            }
+            Self::Rotation { rotation, .. } => {
+                let name = rotation_name(*rotation).ok_or_else(|| {
+                    DisplayError::new(
+                        "unsupported_topology",
+                        "KScreen rotation cannot be represented",
+                    )
+                })?;
+                format!("{prefix}rotation.{name}")
+            }
+            Self::Priority { priority, .. } => {
+                if *priority > 64 {
+                    return Err(DisplayError::new(
+                        "invalid_snapshot",
+                        "KScreen priority is out of range",
+                    ));
+                }
+                format!("{prefix}priority.{priority}")
+            }
+            Self::Hdr { enabled, .. } => {
+                format!(
+                    "{prefix}hdr.{}",
+                    if *enabled { "enable" } else { "disable" }
+                )
+            }
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum KScreenCommand {
+    Query,
+    Configure(Vec<KScreenAction>),
+}
+
+#[derive(Debug)]
+struct KScreenCommandOutput {
+    status: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+trait KScreenCommandRunner {
+    /// Errors after a configure command may have started must carry the
+    /// `may_have_changed` marker so the caller retains its durable journal.
+    fn execute(&mut self, command: &KScreenCommand) -> DisplayResult<KScreenCommandOutput>;
+}
+
+struct SystemKScreenCommandRunner;
+
+impl KScreenCommandRunner for SystemKScreenCommandRunner {
+    fn execute(&mut self, command: &KScreenCommand) -> DisplayResult<KScreenCommandOutput> {
+        require_user_session()?;
+        let arguments = match command {
+            KScreenCommand::Query => vec!["-j".to_owned()],
+            KScreenCommand::Configure(actions) => actions
+                .iter()
+                .map(KScreenAction::argument)
+                .collect::<DisplayResult<Vec<_>>>()?,
+        };
+        if arguments.is_empty() {
+            return Ok(KScreenCommandOutput {
+                status: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
+        let timeout = match command {
+            KScreenCommand::Query => KSCREEN_QUERY_TIMEOUT,
+            KScreenCommand::Configure(_) => KSCREEN_MUTATION_TIMEOUT,
+        };
+        let mut child = Command::new("kscreen-doctor")
+            .args(&arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                DisplayError::new(
+                    "unsupported_platform",
+                    format!("could not start user-session KScreen command: {error}"),
+                )
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| {
+                DisplayError::new("platform_error", "KScreen stdout pipe is unavailable")
+            })
+            .map_err(|error| command_error(command, error))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| {
+                DisplayError::new("platform_error", "KScreen stderr pipe is unavailable")
+            })
+            .map_err(|error| command_error(command, error))?;
+        let stdout_reader = thread::spawn(move || read_bounded_output(stdout));
+        let stderr_reader = thread::spawn(move || read_bounded_output(stderr));
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    let failure = DisplayError::new(
+                        "platform_error",
+                        format!("KScreen command wait failed: {error}"),
+                    );
+                    return Err(if matches!(command, KScreenCommand::Configure(_)) {
+                        failure.after_mutation()
+                    } else {
+                        failure
+                    });
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                let failure = DisplayError::new(
+                    "platform_timeout",
+                    "KScreen command exceeded its bounded deadline",
+                );
+                return Err(if matches!(command, KScreenCommand::Configure(_)) {
+                    failure.after_mutation()
+                } else {
+                    failure
+                });
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| DisplayError::new("platform_error", "KScreen stdout reader panicked"))
+            .and_then(|output| {
+                output.map_err(|error| {
+                    DisplayError::new(
+                        "platform_error",
+                        format!("KScreen stdout read failed: {error}"),
+                    )
+                })
+            })
+            .map_err(|error| command_error(command, error))?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| DisplayError::new("platform_error", "KScreen stderr reader panicked"))
+            .and_then(|output| {
+                output.map_err(|error| {
+                    DisplayError::new(
+                        "platform_error",
+                        format!("KScreen stderr read failed: {error}"),
+                    )
+                })
+            })
+            .map_err(|error| command_error(command, error))?;
+        Ok(KScreenCommandOutput {
+            status: status.and_then(|status| status.code()),
+            stdout,
+            stderr,
+        })
+    }
+}
+
+fn command_error(command: &KScreenCommand, error: DisplayError) -> DisplayError {
+    if matches!(command, KScreenCommand::Configure(_)) {
+        error.after_mutation()
+    } else {
+        error
+    }
+}
 
 #[derive(Default)]
 pub struct LinuxPlatform;
@@ -144,19 +363,21 @@ impl Platform for LinuxPlatform {
 
     fn restore_kscreen_snapshot(
         &mut self,
-        _: &KScreenSnapshot,
-        _: &mut dyn FnMut() -> DisplayResult<()>,
+        baseline: &KScreenSnapshot,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
-        Err(unsupported_mutation())
+        let mut runner = SystemKScreenCommandRunner;
+        restore_kscreen_snapshot_with(&mut runner, baseline, guard)
     }
 
     fn apply_kscreen_snapshot(
         &mut self,
-        _: &Configuration,
-        _: &KScreenSnapshot,
-        _: &mut dyn FnMut() -> DisplayResult<()>,
+        configuration: &Configuration,
+        baseline: &KScreenSnapshot,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
-        Err(unsupported_mutation())
+        let mut runner = SystemKScreenCommandRunner;
+        apply_kscreen_snapshot_with(&mut runner, configuration, baseline, guard)
     }
 
     fn snapshot(&mut self) -> DisplayResult<Snapshot> {
@@ -222,82 +443,13 @@ impl Platform for LinuxPlatform {
 fn unsupported_mutation() -> DisplayError {
     DisplayError::new(
         "unsupported_platform",
-        "Linux KScreen mutation requires an identity-safe provider with exact restore and readback verification",
+        "Linux KScreen mutation capability remains disabled pending central safety qualification",
     )
 }
 
 fn query_configuration() -> DisplayResult<Value> {
-    require_user_session()?;
-    let mut child = Command::new("kscreen-doctor")
-        .arg("-j")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| {
-            DisplayError::new(
-                "unsupported_platform",
-                format!("could not start the user-session KScreen query: {error}"),
-            )
-        })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        DisplayError::new("platform_error", "KScreen query stdout pipe is unavailable")
-    })?;
-    let reader = thread::spawn(move || read_bounded_output(stdout));
-    let deadline = Instant::now() + KSCREEN_QUERY_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(DisplayError::new(
-                    "platform_error",
-                    format!("KScreen query wait failed: {error}"),
-                ));
-            }
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err(DisplayError::new(
-                "platform_timeout",
-                "user-session KScreen query exceeded its five-second deadline",
-            ));
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let stdout = reader
-        .join()
-        .map_err(|_| DisplayError::new("platform_error", "KScreen query reader panicked"))?
-        .map_err(|error| {
-            DisplayError::new(
-                "platform_error",
-                format!("KScreen query read failed: {error}"),
-            )
-        })?;
-    if !status.success() {
-        return Err(DisplayError::new(
-            "platform_error",
-            format!(
-                "user-session KScreen query failed with exit status {}",
-                status.code().unwrap_or(-1)
-            ),
-        ));
-    }
-    if stdout.len() > MAX_CONFIGURATION_BYTES {
-        return Err(DisplayError::new(
-            "resource_exhausted",
-            "KScreen configuration exceeds the snapshot size limit",
-        ));
-    }
-    let configuration: Value = serde_json::from_slice(&stdout).map_err(|error| {
-        DisplayError::new("platform_error", format!("invalid KScreen JSON: {error}"))
-    })?;
-    validated_outputs(&configuration)?;
-    Ok(configuration)
+    let mut runner = SystemKScreenCommandRunner;
+    query_configuration_with(&mut runner)
 }
 
 fn read_bounded_output(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
@@ -313,6 +465,162 @@ fn read_bounded_output(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
         bytes.extend_from_slice(&buffer[..retained]);
     }
     Ok(bytes)
+}
+
+fn query_configuration_with(runner: &mut impl KScreenCommandRunner) -> DisplayResult<Value> {
+    let result = runner.execute(&KScreenCommand::Query)?;
+    if result.status != Some(0) {
+        return Err(DisplayError::new(
+            "platform_error",
+            format!(
+                "user-session KScreen query failed with exit status {:?}",
+                result.status
+            ),
+        ));
+    }
+    if result.stdout.len() > MAX_CONFIGURATION_BYTES {
+        return Err(DisplayError::new(
+            "resource_exhausted",
+            "KScreen configuration exceeds the snapshot size limit",
+        ));
+    }
+    let configuration: Value = serde_json::from_slice(&result.stdout).map_err(|error| {
+        DisplayError::new("platform_error", format!("invalid KScreen JSON: {error}"))
+    })?;
+    validated_outputs(&configuration)?;
+    Ok(configuration)
+}
+
+fn run_configuration_with(
+    runner: &mut impl KScreenCommandRunner,
+    actions: Vec<KScreenAction>,
+) -> DisplayResult<()> {
+    if actions.is_empty() {
+        return Ok(());
+    }
+    let result = runner.execute(&KScreenCommand::Configure(actions))?;
+    let output_bytes = result.stdout.len().saturating_add(result.stderr.len());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    let rejected = stdout
+        .to_ascii_lowercase()
+        .contains("applying config failed")
+        || stderr
+            .to_ascii_lowercase()
+            .contains("applying config failed");
+    if output_bytes > MAX_CONFIGURATION_BYTES || result.status != Some(0) || rejected {
+        return Err(DisplayError::new(
+            if output_bytes > MAX_CONFIGURATION_BYTES {
+                "resource_exhausted"
+            } else {
+                "platform_error"
+            },
+            "KScreen configuration completion was rejected or could not be confirmed",
+        )
+        .after_mutation());
+    }
+    Ok(())
+}
+
+fn action_arguments(actions: &[KScreenAction]) -> DisplayResult<Vec<String>> {
+    actions.iter().map(KScreenAction::argument).collect()
+}
+
+fn apply_kscreen_snapshot_with(
+    runner: &mut impl KScreenCommandRunner,
+    configuration: &Configuration,
+    baseline: &KScreenSnapshot,
+    guard: &mut dyn FnMut() -> DisplayResult<()>,
+) -> DisplayResult<()> {
+    baseline.validate_requested_topology(configuration)?;
+    guard()?;
+    let before_raw = query_configuration_with(runner)?;
+    let before_outputs = validated_outputs(&before_raw)?;
+    let before = typed_snapshot(&before_outputs)?;
+    if before.revision()? != baseline.revision()? {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "KScreen changed after the recovery lease was armed",
+        ));
+    }
+    if !baseline.matches_restoration(&before) {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "KScreen output state changed after the recovery lease was armed",
+        ));
+    }
+    apply_actions(configuration, &before_raw)?;
+    guard()?;
+    let final_raw = query_configuration_with(runner)?;
+    let final_outputs = validated_outputs(&final_raw)?;
+    let final_snapshot = typed_snapshot(&final_outputs)?;
+    if final_snapshot.revision()? != baseline.revision()? {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "KScreen changed immediately before configuration",
+        ));
+    }
+    if !baseline.matches_restoration(&final_snapshot) {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "KScreen output state changed immediately before configuration",
+        ));
+    }
+    let actions = apply_actions(configuration, &final_raw)?;
+    run_configuration_with(runner, actions)?;
+    let after = query_configuration_with(runner).map_err(DisplayError::after_mutation)?;
+    let after_outputs = validated_outputs(&after).map_err(DisplayError::after_mutation)?;
+    let after = typed_snapshot(&after_outputs).map_err(DisplayError::after_mutation)?;
+    if !after.matches_configuration(baseline, configuration) {
+        return Err(DisplayError::new(
+            "verification_failed",
+            "KScreen did not read back the requested display configuration",
+        )
+        .after_mutation());
+    }
+    Ok(())
+}
+
+fn restore_kscreen_snapshot_with(
+    runner: &mut impl KScreenCommandRunner,
+    baseline: &KScreenSnapshot,
+    guard: &mut dyn FnMut() -> DisplayResult<()>,
+) -> DisplayResult<()> {
+    baseline.validate()?;
+    guard()?;
+    let before_raw = query_configuration_with(runner)?;
+    let before_outputs = validated_outputs(&before_raw)?;
+    let before = typed_snapshot(&before_outputs)?;
+    if baseline.matches_restoration(&before) {
+        return Ok(());
+    }
+    restoration_actions(baseline, &before_raw)?;
+    guard()?;
+    let final_raw = query_configuration_with(runner)?;
+    let final_outputs = validated_outputs(&final_raw)?;
+    let final_snapshot = typed_snapshot(&final_outputs)?;
+    if final_snapshot.revision()? != before.revision()? {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "KScreen changed immediately before restoration",
+        ));
+    }
+    if baseline.matches_restoration(&final_snapshot) {
+        return Ok(());
+    }
+    let actions = restoration_actions(baseline, &final_raw)?;
+    run_configuration_with(runner, actions)?;
+    let after = query_configuration_with(runner).map_err(DisplayError::after_mutation)?;
+    let after_outputs = validated_outputs(&after).map_err(DisplayError::after_mutation)?;
+    let after = typed_snapshot(&after_outputs).map_err(DisplayError::after_mutation)?;
+    if !baseline.matches_restoration(&after) {
+        return Err(DisplayError::new(
+            "verification_failed",
+            "KScreen restoration did not match its durable recovery baseline",
+        )
+        .after_mutation());
+    }
+    Ok(())
 }
 
 fn enumeration_rows(configuration: &Value, display: Option<&str>) -> DisplayResult<Vec<Value>> {
@@ -768,46 +1076,70 @@ fn output_configuration_row(output: &Value) -> DisplayResult<Value> {
     }))
 }
 
-/// Produce a restoration request only when every enabled baseline output is
-/// still connected and no unknown connected output appeared. It is fixture-only
-/// until the existing lease pipeline accepts KScreen journal records.
-#[cfg(test)]
-fn restoration_arguments(saved: &KScreenSnapshot, current: &Value) -> DisplayResult<Vec<String>> {
+/// Produce restoration actions only when the journaled connector set and
+/// enabled-output set still match. This path never enables/disables outputs.
+fn restoration_actions(
+    saved: &KScreenSnapshot,
+    current: &Value,
+) -> DisplayResult<Vec<KScreenAction>> {
     saved.validate()?;
+    if !saved
+        .outputs
+        .iter()
+        .any(|output| output.connected && output.enabled)
+    {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "restoration refuses a baseline with no active output",
+        ));
+    }
     let current_outputs = validated_outputs(current)?;
+    let current_snapshot = typed_snapshot(&current_outputs)?;
     let current_by_name: BTreeMap<_, _> = current_outputs
         .iter()
-        .map(|output| (output_name(output).expect("validated output name"), *output))
+        .map(|output| {
+            (
+                output_name(output)
+                    .expect("validated output name")
+                    .to_ascii_lowercase(),
+                *output,
+            )
+        })
+        .collect();
+    let current_state_by_name: BTreeMap<_, _> = current_snapshot
+        .outputs
+        .iter()
+        .map(|output| (output.id.to_ascii_lowercase(), output))
         .collect();
     let saved_by_name: BTreeMap<_, _> = saved
         .outputs
         .iter()
-        .map(|output| (output.id.as_str(), output))
+        .map(|output| (output.id.to_ascii_lowercase(), output))
         .collect();
 
     for saved_output in &saved.outputs {
-        match (
-            saved_output.connected,
-            current_by_name.get(saved_output.id.as_str()),
-        ) {
-            (true, Some(present)) if bool_field(present, "connected")? => {}
-            (false, Some(present)) if bool_field(present, "connected")? => {
+        let current = current_by_name.get(&saved_output.id.to_ascii_lowercase());
+        match (saved_output.connected, current) {
+            (true, Some(output)) if bool_field(output, "connected")? => {}
+            (false, Some(output)) if bool_field(output, "connected")? => {
                 return Err(DisplayError::new(
                     "topology_changed",
-                    "a previously disconnected output appeared; restoration is held for recovery",
+                    "a previously disconnected output appeared; restoration is held",
                 ));
             }
             (true, _) => {
                 return Err(DisplayError::new(
                     "topology_changed",
-                    "a saved connected output is unavailable; restoration is held for recovery",
+                    "a saved connected output is unavailable; restoration is held",
                 ));
             }
             _ => {}
         }
     }
     for present in &current_outputs {
-        if bool_field(present, "connected")? && !saved_by_name.contains_key(output_name(present)?) {
+        if bool_field(present, "connected")?
+            && !saved_by_name.contains_key(&output_name(present)?.to_ascii_lowercase())
+        {
             return Err(DisplayError::new(
                 "topology_changed",
                 "an output appeared after the snapshot; restoration will not guess its state",
@@ -815,90 +1147,306 @@ fn restoration_arguments(saved: &KScreenSnapshot, current: &Value) -> DisplayRes
         }
     }
 
-    let mut arguments = Vec::new();
-    let mut sorted_names: Vec<_> = saved_by_name.keys().copied().collect();
-    sorted_names.sort_unstable();
-    for name in sorted_names {
-        let saved_output = saved_by_name[name];
-        let present = current_by_name.get(name).copied();
-        if !saved_output.connected {
+    let mut names: Vec<_> = saved_by_name.keys().cloned().collect();
+    names.sort_unstable();
+    let mut actions = Vec::new();
+    for identity in names {
+        let saved_output = saved_by_name[&identity];
+        let (Some(present), Some(present_state)) = (
+            current_by_name.get(&identity).copied(),
+            current_state_by_name.get(&identity).copied(),
+        ) else {
+            if saved_output.connected {
+                return Err(DisplayError::new(
+                    "topology_changed",
+                    "saved connector disappeared",
+                ));
+            }
+            continue;
+        };
+        if !saved_output.connected || !saved_output.enabled {
+            if !output_state_matches(saved_output, present_state) {
+                return Err(DisplayError::new(
+                    "unsupported_topology",
+                    "restoration will not change a disconnected or disabled output",
+                ));
+            }
             continue;
         }
-        let present = present.ok_or_else(|| {
-            DisplayError::new(
+        if !bool_field(present, "enabled")? {
+            return Err(DisplayError::new(
                 "topology_changed",
-                "saved output is missing during restore planning",
-            )
-        })?;
-        let prefix = format!("output.{name}.");
-        if !saved_output.enabled {
-            arguments.push(format!("{prefix}disable"));
-            continue;
+                "restoration will not enable or disable outputs",
+            ));
         }
-        let saved_mode = saved_output.mode.as_ref().ok_or_else(|| {
-            DisplayError::new(
-                "invalid_snapshot",
-                "enabled KScreen output has no saved mode",
+        append_output_restoration(&mut actions, saved_output, present)?;
+    }
+    Ok(actions)
+}
+
+fn apply_actions(
+    configuration: &Configuration,
+    current: &Value,
+) -> DisplayResult<Vec<KScreenAction>> {
+    configuration.validate()?;
+    let outputs = validated_outputs(current)?;
+    let by_name: BTreeMap<_, _> = outputs
+        .iter()
+        .map(|output| {
+            (
+                output_name(output)
+                    .expect("validated output name")
+                    .to_ascii_lowercase(),
+                *output,
             )
-        })?;
-        let present_modes = output_modes(present)?;
-        let matches: Vec<_> = present_modes
-            .into_iter()
-            .filter(|mode| {
-                integer_field(mode, "size", "width").ok() == Some(saved_mode.width)
-                    && integer_field(mode, "size", "height").ok() == Some(saved_mode.height)
-                    && mode_refresh_millihz(mode).ok() == Some(saved_mode.refresh_millihz)
-            })
-            .collect();
-        let mode = matches
-            .iter()
+        })
+        .collect();
+    let mut actions = Vec::new();
+    for display in &configuration.displays {
+        validate_output_id(&display.id)?;
+        let output = by_name
+            .get(&display.id.to_ascii_lowercase())
             .copied()
-            .find(|mode| mode.get("id").and_then(Value::as_str) == Some(saved_mode.id.as_str()))
-            .or_else(|| (matches.len() == 1).then(|| matches[0]))
             .ok_or_else(|| {
                 DisplayError::new(
                     "topology_changed",
-                    "the saved mode is no longer uniquely available; restoration is held for recovery",
+                    "requested KScreen connector disappeared",
                 )
             })?;
-        let mode_id = string_field(mode, "id")?;
-        safe_mode_id(mode_id)?;
-        arguments.push(format!("{prefix}enable"));
-        arguments.push(format!("{prefix}mode.{mode_id}"));
-        let rotation = i64::from(saved_output.rotation);
-        let rotation_name = match rotation {
-            1 => "none",
-            2 => "left",
-            4 => "inverted",
-            8 => "right",
-            16 => "flipped",
-            32 => "flipped90",
-            64 => "flipped180",
-            128 => "flipped270",
-            _ => {
-                return Err(DisplayError::new(
-                    "unsupported_topology",
-                    "saved rotation cannot be restored",
-                ));
-            }
-        };
-        arguments.push(format!("{prefix}rotation.{rotation_name}"));
-        arguments.push(format!("{prefix}scale.{}", saved_output.scale));
-        arguments.push(format!(
-            "{prefix}position.{},{}",
-            saved_output.position.x, saved_output.position.y
-        ));
-        if saved_output.priority > 0 {
-            arguments.push(format!("{prefix}priority.{}", saved_output.priority));
+        if !bool_field(output, "connected")? || !bool_field(output, "enabled")? {
+            return Err(DisplayError::new(
+                "topology_changed",
+                "KScreen apply will not change output enable state",
+            ));
         }
-        if let Some(hdr) = saved_output.hdr_enabled {
-            arguments.push(format!(
-                "{prefix}hdr.{}",
-                if hdr { "enable" } else { "disable" }
+        let requested = KScreenModeSnapshot {
+            id: String::new(),
+            width: display.width,
+            height: display.height,
+            refresh_millihz: rational_millihz(display.refresh)?,
+        };
+        let current_mode = current_mode(output)?;
+        let selected_mode = resolve_mode(output, &requested, None)?;
+        if !mode_timing_matches(current_mode, &requested)? {
+            actions.push(KScreenAction::Mode {
+                output: output_name(output)?.to_owned(),
+                mode: string_field(selected_mode, "id")?.to_owned(),
+            });
+        }
+        let position = output.get("pos").ok_or_else(|| {
+            DisplayError::new("platform_error", "KScreen output position is missing")
+        })?;
+        if bounded_integer(position, "x", -65_536, 65_536)? != display.x
+            || bounded_integer(position, "y", -65_536, 65_536)? != display.y
+        {
+            actions.push(KScreenAction::Position {
+                output: output_name(output)?.to_owned(),
+                x: display.x,
+                y: display.y,
+            });
+        }
+        let rotation = match display.rotation {
+            crate::model::Rotation::Identity => 1,
+            crate::model::Rotation::Rotate90 => 2,
+            crate::model::Rotation::Rotate180 => 4,
+            crate::model::Rotation::Rotate270 => 8,
+        };
+        let current_rotation = output
+            .get("rotation")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(1);
+        if rotation != current_rotation {
+            actions.push(KScreenAction::Rotation {
+                output: output_name(output)?.to_owned(),
+                rotation,
+            });
+        }
+        if display
+            .hdr_enabled
+            .is_some_and(|hdr| output.get("hdr").and_then(Value::as_bool) != Some(hdr))
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "KScreen apply does not support changing HDR state",
             ));
         }
     }
-    Ok(arguments)
+    Ok(actions)
+}
+
+fn append_output_restoration(
+    actions: &mut Vec<KScreenAction>,
+    saved: &KScreenOutputSnapshot,
+    present: &Value,
+) -> DisplayResult<()> {
+    let output = output_name(present)?.to_owned();
+    let saved_mode = saved.mode.as_ref().ok_or_else(|| {
+        DisplayError::new(
+            "invalid_snapshot",
+            "enabled KScreen output has no saved mode",
+        )
+    })?;
+    let selected_mode = resolve_mode(present, saved_mode, Some(&saved_mode.id))?;
+    let current_mode = current_mode(present)?;
+    if !mode_timing_matches(current_mode, saved_mode)? {
+        actions.push(KScreenAction::Mode {
+            output: output.clone(),
+            mode: string_field(selected_mode, "id")?.to_owned(),
+        });
+    }
+    let position = present
+        .get("pos")
+        .ok_or_else(|| DisplayError::new("platform_error", "KScreen output position is missing"))?;
+    if bounded_integer(position, "x", -65_536, 65_536)? != saved.position.x
+        || bounded_integer(position, "y", -65_536, 65_536)? != saved.position.y
+    {
+        actions.push(KScreenAction::Position {
+            output: output.clone(),
+            x: saved.position.x,
+            y: saved.position.y,
+        });
+    }
+    if present.get("scale").and_then(Value::as_f64).unwrap_or(1.0) != saved.scale {
+        actions.push(KScreenAction::Scale {
+            output: output.clone(),
+            scale: saved.scale,
+        });
+    }
+    let rotation = present
+        .get("rotation")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or(1);
+    if rotation != saved.rotation {
+        actions.push(KScreenAction::Rotation {
+            output: output.clone(),
+            rotation: saved.rotation,
+        });
+    }
+    let priority = present
+        .get("priority")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    if priority != saved.priority {
+        actions.push(KScreenAction::Priority {
+            output: output.clone(),
+            priority: saved.priority,
+        });
+    }
+    match (
+        saved.hdr_enabled,
+        present.get("hdr").and_then(Value::as_bool),
+    ) {
+        (Some(expected), Some(actual)) if expected != actual => actions.push(KScreenAction::Hdr {
+            output,
+            enabled: expected,
+        }),
+        (Some(_), Some(_)) | (None, None) => {}
+        _ => {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "KScreen HDR state is not readable enough for safe restoration",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn output_state_matches(saved: &KScreenOutputSnapshot, present: &KScreenOutputSnapshot) -> bool {
+    saved.connected == present.connected
+        && saved.enabled == present.enabled
+        && saved
+            .mode
+            .as_ref()
+            .map(|mode| (mode.width, mode.height, mode.refresh_millihz))
+            == present
+                .mode
+                .as_ref()
+                .map(|mode| (mode.width, mode.height, mode.refresh_millihz))
+        && saved.position == present.position
+        && saved.scale == present.scale
+        && saved.rotation == present.rotation
+        && saved.priority == present.priority
+        && saved.primary == present.primary
+        && saved.hdr_enabled == present.hdr_enabled
+}
+
+fn resolve_mode<'a>(
+    output: &'a Value,
+    requested: &KScreenModeSnapshot,
+    preferred_id: Option<&str>,
+) -> DisplayResult<&'a Value> {
+    let mut matches = Vec::new();
+    for mode in output_modes(output)? {
+        if mode_timing_matches(mode, requested)? {
+            matches.push(mode);
+        }
+    }
+    let selected = preferred_id
+        .and_then(|id| {
+            matches
+                .iter()
+                .copied()
+                .find(|mode| mode.get("id").and_then(Value::as_str) == Some(id))
+        })
+        .or_else(|| (matches.len() == 1).then(|| matches[0]));
+    selected.ok_or_else(|| {
+        DisplayError::new(
+            "unsupported_topology",
+            "matching KScreen mode is unavailable or ambiguous",
+        )
+    })
+}
+
+fn mode_timing_matches(mode: &Value, requested: &KScreenModeSnapshot) -> DisplayResult<bool> {
+    Ok(integer_field(mode, "size", "width")? == requested.width
+        && integer_field(mode, "size", "height")? == requested.height
+        && mode_refresh_millihz(mode)? == requested.refresh_millihz)
+}
+
+fn rational_millihz(refresh: Rational) -> DisplayResult<u32> {
+    if refresh.denominator == 0 {
+        return Err(DisplayError::new(
+            "invalid_request",
+            "refresh denominator cannot be zero",
+        ));
+    }
+    u32::try_from(
+        (u64::from(refresh.numerator) * 1000 + u64::from(refresh.denominator) / 2)
+            / u64::from(refresh.denominator),
+    )
+    .map_err(|_| DisplayError::new("invalid_request", "refresh rate is out of range"))
+}
+
+fn validate_output_id(id: &str) -> DisplayResult<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(DisplayError::new(
+            "invalid_request",
+            "KScreen connector identity is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn rotation_name(rotation: u16) -> Option<&'static str> {
+    match rotation {
+        1 => Some("none"),
+        2 => Some("left"),
+        4 => Some("inverted"),
+        8 => Some("right"),
+        16 => Some("flipped"),
+        32 => Some("flipped90"),
+        64 => Some("flipped180"),
+        128 => Some("flipped270"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
