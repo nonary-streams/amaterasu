@@ -2194,7 +2194,7 @@ test("focused future-stream audio editor gates writes by configuration permissio
   };
   const dom = vm.createContext({ TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) } });
-  for (const source of ["src/types.ts", "src/ui.ts", "src/settings.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/settings.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
     vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
   }
