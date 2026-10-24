@@ -493,7 +493,7 @@ fn run_linux_user_service(root: &Path, expected_digest: &str) -> PackageResult<(
             components.tick()?;
             components.health()?;
             input.refresh(root, &digest, pid, starttime)?;
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(crate::timing::TICK_INTERVAL);
         }
         input.revoke();
         drop(components);

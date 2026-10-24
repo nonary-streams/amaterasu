@@ -16,6 +16,7 @@ mod service;
 #[cfg(windows)]
 mod state_root;
 mod supervisor;
+mod timing;
 mod web_recovery;
 #[cfg(windows)]
 mod windows_service;

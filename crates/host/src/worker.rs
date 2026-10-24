@@ -83,7 +83,7 @@ fn execute_request(
         if !matches!(response, Response::Pending) {
             return Ok(response);
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(crate::timing::TICK_INTERVAL);
     }
     Err("development request did not complete within the probe window".into())
 }
@@ -195,7 +195,7 @@ pub fn serve(root: &Path, digest: &str) -> PackageResult<()> {
         components.tick()?;
         components.health()?;
         pulse(&mut heartbeat)?;
-        match input.recv_timeout(std::time::Duration::from_millis(10)) {
+        match input.recv_timeout(crate::timing::TICK_INTERVAL) {
             Ok(Ok(line)) => {
                 let reply = match serde_json::from_str::<Command>(&line) {
                     Ok(command) => {
@@ -245,7 +245,7 @@ pub fn serve_interactive(
     loop {
         components.tick()?;
         components.health()?;
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(crate::timing::TICK_INTERVAL);
     }
 }
 
@@ -277,7 +277,7 @@ fn execute_live(
                 "development request deadline elapsed; reconcile before retrying mutations",
             ));
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(crate::timing::TICK_INTERVAL);
     }
 }
 
