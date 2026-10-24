@@ -117,23 +117,29 @@ test("malformed repository choices and pagination fail closed", () => {
 test("package selection parser preserves persisted phases without exposing extra fields", () => {
   const parsed = context.Amaterasu.parsePackageSelectionStatus({
     ok: true,
+    revision: "f".repeat(64),
     active: "a".repeat(64),
     previous: null,
     pending: "b".repeat(64),
     trial: "c".repeat(64),
     highest_sequence: "18446744073709551615",
+    running: { available: true, digest: "d".repeat(64) },
     package_root: "/private/host/package-root",
   });
+  assert.equal(parsed.revision, "f".repeat(64));
   assert.equal(parsed.active, "a".repeat(64));
   assert.equal(parsed.previous, null);
   assert.equal(parsed.pending, "b".repeat(64));
   assert.equal(parsed.trial, "c".repeat(64));
   assert.equal(parsed.highestSequence, "18446744073709551615");
+  assert.deepEqual(parsed.running, { available: true, digest: "d".repeat(64) });
   assert.equal(Object.hasOwn(parsed, "package_root"), false);
   for (const reply of [
     { ok: false, code: "package_selection_unavailable" },
-    { ok: true, active: "A".repeat(64), previous: null, pending: null, trial: null, highest_sequence: "1" },
-    { ok: true, active: null, previous: null, pending: null, trial: null, highest_sequence: "18446744073709551616" },
+    { ok: true, revision: "f".repeat(64), active: "A".repeat(64), previous: null, pending: null, trial: null, highest_sequence: "1", running: { available: false } },
+    { ok: true, revision: "f".repeat(64), active: null, previous: null, pending: null, trial: null, highest_sequence: "18446744073709551616", running: { available: false } },
+    { ok: true, revision: "not-a-revision", active: null, previous: null, pending: null, trial: null, highest_sequence: "1", running: { available: false } },
+    { ok: true, revision: "f".repeat(64), active: null, previous: null, pending: null, trial: null, highest_sequence: "1", running: { available: true, digest: "/unsafe/path" } },
   ]) assert.throws(() => context.Amaterasu.parsePackageSelectionStatus(reply));
 });
 
@@ -166,11 +172,13 @@ test("repository inventory shows current selection metadata as persisted, not ru
         assert.equal(Object.keys(payload).length, 0);
         return {
           ok: true,
+          revision: "f".repeat(64),
           active: "a".repeat(64),
           previous: null,
           pending: "b".repeat(64),
           trial: null,
           highest_sequence: "4",
+          running: { available: true, digest: "d".repeat(64) },
           package_root: "/must/not/be/rendered",
         };
       }
@@ -188,6 +196,8 @@ test("repository inventory shows current selection metadata as persisted, not ru
   assert.match(content.textContent, /1 UI bundles · 1 native sets/);
   assert.match(content.textContent, /not a live runtime snapshot/);
   assert.match(content.textContent, /Active selection/);
+  assert.match(content.textContent, /Loaded in this worker/);
+  assert.match(content.textContent, /host supplies this digest from the verified package loaded in the worker/);
   assert.match(content.textContent, /Pending selection/);
   assert.match(content.textContent, /publisher: management\.runtime 2/);
   assert.match(content.textContent, /Absent from the current approved catalog/);
@@ -221,11 +231,13 @@ test("a stale package selection refresh cannot replace the newest status", async
   let finishFirst;
   const reply = (digest) => ({
     ok: true,
+    revision: "f".repeat(64),
     active: digest.repeat(64),
     previous: null,
     pending: null,
     trial: null,
     highest_sequence: "1",
+    running: { available: false },
   });
   context.Amaterasu.renderUpdates({ content, api: {
     allows: () => true,

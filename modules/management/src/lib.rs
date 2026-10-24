@@ -168,7 +168,12 @@ impl ManagedModule for ManagementModule {
                         Ok(Response::Result { payload }) => payload
                             .get("package_root")
                             .and_then(serde_json::Value::as_str)
-                            .and_then(package_selection_status)
+                            .and_then(|root| {
+                                package_selection_status_with_running(
+                                    root,
+                                    running_package_status(&self.runtime),
+                                )
+                            })
                             .unwrap_or_else(package_selection_unavailable),
                         _ => package_selection_unavailable(),
                     }
@@ -205,9 +210,9 @@ fn package_selection_status(package_root: &str) -> Option<serde_json::Value> {
         }
     }
 
-    let selection: amaterasu_package::ActivationState =
-        amaterasu_package::read_json(&root.join("selection.json")).ok()?;
+    let selection = amaterasu_package::repository::read_native_selection(root).ok()?;
     for digest in [
+        Some(selection.revision.as_str()),
         selection.active.as_deref(),
         selection.previous.as_deref(),
         selection.pending.as_deref(),
@@ -227,12 +232,46 @@ fn package_selection_status(package_root: &str) -> Option<serde_json::Value> {
 
     Some(json!({
         "ok": true,
+        "revision": selection.revision,
         "active": selection.active,
         "previous": selection.previous,
         "pending": selection.pending,
         "trial": selection.trial,
         "highest_sequence": selection.highest_sequence.to_string(),
     }))
+}
+
+fn package_selection_status_with_running(
+    package_root: &str,
+    running: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let mut status = package_selection_status(package_root)?;
+    status["running"] = running;
+    Some(status)
+}
+
+fn running_package_status(runtime: &RuntimeClient) -> serde_json::Value {
+    match runtime.send(Command::GetRunningPackageDigest {}) {
+        Ok(Response::Result { payload }) => running_package_status_value(
+            payload.get("digest").and_then(serde_json::Value::as_str),
+        ),
+        _ => running_package_status_value(None),
+    }
+}
+
+fn running_package_status_value(digest: Option<&str>) -> serde_json::Value {
+    digest
+        .filter(|digest| is_sha256(digest))
+        .map_or_else(|| json!({"available":false}), |digest| {
+            json!({"available":true,"digest":digest})
+        })
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn package_selection_unavailable() -> serde_json::Value {
@@ -492,13 +531,20 @@ mod tests {
         )
         .unwrap();
 
-        let status = package_selection_status(root.to_str().unwrap()).unwrap();
+        let status = package_selection_status_with_running(
+            root.to_str().unwrap(),
+            running_package_status_value(Some(&"e".repeat(64))),
+        )
+        .unwrap();
         assert_eq!(status["ok"], true);
+        assert!(is_sha256(status["revision"].as_str().unwrap()));
         assert_eq!(status["active"], active);
         assert_eq!(status["previous"], serde_json::Value::Null);
         assert_eq!(status["pending"], pending);
         assert_eq!(status["trial"], trial);
         assert_eq!(status["highest_sequence"], u64::MAX.to_string());
+        assert_eq!(status["running"]["available"], true);
+        assert_eq!(status["running"]["digest"], "e".repeat(64));
         assert!(status.get("package_root").is_none());
         assert!(status.get("repository_sets").is_none());
         assert!(!status.to_string().contains("private-publisher"));
@@ -509,7 +555,10 @@ mod tests {
     #[test]
     fn package_selection_status_fails_closed_for_missing_malformed_or_unsafe_state() {
         let root = temporary_package_root();
-        assert!(package_selection_status(root.to_str().unwrap()).is_none());
+        let empty = package_selection_status(root.to_str().unwrap()).unwrap();
+        assert_eq!(empty["active"], serde_json::Value::Null);
+        assert_eq!(empty["pending"], serde_json::Value::Null);
+        assert_eq!(empty["revision"], "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 
         std::fs::write(root.join("selection.json"), b"not json").unwrap();
         assert!(package_selection_status(root.to_str().unwrap()).is_none());
@@ -530,6 +579,8 @@ mod tests {
         .unwrap();
         assert!(package_selection_status(root.to_str().unwrap()).is_none());
         assert!(package_selection_status("relative/package-root").is_none());
+        assert_eq!(running_package_status_value(None), json!({"available":false}));
+        assert_eq!(running_package_status_value(Some("not-a-digest")), json!({"available":false}));
 
         std::fs::remove_dir_all(root).unwrap();
     }

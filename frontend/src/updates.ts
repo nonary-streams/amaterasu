@@ -25,11 +25,13 @@ namespace Amaterasu {
   }
 
   export interface PackageSelectionStatus {
+    revision: string;
     active: string | null;
     previous: string | null;
     pending: string | null;
     trial: string | null;
     highestSequence: string;
+    running: { available: boolean; digest: string | null };
   }
 
   export function parsePackageSelectionStatus(value: unknown): PackageSelectionStatus {
@@ -38,6 +40,8 @@ namespace Amaterasu {
     const reply = value as Record<string, unknown>;
     if (reply.ok !== true)
       throw new Error("Persisted package selection is unavailable.");
+    if (typeof reply.revision !== "string" || !/^[a-f0-9]{64}$/.test(reply.revision))
+      throw new Error("Package selection revision is invalid.");
     const digest = (key: string): string | null => {
       const candidate = reply[key];
       if (candidate === null) return null;
@@ -50,12 +54,27 @@ namespace Amaterasu {
         !/^(0|[1-9][0-9]{0,19})$/.test(highestSequence) ||
         (highestSequence.length === 20 && highestSequence > "18446744073709551615"))
       throw new Error("Package selection sequence is invalid.");
+    const runningReply = reply.running;
+    if (!runningReply || typeof runningReply !== "object" || Array.isArray(runningReply))
+      throw new Error("Running package status is invalid.");
+    const running = runningReply as Record<string, unknown>;
+    if (running.available === true) {
+      if (typeof running.digest !== "string" || !/^[a-f0-9]{64}$/.test(running.digest))
+        throw new Error("Running package digest is invalid.");
+    } else if (running.available !== false || running.digest !== undefined) {
+      throw new Error("Running package status is invalid.");
+    }
     return {
+      revision: reply.revision,
       active: digest("active"),
       previous: digest("previous"),
       pending: digest("pending"),
       trial: digest("trial"),
       highestSequence,
+      running: {
+        available: running.available as boolean,
+        digest: running.available === true ? running.digest as string : null,
+      },
     };
   }
 
@@ -142,7 +161,7 @@ namespace Amaterasu {
         el("p", "", "Approving a publisher allows it to supply any native module slot, including management, and the UI. Native modules share their worker's user privileges, while a replacement UI runs in the signed-in browser session and can use its API authority. Approval does not grant elevation. A signature proves source, not safe behavior."),
       ),
       panel("Persisted package selection", selectionArea,
-        el("p", "muted", "Read-only activation metadata, refreshed from the host package root. It describes persisted selection phases and is not a live runtime snapshot.")),
+        el("p", "muted", "Persisted phases are not a live runtime snapshot; the host reports the loaded package digest separately.")),
       panel("Read-only repository status", statusArea,
         el("p", "muted", "The authenticated API exposes repository listing only and has no approve, revoke, refresh, download, stage, install, activate, or restore actions. This page will not run shell commands.")),
       area,
@@ -241,6 +260,14 @@ namespace Amaterasu {
       };
       selectionArea.replaceChildren(
         table(
+          ["Running worker package (host report)", "Package digest"],
+          [[
+            selection.running.available ? "Loaded in this worker" : "Digest unavailable",
+            selection.running.digest ?? "Unavailable",
+          ]],
+        ),
+        el("p", "muted", "The host supplies this digest from the verified package loaded in the worker. It does not establish individual module health."),
+        table(
           ["Persisted phase", "Package digest", "Current approved catalog match"],
           [
             ["Active selection", value(selection.active), candidateMatch(selection.active)],
@@ -250,7 +277,7 @@ namespace Amaterasu {
             ["Highest accepted sequence", selection.highestSequence, "—"],
           ],
         ),
-        el("p", "muted", "Catalog matches require exact signed native manifest digest equality. They do not establish which publisher supplied the staged package, which package is running, or whether a trial passed."),
+        el("p", "muted", "Catalog matches require exact signed native manifest digest equality. They do not establish which publisher supplied the staged package or whether a trial passed."),
         ...(!selection.active ? [el("p", "muted", "No active package digest is recorded in selection metadata.")] : []),
       );
     }
