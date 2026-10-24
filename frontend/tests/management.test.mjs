@@ -437,7 +437,7 @@ test("capture consent never opens on load and requires both capture scopes", asy
     await flushUi();
 
     assert.equal(calls.some(({ route }) => route.startsWith("capture/")), false);
-    assert.match(content.textContent, new RegExp(`requires ${missingScope}`));
+    assert.match(content.textContent, new RegExp(`require[s]? ${missingScope}`));
     const choose = descendants(content, "button").find((candidate) => candidate.textContent === "Choose monitor in KDE…");
     assert.equal(choose.disabled, true);
     choose.click();
@@ -466,7 +466,7 @@ test("capture consent explicitly selects one monitor, polls to ready, and hides 
           output: { id: "opaque-output", pipewire_node: 999 },
         };
       }
-      return { ok: true };
+      return baseReply(route);
     },
   };
   module.renderHostManagement({ content, api, notify() {}, navigate() {} });
@@ -507,7 +507,7 @@ test("capture consent reports denied and expired outcomes distinctly", async () 
           return { ok: true, operation_id: payload.operation_id, source_type: "monitor", selection_state: "selecting" };
         if (route === "capture/poll_portal_selection")
           return { ok: true, operation_id: payload.operation_id, source_type: "monitor", selection_state: "failed", error };
-        return { ok: true };
+        return baseReply(route);
       },
     };
     module.renderHostManagement({ content, api, notify() {}, navigate() {} });
@@ -530,7 +530,9 @@ test("capture selection cancellation uses the caller operation ID and stops poll
       calls.push({ route, payload });
       if (route === "capture/select_portal_source")
         return { ok: true, operation_id: payload.operation_id, source_type: "monitor", selection_state: "selecting" };
-      return { ok: true, operation_id: payload.operation_id, source_type: "monitor", selection_state: "failed", error: "source_selection_cancelled" };
+      if (route === "capture/cancel_portal_selection")
+        return { ok: true, operation_id: payload.operation_id, source_type: "monitor", selection_state: "failed", error: "source_selection_cancelled" };
+      return baseReply(route);
     },
   };
   module.renderHostManagement({ content, api, notify() {}, navigate() {} });
@@ -558,7 +560,7 @@ test("unmount during desktop selection best-effort cancels without rendering pro
     async post(route, payload = {}) {
       calls.push({ route, payload });
       if (route === "capture/select_portal_source") return selection.promise;
-      return { ok: true };
+      return baseReply(route);
     },
   };
   module.renderHostManagement({ content, api, notify() {}, navigate() {} });
@@ -576,4 +578,31 @@ test("unmount during desktop selection best-effort cancels without rendering pro
   assert.equal(calls.find(({ route }) => route === "capture/cancel_portal_selection").payload.operation_id, id);
   assert.equal(timers.size, 0);
   assert.match(content.textContent, /Opening the KDE monitor consent prompt/);
+});
+
+test("unmount after ready preserves selected source for the next page", async () => {
+  const { module, observers } = loadManagement();
+  const content = connectedContent();
+  const calls = [];
+  const api = {
+    allows: () => true,
+    async post(route, payload = {}) {
+      calls.push({ route, payload });
+      if (route === "capture/select_portal_source")
+        return { ok: true, operation_id: payload.operation_id, source_type: "monitor", selection_state: "ready" };
+      return baseReply(route);
+    },
+  };
+  module.renderHostManagement({ content, api, notify() {}, navigate() {} });
+  await flushUi();
+  clickButton(content, "Choose monitor in KDE…");
+  await flushUi();
+
+  assert.match(content.textContent, /selected a monitor/);
+  assert.equal(calls.filter(({ route }) => route === "capture/poll_portal_selection").length, 0);
+  content.setConnected(false);
+  observers.at(-1).trigger();
+  await flushUi();
+
+  assert.equal(calls.filter(({ route }) => route === "capture/cancel_portal_selection").length, 0);
 });
