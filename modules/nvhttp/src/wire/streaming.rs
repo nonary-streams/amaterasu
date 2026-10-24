@@ -20,6 +20,7 @@ const LAUNCH_FIELDS: &[&str] = &[
     "surroundAudioInfo",
     "remoteControllersBitmap",
     "gcmap",
+    "gcpmap",
     "psmap",
     "gcpersist",
     "clientVrrRequested",
@@ -76,7 +77,9 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
         return Err("invalid request identifier");
     }
     optional_boolean(query, "additionalStates")?;
-    require_optional_value(query, "sops", "0", "display optimization is unsupported")?;
+    // Moonlight can request SOPS for a Desktop stream. It is a client hint;
+    // Amaterasu never changes the host display or application settings for it.
+    optional_boolean(query, "sops")?;
     require_optional_value(query, "hdrMode", "0", "HDR streaming is unsupported")?;
     require_optional_value(
         query,
@@ -109,7 +112,7 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
     optional_decimal_mask(query, "psmap", u16::MAX as u32)?;
     // This is only a client pacing capability hint; accepting it does not enable host VRR.
     optional_boolean(query, "clientVrrRequested")?;
-    for field in ["remoteControllersBitmap", "gcmap", "gcpersist"] {
+    for field in ["remoteControllersBitmap", "gcmap", "gcpmap", "gcpersist"] {
         require_optional_value(query, field, "0", "controller forwarding is unsupported")?;
     }
     require_optional_value(query, "corever", "1", "unsupported Moonlight core version")
@@ -237,6 +240,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_macos_desktop_launch_metadata_without_exposing_a_session_key() {
+        let request = parse(concat!(
+            "appid=2147483647&mode=3840x2160x120",
+            "&rikey=00000000000000000000000000000000&rikeyid=-475305041",
+            "&additionalStates=1&sops=1&localAudioPlayMode=1",
+            "&surroundAudioInfo=196610&remoteControllersBitmap=0",
+            "&gcmap=0&gcpmap=0&gcpersist=0&corever=1"
+        ))
+        .unwrap();
+        assert_eq!(request.app_id, i32::MAX as u32);
+        assert_eq!((request.width, request.height, request.fps), (3840, 2160, 120));
+        assert_eq!(request.key_id, (-475_305_041_i32) as u32);
+        assert!(request.host_audio_enabled);
+    }
+
+    #[test]
     fn accepts_full_unsigned_key_id_range_and_rejects_ambiguous_forms() {
         let request =
             parse("appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=4294967295")
@@ -305,11 +324,12 @@ mod tests {
         );
         for field in [
             "hdrMode=1",
-            "sops=1",
+            "sops=2",
             "surroundAudioInfo=393223",
             "localAudioPlayMode=2",
             "remoteControllersBitmap=1",
             "gcmap=1",
+            "gcpmap=1",
             "gcpersist=1",
             "corever=2",
             "additionalStates=2",
