@@ -4,12 +4,12 @@
 use crate::profiles::PackageProfile;
 use amaterasu_package::{
     ActivationState, BootstrapConfig, PackageResult, VerificationPolicy, create_private_directory,
-    current_target, package_directory, random_identifier, read_bounded, sha256, unix_timestamp,
-    verify_package,
+    current_target, package_directory, random_identifier, read_bounded, sha256, sha256_reader,
+    unix_timestamp, verify_package,
 };
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -26,6 +26,7 @@ pub fn prepare(
     }
     let host_executable = existing_path(host_executable, "host executable", false)?;
     validate_executable(&host_executable)?;
+    let expected_host_digest = host_executable_sha256(&host_executable)?;
     let output_directory = new_output_path(output_directory)?;
 
     let bootstrap_path = existing_path(&runtime_root.join("bootstrap.json"), "bootstrap", false)?;
@@ -76,6 +77,9 @@ pub fn prepare(
         return Err("active package is not the selected signed LinuxSession package".into());
     }
     validate_linux_session_composition(&verified.manifest.components)?;
+    if host_executable_sha256(&host_executable)? != expected_host_digest {
+        return Err("host executable changed during service artifact preparation".into());
+    }
     if sha256(&read_bounded(&selection_path, 1024 * 1024)?) != sha256(&selection_bytes)
         || sha256(&read_bounded(&bootstrap_path, 1024 * 1024)?) != sha256(&bootstrap_bytes)
     {
@@ -84,7 +88,12 @@ pub fn prepare(
         );
     }
 
-    let service_unit = render_service_unit(&host_executable, &runtime_root, active_digest)?;
+    let service_unit = render_service_unit(
+        &host_executable,
+        &runtime_root,
+        active_digest,
+        &expected_host_digest,
+    )?;
     let artifacts = [
         (UNIT_FILE, service_unit),
         ("install-user-service.sh", install_script().into()),
@@ -121,6 +130,7 @@ pub fn preflight(
     validate_private_user_directory(&state_root, uid, "runtime state root")?;
     let host_executable = existing_path(host_executable, "host executable", false)?;
     validate_executable(&host_executable)?;
+    let expected_host_digest = host_executable_sha256(&host_executable)?;
     let bundle_directory = existing_path(bundle_directory, "service bundle", true)?;
     let unit_path = existing_path(&bundle_directory.join(UNIT_FILE), "service unit", false)?;
     let unit_bytes = read_bounded(&unit_path, 64 * 1024)?;
@@ -174,11 +184,19 @@ pub fn preflight(
         return Err("active package is not the selected signed LinuxSession package".into());
     }
     validate_linux_session_composition(&verified.manifest.components)?;
-    let expected_unit = render_service_unit(&host_executable, &runtime_root, active_digest)?;
+    let expected_unit = render_service_unit(
+        &host_executable,
+        &runtime_root,
+        active_digest,
+        &expected_host_digest,
+    )?;
     if unit != expected_unit.as_str() {
         return Err(
             "service unit does not match the active signed package, root, and executable".into(),
         );
+    }
+    if host_executable_sha256(&host_executable)? != expected_host_digest {
+        return Err("host executable changed during user-service preflight".into());
     }
     if sha256(&read_bounded(&selection_path, 1024 * 1024)?) != sha256(&selection_bytes)
         || sha256(&read_bounded(&bootstrap_path, 1024 * 1024)?) != sha256(&bootstrap_bytes)
@@ -824,13 +842,42 @@ fn write_artifact_directory(output: &Path, files: &[(&str, String)]) -> PackageR
     result
 }
 
-fn render_service_unit(executable: &Path, root: &Path, digest: &str) -> PackageResult<String> {
+fn render_service_unit(
+    executable: &Path,
+    root: &Path,
+    digest: &str,
+    host_executable_digest: &str,
+) -> PackageResult<String> {
+    if !valid_digest(digest) || !valid_digest(host_executable_digest) {
+        return Err("service unit digests must be SHA-256 values".into());
+    }
     let executable = systemd_quote(executable)?;
     let root = systemd_quote(root)?;
     Ok(format!(
-        "[Unit]\nDescription=Amaterasu LinuxSession ({})\nAfter=graphical-session.target\nPartOf=graphical-session.target\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\nExecStart={executable} service-user {root} {digest}\nRestart=on-failure\nRestartSec=5s\nKillSignal=SIGTERM\nKillMode=mixed\nTimeoutStopSec=20s\n\n[Install]\nWantedBy=graphical-session.target\n",
-        &digest[..12]
+        "[Unit]\nDescription=Amaterasu LinuxSession ({})\n# HostExecutableSha256={host_executable_digest}\nAfter=graphical-session.target\nPartOf=graphical-session.target\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\nExecStart={executable} service-user {root} {digest}\nRestart=on-failure\nRestartSec=5s\nKillSignal=SIGTERM\nKillMode=mixed\nTimeoutStopSec=20s\n\n[Install]\nWantedBy=graphical-session.target\n",
+        &digest[..12],
     ))
+}
+
+/// Hashes the executable bytes without running the selected host program. This
+/// keeps preparation usable for cross-built artifacts and pins the bytes into
+/// the generated, reviewable unit for later preflight comparisons.
+fn host_executable_sha256(path: &Path) -> PackageResult<String> {
+    let before = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err("host executable must be a regular non-symlink file".into());
+    }
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let opened = file.metadata().map_err(|error| error.to_string())?;
+    if !opened.is_file() || opened.len() != before.len() {
+        return Err("host executable changed while opening for digest".into());
+    }
+    let digest = sha256_reader(file)?;
+    let after = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if after.file_type().is_symlink() || !after.is_file() || after.len() != opened.len() {
+        return Err("host executable changed while hashing".into());
+    }
+    Ok(digest)
 }
 
 fn systemd_quote(path: &Path) -> PackageResult<String> {
@@ -1070,7 +1117,7 @@ Review `amaterasu-linux-session.service`, then install it for this user with `sh
 
 The host verifies the production bootstrap, trusted package signature, active selection, and pinned digest on every start. A module tick or health failure exits the service; systemd restarts it after a fixed five-second delay and the next start re-verifies the same digest. SIGTERM triggers orderly component teardown and Linux input revocation. A forced kill is recovered by the same fresh verification and load on restart.
 
-The preflight checks that the supplied host executable exists and is executable, but it does not authenticate that executable's identity or bind it to a digest. Use a host binary from a trusted distribution and protect its filesystem path.
+The generated unit records the SHA-256 of the exact host executable bytes supplied during preparation. Preflight hashes the supplied executable again and requires the digest and path to match the unit, without executing the binary; replacing the executable or supplying a symlink fails. Review and preserve the unit together with the selected host binary. The bundle itself is not signed, and the digest does not authenticate the bundle or prevent replacement of the host file after preflight; protect both files and rerun preflight before enabling or starting.
 
 Uninstall from this same bundle with `sh uninstall-user-service.sh`. It stops and disables the user unit only after verifying that the installed unit bytes match this bundle and systemd reports known active and enablement states. A failed or unexpected state query leaves files untouched. It rechecks before removing the file and leaves runtime data and the signed package intact. If the unit was edited or replaced, uninstall refuses to remove it.
 
@@ -1095,10 +1142,12 @@ mod tests {
             Path::new("/home/user/bin/amaterasu"),
             Path::new("/home/user/.local/share/amaterasu"),
             &"a".repeat(64),
+            &"b".repeat(64),
         )
         .unwrap();
         assert!(unit.contains("ExecStart=\"/home/user/bin/amaterasu\" service-user \"/home/user/.local/share/amaterasu\""));
         assert!(unit.contains(&"a".repeat(64)));
+        assert!(unit.contains(&format!("HostExecutableSha256={}", "b".repeat(64))));
         assert!(unit.contains("WantedBy=graphical-session.target"));
         assert!(unit.contains("Restart=on-failure\nRestartSec=5s"));
         assert!(unit.contains("KillMode=mixed\nTimeoutStopSec=20s"));
@@ -1113,6 +1162,52 @@ mod tests {
             "\"/home/user/100%%/a\\\\b\\\"c\""
         );
         assert!(systemd_quote(Path::new("/home/user/line\nbreak")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_binary_digest_is_stable_and_rejects_replacement_or_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = std::env::temp_dir().join(format!(
+            "amaterasu-host-binary-digest-{}-{}",
+            std::process::id(),
+            random_identifier().unwrap()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let executable = directory.join("amaterasu");
+        fs::write(&executable, b"reviewed host executable bytes").unwrap();
+
+        let initial_digest = host_executable_sha256(&executable).unwrap();
+        assert_eq!(host_executable_sha256(&executable).unwrap(), initial_digest);
+        let prepared_unit = render_service_unit(
+            Path::new("/home/user/bin/amaterasu"),
+            Path::new("/home/user/.local/share/amaterasu"),
+            &"a".repeat(64),
+            &initial_digest,
+        )
+        .unwrap();
+
+        let replacement = directory.join("replacement");
+        fs::write(&replacement, b"replacement host executable bytes").unwrap();
+        fs::rename(replacement, &executable).unwrap();
+        let replacement_digest = host_executable_sha256(&executable).unwrap();
+        assert_ne!(replacement_digest, initial_digest);
+        assert_ne!(
+            render_service_unit(
+                Path::new("/home/user/bin/amaterasu"),
+                Path::new("/home/user/.local/share/amaterasu"),
+                &"a".repeat(64),
+                &replacement_digest,
+            )
+            .unwrap(),
+            prepared_unit
+        );
+
+        let link = directory.join("amaterasu-link");
+        symlink(&executable, &link).unwrap();
+        assert!(host_executable_sha256(&link).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1170,6 +1265,7 @@ mod tests {
             Path::new("/home/user/bin/amaterasu"),
             Path::new("/home/user/.local/share/amaterasu"),
             &"a".repeat(64),
+            &"b".repeat(64),
         )
         .unwrap();
         fs::write(bundle.join(UNIT_FILE), &unit).unwrap();
