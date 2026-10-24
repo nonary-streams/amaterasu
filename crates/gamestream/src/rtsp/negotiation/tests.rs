@@ -37,6 +37,18 @@ fn negotiation() -> Negotiation {
     .unwrap()
 }
 
+#[test]
+fn hevc_describe_marker_is_ticket_capability_scoped() {
+    let default = negotiation();
+    assert!(!validation::description(&default.capabilities).contains("sprop-parameter-sets"));
+    let mut enabled = negotiation();
+    enabled.capabilities.transport.hevc = true;
+    let description = validation::description(&enabled.capabilities);
+    assert!(description.contains("sprop-parameter-sets=AAAAAU\r\n"));
+    assert!(description.contains("H264/90000"));
+    assert!(!description.contains("HEVC/90000"));
+}
+
 fn request(method: Method, target: &str, cseq: u32, session: bool) -> Request {
     let mut headers = vec![];
     if session {

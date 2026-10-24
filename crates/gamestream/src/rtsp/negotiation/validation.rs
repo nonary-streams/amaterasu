@@ -177,7 +177,15 @@ pub(super) fn description(capabilities: &Capabilities) -> String {
         } else {
             0
         };
+    // Moonlight's HEVC selection uses this legacy SDP marker even though the
+    // video rtpmap remains H264. Emit it only for a ticket whose end-to-end
+    // capability was enabled by the host; ordinary H.264 tickets stay exact.
+    let hevc_marker = if transport.hevc {
+        "a=fmtp:96 sprop-parameter-sets=AAAAAU\r\n"
+    } else {
+        ""
+    };
     format!(
-        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Amaterasu\r\nt=0 0\r\na=x-ss-general.featureFlags:0\r\na=x-ss-general.encryptionSupported:{supported}\r\na=x-ss-general.encryptionRequested:{requested}\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\nm=audio 0 RTP/AVP 97\r\na=rtpmap:97 opus/48000/2\r\n"
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Amaterasu\r\nt=0 0\r\na=x-ss-general.featureFlags:0\r\na=x-ss-general.encryptionSupported:{supported}\r\na=x-ss-general.encryptionRequested:{requested}\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n{hevc_marker}m=audio 0 RTP/AVP 97\r\na=rtpmap:97 opus/48000/2\r\n"
     )
 }
