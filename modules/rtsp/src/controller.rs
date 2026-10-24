@@ -24,7 +24,7 @@ use record::{Job, Phase, Record, State};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     net::{IpAddr, SocketAddr, UdpSocket},
 };
 
@@ -36,6 +36,7 @@ const MAX_RECORDS: usize = 128;
 const MAX_LIVE_TICKETS: usize = 2;
 const MAX_PENDING_NETWORK: usize = 16;
 const MAX_DISPLAY_CLEANUP: usize = 16;
+const STARTUP_RECONCILIATION_TIMEOUT_MS: u64 = 45_000;
 
 struct PendingNetwork {
     connection: u64,
@@ -63,6 +64,79 @@ struct DisplayAdmission {
     call: Call,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryPhase {
+    List,
+    Stop,
+    Wait,
+    Complete,
+    Blocked,
+}
+
+struct StartupRecovery {
+    nonce: u64,
+    operation_sequence: u64,
+    deadline: u64,
+    retry_status_at: u64,
+    phase: RecoveryPhase,
+    call: Option<Call>,
+    stale_sessions: VecDeque<u64>,
+    current_session: Option<u64>,
+    error: Option<&'static str>,
+}
+
+impl StartupRecovery {
+    fn new(nonce: u64, timeout_ms: u64) -> Self {
+        Self {
+            nonce,
+            operation_sequence: 0,
+            deadline: timeout_ms,
+            retry_status_at: 0,
+            phase: RecoveryPhase::List,
+            call: None,
+            stale_sessions: VecDeque::new(),
+            current_session: None,
+            error: None,
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.phase == RecoveryPhase::Complete
+    }
+
+    #[cfg(test)]
+    fn completed(nonce: u64) -> Self {
+        let mut recovery = Self::new(nonce, STARTUP_RECONCILIATION_TIMEOUT_MS);
+        recovery.phase = RecoveryPhase::Complete;
+        recovery
+    }
+
+    fn blocked(&self) -> bool {
+        self.phase == RecoveryPhase::Blocked
+    }
+
+    fn blocked_code(&self) -> &'static str {
+        self.error.unwrap_or("startup_reconciliation_unavailable")
+    }
+
+    fn operation_id(&mut self, step: &str, session: Option<u64>) -> String {
+        self.operation_sequence = self
+            .operation_sequence
+            .checked_add(1)
+            .expect("bounded startup reconciliation");
+        match session {
+            Some(session) => format!(
+                "rtsp-recovery-{:016x}-{session:016x}-{step}-{}",
+                self.nonce, self.operation_sequence
+            ),
+            None => format!(
+                "rtsp-recovery-{:016x}-{step}-{}",
+                self.nonce, self.operation_sequence
+            ),
+        }
+    }
+}
+
 pub struct Controller {
     settings: Settings,
     bootstrap_settings: Settings,
@@ -83,6 +157,7 @@ pub struct Controller {
     job: Option<Job>,
     display_admission: Option<DisplayAdmission>,
     display_cleanup: Vec<Call>,
+    startup_recovery: StartupRecovery,
     sequence: u64,
     status_after: u64,
 }
@@ -90,6 +165,8 @@ pub struct Controller {
 impl Controller {
     pub fn new(settings: Settings) -> Result<Self, &'static str> {
         settings.validate()?;
+        let mut recovery_nonce = [0; 8];
+        getrandom::fill(&mut recovery_nonce).map_err(|_| "random_unavailable")?;
         let network_base_port = settings.default_base_port();
         let (transport, locals, local) = if settings.enabled {
             let transport = Transport::bind_all(settings.resolved_binds()?, settings.allow_remote)?;
@@ -99,6 +176,13 @@ impl Controller {
         } else {
             (None, Vec::new(), None)
         };
+        #[cfg(test)]
+        let startup_recovery = StartupRecovery::completed(u64::from_ne_bytes(recovery_nonce));
+        #[cfg(not(test))]
+        let startup_recovery = StartupRecovery::new(
+            u64::from_ne_bytes(recovery_nonce),
+            STARTUP_RECONCILIATION_TIMEOUT_MS,
+        );
         Ok(Self {
             bootstrap_settings: settings.clone(),
             active_address_family: None,
@@ -119,6 +203,7 @@ impl Controller {
             job: None,
             display_admission: None,
             display_cleanup: Vec::new(),
+            startup_recovery,
             sequence: 0,
             status_after: 0,
         })
@@ -126,6 +211,7 @@ impl Controller {
 
     pub fn tick(&mut self, runtime: &RuntimeClient, now: u64) -> ModuleResult<()> {
         self.poll_transport(now);
+        self.advance_startup_recovery(runtime, now);
         self.advance_job(runtime, now);
         self.advance_display_admission(runtime, now);
         self.advance_display_cleanup(runtime);
@@ -145,6 +231,9 @@ impl Controller {
     /// Module unload cannot drive the stream-session provider to terminal state.
     /// It only makes bounded settlement attempts; provider unload is the backstop.
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
+        if let Some(call) = self.startup_recovery.call.as_mut() {
+            call.shutdown(runtime);
+        }
         if let Some(job) = self.job.as_mut() {
             job.call.shutdown(runtime);
         }
@@ -157,6 +246,133 @@ impl Controller {
         for record in self.records.values_mut() {
             if let Some(call) = record.uncertain.as_mut() {
                 call.shutdown(runtime);
+            }
+        }
+    }
+
+    fn advance_startup_recovery(&mut self, runtime: &RuntimeClient, now: u64) {
+        let recovery = &mut self.startup_recovery;
+        if recovery.phase == RecoveryPhase::Complete {
+            return;
+        }
+        if recovery.phase == RecoveryPhase::Blocked {
+            if let Some(call) = recovery.call.as_mut() {
+                match call.poll(runtime) {
+                    Outcome::SettledFailure => recovery.call = None,
+                    Outcome::Waiting | Outcome::Uncertain | Outcome::Result(_) => {}
+                }
+            }
+            return;
+        }
+        if now >= recovery.deadline {
+            recovery.error = Some("startup_reconciliation_timeout");
+            recovery.phase = RecoveryPhase::Blocked;
+            if let Some(call) = recovery.call.as_mut() {
+                call.retry_settlement();
+            }
+            return;
+        }
+
+        if recovery.call.is_none() {
+            match recovery.phase {
+                RecoveryPhase::List => {
+                    let operation = recovery.operation_id("list", None);
+                    recovery.call = Some(Call::new(json!({"action":"status"}), operation, None));
+                }
+                RecoveryPhase::Stop => {
+                    let Some(session) = recovery.stale_sessions.pop_front() else {
+                        recovery.phase = RecoveryPhase::Complete;
+                        return;
+                    };
+                    recovery.current_session = Some(session);
+                    let operation = recovery.operation_id("stop", Some(session));
+                    recovery.call = Some(Call::new(
+                        json!({"action":"stop","session":session}),
+                        operation,
+                        None,
+                    ));
+                }
+                RecoveryPhase::Wait if now >= recovery.retry_status_at => {
+                    let Some(session) = recovery.current_session else {
+                        recovery.error = Some("startup_reconciliation_state_invalid");
+                        recovery.phase = RecoveryPhase::Blocked;
+                        return;
+                    };
+                    let operation = recovery.operation_id("status", Some(session));
+                    recovery.call = Some(Call::new(
+                        json!({"action":"status","session":session}),
+                        operation,
+                        None,
+                    ));
+                }
+                RecoveryPhase::Wait => return,
+                RecoveryPhase::Complete | RecoveryPhase::Blocked => return,
+            }
+        }
+
+        let phase = recovery.phase;
+        let outcome = recovery
+            .call
+            .as_mut()
+            .expect("startup recovery call created")
+            .poll(runtime);
+        match outcome {
+            Outcome::Waiting => {}
+            Outcome::SettledFailure | Outcome::Uncertain => {
+                recovery.error = Some("startup_reconciliation_unavailable");
+                recovery.phase = RecoveryPhase::Blocked;
+                if let Some(call) = recovery.call.as_mut() {
+                    call.retry_settlement();
+                }
+            }
+            Outcome::Result(payload) => {
+                recovery.call = None;
+                let result = match phase {
+                    RecoveryPhase::List => recovery_list(&payload).map(|sessions| {
+                        recovery.stale_sessions = sessions;
+                        recovery.phase = if recovery.stale_sessions.is_empty() {
+                            RecoveryPhase::Complete
+                        } else {
+                            RecoveryPhase::Stop
+                        };
+                    }),
+                    RecoveryPhase::Stop => {
+                        let Some(session) = recovery.current_session else {
+                            recovery.error = Some("startup_reconciliation_state_invalid");
+                            recovery.phase = RecoveryPhase::Blocked;
+                            return;
+                        };
+                        match recovery_stop_response(&payload, session) {
+                            Ok(true) => finish_recovered_session(recovery),
+                            Ok(false) => {
+                                recovery.phase = RecoveryPhase::Wait;
+                                recovery.retry_status_at = now.saturating_add(STATUS_INTERVAL_MS);
+                                Ok(())
+                            }
+                            Err(code) => Err(code),
+                        }
+                    }
+                    RecoveryPhase::Wait => {
+                        let Some(session) = recovery.current_session else {
+                            recovery.error = Some("startup_reconciliation_state_invalid");
+                            recovery.phase = RecoveryPhase::Blocked;
+                            return;
+                        };
+                        match recovery_status_response(&payload, session) {
+                            Ok(true) => finish_recovered_session(recovery),
+                            Ok(false) => {
+                                recovery.retry_status_at = now.saturating_add(STATUS_INTERVAL_MS);
+                                Ok(())
+                            }
+                            Err(code) => Err(code),
+                        }
+                    }
+                    RecoveryPhase::Complete | RecoveryPhase::Blocked => Ok(()),
+                };
+                if let Err(code) = result {
+                    recovery.error = Some(code);
+                    recovery.phase = RecoveryPhase::Blocked;
+                }
             }
         }
     }
@@ -357,6 +573,109 @@ impl Controller {
             "error": self.network_error,
         })
     }
+}
+
+fn recovery_list(payload: &Value) -> Result<VecDeque<u64>, &'static str> {
+    let sessions = payload["sessions"]
+        .as_array()
+        .ok_or("startup_reconciliation_response_invalid")?;
+    let total = payload["total"]
+        .as_u64()
+        .ok_or("startup_reconciliation_response_invalid")?;
+    let truncated = payload["truncated"]
+        .as_bool()
+        .ok_or("startup_reconciliation_response_invalid")?;
+    if payload["ok"] != true
+        || sessions.len() > 16
+        || total < sessions.len() as u64
+        || (truncated && sessions.len() != 16)
+        || (!truncated && total != sessions.len() as u64)
+    {
+        return Err("startup_reconciliation_response_invalid");
+    }
+
+    // Stream-session status is broker-scoped to this RTSP module principal and
+    // places all nonterminal records before retained terminal history. Its live
+    // record limit is two, so the bounded status page includes every orphan.
+    let mut stale = VecDeque::new();
+    let mut seen = BTreeSet::new();
+    for session in sessions {
+        let id = session["session"]
+            .as_u64()
+            .filter(|id| *id != 0)
+            .ok_or("startup_reconciliation_response_invalid")?;
+        let state = session["state"]
+            .as_str()
+            .ok_or("startup_reconciliation_response_invalid")?;
+        if !known_stream_state(state) || !seen.insert(id) {
+            return Err("startup_reconciliation_response_invalid");
+        }
+        let cleanup_clear = session["cleanup_error"].is_null();
+        let terminal = matches!(state, "stopped" | "failed" | "cancelled") && cleanup_clear;
+        if !terminal {
+            stale.push_back(id);
+        }
+    }
+    Ok(stale)
+}
+
+fn recovery_stop_response(payload: &Value, expected_session: u64) -> Result<bool, &'static str> {
+    if payload["ok"] == false && payload["code"] == "session_not_found" {
+        return Ok(true);
+    }
+    recovery_session_state(payload, expected_session)
+}
+
+fn recovery_status_response(payload: &Value, expected_session: u64) -> Result<bool, &'static str> {
+    if payload["ok"] == false && payload["code"] == "session_not_found" {
+        return Ok(true);
+    }
+    recovery_session_state(payload, expected_session)
+}
+
+fn recovery_session_state(payload: &Value, expected_session: u64) -> Result<bool, &'static str> {
+    if payload["ok"] != true || payload["session"].as_u64() != Some(expected_session) {
+        return Err("startup_reconciliation_response_invalid");
+    }
+    let state = payload["state"]
+        .as_str()
+        .ok_or("startup_reconciliation_response_invalid")?;
+    if !known_stream_state(state) {
+        return Err("startup_reconciliation_response_invalid");
+    }
+    if matches!(state, "stopped" | "failed" | "cancelled") {
+        return if payload["cleanup_error"].is_null() {
+            Ok(true)
+        } else {
+            Err("startup_reconciliation_cleanup_failed")
+        };
+    }
+    if state == "cleanup_failed" {
+        return Err("startup_reconciliation_cleanup_failed");
+    }
+    Ok(false)
+}
+
+fn known_stream_state(state: &str) -> bool {
+    matches!(
+        state,
+        "preparing"
+            | "prepared"
+            | "armed"
+            | "starting"
+            | "active"
+            | "stopping"
+            | "stopped"
+            | "failed"
+            | "cancelled"
+            | "cleanup_failed"
+    )
+}
+
+fn finish_recovered_session(recovery: &mut StartupRecovery) -> Result<(), &'static str> {
+    recovery.current_session = None;
+    recovery.phase = RecoveryPhase::Stop;
+    Ok(())
 }
 
 fn response_session(payload: &Value) -> Option<u64> {

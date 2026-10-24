@@ -25,6 +25,9 @@ struct Endpoint {
     verifier_reply: Option<Value>,
     deny_launch: bool,
     deny_settlement: bool,
+    recovery_results: VecDeque<Option<Value>>,
+    recovery_requests: BTreeMap<u64, Option<Value>>,
+    next_recovery_request: u64,
 }
 
 impl Endpoint {
@@ -37,7 +40,26 @@ impl Endpoint {
             {
                 Response::error("permission_denied", "no Launch grant")
             }
+            Command::Request { service, .. }
+                if service == "amaterasu.stream-session/1" && !self.recovery_results.is_empty() =>
+            {
+                self.next_recovery_request += 1;
+                let id = 700 + self.next_recovery_request;
+                self.recovery_requests
+                    .insert(id, self.recovery_results.pop_front().expect("nonempty"));
+                Response::Accepted { id }
+            }
             Command::Request { .. } => Response::Accepted { id: 71 },
+            Command::TakeResult { request }
+                if let Some(Some(payload)) = self.recovery_requests.get(request) =>
+            {
+                Response::Result {
+                    payload: payload.clone(),
+                }
+            }
+            Command::TakeResult { request } if self.recovery_requests.contains_key(request) => {
+                Response::Pending
+            }
             Command::TakeResult { .. } if self.verifier_reply.is_some() => Response::Result {
                 payload: self.verifier_reply.clone().unwrap(),
             },
@@ -100,6 +122,142 @@ fn open() -> Open {
         }
     }))
     .expect("valid open")
+}
+
+fn startup_recovery_pending(controller: &mut Controller, deadline: u64) {
+    controller.startup_recovery = StartupRecovery::new(0x1234, deadline);
+}
+
+fn listed_stream_sessions(sessions: Value, total: usize) -> Value {
+    json!({"ok":true,"sessions":sessions,"total":total,"truncated":false})
+}
+
+#[test]
+fn startup_reconciliation_stops_only_sessions_in_rtsp_scoped_status_and_waits_terminal() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    startup_recovery_pending(&mut controller, 45_000);
+    let mut endpoint = Endpoint {
+        recovery_results: VecDeque::from([
+            Some(listed_stream_sessions(
+                json!([{"session":23,"state":"active","cleanup_error":null}]),
+                1,
+            )),
+            Some(json!({"ok":true,"session":23,"state":"stopping","cleanup_error":null})),
+            Some(json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})),
+        ]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+
+    for now in [0, 1, 2, 3, 253, 254, 255] {
+        controller.advance_startup_recovery(&runtime, now);
+    }
+
+    assert!(controller.startup_recovery.ready());
+    let actions: Vec<_> = endpoint
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.stream-session/1" => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(actions[0]["action"], "status");
+    assert!(actions[0]["session"].is_null());
+    assert_eq!(actions[1]["action"], "stop");
+    assert_eq!(actions[1]["session"], 23);
+    assert_eq!(actions[2]["action"], "status");
+    assert_eq!(actions[2]["session"], 23);
+    assert!(!actions.iter().any(|action| action["session"] == 24));
+}
+
+#[test]
+fn startup_reconciliation_clean_status_admits_new_launch_without_stop() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled":true,
+        "bind":"127.0.0.1:0",
+        "allowed_principals":["amaterasu.nvhttp"]
+    }))
+    .unwrap();
+    let mut controller = Controller::new(settings).unwrap();
+    startup_recovery_pending(&mut controller, 45_000);
+    let mut endpoint = Endpoint {
+        recovery_results: VecDeque::from([Some(listed_stream_sessions(json!([]), 0))]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+
+    controller.advance_startup_recovery(&runtime, 0);
+    controller.advance_startup_recovery(&runtime, 1);
+
+    assert!(controller.startup_recovery.ready());
+    assert!(endpoint.commands.iter().all(|command| !matches!(command,
+        Command::Request { payload, .. } if payload["action"] == "stop")));
+    controller.open(
+        OpenRequest {
+            request: 19,
+            caller: "amaterasu.nvhttp".into(),
+            config: open(),
+            deadline: 5_000,
+            display_preflight_deadline: None,
+        },
+        2,
+        &runtime,
+        false,
+    );
+    assert!(controller.job.is_some());
+    assert!(endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.stream-session/1" && payload["action"] == "prepare")));
+}
+
+#[test]
+fn startup_reconciliation_timeout_after_partial_stop_keeps_launch_fail_closed() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    startup_recovery_pending(&mut controller, 300);
+    let mut endpoint = Endpoint {
+        recovery_results: VecDeque::from([
+            Some(listed_stream_sessions(
+                json!([{"session":23,"state":"active","cleanup_error":null}]),
+                1,
+            )),
+            Some(json!({"ok":true,"session":23,"state":"stopping","cleanup_error":null})),
+            None,
+        ]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+
+    for now in [0, 1, 2, 3, 253, 299, 300] {
+        controller.advance_startup_recovery(&runtime, now);
+    }
+
+    assert!(controller.startup_recovery.blocked());
+    assert!(!controller.startup_recovery.ready());
+    let mut config = open();
+    config.operation_id = "new-launch".into();
+    controller.open(
+        OpenRequest {
+            request: 19,
+            caller: "amaterasu.nvhttp".into(),
+            config,
+            deadline: 1_000,
+            display_preflight_deadline: None,
+        },
+        301,
+        &runtime,
+        false,
+    );
+    assert!(
+        endpoint
+            .completions
+            .iter()
+            .any(|(_, reply)| { reply["code"] == "startup_reconciliation_timeout" })
+    );
+    assert!(!endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { payload, .. } if payload["action"] == "prepare")));
 }
 
 fn record(state: State) -> Record {

@@ -91,6 +91,18 @@ impl Controller {
             deadline,
             display_preflight_deadline,
         } = input;
+        if !self.startup_recovery.ready() {
+            rpc::complete(
+                runtime,
+                request,
+                error(if self.startup_recovery.blocked() {
+                    self.startup_recovery.blocked_code()
+                } else {
+                    "startup_reconciliation_pending"
+                }),
+            );
+            return;
+        }
         if !self.settings.enabled {
             rpc::complete(runtime, request, error("disabled"));
             return;

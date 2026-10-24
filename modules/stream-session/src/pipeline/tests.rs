@@ -8,6 +8,33 @@ use super::*;
 use harness::*;
 
 #[test]
+fn session_status_list_is_scoped_to_the_exact_authenticated_caller() {
+    let mut host = Harness::new();
+    host.pipeline.settings.allowed_principals =
+        vec!["amaterasu.rtsp".into(), "another.module".into()];
+    let rtsp_session = host.response_from(1, "amaterasu.rtsp", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let foreign_session = host.response_from(2, "another.module", {
+        let mut request = prepare();
+        request["operation_id"] = json!("foreign-launch");
+        request
+    })["session"]
+        .as_u64()
+        .unwrap();
+
+    let rtsp_status = host.response_from(3, "amaterasu.rtsp", json!({"action":"status"}));
+    let foreign_status = host.response_from(4, "another.module", json!({"action":"status"}));
+
+    assert_eq!(rtsp_status["total"], 1);
+    assert_eq!(rtsp_status["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(rtsp_status["sessions"][0]["session"], rtsp_session);
+    assert_eq!(foreign_status["total"], 1);
+    assert_eq!(foreign_status["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(foreign_status["sessions"][0]["session"], foreign_session);
+}
+
+#[test]
 fn negotiated_color_reaches_video_open_unchanged() {
     let mut host = Harness::new();
     let prepared = host.response(1, prepare());
