@@ -9,8 +9,17 @@ pub trait Backend {
     fn pen_touch_supported(&self) -> bool {
         false
     }
+    /// Whether this backend accepts this event type. This may include a
+    /// constrained emulation path that is distinct from native pen/touch.
+    fn supports_pen_touch_event(&self, _device: PenTouchDevice) -> bool {
+        self.pen_touch_supported()
+    }
     /// Returns a native limit for one device type; `None` uses the common lease limit.
     fn pen_touch_max_contacts(&self, _device: PenTouchDevice) -> Option<usize> {
+        None
+    }
+    /// Maximum contacts mapped through a mouse interface, if supported.
+    fn touch_as_mouse_max_contacts(&self) -> Option<usize> {
         None
     }
     fn controller_input_supported(&self) -> bool {

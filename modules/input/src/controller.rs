@@ -26,6 +26,8 @@ struct AcquireRequest {
     controller: Option<bool>,
     gamepad: Option<GamepadProfile>,
     ds4_back_as_touchpad_click: Option<bool>,
+    // Event-delivery gate only: a backend may emulate a supported touch subset
+    // through mouse events without offering native pen or multitouch devices.
     native_pen_touch: Option<bool>,
     keyboard: Option<bool>,
     mouse: Option<bool>,
@@ -885,10 +887,12 @@ impl<B: Backend> Controller<B> {
             if !self.event_enabled(event, self.effective_device_policy()) {
                 continue;
             }
-            if matches!(event, Event::PenTouch { .. }) && !self.backend.pen_touch_supported() {
+            if let Event::PenTouch { device, .. } = event
+                && !self.backend.supports_pen_touch_event(*device)
+            {
                 return Err(InputError::new(
                     "unsupported_event",
-                    "native pen/touch input is unavailable on this backend",
+                    "this pen/touch event type is unavailable on the active backend",
                 ));
             }
             self.backend.validate(event)?;
@@ -913,9 +917,10 @@ impl<B: Backend> Controller<B> {
                             .iter()
                             .filter(|(held_device, _)| held_device == device)
                             .count();
-                        let device_limit = self
-                            .backend
-                            .pen_touch_max_contacts(*device)
+                        let device_limit = (device == &PenTouchDevice::Touch)
+                            .then(|| self.backend.touch_as_mouse_max_contacts())
+                            .flatten()
+                            .or_else(|| self.backend.pen_touch_max_contacts(*device))
                             .unwrap_or(MAX_PEN_TOUCH_CONTACTS);
                         if device_contacts >= device_limit {
                             return Err(InputError::new(
@@ -1141,6 +1146,12 @@ impl<B: Backend> Controller<B> {
     fn event_enabled(&self, event: &Event, policy: DevicePolicy) -> bool {
         event.enabled_by(policy)
             && match event {
+                Event::PenTouch {
+                    device: PenTouchDevice::Touch,
+                    ..
+                } if self.backend.touch_as_mouse_max_contacts().is_some() => {
+                    self.effective_native_pen_touch() && policy.mouse
+                }
                 Event::PenTouch { .. } => self.effective_native_pen_touch(),
                 Event::Controller { .. } => {
                     self.effective_controller_enabled() && !self.controller_cleanup_pending
@@ -1350,6 +1361,7 @@ impl<B: Backend> Controller<B> {
     fn status(&self, caller: &str, now: Instant) -> Value {
         let effective_gamepad_profile = self.backend.effective_gamepad_profile();
         let gamepad_unavailable_reason = self.backend.gamepad_unavailable_reason();
+        let touch_as_mouse_max_contacts = self.backend.touch_as_mouse_max_contacts();
         let lease = self.lease.as_ref().map(|lease| {
             let owned = lease.owner == caller;
             json!({
@@ -1370,11 +1382,12 @@ impl<B: Backend> Controller<B> {
                 "gamepad_profile":lease.gamepad_profile.as_str(),
                 "ds4_back_as_touchpad_click":lease.requested_ds4_back_as_touchpad_click.unwrap_or(lease.ds4_back_as_touchpad_click),
                 "native_pen_touch":lease.native_pen_touch,
+                "touch_as_mouse_max_contacts":touch_as_mouse_max_contacts,
                 "effective_gamepad_profile":effective_gamepad_profile,
                 "gamepad_unavailable_reason":gamepad_unavailable_reason,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"startup_cleanup_required":self.startup_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,"native_pen_touch":self.native_pen_touch,"pen_touch_supported":self.backend.pen_touch_supported(),"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"startup_cleanup_required":self.startup_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,"native_pen_touch":self.native_pen_touch,"pen_touch_supported":self.backend.pen_touch_supported(),"touch_as_mouse_max_contacts":touch_as_mouse_max_contacts,"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();
@@ -1411,6 +1424,7 @@ fn active_lease<B: Backend>(lease: &Lease, now: Instant, backend: &B) -> Value {
         "absolute_pointer": backend.absolute_pointer(),
         "controller_input": backend.controller_input_supported(),
         "pen_touch_supported": backend.pen_touch_supported(),
+        "touch_as_mouse_max_contacts": backend.touch_as_mouse_max_contacts(),
         "gamepad_profile": lease.gamepad_profile.as_str(),
         "ds4_back_as_touchpad_click": lease.ds4_back_as_touchpad_click,
         "native_pen_touch": lease.native_pen_touch,

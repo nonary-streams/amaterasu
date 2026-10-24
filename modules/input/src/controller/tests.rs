@@ -23,6 +23,7 @@ struct FakeBackend {
     supports_pen_touch: bool,
     max_pen_contacts: Option<usize>,
     max_touch_contacts: Option<usize>,
+    touch_as_mouse_max_contacts: Option<usize>,
     failed_pen_touch_events: Vec<(u32, PenTouchPhase)>,
     controller_input_supported: bool,
     effective_gamepad_profile: Option<&'static str>,
@@ -52,11 +53,18 @@ impl Backend for FakeBackend {
     fn pen_touch_supported(&self) -> bool {
         self.supports_pen_touch
     }
+    fn supports_pen_touch_event(&self, device: PenTouchDevice) -> bool {
+        self.supports_pen_touch
+            || (device == PenTouchDevice::Touch && self.touch_as_mouse_max_contacts.is_some())
+    }
     fn pen_touch_max_contacts(&self, device: PenTouchDevice) -> Option<usize> {
         match device {
             PenTouchDevice::Pen => self.max_pen_contacts,
             PenTouchDevice::Touch => self.max_touch_contacts,
         }
+    }
+    fn touch_as_mouse_max_contacts(&self) -> Option<usize> {
+        self.touch_as_mouse_max_contacts
     }
     fn controller_input_supported(&self) -> bool {
         self.controller_input_supported
@@ -3408,6 +3416,151 @@ fn pen_touch_limit_is_enforced_and_capability_is_reported_separately_from_policy
         unsupported.status("owner", Instant::now())["pen_touch_supported"],
         false
     );
+}
+
+#[test]
+fn touch_as_mouse_status_does_not_claim_native_pen_touch_support() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            touch_as_mouse_max_contacts: Some(1),
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let response = controller.handle("owner", acquire_operation(), now, &mut || Ok(()));
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["native_pen_touch"], true); // Event-delivery gate.
+    assert_eq!(response["pen_touch_supported"], false); // No native device.
+    assert_eq!(response["touch_as_mouse_max_contacts"], 1);
+    let status = controller.status("owner", now);
+    assert_eq!(status["native_pen_touch"], true); // Gate, not capability.
+    assert_eq!(status["pen_touch_supported"], false);
+    assert_eq!(status["touch_as_mouse_max_contacts"], 1);
+    assert_eq!(status["lease"]["pen_touch_supported"], false);
+    assert_eq!(status["lease"]["touch_as_mouse_max_contacts"], 1);
+
+    let lease = response["lease"].as_str().unwrap();
+    assert_eq!(
+        batch(
+            &mut controller,
+            lease,
+            vec![pen_touch(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                1,
+                2
+            )]
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        batch(
+            &mut controller,
+            lease,
+            vec![pen_touch(
+                8,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                3,
+                4
+            )]
+        )["error"]["code"],
+        "resource_exhausted"
+    );
+    assert_eq!(
+        batch(
+            &mut controller,
+            lease,
+            vec![pen_touch(
+                PEN_POINTER_ID,
+                PenTouchDevice::Pen,
+                PenTouchPhase::Down,
+                1,
+                2,
+            )]
+        )["error"]["code"],
+        "unsupported_event"
+    );
+    assert_eq!(controller.backend.trace.borrow().len(), 1);
+}
+
+#[test]
+fn native_pen_touch_setting_is_only_the_event_gate_for_mouse_emulation() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            touch_as_mouse_max_contacts: Some(1),
+            ..Default::default()
+        },
+        true,
+    );
+    controller.set_native_pen_touch(false);
+    let token = acquire(&mut controller, Instant::now());
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![pen_touch(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                1,
+                2
+            )]
+        )["ok"],
+        true
+    );
+    assert!(controller.backend.trace.borrow().is_empty());
+    assert_eq!(
+        controller.status("owner", Instant::now())["pen_touch_supported"],
+        false
+    );
+    assert_eq!(
+        controller.status("owner", Instant::now())["native_pen_touch"],
+        false
+    );
+    assert_eq!(
+        controller.status("owner", Instant::now())["touch_as_mouse_max_contacts"],
+        1
+    );
+}
+
+#[test]
+fn touch_as_mouse_still_requires_the_existing_mouse_device_policy() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            touch_as_mouse_max_contacts: Some(1),
+            ..Default::default()
+        },
+        true,
+    );
+    controller
+        .set_device_policy(
+            DevicePolicy {
+                keyboard: true,
+                mouse: false,
+            },
+            Instant::now(),
+        )
+        .unwrap();
+    let token = acquire(&mut controller, Instant::now());
+
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![pen_touch(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                1,
+                2
+            )]
+        )["ok"],
+        true
+    );
+    assert!(controller.backend.trace.borrow().is_empty());
 }
 
 #[test]

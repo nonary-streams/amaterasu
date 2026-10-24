@@ -188,14 +188,15 @@ impl Backend for LinuxCompanionBackend {
     }
 
     fn pen_touch_supported(&self) -> bool {
-        true
+        false
     }
 
-    fn pen_touch_max_contacts(&self, device: PenTouchDevice) -> Option<usize> {
-        Some(match device {
-            PenTouchDevice::Touch => 1,
-            PenTouchDevice::Pen => 0,
-        })
+    fn supports_pen_touch_event(&self, device: PenTouchDevice) -> bool {
+        device == PenTouchDevice::Touch
+    }
+
+    fn touch_as_mouse_max_contacts(&self) -> Option<usize> {
+        Some(1)
     }
 
     fn controller_input_supported(&self) -> bool {
@@ -539,12 +540,10 @@ mod tests {
     fn backend_reports_one_mouse_mapped_touch_contact_and_no_pen_contacts() {
         let backend = LinuxCompanionBackend::new("unused.sock".into());
         assert_eq!(backend.name(), "linux_uinput_companion_touch_as_mouse");
-        assert!(backend.pen_touch_supported());
-        assert_eq!(
-            backend.pen_touch_max_contacts(PenTouchDevice::Touch),
-            Some(1)
-        );
-        assert_eq!(backend.pen_touch_max_contacts(PenTouchDevice::Pen), Some(0));
+        assert!(!backend.pen_touch_supported());
+        assert!(backend.supports_pen_touch_event(PenTouchDevice::Touch));
+        assert!(!backend.supports_pen_touch_event(PenTouchDevice::Pen));
+        assert_eq!(backend.touch_as_mouse_max_contacts(), Some(1));
     }
 
     #[derive(Default)]

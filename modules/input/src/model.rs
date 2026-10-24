@@ -44,6 +44,9 @@ pub enum Operation {
         gamepad: Option<GamepadProfile>,
         #[serde(default)]
         ds4_back_as_touchpad_click: Option<bool>,
+        /// Enables delivery through the active backend. This is an event gate,
+        /// not a guarantee of native pen/touch support; some backends map a
+        /// limited touch subset to mouse input.
         #[serde(default)]
         native_pen_touch: Option<bool>,
         #[serde(default)]
