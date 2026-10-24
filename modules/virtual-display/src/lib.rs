@@ -1,6 +1,8 @@
 //! Caller-owned temporary monitors for the Sunshine Windows virtual display driver.
 mod backend;
 mod journal;
+#[cfg(target_os = "linux")]
+pub mod linux_control;
 mod manager;
 mod model;
 #[cfg_attr(not(windows), allow(dead_code))]

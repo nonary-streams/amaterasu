@@ -37,6 +37,21 @@ provides documented Win32 bindings. Native code remains trusted, not sandboxed.
 
 ## API
 
+The optional Linux `linux-libvirtualdisplay` feature directly links the pinned
+`third-party/libvirtualdisplay` CMake driver target. Initialize that submodule
+before building. `linux_control::LinuxControlClient` calls the library's original
+C++ broker client through a small exception-safe C ABI; Amaterasu does not
+reimplement its wire protocol. The default endpoint remains
+`/run/vibeshine/vkms-control.sock`, where the installed broker enforces Unix UID
+connector ownership shared with Vibeshine. Query does not grant ownership, and
+set always reaches the broker even when the observed state already matches.
+
+These direct client bindings are available independently of the Windows monitor
+manager. Linux create/remove session orchestration and stream-scoped connector
+recovery are not implemented by that manager; linking the client does not make
+those operations supported. Tests cover the original library's broker messages,
+ownership rejection and invalid targets, plus an opt-in read-only native query.
+
 Requests reject unknown fields. Examples:
 
 ```json

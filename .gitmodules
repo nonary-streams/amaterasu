@@ -1,0 +1,3 @@
+[submodule "third-party/libvirtualdisplay"]
+	path = third-party/libvirtualdisplay
+	url = https://github.com/Nonary/libvirtualdisplay.git
