@@ -161,7 +161,9 @@ impl Controller {
             return;
         }
         record.application_display_overrides = Some(json!({}));
-        record.display_policy_snapshot = Some(display_policy_snapshot(record));
+        // Desktop has no catalog application or display mutation admission.
+        // A synthetic snapshot lacks those attestations and RTSP rejects it.
+        record.display_policy_snapshot = None;
         record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
         record.stage = Stage::OpenRtsp;
     }
@@ -1907,7 +1909,13 @@ fn rtsp_response<'a>(
                     .unwrap_or(&Value::Null),
             )
         || payload["frame_limiter_executable_path"].as_str() != record.executable_path.as_deref()
-        || payload.get("display_policy_snapshot") != record.display_policy_snapshot.as_ref()
+        || payload.get("display_policy_snapshot")
+            != Some(
+                record
+                    .display_policy_snapshot
+                    .as_ref()
+                    .unwrap_or(&Value::Null),
+            )
         || payload.get("display_request")
             != Some(record.display_request.as_ref().unwrap_or(&Value::Null))
         || (record.display_request.is_some()

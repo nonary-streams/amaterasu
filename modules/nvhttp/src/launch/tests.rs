@@ -1720,6 +1720,8 @@ fn desktop_launch_carries_portal_pipewire_source_to_rtsp_without_display_preflig
         })
         .expect("desktop RTSP open request");
     assert_eq!(rtsp_open["capture"]["capture_provider"], "pipewire");
+    assert!(rtsp_open["display_policy_snapshot"].is_null());
+    assert!(rtsp_open["display_request"].is_null());
     assert_eq!(
         rtsp_open["capture"]["output"],
         PORTAL_SELECTED_SESSION_SOURCE
