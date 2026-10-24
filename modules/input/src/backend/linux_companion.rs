@@ -9,6 +9,8 @@ use amaterasu_input_companion::{InputEvent, LinuxInputClient};
 use std::collections::HashMap;
 use std::path::Path;
 
+const MAX_COMPANION_SCROLL_DELTA: i32 = 12_000;
+
 pub struct LinuxCompanionBackend {
     socket_path: String,
     client: Option<LinuxInputClient>,
@@ -208,18 +210,32 @@ impl Backend for LinuxCompanionBackend {
 
 impl LinuxCompanionBackend {
     fn scroll(&mut self, axis: Axis, amount: i16) -> InputResult<()> {
-        let event = match axis {
+        for event in scroll_events(axis, amount) {
+            self.send(event)?;
+        }
+        Ok(())
+    }
+}
+
+fn scroll_events(axis: Axis, amount: i16) -> Vec<InputEvent> {
+    let mut remaining = i32::from(amount);
+    let mut events = Vec::with_capacity(3);
+    while remaining != 0 {
+        let chunk = remaining.clamp(-MAX_COMPANION_SCROLL_DELTA, MAX_COMPANION_SCROLL_DELTA);
+        let chunk = i16::try_from(chunk).expect("bounded scroll chunk fits i16");
+        events.push(match axis {
             Axis::Vertical => InputEvent::Scroll {
-                vertical: amount,
+                vertical: chunk,
                 horizontal: 0,
             },
             Axis::Horizontal => InputEvent::Scroll {
                 vertical: 0,
-                horizontal: amount,
+                horizontal: chunk,
             },
-        };
-        self.send(event)
+        });
+        remaining -= i32::from(chunk);
     }
+    events
 }
 
 fn not_started() -> InputError {
@@ -242,4 +258,55 @@ fn companion_error(error: amaterasu_input_companion::InputError) -> InputError {
         "companion_unavailable",
         format!("Linux input companion rejected the request: {error:?}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Axis, InputEvent, scroll_events};
+
+    #[test]
+    fn high_resolution_scroll_chunks_stay_within_companion_limit_and_preserve_sum() {
+        let cases: [(i16, &[i32]); 2] = [
+            (i16::MAX, &[12_000, 12_000, 8_767]),
+            (i16::MIN, &[-12_000, -12_000, -8_768]),
+        ];
+        for (amount, expected) in cases {
+            let events = scroll_events(Axis::Vertical, amount);
+            let actual = events
+                .iter()
+                .map(|event| match event {
+                    InputEvent::Scroll {
+                        vertical,
+                        horizontal: 0,
+                    } => i32::from(*vertical),
+                    _ => panic!("vertical scroll must keep its axis"),
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(actual.as_slice(), expected);
+            assert_eq!(actual.iter().copied().sum::<i32>(), i32::from(amount));
+            assert!(actual.iter().all(|chunk| chunk.abs() <= 12_000));
+        }
+    }
+
+    #[test]
+    fn horizontal_scroll_chunks_keep_the_horizontal_axis() {
+        assert_eq!(
+            scroll_events(Axis::Horizontal, 25_000),
+            vec![
+                InputEvent::Scroll {
+                    vertical: 0,
+                    horizontal: 12_000,
+                },
+                InputEvent::Scroll {
+                    vertical: 0,
+                    horizontal: 12_000,
+                },
+                InputEvent::Scroll {
+                    vertical: 0,
+                    horizontal: 1_000,
+                },
+            ]
+        );
+    }
 }
