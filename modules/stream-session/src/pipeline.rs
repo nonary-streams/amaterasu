@@ -496,6 +496,9 @@ impl Pipeline {
                         None,
                     ),
                 );
+                record
+                    .rumble_shutdown_deadline
+                    .get_or_insert(now.saturating_add(200));
             }
             if record.state == State::Stopping && record.rumble_shutdown_deadline.is_none() {
                 input::queue_rumble_zeros(record, now);
@@ -513,9 +516,28 @@ impl Pipeline {
             {
                 input::stop_for_input_failure(record, "input_lease_expired");
             }
+            if record.state == State::Active
+                && record
+                    .rumble_shutdown_deadline
+                    .is_some_and(|deadline| now >= deadline)
+                && record
+                    .rumble_pending
+                    .values()
+                    .any(|(command, _)| command.low_frequency == 0 && command.high_frequency == 0)
+            {
+                record.rumble_stop_unconfirmed = true;
+                record.error.get_or_insert("rumble_zero_delivery_timeout");
+                record.outcome = State::Failed;
+                record.state = State::Stopping;
+                record.rumble_pending.clear();
+                record.rumble_active_until.clear();
+            }
             let Some(plane) = record.plane.as_mut() else {
                 continue;
             };
+            if record.error == Some("rumble_zero_delivery_timeout") {
+                plane.stop();
+            }
             if let Some((slot, (command, expires_at))) = record
                 .rumble_pending
                 .first_key_value()
@@ -527,6 +549,11 @@ impl Pipeline {
                         if command.low_frequency == 0 && command.high_frequency == 0 {
                             record.rumble_active_until.remove(&slot);
                             record.rumble_stop_unconfirmed = true;
+                            if !record.rumble_pending.values().any(|(pending, _)| {
+                                pending.low_frequency == 0 && pending.high_frequency == 0
+                            }) {
+                                record.rumble_shutdown_deadline = None;
+                            }
                         } else if let Some(expires_at) = expires_at {
                             record.rumble_active_until.insert(slot, expires_at);
                         }

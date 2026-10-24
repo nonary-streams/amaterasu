@@ -416,7 +416,7 @@ pub(super) fn queue_rumble_zeros(record: &mut Record, now: u64) {
             ),
         );
     }
-    if record.state == State::Stopping && !record.rumble_pending.is_empty() {
+    if !record.rumble_pending.is_empty() {
         record
             .rumble_shutdown_deadline
             .get_or_insert(now.saturating_add(200));
@@ -507,6 +507,13 @@ pub(super) fn accept_gamepad_feedback(
                 Some(expires),
             ),
         );
+        if !record
+            .rumble_pending
+            .values()
+            .any(|(pending, _)| pending.low_frequency == 0 && pending.high_frequency == 0)
+        {
+            record.rumble_shutdown_deadline = None;
+        }
     }
     Ok(())
 }
