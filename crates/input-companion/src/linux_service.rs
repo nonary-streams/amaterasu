@@ -67,7 +67,7 @@ pub struct LinuxInputService {
     host: ProcessIdentity,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<InputResult<()>>>,
-    socket_cleanup: BoundSocketPath,
+    _socket_cleanup: BoundSocketPath,
     _socket_lock: SocketPathLock,
 }
 
@@ -91,7 +91,7 @@ impl LinuxInputService {
         let stop = Arc::new(AtomicBool::new(false));
         remove_stale_socket(socket_path, &socket_lock)?;
         let listener = UnixListener::bind(socket_path).map_err(system_error)?;
-        let socket_cleanup = BoundSocketPath::capture(socket_path)?;
+        let mut socket_cleanup = BoundSocketPath::capture(socket_path)?;
         socket_cleanup.ensure_current()?;
         std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
             .map_err(system_error)?;
@@ -110,7 +110,7 @@ impl LinuxInputService {
             host,
             stop,
             join: Some(join),
-            socket_cleanup,
+            _socket_cleanup: socket_cleanup,
             _socket_lock: socket_lock,
         })
     }
