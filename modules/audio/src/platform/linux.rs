@@ -22,7 +22,7 @@ use std::{
     ptr,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Sender},
     },
     thread::{self, JoinHandle},
@@ -54,6 +54,10 @@ const AUDIO_RATE: u32 = 48_000;
 const FRAMES_PER_PACKET: u32 = 480;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const STARTUP_OPEN_MAX_ATTEMPTS: usize = 2;
+const STARTUP_OPEN_RETRY_DELAY: Duration = Duration::from_millis(200);
+const STARTUP_OPEN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1_800);
+const STARTUP_OPEN_TOTAL_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_CAPTURE_CHUNK: usize = 1024 * 1024;
 static NEXT_MANAGED_SINK: AtomicU64 = AtomicU64::new(1);
 static NEXT_SINK_CLEANUP_SLOT: AtomicU64 = AtomicU64::new(0);
@@ -320,6 +324,57 @@ fn default_route_decision(
     }
 }
 
+fn startup_open_is_side_effect_free(
+    requested: &str,
+    virtual_sink: Option<&str>,
+    host_audio_enabled: bool,
+    capture_sink_without_routing: bool,
+) -> bool {
+    virtual_sink.is_none()
+        && host_audio_enabled
+        && ((requested.is_empty() || requested == "default") || capture_sink_without_routing)
+}
+
+fn transient_startup_open_error(error: &str) -> bool {
+    matches!(
+        error,
+        "audio_server_timeout"
+            | "audio_server_unavailable"
+            | "audio_operation_timeout"
+            | "audio_backend_failed"
+            | "audio_capture_unavailable"
+    )
+}
+
+fn should_retry_startup_open(error: &str, attempt: usize, side_effect_free: bool) -> bool {
+    side_effect_free && attempt < STARTUP_OPEN_MAX_ATTEMPTS && transient_startup_open_error(error)
+}
+
+fn startup_operation_timeout(deadline: Instant, now: Instant) -> AudioResult<Duration> {
+    let remaining = deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or("audio_operation_timeout")?;
+    Ok(CONTROL_TIMEOUT.min(remaining))
+}
+
+fn wait_for_startup_open_retry(stop: &AtomicBool, deadline: Instant) -> bool {
+    let retry_deadline = Instant::now() + STARTUP_OPEN_RETRY_DELAY;
+    if retry_deadline >= deadline {
+        return false;
+    }
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let remaining = retry_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::park_timeout(remaining.min(Duration::from_millis(10)));
+    }
+}
+
 #[derive(Default)]
 struct SinkListResult {
     completed: bool,
@@ -387,6 +442,10 @@ struct PulseClient {
 
 impl PulseClient {
     fn connect() -> AudioResult<Self> {
+        Self::connect_with_timeout(CONTROL_TIMEOUT)
+    }
+
+    fn connect_with_timeout(timeout: Duration) -> AudioResult<Self> {
         let name = CString::new("Amaterasu Audio").expect("static client name contains no NUL");
         // SAFETY: all returned handles are checked and then owned by PulseClient.
         let mainloop = unsafe { pa_mainloop_new() };
@@ -422,7 +481,7 @@ impl PulseClient {
         {
             return Err(context_connection_error(context));
         }
-        client.wait_until_connected(CONTROL_TIMEOUT)?;
+        client.wait_until_connected(timeout)?;
         Ok(client)
     }
 
@@ -503,11 +562,20 @@ impl PulseClient {
         pointer: *mut PaOperation,
         callback_state: Box<T>,
     ) -> AudioResult<Box<T>> {
+        self.wait_operation_with_timeout(pointer, callback_state, CONTROL_TIMEOUT)
+    }
+
+    fn wait_operation_with_timeout<T: 'static>(
+        &mut self,
+        pointer: *mut PaOperation,
+        callback_state: Box<T>,
+        timeout: Duration,
+    ) -> AudioResult<Box<T>> {
         if pointer.is_null() {
             return Err("audio_backend_failed");
         }
         let operation = Operation(pointer);
-        let result = self.wait_until(CONTROL_TIMEOUT, || {
+        let result = self.wait_until(timeout, || {
             // SAFETY: operation guard keeps the operation alive until this call ends.
             match unsafe { pa_operation_get_state(operation.0) } {
                 PA_OPERATION_DONE => Some(Ok(())),
@@ -526,7 +594,11 @@ impl PulseClient {
     }
 
     fn default_sink(&mut self) -> AudioResult<Option<String>> {
-        let result = self.server_info()?;
+        self.default_sink_with_timeout(CONTROL_TIMEOUT)
+    }
+
+    fn default_sink_with_timeout(&mut self, timeout: Duration) -> AudioResult<Option<String>> {
+        let result = self.server_info_with_timeout(timeout)?;
         Ok(result.default_sink)
     }
 
@@ -596,6 +668,13 @@ impl PulseClient {
     }
 
     fn server_info(&mut self) -> AudioResult<Box<ServerInfoResult>> {
+        self.server_info_with_timeout(CONTROL_TIMEOUT)
+    }
+
+    fn server_info_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> AudioResult<Box<ServerInfoResult>> {
         let mut result = Box::new(ServerInfoResult::default());
         // SAFETY: callback userdata points to heap-owned result state retained
         // until completion or until this client's mainloop has been destroyed.
@@ -606,7 +685,7 @@ impl PulseClient {
                 (&mut *result as *mut ServerInfoResult).cast(),
             )
         };
-        let result = self.wait_operation(operation, result)?;
+        let result = self.wait_operation_with_timeout(operation, result, timeout)?;
         if result.failed || !result.completed {
             return Err("audio_backend_failed");
         }
@@ -614,6 +693,10 @@ impl PulseClient {
     }
 
     fn sinks(&mut self) -> AudioResult<Vec<Sink>> {
+        self.sinks_with_timeout(CONTROL_TIMEOUT)
+    }
+
+    fn sinks_with_timeout(&mut self, timeout: Duration) -> AudioResult<Vec<Sink>> {
         let mut result = Box::new(SinkListResult::default());
         // SAFETY: callback userdata points to heap-owned result state retained
         // until completion or until this client's mainloop has been destroyed.
@@ -624,7 +707,7 @@ impl PulseClient {
                 (&mut *result as *mut SinkListResult).cast(),
             )
         };
-        let result = self.wait_operation(operation, result)?;
+        let result = self.wait_operation_with_timeout(operation, result, timeout)?;
         if result.failed || !result.completed {
             return Err("audio_backend_failed");
         }
@@ -702,6 +785,16 @@ impl PulseClient {
         channels: u32,
         positions: &[c_int],
     ) -> AudioResult<PulseStream> {
+        self.record_stream_with_timeout(source, channels, positions, CONTROL_TIMEOUT)
+    }
+
+    fn record_stream_with_timeout(
+        &mut self,
+        source: &str,
+        channels: u32,
+        positions: &[c_int],
+        timeout: Duration,
+    ) -> AudioResult<PulseStream> {
         if positions.len() != channels as usize || !(1..=8).contains(&channels) {
             return Err("unsupported_channel_layout");
         }
@@ -734,7 +827,7 @@ impl PulseClient {
         if unsafe { pa_stream_connect_record(capture.0, source.as_ptr(), &attributes, 0) } < 0 {
             return Err("audio_capture_unavailable");
         }
-        self.wait_until(CONTROL_TIMEOUT, || {
+        self.wait_until(timeout, || {
             // SAFETY: PulseStream guard owns a live stream until setup completes.
             match unsafe { pa_stream_get_state(capture.0) } {
                 PA_STREAM_READY => Some(Ok(())),
@@ -1936,6 +2029,68 @@ pub struct Capture {
 }
 
 impl Capture {
+    pub fn open_with_bounded_retry(
+        requested: &str,
+        virtual_sink: Option<&str>,
+        channels: Option<u32>,
+        capture_format: Option<PcmCaptureFormat>,
+        host_audio_enabled: bool,
+        capture_sink_without_routing: bool,
+        stop: &AtomicBool,
+    ) -> AudioResult<Self> {
+        let side_effect_free = startup_open_is_side_effect_free(
+            requested,
+            virtual_sink,
+            host_audio_enabled,
+            capture_sink_without_routing,
+        );
+        if stop.load(Ordering::Acquire) {
+            return Err("audio_worker_stopped");
+        }
+        if !side_effect_free {
+            return Self::open(
+                requested,
+                virtual_sink,
+                channels,
+                capture_format,
+                host_audio_enabled,
+                capture_sink_without_routing,
+            );
+        }
+        let startup_deadline = Instant::now() + STARTUP_OPEN_TOTAL_TIMEOUT;
+        for attempt in 1..=STARTUP_OPEN_MAX_ATTEMPTS {
+            if stop.load(Ordering::Acquire) {
+                return Err("audio_worker_stopped");
+            }
+            let attempt_deadline =
+                (Instant::now() + STARTUP_OPEN_ATTEMPT_TIMEOUT).min(startup_deadline);
+            match Self::open_with_deadline(
+                requested,
+                virtual_sink,
+                channels,
+                capture_format,
+                host_audio_enabled,
+                capture_sink_without_routing,
+                Some(attempt_deadline),
+            ) {
+                Ok(capture) => return Ok(capture),
+                Err(error) if should_retry_startup_open(error, attempt, side_effect_free) => {
+                    if stop.load(Ordering::Acquire) {
+                        return Err("audio_worker_stopped");
+                    }
+                    if !wait_for_startup_open_retry(stop, startup_deadline) {
+                        if stop.load(Ordering::Acquire) {
+                            return Err("audio_worker_stopped");
+                        }
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err("audio_backend_failed")
+    }
+
     pub fn open(
         requested: &str,
         virtual_sink: Option<&str>,
@@ -1944,12 +2099,41 @@ impl Capture {
         host_audio_enabled: bool,
         capture_sink_without_routing: bool,
     ) -> AudioResult<Self> {
+        Self::open_with_deadline(
+            requested,
+            virtual_sink,
+            channels,
+            capture_format,
+            host_audio_enabled,
+            capture_sink_without_routing,
+            None,
+        )
+    }
+
+    fn open_with_deadline(
+        requested: &str,
+        virtual_sink: Option<&str>,
+        channels: Option<u32>,
+        capture_format: Option<PcmCaptureFormat>,
+        host_audio_enabled: bool,
+        capture_sink_without_routing: bool,
+        deadline: Option<Instant>,
+    ) -> AudioResult<Self> {
         if requested.len() > 4096 || requested.chars().any(char::is_control) {
             return Err("invalid_endpoint");
         }
-        let mut client = PulseClient::connect()?;
-        let default_sink = client.default_sink()?;
-        let mut sinks = client.sinks()?;
+        let mut client = PulseClient::connect_with_timeout(startup_operation_timeout(
+            deadline.unwrap_or_else(|| Instant::now() + CONTROL_TIMEOUT),
+            Instant::now(),
+        )?)?;
+        let default_sink = client.default_sink_with_timeout(startup_operation_timeout(
+            deadline.unwrap_or_else(|| Instant::now() + CONTROL_TIMEOUT),
+            Instant::now(),
+        )?)?;
+        let mut sinks = client.sinks_with_timeout(startup_operation_timeout(
+            deadline.unwrap_or_else(|| Instant::now() + CONTROL_TIMEOUT),
+            Instant::now(),
+        )?)?;
         let mut managed_sink = None;
         let (selected, is_virtual, virtual_channels, effective_capture_only) =
             if let Some(selector) = virtual_sink {
@@ -2002,18 +2186,24 @@ impl Capture {
             is_virtual,
         )?;
 
-        open_selected(CaptureSetup {
-            client,
-            selected,
-            format,
-            channel_positions,
-            virtual_channels,
-            capture_format,
-            follow_console_default: follows_default,
-            capture_sink_without_routing: effective_capture_only,
-            route_lease,
-            virtual_sink_lease: managed_sink,
-        })
+        open_selected_with_timeout(
+            CaptureSetup {
+                client,
+                selected,
+                format,
+                channel_positions,
+                virtual_channels,
+                capture_format,
+                follow_console_default: follows_default,
+                capture_sink_without_routing: effective_capture_only,
+                route_lease,
+                virtual_sink_lease: managed_sink,
+            },
+            startup_operation_timeout(
+                deadline.unwrap_or_else(|| Instant::now() + CONTROL_TIMEOUT),
+                Instant::now(),
+            )?,
+        )
     }
 
     pub fn reopen(config: &RecoveryConfig) -> AudioResult<Self> {
@@ -2190,6 +2380,10 @@ struct CaptureSetup {
 }
 
 fn open_selected(setup: CaptureSetup) -> AudioResult<Capture> {
+    open_selected_with_timeout(setup, CONTROL_TIMEOUT)
+}
+
+fn open_selected_with_timeout(setup: CaptureSetup, timeout: Duration) -> AudioResult<Capture> {
     let CaptureSetup {
         mut client,
         selected,
@@ -2202,10 +2396,11 @@ fn open_selected(setup: CaptureSetup) -> AudioResult<Capture> {
         route_lease,
         virtual_sink_lease,
     } = setup;
-    let stream = client.record_stream(
+    let stream = client.record_stream_with_timeout(
         &selected.monitor_source,
         format.channels,
         &channel_positions,
+        timeout,
     )?;
     let now = Instant::now();
     let recovery_config = RecoveryConfig {
@@ -2513,6 +2708,94 @@ mod tests {
             default_route_decision(Some(Ok(None)), "sink.selected"),
             DefaultRouteDecision::Changed
         );
+    }
+
+    #[test]
+    fn startup_open_retries_only_capture_modes_that_skip_route_and_sink_mutation() {
+        assert!(startup_open_is_side_effect_free(
+            "default", None, true, false
+        ));
+        assert!(startup_open_is_side_effect_free(
+            "speaker.fixed",
+            None,
+            true,
+            true
+        ));
+        assert!(!startup_open_is_side_effect_free(
+            "speaker.fixed",
+            None,
+            true,
+            false
+        ));
+        assert!(!startup_open_is_side_effect_free(
+            "default", None, false, false
+        ));
+        assert!(!startup_open_is_side_effect_free(
+            "default",
+            Some("virtual.sink"),
+            true,
+            false
+        ));
+
+        assert_eq!(
+            route_plan("speaker.fixed", Some("other"), false, false, false),
+            RoutePlan::Skip
+        );
+        assert_eq!(
+            route_plan("speaker.fixed", Some("other"), true, true, false),
+            RoutePlan::Skip
+        );
+    }
+
+    #[test]
+    fn startup_open_retries_only_known_transient_pulse_failures_and_is_bounded() {
+        for error in [
+            "audio_server_timeout",
+            "audio_server_unavailable",
+            "audio_operation_timeout",
+            "audio_backend_failed",
+            "audio_capture_unavailable",
+        ] {
+            assert!(should_retry_startup_open(error, 1, true), "{error}");
+            assert!(!should_retry_startup_open(error, 2, true), "{error}");
+            assert!(!should_retry_startup_open(error, 1, false), "{error}");
+        }
+        for error in [
+            "audio_server_access_denied",
+            "audio_server_configuration_invalid",
+            "endpoint_not_found",
+            "invalid_capture_format",
+        ] {
+            assert!(!should_retry_startup_open(error, 1, true), "{error}");
+        }
+    }
+
+    #[test]
+    fn startup_open_operations_share_a_bounded_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            startup_operation_timeout(now + Duration::from_secs(2), now),
+            Ok(Duration::from_secs(2))
+        );
+        assert_eq!(
+            startup_operation_timeout(now + Duration::from_secs(10), now),
+            Ok(CONTROL_TIMEOUT)
+        );
+        assert_eq!(
+            startup_operation_timeout(now, now),
+            Err("audio_operation_timeout")
+        );
+    }
+
+    #[test]
+    fn startup_retry_budget_stays_inside_the_resource_open_rpc_timeout() {
+        const RESOURCE_OPEN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+        let max_attempts_and_delay =
+            STARTUP_OPEN_ATTEMPT_TIMEOUT + STARTUP_OPEN_RETRY_DELAY + STARTUP_OPEN_ATTEMPT_TIMEOUT;
+
+        assert!(max_attempts_and_delay < RESOURCE_OPEN_RPC_TIMEOUT);
+        assert!(STARTUP_OPEN_TOTAL_TIMEOUT < RESOURCE_OPEN_RPC_TIMEOUT);
+        assert!(max_attempts_and_delay <= STARTUP_OPEN_TOTAL_TIMEOUT);
     }
 
     #[test]

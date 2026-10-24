@@ -130,14 +130,26 @@ impl Worker {
         let thread = thread::Builder::new()
             .name("amaterasu-loopback".into())
             .spawn(move || {
-                let capture = match platform::Capture::open(
+                #[cfg(target_os = "linux")]
+                let opened = platform::Capture::open_with_bounded_retry(
                     &endpoint,
                     virtual_sink.as_deref(),
                     channels,
                     capture_format,
                     host_audio_enabled,
                     capture_sink_without_routing,
-                ) {
+                    &thread_stop,
+                );
+                #[cfg(not(target_os = "linux"))]
+                let opened = platform::Capture::open(
+                    &endpoint,
+                    virtual_sink.as_deref(),
+                    channels,
+                    capture_format,
+                    host_audio_enabled,
+                    capture_sink_without_routing,
+                );
+                let capture = match opened {
                     Ok(capture) => capture,
                     Err(error) => {
                         let _ = ready.send(Err(error));

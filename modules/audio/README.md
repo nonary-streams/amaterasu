@@ -30,6 +30,10 @@ changes; capture-only opens pin the initially selected endpoint. Windows uses
 the Console role; Linux uses the Pulse server's default sink.
 On Linux, capture reads the selected render sink's monitor source through the
 user's existing PulseAudio-compatible server. It never autospawns that server.
+The host must run with the interactive user's libpulse server selection and
+session environment. The module does not discover or switch to another desktop
+session's Pulse server; a host started with a service or stale environment may
+connect to a different server or fail to connect.
 The default capture uses 48 kHz float PCM and keeps the monitor's actual channel
 layout. The optional `capture_format` requests 48 kHz float PCM with 2, 6, or 8
 channels; the server performs any channel conversion. Unsupported monitor layouts
@@ -44,6 +48,15 @@ restore the previous default only while it still points at the selected sink;
 default and capture-only opens do not change the default. Failed restoration
 remains visible in `audio_route_restore_pending` and is retried in the
 background. Linux does not install or require a Steam audio driver.
+Transient Pulse connection, query, and monitor stream setup failures receive at
+most one startup retry only for ordinary default or capture-only opens. Those
+attempts do not assign routes or create virtual sinks. Routed explicit and
+virtual opens keep their existing single-attempt behavior; permanent endpoint,
+format, or access errors remain visible immediately. Each Pulse operation wait
+is capped by the bounded startup attempt, each open attempt at 1.8 seconds, and
+the total startup retry window at four seconds; the retry delay is 200 ms. This
+keeps both attempts and the delay below the stream-session resource-open RPC's
+five-second deadline.
 Enumeration is limited to 64 endpoints and a 12,000-byte metadata reply. On
 Windows, opening an explicit endpoint with `capture_sink_without_routing` omitted
 or false temporarily assigns that endpoint as the Console, Multimedia, and
