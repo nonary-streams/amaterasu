@@ -11,6 +11,7 @@ class FakeElement {
     this.listeners = new Map();
     this.isConnected = false;
     this.value = "";
+    this._text = "";
   }
 
   setConnected(connected) {
@@ -39,18 +40,27 @@ class FakeElement {
   setAttribute() {}
 
   click() {
+    if (this.disabled || this.hidden) return;
     this.listeners.get("click")?.();
   }
 
   get textContent() {
-    return this.children
+    return this._text + this.children
       .map((child) => typeof child === "string" ? child : child?.textContent ?? "")
       .join("");
+  }
+
+  set textContent(value) {
+    this.replaceChildren();
+    this._text = String(value);
   }
 }
 
 function loadManagement() {
   const storageOperations = [];
+  const timers = new Map();
+  const observers = [];
+  let nextTimer = 1;
   const storage = {
     getItem(key) { storageOperations.push(["get", key]); return null; },
     setItem(key, value) { storageOperations.push(["set", key, value]); },
@@ -59,9 +69,21 @@ function loadManagement() {
   };
   const context = vm.createContext({
     document: { createElement: (tag) => new FakeElement(tag) },
+    MutationObserver: class {
+      constructor(callback) { this.callback = callback; observers.push(this); }
+      observe() {}
+      disconnect() { this.disconnected = true; }
+      trigger() { if (!this.disconnected) this.callback(); }
+    },
     localStorage: storage,
     sessionStorage: storage,
-    window: { localStorage: storage, sessionStorage: storage },
+    window: {
+      localStorage: storage,
+      sessionStorage: storage,
+      crypto: { getRandomValues(bytes) { for (let index = 0; index < bytes.length; index += 1) bytes[index] = index + 1; return bytes; } },
+      setTimeout(callback) { const id = nextTimer++; timers.set(id, callback); return id; },
+      clearTimeout(id) { timers.delete(id); },
+    },
     Date,
     Error,
     Number,
@@ -79,7 +101,20 @@ function loadManagement() {
     if (source === "src/ui.ts")
       vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
   }
-  return { module: context.Amaterasu, storageOperations };
+  return {
+    module: context.Amaterasu,
+    storageOperations,
+    timers,
+    observers,
+    runNextTimer() {
+      const next = timers.entries().next().value;
+      if (!next) return false;
+      const [id, callback] = next;
+      timers.delete(id);
+      callback();
+      return true;
+    },
+  };
 }
 
 function descendants(node, tagName) {
@@ -377,4 +412,162 @@ test("an approval finishing after unmount does not refresh or notify the old pag
   assert.equal(calls.filter((call) => call.route === "pairing/pending").length, 1);
   assert.deepEqual(notifications, []);
   assert.doesNotMatch(content.textContent, /7824/);
+});
+
+test("capture consent never opens on load and requires both capture scopes", async () => {
+  for (const missingScope of ["capture.write", "capture.read"]) {
+    const { module } = loadManagement();
+    const content = connectedContent();
+    const calls = [];
+    module.renderHostManagement({
+      content,
+      api: {
+        allows(scope) { return scope !== missingScope; },
+        async post(route, payload) { calls.push({ route, payload }); return baseReply(route); },
+      },
+      notify() {},
+      navigate() {},
+    });
+    await flushUi();
+
+    assert.equal(calls.some(({ route }) => route.startsWith("capture/")), false);
+    assert.match(content.textContent, new RegExp(`requires ${missingScope}`));
+    const choose = descendants(content, "button").find((candidate) => candidate.textContent === "Choose monitor in KDE…");
+    assert.equal(choose.disabled, true);
+    choose.click();
+    assert.equal(calls.some(({ route }) => route.startsWith("capture/")), false);
+  }
+});
+
+test("capture consent explicitly selects one monitor, polls to ready, and hides provider handles", async () => {
+  const { module, runNextTimer, storageOperations } = loadManagement();
+  const content = connectedContent();
+  const calls = [];
+  let pollCount = 0;
+  const api = {
+    allows: () => true,
+    async post(route, payload = {}) {
+      calls.push({ route, payload });
+      if (route === "capture/select_portal_source")
+        return { ok: true, operation_id: payload.operation_id, source_type: "monitor", selection_state: "selecting" };
+      if (route === "capture/poll_portal_selection") {
+        pollCount += 1;
+        return {
+          ok: true,
+          operation_id: payload.operation_id,
+          source_type: "monitor",
+          selection_state: pollCount === 1 ? "ready" : "selecting",
+          output: { id: "opaque-output", pipewire_node: 999 },
+        };
+      }
+      return { ok: true };
+    },
+  };
+  module.renderHostManagement({ content, api, notify() {}, navigate() {} });
+  await flushUi();
+  assert.equal(calls.some(({ route }) => route.startsWith("capture/")), false);
+  const choose = descendants(content, "button").find((candidate) => candidate.textContent === "Choose monitor in KDE…");
+  choose.click();
+  choose.click();
+  await flushUi();
+
+  const selections = calls.filter(({ route }) => route === "capture/select_portal_source");
+  assert.equal(selections.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(selections[0].payload)), {
+    source_type: "monitor",
+    operation_id: "desktop-0102030405060708090a0b0c0d0e0f10",
+  });
+  assert.equal(runNextTimer(), true);
+  await flushUi();
+  assert.equal(calls.filter(({ route }) => route === "capture/poll_portal_selection").length, 1);
+  assert.equal(calls.filter(({ route }) => route === "capture/cancel_portal_selection").length, 0);
+  assert.match(content.textContent, /Launch Moonlight Desktop promptly/);
+  assert.match(content.textContent, /selection only, not a running stream/);
+  assert.doesNotMatch(content.textContent, /999|opaque-output|pipewire_node/);
+  assert.equal(storageOperations.length, 0);
+});
+
+test("capture consent reports denied and expired outcomes distinctly", async () => {
+  for (const [error, expected] of [
+    ["source_selection_denied", /KDE denied desktop capture consent/],
+    ["source_selection_expired", /consent request expired/],
+  ]) {
+    const { module, runNextTimer } = loadManagement();
+    const content = connectedContent();
+    const api = {
+      allows: () => true,
+      async post(route, payload = {}) {
+        if (route === "capture/select_portal_source")
+          return { ok: true, operation_id: payload.operation_id, source_type: "monitor", selection_state: "selecting" };
+        if (route === "capture/poll_portal_selection")
+          return { ok: true, operation_id: payload.operation_id, source_type: "monitor", selection_state: "failed", error };
+        return { ok: true };
+      },
+    };
+    module.renderHostManagement({ content, api, notify() {}, navigate() {} });
+    await flushUi();
+    clickButton(content, "Choose monitor in KDE…");
+    await flushUi();
+    assert.equal(runNextTimer(), true);
+    await flushUi();
+    assert.match(content.textContent, expected);
+  }
+});
+
+test("capture selection cancellation uses the caller operation ID and stops polling", async () => {
+  const { module, runNextTimer, timers } = loadManagement();
+  const content = connectedContent();
+  const calls = [];
+  const api = {
+    allows: () => true,
+    async post(route, payload = {}) {
+      calls.push({ route, payload });
+      if (route === "capture/select_portal_source")
+        return { ok: true, operation_id: payload.operation_id, source_type: "monitor", selection_state: "selecting" };
+      return { ok: true, operation_id: payload.operation_id, source_type: "monitor", selection_state: "failed", error: "source_selection_cancelled" };
+    },
+  };
+  module.renderHostManagement({ content, api, notify() {}, navigate() {} });
+  await flushUi();
+  clickButton(content, "Choose monitor in KDE…");
+  await flushUi();
+  const selection = calls.find(({ route }) => route === "capture/select_portal_source");
+  clickButton(content, "Cancel selection");
+  await flushUi();
+
+  const cancellation = calls.find(({ route }) => route === "capture/cancel_portal_selection");
+  assert.equal(cancellation.payload.operation_id, selection.payload.operation_id);
+  assert.equal(timers.size, 0);
+  assert.match(content.textContent, /Monitor selection was cancelled/);
+  assert.equal(runNextTimer(), false);
+});
+
+test("unmount during desktop selection best-effort cancels without rendering provider data", async () => {
+  const { module, observers, timers } = loadManagement();
+  const content = connectedContent();
+  const selection = defer();
+  const calls = [];
+  const api = {
+    allows: () => true,
+    async post(route, payload = {}) {
+      calls.push({ route, payload });
+      if (route === "capture/select_portal_source") return selection.promise;
+      return { ok: true };
+    },
+  };
+  module.renderHostManagement({ content, api, notify() {}, navigate() {} });
+  await flushUi();
+  clickButton(content, "Choose monitor in KDE…");
+  await Promise.resolve();
+  const id = calls.find(({ route }) => route === "capture/select_portal_source").payload.operation_id;
+  content.setConnected(false);
+  observers.at(-1).trigger();
+  await flushUi();
+  selection.resolve({ ok: true, operation_id: id, source_type: "monitor", selection_state: "selecting" });
+  await flushUi();
+
+  assert.equal(calls.filter(({ route }) => route === "capture/cancel_portal_selection").length, 1);
+  assert.equal(calls.find(({ route }) => route === "capture/cancel_portal_selection").payload.operation_id, id);
+  assert.equal(timers.size, 0);
+  assert.match(content.textContent, /Opening the KDE monitor consent prompt/);
 });
