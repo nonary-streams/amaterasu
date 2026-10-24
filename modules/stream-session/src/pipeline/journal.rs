@@ -271,7 +271,7 @@ impl LifecycleJournal {
     }
 
     pub fn validate_saved_response(
-        &self,
+        &mut self,
         payload: &Value,
         document: Document,
     ) -> Result<(), &'static str> {

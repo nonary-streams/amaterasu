@@ -16,6 +16,7 @@ impl Pipeline {
         }
         if !job.cleanup
             && record.state != State::Stopping
+            && job.step != Step::PersistJournal
             && job
                 .request
                 .is_some_and(|request| !rpc::active(send, request))
@@ -168,7 +169,7 @@ impl Pipeline {
                 }
             }
         }
-        if job.cleanup {
+        if job.cleanup && job.step != Step::PersistJournal {
             let Some(step) = job.next_cleanup(record) else {
                 return self.finish_cleanup(record, job, send);
             };
@@ -230,11 +231,12 @@ impl Pipeline {
                 return true;
             }
         };
-        let parent = if job.cleanup || record.state == State::Stopping {
-            None
-        } else {
-            job.request
-        };
+        let parent =
+            if job.cleanup || record.state == State::Stopping || job.step == Step::PersistJournal {
+                None
+            } else {
+                job.request
+            };
         let operation_id = job
             .journal_operation_id
             .clone()

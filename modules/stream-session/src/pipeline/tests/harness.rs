@@ -183,6 +183,11 @@ impl Broker {
             .is_some_and(|allocation| allocation.state == "stopped" && allocation.leases.is_empty())
     }
 
+    pub fn has_session_key(&self, key: &str) -> bool {
+        self.allocations
+            .contains_key(&("amaterasu.session/1".into(), key.into()))
+    }
+
     pub fn send(&mut self, command: Command) -> ModuleResult<Response> {
         self.commands.push(command.clone());
         match command {
@@ -1019,7 +1024,18 @@ impl Harness {
                 return value;
             }
         }
-        panic!("workflow did not complete");
+        let recent = self
+            .broker
+            .calls
+            .iter()
+            .rev()
+            .take(12)
+            .map(|call| format!("{}/{}", call.service, call.payload["action"]))
+            .collect::<Vec<_>>();
+        panic!(
+            "workflow did not complete at tick {}; state revision {}; recent calls {recent:?}",
+            self.now, self.broker.state_revision
+        );
     }
     pub fn idle(&mut self) {
         for _ in 0..150 {

@@ -838,7 +838,8 @@ fn shutdown_after_confirmed_stop_flushes_queued_events_and_end() {
         host.response(3, json!({"action":"stop","session":session}))["state"],
         "stopped"
     );
-    assert!(host.broker.history_ends.is_empty());
+    // Journal confirmation can let the history pump send End before the stop
+    // reply; shutdown must still leave exactly one End.
 
     let settled = {
         let (pipeline, broker) = (&mut host.pipeline, &mut host.broker);

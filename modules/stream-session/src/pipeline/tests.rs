@@ -1168,6 +1168,11 @@ fn cancelled_parent_and_lost_success_completion_release_allocations() {
     host.broker.cancel_parent(1);
     host.idle();
     assert_eq!(host.broker.live_components(), 0);
+    assert_eq!(host.broker.state_revision, 2);
+    assert_eq!(
+        host.broker.state_value.as_ref().unwrap()["entries"],
+        json!({})
+    );
     assert!(
         host.pipeline
             .records
