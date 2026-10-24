@@ -208,6 +208,7 @@ fn startup_reconciliation_clean_status_admits_new_launch_without_stop() {
         false,
     );
     assert!(controller.job.is_some());
+    controller.advance_job(&runtime, 3);
     assert!(endpoint.commands.iter().any(|command| matches!(command,
         Command::Request { service, payload, .. }
             if service == "amaterasu.stream-session/1" && payload["action"] == "prepare")));
