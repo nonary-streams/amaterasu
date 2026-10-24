@@ -439,7 +439,7 @@ fn check_user_manager_and_unit(uid: u32, bundle_unit: &[u8]) -> PackageResult<()
             Path::new(path)
                 .canonicalize()
                 .map(|path| path.to_string_lossy().into_owned())
-                .map_err(|_| "systemd resolved the unit to an unavailable path".into())
+                .map_err(|_| "systemd resolved the unit to an unavailable path".to_owned())
         })
         .transpose()?;
     validate_manager_resolution(

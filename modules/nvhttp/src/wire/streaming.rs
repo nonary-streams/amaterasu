@@ -250,7 +250,10 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(request.app_id, i32::MAX as u32);
-        assert_eq!((request.width, request.height, request.fps), (3840, 2160, 120));
+        assert_eq!(
+            (request.width, request.height, request.fps),
+            (3840, 2160, 120)
+        );
         assert_eq!(request.key_id, (-475_305_041_i32) as u32);
         assert!(request.host_audio_enabled);
     }
