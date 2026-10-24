@@ -237,6 +237,17 @@ pub fn preflight(
         );
     }
 
+    if let Some(video) = verified
+        .manifest
+        .components
+        .iter()
+        .find(|component| component.id == crate::profiles::linux_session::VIDEO_COMPONENT_ID)
+    {
+        crate::linux_video_runtime::validate(&read_bounded(
+            &package_path.join(&video.file),
+            256 * 1024 * 1024,
+        )?)?;
+    }
     let needs = runtime_needs(&verified.runtime_config.settings)?;
     if needs.pulse {
         require_library("libpulse.so.0", &["pa_context_new", "pa_context_connect"])?;

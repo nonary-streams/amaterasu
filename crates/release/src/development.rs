@@ -2334,6 +2334,10 @@ fn preflight_linux_x264(
     )?;
     validate_linux_x264_inputs(&encoder, runtime_available)?;
     validate_optional_linux_ffmpeg_inputs(&encoder, ffmpeg_runtime_available)?;
+    let video = artifacts.join(library_filename("amaterasu_video"));
+    if video.is_file() {
+        crate::linux_video_runtime::validate(&read_bounded(&video, 256 * 1024 * 1024)?)?;
+    }
     Ok(encoder)
 }
 

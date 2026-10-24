@@ -1,6 +1,7 @@
 mod development;
 #[cfg(target_os = "linux")]
 mod linux_user_service;
+mod linux_video_runtime;
 mod preflight;
 mod profiles;
 mod repositories;

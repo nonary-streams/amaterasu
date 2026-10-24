@@ -50,3 +50,11 @@ the public mode checks those separately. Neither establishes real capture,
 A separate ignored audio test, `sustains_private_monitor_worker_for_one_minute`,
 qualifies the native Pulse worker against an owned private null sink; it must run
 under the native qualification lock and a fresh before/after host snapshot.
+
+For a separate native desktop qualification, compile `client.c` with explicit
+`ORACLE_WIDTH`, `ORACLE_HEIGHT`, `ORACLE_FPS` and `ORACLE_MIN_VIDEO_FPS`
+definitions. For example, a 1920 by 1080, 60 fps stream can use a minimum decoded
+rate of 45 fps. Record actual decoded counts; passing that threshold does not
+establish 60 fps. `ORACLE_REQUIRE_NONZERO_AUDIO=0` permits a quiet native monitor
+while still requiring continuous decoded audio packets. Default builds retain
+the synthetic fixture's dimensions, progress threshold and nonzero audio check.

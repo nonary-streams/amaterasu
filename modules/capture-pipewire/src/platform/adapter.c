@@ -307,6 +307,10 @@ static void format_changed(void *data, uint32_t id, const struct spa_pod *parame
     atomic_store(&session->width, information.size.width);
     atomic_store(&session->height, information.size.height);
     atomic_store(&session->format, format);
+    g_printerr("Amaterasu PipeWire negotiated %ux%u, rate %u/%u, maximum %u/%u\n",
+        information.size.width, information.size.height,
+        information.framerate.num, information.framerate.denom,
+        information.max_framerate.num, information.max_framerate.denom);
     uint8_t storage[512];
     struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
     const struct spa_pod *parameters[2];
@@ -423,7 +427,7 @@ static gboolean connect_pipewire(struct am_pw_session *session) {
         SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(3, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRx),
         /* Preserve the compositor's advertised source size. The video module
          * fits the complete image to the client's requested stream dimensions. */
-        SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(30, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(240, 1)));
+        SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(60, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(240, 1)));
     gboolean connected = pw_stream_connect(session->stream, PW_DIRECTION_INPUT,
         serial_value ? PW_ID_ANY : atomic_load(&session->node),
         PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, &parameter, 1) >= 0;

@@ -10,6 +10,22 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef ORACLE_WIDTH
+#define ORACLE_WIDTH 16
+#endif
+#ifndef ORACLE_HEIGHT
+#define ORACLE_HEIGHT 16
+#endif
+#ifndef ORACLE_FPS
+#define ORACLE_FPS 30
+#endif
+#ifndef ORACLE_MIN_VIDEO_FPS
+#define ORACLE_MIN_VIDEO_FPS 10
+#endif
+#ifndef ORACLE_REQUIRE_NONZERO_AUDIO
+#define ORACLE_REQUIRE_NONZERO_AUDIO 1
+#endif
+
 static atomic_int terminated, decode_errors;
 static atomic_ulong video_frames, audio_packets, nonzero_samples;
 static AVCodecContext *video_decoder;
@@ -33,7 +49,7 @@ static void stage_failed(int stage, int error) {
 }
 static int setup_video(int format, int width, int height, int rate, void *context, int flags) {
     (void)context; (void)flags; (void)rate;
-    if (format != VIDEO_FORMAT_H264 || width != 16 || height != 16) return -1;
+    if (format != VIDEO_FORMAT_H264 || width != ORACLE_WIDTH || height != ORACLE_HEIGHT) return -1;
     video_decoder = avcodec_alloc_context3(avcodec_find_decoder(AV_CODEC_ID_H264));
     if (!video_decoder) return -1;
     video_decoder->thread_count = 1;
@@ -42,7 +58,7 @@ static int setup_video(int format, int width, int height, int rate, void *contex
 static int decode_video(PDECODE_UNIT unit) {
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
-    if (!packet || !frame || unit->fullLength <= 0 || unit->fullLength > 1024 * 1024 ||
+    if (!packet || !frame || unit->fullLength <= 0 || unit->fullLength > 16 * 1024 * 1024 ||
         av_new_packet(packet, unit->fullLength) < 0) goto failure;
     int copied = 0;
     for (PLENTRY entry = unit->bufferList; entry; entry = entry->next) {
@@ -53,7 +69,7 @@ static int decode_video(PDECODE_UNIT unit) {
     if (copied != unit->fullLength || avcodec_send_packet(video_decoder, packet) < 0) goto failure;
     int result;
     while ((result = avcodec_receive_frame(video_decoder, frame)) == 0) {
-        if (frame->width != 16 || frame->height != 16) goto failure;
+        if (frame->width != ORACLE_WIDTH || frame->height != ORACLE_HEIGHT) goto failure;
         atomic_fetch_add(&video_frames, 1);
         av_frame_unref(frame);
     }
@@ -114,7 +130,7 @@ int main(int argc, char **argv) {
     server.serverInfoGfeVersion = "3.23.0.74";
     server.serverCodecModeSupport = SCM_H264;
     server.rtspSessionUrl = argv[1];
-    config.width = 16; config.height = 16; config.fps = 30;
+    config.width = ORACLE_WIDTH; config.height = ORACLE_HEIGHT; config.fps = ORACLE_FPS;
     config.bitrate = 20000; config.packetSize = 1024;
     config.streamingRemotely = STREAM_CFG_LOCAL;
     config.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
@@ -152,6 +168,7 @@ int main(int argc, char **argv) {
         elapsed, atomic_load(&video_frames), atomic_load(&audio_packets), atomic_load(&nonzero_samples),
         atomic_load(&decode_errors), atomic_load(&terminated), stalled);
     return elapsed >= duration && !atomic_load(&terminated) && !stalled && !atomic_load(&decode_errors)
-        && atomic_load(&video_frames) >= duration / 100 && atomic_load(&audio_packets) >= duration / 20
-        && atomic_load(&nonzero_samples) > 0 ? 0 : 1;
+        && atomic_load(&video_frames) >= duration * ORACLE_MIN_VIDEO_FPS / 1000
+        && atomic_load(&audio_packets) >= duration / 20
+        && (!ORACLE_REQUIRE_NONZERO_AUDIO || atomic_load(&nonzero_samples) > 0) ? 0 : 1;
 }
