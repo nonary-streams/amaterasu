@@ -162,6 +162,7 @@ function pairingReply(...pending) {
 }
 
 function baseReply(route) {
+  if (route === "pairing/pending") return pairingReply();
   if (route === "nvhttp/settings") return {
     ok: true,
     hostname: "amaterasu-host",
@@ -180,7 +181,12 @@ function baseReply(route) {
 }
 
 async function flushUi() {
-  await new Promise((resolve) => setImmediate(resolve));
+  // Let page reads, follow-up refreshes, and cleanup requests settle before
+  // assertions or test teardown, including their queued promise callbacks.
+  for (let round = 0; round < 3; round += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+    await Promise.resolve();
+  }
 }
 
 test("pending pairing parser accepts the empty and awaiting-PIN response shapes", () => {
