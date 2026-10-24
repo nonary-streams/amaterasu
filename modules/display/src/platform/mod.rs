@@ -21,6 +21,16 @@ pub trait Platform {
     ) -> DisplayResult<Value>;
     fn available_modes(&mut self, display: &str) -> DisplayResult<Vec<AvailableMode>>;
     fn snapshot(&mut self) -> DisplayResult<Snapshot>;
+    /// Read-only session configuration view exposed by the Snapshot operation.
+    /// Providers whose native recovery state differs from the Windows CCD model
+    /// can override this without pretending their state is a CCD snapshot.
+    fn read_configuration_snapshot(&mut self) -> DisplayResult<Value> {
+        let snapshot = self.snapshot()?;
+        Ok(serde_json::json!({
+            "configuration": snapshot.configuration()?,
+            "topology_revision": snapshot.revision()?,
+        }))
+    }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot>;
     fn bind_inactive(&mut self, display: &str, before: &Snapshot) -> DisplayResult<RouteBinding>;
     fn bind_clone(
@@ -61,10 +71,14 @@ pub trait Platform {
 mod windows;
 #[cfg(windows)]
 pub use windows::WindowsPlatform as NativePlatform;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::LinuxPlatform as NativePlatform;
+#[cfg(not(any(windows, target_os = "linux")))]
 #[derive(Default)]
 pub struct NativePlatform;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 impl Platform for NativePlatform {
     fn name(&self) -> &'static str {
         std::env::consts::OS

@@ -13,9 +13,27 @@ Startup settings default to read-only:
 ```
 
 An administrator must explicitly enable `allow_mutation` before apply, restore,
-or recover. Windows has a native CCD implementation. Linux (including KDE Wayland)
-and macOS return `unsupported_platform` for enumeration/mutation; no simulated
-platform data, shell fallback, or `kscreen-doctor` adapter is used.
+or recover. Windows has a native CCD implementation. Linux/KDE has read-only
+session enumeration and configuration snapshots; physical display mutation and
+macOS display operations remain unsupported.
+
+## Linux/KDE read-only discovery
+
+Linux `enumerate` and `snapshot` query `kscreen-doctor -j` from the module's
+existing user session. The query requires that session's
+`DBUS_SESSION_BUS_ADDRESS` and absolute `XDG_RUNTIME_DIR`; it never invokes a
+shell, requests elevation, or performs a display mutation. Snapshot responses
+include normalized active `Configuration` rows, a topology revision, and the
+validated KScreen output state needed to preserve session settings such as
+scale, rotation, HDR state, priority, and exact mode identity.
+
+`native_supported` remains false for Linux mutations. The current Windows CCD
+journal cannot represent KScreen output state without losing restoration data,
+so Linux `apply`, `restore`, and recovery fail closed. A source-only restoration
+planner has behavioral fixtures for stable output identity, equivalent mode
+selection, hotplug, and ambiguous modes; wiring that plan into a durable
+KScreen lease and verified user-session restore is a follow-up slice. This
+does not qualify KScreen, Plasma, or any virtual-output driver for runtime use.
 
 ## Refresh-rate option model
 

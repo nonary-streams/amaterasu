@@ -166,8 +166,12 @@ impl<P: Platform> Pipeline<P> {
             );
         }
         if let Operation::Snapshot = incoming.operation {
-            let result = self.platform.snapshot().and_then(|snapshot| {
-                Ok(json!({"ok":true,"configuration":snapshot.configuration()?,"topology_revision":snapshot.revision()?}))
+            let result = self.platform.read_configuration_snapshot().map(|snapshot| {
+                let mut payload = snapshot;
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("ok".into(), json!(true));
+                }
+                payload
             });
             return complete(
                 send,
