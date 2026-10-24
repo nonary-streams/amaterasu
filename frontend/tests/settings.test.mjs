@@ -2114,12 +2114,13 @@ test("Moonlight host editor confirms signed update and GET with canonical prepar
 });
 
 test("focused future-stream audio save sends only audio fields and confirms readback", async () => {
-  const current = nvhttpHostSettings();
+  const current = { ...nvhttpHostSettings(), effective_audio_sink: "startup.monitor" };
   const saved = {
     ...current,
     revision: current.revision + 1,
     stream_audio: true,
     configured_audio_sink: "monitor.source.id",
+    effective_audio_sink: "monitor.source.id",
   };
   const calls = [];
   const api = { async post(route, body = {}) {
@@ -2143,6 +2144,45 @@ test("focused future-stream audio save sends only audio fields and confirms read
     }],
     ["nvhttp/settings", {}],
   ]);
+});
+
+test("focused audio save rejects changes to unrelated host, security, and listener fields", async () => {
+  const current = nvhttpHostSettings();
+  const expectedAudio = {
+    ...current,
+    revision: current.revision + 1,
+    stream_audio: true,
+    configured_audio_sink: "monitor.source.id",
+  };
+  const unrelatedChanges = [
+    { configured_hostname: "Changed host" },
+    { configured_max_bitrate: 12000 },
+    { lan_encryption_mode: 2 },
+    { active_http_port: null },
+    { listener_error: "unexpected listener change" },
+  ];
+  for (const changedFields of unrelatedChanges) {
+    const routes = [];
+    await assert.rejects(context.Amaterasu.saveNvhttpAudioSettings({ async post(route, body = {}) {
+      routes.push([route, ordinary(body)]);
+      assert.deepEqual(Object.keys(body).sort(), [
+        "audio_sink", "expected_revision", "hostname", "port", "stream_audio",
+      ]);
+      return route === "nvhttp/settings_update"
+        ? { ...expectedAudio, ...changedFields }
+        : expectedAudio;
+    } }, current, true, "monitor.source.id"), /unrelated host settings changing/);
+    assert.deepEqual(routes.map(([route]) => route), ["nvhttp/settings_update"]);
+  }
+
+  const routes = [];
+  await assert.rejects(context.Amaterasu.saveNvhttpAudioSettings({ async post(route) {
+    routes.push(route);
+    return route === "nvhttp/settings_update"
+      ? expectedAudio
+      : { ...expectedAudio, wan_encryption_mode: 0, active_rtsp_port: null };
+  } }, current, true, "monitor.source.id"), /after saving without unrelated host settings changing/);
+  assert.deepEqual(routes, ["nvhttp/settings_update", "nvhttp/settings"]);
 });
 
 test("focused future-stream audio save validates selectors and rejects mismatched readback", async () => {

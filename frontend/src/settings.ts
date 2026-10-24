@@ -414,10 +414,17 @@ namespace Amaterasu {
     if (typeof streamAudio !== "boolean")
       throw new Error("Choose whether future streams should include host audio.");
     const configuredAudioSink = parseAudioSinkSelection(audioSink);
+    const preservedSettings = (reply: NvhttpSettings): Record<string, unknown> => {
+      const values = { ...(reply as unknown as Record<string, unknown>) };
+      for (const field of ["revision", "stream_audio", "configured_audio_sink", "effective_audio_sink"])
+        delete values[field];
+      return values;
+    };
     const confirms = (reply: NvhttpSettings): boolean =>
       reply.revision === current.revision + 1 &&
       reply.stream_audio === streamAudio &&
-      reply.configured_audio_sink === configuredAudioSink;
+      reply.configured_audio_sink === configuredAudioSink &&
+      sameConfigurationValue(preservedSettings(reply), preservedSettings(current));
     const updated = parseNvhttpSettingsReply(await api.post<unknown>("nvhttp/settings_update", {
       hostname: current.configured_hostname,
       port: current.port,
@@ -426,10 +433,10 @@ namespace Amaterasu {
       audio_sink: configuredAudioSink,
     }));
     if (!confirms(updated))
-      throw new Error("Audio preferences could not be confirmed. Refresh and check the current values.");
+      throw new Error("Audio preferences could not be confirmed without unrelated host settings changing. Refresh and check the current values.");
     const saved = parseNvhttpSettingsReply(await api.post<unknown>("nvhttp/settings"));
     if (!confirms(saved))
-      throw new Error("Audio preferences could not be confirmed after saving. Refresh and check the current values.");
+      throw new Error("Audio preferences could not be confirmed after saving without unrelated host settings changing. Refresh and check the current values.");
     return saved;
   }
 
