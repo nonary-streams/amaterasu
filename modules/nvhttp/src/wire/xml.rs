@@ -80,7 +80,13 @@ pub fn server_info(
                     "AMATERASU_SERVER_FREE"
                 },
             ),
-            ("ServerCodecModeSupport", "0"),
+            // Moonlight's SCM_H264 bit is 1. A zero mask makes its core
+            // abort before RTSP even when /launch succeeded. We advertise
+            // only baseline H.264 for an enabled streaming profile.
+            (
+                "ServerCodecModeSupport",
+                if streaming_supported { "1" } else { "0" },
+            ),
             ("MaxLumaPixelsHEVC", "0"),
             (
                 "StreamingSupported",

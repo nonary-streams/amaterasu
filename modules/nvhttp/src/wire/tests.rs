@@ -362,14 +362,14 @@ fn hostname_updates_change_the_default_launch_device_name() {
 }
 
 #[test]
-fn configured_streaming_advertises_modern_version_without_fake_codec_support() {
+fn configured_streaming_advertises_only_the_supported_h264_codec() {
     let response = xml::server_info(&router().config, "host-id", true, 0, true, true);
     let text = String::from_utf8(response.body).unwrap();
     assert!(text.contains("<appversion>7.1.431.0</appversion>"));
     assert!(text.contains("<StreamingSupported>1</StreamingSupported>"));
     assert!(text.contains("<currentgame>0</currentgame>"));
     assert!(text.contains("<state>AMATERASU_SERVER_BUSY</state>"));
-    assert!(text.contains("<ServerCodecModeSupport>0</ServerCodecModeSupport>"));
+    assert!(text.contains("<ServerCodecModeSupport>1</ServerCodecModeSupport>"));
 }
 
 #[test]
