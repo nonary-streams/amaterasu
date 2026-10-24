@@ -101,6 +101,36 @@ claim those hardware-specific regressions are fixed in this new project.
 
 ## Current verification evidence
 
+### Linux desktop-stream candidate (2026-10-24)
+
+The Mac client has paired and briefly displayed the KDE desktop, but the live
+stream then froze. Sustained playback and input on the user's machine remain
+unqualified; this candidate has not replaced the live host.
+
+The tested Linux candidate explicitly enables a bounded software H.264 path;
+the default build does not include that encoder. Feature-gated NVENC and
+VA-API H.264 paths have source and mock coverage but
+have not been qualified on a GPU. Gamepad feedback now has a lease-scoped Linux
+producer and authenticated Moonlight control sender, with conditional haptics
+acceptance and terminal-zero cleanup tests. The user's gamepad/input grant is
+still off; no native device or client feedback was exercised.
+
+The optional `linux-x265-hevc` build has a software Main, 8-bit 4:2:0,
+BT.709-limited path. Its real shim output passed feature-on encoder/video tests,
+FFprobe reported the expected profile and color fields, FFmpeg decoded one
+64×64 access unit, and the exact bytes survived GameStream packetization and
+reassembly. HEVC is still absent from encoder enumeration and Moonlight codec
+advertisement. A real Moonlight HEVC session, dynamic capability selection and
+runtime packaging have not been qualified.
+
+On the source revision before this ledger entry, the Linux command
+`cargo test --workspace --exclude amaterasu-playnite --locked --offline --features amaterasu-encode/software-x264 --quiet`
+passed 2,892 tests with 23 ignored. Playnite is excluded from that result.
+The feature-on command
+`cargo test --locked --offline -p amaterasu-encode -p amaterasu-video --features amaterasu-encode/linux-x265-hevc --quiet`
+passed 70 encoder and 124 video tests. These are software tests and do not
+establish live client, GPU, display-mutation or privileged input behavior.
+
 For the configuration increment, the locked full workspace test suite, strict
 workspace Clippy, rustfmt check, frontend tests, configuration inventory drift
 check, signed management HTTP regression, platform composition regression, and
