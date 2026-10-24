@@ -2758,6 +2758,37 @@ var Amaterasu;
         return saved;
     }
     Amaterasu.saveNvhttpHostSettings = saveNvhttpHostSettings;
+    async function saveNvhttpAudioSettings(api, current, streamAudio, audioSink) {
+        if (!Number.isSafeInteger(current.revision) || current.revision < 0 || current.revision >= Number.MAX_SAFE_INTEGER ||
+            typeof current.configured_hostname !== "string" || current.configured_hostname.length > 128 ||
+            /[\u0000-\u001f\u007f-\u009f]/.test(current.configured_hostname) ||
+            !Number.isSafeInteger(current.port) || current.port < 1029 || current.port > 65514 ||
+            typeof current.stream_audio !== "boolean" ||
+            !(current.configured_audio_sink === null || typeof current.configured_audio_sink === "string"))
+            throw new Error("Current Moonlight host settings cannot be safely updated.");
+        if (current.configured_audio_sink !== null)
+            parseAudioSinkSelection(current.configured_audio_sink);
+        if (typeof streamAudio !== "boolean")
+            throw new Error("Choose whether future streams should include host audio.");
+        const configuredAudioSink = parseAudioSinkSelection(audioSink);
+        const confirms = (reply) => reply.revision === current.revision + 1 &&
+            reply.stream_audio === streamAudio &&
+            reply.configured_audio_sink === configuredAudioSink;
+        const updated = parseNvhttpSettingsReply(await api.post("nvhttp/settings_update", {
+            hostname: current.configured_hostname,
+            port: current.port,
+            expected_revision: current.revision,
+            stream_audio: streamAudio,
+            audio_sink: configuredAudioSink,
+        }));
+        if (!confirms(updated))
+            throw new Error("Audio preferences could not be confirmed. Refresh and check the current values.");
+        const saved = parseNvhttpSettingsReply(await api.post("nvhttp/settings"));
+        if (!confirms(saved))
+            throw new Error("Audio preferences could not be confirmed after saving. Refresh and check the current values.");
+        return saved;
+    }
+    Amaterasu.saveNvhttpAudioSettings = saveNvhttpAudioSettings;
     class NvhttpSettingsLoadGate {
         generation = 0;
         invalidate() {
@@ -2780,6 +2811,69 @@ var Amaterasu;
         }
     }
     Amaterasu.NvhttpSettingsLoadGate = NvhttpSettingsLoadGate;
+    function renderNvhttpAudioSettings(context, settings, endpoints, discoveryIssue, reload) {
+        const form = Amaterasu.el("form", "settings-form");
+        const streamAudio = Amaterasu.input("stream_audio_preference", "", "checkbox");
+        streamAudio.checked = settings.stream_audio;
+        const audioSink = Amaterasu.el("select");
+        audioSink.name = "audio_sink_preference";
+        const automatic = Amaterasu.el("option", "", "Automatic (host startup endpoint)");
+        automatic.value = "";
+        audioSink.append(automatic);
+        for (const endpoint of endpoints) {
+            if (!endpoint.name || endpoint.name.length > 512 || /[\u0000-\u001f\u007f-\u009f]/.test(endpoint.name))
+                continue;
+            const option = Amaterasu.el("option", "", `${endpoint.name}${endpoint.default_multimedia ? " (default)" : ""} (${endpoint.id})`);
+            option.value = endpoint.id;
+            audioSink.append(option);
+        }
+        const configuredAudioSink = settings.configured_audio_sink;
+        if (configuredAudioSink !== null && !endpoints.some(({ id }) => id === configuredAudioSink)) {
+            try {
+                if (parseAudioSinkSelection(configuredAudioSink) === configuredAudioSink) {
+                    const saved = Amaterasu.el("option", "", `Saved endpoint (not currently listed): ${configuredAudioSink}`);
+                    saved.value = configuredAudioSink;
+                    audioSink.append(saved);
+                }
+            }
+            catch {
+            }
+        }
+        audioSink.value = configuredAudioSink ?? "";
+        const status = Amaterasu.el("div");
+        const save = Amaterasu.el("button", "button primary", "Save audio preferences");
+        save.type = "submit";
+        save.disabled = !context.api.allows("configuration.write");
+        form.append(Amaterasu.field("Include host audio in future streams", streamAudio, "Applications and paired-device overrides may choose a different value."), Amaterasu.field("Audio capture endpoint", audioSink, "Automatic follows the host startup endpoint. A named endpoint applies to future streams."), ...(discoveryIssue ? [Amaterasu.el("p", "muted", discoveryIssue)] : []), ...(!context.api.allows("configuration.write")
+            ? [Amaterasu.el("p", "muted", "Saving audio preferences requires configuration.write permission.")]
+            : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+        form.addEventListener("submit", (event) => {
+            event.preventDefault();
+            if (!form.reportValidity())
+                return;
+            void Amaterasu.runAction(save, status, async () => {
+                if (!context.api.allows("configuration.write")) {
+                    status.replaceChildren(Amaterasu.el("p", "error", "Saving audio preferences requires configuration.write permission."));
+                    return;
+                }
+                try {
+                    await saveNvhttpAudioSettings(context.api, settings, streamAudio.checked, audioSink.value);
+                }
+                catch (error) {
+                    if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                        await reload();
+                        context.notify("Host settings changed elsewhere. Review the latest audio preferences before saving again.");
+                        return;
+                    }
+                    throw error;
+                }
+                await reload();
+                context.notify("Audio preferences saved and read back. They apply to future streams.");
+            });
+        });
+        return Amaterasu.panel("Future stream audio", form);
+    }
+    Amaterasu.renderNvhttpAudioSettings = renderNvhttpAudioSettings;
     async function recoverNvhttpSaveFailure(code, reload, notify) {
         if (code !== "revision_conflict" &&
             !["listener_apply_pending", "listener_apply_failed", "listener_not_active"].includes(code))
@@ -4724,7 +4818,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save input policy");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("Controller input", controller, "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue."), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick, "For the DS4 profile, maps Back to a touchpad click when that backend supports it. The preference stays saved if the selected backend cannot apply it."), Amaterasu.field("Native pen and touch policy", nativePenTouch, "Windows-only global preference. Native pen/touch event transport and platform support are not implemented; saving this value does not activate pen or touch events."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux and Windows, when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other platforms do not inject gamepads."), Amaterasu.field("Gamepad profile", gamepadProfile, "Profiles listed by input status are supported by this backend. A saved platform-recognized profile outside that list remains visible and is labeled unavailable."), gamepadStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("Controller input", controller, "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue."), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick, "For the DS4 profile, maps Back to a touchpad click when that backend supports it. The preference stays saved if the selected backend cannot apply it."), Amaterasu.field("Native pen and touch policy", nativePenTouch, "On Linux, the companion can map one Touch contact to mouse emulation when this setting is enabled and the caller has the mouse grant. Native Linux Pen events and multitouch are unsupported; this does not create a native touch device. Windows native pen/touch support depends on backend capability."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux and Windows, when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other platforms do not inject gamepads."), Amaterasu.field("Gamepad profile", gamepadProfile, "Profiles listed by input status are supported by this backend. A saved platform-recognized profile outside that list remains visible and is labeled unavailable."), gamepadStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
@@ -4893,6 +4987,7 @@ var Amaterasu;
                 automaticAudioSink.value = "";
                 audioSink.append(automaticAudioSink);
                 let audioDiscoveryIssue = null;
+                const audioEndpoints = [];
                 if (context.api.allows("media.read")) {
                     try {
                         const discovered = await context.api.post("media/audio_endpoints");
@@ -4900,8 +4995,12 @@ var Amaterasu;
                             return;
                         for (const endpoint of discovered.endpoints) {
                             try {
-                                if (!endpoint.id || parseAudioSinkSelection(endpoint.id) !== endpoint.id)
+                                if (!endpoint.id || typeof endpoint.name !== "string" ||
+                                    typeof endpoint.default_multimedia !== "boolean" ||
+                                    parseAudioSinkSelection(endpoint.id) !== endpoint.id ||
+                                    audioEndpoints.some((current) => current.id === endpoint.id))
                                     continue;
+                                audioEndpoints.push(endpoint);
                                 const option = Amaterasu.el("option", "", `${endpoint.name}${endpoint.default_multimedia ? " (default)" : ""} (${endpoint.id})`);
                                 option.value = endpoint.id;
                                 audioSink.append(option);
@@ -5030,7 +5129,7 @@ var Amaterasu;
                     });
                 });
                 if (hostLoads.isCurrent(generation))
-                    hostArea.replaceChildren(Amaterasu.panel("Moonlight host settings", form));
+                    hostArea.replaceChildren(Amaterasu.panel("Moonlight host settings", form), renderNvhttpAudioSettings(context, settings, audioEndpoints, audioDiscoveryIssue, loadHost));
             }
             catch (error) {
                 if (context.content.isConnected && (generation === null || hostLoads.isCurrent(generation)))
