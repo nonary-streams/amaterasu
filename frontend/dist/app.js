@@ -6487,6 +6487,7 @@ var Amaterasu;
     }
     function renderHostManagement(context) {
         const pairingArea = Amaterasu.el("div");
+        const captureArea = Amaterasu.el("div");
         const hostArea = Amaterasu.el("div");
         const sessionArea = Amaterasu.el("div");
         const runtimeArea = Amaterasu.el("div");
@@ -6499,7 +6500,7 @@ var Amaterasu;
             void loadHost();
             void loadSessions();
             void loadRuntime();
-        })), Amaterasu.panel("Pending device pairing", pairingArea), Amaterasu.panel("Host listeners", hostArea), Amaterasu.panel("Streaming status", runtimeArea), Amaterasu.panel("Management sessions", sessionArea));
+        })), Amaterasu.panel("Pending device pairing", pairingArea), Amaterasu.panel("KDE desktop capture consent", captureArea), Amaterasu.panel("Host listeners", hostArea), Amaterasu.panel("Streaming status", runtimeArea), Amaterasu.panel("Management sessions", sessionArea));
         async function loadPairings(notice) {
             if (!context.content.isConnected)
                 return;
@@ -6660,6 +6661,7 @@ var Amaterasu;
             }
         }
         void loadPairings();
+        renderCaptureConsent(context, captureArea);
         void loadHost();
         void loadSessions();
         void loadRuntime();
@@ -6670,6 +6672,251 @@ var Amaterasu;
         notice.setAttribute("role", "status");
         notice.setAttribute("aria-live", "polite");
         return notice;
+    }
+    const PORTAL_POLL_INTERVAL_MS = 1000;
+    const PORTAL_POLL_LIMIT = 120;
+    function renderCaptureConsent(context, area) {
+        let operationId = null;
+        let pollTimer = null;
+        let pollCount = 0;
+        let requestInFlight = false;
+        let finished = false;
+        let observer = null;
+        const cleanedOperations = new Set();
+        const status = Amaterasu.el("div");
+        status.setAttribute("role", "status");
+        status.setAttribute("aria-live", "polite");
+        const choose = Amaterasu.button("Choose monitor in KDE…", () => { void beginSelection(); }, "primary");
+        const cancel = Amaterasu.button("Cancel selection", () => { void cancelSelection(); });
+        const permission = Amaterasu.el("p", "muted");
+        const help = Amaterasu.el("p", "muted", "This opens the KDE desktop portal only after you choose a monitor. After it reports ready, launch Moonlight Desktop promptly: the selected source is retained for up to 60 seconds. Selection does not confirm that a stream started.");
+        area.append(permission, help, choose, cancel, status);
+        cancel.hidden = true;
+        updatePermission();
+        function updatePermission() {
+            const canSelect = context.api.allows("capture.write");
+            const canPoll = context.api.allows("capture.read");
+            choose.disabled = !canSelect || !canPoll || Boolean(operationId) || !context.content.isConnected;
+            cancel.disabled = !canSelect || !operationId || requestInFlight;
+            permission.textContent = !canSelect
+                ? "Monitor selection and cancellation require capture.write permission."
+                : !canPoll
+                    ? "Selection status requires capture.read permission; no chooser will be opened."
+                    : "Monitor selection requires capture.write and capture.read permissions.";
+            cancel.hidden = !operationId;
+        }
+        function show(message, tone = "muted") {
+            status.replaceChildren(Amaterasu.el("p", tone, message));
+        }
+        function newOperationId() {
+            const bytes = new Uint8Array(16);
+            window.crypto.getRandomValues(bytes);
+            let suffix = "";
+            for (const byte of bytes)
+                suffix += byte.toString(16).padStart(2, "0");
+            return `desktop-${suffix}`;
+        }
+        function armUnmountCleanup() {
+            observer?.disconnect();
+            observer = new MutationObserver(() => {
+                if (!context.content.isConnected) {
+                    observer?.disconnect();
+                    observer = null;
+                    stopPolling();
+                    void cancelForCleanup();
+                }
+            });
+            observer.observe(document, { childList: true, subtree: true });
+        }
+        function stopPolling() {
+            if (pollTimer !== null)
+                window.clearTimeout(pollTimer);
+            pollTimer = null;
+            observer?.disconnect();
+            observer = null;
+        }
+        function finish(message, tone = "muted") {
+            finished = true;
+            stopPolling();
+            show(message, tone);
+            operationId = null;
+            requestInFlight = false;
+            updatePermission();
+        }
+        function schedulePoll() {
+            if (finished || !operationId || !context.content.isConnected)
+                return;
+            if (pollCount >= PORTAL_POLL_LIMIT) {
+                const expiredOperation = operationId;
+                finish("Monitor selection timed out. Start a new selection if you still want to choose a monitor.", "error");
+                void cancelForCleanup(expiredOperation);
+                return;
+            }
+            pollTimer = window.setTimeout(() => { void pollSelection(); }, PORTAL_POLL_INTERVAL_MS);
+        }
+        function selectionErrorMessage(error) {
+            const code = error && typeof error === "object" && "code" in error
+                ? String(error.code)
+                : "";
+            if (["source_selection_expired", "source_selection_timeout", "portal_selection_expired"].includes(code))
+                return { message: "The KDE consent request expired. Start a new selection to try again.", tone: "error" };
+            if (["source_selection_denied", "selection_permission_denied", "portal_selection_denied"].includes(code))
+                return { message: "KDE denied desktop capture consent. No source was selected.", tone: "error" };
+            if (["source_selection_cancelled", "portal_selection_cancelled"].includes(code))
+                return { message: "Monitor selection was cancelled.", tone: "muted" };
+            if (["portal_unavailable", "pipewire_unavailable"].includes(code))
+                return { message: "The KDE desktop portal is unavailable. Check that a desktop session is active, then try again.", tone: "error" };
+            return { message: "Unable to read monitor selection status. Check the connection and refresh before starting another selection.", tone: "error" };
+        }
+        function validateReply(value) {
+            if (!value || typeof value !== "object" || Array.isArray(value))
+                throw new Error("invalid selection response");
+            const reply = value;
+            if (reply.ok !== true || reply.operation_id !== operationId || reply.source_type !== "monitor" ||
+                !["selecting", "ready", "denied", "failed"].includes(String(reply.selection_state)))
+                throw new Error("invalid selection response");
+            return reply;
+        }
+        async function beginSelection() {
+            if (operationId || !context.content.isConnected)
+                return;
+            updatePermission();
+            if (choose.disabled || !context.api.allows("capture.write") || !context.api.allows("capture.read"))
+                return;
+            let createdId;
+            try {
+                createdId = newOperationId();
+            }
+            catch {
+                show("Secure operation ID generation is unavailable; no chooser was opened.", "error");
+                return;
+            }
+            operationId = createdId;
+            pollCount = 0;
+            finished = false;
+            requestInFlight = true;
+            show("Opening the KDE monitor consent prompt…");
+            updatePermission();
+            armUnmountCleanup();
+            try {
+                const reply = validateReply(await context.api.post("capture/select_portal_source", {
+                    source_type: "monitor",
+                    operation_id: createdId,
+                }));
+                if (!context.content.isConnected || operationId !== createdId) {
+                    void cancelForCleanup(createdId);
+                    return;
+                }
+                requestInFlight = false;
+                updatePermission();
+                acceptReply(reply);
+            }
+            catch (error) {
+                if (operationId !== createdId || !context.content.isConnected) {
+                    void cancelForCleanup(createdId);
+                    return;
+                }
+                const outcome = selectionErrorMessage(error);
+                finish(outcome.message, outcome.tone);
+                void cancelForCleanup(createdId);
+            }
+        }
+        function acceptReply(reply) {
+            if (reply.selection_state === "ready") {
+                finish("KDE selected a monitor. Launch Moonlight Desktop promptly within the 60-second selection lifetime. This confirms selection only, not a running stream.", "good");
+            }
+            else if (reply.selection_state === "denied") {
+                finish("KDE denied desktop capture consent. No source was selected.", "error");
+            }
+            else if (reply.selection_state === "failed") {
+                const error = { code: reply.error };
+                const outcome = selectionErrorMessage(error);
+                finish(outcome.message, outcome.tone);
+            }
+            else {
+                show("Selecting monitor… Approve the request in the KDE desktop portal. When it reports ready, launch Moonlight Desktop promptly within 60 seconds.");
+                schedulePoll();
+            }
+        }
+        async function pollSelection() {
+            const current = operationId;
+            if (!current || finished || requestInFlight || !context.content.isConnected)
+                return;
+            if (!context.api.allows("capture.read")) {
+                finish("Monitor selection status is unavailable because capture.read permission is missing.", "error");
+                void cancelForCleanup(current);
+                return;
+            }
+            requestInFlight = true;
+            pollCount += 1;
+            updatePermission();
+            try {
+                const reply = validateReply(await context.api.post("capture/poll_portal_selection", {
+                    operation_id: current,
+                }));
+                if (!context.content.isConnected || operationId !== current) {
+                    void cancelForCleanup(current);
+                    return;
+                }
+                requestInFlight = false;
+                updatePermission();
+                acceptReply(reply);
+            }
+            catch (error) {
+                if (!context.content.isConnected || operationId !== current) {
+                    void cancelForCleanup(current);
+                    return;
+                }
+                const outcome = selectionErrorMessage(error);
+                if (outcome.message.startsWith("Unable to read")) {
+                    requestInFlight = false;
+                    updatePermission();
+                    show(`${outcome.message} Retrying while this request remains active.`, "error");
+                    schedulePoll();
+                }
+                else {
+                    finish(outcome.message, outcome.tone);
+                }
+            }
+        }
+        async function cancelSelection() {
+            const current = operationId;
+            if (!current || requestInFlight || !context.api.allows("capture.write"))
+                return;
+            stopPolling();
+            requestInFlight = true;
+            updatePermission();
+            show("Cancelling monitor selection…");
+            try {
+                await context.api.post("capture/cancel_portal_selection", { operation_id: current });
+                if (!context.content.isConnected || operationId !== current)
+                    return;
+                finish("Monitor selection was cancelled.");
+            }
+            catch {
+                if (!context.content.isConnected || operationId !== current)
+                    return;
+                requestInFlight = false;
+                updatePermission();
+                show("Cancellation was not confirmed. Retry cancellation before leaving this page.", "error");
+                armUnmountCleanup();
+            }
+        }
+        async function cancelForCleanup(id = operationId) {
+            if (!id || cleanedOperations.has(id) || !context.api.allows("capture.write"))
+                return;
+            cleanedOperations.add(id);
+            try {
+                await context.api.post("capture/cancel_portal_selection", { operation_id: id });
+            }
+            catch {
+            }
+            if (operationId === id) {
+                operationId = null;
+                finished = true;
+                requestInFlight = false;
+            }
+        }
     }
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
