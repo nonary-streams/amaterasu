@@ -261,4 +261,16 @@ fn linux_mutation_contract_remains_unsupported() {
         platform.snapshot().unwrap_err().code,
         "unsupported_platform"
     );
+
+    let state = configuration_snapshot(&reference_kde_configuration(), "linux_kscreen").unwrap();
+    let saved: KScreenSnapshot = serde_json::from_value(state["session_state"].clone()).unwrap();
+    let mut guard_called = false;
+    let error = platform
+        .restore_kscreen_snapshot(&saved, &mut || {
+            guard_called = true;
+            Ok(())
+        })
+        .unwrap_err();
+    assert_eq!(error.code, "unsupported_platform");
+    assert!(!guard_called);
 }

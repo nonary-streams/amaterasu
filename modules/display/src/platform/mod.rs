@@ -1,4 +1,7 @@
-use crate::model::{Address, AvailableMode, Configuration, DisplayResult, RouteBinding, Snapshot};
+use crate::model::{
+    Address, AvailableMode, Configuration, DisplayError, DisplayResult, KScreenSnapshot,
+    RouteBinding, Snapshot,
+};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +33,56 @@ pub trait Platform {
             "configuration": snapshot.configuration()?,
             "topology_revision": snapshot.revision()?,
         }))
+    }
+    /// Capture a provider-specific baseline that must accompany the classic CCD
+    /// snapshot in the durable recovery journal. Providers without extra state
+    /// keep the legacy journal shape.
+    fn capture_kscreen_snapshot(&mut self) -> DisplayResult<Option<KScreenSnapshot>> {
+        Ok(None)
+    }
+    /// Restore a KScreen journal baseline, including conservative hotplug
+    /// reconciliation and readback verification before returning success. This
+    /// defaults to fail-closed so a provider cannot treat it as a CCD snapshot.
+    fn restore_kscreen_snapshot(
+        &mut self,
+        _: &KScreenSnapshot,
+        _: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        Err(DisplayError::new(
+            "unsupported_platform",
+            "KScreen journal restoration is not implemented by this provider",
+        ))
+    }
+    /// Apply a KScreen configuration and return success only after exact
+    /// requested-state readback verification.
+    fn apply_kscreen_snapshot(
+        &mut self,
+        _: &Configuration,
+        _: &Snapshot,
+        _: &KScreenSnapshot,
+        _: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        Err(DisplayError::new(
+            "unsupported_platform",
+            "KScreen apply is not implemented by this provider",
+        ))
+    }
+    /// Apply a KScreen configuration while preserving the selected topology,
+    /// with success contingent on exact requested-state readback verification.
+    fn apply_kscreen_snapshot_preserving(
+        &mut self,
+        _: &Configuration,
+        _: &Snapshot,
+        _: &KScreenSnapshot,
+        _: &str,
+        _: Option<&RouteBinding>,
+        _: TopologyShape,
+        _: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        Err(DisplayError::new(
+            "unsupported_platform",
+            "KScreen topology-preserving apply is not implemented by this provider",
+        ))
     }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot>;
     fn bind_inactive(&mut self, display: &str, before: &Snapshot) -> DisplayResult<RouteBinding>;

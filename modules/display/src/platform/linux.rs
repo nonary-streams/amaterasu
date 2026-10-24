@@ -75,6 +75,43 @@ impl Platform for LinuxPlatform {
         configuration_snapshot(&configuration, self.name())
     }
 
+    fn capture_kscreen_snapshot(&mut self) -> DisplayResult<Option<KScreenSnapshot>> {
+        let configuration = query_configuration()?;
+        let outputs = validated_outputs(&configuration)?;
+        Ok(Some(typed_snapshot(&outputs)?))
+    }
+
+    fn restore_kscreen_snapshot(
+        &mut self,
+        _: &KScreenSnapshot,
+        _: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        Err(unsupported_mutation())
+    }
+
+    fn apply_kscreen_snapshot(
+        &mut self,
+        _: &Configuration,
+        _: &Snapshot,
+        _: &KScreenSnapshot,
+        _: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        Err(unsupported_mutation())
+    }
+
+    fn apply_kscreen_snapshot_preserving(
+        &mut self,
+        _: &Configuration,
+        _: &Snapshot,
+        _: &KScreenSnapshot,
+        _: &str,
+        _: Option<&RouteBinding>,
+        _: TopologyShape,
+        _: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        Err(unsupported_mutation())
+    }
+
     fn snapshot(&mut self) -> DisplayResult<Snapshot> {
         Err(unsupported_mutation())
     }

@@ -802,9 +802,9 @@ impl<P: Platform> Pipeline<P> {
                         ),
                     );
                 }
-                let result = self
-                    .platform
-                    .restore(&journal.snapshot, &mut || check_request(send, &context));
+                let result = restore_journal_snapshot(&mut self.platform, &journal, &mut || {
+                    check_request(send, &context)
+                });
                 match result {
                     Ok(()) => self.clear(
                         context,
@@ -880,6 +880,10 @@ impl<P: Platform> Pipeline<P> {
                 );
             }
         }
+        let kscreen_before = match self.platform.capture_kscreen_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => return complete(send, context.request, error.payload()),
+        };
         let prepared = match native_target.as_ref() {
             Some((selected, shape)) => self.platform.prepare_preserving(
                 &configuration,
@@ -944,6 +948,42 @@ impl<P: Platform> Pipeline<P> {
                 ),
             );
         }
+        let kscreen = match self.platform.capture_kscreen_snapshot() {
+            Ok(kscreen_after) => match (kscreen_before, kscreen_after) {
+                (Some(before), Some(after)) => match (before.revision(), after.revision()) {
+                    (Ok(before_revision), Ok(after_revision))
+                        if before_revision == after_revision =>
+                    {
+                        Some(before)
+                    }
+                    (Err(error), _) | (_, Err(error)) => {
+                        return complete(send, context.request, error.payload());
+                    }
+                    _ => {
+                        return complete(
+                            send,
+                            context.request,
+                            failure(
+                                "topology_changed",
+                                "KScreen topology changed during journal prepare",
+                            ),
+                        );
+                    }
+                },
+                (None, None) => None,
+                _ => {
+                    return complete(
+                        send,
+                        context.request,
+                        failure(
+                            "topology_changed",
+                            "KScreen recovery capability changed during journal prepare",
+                        ),
+                    );
+                }
+            },
+            Err(error) => return complete(send, context.request, error.payload()),
+        };
         let Some(generation) = revision.checked_add(1) else {
             return complete(
                 send,
@@ -956,7 +996,7 @@ impl<P: Platform> Pipeline<P> {
             owner: context.caller.clone(),
             lease: format!("display-{generation:016x}"),
             snapshot,
-            kscreen: None,
+            kscreen,
             operation_id,
             requested_configuration: None,
             request_identity,
@@ -997,20 +1037,37 @@ impl<P: Platform> Pipeline<P> {
         native_target: Option<(String, TopologyShape)>,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
-        let result = if let Some((selected, shape)) = native_target.as_ref() {
-            self.platform.apply_preserving(
+        let result = match (&journal.kscreen, native_target.as_ref()) {
+            (Some(kscreen), Some((selected, shape))) => {
+                self.platform.apply_kscreen_snapshot_preserving(
+                    &configuration,
+                    &journal.snapshot,
+                    kscreen,
+                    selected,
+                    journal.pending_route.as_ref(),
+                    *shape,
+                    &mut || check_request(send, &context),
+                )
+            }
+            (Some(kscreen), None) => self.platform.apply_kscreen_snapshot(
+                &configuration,
+                &journal.snapshot,
+                kscreen,
+                &mut || check_request(send, &context),
+            ),
+            (None, Some((selected, shape))) => self.platform.apply_preserving(
                 &configuration,
                 &journal.snapshot,
                 selected,
                 journal.pending_route.as_ref(),
                 *shape,
                 &mut || check_request(send, &context),
-            )
-        } else {
-            self.platform
+            ),
+            (None, None) => self
+                .platform
                 .apply(&configuration, &journal.snapshot, &mut || {
                     check_request(send, &context)
-                })
+                }),
         };
         match result {
             Ok(()) => {
@@ -1026,7 +1083,8 @@ impl<P: Platform> Pipeline<P> {
                 // to its durable baseline is cleanup authorized by this same lease,
                 // including when the parent ended after the mutation boundary.
                 if error.may_have_changed
-                    && let Err(rollback) = self.platform.restore(&journal.snapshot, &mut || Ok(()))
+                    && let Err(rollback) =
+                        restore_journal_snapshot(&mut self.platform, &journal, &mut || Ok(()))
                 {
                     let mut reply = recovery_failure(error, &journal.lease);
                     reply["rollback_error"] = rollback.payload()["error"].clone();
@@ -1047,6 +1105,18 @@ impl<P: Platform> Pipeline<P> {
         self.submit(context, payload, Stage::Clearing(reply), send)
     }
 }
+fn restore_journal_snapshot<P: Platform>(
+    platform: &mut P,
+    journal: &Journal,
+    guard: &mut dyn FnMut() -> DisplayResult<()>,
+) -> DisplayResult<()> {
+    if let Some(kscreen) = &journal.kscreen {
+        platform.restore_kscreen_snapshot(kscreen, guard)
+    } else {
+        platform.restore(&journal.snapshot, guard)
+    }
+}
+
 fn read_only_apply<P: Platform>(
     platform: &mut P,
     configuration: &Configuration,

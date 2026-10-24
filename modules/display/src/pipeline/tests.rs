@@ -648,6 +648,13 @@ struct FakePlatform {
     hdr_mutations: usize,
     prepared_hdr: Option<Option<bool>>,
     reorder_readback: bool,
+    kscreen_baseline: Option<KScreenSnapshot>,
+    kscreen_capture_count: usize,
+    kscreen_drift_on_second_capture: bool,
+    kscreen_restore_blocked: bool,
+    kscreen_restore_failure: bool,
+    kscreen_restore_readback_failure: bool,
+    kscreen_restore_calls: usize,
 }
 impl Platform for FakePlatform {
     fn name(&self) -> &'static str {
@@ -655,6 +662,71 @@ impl Platform for FakePlatform {
     }
     fn supported(&self) -> bool {
         true
+    }
+    fn capture_kscreen_snapshot(&mut self) -> DisplayResult<Option<KScreenSnapshot>> {
+        self.kscreen_capture_count += 1;
+        let Some(mut baseline) = self.kscreen_baseline.clone() else {
+            return Ok(None);
+        };
+        if self.kscreen_drift_on_second_capture && self.kscreen_capture_count == 2 {
+            baseline.outputs[0].scale = 1.75;
+        }
+        Ok(Some(baseline))
+    }
+    fn apply_kscreen_snapshot(
+        &mut self,
+        _: &Configuration,
+        _: &Snapshot,
+        baseline: &KScreenSnapshot,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        baseline.validate()?;
+        guard()?;
+        self.effects.push("apply_kscreen");
+        if self.apply_failure {
+            return Err(DisplayError::new(
+                "platform_error",
+                "partial KScreen apply in fake platform",
+            )
+            .after_mutation());
+        }
+        Ok(())
+    }
+    fn apply_kscreen_snapshot_preserving(
+        &mut self,
+        configuration: &Configuration,
+        before: &Snapshot,
+        baseline: &KScreenSnapshot,
+        _: &str,
+        _: Option<&RouteBinding>,
+        _: TopologyShape,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        self.apply_kscreen_snapshot(configuration, before, baseline, guard)
+    }
+    fn restore_kscreen_snapshot(
+        &mut self,
+        baseline: &KScreenSnapshot,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        baseline.validate()?;
+        self.kscreen_restore_calls += 1;
+        if self.kscreen_restore_blocked {
+            return Err(DisplayError::new(
+                "topology_changed",
+                "fake hotplug reconciliation held restoration",
+            ));
+        }
+        guard()?;
+        self.effects.push("restore_kscreen");
+        if self.kscreen_restore_failure || self.kscreen_restore_readback_failure {
+            return Err(DisplayError::new(
+                "verification_failed",
+                "fake KScreen restoration did not verify",
+            )
+            .after_mutation());
+        }
+        Ok(())
     }
     fn bind_inactive(&mut self, display: &str, before: &Snapshot) -> DisplayResult<RouteBinding> {
         if self.inactive_route_ambiguous {
@@ -3738,4 +3810,149 @@ fn kscreen_snapshot_rejects_payloads_over_the_journal_byte_limit() {
         });
     }
     assert_eq!(snapshot.validate().unwrap_err().code, "resource_exhausted");
+}
+
+#[test]
+fn kscreen_baseline_is_persisted_and_apply_retry_is_idempotent() {
+    let request = json!({
+        "action":"apply",
+        "configuration":configuration(),
+        "operation_id":"kscreen-lease-operation"
+    });
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            kscreen_baseline: Some(kscreen_snapshot()),
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(&mut pipeline, "owner", request.clone());
+    assert_eq!(applied["applied"], true, "{applied}");
+    let journal: Journal = serde_json::from_value(state.journal.clone().unwrap()).unwrap();
+    assert_eq!(journal.kscreen.unwrap(), kscreen_snapshot());
+    assert_eq!(pipeline.platform.kscreen_capture_count, 2);
+    assert_eq!(pipeline.platform.effects, ["apply_kscreen"]);
+
+    let retry = state.run(&mut pipeline, "owner", request);
+    assert_eq!(retry["applied"], false, "{retry}");
+    assert_eq!(retry["lease"], applied["lease"]);
+    assert_eq!(pipeline.platform.effects, ["apply_kscreen"]);
+}
+
+#[test]
+fn kscreen_topology_drift_before_journal_arm_has_no_native_effects() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            kscreen_baseline: Some(kscreen_snapshot()),
+            kscreen_drift_on_second_capture: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"apply","configuration":configuration()}),
+    );
+    assert_eq!(result["error"]["code"], "topology_changed");
+    assert!(pipeline.platform.effects.is_empty());
+    assert!(state.journal.is_none());
+}
+
+#[test]
+fn partial_kscreen_apply_rolls_back_from_journal_or_retains_recovery() {
+    for kscreen_restore_failure in [false, true] {
+        let mut state = State::default();
+        let mut pipeline = Pipeline::new(
+            FakePlatform {
+                kscreen_baseline: Some(kscreen_snapshot()),
+                apply_failure: true,
+                kscreen_restore_failure,
+                ..Default::default()
+            },
+            true,
+        );
+        let result = state.run(
+            &mut pipeline,
+            "owner",
+            json!({"action":"apply","configuration":configuration()}),
+        );
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["recovery_required"], kscreen_restore_failure);
+        assert_eq!(
+            pipeline.platform.effects,
+            ["apply_kscreen", "restore_kscreen"]
+        );
+        assert_eq!(state.journal.is_some(), kscreen_restore_failure);
+    }
+}
+
+#[test]
+fn interrupted_kscreen_lease_holds_on_hotplug_and_readback_failure() {
+    let journal = Journal {
+        owner: "owner".into(),
+        lease: "display-kscreen-interrupted".into(),
+        snapshot: snapshot(),
+        kscreen: Some(kscreen_snapshot()),
+        operation_id: Some("kscreen-interrupted-operation".into()),
+        request_identity: None,
+        requested_configuration: None,
+        expected_topology_revision: None,
+        pending_route: None,
+    };
+    let lease = journal.lease.clone();
+    let mut state = State {
+        // This is the durable state left by a process interruption after
+        // journal acknowledgement and before a native apply completed.
+        journal: Some(serde_json::to_value(journal).unwrap()),
+        ..Default::default()
+    };
+    let mut restarted = Pipeline::new(
+        FakePlatform {
+            kscreen_restore_blocked: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let hotplug_hold = state.run(
+        &mut restarted,
+        "owner",
+        json!({"action":"recover","lease":lease}),
+    );
+    assert_eq!(hotplug_hold["recovery_required"], true);
+    assert!(state.journal.is_some());
+    assert!(restarted.platform.effects.is_empty());
+
+    restarted.platform.kscreen_restore_blocked = false;
+    restarted.platform.kscreen_restore_readback_failure = true;
+    let readback_hold = state.run(
+        &mut restarted,
+        "owner",
+        json!({"action":"recover","lease":lease}),
+    );
+    assert_eq!(readback_hold["recovery_required"], true);
+    assert!(state.journal.is_some());
+    assert_eq!(restarted.platform.effects, ["restore_kscreen"]);
+
+    restarted.platform.kscreen_restore_readback_failure = false;
+    let recovered = state.run(
+        &mut restarted,
+        "owner",
+        json!({"action":"recover","lease":lease}),
+    );
+    assert_eq!(recovered["restored"], true);
+    assert!(state.journal.is_none());
+    assert_eq!(
+        restarted.platform.effects,
+        ["restore_kscreen", "restore_kscreen"]
+    );
+    let duplicate = state.run(
+        &mut restarted,
+        "owner",
+        json!({"action":"recover","lease":lease}),
+    );
+    assert_eq!(duplicate["error"]["code"], "not_found");
+    assert_eq!(restarted.platform.kscreen_restore_calls, 3);
 }

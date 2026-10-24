@@ -33,10 +33,14 @@ selection, hotplug, and ambiguous modes. The journal model has a separate,
 version-1 KScreen payload; legacy CCD records omit it and continue to decode.
 The payload preserves connector identity, mode timing and ID, position, scale,
 rotation, enabled/connected and primary state, priority, and optional HDR state.
-The existing pipeline validates the complete bounded journal and persists it
-through its state revision-CAS boundary before native effects. Linux does not
-yet populate this payload in a runtime lease or execute restoration; those
-paths remain disabled. This does not qualify KScreen, Plasma, or any
+The existing pipeline captures and rechecks provider-specific KScreen state
+around journal preparation, then persists it through the state revision-CAS
+boundary before native effects. Restore and rollback dispatch to a KScreen
+provider hook when that payload is present. Linux supplies the read-only capture
+hook, but remains `native_supported:false`; its apply and restore hooks fail
+closed, so no Linux lease can currently reach mutation. The fake-platform
+transaction fixtures cover journal interruption, retries, hotplug holds, and
+restore readback failures. This does not qualify KScreen, Plasma, or any
 virtual-output driver for runtime use.
 
 ## Refresh-rate option model
