@@ -37,6 +37,8 @@ pub(super) struct Record {
     pub next_status: u64,
     pub failure: Option<&'static str>,
     pub cleanup_error: Option<&'static str>,
+    pub cleanup_retry_count: u8,
+    pub cleanup_retry_at: Option<u64>,
     pub uncertain: Option<Call>,
     pub uncertain_phase: Option<Phase>,
     pub needs_lookup: bool,

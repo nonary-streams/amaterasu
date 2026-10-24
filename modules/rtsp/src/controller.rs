@@ -33,6 +33,8 @@ use std::{
 const PREPARE_BUDGET_MS: u64 = 5_000;
 const STAGED_DISPLAY_PREPARE_MAX_MS: u64 = 40_000;
 const CLEANUP_BUDGET_MS: u64 = 15_000;
+const MAX_CLEANUP_RETRIES: u8 = 2;
+const CLEANUP_RETRY_DELAYS_MS: [u64; 2] = [250, 1_000];
 const STATUS_INTERVAL_MS: u64 = 250;
 const MAX_RECORDS: usize = 128;
 const MAX_LIVE_TICKETS: usize = 2;
@@ -864,6 +866,8 @@ fn missing(payload: &Value) -> bool {
 
 fn finish_record(record: &mut Record) {
     record.display_applied = false;
+    record.cleanup_retry_count = 0;
+    record.cleanup_retry_at = None;
     record.state = if record.failure.is_some() {
         State::Failed
     } else {

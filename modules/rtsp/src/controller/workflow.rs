@@ -405,6 +405,8 @@ impl Controller {
         // The stream-session Stop/Status has confirmed cleanup even if RTSP is
         // still waiting for the TEARDOWN reply to leave the network transport.
         record.display_applied = false;
+        record.cleanup_retry_count = 0;
+        record.cleanup_retry_at = None;
         if let Some((connection, action_ticket)) = job.network {
             let reply = record
                 .negotiation
@@ -458,6 +460,33 @@ impl Controller {
             let record = self.records.get_mut(&ticket).expect("selected record");
             record.close(Some("prepare_expired"));
             self.revoke_ticket(ticket);
+        }
+        let retry_ticket = self.records.iter_mut().find_map(|(ticket, record)| {
+            if record.state != State::CleanupFailed
+                || record.cleanup_retry_count >= MAX_CLEANUP_RETRIES
+            {
+                return None;
+            }
+            if let Some(retry_at) = record.cleanup_retry_at {
+                if now < retry_at {
+                    return None;
+                }
+                record.cleanup_retry_at = None;
+                record.cleanup_error = None;
+                record.state = State::Closing;
+                return Some(*ticket);
+            }
+
+            let delay = CLEANUP_RETRY_DELAYS_MS[usize::from(record.cleanup_retry_count)];
+            record.cleanup_retry_count += 1;
+            record.cleanup_retry_at = Some(now.saturating_add(delay));
+            None
+        });
+        if let Some(ticket) = retry_ticket {
+            let mut record = self.records.remove(&ticket).expect("selected retry record");
+            self.schedule_cleanup(&mut record, None, now);
+            self.records.insert(ticket, record);
+            return;
         }
         if let Some(ticket) = self
             .records

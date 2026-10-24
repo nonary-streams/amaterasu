@@ -315,6 +315,93 @@ fn authenticated_disconnect_revokes_ticket_and_stops_its_session() {
 }
 
 #[test]
+fn transient_cleanup_failure_retries_owned_stop_and_confirms_cleanup() {
+    let mut endpoint = Endpoint {
+        cleanup_fails: true,
+        ..Endpoint::default()
+    };
+    endpoint.enqueue(1, "owner", open("disconnect-retry-cleanup"));
+    let runtime = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+    finish_prepare(&mut controller, &runtime);
+    let ticket = endpoint.completed(1)["ticket"].as_u64().unwrap();
+
+    controller.disconnected(77, Some(ticket), "peer_closed");
+    for now in 3..10 {
+        tick(&mut controller, &runtime, now);
+    }
+    assert_eq!(controller.records[&ticket].state, State::CleanupFailed);
+    assert!(!controller.records[&ticket].cleanup_confirmed);
+
+    // Model the provider recovering after its first idempotent cleanup attempt.
+    endpoint.cleanup_fails = false;
+    for now in 10..400 {
+        tick(&mut controller, &runtime, now);
+        if controller.records[&ticket].cleanup_confirmed {
+            break;
+        }
+    }
+
+    assert!(controller.records[&ticket].cleanup_confirmed);
+    assert_eq!(controller.records[&ticket].state, State::Failed);
+    let stop_count = endpoint
+        .downstream_requests()
+        .iter()
+        .filter(|(action, _, _)| *action == "stop")
+        .count();
+    assert_eq!(stop_count, 2, "recovery should issue one bounded retry");
+    assert!(
+        endpoint
+            .downstream_requests()
+            .iter()
+            .all(|(action, _, parent)| { *action != "stop" || parent.is_none() })
+    );
+}
+
+#[test]
+fn cleanup_retry_budget_exhaustion_keeps_session_fail_closed() {
+    let mut endpoint = Endpoint {
+        cleanup_fails: true,
+        ..Endpoint::default()
+    };
+    endpoint.enqueue(1, "owner", open("disconnect-cleanup-retry-exhausted"));
+    let runtime = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+    finish_prepare(&mut controller, &runtime);
+    let ticket = endpoint.completed(1)["ticket"].as_u64().unwrap();
+
+    controller.disconnected(77, Some(ticket), "peer_closed");
+    for now in 3..2_500 {
+        tick(&mut controller, &runtime, now);
+    }
+
+    let record = &controller.records[&ticket];
+    assert_eq!(record.state, State::CleanupFailed);
+    assert!(!record.cleanup_confirmed);
+    assert_eq!(record.cleanup_retry_count, MAX_CLEANUP_RETRIES);
+    assert!(record.cleanup_error.is_some());
+    let stop_count = endpoint
+        .downstream_requests()
+        .iter()
+        .filter(|(action, _, _)| *action == "stop")
+        .count();
+    assert_eq!(stop_count, usize::from(MAX_CLEANUP_RETRIES) + 1);
+
+    for now in 2_500..3_000 {
+        tick(&mut controller, &runtime, now);
+    }
+    let later_stop_count = endpoint
+        .downstream_requests()
+        .iter()
+        .filter(|(action, _, _)| *action == "stop")
+        .count();
+    assert_eq!(
+        later_stop_count, stop_count,
+        "exhausted cleanup is not retried forever"
+    );
+}
+
+#[test]
 fn orderly_module_shutdown_requests_replay_safe_stop_for_owned_sessions() {
     let mut endpoint = Endpoint::default();
     endpoint.enqueue(1, "owner", open("module-shutdown-cleanup"));

@@ -249,6 +249,8 @@ impl Controller {
             next_status: expires,
             failure: None,
             cleanup_error: None,
+            cleanup_retry_count: 0,
+            cleanup_retry_at: None,
             uncertain: None,
             uncertain_phase: None,
             needs_lookup: true,
