@@ -1,6 +1,7 @@
 namespace Amaterasu {
   const pageNames: Record<Page, string> = {
     overview: "Overview",
+    host: "Host & devices",
     catalog: "Library",
     settings: "Settings",
     updates: "Modules & UI",
@@ -11,6 +12,7 @@ namespace Amaterasu {
   };
   const pageIcons: Record<Page, string> = {
     updates: "+",
+    host: "⌂",
     overview: "▦",
     catalog: "⊞",
     settings: "≡",
@@ -409,6 +411,7 @@ namespace Amaterasu {
       };
       const renderers: Record<Page, (context: PageContext) => void> = {
         overview: renderOverview,
+        host: renderHostManagement,
         catalog: renderCatalog,
         settings: renderSettings,
         updates: renderUpdates,

@@ -1,6 +1,7 @@
 namespace Amaterasu {
   export type Page =
     | "overview"
+    | "host"
     | "catalog"
     | "settings"
     | "updates"

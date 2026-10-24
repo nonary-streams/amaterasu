@@ -118,7 +118,7 @@ namespace Amaterasu {
           el(
             "p",
             "",
-            "Client pairing, capture, and stream connections are not available in this release. The management tools shown here are live.",
+            "Review pending device pairing from Host & devices. Capture controls and a browser streaming view are not available in this release.",
           ),
         ),
       );

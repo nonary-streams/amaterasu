@@ -43,6 +43,12 @@ browser API calls.
 - Overview shows actual responses from catalog, sessions, applications, and Steam.
   Missing authority or failed services appear unavailable. Counts ending in `+`
   are bounded page counts, not invented global totals.
+- Host & devices shows pending pairing requests, allows an administrator with
+  `pairing.admin` to submit a four-digit device PIN, and reports host listeners,
+  streaming history health, and management sessions using their existing read
+  scopes. PIN input is cleared on submission and is not stored or rendered as
+  text. Approval advances the pairing protocol; it does not claim the device
+  completed pairing.
 - Catalog list/search with revision-bound next/previous pagination, including empty
   search pages with valid continuations. Create, edit, and delete use expected
   catalog revisions; conflicts require refresh and are never retried silently.
@@ -123,7 +129,7 @@ actual API outcomes.
 
 ## Not implemented
 
-Pairing, screen/audio capture, streaming connections, gamepad controls, legacy
+Screen/audio capture, streaming connections, gamepad controls, legacy
 client compatibility, application launching UX, Steam import/artwork, schema
 registration/migration UX, credential/token lifecycle administration, multi-user
 isolation, remote TLS setup, and installed-service setup remain unavailable.

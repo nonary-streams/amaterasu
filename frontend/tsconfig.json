@@ -21,6 +21,7 @@
     "src/updates.ts",
     "src/locale.ts",
     "src/pages.ts",
+    "src/management.ts",
     "src/app.ts"
   ]
 }
