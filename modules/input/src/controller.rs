@@ -1382,6 +1382,7 @@ impl<B: Backend> Controller<B> {
                 "gamepad_profile":lease.gamepad_profile.as_str(),
                 "ds4_back_as_touchpad_click":lease.requested_ds4_back_as_touchpad_click.unwrap_or(lease.ds4_back_as_touchpad_click),
                 "native_pen_touch":lease.native_pen_touch,
+                "pen_touch_supported":self.backend.pen_touch_supported(),
                 "touch_as_mouse_max_contacts":touch_as_mouse_max_contacts,
                 "effective_gamepad_profile":effective_gamepad_profile,
                 "gamepad_unavailable_reason":gamepad_unavailable_reason,

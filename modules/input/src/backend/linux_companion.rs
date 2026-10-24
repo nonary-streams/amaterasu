@@ -31,6 +31,7 @@ struct SingleTouchAsMouse {
 }
 
 impl SingleTouchAsMouse {
+    #[cfg(test)]
     fn translate(&mut self, event: &Event) -> InputResult<Vec<InputEvent>> {
         let (intents, next_pointer) = self.plan(event)?;
         self.active_pointer = next_pointer;
@@ -386,7 +387,7 @@ fn companion_error(error: amaterasu_input_companion::InputError) -> InputError {
 mod tests {
     use super::{
         Axis, Backend, InputEvent, KeyState, LinuxCompanionBackend, SingleTouchAsMouse,
-        absolute_pointer_event, evdev_key_event, scroll_events,
+        absolute_pointer_event, evdev_key_event, left_button_event, scroll_events,
     };
     use crate::model::{Event, PenTouchDevice, PenTouchPhase};
     use amaterasu_input_companion::{
