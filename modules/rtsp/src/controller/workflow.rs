@@ -462,9 +462,7 @@ impl Controller {
             self.revoke_ticket(ticket);
         }
         let retry_ticket = self.records.iter_mut().find_map(|(ticket, record)| {
-            if record.state != State::CleanupFailed
-                || record.cleanup_retry_count >= MAX_CLEANUP_RETRIES
-            {
+            if record.state != State::CleanupFailed {
                 return None;
             }
             if let Some(retry_at) = record.cleanup_retry_at {
@@ -475,6 +473,10 @@ impl Controller {
                 record.cleanup_error = None;
                 record.state = State::Closing;
                 return Some(*ticket);
+            }
+
+            if record.cleanup_retry_count >= MAX_CLEANUP_RETRIES {
+                return None;
             }
 
             let delay = CLEANUP_RETRY_DELAYS_MS[usize::from(record.cleanup_retry_count)];

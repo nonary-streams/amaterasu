@@ -371,7 +371,7 @@ fn cleanup_retry_budget_exhaustion_keeps_session_fail_closed() {
     let ticket = endpoint.completed(1)["ticket"].as_u64().unwrap();
 
     controller.disconnected(77, Some(ticket), "peer_closed");
-    for now in 3..2_500 {
+    for now in 3..5_000 {
         tick(&mut controller, &runtime, now);
     }
 
@@ -387,7 +387,7 @@ fn cleanup_retry_budget_exhaustion_keeps_session_fail_closed() {
         .count();
     assert_eq!(stop_count, usize::from(MAX_CLEANUP_RETRIES) + 1);
 
-    for now in 2_500..3_000 {
+    for now in 5_000..5_500 {
         tick(&mut controller, &runtime, now);
     }
     let later_stop_count = endpoint
