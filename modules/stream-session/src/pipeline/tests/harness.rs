@@ -521,6 +521,9 @@ impl Broker {
             } else {
                 self.allocations.remove(&key);
             }
+            if service == "amaterasu.control-transport/1" {
+                self.timeline.borrow_mut().push("control_close");
+            }
             return json!({"ok":true,"stream":id,"state":"closing"});
         }
         if action == "recover" && service == "amaterasu.audio-encode/1" {

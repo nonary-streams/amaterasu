@@ -98,7 +98,11 @@ fn stop_attempts_terminal_zero_before_releasing_local_input() {
         .iter()
         .position(|event| *event == "input_release")
         .expect("local input release");
-    assert!(zero_index < release_index);
+    let control_close_index = timeline
+        .iter()
+        .position(|event| *event == "control_close")
+        .expect("control resource close");
+    assert!(zero_index < release_index && release_index < control_close_index);
     assert_eq!(
         response["remote_rumble_stop_unconfirmed"], true,
         "provider acceptance is not a client acknowledgement"
