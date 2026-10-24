@@ -850,6 +850,10 @@ impl Controller {
         if record.state == State::Stopping || record.cancel_connection.is_some() {
             return Some(private_error(409, "stream cleanup is already in progress"));
         }
+        eprintln!(
+            "amaterasu launch cancel requested state={:?} stage={:?}",
+            record.state, record.stage
+        );
         record.cancel_connection = Some(connection);
         let retry = if record.state == State::CleanupFailed {
             record.retry_cleanup(now)

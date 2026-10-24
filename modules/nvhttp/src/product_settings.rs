@@ -33,10 +33,10 @@ const GLOBAL_RAW_PREPARATION_SETTINGS_VERSION: u64 = 17;
 const FRAME_LIMITER_SETTINGS_VERSION: u64 = 17;
 const ENCRYPTION_MODE_SETTINGS_VERSION: u64 = 17;
 const DISPLAY_POLICY_SETTINGS_VERSION: u64 = 18;
-// The Linux Desktop profile requires video encryption. Its LAN policy must
-// require the same choice on a newly initialized host.
+// The Linux Desktop profile requests video encryption. The default LAN policy
+// permits that choice while still allowing other profiles to negotiate it.
 #[cfg(target_os = "linux")]
-const DEFAULT_LAN_ENCRYPTION_MODE: u8 = 2;
+const DEFAULT_LAN_ENCRYPTION_MODE: u8 = 1;
 #[cfg(not(target_os = "linux"))]
 const DEFAULT_LAN_ENCRYPTION_MODE: u8 = 0;
 const DEFAULT_WAN_ENCRYPTION_MODE: u8 = 1;
@@ -3154,7 +3154,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn new_linux_host_accepts_encrypted_video_from_its_desktop_profile() {
+    fn new_linux_host_supports_automatic_video_encryption() {
         use amaterasu_gamestream::network::{NetworkEncryptionPolicy, VideoEncryptionMode};
 
         let settings = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
@@ -3165,7 +3165,7 @@ mod tests {
                 .unwrap(),
         };
         assert!(policy.accepts_video_encryption_for_peer("192.168.0.134".parse().unwrap(), true));
-        assert!(!policy.accepts_video_encryption_for_peer("192.168.0.134".parse().unwrap(), false));
+        assert!(policy.accepts_video_encryption_for_peer("192.168.0.134".parse().unwrap(), false));
     }
 
     fn v17_update_confirmation(mut payload: Value) -> Value {

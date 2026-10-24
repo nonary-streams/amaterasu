@@ -73,6 +73,7 @@ impl Controller {
             record.retrying_uncertainty = false;
         }
         let phase = next_phase(&record);
+        eprintln!("amaterasu launch phase start={phase:?}");
         let call = self.make_call(&mut record, phase);
         let deadline = if matches!(phase, Phase::MonitorApplication | Phase::MonitorRtsp) {
             now + std::time::Duration::from_secs(5)
@@ -104,6 +105,7 @@ impl Controller {
             Outcome::Rejected => self.rejected(job, now, replies),
             Outcome::Settled => self.settled(job, now, replies),
             Outcome::Uncertain => {
+                eprintln!("amaterasu launch phase uncertain={:?}", job.phase);
                 let record = self.records.get_mut(&job.record).expect("workflow record");
                 let entering_cleanup =
                     !matches!(record.state, State::Stopping | State::CleanupFailed);
@@ -410,6 +412,11 @@ impl Controller {
         now: Instant,
         replies: &mut Vec<(u64, Reply)>,
     ) {
+        eprintln!(
+            "amaterasu launch phase result={:?} ok={}",
+            job.phase,
+            payload["ok"] == true
+        );
         let record = self.records.get_mut(&job.record).expect("workflow record");
         match job.phase {
             Phase::ReserveHistory => {
@@ -701,6 +708,7 @@ impl Controller {
     }
 
     fn rejected(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
+        eprintln!("amaterasu launch phase rejected={:?}", job.phase);
         let record = self.records.get_mut(&job.record).expect("workflow record");
         match job.phase {
             Phase::ReserveHistory => {
@@ -756,6 +764,7 @@ impl Controller {
     }
 
     fn settled(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
+        eprintln!("amaterasu launch phase settled={:?}", job.phase);
         let record = self.records.get_mut(&job.record).expect("workflow record");
         record.stage = Stage::Cleanup;
         match job.phase {
@@ -1398,6 +1407,7 @@ fn fail_record(record: &mut Record, code: &'static str, now: Instant) {
 }
 
 fn complete_launch(record: &mut Record, now: Instant, replies: &mut Vec<(u64, Reply)>) {
+    eprintln!("amaterasu launch preparation complete");
     record.state = State::AwaitingDelivery;
     record.stage = Stage::AwaitingDelivery;
     if let Some(connection) = record.launch_connection {
