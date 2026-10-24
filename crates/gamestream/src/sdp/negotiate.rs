@@ -1,6 +1,8 @@
 use super::attributes::{Attributes, bounded};
 use super::syntax;
-use super::{Announce, Audio, ColorMode, ControlProtocol, Encryption, Error, Fec, Video};
+use super::{
+    Announce, Audio, ColorMode, ControlProtocol, Encryption, Error, Fec, Video, VideoCodec,
+};
 
 pub fn parse_announce(bytes: &[u8]) -> Result<Announce, Error> {
     let document = syntax::parse(bytes)?;
@@ -44,8 +46,20 @@ pub fn parse_announce(bytes: &[u8]) -> Result<Announce, Error> {
 }
 
 fn video(attributes: &mut Attributes<'_>) -> Result<Video, Error> {
-    attributes.require_value("x-nv-vqos[0].bitStreamFormat", 0)?;
-    attributes.default_value("x-nv-clientSupportHevc", 0)?;
+    let codec = match attributes.required("x-nv-vqos[0].bitStreamFormat")? {
+        0 => VideoCodec::H264,
+        1 => VideoCodec::Hevc,
+        _ => return Err(Error::Unsupported("video codec")),
+    };
+    let client_hevc = bounded(
+        attributes.default("x-nv-clientSupportHevc", 0)?,
+        0,
+        1,
+        "HEVC support",
+    )?;
+    if codec == VideoCodec::Hevc && client_hevc != 1 {
+        return Err(Error::Unsupported("HEVC support"));
+    }
     attributes.require_value("x-nv-video[0].dynamicRangeMode", 0)?;
     attributes.default_value("x-ss-video[0].chromaSamplingType", 0)?;
     attributes.default_value("x-ss-video[0].intraRefresh", 0)?;
@@ -88,6 +102,7 @@ fn video(attributes: &mut Attributes<'_>) -> Result<Video, Error> {
         _ => return Err(Error::Unsupported("color mode")),
     };
     Ok(Video {
+        codec,
         width,
         height,
         fps,

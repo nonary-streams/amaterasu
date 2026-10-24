@@ -17,6 +17,7 @@ fn changed(name: &str, value: &str) -> String {
 
 fn all_support() -> TransportSupport {
     TransportSupport {
+        hevc: false,
         stereo_audio: true,
         enet_control: true,
         encrypted_control: true,
@@ -29,6 +30,28 @@ fn all_support() -> TransportSupport {
 }
 
 #[test]
+fn hevc_sdr_announce_is_parsed_but_requires_end_to_end_capability() {
+    let hevc = changed("x-nv-vqos[0].bitStreamFormat", "1")
+        .replace("a=x-nv-clientSupportHevc:0 ", "a=x-nv-clientSupportHevc:1 ");
+    let announce = parse_announce(hevc.as_bytes()).unwrap();
+    assert_eq!(announce.video.codec, VideoCodec::Hevc);
+    assert_eq!(
+        announce.check_support(&all_support()),
+        Err(Error::Unsupported("HEVC video"))
+    );
+    let mut enabled = all_support();
+    enabled.hevc = true;
+    announce.check_support(&enabled).unwrap();
+
+    let h264_capable = changed("x-nv-clientSupportHevc", "1");
+    assert_eq!(
+        parse_announce(h264_capable.as_bytes()).unwrap().video.codec,
+        VideoCodec::H264
+    );
+    assert!(parse_announce(changed("x-nv-vqos[0].bitStreamFormat", "1").as_bytes()).is_err());
+}
+
+#[test]
 fn primary_client_shape_negotiates_exact_h264_sdr_requirements() {
     let result = parse_announce(FIXTURE.as_bytes()).unwrap();
     assert_eq!(
@@ -38,6 +61,7 @@ fn primary_client_shape_negotiates_exact_h264_sdr_requirements() {
     assert_eq!(result.video.bitrate_kbps, 16000);
     assert_eq!(result.video.configured_bitrate_kbps, Some(20000));
     assert_eq!(result.video.color, ColorMode::Bt709Limited);
+    assert_eq!(result.video.codec, VideoCodec::H264);
     assert_eq!(result.packet_size, 1392);
     assert_eq!(result.audio.packet_duration_ms, 5);
     assert_eq!(result.fec.minimum_packets, 2);
@@ -136,7 +160,6 @@ fn encryption_requirements_are_preserved_and_cannot_silently_downgrade() {
 #[test]
 fn unsupported_media_modes_and_invalid_numeric_boundaries_fail() {
     for (name, value) in [
-        ("x-nv-vqos[0].bitStreamFormat", "1"),
         ("x-nv-vqos[0].bitStreamFormat", "2"),
         ("x-nv-video[0].dynamicRangeMode", "1"),
         ("x-ss-video[0].chromaSamplingType", "1"),

@@ -15,6 +15,7 @@ fn negotiation() -> Negotiation {
         },
         Capabilities {
             transport: sdp::TransportSupport {
+                hevc: false,
                 stereo_audio: true,
                 enet_control: true,
                 encrypted_control: true,

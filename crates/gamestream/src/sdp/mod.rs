@@ -35,6 +35,12 @@ pub enum ColorMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoCodec {
+    H264,
+    Hevc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlProtocol {
     Enet,
     EncryptedEnet,
@@ -42,6 +48,7 @@ pub enum ControlProtocol {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Video {
+    pub codec: VideoCodec,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -96,6 +103,8 @@ pub struct Announce {
 /// Default denies audio, control, encryption and parity generation.
 #[derive(Default)]
 pub struct TransportSupport {
+    /// HEVC Main SDR encoder, packetizer and session configuration are all ready.
+    pub hevc: bool,
     pub stereo_audio: bool,
     pub enet_control: bool,
     pub encrypted_control: bool,
@@ -111,6 +120,11 @@ impl Announce {
     /// before committing ANNOUNCE; resource allocation and session checks follow.
     pub fn check_support(&self, support: &TransportSupport) -> Result<(), Error> {
         let requirements = [
+            (
+                self.video.codec == VideoCodec::Hevc,
+                support.hevc,
+                "HEVC video",
+            ),
             (true, support.stereo_audio, "stereo audio"),
             (true, support.enet_control, "ENet control"),
             (

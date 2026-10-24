@@ -149,6 +149,7 @@ impl Record {
         let bounds = self.config.negotiation_bounds;
         Capabilities {
             transport: amaterasu_gamestream::sdp::TransportSupport {
+                hevc: false,
                 stereo_audio: true,
                 enet_control: true,
                 encrypted_control: true,
