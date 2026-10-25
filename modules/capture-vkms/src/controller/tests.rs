@@ -1,5 +1,7 @@
 use super::*;
-use crate::test_support::{FakeBackend, HELPER, Scripted, appended_layout, connector, settings};
+use crate::test_support::{
+    FakeBackend, HELPER, ScriptedWait, appended_layout, connector, eventually, settings,
+};
 use amaterasu_media::DesktopRect;
 
 const VIDEO: &str = "amaterasu.video";
@@ -363,14 +365,60 @@ fn an_inconsistent_layout_refuses_open_instead_of_guessing() {
 fn a_crtc_lookup_failure_triggers_an_immediate_refresh() {
     let (mut controller, backend) = controller();
     let id = opened(&mut controller);
-    backend.script.push(Scripted::Refuse(
+    let frames = controller.reader(VIDEO, id).unwrap().frames;
+    backend.script.present(4, 2_000_000);
+    assert!(eventually(|| frames
+        .latest_presentation()
+        .unwrap()
+        .sequence
+        == 4));
+    *backend.connectors.lock().unwrap() = Ok(vec![connector(9, 60, 1920)]);
+    backend.script.push_wait(ScriptedWait::Refuse(
         amaterasu_vkms_frame_helper::protocol::Failure::CrtcNotFound,
     ));
+    // Long before the periodic re-resolve is due, the thread's request
+    // makes the next refresh follow the new CRTC.
+    assert!(eventually(|| {
+        controller.refresh(1);
+        frames.crtc_id() == 60
+    }));
+    assert_eq!(frames.fault(), None);
+    let status = controller
+        .handle(VIDEO, Operation::Status, 0)
+        .unwrap()
+        .payload;
+    assert_eq!(status["streams"][0]["crtc_id"], 60);
+
+    // The woken thread waits on the new CRTC and delivers from it.
+    backend.script.present(1, 3_000_000);
+    assert!(eventually(|| frames
+        .latest_presentation()
+        .unwrap()
+        .sequence
+        == 5));
+    assert!(backend.script.waits.lock().unwrap().contains(&(60, 0)));
+}
+
+#[test]
+fn close_stops_the_presentation_thread_promptly() {
+    let (mut controller, backend) = controller();
+    let id = opened(&mut controller);
     let frames = controller.reader(VIDEO, id).unwrap().frames;
-    assert!(frames.lend().is_err());
-    *backend.connectors.lock().unwrap() = Ok(vec![connector(9, 60, 1920)]);
-    controller.refresh(1);
-    assert_eq!(frames.crtc_id(), 60);
+    backend.script.present_fenced(1);
+    assert!(eventually(|| frames
+        .latest_presentation()
+        .unwrap()
+        .sequence
+        == 1));
+    let started = std::time::Instant::now();
+    controller.close(VIDEO, id).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    let waits = backend.script.waits.lock().unwrap().len();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert_eq!(backend.script.waits.lock().unwrap().len(), waits);
+    // The last frame closes when the stream's state is released.
+    drop(frames);
+    assert!(backend.script.all_lent_descriptors_closed());
 }
 
 #[test]

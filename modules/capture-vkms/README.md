@@ -70,7 +70,8 @@ reply `{"ok":false,"error":{"code":"...","message":"..."}}`.
   requires a capture principal and an operation id. `constant_rate:true` fails
   with `unsupported_constant_rate`. The output is resolved to its current CRTC,
   a helper is started for the stream, opens the card and exports one frame to
-  prove the path; only then is the stream reported. The reply carries
+  prove the path; only then is the stream's presentation thread started and
+  the stream reported. The reply carries
   `stream`, `output`, `operation_id`, `card`, `connector_id`, `crtc_id`, the
   mode, `frame_transport:"dmabuf"`, `geometry_supported` and, when supported,
   `desktop_geometry` (see Geometry). Replaying the same operation id returns the same stream;
@@ -82,8 +83,9 @@ reply `{"ok":false,"error":{"code":"...","message":"..."}}`.
   4 open streams and 128 per module instance).
 - `{"action":"lookup","operation_id":"video-1"}` recovers the caller's stream.
 - `{"action":"close","stream":123}` is idempotent for its owner. It stops
-  admitting native reads at once and ends that stream's helper; a read admitted
-  before close finishes with its descriptors still valid.
+  admitting native reads at once, stops the stream's presentation thread and
+  ends its helper; a read admitted before close finishes with its descriptors
+  still valid.
 
 ## Output resolution
 
@@ -97,8 +99,8 @@ GETRESOURCES, GETCONNECTOR, GETENCODER and GETCRTC queries to find the
 connector's encoder, CRTC and mode. The descriptor is closed afterward. If the
 kernel made it DRM master because no compositor held the device, master is
 dropped immediately so the compositor can still acquire it; no other DRM state
-is touched. Open streams re-resolve once per second, and immediately when the
-helper reports the CRTC is gone: a CRTC or mode change is followed, while a
+is touched. Open streams re-resolve once per second, and on the next host tick
+when the presentation thread reports the CRTC is gone: a CRTC or mode change is followed, while a
 disconnected, inactive or replaced connector faults the stream.
 
 ## Geometry
@@ -141,32 +143,78 @@ A lost compositor connection is retried at most once per second.
 
 ## Native frames
 
-The native table is `CaptureApiV1_4` (major 1, minor 4). `read_frame`,
-`read_frame_with_freshness` and `read_frame_with_capture_timestamp` return
-`MEDIA_UNSUPPORTED`. `read_dmabuf_frame` synchronously asks the stream's
-helper for the newest presentation, fills one `DmaBufFrame` and calls the sink
-exactly once:
+The native table is `CaptureApiV1_5` (major 1, minor 5), a strict superset of
+`CaptureApiV1_4`, so v1.4 consumers bind and read it unchanged.
+`read_frame`, `read_frame_with_freshness` and
+`read_frame_with_capture_timestamp` return `MEDIA_UNSUPPORTED`.
+
+Frames are pushed by presentation, not sampled. Each open stream has one
+presentation thread that alone owns the stream's helper. It asks the helper to
+WAIT (bounded to 100 ms) for a sequence newer than the last one it saw; as soon
+as the driver completes a newer presentation it exports it with FRAME and
+stores it as the stream's newest frame, replacing the previous one. A timeout
+just waits again, so frames arrive at the compositor's presentation rate,
+including variable refresh, and nothing is exported while the output is idle.
+FRAME always returns the newest completed scanout, so presentations completed
+during an export are coalesced into the next frame.
+
+`read_dmabuf_frame` never talks to the helper. It lends the stored newest frame
+to the sink exactly once; that frame is the buffer currently scanned out, so
+lending it again for a repeat is valid:
 
 - fourcc, modifier, plane layout and per-plane acquire fences are the driver's.
   `color` is `DMABUF_COLOR_SRGB`.
-- `sequence` is the driver presentation sequence. Freshness is
-  `CAPTURE_FRAME_FRESH` when the sequence is newer than the last presentation
-  the sink accepted on this stream, otherwise `CAPTURE_FRAME_CACHED_REUSE`; a
-  rejected fresh frame stays fresh on the next read.
+- `sequence` is the driver presentation sequence. If the output moves to
+  another CRTC, sequences continue after the last stored one, so a stream's
+  sequences never decrease. Freshness is `CAPTURE_FRAME_FRESH` when the stored
+  sequence is newer than the last one the sink accepted on this stream,
+  otherwise `CAPTURE_FRAME_CACHED_REUSE`; a rejected fresh frame stays fresh on
+  the next read.
 - `timestamp_us` is the driver's CLOCK_MONOTONIC presentation time in
   microseconds since the stream opened. A presentation completed before open
   maps to zero, and timestamps never decrease.
-- The DMA-BUF and fence descriptors are borrowed for the callback only. The
-  module closes them after the sink returns; a consumer that keeps a buffer
-  must duplicate its descriptor first. An open DMA-BUF pins the allocation but
-  does not stop the compositor from rendering into it again.
+- The DMA-BUF and fence descriptors are borrowed for the callback only and
+  stay owned by the stream. A frame replaced while a read borrows it is closed
+  when that read returns; otherwise a replaced frame is closed at once and the
+  newest one when the stream ends. A consumer that keeps a buffer must
+  duplicate its descriptor first. An open DMA-BUF pins the allocation but does
+  not stop the compositor from rendering into it again.
 
-No frame yet is `MEDIA_PENDING`; a busy helper or controller is `MEDIA_BUSY`;
-a closed or faulted-output stream is `MEDIA_CLOSED`; a failed helper or
-permission refusal is `MEDIA_BACKEND_ERROR`. Each read is one helper round trip
-bounded by 100 ms; a helper that misses it is treated as failed. The module
-does not use the helper's WAIT operation, so reads never block on the next
-presentation.
+`latest_presentation` writes the stored newest frame's `sequence` and
+`timestamp_us` (the same values its `DmaBufFrame` carries), or zeros before the
+first frame. It never calls the helper. A consumer polls it each tick and reads
+only when the sequence advances.
+
+No frame yet is `MEDIA_PENDING`; a frame the module cannot describe (larger
+than the DMA-BUF limits) is `MEDIA_UNSUPPORTED`; a busy controller or a second
+concurrent read of the same stream is `MEDIA_BUSY`; a closed or faulted-output
+stream is `MEDIA_CLOSED`; a failed helper or permission refusal is
+`MEDIA_BACKEND_ERROR` for both reads and presentation queries.
+
+### Threading, latency and lifetimes
+
+- Reads and queries take the controller lock with `try_lock` (busy rather
+  than blocking the host tick) and the stream's slot lock only to copy a
+  reference to the stored frame. No lock is held while the presentation thread
+  waits on the helper, and the presentation thread never waits for a sink:
+  a read holds only that stream's read gate while the sink runs.
+- A presentation is readable one FRAME round trip (a helper exchange and the
+  driver export, bounded to 100 ms) after WAIT returns, which is itself
+  immediate on completion. The consumer then sees it on its next
+  `latest_presentation` poll.
+- The thread stops on close, on module shutdown, and on its own when the
+  stream faults. Close sets a stop flag, shuts down the stream's helper socket,
+  which makes a pending WAIT or FRAME fail at once, and joins the thread; the
+  thread then ends the helper (it exits on end of stream, or is killed after
+  50 ms if it is still in the driver). Close therefore blocks the tick for
+  about 50 ms at most, well under one WAIT timeout.
+- `busy` and `interrupted` driver refusals are retried after 5 ms; other
+  driver refusals after 20 ms, faulting the stream as `frame_helper_failed`
+  after 10 in a row. `crtc_not_found` asks the controller to re-resolve the
+  output on its next tick and retries after 100 ms or as soon as the
+  controller retargets the stream. A closed, silent (the WAIT bound plus
+  250 ms) or out-of-step helper faults the stream as `frame_helper_failed`,
+  and `permission_denied` as `permission_denied`.
 
 ## Helper protocol
 
@@ -190,7 +238,8 @@ u32, 12 reserved bytes. Opcodes:
    major 226, the same `st_rdev` and the driver name `vibeshine_drm`, and drops
    any master role. One card per helper.
 3. FRAME(crtc): driver GET_FRAME.
-4. WAIT(crtc, last sequence, timeout <= 1000 ms): driver WAIT_PRESENT.
+4. WAIT(crtc, last sequence, timeout <= 1000 ms): driver WAIT_PRESENT. It
+   returns as soon as a newer sequence completes, or flags a timeout.
 
 Responses are 128 bytes: magic `AVFR`, version, echoed opcode and request id,
 status u32 (0 or a failure), errno detail, result flags, crtc id, plane count,
@@ -199,7 +248,9 @@ four offsets and 24 reserved bytes. A ready frame carries one SCM_RIGHTS
 message: each plane's DMA-BUF in plane order, then the sync_file of each plane
 named in the fence mask. The helper closes its own copies after sending. The
 client checks the request id, opcode, CRTC echo and exact descriptor count, and
-stops using a helper after any transport or protocol fault.
+stops using a helper after any transport or protocol fault. Another thread can
+end a pending request through a shutdown handle that holds its own duplicate of
+the socket; the request then fails as closed and the helper sees end of stream.
 
 Failures are distinct: `permission_denied` (no permitted `CAP_SYS_ADMIN` or the
 driver refused it), `card_not_open`, `card_already_open`, `device_rejected`,
@@ -220,11 +271,16 @@ the helper's request rules and capability handling with fakes, output names,
 sysfs scanning of a fake tree, resolution and error mapping, desktop geometry
 from fake compositor layouts (scaled primary, appended-right, negative origins,
 mode mismatch, missing outputs, unsupported and not-ready states), freshness and
-timestamps, descriptor lifetimes across the native callback, and helper-file
+timestamps, descriptor lifetimes across the native callback and across frame
+replacement, the presentation thread against a fake helper (push on each
+presentation, coalescing, empty CRTCs, monotonic presentation queries, fault
+propagation, re-resolution after `crtc_not_found`, and stop latency with and
+without interruptible helpers), the socket shutdown handle, and helper-file
 checks. An integration test runs the real helper binary without capabilities
 and never asks it to open a DRM device. No test connects to the compositor; the
 live layout test is ignored. Capture from a real vibeshine_drm
 device with `CAP_SYS_ADMIN`, the exported formats and modifiers KWin produces,
-fence behavior, and the video and encoder import path remain separate
-acceptance gates. Behavior was modeled on Vibeshine's KMS capture; no Vibeshine
+fence behavior, presentation-to-availability latency and VRR cadence on real
+hardware, and the video and encoder import path remain separate acceptance
+gates. Behavior was modeled on Vibeshine's KMS capture; no Vibeshine
 source was copied.

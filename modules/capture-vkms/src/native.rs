@@ -1,13 +1,15 @@
-//! Native `amaterasu.capture-vkms/1` capture table, v1.4. Only DMA-BUF
+//! Native `amaterasu.capture-vkms/1` capture table, v1.5. Only DMA-BUF
 //! delivery is offered; the CPU frame callbacks report MEDIA_UNSUPPORTED.
+//! Reads and presentation queries use the frame the stream's presentation
+//! thread stored and never wait for the helper.
 use crate::{
     backend::Backend,
     controller::{Controller, StreamGeometry},
 };
 use amaterasu_media::{
-    CAPTURE_API_V1_4_SIZE, CAPTURE_DMABUF_INTERFACE_MINOR, CaptureApiV1_4, CaptureGeometry,
+    CAPTURE_API_V1_5_SIZE, CAPTURE_PRESENTATION_INTERFACE_MINOR, CaptureApiV1_5, CaptureGeometry,
     DmaBufFrameSink, FrameSink, FreshFrameSinkV1_2, FreshFrameSinkV1_3, INTERFACE_MAJOR,
-    MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_UNSUPPORTED,
+    MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_UNSUPPORTED, PresentationStatus,
 };
 use amaterasu_module_sdk::abi::{
     AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery, NativeServiceFactory,
@@ -42,7 +44,7 @@ impl<B: Backend + 'static> Factory<B> {
 }
 
 struct Binding<B: Backend> {
-    api: CaptureApiV1_4,
+    api: CaptureApiV1_5,
     controller: Shared<B>,
     caller: String,
 }
@@ -50,12 +52,12 @@ struct Binding<B: Backend> {
 impl<B: Backend> Binding<B> {
     fn new(controller: Shared<B>, caller: String) -> Box<Self> {
         let mut binding = Box::new(Self {
-            api: CaptureApiV1_4 {
+            api: CaptureApiV1_5 {
                 base: NativeInterface {
                     header: AbiHeader {
-                        size: CAPTURE_API_V1_4_SIZE,
+                        size: CAPTURE_API_V1_5_SIZE,
                         major: INTERFACE_MAJOR,
-                        minor: CAPTURE_DMABUF_INTERFACE_MINOR,
+                        minor: CAPTURE_PRESENTATION_INTERFACE_MINOR,
                     },
                     context: std::ptr::null_mut(),
                     release: Some(release::<B>),
@@ -65,6 +67,7 @@ impl<B: Backend> Binding<B> {
                 read_frame_with_freshness,
                 read_frame_with_capture_timestamp,
                 read_dmabuf_frame: read_dmabuf_frame::<B>,
+                latest_presentation: latest_presentation::<B>,
             },
             controller,
             caller,
@@ -88,8 +91,8 @@ impl<B: Backend> Binding<B> {
 fn supports_query(query: &NativeInterfaceQuery) -> bool {
     query.header.supports::<NativeInterfaceQuery>()
         && query.interface_major == INTERFACE_MAJOR
-        && query.min_minor <= CAPTURE_DMABUF_INTERFACE_MINOR
-        && query.min_size <= CAPTURE_API_V1_4_SIZE
+        && query.min_minor <= CAPTURE_PRESENTATION_INTERFACE_MINOR
+        && query.min_size <= CAPTURE_API_V1_5_SIZE
 }
 
 unsafe extern "C" fn bind<B: Backend + 'static>(
@@ -220,12 +223,46 @@ unsafe extern "C" fn read_dmabuf_frame<B: Backend>(
             Ok(lent) => lent,
             Err(status) => return status,
         };
-        // SAFETY: every descriptor in the frame is owned by `lent` and stays
-        // open until `finish` drops it after the callback returns. No
-        // controller or stream lock is held while foreign code runs; the sink
-        // must duplicate any descriptor it keeps.
-        let status = unsafe { sink.send(&lent.frame, lent.freshness) };
+        // SAFETY: `lent` shares ownership of the stored frame, so every
+        // descriptor in it stays open until `finish` drops it after the
+        // callback returns, even if the presentation thread stores a newer
+        // frame meanwhile. Only this stream's read gate is held while
+        // foreign code runs; the sink must duplicate any descriptor it keeps.
+        let status = unsafe { sink.send(lent.frame(), lent.freshness) };
         frames.finish(lent, status)
+    })
+}
+
+unsafe extern "C" fn latest_presentation<B: Backend>(
+    context: *mut c_void,
+    stream: u64,
+    output: *mut PresentationStatus,
+) -> Status {
+    guarded(|| {
+        if context.is_null()
+            || output.is_null()
+            || !(output as usize).is_multiple_of(align_of::<PresentationStatus>())
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: broker retains the native binding until the synchronous call ends.
+        let binding = unsafe { &*context.cast::<Binding<B>>() };
+        let frames = match binding.reader(stream) {
+            Ok(reader) => reader.frames,
+            Err(status) => return status,
+        };
+        let Some(_admission) = frames.admission.enter() else {
+            return MEDIA_CLOSED;
+        };
+        match frames.latest_presentation() {
+            Ok(presentation) => {
+                // SAFETY: the validated aligned output slot is writable for
+                // this synchronous native call and holds plain data.
+                unsafe { output.write(presentation) };
+                STATUS_OK
+            }
+            Err(status) => status,
+        }
     })
 }
 

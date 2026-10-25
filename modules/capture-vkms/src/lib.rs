@@ -16,6 +16,7 @@ mod geometry;
 mod model;
 mod native;
 mod output_name;
+mod presenter;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use backend::NativeBackend;

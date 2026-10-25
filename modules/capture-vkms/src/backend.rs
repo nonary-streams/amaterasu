@@ -2,17 +2,21 @@
 //! controller is testable without DRM or a helper process.
 use crate::{
     discovery::{self, Discovery, DisplayProbe, OutputBinding, kms::KmsProbe},
-    frames::FrameSource,
     geometry::{DesktopLayout, LayoutOutput, WaylandLayout},
     model::{CaptureError, CaptureResult},
     output_name::OutputName,
+    presenter::{FrameSource, SourceInterrupt},
 };
 use amaterasu_vkms_frame_helper::{
-    client::{ClientError, FrameExport},
+    channel::ChannelShutdown,
+    client::{ClientError, FrameExport, Presentation},
     process::{self, HelperProcess},
     protocol::Failure,
 };
-use std::{path::Path, sync::Mutex};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 pub trait Backend: Send {
     fn discover(&self) -> CaptureResult<Discovery>;
@@ -81,7 +85,16 @@ impl Backend for NativeBackend {
             Ok(_) => {}
             Err(error) => return Err(first_frame_error(helper, binding, &error)),
         }
-        Ok(Box::new(HelperSource(process)))
+        let shutdown = process.client().shutdown_handle().map_err(|error| {
+            CaptureError::new(
+                "frame_helper_failed",
+                format!("the frame helper socket cannot be shared: {error}"),
+            )
+        })?;
+        Ok(Box::new(HelperSource {
+            process,
+            shutdown: Arc::new(shutdown),
+        }))
     }
 
     fn monotonic_now_ns(&self) -> u64 {
@@ -97,12 +110,45 @@ impl Backend for NativeBackend {
     }
 }
 
-/// A helper process serving one stream.
-struct HelperSource(HelperProcess);
+/// A helper process serving one stream, used only by its presentation
+/// thread. The shutdown handle lets another thread end a pending WAIT.
+struct HelperSource {
+    process: HelperProcess,
+    shutdown: Arc<ChannelShutdown>,
+}
 
 impl FrameSource for HelperSource {
+    fn wait(
+        &mut self,
+        crtc_id: u32,
+        last_sequence: u64,
+        timeout_ms: u32,
+    ) -> Result<Presentation, ClientError> {
+        self.process
+            .client()
+            .wait(crtc_id, last_sequence, timeout_ms)
+    }
+
     fn frame(&mut self, crtc_id: u32) -> Result<FrameExport, ClientError> {
-        self.0.client().frame(crtc_id)
+        self.process.client().frame(crtc_id)
+    }
+
+    fn interrupter(&self) -> Arc<dyn SourceInterrupt> {
+        self.shutdown.clone()
+    }
+}
+
+impl Drop for HelperSource {
+    fn drop(&mut self) {
+        // The shutdown handle holds a second reference to the socket, so
+        // closing the client alone would not show the helper end of stream.
+        self.shutdown.shutdown();
+    }
+}
+
+impl SourceInterrupt for ChannelShutdown {
+    fn interrupt(&self) {
+        self.shutdown();
     }
 }
 

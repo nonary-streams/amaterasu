@@ -9,6 +9,7 @@ use crate::{
         Operation, Settings, new_id, validate_operation_id,
     },
     output_name::OutputName,
+    presenter::PresentationThread,
 };
 use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
@@ -52,6 +53,7 @@ struct Stream {
     binding: OutputBinding,
     geometry: StreamGeometry,
     frames: Arc<StreamFrames>,
+    presenter: PresentationThread,
     next_resolve_ms: u64,
 }
 
@@ -198,16 +200,22 @@ impl<B: Backend> Controller<B> {
         }
         let source = self.backend.connect(&helper, &binding)?;
         let frames = Arc::new(StreamFrames::new(
-            source,
             binding.crtc_id,
             self.backend.monotonic_now_ns(),
         ));
+        let presenter = PresentationThread::spawn(source, frames.clone()).map_err(|error| {
+            CaptureError::new(
+                "resource_exhausted",
+                format!("cannot start the presentation thread: {error}"),
+            )
+        })?;
         let stream = Stream {
             owner: caller.to_owned(),
             operation,
             binding,
             geometry,
             frames,
+            presenter,
             next_resolve_ms: now + RESOLVE_INTERVAL_MS,
         };
         let payload = stream_reply(id, &stream);
@@ -269,11 +277,13 @@ impl<B: Backend> Controller<B> {
         Ok(())
     }
 
-    /// Stops admitting native reads, then releases the helper. A read
-    /// admitted before close keeps the stream's frames alive until it ends.
+    /// Stops admitting native reads, then stops the presentation thread,
+    /// which ends the helper. A read admitted before close keeps the stored
+    /// frame alive until it ends.
     fn end_stream(&mut self, id: u64) {
-        if let Some(stream) = self.streams.remove(&id) {
+        if let Some(mut stream) = self.streams.remove(&id) {
             stream.frames.admission.close();
+            stream.presenter.stop();
             self.closed.insert(id, stream.owner);
         }
     }
@@ -284,8 +294,8 @@ impl<B: Backend> Controller<B> {
         }
     }
 
-    /// Re-resolves each stream's output on its interval, or at once after a
-    /// read reported that its CRTC disappeared.
+    /// Re-resolves each stream's output on its interval, or at once after
+    /// its presentation thread reported that the CRTC disappeared.
     pub fn refresh(&mut self, now: u64) {
         let layout_changed = self.backend.poll_layout();
         let due: Vec<u64> = self
@@ -313,6 +323,9 @@ impl<B: Backend> Controller<B> {
                 Err(error) if error.code == "driver_unavailable" => {}
                 Err(error) => stream.frames.set_fault(StreamFault::OutputLost(error.code)),
             }
+            // A thread paused for a missing CRTC retries at once on the new
+            // binding, and a faulted one exits without finishing its pause.
+            stream.presenter.wake();
         }
     }
 

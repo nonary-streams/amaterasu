@@ -138,3 +138,26 @@ fn too_many_descriptors_are_refused_before_sending() {
         io::ErrorKind::InvalidInput
     );
 }
+
+#[test]
+fn a_shutdown_handle_wakes_a_blocked_receive_and_ends_the_peer() {
+    let (left, right) = SeqpacketChannel::pair().unwrap();
+    let handle = left.shutdown_handle().unwrap();
+    assert!(is_close_on_exec(handle.socket.as_fd()));
+    let receiver = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let mut buffer = [0; 8];
+        let received = left.receive(&mut buffer).unwrap();
+        (received.is_end_of_stream(), started.elapsed(), left)
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    handle.shutdown();
+    let (ended, waited, left) = receiver.join().unwrap();
+    assert!(ended);
+    assert!(waited < Duration::from_secs(1));
+    assert!(left.send(b"x", &[]).is_err());
+    let mut buffer = [0; 8];
+    assert!(right.receive(&mut buffer).unwrap().is_end_of_stream());
+    // A second shutdown is harmless.
+    handle.shutdown();
+}
