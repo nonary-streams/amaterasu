@@ -1,4 +1,5 @@
 use super::*;
+use crate::encoder_snapshot::{CodecAdvertisement, EncoderSnapshot};
 use crate::launch::{CaptureConfig, CaptureProvider, StreamProfile, StreamingConfig};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -313,7 +314,15 @@ fn query_rejects_duplicate_escaped_fields_and_bounded_malformed_input() {
 #[test]
 fn xml_escapes_metadata_and_advertises_configured_streaming_honestly() {
     assert_eq!(xml::escape("<&>\"'"), "&lt;&amp;&gt;&quot;&apos;");
-    let response = xml::server_info(&router().config, "host-id", false, 0, false, false);
+    let response = xml::server_info(
+        &router().config,
+        "host-id",
+        false,
+        0,
+        false,
+        false,
+        CodecAdvertisement::NONE,
+    );
     let text = String::from_utf8(response.body).unwrap();
     assert!(text.contains("Amaterasu &amp; &lt;test&gt;"));
     assert!(text.contains("<appversion>7.1.0.0</appversion>"));
@@ -364,7 +373,15 @@ fn hostname_updates_change_the_default_launch_device_name() {
 
 #[test]
 fn configured_streaming_advertises_only_the_supported_h264_codec() {
-    let response = xml::server_info(&router().config, "host-id", true, 0, true, true);
+    let response = xml::server_info(
+        &router().config,
+        "host-id",
+        true,
+        0,
+        true,
+        true,
+        EncoderSnapshot::default().advertisement(),
+    );
     let text = String::from_utf8(response.body).unwrap();
     let expected_version = if cfg!(target_os = "linux") {
         "7.1.431.-1"
@@ -376,6 +393,59 @@ fn configured_streaming_advertises_only_the_supported_h264_codec() {
     assert!(text.contains("<currentgame>0</currentgame>"));
     assert!(text.contains("<state>AMATERASU_SERVER_BUSY</state>"));
     assert!(text.contains("<ServerCodecModeSupport>1</ServerCodecModeSupport>"));
+    assert!(text.contains("<MaxLumaPixelsHEVC>0</MaxLumaPixelsHEVC>"));
+}
+
+#[test]
+fn serverinfo_codec_mask_and_hevc_luma_follow_the_encoder_snapshot() {
+    let encoder = |codec: &str, hardware: bool| {
+        json!({"identity":{"clsid":format!("test.{codec}.{hardware}"),"hardware_url":null,
+            "friendly_name":codec},"name":codec,"codec":codec,"hardware":hardware,
+            "vendor_id":null})
+    };
+    let cases = [
+        (vec![encoder("h264", false)], "1", "0"),
+        (
+            vec![encoder("h264", true), encoder("hevc", true)],
+            "257",
+            "1869449984",
+        ),
+        (
+            vec![encoder("h264", true), encoder("av1", true)],
+            "65537",
+            "0",
+        ),
+        (
+            vec![
+                encoder("h264", true),
+                encoder("hevc", true),
+                encoder("av1", true),
+            ],
+            "65793",
+            "1869449984",
+        ),
+    ];
+    for (encoders, mask, luma) in cases {
+        let snapshot =
+            EncoderSnapshot::parse(&json!({"ok":true,"enabled":true,"encoders":encoders})).unwrap();
+        let response = xml::server_info(
+            &router().config,
+            "host-id",
+            true,
+            0,
+            false,
+            true,
+            snapshot.advertisement(),
+        );
+        let text = String::from_utf8(response.body).unwrap();
+        assert!(
+            text.contains(&format!(
+                "<ServerCodecModeSupport>{mask}</ServerCodecModeSupport>"
+            )),
+            "{text}"
+        );
+        assert!(text.contains(&format!("<MaxLumaPixelsHEVC>{luma}</MaxLumaPixelsHEVC>")));
+    }
 }
 
 #[test]
@@ -699,7 +769,15 @@ fn peer(
 fn configured_hostname_replaces_xml_noncharacters_and_escapes_quotes() {
     let mut config = router().config;
     config.hostname = "A&<\"'\u{fffe}\u{ffff}Z".into();
-    let reply = xml::server_info(&config, "host", false, 0, false, false);
+    let reply = xml::server_info(
+        &config,
+        "host",
+        false,
+        0,
+        false,
+        false,
+        CodecAdvertisement::NONE,
+    );
     let body = String::from_utf8(reply.body).unwrap();
     assert!(body.contains("<hostname>A&amp;&lt;&quot;&apos;  Z</hostname>"));
     assert!(!body.contains('\u{fffe}'));

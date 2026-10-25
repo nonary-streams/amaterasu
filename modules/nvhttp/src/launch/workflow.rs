@@ -5,6 +5,9 @@ use super::{
     record::{Record, Stage, State},
     success_reply,
 };
+use crate::encoder_snapshot::{
+    CodecOffer, SOFTWARE_MAX_FPS, SOFTWARE_MAX_HEIGHT, SOFTWARE_MAX_WIDTH,
+};
 use crate::frame_limiter::FrameLimiterSettings;
 use crate::wire::Reply;
 use serde::Deserialize;
@@ -293,13 +296,15 @@ impl Controller {
                     "encrypt_audio": config.profile.encrypt_audio,
                     "permit_legacy_audio_iv_wrap": config.profile.permit_legacy_audio_iv_wrap,
                 });
-                if config.profile.codec == amaterasu_media::VideoCodec::Hevc {
-                    profile["codec"] = json!("hevc");
+                let offer = &record.video_codec_offer;
+                if offer.codecs != [amaterasu_media::VideoCodec::H264] {
+                    profile["codecs"] = json!(offer.codecs);
                 }
+                let (max_width, max_height, max_fps) = negotiation_mode_limit(config, offer);
                 let negotiation_bounds = json!({
-                    "max_width": config.profile.max_width,
-                    "max_height": config.profile.max_height,
-                    "max_fps": config.profile.max_fps,
+                    "max_width": max_width,
+                    "max_height": max_height,
+                    "max_fps": max_fps,
                     "max_bitrate_kbps": record.effective_max_bitrate_kbps
                         .filter(|maximum| *maximum > 0)
                         .map_or(config.profile.bitrate_kbps, |maximum| {
@@ -917,6 +922,20 @@ impl Phase {
             Self::ReleaseHistory => "release-history",
         }
     }
+}
+
+/// RTSP may accept any client mode up to the profile maximum, but an offer
+/// that includes a software-only codec stays within the software limit.
+fn negotiation_mode_limit(config: &StreamingConfig, offer: &CodecOffer) -> (u32, u32, u32) {
+    let profile = &config.profile;
+    if !offer.software_limited {
+        return (profile.max_width, profile.max_height, profile.max_fps);
+    }
+    (
+        profile.max_width.min(SOFTWARE_MAX_WIDTH),
+        profile.max_height.min(SOFTWARE_MAX_HEIGHT),
+        profile.max_fps.min(SOFTWARE_MAX_FPS),
+    )
 }
 
 fn needs_work(record: &Record, now: Instant) -> bool {

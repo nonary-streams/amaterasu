@@ -14,6 +14,9 @@ mod tests {
     include!("launch/display_mutation_tests.rs");
 }
 
+use crate::encoder_snapshot::{
+    CodecAdvertisement, CodecOffer, EncoderSnapshot, StreamMode, unknown_encoders_offer,
+};
 use crate::frame_limiter::FrameLimiterSettings;
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use crate::wire::{ClientConfigOverrides, Reply, xml};
@@ -468,6 +471,9 @@ pub enum CaptureProvider {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamProfile {
+    /// Legacy single-codec setting, still accepted in stored configuration.
+    /// It no longer selects the codec: each launch offers the codecs its
+    /// encoders support and the client negotiates one in RTSP ANNOUNCE.
     #[serde(
         default,
         skip_serializing_if = "amaterasu_media::VideoCodec::is_default"
@@ -503,13 +509,8 @@ impl StreamProfile {
         {
             return Err("invalid_streaming_profile");
         }
-        let codec = match self.codec {
-            amaterasu_media::VideoCodec::H264 => amaterasu_gamestream::video::VideoCodec::H264,
-            amaterasu_media::VideoCodec::Hevc => amaterasu_gamestream::video::VideoCodec::Hevc,
-            // AV1 has no GameStream packetizer yet.
-            amaterasu_media::VideoCodec::Av1 => return Err("invalid_streaming_profile"),
-        };
-        amaterasu_gamestream::video::VideoPacketizer::new_with_codec(
+        // Framing and FEC limits do not depend on the codec.
+        amaterasu_gamestream::video::VideoPacketizer::new(
             amaterasu_gamestream::video::VideoConfig {
                 packet_size: self.packet_size,
                 fec_percentage: self.fec_percentage,
@@ -517,7 +518,6 @@ impl StreamProfile {
                 max_fec_blocks: self.max_fec_blocks,
                 encrypted: false,
             },
-            codec,
         )
         .map_err(|_| "invalid_streaming_profile")?;
         Ok(())
@@ -541,6 +541,8 @@ struct PendingResume {
 
 pub struct Controller {
     config: Option<StreamingConfig>,
+    /// Latest encoder enumeration; `None` until the first one completes.
+    encoder_snapshot: Option<EncoderSnapshot>,
     configured_output_name: Option<String>,
     configured_audio_sink: Option<String>,
     configured_virtual_sink: Option<String>,
@@ -577,6 +579,7 @@ impl Controller {
         getrandom::fill(&mut nonce).map_err(|_| "random_unavailable")?;
         Ok(Self {
             config,
+            encoder_snapshot: None,
             configured_output_name: None,
             configured_audio_sink: None,
             configured_virtual_sink: None,
@@ -607,6 +610,40 @@ impl Controller {
 
     pub fn supported(&self) -> bool {
         self.config.is_some()
+    }
+
+    pub fn set_encoder_snapshot(&mut self, snapshot: EncoderSnapshot) {
+        self.encoder_snapshot = Some(snapshot);
+    }
+
+    /// Serverinfo codec values. Until encoders are enumerated, only the
+    /// H.264 baseline is advertised.
+    pub fn codec_advertisement(&self) -> CodecAdvertisement {
+        if self.config.is_none() {
+            return CodecAdvertisement::NONE;
+        }
+        self.encoder_snapshot.as_ref().map_or(
+            EncoderSnapshot::default().advertisement(),
+            EncoderSnapshot::advertisement,
+        )
+    }
+
+    /// The codecs this launch may negotiate, or the reason no encoder can
+    /// serve the requested mode. This runs before any launch state exists.
+    fn codec_offer(
+        &self,
+        config: &StreamingConfig,
+        request: &LaunchRequest,
+    ) -> Result<CodecOffer, &'static str> {
+        let mode = StreamMode {
+            width: request.width,
+            height: request.height,
+            fps: request.fps,
+        };
+        match &self.encoder_snapshot {
+            Some(snapshot) => snapshot.offer(config.capture.encoder, mode),
+            None => unknown_encoders_offer(mode),
+        }
     }
 
     pub(crate) fn desktop_enabled(&self) -> bool {
@@ -789,6 +826,10 @@ impl Controller {
         {
             return Some(private_error(503, "another stream is active"));
         }
+        let video_codec_offer = match self.codec_offer(config, &request) {
+            Ok(offer) => offer,
+            Err(message) => return Some(private_error(503, message)),
+        };
 
         let id = match self.allocate_id() {
             Ok(id) => id,
@@ -830,6 +871,7 @@ impl Controller {
             now + INITIAL_DEADLINE,
         );
         record.desktop = desktop;
+        record.video_codec_offer = video_codec_offer;
         record.global_display_revision = self.global_display_revision;
         record.global_display_policy = self.global_display_policy.clone();
         self.records.insert(id, record);
@@ -919,6 +961,10 @@ impl Controller {
         }
         if self.pending_resume.is_some() {
             return Some(private_error(409, "Desktop resume is already in progress"));
+        }
+        // Refuse before tearing down the live session the resume would replace.
+        if let Err(message) = self.codec_offer(config, &request) {
+            return Some(private_error(503, message));
         }
         if self.records.values().any(|record| {
             record.request.remote_input_key == request.remote_input_key

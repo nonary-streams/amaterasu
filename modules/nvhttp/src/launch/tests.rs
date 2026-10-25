@@ -32,6 +32,20 @@ fn config() -> StreamingConfig {
     }
 }
 
+fn encoder_entry(clsid: &str, codec: &str, hardware: bool) -> Value {
+    json!({"identity":{"clsid":clsid,"hardware_url":null,"friendly_name":clsid},
+        "name":clsid,"codec":codec,"hardware":hardware,"vendor_id":null})
+}
+
+fn encoders(entries: Vec<Value>) -> EncoderSnapshot {
+    EncoderSnapshot::parse(&json!({"ok":true,"enabled":true,"encoders":entries})).unwrap()
+}
+
+/// A hardware H.264 encoder: launches above the software limit offer H.264.
+fn hardware_h264() -> EncoderSnapshot {
+    encoders(vec![encoder_entry("test.hardware.h264", "h264", true)])
+}
+
 #[test]
 fn signed_stream_profile_codec_defaults_to_h264_and_serializes_hevc_explicitly() {
     let mut configured = config();
@@ -297,6 +311,7 @@ fn paired_physical_mode_freezes_independently_of_stream_cadence_and_retry() {
     let mut streaming = config();
     streaming.profile.max_fps = 120;
     let mut controller = Controller::new(Some(streaming)).unwrap();
+    controller.set_encoder_snapshot(hardware_h264());
     let paired = peer_with_display_mode(19, "1920x1080x59.94").unwrap();
     let mut stream = request(19);
     stream.fps = 120;
@@ -4075,5 +4090,151 @@ fn dual_uncertain_cleanup_calls_are_both_retained_and_reconciled_before_success(
     assert!(
         record.deadline > deadline,
         "explicit retry gets one fresh budget"
+    );
+}
+
+fn uhd_profile(encoder: CaptureEncoderSelection) -> StreamingConfig {
+    let mut streaming = config();
+    streaming.capture.encoder = encoder;
+    streaming.profile.max_width = 3840;
+    streaming.profile.max_height = 2160;
+    streaming.profile.max_fps = 120;
+    streaming
+}
+
+fn uhd_request(key: u8) -> LaunchRequest {
+    LaunchRequest {
+        width: 3840,
+        height: 2160,
+        fps: 120,
+        ..request(key)
+    }
+}
+
+fn nvenc_and_x264() -> EncoderSnapshot {
+    encoders(vec![
+        encoder_entry("amaterasu.hardware.nvenc-cuda.h264", "h264", true),
+        encoder_entry("amaterasu.hardware.nvenc-cuda.hevc", "hevc", true),
+        encoder_entry("amaterasu.hardware.nvenc-cuda.av1", "av1", true),
+        encoder_entry("amaterasu.software.x264", "h264", false),
+    ])
+}
+
+const AUTO_ENCODER: CaptureEncoderSelection =
+    CaptureEncoderSelection::Backend(CaptureEncoderBackend::Auto);
+
+#[test]
+fn hardware_encoders_offer_every_codec_to_rtsp_up_to_the_profile_maximum() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+    controller.set_encoder_snapshot(nvenc_and_x264());
+    let mut broker = Broker::default();
+
+    assert!(controller.launch(10, uhd_request(61), peer(61), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let open = opened_rtsp_payload(&broker);
+    assert_eq!(open["profile"]["codecs"], json!(["av1", "hevc", "h264"]));
+    assert!(open["profile"].get("codec").is_none());
+    assert_eq!(open["negotiation_bounds"]["max_width"], 3840);
+    assert_eq!(open["negotiation_bounds"]["max_height"], 2160);
+    assert_eq!(open["negotiation_bounds"]["max_fps"], 120);
+}
+
+#[test]
+fn software_only_launches_above_full_hd_sixty_are_refused_before_any_effect() {
+    let now = Instant::now();
+    for (snapshot, message) in [
+        (
+            Some(encoders(vec![encoder_entry("amaterasu.software.x264", "h264", false)])),
+            "no hardware encoder for this stream mode",
+        ),
+        (None, "encoder capabilities are not known yet"),
+        (Some(encoders(vec![])), "no video encoder is available"),
+    ] {
+        let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+        if let Some(snapshot) = snapshot {
+            controller.set_encoder_snapshot(snapshot);
+        }
+        let mut broker = Broker::default();
+        let reply = controller
+            .launch(10, uhd_request(62), peer(62), now)
+            .expect("immediate refusal");
+        assert_eq!(reply.status, 503);
+        assert!(String::from_utf8(reply.body).unwrap().contains(message));
+        assert!(controller.records.is_empty());
+        assert!(controller.poll(now, &mut |command| broker.send(command)).is_empty());
+        assert!(broker.commands.is_empty());
+    }
+}
+
+#[test]
+fn software_codecs_keep_negotiation_within_the_software_limit() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+    controller.set_encoder_snapshot(encoders(vec![
+        encoder_entry("amaterasu.hardware.nvenc-cuda.hevc", "hevc", true),
+        encoder_entry("amaterasu.software.x264", "h264", false),
+    ]));
+    let mut broker = Broker::default();
+    let full_hd = LaunchRequest {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        ..request(63)
+    };
+    assert!(controller.launch(10, full_hd, peer(63), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    let open = opened_rtsp_payload(&broker);
+    assert_eq!(open["profile"]["codecs"], json!(["hevc", "h264"]));
+    assert_eq!(
+        (
+            &open["negotiation_bounds"]["max_width"],
+            &open["negotiation_bounds"]["max_height"],
+            &open["negotiation_bounds"]["max_fps"],
+        ),
+        (&json!(1920), &json!(1080), &json!(60))
+    );
+}
+
+#[test]
+fn a_numeric_encoder_selection_offers_only_that_encoder_codec() {
+    let now = Instant::now();
+    let mut controller =
+        Controller::new(Some(uhd_profile(CaptureEncoderSelection::Index(1)))).unwrap();
+    controller.set_encoder_snapshot(nvenc_and_x264());
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, uhd_request(64), peer(64), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(opened_rtsp_payload(&broker)["profile"]["codecs"], json!(["hevc"]));
+}
+
+#[test]
+fn an_h264_only_offer_keeps_the_legacy_rtsp_profile_shape() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_encoder_snapshot(hardware_h264());
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(65), peer(65), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    let profile = &opened_rtsp_payload(&broker)["profile"];
+    assert!(profile.get("codecs").is_none() && profile.get("codec").is_none());
+}
+
+#[test]
+fn codec_advertisement_tracks_configuration_and_the_latest_snapshot() {
+    assert_eq!(
+        Controller::new(None).unwrap().codec_advertisement(),
+        CodecAdvertisement::NONE
+    );
+    let mut controller = Controller::new(Some(config())).unwrap();
+    assert_eq!(controller.codec_advertisement().codec_mode_support, 0x1);
+    controller.set_encoder_snapshot(nvenc_and_x264());
+    assert_eq!(
+        controller.codec_advertisement(),
+        CodecAdvertisement {
+            codec_mode_support: 0x10101,
+            max_luma_pixels_hevc: 1_869_449_984,
+        }
     );
 }

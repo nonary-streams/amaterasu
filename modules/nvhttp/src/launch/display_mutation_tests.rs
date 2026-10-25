@@ -4,6 +4,7 @@ fn mutating_display_fixture(option: &str, two_displays: bool) -> (Controller, Br
     streaming.capture.capture_provider = CaptureProvider::Wgc;
     streaming.capture.output = "\\\\.\\DISPLAY2".into();
     let mut controller = Controller::new(Some(streaming)).unwrap();
+    controller.set_encoder_snapshot(hardware_h264());
     controller.set_global_display_policy(
         9,
         json!({
