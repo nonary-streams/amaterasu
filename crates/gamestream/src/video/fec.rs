@@ -95,6 +95,7 @@ impl VideoPacketizer {
         encoder_keyframe: bool,
         frame_index: u32,
         timestamp: u32,
+        host_processing_latency: u16,
     ) -> Result<Vec<Vec<u8>>, VideoError> {
         let total_bytes = access_unit.len() + FRAME_BYTES;
         let blocks = plan_blocks(total_bytes.div_ceil(self.payload_bytes), self.config)?;
@@ -103,6 +104,7 @@ impl VideoPacketizer {
         frame.extend_from_slice(&short_frame_header(
             is_idr,
             ((total_bytes - 1) % self.payload_bytes + 1) as u16,
+            host_processing_latency,
         ));
         frame.extend_from_slice(access_unit);
         let total_packets = blocks

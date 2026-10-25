@@ -520,3 +520,23 @@ fn av1_invalid_temporal_units_do_not_consume_sequence_state() {
     let valid = [delimiter, sequence, obu(5, &[1]), frame, obu(15, &[0])].concat();
     assert!(sender.packetize(&valid, true, 1, 0).is_ok());
 }
+
+#[test]
+fn host_processing_latency_fills_frame_header_bytes_one_and_two() {
+    let access_unit = [0, 0, 0, 1, 0x65, 0x88];
+    let first_frame_header = |packets: &[Vec<u8>]| packets[0][32..36].to_vec();
+    let plain = packetizer(1392)
+        .packetize_with_latency(&access_unit, false, 1, 0, 0x0123)
+        .unwrap();
+    assert_eq!(first_frame_header(&plain), [1, 0x23, 0x01, 2]);
+    let hevc_idr: Vec<_> = [32, 33, 34, 19].into_iter().flat_map(hevc_nal).collect();
+    let protected = hevc_packetizer(1392, 20)
+        .packetize_with_latency(&hevc_idr, false, 1, 0, 0x0123)
+        .unwrap();
+    assert_eq!(first_frame_header(&protected), [1, 0x23, 0x01, 2]);
+    // The latency-free form reports unknown, as before.
+    let unknown = packetizer(1392)
+        .packetize(&access_unit, false, 1, 0)
+        .unwrap();
+    assert_eq!(first_frame_header(&unknown), [1, 0, 0, 2]);
+}

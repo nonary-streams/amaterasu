@@ -61,6 +61,14 @@ consumer polls it each tick and reads a frame only when the sequence advances,
 so frames are pushed at the compositor's presentation rate, including variable
 refresh, rather than sampled on a fixed timer.
 
+Encoded video leaving the video service is stamped on the shared host
+monotonic clock (`amaterasu_media::host_monotonic_micros`: CLOCK_MONOTONIC on
+Linux, the performance counter on Windows) at capture or presentation. The media
+transport compares it with the same clock at packetization and reports the
+difference, in 0.1 ms units, as the GameStream frame header's host processing
+latency that Moonlight shows. A timestamp in the future or over five seconds old
+is reported as unknown (zero).
+
 Codec 3 is AV1: each packet is one low-overhead OBU temporal unit, starting with
 a temporal delimiter. AV1 has no start codes, so transports frame it by length.
 

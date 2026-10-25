@@ -755,3 +755,19 @@ fn wait_for_peer(stream: &mut Stream, medium: crate::datagrams::Medium) {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
+
+#[test]
+fn frames_stamped_on_the_host_clock_report_their_host_processing_latency() {
+    let (video, audio) = receivers();
+    let mut stream = offered_stream(&video, &audio);
+    let mut keyframe = video_packet(&[0, 0, 0, 1, 0x65, 0x88], 0);
+    keyframe.flags |= FLAG_END_OF_ACCESS_UNIT;
+    keyframe.timestamp_us = host_monotonic_micros() - 5_000;
+    // SAFETY: the packet bytes outlive this synchronous submission.
+    assert_eq!(unsafe { stream.submit_video(&keyframe) }, STATUS_OK);
+    stream.delivery.tick();
+    let datagram = receive(&video);
+    let latency = u16::from_le_bytes([datagram[33], datagram[34]]);
+    // 5 ms in 0.1 ms units, plus however long this test took to packetize.
+    assert!((50..100).contains(&latency), "{latency}");
+}

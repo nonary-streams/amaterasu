@@ -314,10 +314,16 @@ impl Stream {
             return MEDIA_BUSY;
         }
         let clock = (u128::from(timestamp_us) * 90_000 / 1_000_000) as u32;
-        let datagrams = match self
-            .video
-            .packetize(access_unit, keyframe, frame_index, clock)
-        {
+        // The video service stamps packets on the shared host clock at capture,
+        // so the time to this point is the host's processing latency.
+        let latency = host_processing_latency_tenths_ms(timestamp_us, host_monotonic_micros());
+        let datagrams = match self.video.packetize_with_latency(
+            access_unit,
+            keyframe,
+            frame_index,
+            clock,
+            latency,
+        ) {
             Ok(datagrams) => datagrams,
             Err(_) => return STATUS_INVALID_ARGUMENT,
         };

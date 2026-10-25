@@ -138,6 +138,26 @@ impl VideoPacketizer {
         frame_index: u32,
         timestamp_90khz: u32,
     ) -> Result<Vec<Vec<u8>>, VideoError> {
+        self.packetize_with_latency(
+            access_unit,
+            encoder_keyframe,
+            frame_index,
+            timestamp_90khz,
+            0,
+        )
+    }
+
+    /// [`Self::packetize`], also reporting how long the host held this frame,
+    /// in 0.1 ms units, in the frame header's host processing latency field
+    /// that Moonlight shows in its statistics. Zero means unknown.
+    pub fn packetize_with_latency(
+        &mut self,
+        access_unit: &[u8],
+        encoder_keyframe: bool,
+        frame_index: u32,
+        timestamp_90khz: u32,
+        host_processing_latency: u16,
+    ) -> Result<Vec<Vec<u8>>, VideoError> {
         if access_unit.len() > MAX_ACCESS_UNIT_BYTES {
             return Err(VideoError::AccessUnitTooLarge);
         }
@@ -147,6 +167,7 @@ impl VideoPacketizer {
                 encoder_keyframe,
                 frame_index,
                 timestamp_90khz,
+                host_processing_latency,
             );
         }
         let total_bytes = access_unit.len() + FRAME_BYTES;
@@ -155,8 +176,11 @@ impl VideoPacketizer {
             return Err(VideoError::TooManyPackets);
         }
         let is_idr = self.keyframe(access_unit, encoder_keyframe)?;
-        let frame_header =
-            short_frame_header(is_idr, ((total_bytes - 1) % self.payload_bytes + 1) as u16);
+        let frame_header = short_frame_header(
+            is_idr,
+            ((total_bytes - 1) % self.payload_bytes + 1) as u16,
+            host_processing_latency,
+        );
         let mut datagrams = Vec::with_capacity(packet_count);
         for packet_index in 0..packet_count {
             let start = packet_index * self.payload_bytes;
@@ -203,15 +227,20 @@ impl VideoPacketizer {
 
 /// The eight-byte short frame header that opens the first packet's payload.
 ///
-/// Byte 0 is the short header type (1). Bytes 1..3 hold the host processing
-/// latency, unknown here and so zero. Byte 3 is the frame type: 2 for IDR,
+/// Byte 0 is the short header type (1). Bytes 1..3 hold the little-endian host
+/// processing latency in 0.1 ms units, zero when unknown. Byte 3 is the frame type: 2 for IDR,
 /// 1 for an ordinary picture. Bytes 4..6 hold the little-endian length of the
 /// final data packet's payload, counting this header when that packet is also
 /// the first. Receivers truncate the final packet to that length for codecs
 /// that cannot tolerate trailing zero padding, such as AV1. Bytes 6..8 are zero.
-fn short_frame_header(is_idr: bool, final_payload_bytes: u16) -> [u8; FRAME_BYTES] {
+fn short_frame_header(
+    is_idr: bool,
+    final_payload_bytes: u16,
+    host_processing_latency: u16,
+) -> [u8; FRAME_BYTES] {
     let mut header = [0; FRAME_BYTES];
     header[0] = 1;
+    header[1..3].copy_from_slice(&host_processing_latency.to_le_bytes());
     header[3] = if is_idr { 2 } else { 1 };
     header[4..6].copy_from_slice(&final_payload_bytes.to_le_bytes());
     header

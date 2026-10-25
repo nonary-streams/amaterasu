@@ -9,6 +9,8 @@ mod audio_encoder;
 pub use audio_encoder::*;
 mod control;
 pub use control::*;
+mod clock;
+pub use clock::*;
 mod color;
 pub use color::*;
 mod dmabuf;

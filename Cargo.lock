@@ -356,8 +356,10 @@ name = "amaterasu-media"
 version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
+ "libc",
  "serde",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
