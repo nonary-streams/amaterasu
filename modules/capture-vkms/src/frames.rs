@@ -1,35 +1,30 @@
-//! Per-stream frame delivery shared between the controller and native reads.
+//! Per-stream frame state shared by the presentation thread, the controller
+//! and native reads.
 //!
-//! A read asks the stream's helper for the newest presentation, lends its
-//! descriptors to exactly one sink callback, and closes them afterward.
+//! The presentation thread stores each completed presentation as the
+//! stream's newest frame. Reads lend that stored frame to one sink callback
+//! without asking the helper; the stored frame is the buffer currently
+//! scanned out, so lending it again for a repeat is valid.
 use crate::admission::Admission;
 use amaterasu_media::{
     CAPTURE_FRAME_CACHED_REUSE, CAPTURE_FRAME_FRESH, DMABUF_COLOR_SRGB, DMABUF_MAX_DIMENSION,
     DmaBufFrame, DmaBufPlane, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING,
-    MEDIA_UNSUPPORTED,
+    MEDIA_UNSUPPORTED, PresentationStatus,
 };
 use amaterasu_module_sdk::abi::{STATUS_OK, Status};
-use amaterasu_vkms_frame_helper::{
-    client::{ClientError, ExportedFrame, FrameExport},
-    protocol::Failure,
-};
+use amaterasu_vkms_frame_helper::client::ExportedFrame;
 use std::{
     os::fd::AsRawFd,
     sync::{
-        Arc, Mutex, TryLockError,
+        Arc, Mutex, MutexGuard, PoisonError, TryLockError,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
-/// Exports frames for one CRTC. The production source is a helper process.
-pub trait FrameSource: Send {
-    fn frame(&mut self, crtc_id: u32) -> Result<FrameExport, ClientError>;
-}
-
 /// Why a stream stopped delivering; reported in status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamFault {
-    /// The helper exited, timed out or broke protocol.
+    /// The helper exited, timed out, broke protocol or kept failing.
     HelperFailed,
     /// The driver refused CAP_SYS_ADMIN.
     PermissionDenied,
@@ -45,11 +40,36 @@ impl StreamFault {
             Self::OutputLost(code) => code,
         }
     }
+
+    /// What native calls on a faulted stream return.
+    pub fn status(self) -> Status {
+        match self {
+            Self::OutputLost(_) => MEDIA_CLOSED,
+            Self::HelperFailed | Self::PermissionDenied => MEDIA_BACKEND_ERROR,
+        }
+    }
+}
+
+/// One exported presentation and the frame description that borrows its
+/// descriptors. Dropping it closes every descriptor.
+pub struct StoredFrame {
+    frame: DmaBufFrame,
+    _descriptors: ExportedFrame,
+}
+
+/// The newest presentation the presentation thread stored.
+struct Newest {
+    presentation: PresentationStatus,
+    /// `MEDIA_PENDING` before the first frame, `MEDIA_UNSUPPORTED` when the
+    /// newest presentation cannot be described.
+    frame: Result<Arc<StoredFrame>, Status>,
 }
 
 pub struct StreamFrames {
     pub admission: Arc<Admission>,
-    source: Mutex<Box<dyn FrameSource>>,
+    newest: Mutex<Newest>,
+    /// Serializes reads so freshness accounting sees one sink at a time.
+    reading: Mutex<()>,
     crtc_id: AtomicU32,
     /// CLOCK_MONOTONIC nanoseconds at stream open: the stream epoch.
     epoch_ns: u64,
@@ -61,18 +81,29 @@ pub struct StreamFrames {
     fault: Mutex<Option<StreamFault>>,
 }
 
-/// One frame lent to a sink. Dropping it closes every descriptor.
-pub struct Lent {
-    pub frame: DmaBufFrame,
+/// One stored frame lent to a sink. The read gate stays held and the
+/// descriptors stay open until it drops, even if a newer frame replaces it.
+pub struct Lent<'a> {
+    stored: Arc<StoredFrame>,
     pub freshness: u32,
-    _descriptors: ExportedFrame,
+    _reading: MutexGuard<'a, ()>,
+}
+
+impl Lent<'_> {
+    pub fn frame(&self) -> &DmaBufFrame {
+        &self.stored.frame
+    }
 }
 
 impl StreamFrames {
-    pub fn new(source: Box<dyn FrameSource>, crtc_id: u32, epoch_ns: u64) -> Self {
+    pub fn new(crtc_id: u32, epoch_ns: u64) -> Self {
         Self {
             admission: Arc::new(Admission::default()),
-            source: Mutex::new(source),
+            newest: Mutex::new(Newest {
+                presentation: PresentationStatus::default(),
+                frame: Err(MEDIA_PENDING),
+            }),
+            reading: Mutex::new(()),
             crtc_id: AtomicU32::new(crtc_id),
             epoch_ns,
             last_timestamp_us: AtomicU64::new(0),
@@ -95,130 +126,90 @@ impl StreamFrames {
         self.delivered.load(Ordering::Relaxed)
     }
 
+    /// Asks the controller to re-resolve the output's CRTC.
+    pub fn request_resolve(&self) {
+        self.resolve_requested.store(true, Ordering::SeqCst);
+    }
+
     /// Takes a pending request to re-resolve the output's CRTC.
     pub fn take_resolve_request(&self) -> bool {
         self.resolve_requested.swap(false, Ordering::SeqCst)
     }
 
     pub fn fault(&self) -> Option<StreamFault> {
-        *self
-            .fault
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self.fault.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Records why delivery stopped. The first fault is kept.
     pub fn set_fault(&self, fault: StreamFault) {
-        let mut current = self
-            .fault
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut current = self.fault.lock().unwrap_or_else(PoisonError::into_inner);
         current.get_or_insert(fault);
     }
 
-    /// Exports the newest presentation for one sink callback.
-    pub fn lend(&self) -> Result<Lent, Status> {
+    /// The newest stored presentation; sequence zero before the first.
+    pub fn latest_presentation(&self) -> Result<PresentationStatus, Status> {
         if let Some(fault) = self.fault() {
-            return Err(match fault {
-                StreamFault::OutputLost(_) => MEDIA_CLOSED,
-                _ => MEDIA_BACKEND_ERROR,
-            });
+            return Err(fault.status());
         }
-        let exported = {
-            let mut source = match self.source.try_lock() {
-                Ok(source) => source,
-                Err(TryLockError::WouldBlock) => return Err(MEDIA_BUSY),
-                Err(TryLockError::Poisoned(_)) => return Err(MEDIA_BACKEND_ERROR),
+        Ok(self.lock_newest().presentation)
+    }
+
+    /// Stores `exported` as the newest frame under the stream `sequence`.
+    /// The previous frame's descriptors close at once unless a read still
+    /// borrows them, in which case they close when that read ends.
+    pub fn store(&self, exported: ExportedFrame, sequence: u64) {
+        let timestamp_us = self.stream_timestamp_us(exported.descriptor.timestamp_ns);
+        let frame = describe(exported, sequence, timestamp_us).map(Arc::new);
+        let replaced = {
+            let mut newest = self.lock_newest();
+            newest.presentation = PresentationStatus {
+                sequence,
+                timestamp_us,
             };
-            source.frame(self.crtc_id())
+            std::mem::replace(&mut newest.frame, frame)
         };
-        match exported {
-            Ok(FrameExport::Empty) => Err(MEDIA_PENDING),
-            Ok(FrameExport::Ready(exported)) => self.describe(exported),
-            Err(error) => Err(self.export_failure(&error)),
+        // The old descriptors close outside the lock.
+        drop(replaced);
+    }
+
+    /// Lends the stored newest frame for one sink callback.
+    pub fn lend(&self) -> Result<Lent<'_>, Status> {
+        if let Some(fault) = self.fault() {
+            return Err(fault.status());
         }
+        let reading = match self.reading.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Err(MEDIA_BUSY),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        let stored = self.lock_newest().frame.clone()?;
+        let last_delivered = self.last_delivered_sequence.load(Ordering::SeqCst);
+        let freshness = if stored.frame.sequence > last_delivered {
+            CAPTURE_FRAME_FRESH
+        } else {
+            CAPTURE_FRAME_CACHED_REUSE
+        };
+        Ok(Lent {
+            stored,
+            freshness,
+            _reading: reading,
+        })
     }
 
     /// Records the sink's verdict. Only an accepted presentation counts as
     /// delivered, so a rejected fresh frame stays fresh on the next read.
-    pub fn finish(&self, lent: Lent, status: Status) -> Status {
+    pub fn finish(&self, lent: Lent<'_>, status: Status) -> Status {
         if status == STATUS_OK {
             self.last_delivered_sequence
-                .fetch_max(lent.frame.sequence, Ordering::SeqCst);
+                .fetch_max(lent.frame().sequence, Ordering::SeqCst);
             self.delivered.fetch_add(1, Ordering::Relaxed);
         }
         drop(lent);
         status
     }
 
-    fn export_failure(&self, error: &ClientError) -> Status {
-        match error {
-            ClientError::Refused {
-                failure: Failure::CrtcNotFound,
-                ..
-            } => {
-                // The output may have moved to another CRTC; the controller
-                // re-resolves it on its next refresh.
-                self.resolve_requested.store(true, Ordering::SeqCst);
-                MEDIA_PENDING
-            }
-            ClientError::Refused {
-                failure: Failure::Busy | Failure::Interrupted,
-                ..
-            } => MEDIA_BUSY,
-            ClientError::Refused {
-                failure: Failure::PermissionDenied,
-                ..
-            } => {
-                self.set_fault(StreamFault::PermissionDenied);
-                MEDIA_BACKEND_ERROR
-            }
-            ClientError::Refused { .. } => MEDIA_BACKEND_ERROR,
-            _ => {
-                self.set_fault(StreamFault::HelperFailed);
-                MEDIA_BACKEND_ERROR
-            }
-        }
-    }
-
-    fn describe(&self, exported: ExportedFrame) -> Result<Lent, Status> {
-        let descriptor = exported.descriptor;
-        if descriptor.width > DMABUF_MAX_DIMENSION || descriptor.height > DMABUF_MAX_DIMENSION {
-            return Err(MEDIA_UNSUPPORTED);
-        }
-        let mut planes = [DmaBufPlane::UNUSED; amaterasu_media::DMABUF_MAX_PLANES];
-        for (plane, buffer) in exported.dma_bufs.iter().enumerate() {
-            planes[plane] = DmaBufPlane {
-                fd: buffer.as_raw_fd(),
-                acquire_fence_fd: exported.fences[plane]
-                    .as_ref()
-                    .map_or(-1, AsRawFd::as_raw_fd),
-                offset: descriptor.offsets[plane],
-                pitch: descriptor.pitches[plane],
-            };
-        }
-        let freshness = if descriptor.sequence > self.last_delivered_sequence.load(Ordering::SeqCst)
-        {
-            CAPTURE_FRAME_FRESH
-        } else {
-            CAPTURE_FRAME_CACHED_REUSE
-        };
-        let frame = DmaBufFrame {
-            width: descriptor.width,
-            height: descriptor.height,
-            fourcc: descriptor.fourcc,
-            plane_count: descriptor.plane_count,
-            modifier: descriptor.modifier,
-            planes,
-            color: DMABUF_COLOR_SRGB,
-            reserved: 0,
-            timestamp_us: self.stream_timestamp_us(descriptor.timestamp_ns),
-            sequence: descriptor.sequence,
-        };
-        Ok(Lent {
-            frame,
-            freshness,
-            _descriptors: exported,
-        })
+    fn lock_newest(&self) -> MutexGuard<'_, Newest> {
+        self.newest.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Converts a driver CLOCK_MONOTONIC presentation time to microseconds
@@ -231,6 +222,46 @@ impl StreamFrames {
             .fetch_max(elapsed_us, Ordering::SeqCst);
         previous.max(elapsed_us)
     }
+}
+
+/// Describes an exported presentation as a borrowed DMA-BUF frame whose
+/// descriptors the returned value owns.
+fn describe(
+    exported: ExportedFrame,
+    sequence: u64,
+    timestamp_us: u64,
+) -> Result<StoredFrame, Status> {
+    let descriptor = exported.descriptor;
+    if descriptor.width > DMABUF_MAX_DIMENSION || descriptor.height > DMABUF_MAX_DIMENSION {
+        return Err(MEDIA_UNSUPPORTED);
+    }
+    let mut planes = [DmaBufPlane::UNUSED; amaterasu_media::DMABUF_MAX_PLANES];
+    for (plane, buffer) in exported.dma_bufs.iter().enumerate() {
+        planes[plane] = DmaBufPlane {
+            fd: buffer.as_raw_fd(),
+            acquire_fence_fd: exported.fences[plane]
+                .as_ref()
+                .map_or(-1, AsRawFd::as_raw_fd),
+            offset: descriptor.offsets[plane],
+            pitch: descriptor.pitches[plane],
+        };
+    }
+    let frame = DmaBufFrame {
+        width: descriptor.width,
+        height: descriptor.height,
+        fourcc: descriptor.fourcc,
+        plane_count: descriptor.plane_count,
+        modifier: descriptor.modifier,
+        planes,
+        color: DMABUF_COLOR_SRGB,
+        reserved: 0,
+        timestamp_us,
+        sequence,
+    };
+    Ok(StoredFrame {
+        frame,
+        _descriptors: exported,
+    })
 }
 
 #[cfg(test)]

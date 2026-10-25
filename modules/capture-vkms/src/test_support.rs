@@ -5,23 +5,28 @@ use crate::{
         Connection, ConnectorState, CrtcState, DiscoveredOutput, Discovery, DisplayMode,
         OutputBinding,
     },
-    frames::FrameSource,
     geometry::LayoutOutput,
     model::{CaptureError, CaptureResult, Settings},
     output_name::OutputName,
+    presenter::{FrameSource, SourceInterrupt},
 };
 use amaterasu_vkms_frame_helper::{
-    client::{ClientError, ExportedFrame, FrameExport},
+    client::{ClientError, ExportedFrame, FrameExport, Presentation},
     drm_node::DeviceNumber,
-    protocol::{Failure, FrameDescriptor, MAX_PLANES},
+    protocol::{Failure, FrameDescriptor, MAX_PLANES, PRESENT_CHANGED, PRESENT_TIMEOUT},
 };
 use std::{
     collections::VecDeque,
     fs::File,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
+/// One scripted FRAME answer. Without one, FRAME reports an empty CRTC.
 #[derive(Clone, Copy, Debug)]
 pub enum Scripted {
     Frame { sequence: u64, timestamp_ns: u64 },
@@ -31,23 +36,89 @@ pub enum Scripted {
     HelperGone,
 }
 
+/// One scripted WAIT answer. Without one, WAIT blocks until its timeout
+/// (or an interrupt) like the driver.
+#[derive(Clone, Copy, Debug)]
+pub enum ScriptedWait {
+    Presented(u64),
+    Refuse(Failure),
+    HelperGone,
+}
+
+#[derive(Default)]
+struct FakeDriver {
+    waits: VecDeque<ScriptedWait>,
+    frames: VecDeque<Scripted>,
+}
+
 /// Shared script and observations for every source a fake backend creates.
 #[derive(Default)]
 pub struct SourceScript {
-    pub answers: Mutex<VecDeque<Scripted>>,
-    /// Write ends of every lent descriptor; each reports when the read end
-    /// (the descriptor the sink borrowed) has been closed.
+    driver: Mutex<FakeDriver>,
+    answered: Condvar,
+    /// Write ends of every exported descriptor; each reports when the read
+    /// end (the descriptor the module owned or lent) has been closed.
     pub writers: Mutex<Vec<File>>,
+    /// The CRTC of every FRAME request.
     pub requested_crtcs: Mutex<Vec<u32>>,
+    /// The CRTC and last sequence of every WAIT request.
+    pub waits: Mutex<Vec<(u32, u64)>>,
+    /// Models a helper stuck in the driver: interrupts are ignored and a
+    /// WAIT returns only at its timeout.
+    pub ignore_interrupts: AtomicBool,
 }
 
 impl SourceScript {
     pub fn push(&self, answer: Scripted) {
-        self.answers.lock().unwrap().push_back(answer);
+        self.driver_state().frames.push_back(answer);
+        self.answered.notify_all();
+    }
+
+    pub fn push_wait(&self, answer: ScriptedWait) {
+        self.driver_state().waits.push_back(answer);
+        self.answered.notify_all();
+    }
+
+    /// A completed presentation: WAIT reports it and FRAME exports it.
+    pub fn present(&self, sequence: u64, timestamp_ns: u64) {
+        self.present_answer(
+            sequence,
+            Scripted::Frame {
+                sequence,
+                timestamp_ns,
+            },
+        );
+    }
+
+    /// Like [`Self::present`] with an acquire fence on the plane.
+    pub fn present_fenced(&self, sequence: u64) {
+        self.present_answer(sequence, Scripted::FencedFrame { sequence });
+    }
+
+    fn present_answer(&self, sequence: u64, frame: Scripted) {
+        let mut driver = self.driver_state();
+        driver.frames.push_back(frame);
+        driver.waits.push_back(ScriptedWait::Presented(sequence));
+        drop(driver);
+        self.answered.notify_all();
     }
 
     pub fn all_lent_descriptors_closed(&self) -> bool {
-        self.writers.lock().unwrap().iter().all(reader_closed)
+        self.open_descriptors() == 0
+    }
+
+    /// Exported descriptors the module has not closed yet.
+    pub fn open_descriptors(&self) -> usize {
+        self.writers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|writer| !reader_closed(writer))
+            .count()
+    }
+
+    fn driver_state(&self) -> std::sync::MutexGuard<'_, FakeDriver> {
+        self.driver.lock().unwrap()
     }
 
     fn tracked_descriptor(&self) -> OwnedFd {
@@ -60,7 +131,8 @@ impl SourceScript {
         read
     }
 
-    fn export(&self, sequence: u64, timestamp_ns: u64, fenced: bool) -> ExportedFrame {
+    /// An exported 1920x1080 frame whose descriptors are tracked pipes.
+    pub fn export(&self, sequence: u64, timestamp_ns: u64, fenced: bool) -> ExportedFrame {
         let mut pitches = [0; MAX_PLANES];
         pitches[0] = 7680;
         let mut fences: [Option<OwnedFd>; MAX_PLANES] = Default::default();
@@ -98,30 +170,126 @@ fn reader_closed(writer: &File) -> bool {
     poll.revents & libc::POLLERR != 0
 }
 
-pub struct FakeSource(pub Arc<SourceScript>);
+/// Polls `condition` until it holds or two seconds pass.
+pub fn eventually(mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    condition()
+}
+
+/// Interrupts one fake source; the script's other sources are unaffected.
+struct FakeInterrupt {
+    interrupted: AtomicBool,
+    script: Arc<SourceScript>,
+}
+
+impl SourceInterrupt for FakeInterrupt {
+    fn interrupt(&self) {
+        let _driver = self.script.driver_state();
+        self.interrupted.store(true, Ordering::SeqCst);
+        self.script.answered.notify_all();
+    }
+}
+
+pub struct FakeSource {
+    script: Arc<SourceScript>,
+    interrupt: Arc<FakeInterrupt>,
+}
+
+impl FakeSource {
+    pub fn new(script: Arc<SourceScript>) -> Self {
+        Self {
+            interrupt: Arc::new(FakeInterrupt {
+                interrupted: AtomicBool::new(false),
+                script: script.clone(),
+            }),
+            script,
+        }
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupt.interrupted.load(Ordering::SeqCst)
+            && !self.script.ignore_interrupts.load(Ordering::SeqCst)
+    }
+}
 
 impl FrameSource for FakeSource {
-    fn frame(&mut self, crtc_id: u32) -> Result<FrameExport, ClientError> {
-        self.0.requested_crtcs.lock().unwrap().push(crtc_id);
-        let answer = self
-            .0
-            .answers
+    fn wait(
+        &mut self,
+        crtc_id: u32,
+        last_sequence: u64,
+        timeout_ms: u32,
+    ) -> Result<Presentation, ClientError> {
+        self.script
+            .waits
             .lock()
             .unwrap()
+            .push((crtc_id, last_sequence));
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.into());
+        let mut driver = self.script.driver_state();
+        loop {
+            if self.interrupted() {
+                return Err(ClientError::Closed);
+            }
+            if let Some(answer) = driver.waits.pop_front() {
+                return match answer {
+                    ScriptedWait::Presented(sequence) => Ok(Presentation {
+                        sequence,
+                        timestamp_ns: 0,
+                        flags: PRESENT_CHANGED,
+                    }),
+                    ScriptedWait::Refuse(failure) => Err(ClientError::Refused {
+                        failure,
+                        os_error: 0,
+                    }),
+                    ScriptedWait::HelperGone => Err(ClientError::Closed),
+                };
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(Presentation {
+                    sequence: last_sequence,
+                    timestamp_ns: 0,
+                    flags: PRESENT_TIMEOUT,
+                });
+            }
+            driver = self
+                .script
+                .answered
+                .wait_timeout(driver, deadline - now)
+                .unwrap()
+                .0;
+        }
+    }
+
+    fn frame(&mut self, crtc_id: u32) -> Result<FrameExport, ClientError> {
+        self.script.requested_crtcs.lock().unwrap().push(crtc_id);
+        if self.interrupted() {
+            return Err(ClientError::Closed);
+        }
+        let answer = self
+            .script
+            .driver_state()
+            .frames
             .pop_front()
             .unwrap_or(Scripted::Empty);
         match answer {
             Scripted::Frame {
                 sequence,
                 timestamp_ns,
-            } => Ok(FrameExport::Ready(self.0.export(
+            } => Ok(FrameExport::Ready(self.script.export(
                 sequence,
                 timestamp_ns,
                 false,
             ))),
-            Scripted::FencedFrame { sequence } => {
-                Ok(FrameExport::Ready(self.0.export(sequence, 1_000, true)))
-            }
+            Scripted::FencedFrame { sequence } => Ok(FrameExport::Ready(
+                self.script.export(sequence, 1_000, true),
+            )),
             Scripted::Empty => Ok(FrameExport::Empty),
             Scripted::Refuse(failure) => Err(ClientError::Refused {
                 failure,
@@ -129,6 +297,10 @@ impl FrameSource for FakeSource {
             }),
             Scripted::HelperGone => Err(ClientError::Closed),
         }
+    }
+
+    fn interrupter(&self) -> Arc<dyn SourceInterrupt> {
+        self.interrupt.clone()
     }
 }
 
@@ -260,7 +432,7 @@ impl Backend for FakeBackend {
             .lock()
             .unwrap()
             .push((helper.to_owned(), binding.crtc_id));
-        Ok(Box::new(FakeSource(self.script.clone())))
+        Ok(Box::new(FakeSource::new(self.script.clone())))
     }
 
     fn monotonic_now_ns(&self) -> u64 {
