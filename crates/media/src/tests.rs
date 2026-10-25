@@ -424,6 +424,9 @@ fn dmabuf_and_gpu_table_layouts_are_stable() {
     assert_eq!(size_of::<DmaBufFrameSink>(), 16);
     assert_eq!(CAPTURE_API_V1_4_SIZE, 72);
     assert_eq!(offset_of!(CaptureApiV1_4, read_dmabuf_frame), 64);
+    assert_eq!(CAPTURE_API_V1_5_SIZE, 80);
+    assert_eq!(offset_of!(CaptureApiV1_5, latest_presentation), 72);
+    assert_eq!(size_of::<PresentationStatus>(), 16);
     assert_eq!(ENCODER_API_V1_0_SIZE, 56);
     assert_eq!(ENCODER_API_V1_1_SIZE, 64);
     assert_eq!(offset_of!(EncoderApiV1_1, submit_dmabuf), 56);

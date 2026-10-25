@@ -30,6 +30,8 @@ pub const CAPTURE_FRESHNESS_INTERFACE_MINOR: u32 = 2;
 pub const CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR: u32 = 3;
 /// Capture API v1.4 adds borrowed DMA-BUF (GPU) frame delivery.
 pub const CAPTURE_DMABUF_INTERFACE_MINOR: u32 = 4;
+/// Capture API v1.5 adds a cheap query of the newest completed presentation.
+pub const CAPTURE_PRESENTATION_INTERFACE_MINOR: u32 = 5;
 /// Encoder API v1.1 adds DMA-BUF frame submission.
 pub const ENCODER_DMABUF_INTERFACE_MINOR: u32 = 1;
 pub const CAPTURE_FRAME_CACHED_REUSE: u32 = 0;
@@ -247,6 +249,34 @@ pub struct CaptureApiV1_4 {
     pub read_dmabuf_frame: unsafe extern "C" fn(*mut c_void, u64, DmaBufFrameSink) -> Status,
 }
 
+/// Additive v1.5 table. Its first six fields preserve the complete v1.4
+/// layout. `latest_presentation` reports the newest completed presentation
+/// without delivering a frame, so a consumer can push each new presentation
+/// as soon as it lands instead of sampling on a fixed timer. It never blocks.
+#[repr(C)]
+pub struct CaptureApiV1_5 {
+    pub base: NativeInterface,
+    pub read_frame: unsafe extern "C" fn(*mut c_void, u64, FrameSink) -> Status,
+    pub geometry: unsafe extern "C" fn(*mut c_void, u64, *mut CaptureGeometry) -> Status,
+    pub read_frame_with_freshness:
+        unsafe extern "C" fn(*mut c_void, u64, FreshFrameSinkV1_2) -> Status,
+    pub read_frame_with_capture_timestamp:
+        unsafe extern "C" fn(*mut c_void, u64, FreshFrameSinkV1_3) -> Status,
+    pub read_dmabuf_frame: unsafe extern "C" fn(*mut c_void, u64, DmaBufFrameSink) -> Status,
+    pub latest_presentation:
+        unsafe extern "C" fn(*mut c_void, u64, *mut PresentationStatus) -> Status,
+}
+
+/// Newest completed presentation of one capture stream. `sequence` is the
+/// value a later `DmaBufFrame` for that presentation carries; zero means no
+/// presentation has completed yet. `timestamp_us` uses the stream epoch.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PresentationStatus {
+    pub sequence: u64,
+    pub timestamp_us: u64,
+}
+
 /// The v1.0 prefix retained so consumers can bind older capture providers
 /// without reading the optional v1.1 geometry callback past their table.
 #[repr(C)]
@@ -260,6 +290,7 @@ pub const CAPTURE_API_V1_1_SIZE: u32 = size_of::<CaptureApi>() as u32;
 pub const CAPTURE_API_V1_2_SIZE: u32 = size_of::<CaptureApiV1_2>() as u32;
 pub const CAPTURE_API_V1_3_SIZE: u32 = size_of::<CaptureApiV1_3>() as u32;
 pub const CAPTURE_API_V1_4_SIZE: u32 = size_of::<CaptureApiV1_4>() as u32;
+pub const CAPTURE_API_V1_5_SIZE: u32 = size_of::<CaptureApiV1_5>() as u32;
 
 /// Receives one borrowed frame and its source freshness in a single callback.
 #[repr(C)]

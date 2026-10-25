@@ -55,6 +55,12 @@ on its own GPU timeline, and copies the pixels into storage it owns before the
 next presentation can reuse the producer's buffer. Keeping a DMA-BUF open pins the
 allocation; it does not stop the compositor from rendering into it again.
 
+Capture v1.5 adds `latest_presentation`, a non-blocking query of the newest
+completed presentation (`PresentationStatus { sequence, timestamp_us }`). A
+consumer polls it each tick and reads a frame only when the sequence advances,
+so frames are pushed at the compositor's presentation rate, including variable
+refresh, rather than sampled on a fixed timer.
+
 Codec 3 is AV1: each packet is one low-overhead OBU temporal unit, starting with
 a temporal delimiter. AV1 has no start codes, so transports frame it by length.
 
