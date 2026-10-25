@@ -48,8 +48,18 @@ set always reaches the broker even when the observed state already matches.
 
 With that feature, Linux create/remove use a separate monitor controller. A
 bounded actor serializes native effects outside the input/media tick. Each
-caller/UUID gets a distinct free connector among Virtual-1 through Virtual-8;
-already connected outputs are never adopted. The shared broker rechecks Unix UID
+caller/UUID gets the lowest free connector the vibeshine DRM card actually
+exposes; already connected outputs are never adopted. DRM connector type ids are
+global and are not reset when the driver reloads, so a reloaded pool is named
+Virtual-9 through Virtual-16 rather than Virtual-1 through Virtual-8. The actor
+therefore lists `/sys/class/drm/card<N>-Virtual-<M>` entries whose card device
+is bound to a `vibeshine` or `vibeshine_drm` driver, or is the `vibeshine` faux
+device (stock vkms, also a faux device, is excluded). It reads sysfs metadata
+only and never opens a DRM node. Missing sysfs, no vibeshine connectors, or an
+id present on two vibeshine cards fails the create before any journal entry or
+broker effect. The broker accepts any `Virtual-<id>` public name (a positive
+32-bit id) and resolves it through the driver's `drm_name` mapping. Journal
+records accept the same names. The shared broker rechecks Unix UID
 ownership on every mutation. The private user journal at
 `$XDG_STATE_HOME/amaterasu/virtual-display-linux` (default
 `~/.local/state/amaterasu/virtual-display-linux`) is locked against other
@@ -85,7 +95,9 @@ also have access to the existing broker socket. A socket ACL must be reapplied
 on socket recreation, for example through an administrator-owned socket unit
 drop-in. Do not replace the broker, unload the driver, or steal Vibeshine's output.
 
-Tests cover free-connector allocation, caller identity, durable intent before
+Tests cover sysfs connector discovery against a fake tree (reloaded ids,
+non-vibeshine and stock vkms cards, malformed names, ambiguity), free-connector
+allocation past Virtual-8, caller identity, durable intent before
 effects, bounded cleanup, process exclusion and interrupted recovery. Native
 qualification must separately exercise actual display creation, capture, input,
 playback and restoration. Private DRM frame export / GPU zero-copy interop and

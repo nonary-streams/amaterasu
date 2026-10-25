@@ -1,5 +1,7 @@
 //! Serialized native effects run outside the host's input/media tick.
-use super::{Event, Record, Work, compositor::Compositor, journal::Journal};
+use super::{
+    Event, Record, Work, compositor::Compositor, connectors::ConnectorInventory, journal::Journal,
+};
 use crate::{linux_control::LinuxControlClient, model::Specification};
 use std::sync::mpsc::{Receiver, SyncSender};
 
@@ -19,13 +21,14 @@ impl Broker for LinuxControlClient {
         }
     }
 }
-struct Controller<B: Broker, C: Compositor> {
+struct Controller<B: Broker, C: Compositor, I: ConnectorInventory> {
     journal: Journal,
     broker: B,
     compositor: C,
+    connectors: I,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
-impl<B: Broker, C: Compositor> Controller<B, C> {
+impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
     fn remove(&mut self, key: &(String, String)) -> Result<(), String> {
         let Some(mut record) = self
             .journal
@@ -61,9 +64,10 @@ impl<B: Broker, C: Compositor> Controller<B, C> {
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             return Err("display manager stopping".into());
         }
+        // Connector names follow the driver's current type ids, which a module
+        // reload advances; never assume the first pool's Virtual-1..8 names.
         let mut selected = None;
-        for index in 1..=8 {
-            let output = format!("Virtual-{index}");
+        for output in self.connectors.connectors()? {
             if !self
                 .journal
                 .records
@@ -108,10 +112,11 @@ impl<B: Broker, C: Compositor> Controller<B, C> {
         result
     }
 }
-pub(super) fn run<B: Broker, C: Compositor>(
+pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
     journal: Journal,
     broker: B,
     compositor: C,
+    connectors: I,
     jobs: Receiver<Work>,
     events: SyncSender<Event>,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -120,6 +125,7 @@ pub(super) fn run<B: Broker, C: Compositor>(
         journal,
         broker,
         compositor,
+        connectors,
         stopped: stopped.clone(),
     };
     let error = controller.recover();

@@ -1,5 +1,6 @@
 //! Linux connector ownership uses libvirtualdisplay's broker, never Windows leases.
 mod compositor;
+mod connectors;
 mod journal;
 mod layout;
 mod worker;
@@ -34,7 +35,7 @@ impl Record {
             && self.owner.len() <= 128
             && !self.owner.chars().any(char::is_control)
             && self.specification.validate().is_ok()
-            && (1..=8).any(|index| self.output == format!("Virtual-{index}"))
+            && connectors::connector_id(&self.output).is_some()
     }
 }
 #[derive(Clone)]
@@ -114,6 +115,7 @@ impl Manager {
                         journal,
                         crate::linux_control::LinuxControlClient::default(),
                         compositor::KScreen,
+                        connectors::SysfsConnectors::default(),
                         jobs,
                         events,
                         stopped,
