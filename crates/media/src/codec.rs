@@ -7,6 +7,7 @@ pub enum VideoCodec {
     #[default]
     H264,
     Hevc,
+    Av1,
 }
 
 impl VideoCodec {
@@ -18,6 +19,7 @@ impl VideoCodec {
         match self {
             Self::H264 => crate::CODEC_H264,
             Self::Hevc => crate::CODEC_HEVC,
+            Self::Av1 => crate::CODEC_AV1,
         }
     }
 }
@@ -35,6 +37,11 @@ mod tests {
             serde_json::to_string(&VideoCodec::Hevc).unwrap(),
             "\"hevc\""
         );
-        assert!(serde_json::from_str::<VideoCodec>("\"av1\"").is_err());
+        assert_eq!(VideoCodec::Av1.abi_id(), crate::CODEC_AV1);
+        assert_eq!(
+            serde_json::from_str::<VideoCodec>("\"av1\"").unwrap(),
+            VideoCodec::Av1
+        );
+        assert!(serde_json::from_str::<VideoCodec>("\"vp9\"").is_err());
     }
 }

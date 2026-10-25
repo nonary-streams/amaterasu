@@ -506,6 +506,8 @@ impl StreamProfile {
         let codec = match self.codec {
             amaterasu_media::VideoCodec::H264 => amaterasu_gamestream::video::VideoCodec::H264,
             amaterasu_media::VideoCodec::Hevc => amaterasu_gamestream::video::VideoCodec::Hevc,
+            // AV1 has no GameStream packetizer yet.
+            amaterasu_media::VideoCodec::Av1 => return Err("invalid_streaming_profile"),
         };
         amaterasu_gamestream::video::VideoPacketizer::new_with_codec(
             amaterasu_gamestream::video::VideoConfig {

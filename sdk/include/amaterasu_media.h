@@ -7,6 +7,8 @@ extern "C" {
 #define AMATERASU_PIXEL_BGRA8 1
 #define AMATERASU_PIXEL_NV12 2
 #define AMATERASU_CODEC_H264 1
+#define AMATERASU_CODEC_HEVC 2
+#define AMATERASU_CODEC_AV1 3
 #define AMATERASU_PACKET_KEYFRAME 1
 #define AMATERASU_PACKET_EOS 2
 #define AMATERASU_PACKET_END_OF_ACCESS_UNIT 4
@@ -91,7 +93,33 @@ typedef struct {
     AmaterasuStatus (*write)(void *context, const AmaterasuCpuFrame *frame, uint32_t freshness);
 } AmaterasuFreshFrameSinkV1_2;
 
-/* H264 bytes are Annex B. EOS has flags=2, len=0, no payload.
+/* Linux DMA-BUF frames. Every descriptor is borrowed only until the callback
+ * or submit returns; a consumer that retains the pixels duplicates the fds
+ * (F_DUPFD_CLOEXEC) and copies them out of the producer's buffer promptly.
+ * fourcc/modifier are DRM values. Unused planes are {-1, -1, 0, 0}.
+ * acquire_fence_fd is a sync_file signalled when GPU writes finish, or -1. */
+#define AMATERASU_DMABUF_MAX_PLANES 4
+#define AMATERASU_DMABUF_COLOR_SRGB 1u
+#define AMATERASU_DMABUF_COLOR_BT2020_PQ 2u
+typedef struct {
+    int32_t fd, acquire_fence_fd;
+    uint32_t offset, pitch;
+} AmaterasuDmaBufPlane;
+
+typedef struct {
+    uint32_t width, height, fourcc, plane_count;
+    uint64_t modifier;
+    AmaterasuDmaBufPlane planes[AMATERASU_DMABUF_MAX_PLANES];
+    uint32_t color, reserved;
+    uint64_t timestamp_us, sequence;
+} AmaterasuDmaBufFrame;
+
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *context, const AmaterasuDmaBufFrame *frame, uint32_t freshness);
+} AmaterasuDmaBufFrameSink;
+
+/* H264/HEVC bytes are Annex B; AV1 bytes are one OBU temporal unit. EOS has flags=2, len=0, no payload.
  * When open selects packet_boundaries=true, flag 4 marks the last fragment of
  * one picture. Its fragments share sequence/timestamp. EOS never carries 4. */
 typedef struct {
@@ -157,6 +185,19 @@ typedef struct {
     AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuPacketSink sink);
     AmaterasuStatus (*drain)(void *context, uint64_t stream);
 } AmaterasuEncoderApi;
+
+/* Optional encoder v1.1 tail: access only after checking advertised minor >= 1
+ * and table size >= sizeof(AmaterasuEncoderApiV1_1). OK means the encoder has
+ * duplicated what it needs; BUSY accepts nothing; UNSUPPORTED means this
+ * stream cannot import the frame's format or modifier. */
+#define AMATERASU_ENCODER_DMABUF_INTERFACE_MINOR 1u
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*submit)(void *context, uint64_t stream, const AmaterasuCpuFrame *frame, uint32_t force_idr);
+    AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuPacketSink sink);
+    AmaterasuStatus (*drain)(void *context, uint64_t stream);
+    AmaterasuStatus (*submit_dmabuf)(void *context, uint64_t stream, const AmaterasuDmaBufFrame *frame, uint32_t force_idr);
+} AmaterasuEncoderApiV1_1;
 typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuPacketSink sink);

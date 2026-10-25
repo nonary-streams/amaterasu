@@ -87,7 +87,9 @@ fn require_current_development_bootstrap(
 mod tests {
     use super::*;
     use amaterasu_contracts::RuntimeConfig;
-    use amaterasu_package::{ReleaseManifest, current_target, random_identifier, write_json_atomically};
+    use amaterasu_package::{
+        ReleaseManifest, current_target, random_identifier, write_json_atomically,
+    };
     use std::collections::BTreeMap;
     use std::fs;
 

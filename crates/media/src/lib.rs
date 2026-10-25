@@ -11,6 +11,8 @@ mod control;
 pub use control::*;
 mod color;
 pub use color::*;
+mod dmabuf;
+pub use dmabuf::*;
 mod codec;
 pub use codec::*;
 mod geometry;
@@ -26,12 +28,17 @@ pub const CAPTURE_INTERFACE_MINOR: u32 = 1;
 pub const CAPTURE_FRESHNESS_INTERFACE_MINOR: u32 = 2;
 /// Capture API v1.3 adds a separate WGC source timestamp to fresh deliveries.
 pub const CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR: u32 = 3;
+/// Capture API v1.4 adds borrowed DMA-BUF (GPU) frame delivery.
+pub const CAPTURE_DMABUF_INTERFACE_MINOR: u32 = 4;
+/// Encoder API v1.1 adds DMA-BUF frame submission.
+pub const ENCODER_DMABUF_INTERFACE_MINOR: u32 = 1;
 pub const CAPTURE_FRAME_CACHED_REUSE: u32 = 0;
 pub const CAPTURE_FRAME_FRESH: u32 = 1;
 pub const PIXEL_BGRA8: u32 = 1;
 pub const PIXEL_NV12: u32 = 2;
 pub const CODEC_H264: u32 = 1;
 pub const CODEC_HEVC: u32 = 2;
+pub const CODEC_AV1: u32 = 3;
 pub const FLAG_KEYFRAME: u32 = 1;
 pub const FLAG_END_OF_STREAM: u32 = 2;
 /// Last fragment of one complete coded picture. Earlier fragments share its
@@ -121,7 +128,9 @@ impl FrameSink {
     }
 }
 
-/// H.264 and HEVC packets use Annex B start codes, not length prefixes. An encoder
+/// H.264 and HEVC packets use Annex B start codes, not length prefixes. AV1
+/// packets are low-overhead OBU streams, each access unit one temporal unit
+/// beginning with a temporal delimiter. An encoder
 /// may emit several packets for one submitted sequence. The final fragment sets
 /// FLAG_END_OF_ACCESS_UNIT. EOS carries no bytes and cannot terminate a partial AU.
 #[repr(C)]
@@ -137,7 +146,7 @@ pub struct EncodedPacket {
 
 impl EncodedPacket {
     pub fn validate(&self) -> Result<(), Status> {
-        if !matches!(self.codec, CODEC_H264 | CODEC_HEVC)
+        if !matches!(self.codec, CODEC_H264 | CODEC_HEVC | CODEC_AV1)
             || self.flags & !(FLAG_KEYFRAME | FLAG_END_OF_STREAM | FLAG_END_OF_ACCESS_UNIT) != 0
         {
             return Err(STATUS_INVALID_ARGUMENT);
@@ -222,6 +231,22 @@ pub struct CaptureApiV1_3 {
         unsafe extern "C" fn(*mut c_void, u64, FreshFrameSinkV1_3) -> Status,
 }
 
+/// Additive v1.4 table. Its first five fields preserve the complete v1.3
+/// layout. Providers whose frames live in GPU memory deliver them as borrowed
+/// DMA-BUF descriptors; MEDIA_UNSUPPORTED means this stream has no GPU frames
+/// and the consumer should use a CPU callback instead.
+#[repr(C)]
+pub struct CaptureApiV1_4 {
+    pub base: NativeInterface,
+    pub read_frame: unsafe extern "C" fn(*mut c_void, u64, FrameSink) -> Status,
+    pub geometry: unsafe extern "C" fn(*mut c_void, u64, *mut CaptureGeometry) -> Status,
+    pub read_frame_with_freshness:
+        unsafe extern "C" fn(*mut c_void, u64, FreshFrameSinkV1_2) -> Status,
+    pub read_frame_with_capture_timestamp:
+        unsafe extern "C" fn(*mut c_void, u64, FreshFrameSinkV1_3) -> Status,
+    pub read_dmabuf_frame: unsafe extern "C" fn(*mut c_void, u64, DmaBufFrameSink) -> Status,
+}
+
 /// The v1.0 prefix retained so consumers can bind older capture providers
 /// without reading the optional v1.1 geometry callback past their table.
 #[repr(C)]
@@ -234,6 +259,7 @@ pub const CAPTURE_API_V1_0_SIZE: u32 = size_of::<CaptureApiPrefix>() as u32;
 pub const CAPTURE_API_V1_1_SIZE: u32 = size_of::<CaptureApi>() as u32;
 pub const CAPTURE_API_V1_2_SIZE: u32 = size_of::<CaptureApiV1_2>() as u32;
 pub const CAPTURE_API_V1_3_SIZE: u32 = size_of::<CaptureApiV1_3>() as u32;
+pub const CAPTURE_API_V1_4_SIZE: u32 = size_of::<CaptureApiV1_4>() as u32;
 
 /// Receives one borrowed frame and its source freshness in a single callback.
 #[repr(C)]
@@ -304,6 +330,23 @@ pub struct EncoderApi {
     /// Stops accepting input and flushes queued packets before one EOS marker.
     pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
 }
+
+/// Additive v1.1 encoder table. The v1.0 prefix is unchanged. `submit_dmabuf`
+/// follows `submit`'s contract: STATUS_OK means the encoder has duplicated
+/// what it needs from the borrowed descriptors, MEDIA_BUSY accepts nothing,
+/// and MEDIA_UNSUPPORTED means this stream's encoder cannot import the
+/// frame's format or modifier. Fourth argument: nonzero forces an IDR frame.
+#[repr(C)]
+pub struct EncoderApiV1_1 {
+    pub base: NativeInterface,
+    pub submit: unsafe extern "C" fn(*mut c_void, u64, *const CpuFrame, u32) -> Status,
+    pub receive: unsafe extern "C" fn(*mut c_void, u64, PacketSink) -> Status,
+    pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
+    pub submit_dmabuf: unsafe extern "C" fn(*mut c_void, u64, *const DmaBufFrame, u32) -> Status,
+}
+
+pub const ENCODER_API_V1_0_SIZE: u32 = size_of::<EncoderApi>() as u32;
+pub const ENCODER_API_V1_1_SIZE: u32 = size_of::<EncoderApiV1_1>() as u32;
 
 /// Encoded output from an owned capture-to-encode stream. Configuration and
 /// lifecycle remain on the control service; consumers only receive packets here.

@@ -172,6 +172,7 @@ impl Stream {
         let expected_codec = match self.video_settings.codec {
             VideoCodec::H264 => CODEC_H264,
             VideoCodec::Hevc => CODEC_HEVC,
+            VideoCodec::Av1 => CODEC_AV1,
         };
         if packet.codec != expected_codec {
             return STATUS_INVALID_ARGUMENT;
@@ -420,6 +421,8 @@ fn packetizers(request: &Open) -> TransportResult<(VideoPacketizer, AudioPacketi
     let codec = match request.video.codec {
         VideoCodec::H264 => WireVideoCodec::H264,
         VideoCodec::Hevc => WireVideoCodec::Hevc,
+        // AV1 has no GameStream packetizer yet.
+        VideoCodec::Av1 => return Err("invalid_video_configuration"),
     };
     let video = VideoPacketizer::new_with_codec(
         VideoConfig {
