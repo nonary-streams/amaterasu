@@ -592,6 +592,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-vkms-frame-helper"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "amaterasu-windows-capture-geometry"
 version = "0.1.0"
 dependencies = [

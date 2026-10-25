@@ -14,6 +14,7 @@ members = [
     "crates/module-sdk",
     "crates/host",
     "crates/release",
+    "crates/vkms-frame-helper",
     "fixtures/echo",
     "fixtures/media-probe",
     "fixtures/stream-source",
