@@ -252,3 +252,93 @@ fn explicitly_enabled_virtual_displays_select_a_stream_owned_output() {
         "portal-selected-session-source"
     );
 }
+
+#[test]
+fn video_may_capture_owned_outputs_through_the_vkms_scanout_provider() {
+    let capture = COMPONENTS
+        .iter()
+        .find(|component| component.id == "amaterasu.capture-vkms")
+        .expect("vkms capture component");
+    assert_eq!(capture.library, "amaterasu_capture_vkms");
+    assert!(
+        capture
+            .native_provides
+            .contains(&"amaterasu.capture-vkms/1")
+    );
+
+    let video = COMPONENTS
+        .iter()
+        .find(|component| component.id == VIDEO_COMPONENT_ID)
+        .expect("Linux video component");
+    assert!(video.calls.contains(&"amaterasu.capture-vkms/1"));
+    assert!(video.native_uses.contains(&"amaterasu.capture-vkms/1"));
+    assert!(video.dependencies.contains(&"amaterasu.capture-vkms"));
+
+    // Every ancestor of video's capture requests carries the call grant so the
+    // intersected authority still reaches the provider; none gets native use.
+    for component_id in [NVHTTP.id, RTSP.id, STREAM_SESSION.id, MANAGEMENT.id] {
+        let component = COMPONENTS
+            .iter()
+            .find(|component| component.id == component_id)
+            .expect("stream ancestor component");
+        assert!(component.calls.contains(&"amaterasu.capture-vkms/1"));
+        assert!(!component.native_uses.contains(&"amaterasu.capture-vkms/1"));
+    }
+}
+
+#[test]
+fn vkms_capture_stays_disabled_until_a_frame_helper_is_named() {
+    let without_helper = LinuxSessionOptions {
+        enable_capture: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        vkms_capture_settings(&without_helper),
+        json!({"enabled": false})
+    );
+
+    let helper = "/usr/local/libexec/amaterasu/amaterasu-vkms-frame-helper";
+    let with_helper = LinuxSessionOptions {
+        enable_capture: true,
+        frame_helper: Some(helper.into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        vkms_capture_settings(&with_helper),
+        json!({
+            "enabled": true,
+            "capture_principals": [VIDEO_COMPONENT_ID],
+            "frame_helper": helper,
+        })
+    );
+    let capture_disabled = LinuxSessionOptions {
+        frame_helper: Some(helper.into()),
+        ..Default::default()
+    };
+    assert_eq!(vkms_capture_settings(&capture_disabled)["enabled"], false);
+}
+
+#[test]
+fn frame_helper_option_requires_one_absolute_normal_path() {
+    let parse = |values: &[&str]| {
+        LinuxSessionOptions::from_arguments(
+            &values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+        )
+    };
+    let helper = "/usr/local/libexec/amaterasu/amaterasu-vkms-frame-helper";
+    assert_eq!(
+        parse(&["--frame-helper", helper])
+            .unwrap()
+            .frame_helper
+            .as_deref(),
+        Some(helper)
+    );
+    for invalid in ["relative/helper", "/usr/../tmp/helper", "/usr/libexec/", ""] {
+        assert!(parse(&["--frame-helper", invalid]).is_err(), "{invalid:?}");
+    }
+    assert!(parse(&["--frame-helper"]).is_err());
+    assert!(parse(&["--frame-helper", helper, "--frame-helper", helper]).is_err());
+}

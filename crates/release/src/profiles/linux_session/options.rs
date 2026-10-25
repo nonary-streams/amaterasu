@@ -32,6 +32,7 @@ pub enum OptionError {
     AllowRemoteWithoutWildcard,
     InvalidManagementPort(String),
     InvalidCatalogOwner(String),
+    InvalidFrameHelper(String),
     InvalidLabel(&'static str),
 }
 
@@ -65,6 +66,10 @@ impl fmt::Display for OptionError {
             Self::InvalidManagementPort(value) => write!(
                 formatter,
                 "--management-port expects a loopback TCP port from 1024 through 65535, got {value:?}"
+            ),
+            Self::InvalidFrameHelper(value) => write!(
+                formatter,
+                "--frame-helper expects an absolute path to amaterasu-vkms-frame-helper, got {value:?}"
             ),
             Self::InvalidCatalogOwner(value) => write!(
                 formatter,
@@ -271,6 +276,9 @@ pub struct LinuxSessionOptions {
     pub enable_input: bool,
     /// Allows the display module to change the physical display layout.
     pub enable_display_mutation: bool,
+    /// Absolute path of the root-owned `amaterasu-vkms-frame-helper` that the
+    /// operator granted `cap_sys_admin+p`. Enables direct scanout capture.
+    pub frame_helper: Option<String>,
 }
 
 impl Default for LinuxSessionOptions {
@@ -285,6 +293,7 @@ impl Default for LinuxSessionOptions {
             enable_virtual_display: false,
             enable_input: false,
             enable_display_mutation: false,
+            frame_helper: None,
         }
     }
 }
@@ -335,6 +344,13 @@ impl LinuxSessionOptions {
                     seen.once("--enable-audio")?;
                     options.enable_audio = true;
                 }
+                "--frame-helper" => {
+                    seen.once("--frame-helper")?;
+                    options.frame_helper = Some(parse_frame_helper(&required_value(
+                        &mut arguments,
+                        "--frame-helper",
+                    )?)?);
+                }
                 "--enable-virtual-display" => {
                     seen.once("--enable-virtual-display")?;
                     options.enable_virtual_display = true;
@@ -380,6 +396,20 @@ fn required_value<'a>(
         .next()
         .cloned()
         .ok_or(OptionError::MissingValue(option))
+}
+
+fn parse_frame_helper(value: &str) -> Result<String, OptionError> {
+    let path = std::path::Path::new(value);
+    let normal = path.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
+    });
+    if !path.is_absolute() || !normal || value.ends_with('/') {
+        return Err(OptionError::InvalidFrameHelper(value.into()));
+    }
+    Ok(value.into())
 }
 
 fn parse_catalog_owner(value: &str) -> Result<CatalogOwner, OptionError> {

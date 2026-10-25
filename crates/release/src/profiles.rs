@@ -436,6 +436,18 @@ const CAPTURE_PIPEWIRE: ComponentDefinition = ComponentDefinition {
     native_uses: &[],
     dependencies: &[RUNTIME_ID],
 };
+/// Owned virtual-display scanout as DMA-BUF frames from the vibeshine_drm
+/// driver, read through a separately installed privileged frame helper.
+const CAPTURE_VKMS: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.capture-vkms",
+    library: "amaterasu_capture_vkms",
+    provides: &["amaterasu.capture-vkms/1"],
+    calls: &[],
+    publishes: &[],
+    native_provides: &["amaterasu.capture-vkms/1"],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
+};
 const MEDIA_TRANSPORT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.media-transport",
     library: "amaterasu_media_transport",

@@ -16,9 +16,9 @@ pub mod options;
 mod tests;
 
 use super::{
-    APPLICATION, AUDIO, AUDIO_ENCODE, AUTHENTICATION, CAPTURE_PIPEWIRE, CATALOG, CONFIGURATION,
-    CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, FRAME_LIMITER, INPUT, LAUNCH,
-    MANAGEMENT, MEDIA_TRANSPORT, NVHTTP, PAIRING, RTSP, RUNTIME, RUNTIME_ID, SESSION,
+    APPLICATION, AUDIO, AUDIO_ENCODE, AUTHENTICATION, CAPTURE_PIPEWIRE, CAPTURE_VKMS, CATALOG,
+    CONFIGURATION, CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, FRAME_LIMITER, INPUT,
+    LAUNCH, MANAGEMENT, MEDIA_TRANSPORT, NVHTTP, PAIRING, RTSP, RUNTIME, RUNTIME_ID, SESSION,
     SESSION_HISTORY, STATE, STREAM_SESSION, VIDEO, VIRTUAL_DISPLAY, names,
 };
 use amaterasu_contracts::{Grants, RuntimeConfig};
@@ -96,12 +96,27 @@ const LINUX_SESSION_LAUNCH: ComponentDefinition = ComponentDefinition {
     ..LAUNCH
 };
 
-/// The profile's only video source is a current-user ScreenCast portal stream.
+/// Video captures owned virtual outputs as DMA-BUF scanout through
+/// capture-vkms when its frame helper is usable, and otherwise through a
+/// current-user PipeWire stream (KWin ScreenCast or the portal).
 const LINUX_SESSION_VIDEO: ComponentDefinition = ComponentDefinition {
     id: VIDEO_COMPONENT_ID,
-    calls: &["amaterasu.capture-pipewire/1", "amaterasu.encode/1"],
-    native_uses: &["amaterasu.capture-pipewire/1", "amaterasu.encode/1"],
-    dependencies: &[RUNTIME_ID, "amaterasu.capture-pipewire", "amaterasu.encode"],
+    calls: &[
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
+        "amaterasu.encode/1",
+    ],
+    native_uses: &[
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
+        "amaterasu.encode/1",
+    ],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.capture-pipewire",
+        "amaterasu.capture-vkms",
+        "amaterasu.encode",
+    ],
     ..VIDEO
 };
 
@@ -133,6 +148,7 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
         "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
         "amaterasu.encode/1",
     ],
     dependencies: &[
@@ -163,6 +179,7 @@ const LINUX_SESSION_RTSP: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
         "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
         "amaterasu.encode/1",
     ],
     ..RTSP
@@ -181,6 +198,7 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
         "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
         "amaterasu.encode/1",
         "amaterasu.session-history/1",
         "amaterasu.frame-limiter/1",
@@ -223,6 +241,7 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         // nested authority intersection; management does not depend on or
         // invoke the provider directly.
         "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
         "amaterasu.audio/1",
         "amaterasu.audio-encode/1",
         "amaterasu.encode/1",
@@ -277,6 +296,7 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     INPUT,
     VIRTUAL_DISPLAY,
     CAPTURE_PIPEWIRE,
+    CAPTURE_VKMS,
     AUDIO,
     AUDIO_ENCODE,
     ENCODE,
@@ -410,13 +430,14 @@ fn settings(
     // enabled through the profile option.
     insert(
         VIDEO_COMPONENT_ID,
-        json!({"enabled": options.enable_capture, "capture_providers": ["pipewire"]}),
+        json!({"enabled": options.enable_capture, "capture_providers": ["pipewire", "vkms"]}),
     );
     let mut capture_settings = portal_capture_settings();
     if options.enable_virtual_display {
         capture_settings["allow_named_outputs"] = json!(true);
     }
     insert("amaterasu.capture-pipewire", capture_settings);
+    insert("amaterasu.capture-vkms", vkms_capture_settings(options));
     insert("amaterasu.audio", json!({"enabled": options.enable_audio}));
     insert(
         "amaterasu.virtual-display",
@@ -449,6 +470,20 @@ fn portal_capture_settings() -> Value {
         "selection_principals": [VIDEO_COMPONENT_ID],
         "capture_principals": [VIDEO_COMPONENT_ID],
     })
+}
+
+/// Direct scanout capture needs the operator-installed privileged helper.
+/// Without `--frame-helper` the provider stays disabled and video keeps
+/// capturing owned outputs through PipeWire.
+fn vkms_capture_settings(options: &LinuxSessionOptions) -> Value {
+    match &options.frame_helper {
+        Some(helper) => json!({
+            "enabled": options.enable_capture,
+            "capture_principals": [VIDEO_COMPONENT_ID],
+            "frame_helper": helper,
+        }),
+        None => json!({"enabled": false}),
+    }
 }
 
 fn catalog_settings(options: &LinuxSessionOptions) -> Value {
