@@ -22,6 +22,8 @@ pub struct Handles {
     pub control_transport: u64,
     pub stream_audio: bool,
     pub audio_channels: u32,
+    /// ABI codec identifier of the negotiated video codec.
+    pub video_codec: u32,
 }
 
 #[derive(Debug)]
@@ -63,10 +65,11 @@ pub struct Plane {
 impl Plane {
     pub fn new(runtime: &RuntimeClient, handles: Handles) -> PlaneResult<Self> {
         Ok(Self {
-            pump: Pump::with_audio(
+            pump: Pump::with_media(
                 native::NativeBackend::new(runtime, handles)?,
                 handles.stream_audio,
                 handles.audio_channels,
+                handles.video_codec,
             ),
         })
     }
@@ -131,15 +134,15 @@ struct Pump<B> {
 impl<B: Backend> Pump<B> {
     #[cfg(test)]
     fn new(backend: B) -> Self {
-        Self::with_audio(backend, true, 2)
+        Self::with_media(backend, true, 2, CODEC_H264)
     }
 
-    fn with_audio(backend: B, stream_audio: bool, audio_channels: u32) -> Self {
+    fn with_media(backend: B, stream_audio: bool, audio_channels: u32, video_codec: u32) -> Self {
         Self {
             backend,
             stream_audio,
             audio_channels,
-            video: VideoAssembly::default(),
+            video: VideoAssembly::new(video_codec),
             pending_pcm: None,
             pending_audio: None,
             stopping: false,

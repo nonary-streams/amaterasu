@@ -187,6 +187,7 @@ fn handles() -> Handles {
         control_transport: 50,
         stream_audio: true,
         audio_channels: 2,
+        video_codec: CODEC_H264,
     }
 }
 
@@ -199,6 +200,7 @@ fn disabled_audio_handles() -> Handles {
         control_transport: 50,
         stream_audio: false,
         audio_channels: 2,
+        video_codec: CODEC_H264,
     }
 }
 
@@ -207,7 +209,7 @@ fn actual_native_tables_copy_borrowed_bytes_and_release_all_bindings() {
     let mut host = Host::new();
     let mut backend = NativeBackend::new(&host.runtime(), handles()).unwrap();
     let packet = backend.video().unwrap().unwrap();
-    let mut assembly = VideoAssembly::default();
+    let mut assembly = VideoAssembly::new(CODEC_H264);
     assembly.push(packet).unwrap();
     let header = assembly.header().unwrap();
     // SAFETY: assembly owns the copied bytes despite provider overwriting its source.
