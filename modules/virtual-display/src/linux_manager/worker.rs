@@ -8,6 +8,7 @@ use super::{
 use crate::{
     linux_control::LinuxControlClient,
     model::{Specification, VirtualDisplayLayout},
+    scale::ScaleSetting,
 };
 use std::sync::mpsc::{Receiver, SyncSender};
 
@@ -83,7 +84,12 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         }
         failure
     }
-    fn create(&mut self, owner: String, specification: Specification) -> Result<Record, String> {
+    fn create(
+        &mut self,
+        owner: String,
+        specification: Specification,
+        scale: ScaleSetting,
+    ) -> Result<Record, String> {
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             return Err("display manager stopping".into());
         }
@@ -121,6 +127,7 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
                 &record.specification,
                 record.layout.as_ref(),
                 &placement,
+                scale,
             )?;
             if !self.broker.connected(&record.output)? {
                 return Err("owned connector disappeared".into());
@@ -179,11 +186,12 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
             Work::Create {
                 owner,
                 specification,
+                scale,
             } => {
                 let key = (owner.clone(), specification.identity.clone());
                 Event::Created {
                     key,
-                    result: controller.create(owner, specification),
+                    result: controller.create(owner, specification, scale),
                 }
             }
             Work::Remove { key } => {

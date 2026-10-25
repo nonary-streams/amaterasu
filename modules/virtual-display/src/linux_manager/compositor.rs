@@ -1,7 +1,7 @@
 //! Configure the newly owned connector in the current KDE session, either
 //! beside the existing desktop or as its only enabled display.
 use super::layout::Layout;
-use crate::model::Specification;
+use crate::{model::Specification, scale::ScaleSetting};
 use serde_json::Value;
 use std::{
     io::Read,
@@ -33,6 +33,7 @@ pub(super) trait Compositor: Send {
         specification: &Specification,
         layout: Option<&Layout>,
         placement: &Placement,
+        scale: ScaleSetting,
     ) -> Result<(), String>;
 }
 pub(super) struct KScreen;
@@ -58,6 +59,7 @@ impl Compositor for KScreen {
         specification: &Specification,
         layout: Option<&Layout>,
         placement: &Placement,
+        scale: ScaleSetting,
     ) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut configuration = loop {
@@ -79,8 +81,12 @@ impl Compositor for KScreen {
         }
         let selected = mode(&configuration, output, specification)
             .ok_or("requested owned display mode is unavailable")?;
+        let target = OwnedTarget {
+            mode: selected,
+            scale: scale.factor(specification.width, specification.height),
+        };
         if let Placement::Exclusive { keep } = placement {
-            return configure_exclusive(&configuration, output, &selected, keep);
+            return configure_exclusive(&configuration, output, &target, keep);
         }
         let right = match layout {
             Some(layout) => layout.right_edge(),
@@ -90,9 +96,8 @@ impl Compositor for KScreen {
             Some(layout) => layout.arguments(&configuration)?,
             None => Vec::new(),
         };
-        arguments.extend(owned_output_arguments(
+        arguments.extend(target.arguments(
             output,
-            &selected,
             right,
             layout.map_or(1, Layout::next_priority) as usize,
         ));
@@ -103,7 +108,7 @@ impl Compositor for KScreen {
         }
         let actual = find_output(&confirmed, output)
             .ok_or("owned display disappeared after configuration")?;
-        if !owned_output_matches(actual, &selected, right) {
+        if !target.matches(actual, right) {
             return Err("owned display configuration readback differs".into());
         }
         Ok(())
@@ -115,19 +120,19 @@ impl Compositor for KScreen {
 fn configure_exclusive(
     configuration: &Value,
     output: &str,
-    selected: &str,
+    target: &OwnedTarget,
     keep: &[String],
 ) -> Result<(), String> {
     let right = right_edge_of(configuration, |name| keep.iter().any(|kept| kept == name))?;
     // Kept peer outputs retain their order; this stream's output follows them.
     let priority = keep.len() + 1;
     let mut arguments = exclusive_disable_arguments(configuration, output, keep)?;
-    arguments.extend(owned_output_arguments(output, selected, right, priority));
+    arguments.extend(target.arguments(output, right, priority));
     run(&arguments)?;
     let confirmed = query()?;
     let actual =
         find_output(&confirmed, output).ok_or("owned display disappeared after configuration")?;
-    if !owned_output_matches(actual, selected, right)
+    if !target.matches(actual, right)
         || !exclusive_disable_arguments(&confirmed, output, keep)?.is_empty()
     {
         return Err("exclusive owned display configuration readback differs".into());
@@ -165,27 +170,48 @@ fn valid_output_name(name: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
-fn owned_output_arguments(output: &str, selected: &str, x: i64, priority: usize) -> Vec<String> {
-    vec![
-        format!("output.{output}.enable"),
-        format!("output.{output}.mode.{selected}"),
-        format!("output.{output}.scale.1"),
-        format!("output.{output}.rotation.none"),
-        format!("output.{output}.position.{x},0"),
-        format!("output.{output}.hdr.disable"),
-        format!("output.{output}.wcg.disable"),
-        format!("output.{output}.priority.{priority}"),
-    ]
+/// The requested mode and scale of the owned output. `scale` is `None` when
+/// the compositor's own or remembered choice is kept.
+struct OwnedTarget {
+    mode: String,
+    scale: Option<f64>,
 }
-fn owned_output_matches(actual: &Value, selected: &str, x: i64) -> bool {
-    actual["enabled"] == true
-        && actual["scale"].as_f64() == Some(1.0)
-        && actual["pos"]["x"].as_i64() == Some(x)
-        && actual["pos"]["y"].as_i64() == Some(0)
-        && actual["currentModeId"].as_str() == Some(selected)
-        && actual["rotation"] == 1
-        && actual["hdr"] == false
-        && actual["wcg"] == false
+impl OwnedTarget {
+    /// Like Vibeshine, ask for adaptive sync so the compositor presents at the
+    /// content's rate. It is not read back: a compositor without VRR support
+    /// for this output keeps streaming at the fixed mode rate.
+    fn arguments(&self, output: &str, x: i64, priority: usize) -> Vec<String> {
+        let mut arguments = vec![
+            format!("output.{output}.enable"),
+            format!("output.{output}.mode.{}", self.mode),
+            format!("output.{output}.rotation.none"),
+            format!("output.{output}.position.{x},0"),
+            format!("output.{output}.hdr.disable"),
+            format!("output.{output}.wcg.disable"),
+            format!("output.{output}.vrrpolicy.always"),
+            format!("output.{output}.priority.{priority}"),
+        ];
+        if let Some(scale) = self.scale {
+            arguments.insert(2, format!("output.{output}.scale.{scale}"));
+        }
+        arguments
+    }
+    fn matches(&self, actual: &Value, x: i64) -> bool {
+        let scale_matches = match self.scale {
+            Some(scale) => actual["scale"]
+                .as_f64()
+                .is_some_and(|actual| (actual - scale).abs() < 0.001),
+            None => actual["scale"].as_f64().is_some(),
+        };
+        actual["enabled"] == true
+            && scale_matches
+            && actual["pos"]["x"].as_i64() == Some(x)
+            && actual["pos"]["y"].as_i64() == Some(0)
+            && actual["currentModeId"].as_str() == Some(&self.mode)
+            && actual["rotation"] == 1
+            && actual["hdr"] == false
+            && actual["wcg"] == false
+    }
 }
 fn query() -> Result<Value, String> {
     serde_json::from_slice(&run(&["-j".into()])?).map_err(|_| "invalid KScreen JSON".into())
@@ -340,8 +366,27 @@ mod tests {
         let kept = |name: &str| name == "Virtual-2";
         assert_eq!(right_edge_of(&configuration, kept).unwrap(), 4480);
         assert_eq!(right_edge_of(&configuration, |_| false).unwrap(), 0);
-        let arguments = owned_output_arguments("Virtual-3", "7", 0, 1);
+        let automatic = OwnedTarget {
+            mode: "7".into(),
+            scale: Some(2.5),
+        };
+        let arguments = automatic.arguments("Virtual-3", 0, 1);
         assert!(arguments.contains(&"output.Virtual-3.position.0,0".into()));
         assert!(arguments.contains(&"output.Virtual-3.priority.1".into()));
+        assert!(arguments.contains(&"output.Virtual-3.scale.2.5".into()));
+        assert!(arguments.contains(&"output.Virtual-3.vrrpolicy.always".into()));
+        let retained = OwnedTarget {
+            mode: "7".into(),
+            scale: None,
+        };
+        assert!(
+            !retained
+                .arguments("Virtual-3", 0, 1)
+                .iter()
+                .any(|argument| argument.contains(".scale."))
+        );
+        let actual = json!({"enabled":true,"scale":1.75,"pos":{"x":0,"y":0},"currentModeId":"7","rotation":1,"hdr":false,"wcg":false});
+        assert!(retained.matches(&actual, 0));
+        assert!(!automatic.matches(&actual, 0));
     }
 }

@@ -276,9 +276,10 @@ impl<D: Driver> Manager<D> {
                 name,
                 dd_virtual_display_scale,
             } => {
-                let scale = match ScaleSetting::try_from(dd_virtual_display_scale) {
-                    Ok(scale) => scale,
-                    Err(()) => return failure("invalid_request"),
+                let scale = match dd_virtual_display_scale.map(ScaleSetting::try_from) {
+                    None => self.settings.dd_virtual_display_scale,
+                    Some(Ok(scale)) => scale,
+                    Some(Err(())) => return failure("invalid_request"),
                 };
                 if scale != ScaleSetting::Retain {
                     return failure("unsupported_scale");

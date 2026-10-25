@@ -439,9 +439,16 @@ fn settings(
     insert("amaterasu.capture-pipewire", capture_settings);
     insert("amaterasu.capture-vkms", vkms_capture_settings(options));
     insert("amaterasu.audio", json!({"enabled": options.enable_audio}));
+    // Owned displays are the only screen while streaming (Vibeshine's default
+    // exclusive layout) and are scaled to keep about 864 logical rows, since
+    // KWin otherwise remembers a 100% scale for these connectors.
     insert(
         "amaterasu.virtual-display",
-        json!({"enabled": options.enable_virtual_display}),
+        json!({
+            "enabled": options.enable_virtual_display,
+            "virtual_display_layout": "exclusive",
+            "dd_virtual_display_scale": -1,
+        }),
     );
     insert(
         "amaterasu.input",

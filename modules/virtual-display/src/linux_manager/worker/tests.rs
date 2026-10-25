@@ -96,6 +96,7 @@ impl Compositor for FakeCompositor {
         _: &Specification,
         _: Option<&super::super::layout::Layout>,
         placement: &Placement,
+        _: ScaleSetting,
     ) -> Result<(), String> {
         self.placements.push((output.into(), placement.clone()));
         if self.fail {
@@ -145,10 +146,18 @@ const SECOND: &str = "22222222-2222-4222-8222-222222222222";
 fn clients_get_distinct_free_connectors_and_cleanup_preserves_vibeshines_display() {
     let (root, mut controller) = fixture();
     let first = controller
-        .create("stream-session".into(), specification(FIRST))
+        .create(
+            "stream-session".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+        )
         .unwrap();
     let second = controller
-        .create("stream-session".into(), specification(SECOND))
+        .create(
+            "stream-session".into(),
+            specification(SECOND),
+            ScaleSetting::Automatic,
+        )
         .unwrap();
     assert_eq!(first.output, "Virtual-2");
     assert_eq!(second.output, "Virtual-3");
@@ -177,7 +186,11 @@ fn interrupted_cleanup_retains_intent_and_restart_only_recovers_owned_connectors
     *controller.broker.reject_removal.lock().unwrap() = true;
     assert!(
         controller
-            .create("stream-session".into(), specification(FIRST))
+            .create(
+                "stream-session".into(),
+                specification(FIRST),
+                ScaleSetting::Automatic
+            )
             .is_err()
     );
     assert_eq!(controller.journal.records.len(), 1);
@@ -217,7 +230,11 @@ fn shutdown_never_admits_a_new_connector_effect() {
         .store(true, std::sync::atomic::Ordering::Release);
     assert!(
         controller
-            .create("stream-session".into(), specification(FIRST))
+            .create(
+                "stream-session".into(),
+                specification(FIRST),
+                ScaleSetting::Automatic
+            )
             .is_err()
     );
     assert!(controller.journal.records.is_empty());
@@ -237,7 +254,11 @@ fn reloaded_pool_allocates_the_connectors_that_exist_past_virtual_8() {
         .unwrap()
         .insert("Virtual-9".into(), true);
     let first = controller
-        .create("stream-session".into(), specification(FIRST))
+        .create(
+            "stream-session".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+        )
         .unwrap();
     assert_eq!(first.output, "Virtual-10");
     assert!(controller.broker.connected("Virtual-10").unwrap());
@@ -277,7 +298,11 @@ fn connector_discovery_failure_or_exhaustion_admits_no_effect() {
     *controller.connectors.0.lock().unwrap() = Err("DRM sysfs is unavailable".into());
     assert_eq!(
         controller
-            .create("stream-session".into(), specification(FIRST))
+            .create(
+                "stream-session".into(),
+                specification(FIRST),
+                ScaleSetting::Automatic
+            )
             .err()
             .as_deref(),
         Some("DRM sysfs is unavailable")
@@ -291,7 +316,11 @@ fn connector_discovery_failure_or_exhaustion_admits_no_effect() {
         .insert("Virtual-9".into(), true);
     assert_eq!(
         controller
-            .create("stream-session".into(), specification(FIRST))
+            .create(
+                "stream-session".into(),
+                specification(FIRST),
+                ScaleSetting::Automatic
+            )
             .err()
             .as_deref(),
         Some("no free virtual display connector")
@@ -307,10 +336,18 @@ fn exclusive_streams_keep_peer_outputs_and_restore_the_pre_stream_desktop() {
     let (root, mut controller) = fixture();
     controller.layout = VirtualDisplayLayout::Exclusive;
     let first = controller
-        .create("stream-session".into(), specification(FIRST))
+        .create(
+            "stream-session".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+        )
         .unwrap();
     let second = controller
-        .create("stream-session".into(), specification(SECOND))
+        .create(
+            "stream-session".into(),
+            specification(SECOND),
+            ScaleSetting::Automatic,
+        )
         .unwrap();
     assert_eq!(
         controller.compositor.placements,
@@ -344,7 +381,11 @@ fn exclusive_streams_keep_peer_outputs_and_restore_the_pre_stream_desktop() {
 fn extended_streams_restore_the_layout_current_at_removal() {
     let (root, mut controller) = fixture();
     let record = controller
-        .create("stream-session".into(), specification(FIRST))
+        .create(
+            "stream-session".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+        )
         .unwrap();
     assert_eq!(
         controller.compositor.placements,

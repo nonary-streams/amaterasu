@@ -342,3 +342,22 @@ fn frame_helper_option_requires_one_absolute_normal_path() {
     assert!(parse(&["--frame-helper"]).is_err());
     assert!(parse(&["--frame-helper", helper, "--frame-helper", helper]).is_err());
 }
+
+#[test]
+fn owned_displays_are_exclusive_and_automatically_scaled() {
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-linux-session-display-policy-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let options = LinuxSessionOptions {
+        enable_virtual_display: true,
+        ..Default::default()
+    };
+    let policy = linux_session_policy(&root, &options).unwrap();
+    let settings = &policy.settings["amaterasu.virtual-display"];
+    assert_eq!(settings["enabled"], true);
+    assert_eq!(settings["virtual_display_layout"], "exclusive");
+    assert_eq!(settings["dd_virtual_display_scale"], -1);
+    std::fs::remove_dir_all(root).unwrap();
+}

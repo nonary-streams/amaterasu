@@ -59,6 +59,7 @@ enum Work {
     Create {
         owner: String,
         specification: Specification,
+        scale: ScaleSetting,
     },
     Remove {
         key: (String, String),
@@ -203,11 +204,11 @@ impl Manager {
                 name,
                 dd_virtual_display_scale,
             } => {
-                match ScaleSetting::try_from(dd_virtual_display_scale) {
-                    Err(()) => return (failure("invalid_request"), None),
-                    Ok(ScaleSetting::Retain) => {}
-                    Ok(_) => return (failure("unsupported_scale"), None),
-                }
+                let scale = match dd_virtual_display_scale.map(ScaleSetting::try_from) {
+                    None => self.settings.dd_virtual_display_scale,
+                    Some(Ok(scale)) => scale,
+                    Some(Err(())) => return (failure("invalid_request"), None),
+                };
                 if !self.settings.enabled {
                     return (failure("disabled"), None);
                 }
@@ -244,6 +245,7 @@ impl Manager {
                 if !self.enqueue(Work::Create {
                     owner: caller.into(),
                     specification: specification.clone(),
+                    scale,
                 }) {
                     return (failure("busy"), None);
                 }

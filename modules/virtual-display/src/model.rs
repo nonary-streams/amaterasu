@@ -22,6 +22,10 @@ pub enum VirtualDisplayLayout {
 pub struct Settings {
     pub enabled: bool,
     pub virtual_display_layout: VirtualDisplayLayout,
+    /// Default scale for owned outputs when a create request names none:
+    /// Vibeshine's `dd_virtual_display_scale` (0 retains the compositor's
+    /// choice, -1 is automatic, otherwise a supported percentage).
+    pub dd_virtual_display_scale: crate::scale::ScaleSetting,
     pub dd_activate_virtual_display: bool,
     pub dd_use_sunshine_virtual_display_driver: bool,
     /// None preserves the distinction between an omitted setting and explicit zero.
@@ -33,6 +37,7 @@ pub struct Settings {
 struct SettingsInput {
     enabled: bool,
     virtual_display_layout: VirtualDisplayLayout,
+    dd_virtual_display_scale: i32,
     dd_activate_virtual_display: bool,
     dd_use_sunshine_virtual_display_driver: bool,
     dd_virtual_display_permanent_count: Present<Value>,
@@ -44,6 +49,7 @@ impl Default for SettingsInput {
         Self {
             enabled: false,
             virtual_display_layout: VirtualDisplayLayout::default(),
+            dd_virtual_display_scale: 0,
             dd_activate_virtual_display: false,
             dd_use_sunshine_virtual_display_driver: true,
             dd_virtual_display_permanent_count: Present::default(),
@@ -70,6 +76,13 @@ where
     {
         T::deserialize(deserializer).map(|value| Self(Some(value)))
     }
+}
+
+fn present_integer<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    i32::deserialize(deserializer).map(Some)
 }
 
 impl<'de> Deserialize<'de> for Settings {
@@ -105,9 +118,12 @@ impl<'de> Deserialize<'de> for Settings {
             })
             .transpose()?;
 
+        let scale = crate::scale::ScaleSetting::try_from(input.dd_virtual_display_scale)
+            .map_err(|()| D::Error::custom("unsupported dd_virtual_display_scale"))?;
         Ok(Self {
             enabled: input.enabled,
             virtual_display_layout: input.virtual_display_layout,
+            dd_virtual_display_scale: scale,
             dd_activate_virtual_display: input.dd_activate_virtual_display,
             dd_use_sunshine_virtual_display_driver: input.dd_use_sunshine_virtual_display_driver,
             dd_virtual_display_permanent_count: permanent_count,
@@ -120,6 +136,7 @@ impl Default for Settings {
         Self {
             enabled: false,
             virtual_display_layout: VirtualDisplayLayout::default(),
+            dd_virtual_display_scale: crate::scale::ScaleSetting::Retain,
             dd_activate_virtual_display: false,
             dd_use_sunshine_virtual_display_driver: true,
             dd_virtual_display_permanent_count: None,
@@ -136,8 +153,10 @@ pub enum Operation {
         height: u32,
         refresh_millihz: u32,
         name: String,
-        #[serde(default)]
-        dd_virtual_display_scale: i32,
+        /// Overrides the module's `dd_virtual_display_scale` for this output.
+        /// Omitted means the module setting; an explicit null is invalid.
+        #[serde(default, deserialize_with = "present_integer")]
+        dd_virtual_display_scale: Option<i32>,
     },
     Status {
         identity: Option<String>,

@@ -101,7 +101,7 @@ fn create() -> Operation {
         height: 1080,
         refresh_millihz: 60000,
         name: "Test display".into(),
-        dd_virtual_display_scale: 0,
+        dd_virtual_display_scale: None,
     }
 }
 fn create_with_scale(dd_virtual_display_scale: i32) -> Operation {
@@ -111,7 +111,7 @@ fn create_with_scale(dd_virtual_display_scale: i32) -> Operation {
         height: 1080,
         refresh_millihz: 60000,
         name: "Test display".into(),
-        dd_virtual_display_scale,
+        dd_virtual_display_scale: Some(dd_virtual_display_scale),
     }
 }
 fn tick(manager: &mut Manager<Fake>) {
@@ -543,7 +543,8 @@ fn omitted_create_scale_defaults_to_retain_and_preserves_old_payloads() {
     else {
         panic!("create payload should deserialize as Create");
     };
-    assert_eq!(*dd_virtual_display_scale, 0);
+    // An omitted scale falls back to the module setting, which retains.
+    assert_eq!(*dd_virtual_display_scale, None);
 
     let (mut manager, calls) = setup(true);
     assert_eq!(manager.handle("alice", operation)["ok"], true);
