@@ -1,4 +1,4 @@
-//! Synthetic integration source. The H.264-shaped bytes are not decodable video.
+//! Synthetic integration source with optional paced, decodable H.264 video.
 mod controller;
 mod native;
 
@@ -15,6 +15,7 @@ const METRICS: &str = "test.stream-source/1";
 struct Settings {
     desktop_geometry: bool,
     enable_video: bool,
+    sustain_ms: u32,
 }
 
 impl Default for Settings {
@@ -22,6 +23,7 @@ impl Default for Settings {
         Self {
             desktop_geometry: false,
             enable_video: true,
+            sustain_ms: 0,
         }
     }
 }
@@ -52,7 +54,13 @@ impl ManagedModule for StreamSource {
         };
         let settings: Settings = serde_json::from_value(payload)
             .map_err(|error| format!("invalid stream source settings: {error}"))?;
-        let state = Arc::new(Mutex::new(Controller::new(settings.desktop_geometry)));
+        if settings.sustain_ms > 300_000 {
+            return Err("fixture sustain_ms exceeds five minutes".into());
+        }
+        let state = Arc::new(Mutex::new(Controller::with_duration(
+            settings.desktop_geometry,
+            settings.sustain_ms,
+        )));
         let kinds = settings.source_kinds();
         let factories: Vec<_> = kinds
             .iter()
@@ -146,10 +154,17 @@ mod settings_tests {
 
     #[test]
     fn explicit_audio_only_startup_has_no_video_registration() {
-        let settings: Settings = serde_json::from_value(json!({"enable_video": false})).unwrap();
-        let kinds = settings.source_kinds();
-        assert_eq!(kinds.len(), 1);
-        assert!(kinds[0] == Kind::Audio);
+        for sustain_ms in [0, 60_000] {
+            let settings: Settings = serde_json::from_value(json!({
+                "enable_video": false,
+                "sustain_ms": sustain_ms,
+            }))
+            .unwrap();
+            let kinds = settings.source_kinds();
+            assert_eq!(kinds.len(), 1);
+            assert!(kinds[0] == Kind::Audio);
+            assert_eq!(settings.sustain_ms, sustain_ms);
+        }
         assert!(serde_json::from_value::<Settings>(json!({"enable_video": "false"})).is_err());
     }
 }

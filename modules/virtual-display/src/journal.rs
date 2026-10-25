@@ -37,6 +37,7 @@ pub struct Journal {
 }
 
 impl Journal {
+    #[cfg_attr(all(amaterasu_libvirtualdisplay, test), allow(dead_code))]
     pub fn open_default() -> Result<Self, String> {
         let root = std::env::var_os("LOCALAPPDATA")
             .or_else(|| std::env::var_os("APPDATA"))

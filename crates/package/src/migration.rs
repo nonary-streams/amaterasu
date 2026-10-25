@@ -539,7 +539,7 @@ pub fn rollback_legacy_configuration(receipt: &MigrationReceipt) -> PackageResul
 
 fn analyze_source_file(
     product: LegacyProduct,
-    path: &Path,
+    content_path: &Path,
     logical_path: &Path,
     policy: SourceFilePolicy,
     plan: &mut ImportPlan,
@@ -565,7 +565,7 @@ fn analyze_source_file(
         });
         classify_legacy_state_credentials(
             product,
-            path,
+            content_path,
             is_configured_authentication_file
                 || is_default_primary_state_file
                 || (!is_auxiliary_state_file
@@ -575,9 +575,9 @@ fn analyze_source_file(
         )?;
     }
     if filename == "apps.json" {
-        return analyze_applications(product, path, plan);
+        return analyze_applications(product, content_path, plan);
     } else if filename.ends_with(".conf") {
-        return analyze_settings(product, path, plan);
+        return analyze_settings(product, content_path, plan);
     } else if is_state_document {
         return Ok(());
     } else if logical_path

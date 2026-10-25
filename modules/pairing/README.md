@@ -32,8 +32,13 @@ X.509 certificate, and random UUID:
 Initialize is idempotent after persistence, returning existing public identity.
 Both successful operations return `ok`, `host_id`, `certificate_pem`, and
 `certificate_id` (SHA-256 of certificate DER). No public response returns the
-private key. Initial generation can take significant CPU time inside a tick;
-it is an administrator setup operation, not an untrusted pairing request.
+private key. Initial RSA generation runs on one owned worker so host ticks remain
+responsive. The pipeline checks the setup request's existing cancellation and
+deadline while generation runs; a canceled result is discarded without saving or
+publishing it. Durable state writes and native publication remain serialized and
+publication waits for the state acknowledgment. Until a canceled worker finishes,
+new pairing requests receive `identity_generation_busy`. Module teardown joins
+unfinished identity work before its native code can unload.
 Generated certificates use SHA-256 with RSA PKCS#1 v1.5 and a 20-year validity.
 The key is stored as unencrypted PKCS#8 PEM in the state namespace, requiring
 host/state filesystem protection; this is not a keystore or encrypted-key vault.
@@ -241,8 +246,10 @@ trust when required, and must not let session resumption bypass revocation.
 
 When the platform enables `host_configuration`, the effective `pkey` and `cert`
 paths provide the TLS identity used by pairing and its native identity API. If both
-files are absent on first use, pairing generates a self-signed RSA identity and
-creates the configured files without replacing existing paths. Missing parent
+files are absent on first use, an owned worker generates a self-signed RSA identity
+and creates the configured files without replacing existing paths. Pairing keeps
+its native snapshot unavailable during provisioning and publishes validated material
+from a later host tick. Missing parent
 directories are created with Unix mode `0700`, and new Unix key and certificate
 files are mode `0600`. If only one file exists, or either existing file is unsafe
 or invalid, pairing fails closed and leaves the configured material untouched.

@@ -14,12 +14,26 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         return fields(object, &[], &[]);
     }
     match route.service {
+        "amaterasu.management/1" if route.action == "repository_list" => {
+            fields(object, &[], &["offset"])?;
+            if object
+                .get("offset")
+                .is_some_and(|value| !value.as_u64().is_some_and(|offset| offset <= 4096))
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "amaterasu.management/1" if route.action == "package_selection_status" => {
+            fields(object, &[], &[])
+        }
         "amaterasu.authentication/1" => authentication(route.action, object),
         "amaterasu.management/1" => management_settings(route.action, object),
         "amaterasu.host-configuration/1" => host_configuration(route.action, object),
         "amaterasu.catalog/1" => catalog(route.action, object),
         "amaterasu.pairing/1" => pairing(route.action, object),
         "amaterasu.display/1" => display(route.action, object),
+        "amaterasu.video/1" => video(route.action, object),
         "amaterasu.launch/1" => launch(route.action, object),
         "amaterasu.nvhttp/1" => nvhttp(route.action, object),
         "amaterasu.steam/1" => steam(route.action, object),
@@ -287,6 +301,29 @@ mod management_policy_tests {
             assert!(validate(update, payload.as_object().unwrap()).is_err());
         }
     }
+}
+
+fn video(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "select_portal_source" => {
+            fields(object, &["source_type", "operation_id"], &[])?;
+            if !matches!(text(object, "source_type")?, "monitor" | "window") {
+                return Err(INVALID);
+            }
+        }
+        "poll_portal_selection" | "cancel_portal_selection" => {
+            fields(object, &["operation_id"], &[])?;
+        }
+        _ => return Err(INVALID),
+    }
+    let operation_id = text(object, "operation_id")?;
+    if operation_id.is_empty()
+        || operation_id.len() > 128
+        || !operation_id.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(INVALID);
+    }
+    Ok(())
 }
 
 fn host_configuration(action: &str, object: &Object) -> Result<(), &'static str> {
@@ -2264,6 +2301,39 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
 #[cfg(test)]
 mod nvhttp_tests {
     use super::*;
+
+    #[test]
+    fn video_encryption_modes_can_be_set_through_authenticated_nvhttp_settings() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        for value in [
+            Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!(2),
+        ] {
+            let body = serde_json::json!({"hostname":"Ama","port":48050,
+                "expected_revision":1,"lan_encryption_mode":value,"wan_encryption_mode":value});
+            assert!(validate(route, body.as_object().unwrap()).is_ok(), "{body}");
+        }
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(3),
+            serde_json::json!("1"),
+            serde_json::json!(true),
+        ] {
+            let body = serde_json::json!({"hostname":"Ama","port":48050,
+                "expected_revision":1,"lan_encryption_mode":value});
+            assert!(
+                validate(route, body.as_object().unwrap()).is_err(),
+                "{body}"
+            );
+        }
+    }
 
     #[test]
     fn upnp_update_accepts_explicit_booleans_only() {

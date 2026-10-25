@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::Availability;
+use crate::model::{Availability, PipeWireState, SourceDiagnostics, SourceStage};
 use crate::test_support::{Driver, FakeBackend, settings, setup};
 use std::sync::atomic::Ordering;
 
@@ -383,9 +383,72 @@ fn deny_revoke_and_timeout_release_sessions_and_active_leases() {
 }
 
 #[test]
+fn timeout_status_distinguishes_waiting_for_start_from_pipewire_connection_failure() {
+    let (mut controller, driver) = setup(settings());
+    select(&mut controller, "administrator", "start-timeout", 0).unwrap();
+    *driver.diagnostics.lock().unwrap() = SourceDiagnostics {
+        stage: Some(SourceStage::Start),
+        ..SourceDiagnostics::default()
+    };
+    controller.refresh(5000);
+    let timed_out = controller
+        .handle(
+            "administrator",
+            Operation::PollSelection {
+                operation_id: "start-timeout".into(),
+            },
+            5001,
+        )
+        .unwrap()
+        .payload;
+    assert_eq!(timed_out["error"], "source_selection_timeout");
+    assert_eq!(timed_out["diagnostics"]["stage"], "start");
+    assert!(timed_out["diagnostics"].get("pipewire_node").is_none());
+    assert!(timed_out["diagnostics"].get("pipewire_serial").is_none());
+    assert!(timed_out["diagnostics"].get("pipewire_state").is_none());
+
+    let (mut controller, driver) = setup(settings());
+    select(&mut controller, "administrator", "pipewire-error", 0).unwrap();
+    *driver.diagnostics.lock().unwrap() = SourceDiagnostics {
+        stage: Some(SourceStage::ConnectPipeWire),
+        pipewire_node: Some(93),
+        pipewire_serial: Some(98),
+        pipewire_state: Some(PipeWireState::Error),
+        pipewire_error: Some(-2),
+        adapter_error_code: Some(4),
+    };
+    *driver.state.lock().unwrap() = SourceState::Failed("pipewire_failed");
+    controller.refresh(10);
+    let failed = controller
+        .handle(
+            "administrator",
+            Operation::PollSelection {
+                operation_id: "pipewire-error".into(),
+            },
+            11,
+        )
+        .unwrap()
+        .payload;
+    assert_eq!(failed["diagnostics"]["stage"], "connect_pipewire");
+    assert_eq!(failed["diagnostics"]["pipewire_node"], 93);
+    assert_eq!(failed["diagnostics"]["pipewire_serial"], 98);
+    assert_eq!(failed["diagnostics"]["pipewire_state"], "error");
+    assert_eq!(failed["diagnostics"]["pipewire_error"], -2);
+    assert_eq!(failed["diagnostics"]["adapter_error_code"], 4);
+    assert!(failed["diagnostics"].get("session_path").is_none());
+    assert!(failed["diagnostics"].get("fd").is_none());
+    assert!(failed["diagnostics"].get("token").is_none());
+}
+
+#[test]
 fn settings_and_selection_bounds_fail_before_native_allocation() {
     assert!(Settings::default().validate().is_ok());
     let mut policy = settings();
+    policy.idle_timeout_seconds = 600;
+    assert!(policy.validate().is_ok());
+    policy.idle_timeout_seconds = 601;
+    assert_eq!(policy.validate(), Err("invalid_settings"));
+    policy.idle_timeout_seconds = 60;
     policy.selection_timeout_seconds = 301;
     assert_eq!(policy.validate(), Err("invalid_settings"));
     let (mut controller, driver) = setup(settings());
@@ -415,4 +478,140 @@ fn settings_and_selection_bounds_fail_before_native_allocation() {
         select(&mut controller, "administrator", "too-many", 0),
         Err("resource_exhausted")
     ));
+}
+
+#[test]
+fn remembered_selection_restores_only_for_allowed_callers_and_waits_for_real_frames() {
+    let mut policy = settings();
+    policy.remember_source = true;
+    policy.selection_principals.insert("amaterasu.video".into());
+    let (mut controller, driver) = setup(policy);
+    driver.restore_available.store(true, Ordering::SeqCst);
+    let request = || Operation::Open {
+        output: "portal-selected-session-source".into(),
+        operation_id: Some("resume".into()),
+        constant_rate: None,
+    };
+    assert!(matches!(
+        controller.handle("stranger", request(), 0),
+        Err("capture_permission_denied")
+    ));
+    assert_eq!(driver.selections.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        controller.handle("amaterasu.video", request(), 0),
+        Err("source_restore_pending")
+    ));
+    assert!(controller.lease.is_none());
+    assert_eq!(driver.selections.load(Ordering::SeqCst), 1);
+    // A repeated pending open must not launch another picker or consume another token.
+    assert!(matches!(
+        controller.handle("amaterasu.video", request(), 1),
+        Err("source_restore_pending")
+    ));
+    assert_eq!(driver.selections.load(Ordering::SeqCst), 1);
+    driver.frame(50, 1000);
+    *driver.state.lock().unwrap() = SourceState::Ready {
+        node: 42,
+        width: 2,
+        height: 2,
+    };
+    let opened = controller.handle("amaterasu.video", request(), 10).unwrap();
+    assert!(opened.payload["ok"].as_bool().unwrap());
+    let id = opened.payload["stream"].as_u64().unwrap();
+    controller.close("amaterasu.video", id).unwrap();
+    assert!(controller.lease.is_none());
+    assert!(controller.selection.is_none());
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+    // Reconnects reuse an internal record instead of exhausting selection history.
+    for _ in 0..35 {
+        assert!(matches!(
+            controller.handle("amaterasu.video", request(), 20),
+            Err("source_restore_pending")
+        ));
+        let opened = controller.handle("amaterasu.video", request(), 21).unwrap();
+        controller
+            .close(
+                "amaterasu.video",
+                opened.payload["stream"].as_u64().unwrap(),
+            )
+            .unwrap();
+    }
+    assert_eq!(controller.selections.len(), 1);
+}
+
+#[test]
+fn restoration_is_opt_in_and_cancelled_opens_do_not_leave_capture_running() {
+    let (mut controller, driver) = setup(settings());
+    driver.restore_available.store(true, Ordering::SeqCst);
+    let request = || Operation::Open {
+        output: "portal-selected-session-source".into(),
+        operation_id: Some("resume".into()),
+        constant_rate: None,
+    };
+    assert!(matches!(
+        controller.handle("amaterasu.video", request(), 0),
+        Err("source_selection_required")
+    ));
+    assert_eq!(driver.selections.load(Ordering::SeqCst), 0);
+    controller.settings.remember_source = true;
+    assert!(matches!(
+        controller.handle("amaterasu.video", request(), 0),
+        Err("source_selection_required")
+    ));
+    controller
+        .settings
+        .selection_principals
+        .insert("amaterasu.video".into());
+    assert!(matches!(
+        controller.handle("amaterasu.video", request(), 0),
+        Err("source_restore_pending")
+    ));
+    controller.cancel_pending_restore("stranger");
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 0);
+    controller.cancel_pending_restore("amaterasu.video");
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+    assert!(controller.selection.is_none());
+}
+
+#[test]
+fn named_outputs_have_independent_capture_leases_and_cancel_does_not_close_a_peer() {
+    let mut settings = crate::test_support::settings();
+    settings.allow_named_outputs = true;
+    let (mut controller, driver) = crate::test_support::setup(settings);
+    let open = |output: &str, operation: &str| Operation::Open {
+        output: output.into(),
+        operation_id: Some(operation.into()),
+        constant_rate: None,
+    };
+    assert!(matches!(
+        controller.handle("amaterasu.video", open("kwin:Virtual-2", "first"), 0),
+        Err("named_source_pending")
+    ));
+    *driver.state.lock().unwrap() = SourceState::Ready {
+        node: 1,
+        width: 2,
+        height: 2,
+    };
+    driver.frame(42, 1);
+    let first = controller
+        .handle("amaterasu.video", open("kwin:Virtual-2", "first"), 1)
+        .unwrap()
+        .payload["stream"]
+        .as_u64()
+        .unwrap();
+    let second = controller
+        .handle("amaterasu.video", open("kwin:Virtual-3", "second"), 1)
+        .unwrap()
+        .payload["stream"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(first, second);
+    controller.close("amaterasu.video", first).unwrap();
+    assert!(controller.reader("amaterasu.video", first).is_err());
+    assert!(controller.reader("amaterasu.video", second).is_ok());
+    assert!(controller.reader("other.module", second).is_err());
+    controller.cancel_pending_restore("amaterasu.video");
+    assert!(controller.reader("amaterasu.video", second).is_ok());
+    controller.shutdown();
+    assert!(controller.reader("amaterasu.video", second).is_err());
 }

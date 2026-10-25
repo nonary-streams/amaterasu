@@ -16,6 +16,7 @@ impl Pipeline {
         }
         if !job.cleanup
             && record.state != State::Stopping
+            && job.step != Step::PersistJournal
             && job
                 .request
                 .is_some_and(|request| !rpc::active(send, request))
@@ -43,6 +44,14 @@ impl Pipeline {
                     return true;
                 }
                 rpc::Progress::Unresolved => {
+                    if job.step == Step::PersistJournal {
+                        self.journal.failed = true;
+                        self.recovery_blocked = true;
+                        record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
+                        record.state = State::CleanupFailed;
+                        self.reply(record, job, send);
+                        return false;
+                    }
                     if job.step == Step::ApplyLimiter {
                         let settled = pending.shutdown(send);
                         if !settled {
@@ -98,6 +107,17 @@ impl Pipeline {
                         }
                         record.feedback_poll_at = now.saturating_add(100);
                         return false;
+                    } else if job.step == Step::PersistJournal {
+                        self.journal.failed = true;
+                        self.recovery_blocked = true;
+                        if job.cleanup {
+                            record.cleanup_error = Some("lifecycle_journal_write_failed");
+                            record.state = State::CleanupFailed;
+                            self.reply(record, job, send);
+                            return false;
+                        }
+                        job.fail(record, "lifecycle_journal_write_failed", now);
+                        return true;
                     }
                     if job.settling_allocation {
                         job.settling_allocation = false;
@@ -115,6 +135,8 @@ impl Pipeline {
                                 | Step::ReleaseInput
                                 | Step::FindLimiter
                                 | Step::RestoreLimiter
+                                | Step::FindOwnedVirtualDisplay
+                                | Step::RemoveOwnedVirtualDisplay
                                 | Step::FindDisplay
                                 | Step::RestoreDisplay
                                 | Step::RecoverDisplay
@@ -187,15 +209,41 @@ impl Pipeline {
                 }
             }
         }
-        if job.cleanup {
+        let mut transferred_display_restore = false;
+        if job.cleanup && job.step != Step::PersistJournal {
             if record.uncertain.is_some() {
                 return self.finish_cleanup(record, job, send);
             }
-            self.transfer_shared_display_restore(record);
+            transferred_display_restore = self.transfer_shared_display_restore(record);
             let Some(step) = job.next_cleanup(record) else {
                 return self.finish_cleanup(record, job, send);
             };
             job.step = step;
+        }
+        if job.step == Step::RumbleDrain {
+            if record.rumble_pending.is_empty() {
+                job.rumble_tried = true;
+            } else if record
+                .rumble_shutdown_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                record.rumble_stop_unconfirmed = true;
+                record.rumble_pending.clear();
+                record.rumble_active_until.clear();
+                job.rumble_tried = true;
+            } else {
+                return true;
+            }
+            if job.cleanup {
+                record.plane = None;
+                if let Some(step) = job.next_cleanup(record) {
+                    job.step = step;
+                } else {
+                    return self.finish_cleanup(record, job, send);
+                }
+            } else {
+                job.step = Step::ReleaseInput;
+            }
         }
         if job.step == Step::WaitDrain {
             if record
@@ -219,6 +267,15 @@ impl Pipeline {
         }
         if job.step == Step::ApplyLimiter {
             record.limiter_attempted = true;
+        }
+        if job.step == Step::AcquireOutput
+            && super::virtual_display::requested(record)
+            && record.virtual_display_output.is_none()
+        {
+            job.step = Step::CreateOwnedVirtualDisplay;
+        }
+        if job.step == Step::CreateOwnedVirtualDisplay {
+            record.virtual_display_attempted = true;
         }
         if job.step == Step::ApplyDisplay {
             record.display_attempted = true;
@@ -245,6 +302,34 @@ impl Pipeline {
         if job.step == Step::InputBatch {
             record.input_inflight = next_input_batch_size(record);
         }
+        if job.step != Step::PersistJournal
+            && (transferred_display_restore
+                || (!job.cleanup && !self.journal.matches_record(record)))
+        {
+            let mut document = match self.journal.with_record(record) {
+                Ok(document) => document,
+                Err(code) => {
+                    job.fail(record, code, now);
+                    return true;
+                }
+            };
+            if transferred_display_restore {
+                // The recipient must durably inherit the exact topology operation
+                // before the original monitor reference can be released.
+                for candidate in self.records.values() {
+                    if document.entries.contains_key(&candidate.id) {
+                        document
+                            .entries
+                            .insert(candidate.id, journal::Entry::from_record(candidate));
+                    }
+                }
+            }
+            job.journal_resume = Some(job.step);
+            job.journal_payload = Some(self.journal.set_payload(&document));
+            job.journal_document = Some(document);
+            job.journal_operation_id = Some(self.journal.op_id(self.sequence.saturating_add(1)));
+            job.step = Step::PersistJournal;
+        }
         let (service, payload) = job.command(record);
         self.sequence = match self.sequence.checked_add(1) {
             Some(value) => value,
@@ -253,17 +338,17 @@ impl Pipeline {
                 return true;
             }
         };
-        let parent = if job.cleanup || record.state == State::Stopping {
-            None
-        } else {
-            job.request
-        };
-        let pending = rpc::Pending::new(
-            &service,
-            payload,
-            format!("ss-{:x}-{}", record.id, self.sequence),
-            parent,
-        );
+        let parent =
+            if job.cleanup || record.state == State::Stopping || job.step == Step::PersistJournal {
+                None
+            } else {
+                job.request
+            };
+        let operation_id = job
+            .journal_operation_id
+            .clone()
+            .unwrap_or_else(|| format!("ss-{:x}-{}", record.id, self.sequence));
+        let pending = rpc::Pending::new(&service, payload, operation_id, parent);
         job.pending = Some(if job.step == Step::RecoverAudio {
             pending.retry_uncertain_admission()
         } else {
@@ -281,6 +366,24 @@ impl Pipeline {
         send: &mut Send<'_>,
         factory: &mut Factory<'_>,
     ) -> bool {
+        if job.step == Step::PersistJournal {
+            let Some(document) = job.journal_document.take() else {
+                self.journal.failed = true;
+                return self.journal_write_failed(record, job, now, send);
+            };
+            if self
+                .journal
+                .validate_saved_response(&payload, document)
+                .is_err()
+            {
+                self.journal.failed = true;
+                return self.journal_write_failed(record, job, now, send);
+            }
+            job.journal_payload = None;
+            job.journal_operation_id = None;
+            job.step = job.journal_resume.take().unwrap_or(Step::WaitDrain);
+            return true;
+        }
         if job.cleanup {
             return self.consume_cleanup(record, job, payload, now, send);
         }
@@ -453,6 +556,28 @@ impl Pipeline {
             job.fail(record, "display_status_unverified", now);
             return true;
         }
+        if matches!(
+            job.step,
+            Step::CreateOwnedVirtualDisplay | Step::FindOwnedVirtualDisplay
+        ) {
+            if job.step == Step::CreateOwnedVirtualDisplay {
+                if payload["ok"] == true {
+                    job.step = Step::FindOwnedVirtualDisplay;
+                } else if !matches!(
+                    payload["error"]["code"].as_str(),
+                    Some("startup_reconciliation_pending" | "busy")
+                ) {
+                    job.fail(record, "virtual_display_create_failed", now);
+                }
+            } else {
+                match super::virtual_display::accept_ready(record, &payload) {
+                    Ok(true) => job.step = Step::AcquireOutput,
+                    Ok(false) => {}
+                    Err(code) => job.fail(record, code, now),
+                }
+            }
+            return true;
+        }
         if payload["ok"] != true {
             if matches!(job.step, Step::FeedbackPeek | Step::FeedbackAck) {
                 if job.step == Step::FeedbackPeek {
@@ -460,6 +585,9 @@ impl Pipeline {
                 }
                 record.feedback_poll_at = now.saturating_add(100);
                 return false;
+            } else if job.step == Step::PersistJournal {
+                self.journal.failed = true;
+                return self.journal_write_failed(record, job, now, send);
             }
             if job.step == Step::InputBatch && payload["error"]["code"] == "controller_unavailable"
             {
@@ -470,6 +598,11 @@ impl Pipeline {
                 }
                 return true;
             }
+            eprintln!(
+                "amaterasu session dependency rejected step={:?} code={}",
+                job.step,
+                safe_dependency_code(&payload),
+            );
             job.fail(record, "dependency_rejected", now);
             return true;
         }
@@ -591,6 +724,21 @@ impl Pipeline {
             }
             Step::AcquireInput => {
                 accept_input_lease(record, &payload, now)?;
+                if super::virtual_display::requested(record)
+                    && record.input_absolute_pointer
+                    && record
+                        .start
+                        .as_ref()
+                        .is_some_and(|start| start.mouse != Some(false))
+                    && let Some(geometry) = record.capture_geometry
+                {
+                    let bounds = geometry
+                        .normalized_output()
+                        .map_err(|_| "invalid_capture_geometry")?;
+                    record.input_events.push_front(json!({"kind":"absolute",
+                        "x":(u32::from(bounds.left)+u32::from(bounds.right))/2,
+                        "y":(u32::from(bounds.top)+u32::from(bounds.bottom))/2}));
+                }
                 record.state = State::Active;
                 record.history.activated(now);
                 record.host_metrics.activated(record.id);
@@ -617,6 +765,10 @@ impl Pipeline {
             }
             Step::FeedbackAck => {
                 accept_feedback_ack(record, &payload, now)?;
+                Ok(false)
+            }
+            Step::PollGamepadFeedback => {
+                accept_gamepad_feedback(record, &payload, now)?;
                 Ok(false)
             }
             Step::ReleaseInput => {
@@ -855,13 +1007,13 @@ impl Pipeline {
         true
     }
 
-    fn transfer_shared_display_restore(&mut self, record: &mut Record) {
+    fn transfer_shared_display_restore(&mut self, record: &mut Record) -> bool {
         if !record.owns_display_restore
             || !record.display_applied
             || record.display_lease.is_none()
             || !record.virtual_display_reference_owned
         {
-            return;
+            return false;
         }
         let Some(shared) = self.records.values_mut().find(|candidate| {
             candidate.state != State::Stopping
@@ -870,7 +1022,7 @@ impl Pipeline {
                 && candidate.display_applied
                 && super::virtual_display::same_shared_specification(record, candidate)
         }) else {
-            return;
+            return false;
         };
         shared.display_attempted = true;
         shared.display_lease = record.display_lease.take();
@@ -886,5 +1038,63 @@ impl Pipeline {
         record.display_applied = false;
         record.owns_display_restore = false;
         record.display_operation_id = None;
+        true
+    }
+
+    fn journal_write_failed(
+        &mut self,
+        record: &mut Record,
+        job: &mut Job,
+        now: u64,
+        send: &mut Send<'_>,
+    ) -> bool {
+        record.cleanup_error = Some("lifecycle_journal_write_failed");
+        if job.cleanup {
+            record.state = State::CleanupFailed;
+            self.reply(record, job, send);
+            return false;
+        }
+        job.fail(record, "lifecycle_journal_write_failed", now);
+        true
+    }
+}
+
+fn safe_dependency_code(payload: &serde_json::Value) -> &str {
+    payload["code"]
+        .as_str()
+        .or_else(|| payload["error"]["code"].as_str())
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .unwrap_or("unavailable")
+}
+
+#[cfg(test)]
+mod diagnostic_code_tests {
+    use super::safe_dependency_code;
+    use serde_json::json;
+
+    #[test]
+    fn dependency_code_trace_accepts_only_bounded_status_tokens() {
+        assert_eq!(
+            safe_dependency_code(&json!({"code":"backend_unavailable"})),
+            "backend_unavailable"
+        );
+        assert_eq!(
+            safe_dependency_code(&json!({"error":{"code":"codec_unavailable"}})),
+            "codec_unavailable"
+        );
+        assert_eq!(
+            safe_dependency_code(&json!({"code":"key_hex=secret"})),
+            "unavailable"
+        );
+        assert_eq!(
+            safe_dependency_code(&json!({"code":"a".repeat(65)})),
+            "unavailable"
+        );
     }
 }

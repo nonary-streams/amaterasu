@@ -203,6 +203,7 @@ fn resolve_runtime_grants(
 ) -> RuntimeConfig {
     let mut runtime = RuntimeConfig {
         principals: BTreeMap::new(),
+        api_methods: Vec::new(),
         hooks: bootstrap.policy.hooks.clone(),
         settings: BTreeMap::new(),
         // A package policy is deliberately unable to specify process-local
@@ -235,6 +236,24 @@ fn resolve_runtime_grants(
             .principals
             .insert("amaterasu.console".into(), console.clone());
     }
+    runtime.api_methods = bootstrap
+        .policy
+        .api_methods
+        .iter()
+        .filter(|approval| {
+            runtime
+                .principals
+                .get(&approval.provider)
+                .is_some_and(|grants| grants.provide.contains(&approval.method.service))
+                && approval.callers.iter().all(|caller| {
+                    runtime
+                        .principals
+                        .get(caller)
+                        .is_some_and(|grants| grants.call.contains(&approval.method.service))
+                })
+        })
+        .cloned()
+        .collect();
     runtime
 }
 

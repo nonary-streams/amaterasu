@@ -68,6 +68,8 @@ pub struct HookSpec {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub principals: BTreeMap<String, Grants>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_methods: Vec<ApiMethodApproval>,
     #[serde(default)]
     pub hooks: BTreeMap<String, HookSpec>,
     #[serde(default)]
@@ -83,6 +85,60 @@ pub struct RuntimeConfig {
     pub host_lifecycle_control: bool,
 }
 
+/// A wire contract can describe arbitrary namespaced methods. `Any` and
+/// `Object` keep nested payloads extensible; the broker still bounds byte size.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiFieldKind {
+    Any,
+    Null,
+    Boolean,
+    Integer,
+    Number,
+    String,
+    Array,
+    Object,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiSchema {
+    pub required: BTreeMap<String, ApiFieldKind>,
+    #[serde(default)]
+    pub optional: BTreeMap<String, ApiFieldKind>,
+    #[serde(default)]
+    pub allow_extra: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiPrivilege {
+    User,
+    Elevated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiMethod {
+    pub service: String,
+    pub method: String,
+    pub interface_major: u32,
+    pub interface_minor: u32,
+    pub request: ApiSchema,
+    pub response: ApiSchema,
+    pub privilege: ApiPrivilege,
+}
+
+/// Installed policy, not a publisher's manifest, controls provider identity,
+/// callable identities, and whether a handler is approved at all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiMethodApproval {
+    pub provider: String,
+    pub callers: BTreeSet<String>,
+    pub method: ApiMethod,
+}
+
 /// Facts supplied by the trusted host for one worker process.
 ///
 /// `state_root` is intentionally separate from module settings: a release
@@ -94,6 +150,14 @@ pub struct RuntimeHostContext {
     pub schema: u32,
     #[serde(default)]
     pub state_root: Option<String>,
+    /// The verified package root is injected by the host, never by package settings.
+    /// Only the management principal may request it from the runtime broker.
+    #[serde(default)]
+    pub package_root: Option<String>,
+    /// Verified package digest loaded into this worker, overwritten by the host.
+    /// Only management may request it; persisted selection can differ.
+    #[serde(default)]
+    pub running_package_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,11 +199,36 @@ pub enum Command {
     /// Reserved for the host endpoint; returns pending product log events.
     DrainLogEvents {},
     GetSettings {},
-    /// Returns host-owned context only to the state service. This prevents a
-    /// module policy from impersonating a host decision through `GetSettings`.
+    /// Returns host-owned context to the state service, and to the Linux audio
+    /// module for its restart-safe cleanup journal. This prevents a module
+    /// policy from impersonating a host decision through `GetSettings`.
     GetHostContext {},
+    /// Returns the host-owned package root only to the management principal.
+    GetPackageRoot {},
+    /// Returns the verified package digest actually loaded by this worker.
+    GetRunningPackageDigest {},
     Register {
         service: String,
+    },
+    RegisterApi {
+        method: ApiMethod,
+    },
+    QueryApi {
+        service: String,
+        method: String,
+        interface_major: u32,
+        min_minor: u32,
+    },
+    CallApi {
+        service: String,
+        method: String,
+        interface_major: u32,
+        interface_minor: u32,
+        payload: Value,
+        timeout_ms: u64,
+        operation_id: String,
+        #[serde(default)]
+        parent: Option<u64>,
     },
     Request {
         service: String,

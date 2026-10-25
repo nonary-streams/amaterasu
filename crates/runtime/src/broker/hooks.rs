@@ -66,6 +66,7 @@ impl HookInvocation {
             timeout_ms: 0, // Hook requests use the invocation's absolute deadline.
             operation_id: format!("hook.{invocation_id}.{participant}"),
             parent: None,
+            response_schema: None,
         };
         let response = requests.submit_hook(
             &self.owner,

@@ -317,3 +317,68 @@ fn native_binding_copies_caller_and_reentrant_read_returns_busy() {
 unsafe extern "C" fn reject(_: *mut c_void, _: *const EncodedPacket) -> Status {
     STATUS_INVALID_ARGUMENT
 }
+
+#[test]
+fn sustained_sources_are_paced_beyond_eight_packets_and_stop_without_a_long_drain() {
+    use std::time::Duration;
+    let mut state = Controller::with_duration(false, 60_000);
+    let video = state
+        .handle("alice", Kind::Video.service(), open(Kind::Video))
+        .unwrap()
+        .1
+        .unwrap()
+        .1;
+    let audio = state
+        .handle("alice", Kind::Audio.service(), open(Kind::Audio))
+        .unwrap()
+        .1
+        .unwrap()
+        .1;
+    let mut video_output = Output::default();
+    let mut audio_output = Output::default();
+    let video_sink = PacketSink {
+        context: (&mut video_output as *mut Output).cast(),
+        write: video_sink,
+    };
+    let audio_sink = AudioSink {
+        context: (&mut audio_output as *mut Output).cast(),
+        write: audio_sink,
+    };
+    // SAFETY: both sinks borrow initialized test-owned storage until each callback returns.
+    unsafe {
+        assert_eq!(state.video("alice", video, video_sink), STATUS_OK);
+        assert_eq!(state.video("alice", video, video_sink), STATUS_OK);
+        assert_eq!(state.video("alice", video, video_sink), MEDIA_PENDING);
+        assert_eq!(state.audio("alice", audio, audio_sink), STATUS_OK);
+        assert_eq!(state.audio("alice", audio, audio_sink), MEDIA_PENDING);
+        for id in [video, audio] {
+            let stream = state.streams.get_mut(&id).unwrap();
+            stream.started = Instant::now() - Duration::from_secs(5);
+        }
+        for _ in 0..20 {
+            assert_eq!(state.video("alice", video, video_sink), STATUS_OK);
+            assert_eq!(state.audio("alice", audio, audio_sink), STATUS_OK);
+        }
+        assert_eq!(state.metrics()["video"]["frames"], 11);
+        assert_eq!(state.metrics()["audio"]["frames"], 21);
+        assert_eq!(
+            [
+                video_output.packets[0].0.as_slice(),
+                video_output.packets[1].0.as_slice()
+            ]
+            .concat(),
+            include_bytes!("../sustained-idr.h264")
+        );
+        assert_eq!(video_output.packets[2].3, 33_333);
+        state
+            .handle(
+                "alice",
+                Kind::Video.service(),
+                json!({"action":"drain", "stream":video}),
+            )
+            .unwrap();
+        assert_eq!(state.video("alice", video, video_sink), STATUS_OK);
+        assert_eq!(video_output.packets.last().unwrap().1, FLAG_END_OF_STREAM);
+        assert_eq!(state.video("alice", video, video_sink), MEDIA_PENDING);
+    }
+}

@@ -45,6 +45,9 @@ pub enum Operation {
         gamepad: Option<GamepadProfile>,
         #[serde(default)]
         ds4_back_as_touchpad_click: Option<bool>,
+        /// Enables delivery through the active backend. This is an event gate,
+        /// not a guarantee of native pen/touch support; some backends map a
+        /// limited touch subset to mouse input.
         #[serde(default)]
         motion_as_ds4: Option<bool>,
         #[serde(default)]
@@ -89,6 +92,9 @@ pub enum Operation {
     FeedbackAck {
         lease: String,
         through_sequence: u64,
+    },
+    PollGamepadFeedback {
+        lease: String,
     },
     Release {
         lease: String,
@@ -729,6 +735,11 @@ pub fn validate_operation_id(operation_id: &str) -> InputResult<()> {
         ));
     }
     Ok(())
+}
+
+/// Apply the legacy right-Alt mapping for companion wire translation.
+pub(crate) const fn effective_virtual_key(code: u8, enabled: bool) -> u8 {
+    if enabled && code == 0xa5 { 0x5b } else { code }
 }
 
 #[cfg(test)]

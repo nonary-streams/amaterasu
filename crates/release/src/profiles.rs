@@ -19,8 +19,9 @@ pub enum PackageProfile {
     SoftwareProbe,
     /// Explicit Linux portal capture with real video/encoder and test-only audio.
     LinuxProbe,
-    /// Product Linux session host with real KMS capture, audio, input and
-    /// virtual display libraries. Effects stay disabled until requested.
+    /// Explicit Windows DXGI desktop streaming qualification profile.
+    DesktopStreamSmoke,
+    /// Product Linux session host; effects stay disabled until selected.
     LinuxSession,
 }
 
@@ -493,7 +494,6 @@ const VIDEO: ComponentDefinition = ComponentDefinition {
         RUNTIME_ID,
         "amaterasu.capture-dxgi",
         "amaterasu.capture-wgc",
-        "amaterasu.capture-x11",
         "amaterasu.encode",
     ],
 };
@@ -518,6 +518,30 @@ const X11_VIDEO: ComponentDefinition = ComponentDefinition {
         "amaterasu.encode",
     ],
     ..VIDEO
+};
+
+/// Current-user XDG Desktop Portal capture through a restricted PipeWire remote.
+const CAPTURE_PIPEWIRE: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.capture-pipewire",
+    library: "amaterasu_capture_pipewire",
+    provides: &["amaterasu.capture-pipewire/1"],
+    calls: &[],
+    publishes: &[],
+    native_provides: &["amaterasu.capture-pipewire/1"],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
+};
+/// Owned virtual-display scanout as DMA-BUF frames from the vibeshine_drm
+/// driver, read through a separately installed privileged frame helper.
+const CAPTURE_VKMS: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.capture-vkms",
+    library: "amaterasu_capture_vkms",
+    provides: &["amaterasu.capture-vkms/1"],
+    calls: &[],
+    publishes: &[],
+    native_provides: &["amaterasu.capture-vkms/1"],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
 };
 const MEDIA_TRANSPORT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.media-transport",
@@ -670,6 +694,134 @@ const RTSP: ComponentDefinition = ComponentDefinition {
         "amaterasu.state",
         "amaterasu.launch",
     ],
+};
+
+// The desktop smoke profile follows a manually-added Moonlight desktop path.
+// It deliberately excludes app-launch integrations, WGC, and the catalog;
+// no catalog is needed for the Desktop-only app list. NVHTTP still detects ID
+// collisions if a catalog is provided in a different profile.
+const PAIRING_DESKTOP_SMOKE: ComponentDefinition = ComponentDefinition {
+    calls: &["amaterasu.state/1", "amaterasu.host-configuration/1"],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.state",
+        "amaterasu.host-configuration",
+    ],
+    ..PLATFORM_PAIRING
+};
+
+const NVHTTP_DESKTOP_SMOKE: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.configuration/1",
+        "amaterasu.input/1",
+        "amaterasu.pairing/1",
+        "amaterasu.state/1",
+        "amaterasu.display/1",
+        "amaterasu.rtsp/1",
+        "amaterasu.stream-session/1",
+        "amaterasu.session/1",
+        "amaterasu.video/1",
+        "amaterasu.audio/1",
+        "amaterasu.audio-encode/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
+        "amaterasu.capture-dxgi/1",
+        "amaterasu.encode/1",
+    ],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.configuration",
+        "amaterasu.input",
+        "amaterasu.pairing",
+        "amaterasu.state",
+        "amaterasu.display",
+        "amaterasu.rtsp",
+        "amaterasu.stream-session",
+        "amaterasu.session",
+        "amaterasu.video",
+        "amaterasu.audio",
+        "amaterasu.audio-encode",
+        "amaterasu.media-transport",
+        "amaterasu.control-transport",
+        "amaterasu.capture-dxgi",
+        "amaterasu.encode",
+    ],
+    ..NVHTTP
+};
+
+const VIDEO_DXGI_SMOKE: ComponentDefinition = ComponentDefinition {
+    calls: &["amaterasu.capture-dxgi/1", "amaterasu.encode/1"],
+    native_uses: &["amaterasu.capture-dxgi/1", "amaterasu.encode/1"],
+    dependencies: &[RUNTIME_ID, "amaterasu.capture-dxgi", "amaterasu.encode"],
+    ..VIDEO
+};
+
+const STREAM_SESSION_DXGI_SMOKE: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.input/1",
+        "amaterasu.session/1",
+        "amaterasu.display/1",
+        "amaterasu.state/1",
+        "amaterasu.video/1",
+        "amaterasu.audio/1",
+        "amaterasu.audio-encode/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
+        "amaterasu.capture-dxgi/1",
+        "amaterasu.encode/1",
+        "amaterasu.session-history/1",
+        "amaterasu.frame-limiter/1",
+    ],
+    dependencies: &[
+        "amaterasu.input",
+        RUNTIME_ID,
+        "amaterasu.session",
+        "amaterasu.display",
+        "amaterasu.state",
+        "amaterasu.session-history",
+        "amaterasu.video",
+        "amaterasu.audio",
+        "amaterasu.audio-encode",
+        "amaterasu.media-transport",
+        "amaterasu.control-transport",
+        "amaterasu.capture-dxgi",
+        "amaterasu.encode",
+        "amaterasu.frame-limiter",
+    ],
+    ..STREAM_SESSION
+};
+
+const RTSP_DESKTOP_SMOKE: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.input/1",
+        "amaterasu.stream-session/1",
+        "amaterasu.session/1",
+        "amaterasu.display/1",
+        "amaterasu.state/1",
+        "amaterasu.video/1",
+        "amaterasu.audio/1",
+        "amaterasu.audio-encode/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
+        "amaterasu.capture-dxgi/1",
+        "amaterasu.encode/1",
+    ],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.input",
+        "amaterasu.stream-session",
+        "amaterasu.session",
+        "amaterasu.display",
+        "amaterasu.state",
+        "amaterasu.video",
+        "amaterasu.audio",
+        "amaterasu.audio-encode",
+        "amaterasu.media-transport",
+        "amaterasu.control-transport",
+        "amaterasu.capture-dxgi",
+        "amaterasu.encode",
+    ],
+    ..RTSP
 };
 const STREAM_SESSION_PROBE: ComponentDefinition = ComponentDefinition {
     dependencies: &[
@@ -901,16 +1053,6 @@ const MANAGEMENT_SOFTWARE_PROBE: ComponentDefinition = ComponentDefinition {
 
 // Linux capture is an explicit qualification composition. It never substitutes
 // for Windows providers or adds capture permissions to the installer policy.
-const CAPTURE_PIPEWIRE: ComponentDefinition = ComponentDefinition {
-    id: "amaterasu.capture-pipewire",
-    library: "amaterasu_capture_pipewire",
-    provides: &["amaterasu.capture-pipewire/1"],
-    calls: &[],
-    publishes: &[],
-    native_provides: &["amaterasu.capture-pipewire/1"],
-    native_uses: &[],
-    dependencies: &[RUNTIME_ID],
-};
 
 const LINUX_VIDEO: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.linux-probe-video",
@@ -1208,6 +1350,29 @@ impl PackageProfile {
                 LINUX_STREAM_SESSION,
                 LINUX_RTSP,
             ],
+            Self::DesktopStreamSmoke => &[
+                RUNTIME,
+                STATE,
+                SESSION,
+                SESSION_HISTORY,
+                CONFIGURATION,
+                HOST_CONFIGURATION,
+                DIAGNOSTICS,
+                PAIRING_DESKTOP_SMOKE,
+                NVHTTP_DESKTOP_SMOKE,
+                DISPLAY,
+                INPUT,
+                CAPTURE_DXGI,
+                AUDIO,
+                AUDIO_ENCODE,
+                ENCODE,
+                VIDEO_DXGI_SMOKE,
+                MEDIA_TRANSPORT,
+                CONTROL_TRANSPORT,
+                FRAME_LIMITER,
+                STREAM_SESSION_DXGI_SMOKE,
+                RTSP_DESKTOP_SMOKE,
+            ],
             Self::LinuxSession => linux_session::COMPONENTS,
             Self::Platform => &[
                 RUNTIME,
@@ -1409,6 +1574,90 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
     policy
         .principals
         .insert("amaterasu.pairing".into(), PLATFORM_PAIRING.grants());
+    Ok(policy)
+}
+
+/// Development-only policy for a manually-added Moonlight desktop smoke host.
+/// The default binds every stream listener to loopback. `allow_remote` opts in
+/// to wildcard listeners in the host policy; it does not change firewall or
+/// machine networking settings. Before streaming, replace the output placeholder
+/// in bootstrap settings with an ID from the DXGI provider's enumerate action;
+/// output IDs are topology-specific and capture does not guess a display.
+pub fn desktop_stream_smoke_policy(
+    root: &Path,
+    allow_remote: bool,
+) -> PackageResult<RuntimeConfig> {
+    let mut policy = development_policy(root)?;
+    let components = PackageProfile::DesktopStreamSmoke.components();
+    let component_ids: BTreeSet<_> = components.iter().map(|component| component.id).collect();
+    policy.principals.retain(|principal, _| {
+        principal == "amaterasu.console" || component_ids.contains(principal.as_str())
+    });
+    let mut console = Grants::default();
+    for component in components {
+        if component.id == RUNTIME_ID {
+            continue;
+        }
+        policy
+            .principals
+            .insert(component.id.into(), component.grants());
+        console.call.extend(names(component.provides));
+        console.subscribe.extend(names(component.publishes));
+    }
+    policy
+        .principals
+        .insert("amaterasu.console".into(), console);
+
+    let remote_stream = allow_remote;
+    policy
+        .settings
+        .retain(|principal, _| component_ids.contains(principal.as_str()));
+    policy.settings.extend(BTreeMap::from([
+        (
+            "amaterasu.rtsp".into(),
+            json!({"enabled":true,"allow_remote":remote_stream,"address_family":"ipv4","bind_address":"","allowed_principals":["amaterasu.nvhttp"]}),
+        ),
+        (
+            "amaterasu.stream-session".into(),
+            json!({"enabled":true,"allow_remote":remote_stream,"allowed_principals":["amaterasu.nvhttp"],"enable_input":true}),
+        ),
+        ("amaterasu.video".into(), json!({"enabled":true,"capture_providers":["dxgi"]})),
+        (
+            "amaterasu.control-transport".into(),
+            json!({"enabled":true,"allow_remote":remote_stream,"allowed_principals":["amaterasu.stream-session"]}),
+        ),
+        ("amaterasu.capture-dxgi".into(), json!({"enabled":true})),
+        ("amaterasu.encode".into(), json!({"enabled":true})),
+        ("amaterasu.audio".into(), json!({"enabled":true})),
+        ("amaterasu.audio-encode".into(), json!({"enabled":true})),
+        (
+            "amaterasu.media-transport".into(),
+            json!({"enabled":true,"allow_remote":remote_stream,"allowed_principals":["amaterasu.stream-session"]}),
+        ),
+        (
+            "amaterasu.input".into(),
+            json!({"allow_injection":true,"windows_backend":"vhf_companion"}),
+        ),
+        (
+            "amaterasu.pairing".into(),
+            json!({"administrator_principals":["amaterasu.console"],"transport_principals":["amaterasu.nvhttp"],"host_configuration":true}),
+        ),
+        ("amaterasu.display".into(), json!({"allow_mutation":false})),
+        (
+            "amaterasu.nvhttp".into(),
+            json!({
+                "enabled":true,
+                "address_family":"ipv4",
+                "bind_address":"",
+                "allow_remote":remote_stream,
+                "streaming":{
+                    "desktop":{"enabled":true},
+                    "capture":{"capture_provider":"dxgi","output":"SELECT_OUTPUT_ID","encoder":0,"audio_endpoint":"default"},
+                    "profile":{"max_width":1920,"max_height":1080,"max_fps":60,"bitrate_kbps":10000,"max_reference_frames":1,"packet_size":1024,"fec_percentage":20,"min_parity_shards":2,"max_fec_blocks":1,"packet_ms":10,"audio_bitrate":128000,"encrypt_video":true,"encrypt_audio":true,"permit_legacy_audio_iv_wrap":false}
+                }
+            }),
+        ),
+    ]));
     Ok(policy)
 }
 

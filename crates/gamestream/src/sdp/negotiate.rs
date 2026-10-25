@@ -49,7 +49,15 @@ pub fn parse_announce(bytes: &[u8]) -> Result<Announce, Error> {
 
 fn video(attributes: &mut Attributes<'_>) -> Result<Video, Error> {
     let format = video_format(attributes)?;
-    attributes.default_value("x-nv-clientSupportHevc", 0)?;
+    let client_hevc = bounded(
+        attributes.default("x-nv-clientSupportHevc", 0)?,
+        0,
+        1,
+        "HEVC support",
+    )?;
+    if format.codec == VideoCodec::Hevc && client_hevc != 1 {
+        return Err(Error::Unsupported("HEVC support"));
+    }
     attributes.default_value("x-ss-video[0].chromaSamplingType", 0)?;
     attributes.default_value("x-ss-video[0].intraRefresh", 0)?;
     const SLICES_PER_FRAME: &str = "x-nv-video[0].videoEncoderSlicesPerFrame";

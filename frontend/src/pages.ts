@@ -140,7 +140,7 @@ namespace Amaterasu {
           el(
             "p",
             "",
-            "Client pairing, capture, and stream connections are not available in this release. The management tools shown here are live.",
+            "Review pending device pairing from Host & devices. Capture controls and a browser streaming view are not available in this release.",
           ),
         ),
       );
@@ -1099,23 +1099,126 @@ namespace Amaterasu {
     return counters as Record<string, number>;
   }
 
+  const DIAGNOSTIC_SESSION_LIMIT = 4;
+
+  function diagnosticFailureStage(reason: unknown): string {
+    if (typeof reason !== "string") return "Failure · stage not identified";
+    const stages: Record<string, string> = {
+      capture_failed: "Capture",
+      capture_read_failed: "Capture",
+      capture_geometry_failed: "Capture",
+      drm_capture_failed: "Capture",
+      encoder_failed: "Video encoder",
+      encoder_drain_failed: "Video encoder",
+      software_encoder_failed: "Video encoder",
+      video_failed_after_admission: "Video pipeline · stage not identified",
+      audio_encoder_failed: "Audio encoder",
+      audio_capture_failed: "Audio capture",
+      audio_backend_failed: "Audio capture",
+      audio_packetization_failed: "Audio transport",
+      transport_drain_failed: "RTP / media transport",
+      udp_send_failed: "RTP / media transport",
+      udp_stalled: "RTP / media transport",
+      control_failed: "Control channel",
+      control_transport_failed: "Control channel",
+      peer_disconnected: "Control channel",
+      authenticated_peer_idle: "Control channel",
+      authentication_timeout: "Control channel",
+    };
+    return Object.hasOwn(stages, reason) ? `Failure · ${stages[reason]}` : "Failure · stage not identified";
+  }
+
+  export function diagnosticSessionOutcome(detail: HistoryDetailReply["detail"]): string {
+    if (!detail) return "Outcome unavailable";
+    const events = detail.events
+      .filter((event) => ["stream_stopping", "stream_stopped", "stream_cancelled", "stream_failed"].includes(event.event_type))
+      .sort((left, right) => right.recorded_at_unix - left.recorded_at_unix);
+    const terminal = events.find((event) => event.event_type !== "stream_stopping") ?? events[0];
+    if (!terminal) {
+      if (detail.events_truncated) return "Outcome unavailable · event history is truncated";
+      return detail.session.ended_at_unix == null
+        ? "Active · no termination event"
+        : "Ended · no termination event recorded";
+    }
+    if (terminal.event_type === "stream_stopped") return "Stopped";
+    if (terminal.event_type === "stream_cancelled") return "Cancelled";
+    const payload = terminal.payload;
+    const reason = payload && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>).reason
+      : undefined;
+    if (terminal.event_type === "stream_stopping")
+      return reason == null ? "Stopping · termination not confirmed" : `Stopping · ${diagnosticFailureStage(reason)}`;
+    return diagnosticFailureStage(reason);
+  }
+
   export function renderDiagnostics(context: PageContext): void {
     const area = el("div");
+    const sessionsArea = el("div");
     let after = 0;
     const history = [0];
     let loadRequest = 0;
+    let sessionRequest = 0;
     context.content.append(
       sectionHeading(
         "Diagnostics",
-        "Records and counters for this management console.",
+        "Caller-scoped records and counters, plus separately recorded stream outcomes.",
         button("Refresh", () => {
           after = 0;
           history.splice(0, history.length, 0);
+          void loadRecentSessions();
           return load();
         }),
       ),
       area,
+      panel("Recent stream outcomes", sessionsArea,
+        el("p", "muted", "Session history is separate from caller-scoped diagnostics; no record-to-session correlation is implied. Only recognized termination codes receive a stage label.")),
     );
+    async function loadRecentSessions(): Promise<void> {
+      const request = ++sessionRequest;
+      if (!context.api.allows("session.read")) {
+        sessionsArea.replaceChildren(empty(
+          "Session history unavailable",
+          "This session needs session.read to inspect recent stream outcomes.",
+        ));
+        return;
+      }
+      sessionsArea.replaceChildren(el("p", "muted", "Loading recent stream outcomes…"));
+      try {
+        const list = parseHistoryListReply(await context.api.post<unknown>(
+          "history/list_sessions", { limit: DIAGNOSTIC_SESSION_LIMIT, offset: 0 },
+        ), 0);
+        if (!context.content.isConnected || request !== sessionRequest) return;
+        if (!list.sessions.length) {
+          sessionsArea.replaceChildren(empty(
+            "No recorded streams",
+            "Recent outcomes appear when session history is available and recording has captured a stream.",
+          ));
+          return;
+        }
+        const details = await Promise.all(list.sessions.map(async (session) => {
+          try {
+            const detail = parseHistoryDetailReply(await context.api.post<unknown>(
+              "history/session_detail", { session_id: session.session_id },
+            ), session.session_id).detail;
+            return { session, outcome: diagnosticSessionOutcome(detail) };
+          } catch {
+            return { session, outcome: "Outcome unavailable · refresh to retry" };
+          }
+        }));
+        if (!context.content.isConnected || request !== sessionRequest) return;
+        sessionsArea.replaceChildren(table(
+          ["Started", "State", "Recorded outcome"],
+          details.map(({ session, outcome }) => [
+            new Date(session.started_at_unix * 1000).toLocaleString(),
+            session.ended_at_unix == null ? badge("Active", "good") : "Ended",
+            outcome,
+          ]),
+        ), el("p", "muted", `Showing at most ${DIAGNOSTIC_SESSION_LIMIT} recent sessions. Client and device identity are not displayed.`));
+      } catch (error) {
+        if (context.content.isConnected && request === sessionRequest)
+          sessionsArea.replaceChildren(errorPanel(error, loadRecentSessions));
+      }
+    }
     async function load(): Promise<void> {
       const request = ++loadRequest;
       const cursor = after;
@@ -1206,6 +1309,7 @@ namespace Amaterasu {
       }
     }
     void load();
+    void loadRecentSessions();
   }
   function nullNode(): Text {
     return document.createTextNode("");

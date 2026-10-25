@@ -1,4 +1,5 @@
-use super::{Reply, RouterConfig, capabilities::Advertised};
+use super::{Reply, RouterConfig};
+use crate::encoder_snapshot::CodecAdvertisement;
 
 pub fn escape(value: &str) -> String {
     let mut output = String::new();
@@ -69,8 +70,10 @@ pub fn server_info(
     current_game: u32,
     busy: bool,
     streaming_supported: bool,
-    advertised: &Advertised,
+    codecs: CodecAdvertisement,
 ) -> Reply {
+    let codec_mode_support = codecs.codec_mode_support.to_string();
+    let max_luma_pixels_hevc = codecs.max_luma_pixels_hevc.to_string();
     response(
         200,
         "OK",
@@ -79,7 +82,13 @@ pub fn server_info(
             (
                 "appversion",
                 if streaming_supported {
-                    "7.1.431.0"
+                    if cfg!(target_os = "linux") {
+                        // Moonlight uses a negative fourth component to enable
+                        // Sunshine-compatible RTSP encryption negotiation.
+                        "7.1.431.-1"
+                    } else {
+                        "7.1.431.0"
+                    }
                 } else {
                     "7.1.0.0"
                 },
@@ -88,7 +97,7 @@ pub fn server_info(
             ("uniqueid", host_id),
             ("HttpsPort", &config.https_port.to_string()),
             ("ExternalPort", &config.http_port.to_string()),
-            ("mac", &advertised.mac),
+            ("mac", super::capabilities::mac()),
             ("PairStatus", if paired { "1" } else { "0" }),
             ("currentgame", &current_game.to_string()),
             (
@@ -99,14 +108,11 @@ pub fn server_info(
                     "AMATERASU_SERVER_FREE"
                 },
             ),
-            (
-                "ServerCodecModeSupport",
-                &advertised.codec_mode_support.to_string(),
-            ),
-            (
-                "MaxLumaPixelsHEVC",
-                &advertised.max_luma_pixels_hevc.to_string(),
-            ),
+            // Moonlight's SCM_* codec bits and its nonzero-means-HEVC luma
+            // limit, both derived from the enumerated encoders. A zero mask
+            // makes Moonlight abort before RTSP even when /launch succeeded.
+            ("ServerCodecModeSupport", codec_mode_support.as_str()),
+            ("MaxLumaPixelsHEVC", max_luma_pixels_hevc.as_str()),
             (
                 "StreamingSupported",
                 if streaming_supported { "1" } else { "0" },

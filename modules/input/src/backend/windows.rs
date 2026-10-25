@@ -9,27 +9,39 @@ use crate::model::{
     Axis, Button, Event, InputError, InputResult, Key, KeyState, PenTouchDevice,
     is_temporary_modifier,
 };
+use amaterasu_input_companion::WindowsInputClient;
 use amaterasu_input_policy::{KeyBindings, host_modifier_identity};
+use std::collections::HashMap;
 use windows_gamepad::WindowsGamepads;
 use windows_pen_touch::WindowsPenTouch;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 pub struct WindowsBackend {
+    vhf_companion: bool,
+    companion: Option<WindowsInputClient>,
     always_send_scancodes: bool,
     key_rightalt_to_key_win: bool,
     keybindings: KeyBindings,
     held_key_plans: HeldKeyPlans<KeyboardPlan>,
+    companion_key_plans: HashMap<u8, KeyboardPlan>,
     gamepads: WindowsGamepads,
     pen_touch: WindowsPenTouch,
 }
 
 impl WindowsBackend {
     pub fn new(_: String) -> Self {
+        Self::new_with_companion(false)
+    }
+
+    pub fn new_with_companion(vhf_companion: bool) -> Self {
         Self {
+            vhf_companion,
+            companion: None,
             always_send_scancodes: true,
             key_rightalt_to_key_win: false,
             keybindings: KeyBindings::default(),
             held_key_plans: HeldKeyPlans::new(),
+            companion_key_plans: HashMap::new(),
             gamepads: WindowsGamepads::new(),
             pen_touch: WindowsPenTouch::new(),
         }
@@ -151,7 +163,11 @@ impl WindowsBackend {
 
 impl Backend for WindowsBackend {
     fn name(&self) -> &'static str {
-        "windows_send_input"
+        if self.vhf_companion {
+            "windows_vhf_companion"
+        } else {
+            "windows_send_input"
+        }
     }
 
     fn supported(&self) -> bool {
@@ -159,27 +175,39 @@ impl Backend for WindowsBackend {
     }
 
     fn absolute_pointer(&self) -> bool {
-        true
+        !self.vhf_companion
     }
 
     fn controller_input_supported(&self) -> bool {
-        self.gamepads.supported()
+        !self.vhf_companion && self.gamepads.supported()
     }
 
     fn pen_touch_supported(&self) -> bool {
-        self.pen_touch.supported()
+        !self.vhf_companion && self.pen_touch.supported()
     }
 
     fn pen_touch_max_contacts(&self, device: PenTouchDevice) -> Option<usize> {
-        Some(self.pen_touch.max_contacts(device))
+        if self.vhf_companion {
+            None
+        } else {
+            Some(self.pen_touch.max_contacts(device))
+        }
     }
 
     fn effective_gamepad_profile(&self) -> Option<&'static str> {
-        self.gamepads.effective_profile()
+        if self.vhf_companion {
+            None
+        } else {
+            self.gamepads.effective_profile()
+        }
     }
 
     fn gamepad_unavailable_reason(&self) -> Option<&str> {
-        self.gamepads.unavailable_reason()
+        if self.vhf_companion {
+            Some("VHF companion currently supports keyboard and mouse only")
+        } else {
+            self.gamepads.unavailable_reason()
+        }
     }
 
     fn key_encoding(&self) -> &'static str {
@@ -187,6 +215,15 @@ impl Backend for WindowsBackend {
     }
 
     fn validate(&self, event: &Event) -> InputResult<()> {
+        if self.vhf_companion {
+            return companion_intent(
+                event,
+                self.key_rightalt_to_key_win,
+                &self.keybindings,
+                &self.companion_key_plans,
+            )
+            .map(|_| ());
+        }
         event.validate()?;
         if matches!(event, Event::PenTouch { .. }) {
             // Controller batch validation calls this before any batch event is
@@ -210,6 +247,11 @@ impl Backend for WindowsBackend {
     }
 
     fn start(&mut self) -> InputResult<()> {
+        if self.vhf_companion {
+            self.companion = Some(WindowsInputClient::connect().map_err(companion_error)?);
+            self.companion_key_plans.clear();
+            return Ok(());
+        }
         self.gamepads.start()?;
         self.pen_touch.start()?;
         self.held_key_plans.clear();
@@ -217,6 +259,41 @@ impl Backend for WindowsBackend {
     }
 
     fn inject(&mut self, event: &Event) -> InputResult<()> {
+        if self.vhf_companion {
+            let Some(translated) = companion_intent(
+                event,
+                self.key_rightalt_to_key_win,
+                &self.keybindings,
+                &self.companion_key_plans,
+            )?
+            else {
+                // Windows HID typematic repeats a held keyboard report. An
+                // application-level Repeat must not submit a second down.
+                return Ok(());
+            };
+            if let Some(companion) = &mut self.companion {
+                if let Err(error) = companion.send(translated.clone()) {
+                    // Closing the pipe makes the companion destroy its HID
+                    // child. Let subsequent releases clear controller state.
+                    self.companion = None;
+                    self.companion_key_plans.clear();
+                    if !companion_release(event) {
+                        return Err(companion_error(error));
+                    }
+                }
+                record_companion_key_plan(event, &translated, &mut self.companion_key_plans);
+                return Ok(());
+            }
+            self.companion_key_plans.clear();
+            return if companion_release(event) {
+                Ok(())
+            } else {
+                Err(InputError::new(
+                    "companion_unavailable",
+                    "VHF companion lease is not active",
+                ))
+            };
+        }
         self.inject_with_sender(event, |input, _held_plan_snapshot| {
             // SAFETY: input is a fully initialized INPUT with the matching union tag.
             // SendInput reads this one owned record synchronously and retains no pointer.
@@ -247,11 +324,17 @@ impl Backend for WindowsBackend {
     }
 
     fn advance(&mut self, now: std::time::Instant) -> InputResult<()> {
+        if self.vhf_companion {
+            return Ok(());
+        }
         self.gamepads.advance(now);
         self.pen_touch.advance(now)
     }
 
     fn advance_pen_touch(&mut self, now: std::time::Instant) -> InputResult<()> {
+        if self.vhf_companion {
+            return Ok(());
+        }
         self.pen_touch.advance(now)
     }
 
@@ -276,16 +359,124 @@ impl Backend for WindowsBackend {
     }
 
     fn disable_controller_input(&mut self) -> InputResult<()> {
+        if self.vhf_companion {
+            return Ok(());
+        }
         self.gamepads.disable()
     }
 
     fn stop(&mut self) -> InputResult<()> {
+        if self.vhf_companion {
+            self.companion_key_plans.clear();
+            if let Some(mut companion) = self.companion.take() {
+                // The server destroys its child on disconnect. Discard the
+                // terminal pipe even if its close acknowledgement is lost.
+                companion.close().map_err(companion_error)?;
+            }
+            return Ok(());
+        }
         let gamepad_result = self.gamepads.stop();
         let pen_touch_result = self.pen_touch.stop();
         self.held_key_plans.clear();
         gamepad_result?;
         pen_touch_result
     }
+}
+
+fn companion_intent(
+    event: &Event,
+    key_rightalt_to_key_win: bool,
+    keybindings: &KeyBindings,
+    held_key_plans: &HashMap<u8, KeyboardPlan>,
+) -> InputResult<Option<amaterasu_input_companion::InputEvent>> {
+    event.validate()?;
+    if let Event::Key {
+        key: Key::MoonlightVk { code, .. },
+        state: state @ (KeyState::Up | KeyState::Repeat),
+    } = event
+        && let Some(KeyboardPlan::Scan {
+            code: held_scan,
+            extended,
+        }) = held_key_plans.get(code)
+    {
+        event.validate()?;
+        if *state == KeyState::Repeat {
+            return Ok(None);
+        }
+        return Ok(Some(amaterasu_input_companion::InputEvent::Key {
+            scan_code: u8::try_from(*held_scan).expect("held VHF scan code fits u8"),
+            extended: *extended,
+            pressed: false,
+        }));
+    }
+    // Resolve both explicit bindings and the Right Alt policy before either
+    // normalized or layout-dependent translation. Held releases above keep
+    // the accepted down plan across subsequent configuration changes.
+    let mut mapped_event = event.clone();
+    if let Event::Key {
+        key: Key::MoonlightVk { code, .. },
+        ..
+    } = &mut mapped_event
+    {
+        *code = keybindings.resolve(*code, key_rightalt_to_key_win);
+    }
+    crate::companion_client::translate(&mapped_event, false, |code| {
+        let scan_code = map_virtual_key(code);
+        (scan_code != 0).then_some((scan_code, is_extended_virtual_key(code)))
+    })
+}
+
+fn record_companion_key_plan(
+    event: &Event,
+    translated: &amaterasu_input_companion::InputEvent,
+    held_key_plans: &mut HashMap<u8, KeyboardPlan>,
+) {
+    let Event::Key {
+        key: Key::MoonlightVk { code, .. },
+        state,
+    } = event
+    else {
+        return;
+    };
+    match (state, translated) {
+        (
+            KeyState::Down,
+            amaterasu_input_companion::InputEvent::Key {
+                scan_code,
+                extended,
+                pressed: true,
+            },
+        ) => {
+            held_key_plans.insert(
+                *code,
+                KeyboardPlan::Scan {
+                    code: u16::from(*scan_code),
+                    extended: *extended,
+                },
+            );
+        }
+        (KeyState::Up, _) => {
+            held_key_plans.remove(code);
+        }
+        _ => {}
+    }
+}
+
+fn companion_release(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key {
+            state: KeyState::Up,
+            ..
+        } | Event::Button { pressed: false, .. }
+    )
+}
+
+fn companion_error(error: amaterasu_input_companion::InputError) -> InputError {
+    InputError::new(
+        "companion_unavailable",
+        format!("VHF companion denied input: {error:?}"),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -515,6 +706,146 @@ fn native_input(event: &Event) -> InputResult<INPUT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vhf_release_and_repeat_use_the_accepted_down_mapping() {
+        let key = Key::MoonlightVk {
+            code: 0x41,
+            normalized: false,
+            repeat_modifiers: 0,
+            temporary_modifier: false,
+        };
+        let mut held = HashMap::new();
+        let down = Event::Key {
+            key: key.clone(),
+            state: KeyState::Down,
+        };
+        record_companion_key_plan(
+            &down,
+            &amaterasu_input_companion::InputEvent::Key {
+                scan_code: 0x1e,
+                extended: true,
+                pressed: true,
+            },
+            &mut held,
+        );
+        let released = Event::Key {
+            key: key.clone(),
+            state: KeyState::Up,
+        };
+        assert_eq!(
+            companion_intent(&released, true, &KeyBindings::empty(), &held).unwrap(),
+            Some(amaterasu_input_companion::InputEvent::Key {
+                scan_code: 0x1e,
+                extended: true,
+                pressed: false,
+            })
+        );
+        let repeat = Event::Key {
+            key,
+            state: KeyState::Repeat,
+        };
+        assert_eq!(
+            companion_intent(&repeat, true, &KeyBindings::empty(), &held).unwrap(),
+            None
+        );
+        record_companion_key_plan(
+            &released,
+            &amaterasu_input_companion::InputEvent::Key {
+                scan_code: 0x1e,
+                extended: true,
+                pressed: false,
+            },
+            &mut held,
+        );
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn vhf_keybindings_preserve_the_accepted_release_after_policy_changes() {
+        let mut backend = WindowsBackend::new_with_companion(true);
+        backend.set_keybindings(&KeyBindings::from_flat(vec![0x41, 0x42]).unwrap());
+        let down = key(0x41, true, KeyState::Down);
+        let translated = companion_intent(
+            &down,
+            backend.key_rightalt_to_key_win,
+            &backend.keybindings,
+            &backend.companion_key_plans,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            translated,
+            amaterasu_input_companion::InputEvent::Key {
+                scan_code: 0x30,
+                extended: false,
+                pressed: true,
+            }
+        );
+        record_companion_key_plan(&down, &translated, &mut backend.companion_key_plans);
+        backend.set_keybindings(&KeyBindings::from_flat(vec![0x41, 0x43]).unwrap());
+        let release = key(0x41, true, KeyState::Up);
+        let translated = companion_intent(
+            &release,
+            backend.key_rightalt_to_key_win,
+            &backend.keybindings,
+            &backend.companion_key_plans,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            translated,
+            amaterasu_input_companion::InputEvent::Key {
+                scan_code: 0x30,
+                extended: false,
+                pressed: false,
+            }
+        );
+        record_companion_key_plan(&release, &translated, &mut backend.companion_key_plans);
+        assert!(backend.companion_key_plans.is_empty());
+        assert!(backend.held_key_plans.is_empty());
+    }
+
+    #[test]
+    fn vhf_companion_requires_a_live_lease_without_native_fallback() {
+        let mut selected = WindowsBackend::new_with_companion(true);
+        let event = Event::Key {
+            key: Key::WindowsScan {
+                code: 0x1e,
+                extended: false,
+            },
+            state: KeyState::Down,
+        };
+        assert_eq!(
+            WindowsBackend::new(String::new()).name(),
+            "windows_send_input"
+        );
+        assert_eq!(selected.name(), "windows_vhf_companion");
+        selected.validate(&event).unwrap();
+        assert_eq!(
+            selected.inject(&event).unwrap_err().code,
+            "companion_unavailable"
+        );
+        assert!(!selected.absolute_pointer());
+        assert!(!selected.controller_input_supported());
+        let repeated = Event::Key {
+            key: Key::WindowsScan {
+                code: 0x1e,
+                extended: false,
+            },
+            state: KeyState::Repeat,
+        };
+        selected.validate(&repeated).unwrap();
+        selected.inject(&repeated).unwrap();
+        let released = Event::Key {
+            key: Key::WindowsScan {
+                code: 0x1e,
+                extended: false,
+            },
+            state: KeyState::Up,
+        };
+        selected.inject(&released).unwrap();
+    }
 
     fn key(code: u8, normalized: bool, state: KeyState) -> Event {
         Event::Key {

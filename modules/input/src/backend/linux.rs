@@ -354,6 +354,15 @@ impl Device {
         )
     }
     fn emit(&self, values: &[(u16, u16, i32)]) -> InputResult<()> {
+        let mut events_written = 0;
+        self.emit_with_progress(values, &mut events_written)
+    }
+
+    fn emit_with_progress(
+        &self,
+        values: &[(u16, u16, i32)],
+        events_written: &mut usize,
+    ) -> InputResult<()> {
         #[cfg(test)]
         if let Some((id, adapter)) = &self.fake {
             let mut state = adapter.borrow_mut();
@@ -363,6 +372,7 @@ impl Device {
                 state.fail_write = None;
                 return Err(InputError::new("injection_failed", "fake partial frame"));
             }
+            *events_written = values.len();
             return Ok(());
         }
         let mut frame: Vec<libc::input_event> = values
@@ -381,7 +391,7 @@ impl Device {
         let mut sync: libc::input_event = unsafe { std::mem::zeroed() };
         sync.type_ = EV_SYN;
         frame.push(sync);
-        write_frame(self.file.as_raw_fd(), &frame)
+        write_frame(self.file.as_raw_fd(), &frame, events_written)
     }
 
     fn destroy(&mut self) -> InputResult<()> {
@@ -3287,7 +3297,11 @@ mod tests {
     }
 }
 
-fn write_frame(fd: RawFd, frame: &[libc::input_event]) -> InputResult<()> {
+fn write_frame(
+    fd: RawFd,
+    frame: &[libc::input_event],
+    events_written: &mut usize,
+) -> InputResult<()> {
     let bytes = std::mem::size_of_val(frame);
     let mut written = 0;
     let mut interruptions = 0;
@@ -3319,6 +3333,7 @@ fn write_frame(fd: RawFd, frame: &[libc::input_event]) -> InputResult<()> {
             ));
         }
         written += result as usize;
+        *events_written = written / std::mem::size_of::<libc::input_event>();
     }
     Ok(())
 }

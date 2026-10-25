@@ -591,6 +591,9 @@ impl Connection {
         } else {
             reply
         };
+        if reply.status >= 400 {
+            eprintln!("amaterasu nvhttp response status={}", reply.status);
+        }
         let reason = match reply.status {
             200 => "OK",
             400 => "Bad Request",
@@ -771,6 +774,38 @@ mod tests {
     use std::sync::Mutex;
 
     static FIXED_PORT_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_loopback_listener_can_restart_without_sharing_a_live_port() {
+        use std::{
+            io::Read,
+            net::{Shutdown, TcpStream},
+            time::Duration,
+        };
+
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap(), "test").unwrap();
+        let address = listener.local_addr().unwrap();
+        assert!(bind_listener(address, "occupied").is_err());
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        // Close the accepted side first. After the client observes EOF and
+        // closes, the server-side connection enters TIME_WAIT on this port.
+        accepted.shutdown(Shutdown::Write).unwrap();
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+        drop(client);
+        drop(accepted);
+        drop(listener);
+
+        let restarted = bind_listener(address, "restart").unwrap();
+        assert_eq!(restarted.local_addr().unwrap(), address);
+    }
+
     #[test]
     fn strict_http_framing_rejects_smuggling_and_waits_for_complete_bodies() {
         assert!(

@@ -12,6 +12,30 @@ impl Pipeline {
         send: &mut Send<'_>,
     ) -> bool {
         match job.step {
+            Step::FindOwnedVirtualDisplay | Step::RemoveOwnedVirtualDisplay => {
+                if payload["error"]["code"] == "startup_reconciliation_pending" {
+                    return true;
+                }
+                if super::virtual_display::absent(record, &payload) {
+                    record.virtual_display_attempted = false;
+                    record.virtual_display_output = None;
+                    job.virtual_display_tried = true;
+                } else if payload["ok"] == true {
+                    if payload["monitors"].as_array().is_some_and(|monitors| {
+                        monitors
+                            .iter()
+                            .any(|monitor| monitor["state"] == "cleanup_failed")
+                    }) {
+                        record.cleanup_error = Some("virtual_display_cleanup_failed");
+                        job.virtual_display_tried = true;
+                    } else {
+                        job.virtual_display_removing = true;
+                    }
+                } else {
+                    record.cleanup_error = Some("virtual_display_cleanup_failed");
+                    job.virtual_display_tried = true;
+                }
+            }
             Step::FindDisplay => {
                 if super::display::accept_status(record, &payload) {
                     if record.display_lease.is_none() {
@@ -217,6 +241,11 @@ impl Pipeline {
     ) -> bool {
         record.cleanup_error = Some("component_cleanup_failed");
         match job.step {
+            Step::FindOwnedVirtualDisplay | Step::RemoveOwnedVirtualDisplay => {
+                record.cleanup_error = Some("virtual_display_cleanup_unavailable");
+                job.virtual_display_tried = true;
+                true
+            }
             Step::FindDisplay | Step::RestoreDisplay | Step::RecoverDisplay => {
                 record.cleanup_error = Some("display_cleanup_unavailable");
                 job.display_tried = true;
@@ -269,22 +298,31 @@ impl Pipeline {
     }
 
     pub(super) fn finish_cleanup(
-        &self,
+        &mut self,
         record: &mut Record,
-        job: &Job,
+        job: &mut Job,
         send: &mut Send<'_>,
     ) -> bool {
-        record.state = if record.attempted.is_empty()
+        let clean = record.attempted.is_empty()
             && record.uncertain.is_none()
             && !record.input_attempted
             && record.input_lease.is_none()
             && record.limiter_lease.is_none()
             && !record.limiter_attempted
+            && !record.virtual_display_attempted
             && !record.display_attempted
             && record.display_lease.is_none()
-            && !record.virtual_display_attempted
-            && !record.virtual_display_reference_owned
-        {
+            && !record.virtual_display_reference_owned;
+        if clean && self.journal.document.entries.contains_key(&record.id) {
+            let document = self.journal.without_record(record.id);
+            job.journal_resume = Some(Step::WaitDrain);
+            job.journal_payload = Some(self.journal.set_payload(&document));
+            job.journal_document = Some(document);
+            job.journal_operation_id = Some(self.journal.op_id(self.sequence.saturating_add(1)));
+            job.step = Step::PersistJournal;
+            return true;
+        }
+        record.state = if clean {
             record.cleanup_error = None;
             record.outcome
         } else {

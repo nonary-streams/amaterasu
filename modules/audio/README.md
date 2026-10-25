@@ -1,17 +1,19 @@
-# Native audio capture
+# Desktop loopback audio
 
 `amaterasu-audio` provides `amaterasu.audio/1` control and the matching native
 `amaterasu_media::AudioCaptureApi`. Startup settings default to
 `{"enabled":false}`. Disabled enumeration returns an empty list without starting
-COM or connecting to the user audio server; open returns `disabled`. Windows uses
-WASAPI loopback. Linux uses libpulse recording, including servers exposed through
-PipeWire-Pulse. Other platforms return `unsupported_platform`.
+COM or connecting to an audio server; open returns `disabled`. Windows uses
+WASAPI loopback. Linux uses monitor sources from the user's existing
+PulseAudio-compatible server, including PipeWire's Pulse server. Other operating
+systems return an empty endpoint list and `unsupported_platform` on open.
 
 Strict JSON controls:
 
 ```json
 {"action":"enumerate"}
 {"action":"open","endpoint":"default","host_audio_enabled":false,"operation_id":"living-room-audio"}
+{"action":"open","endpoint":"default","capture_format":{"sample_rate":48000,"channels":6,"sample_format":"f32"}}
 {"action":"open","endpoint":"default","operation_id":"continuous-audio","continuous_audio":{"packet_ms":5}}
 {"action":"open","endpoint":"","virtual_sink":"","channels":6,"operation_id":"surround-audio"}
 {"action":"lookup","operation_id":"living-room-audio"}
@@ -51,12 +53,40 @@ which requires `media.read`. This is trusted native-module coordination, not a
 native-code sandbox.
 
 Enumeration returns `{ok:true,enabled,endpoints:[{id,name,description,adapter_name,default_multimedia}]}`
-for active render endpoints. On Linux, endpoint IDs are Pulse sink names and
-capture reads their monitor sources. Explicit endpoint IDs come from that list. With no
-virtual sink selected, an empty or `default` ordinary endpoint initially selects
-the current Windows Console render default. Regular empty/default opens normally
-follow later Console default changes; capture-only opens pin the initially
-selected endpoint.
+for active render endpoints. Explicit endpoint IDs come from that list. With no
+virtual sink selected, an empty or `default` ordinary endpoint selects the
+current default render sink. Regular empty/default opens follow later default
+changes; capture-only opens pin the initially selected endpoint. Windows uses
+the Console role; Linux uses the Pulse server's default sink.
+On Linux, capture reads the selected render sink's monitor source through the
+user's existing PulseAudio-compatible server. It never autospawns that server.
+The host must run with the interactive user's libpulse server selection and
+session environment. The module does not discover or switch to another desktop
+session's Pulse server; a host started with a service or stale environment may
+connect to a different server or fail to connect.
+The default capture uses 48 kHz float PCM and keeps the monitor's actual channel
+layout. The optional `capture_format` requests 48 kHz float PCM with 2, 6, or 8
+channels; the server performs any channel conversion. Unsupported monitor layouts
+fail rather than being reported as a different channel count. Linux enumeration
+and capture link against libpulse.
+
+On Linux, `host_audio_enabled:false` creates a uniquely named managed null sink
+for capture, then releases it when the last stream closes. An explicit
+`virtual_sink` selects an existing sink by exact ID, name, description, or
+adapter name. Routed explicit and virtual opens use a shared route lease and
+restore the previous default only while it still points at the selected sink;
+default and capture-only opens do not change the default. Failed restoration
+remains visible in `audio_route_restore_pending` and is retried in the
+background. Linux does not install or require a Steam audio driver.
+Transient Pulse connection, query, and monitor stream setup failures receive at
+most one startup retry only for ordinary default or capture-only opens. Those
+attempts do not assign routes or create virtual sinks. Routed explicit and
+virtual opens keep their existing single-attempt behavior; permanent endpoint,
+format, or access errors remain visible immediately. Each Pulse operation wait
+is capped by the bounded startup attempt, each open attempt at 1.8 seconds, and
+the total startup retry window at four seconds; the retry delay is 200 ms. This
+keeps both attempts and the delay below the stream-session resource-open RPC's
+five-second deadline.
 Enumeration is limited to 64 endpoints and a 12,000-byte metadata reply. On
 Windows, opening an explicit endpoint with `capture_sink_without_routing` omitted
 or false temporarily assigns that endpoint as the Console, Multimedia, and
@@ -229,8 +259,10 @@ borrowed buffers on that same thread. Polling sleeps two milliseconds only when
 no packet is available. No COM pointer or borrowed WASAPI allocation crosses a
 thread boundary. Endpoint enumeration uses a short-lived separate apartment.
 
-Supported formats are little-endian 32-bit IEEE floating point or 16-bit signed PCM,
-8–192 kHz and 1–8 channels. There is no format conversion or resampling.
+Windows supports little-endian 32-bit IEEE floating point or 16-bit signed PCM,
+8–192 kHz and 1–8 channels. It performs no format conversion or resampling.
+Linux publishes 48 kHz float PCM, retaining the endpoint's 1–8 channel monitor
+layout by default, or using the requested 2/6/8 channel capture format above.
 WAVEFORMATEXTENSIBLE valid bits, block alignment, byte rate, subtype and channel
 mask are checked. `channel_mask` preserves the platform speaker mask; interleaved
 samples follow ascending speaker-mask bit order. Zero means unspecified layout.
@@ -260,34 +292,12 @@ releasing module-owned code. Driver activation, GetBuffer, Stop or COM teardown
 can still block indefinitely. A hung driver therefore needs external host
 supervision; no hard teardown deadline or crash recovery is claimed.
 
-Linux selects the current Pulse default sink for an empty or `default` ordinary
-selector. An explicit ordinary sink is temporarily assigned as the Pulse default
-unless `capture_sink_without_routing` is true. Concurrent routed opens share a
-lease for one sink; an open for a different sink fails while that lease is held.
-The final close restores the previous default only while the current default is
-still the routed sink, so a user's intervening choice is retained. Failed
-restoration remains pending and is retried in the background and before later
-routed opens. Opens without routing do not change the Pulse default. Regular
-default opens follow default-sink changes and recover on the new monitor; explicit
-and capture-only opens stay pinned. If the server has no previous default sink,
-Amaterasu captures without assigning a new default because it cannot restore an
-unset route.
-
-On Linux, an explicit `virtual_sink` uses the same exact endpoint-field selector
-contract as Windows and must resolve to an existing Pulse sink. With no explicit
-virtual selector, `host_audio_enabled:false` creates or shares a process-owned
-`module-null-sink` with the requested stereo, 5.1, or 7.1 layout. The final owner
-unloads a module created by Amaterasu; a pre-existing same-name sink is left
-alone. Linux capture requests 48 kHz float32 PCM from the sink monitor and reports
-estimated monotonic timestamps. This is real server-provided monitor capture;
-the private null sink itself has no producer unless an application routes audio
-to it. PipeWire-Pulse can provide the compatible server API. The module disables
-PulseAudio autospawn and does not start or restart an audio service. Failed
-module unloads retain their sink name and module index, are retried once per
-second, and set `virtual_sink_cleanup_pending`; the queue is limited to this
-process's three supported private layouts. Shutdown makes one final bounded
-cleanup attempt. If the sound server remains inaccessible at shutdown, the
-server-owned null sink can outlive the module and cannot be reported afterward.
+Linux route and managed-sink ownership is recorded in the host state's durable
+cleanup journal. Startup reconciles pending operations from a previous process,
+and background cleanup retries failed route restoration and owned sink unloads.
+Shutdown makes one final bounded pass; failed or indeterminate operations remain
+journaled for the next startup. Cleanup validates the sink's ownership token before
+unloading its module so an unrelated sink reusing a name or module index is retained.
 
 The Windows audio policy/capture behavior and audio capture contract in pinned
 Vibeshine commit `457237db7e57f9c4be21c35bb07e28d1c100eb7d` were used as
@@ -295,8 +305,8 @@ behavioral references without copying or translating source. The selected-endpoi
 capture-only case is represented by the per-open policy above. Continuous audio
 is opt-in per open; product setting persistence, management UI, and hardware
 qualification remain unimplemented. Opus encoding, configured speaker remapping,
-resampling, process-specific loopback, microphone capture, and full streaming
-audio parity remain unimplemented. macOS capture remains unsupported.
+resampling, process-specific loopback, microphone capture, the macOS backend,
+and full streaming audio parity remain unimplemented.
 
 Host tests use fake endpoint/capture backends and real native callback bindings
 for selection, ownership, idempotency, cancellation rollback, silent packets,
@@ -315,7 +325,10 @@ checks all three default render roles before and after:
 cargo test -p amaterasu-audio explicit_endpoint_captures_without_changing_any_default_role -- --ignored
 ```
 
-That test has not been run on development hardware. Real Windows qualification
+That test has not been run on development hardware. Linux tests exercise Pulse
+ABI layout, endpoint selection, channel negotiation, route restoration policy,
+and silence packet sizing without opening a server; the ignored Linux monitor
+test requires the user's PulseAudio-compatible server. Real Windows qualification
 of routed opens must exercise successful switching/restoration, each partial
 switch failure and rollback, role changes made by another application, device
 removal, default-device changes while capturing, and recovery after restoration

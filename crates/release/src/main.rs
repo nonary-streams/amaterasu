@@ -1,5 +1,12 @@
 mod development;
+mod linux_owned_display;
+#[cfg(target_os = "linux")]
+mod linux_user_service;
+mod linux_video_runtime;
+mod preflight;
 mod profiles;
+mod repositories;
+mod vhf_install;
 
 use amaterasu_package::{
     BootstrapConfig, PackageResult, RootLock, VerificationPolicy, read_json, stage_package,
@@ -24,6 +31,36 @@ fn run() -> PackageResult<()> {
                     .map_err(|error| error.to_string())?;
             development::initialize_linux_session(Path::new(root), &options)
         }
+        #[cfg(target_os = "linux")]
+        [command, root, host_executable, output] if command == "prepare-linux-user-service" => {
+            linux_user_service::prepare(
+                Path::new(root),
+                Path::new(host_executable),
+                Path::new(output),
+            )
+        }
+        #[cfg(target_os = "linux")]
+        [command, root, host_executable, bundle] if command == "preflight-linux-user-service" => {
+            linux_user_service::preflight(
+                Path::new(root),
+                Path::new(host_executable),
+                Path::new(bundle),
+            )
+        }
+        [command, root] if command == "preflight-desktop-stream-smoke" => {
+            preflight::run(Path::new(root), None)
+        }
+        [command, root, vhf_install_root] if command == "preflight-desktop-stream-smoke" => {
+            preflight::run(Path::new(root), Some(Path::new(vhf_install_root)))
+        }
+        [command, root] if command == "init-desktop-stream-smoke" => {
+            development::initialize_desktop_stream_smoke(Path::new(root), false)
+        }
+        [command, root, option]
+            if command == "init-desktop-stream-smoke" && option == "--allow-remote" =>
+        {
+            development::initialize_desktop_stream_smoke(Path::new(root), true)
+        }
         [command, root, artifacts, output, sequence]
             if matches!(
                 command.as_str(),
@@ -33,6 +70,7 @@ fn run() -> PackageResult<()> {
                     | "pack-stream-probe"
                     | "pack-software-probe"
                     | "pack-linux-probe"
+                    | "pack-desktop-stream-smoke"
                     | "pack-linux-session"
             ) =>
         {
@@ -47,6 +85,8 @@ fn run() -> PackageResult<()> {
                 profiles::PackageProfile::SoftwareProbe
             } else if command == "pack-stream-probe" {
                 profiles::PackageProfile::StreamProbe
+            } else if command == "pack-desktop-stream-smoke" {
+                profiles::PackageProfile::DesktopStreamSmoke
             } else if command == "pack-media-probe" {
                 profiles::PackageProfile::MediaProbe
             } else if command == "pack-platform" {
@@ -71,6 +111,38 @@ fn run() -> PackageResult<()> {
             pack_web(root, source, output, sequence)
         }
         [command, root, source] if command == "stage-web" => stage_web(root, source),
+        [command, root, id, location, public_key, fingerprint]
+            if command == "repository-approve" =>
+        {
+            repositories::approve(root, id, location, public_key, fingerprint)
+        }
+        [command, root, id] if command == "repository-revoke" => repositories::revoke(root, id),
+        [command, root, id] if command == "repository-refresh" => repositories::refresh(root, id),
+        [command, root] if command == "repository-list" => repositories::list(root),
+        [command, root, id, slot, implementation, version, output]
+            if command == "repository-download" =>
+        {
+            repositories::download(root, id, slot, implementation, version, Path::new(output))
+        }
+        [command, root, id, implementation, version, output]
+            if command == "repository-install-ui" =>
+        {
+            repositories::install_ui(root, id, implementation, version, Path::new(output))
+        }
+        [command, root, id, slot, implementation, version, source]
+            if command == "repository-stage-native" =>
+        {
+            repositories::stage_native(root, id, slot, implementation, version, Path::new(source))
+        }
+        [command, root, digest] if command == "repository-activate-native" => {
+            repositories::activate_native(root, digest)
+        }
+        [command, root] if command == "repository-restore-ui" => {
+            repositories::restore_ui(root, None)
+        }
+        [command, root, digest] if command == "repository-restore-ui" => {
+            repositories::restore_ui(root, Some(digest))
+        }
         [command, artifacts, web, output] if command == "prepare-installer" => {
             development::prepare_installer_assets(
                 Path::new(artifacts),
@@ -97,6 +169,49 @@ fn run() -> PackageResult<()> {
         }
         [command, root] if command == "finalize-installer-provision" => {
             development::finalize_installer_provision(Path::new(root))
+        }
+        [command, package, fingerprint, signtool] if command == "verify-vhf-package" => {
+            vhf_install::verify_command(Path::new(package), fingerprint, Path::new(signtool))
+        }
+        [command, package, fingerprint, signtool] if command == "seal-vhf-package" => {
+            vhf_install::seal_command(Path::new(package), fingerprint, Path::new(signtool))
+        }
+        [
+            command,
+            package,
+            install_root,
+            runtime_root,
+            fingerprint,
+            signtool,
+            devcon,
+        ] if command == "install-vhf-package" => vhf_install::install_command(
+            Path::new(package),
+            Path::new(install_root),
+            Path::new(runtime_root),
+            fingerprint,
+            Path::new(signtool),
+            Path::new(devcon),
+        ),
+        [command, install_root, runtime_root, devcon] if command == "rollback-vhf-package" => {
+            vhf_install::rollback_command(
+                Path::new(install_root),
+                Path::new(runtime_root),
+                Path::new(devcon),
+            )
+        }
+        [command, install_root, runtime_root, digest, keyboard, mouse]
+            if command == "grant-vhf-input" =>
+        {
+            vhf_install::grant_command(
+                Path::new(install_root),
+                Path::new(runtime_root),
+                digest,
+                keyboard,
+                mouse,
+            )
+        }
+        [command, install_root, runtime_root] if command == "revoke-vhf-input" => {
+            vhf_install::revoke_command(Path::new(install_root), Path::new(runtime_root))
         }
         _ => Err(usage().into()),
     }
@@ -158,5 +273,5 @@ fn verify(root: &str, source: &str) -> PackageResult<()> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-software-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-linux-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release init-linux-session ROOT [--lan ADDRESS:PORT [--allow-remote]] [--catalog-owner management|console] [--management-port PORT] [--capture-output ID] [--audio-endpoint NAME] [--enable-capture] [--enable-audio] [--enable-virtual-display] [--enable-input] [--enable-display-mutation]\n  amaterasu-release pack-linux-session ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT"
+    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release init-linux-session ROOT [--lan ADDRESS:PORT [--allow-remote]] [--catalog-owner management|console] [--management-port PORT] [--capture-output ID] [--audio-endpoint NAME] [--enable-capture] [--enable-audio] [--enable-virtual-display] [--enable-input] [--enable-display-mutation] [--frame-helper ABSOLUTE_PATH]\n  amaterasu-release prepare-linux-user-service ROOT HOST_EXECUTABLE OUTPUT_DIRECTORY (Linux only; emits a reviewable bundle)\n  amaterasu-release preflight-linux-user-service ROOT HOST_EXECUTABLE BUNDLE_DIRECTORY (Linux only; read-only deployment checks)\n  amaterasu-release pack-linux-session ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release init-desktop-stream-smoke ROOT [--allow-remote]\n  amaterasu-release preflight-desktop-stream-smoke ROOT [VHF_INSTALL_ROOT]\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-desktop-stream-smoke ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-software-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-linux-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release repository-approve ROOT ID HTTPS_URL PUBLIC_KEY_HEX CONFIRMED_SHA256\n  amaterasu-release repository-revoke ROOT ID\n  amaterasu-release repository-refresh ROOT ID\n  amaterasu-release repository-list ROOT\n  amaterasu-release repository-download ROOT ID SLOT IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-install-ui ROOT ID IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-stage-native ROOT ID SLOT IMPLEMENTATION VERSION SOURCE\n  amaterasu-release repository-activate-native ROOT DIGEST\n  amaterasu-release repository-restore-ui ROOT [DIGEST]\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT\n  amaterasu-release seal-vhf-package PACKAGE CONFIRMED_FINGERPRINT SIGNTOOL\n  amaterasu-release verify-vhf-package PACKAGE CONFIRMED_FINGERPRINT SIGNTOOL\n  amaterasu-release install-vhf-package PACKAGE INSTALL_ROOT RUNTIME_ROOT CONFIRMED_FINGERPRINT SIGNTOOL DEVCON\n  amaterasu-release rollback-vhf-package INSTALL_ROOT RUNTIME_ROOT DEVCON\n  amaterasu-release grant-vhf-input INSTALL_ROOT RUNTIME_ROOT ACTIVE_SET_DIGEST KEYBOARD_0_OR_1 MOUSE_0_OR_1\n  amaterasu-release revoke-vhf-input INSTALL_ROOT RUNTIME_ROOT\n  Desktop smoke requires replacing SELECT_OUTPUT_ID with a current DXGI output ID in bootstrap.json.\n  --allow-remote selects wildcard stream listeners only; it does not alter firewall or machine network settings."
 }

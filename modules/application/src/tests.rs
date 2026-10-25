@@ -210,18 +210,32 @@ fn steam_install_tree_association_tracks_and_stops_only_the_new_game_process() {
     std::fs::create_dir_all(&install_directory).unwrap();
     let executable = install_directory.join("amaterasu-steam-game-probe");
     std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    let game_directory = install_directory.join("game");
+    std::fs::create_dir(&game_directory).unwrap();
     let mut request = launch("steam-tracked", "sleep");
     request["executable"] = json!(executable);
     request["steam_id"] = json!("42");
     request["steam_install_dir"] = json!(install_directory);
-    request["cwd"] = json!(install_directory);
+    request["cwd"] = json!(game_directory);
 
     let mut manager = ProcessManager::default();
     let launched = manager.handle("alice", request);
     assert_eq!(launched["ok"], true, "{launched}");
     let process_id = launched["process"]["process_id"].as_u64().unwrap();
 
-    let associated = manager.handle("alice", json!({"action":"status","process_id":process_id}));
+    // The spawned child can still be between fork and exec/chdir when the
+    // first status request scans /proc. Association is deliberately based on
+    // observed install-tree evidence, so wait for that evidence to appear.
+    let association_deadline = Instant::now() + Duration::from_secs(5);
+    let associated = loop {
+        let response = manager.handle("alice", json!({"action":"status","process_id":process_id}));
+        if response["process"]["steam_game_liveness"] == "associated"
+            || Instant::now() >= association_deadline
+        {
+            break response;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(
         associated["process"]["steam_game_liveness"], "associated",
         "{associated}"
@@ -242,7 +256,7 @@ fn steam_install_tree_association_tracks_and_stops_only_the_new_game_process() {
         }
     }
     assert_eq!(stopped["process"]["state"], "cancelled", "{stopped}");
-    let _ = std::fs::remove_dir(install_directory);
+    let _ = std::fs::remove_dir_all(install_directory);
 }
 
 #[cfg(windows)]

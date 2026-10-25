@@ -1,8 +1,10 @@
 namespace Amaterasu {
   export type Page =
     | "overview"
+    | "host"
     | "catalog"
     | "settings"
+    | "updates"
     | "sessions"
     | "applications"
     | "steam"

@@ -1,12 +1,23 @@
 #[cfg(windows)]
+mod input_companion;
+#[cfg(target_os = "linux")]
+mod input_companion;
+#[cfg(windows)]
 mod interactive_worker;
+#[cfg(target_os = "linux")]
+mod linux_input;
 mod loading;
 mod logging_config;
+mod native_recovery;
+mod privilege;
 mod protocol;
+mod publisher_selection;
 mod service;
 #[cfg(windows)]
 mod state_root;
 mod supervisor;
+mod timing;
+mod web_recovery;
 #[cfg(windows)]
 mod windows_service;
 mod worker;
@@ -26,6 +37,10 @@ fn run() -> PackageResult<()> {
     match arguments.as_slice() {
         [command, root] if command == "serve" => service::serve(Path::new(root))?,
         [command, root] if command == "service" => service::service(Path::new(root))?,
+        #[cfg(target_os = "linux")]
+        [command, root, digest] if command == "service-user" => {
+            service::user_service(Path::new(root), digest)?
+        }
         [command, root] if command == "service-ready" => {
             service::probe_service_readiness(Path::new(root))?;
             println!("service ready");
@@ -33,6 +48,18 @@ fn run() -> PackageResult<()> {
         [command, root] if command == "operational-ready" => {
             service::probe_operational_readiness(Path::new(root))?;
             println!("operationally ready");
+        }
+        [command, root] if command == "web-recovery-status" => {
+            web_recovery::status(Path::new(root))?;
+        }
+        [command, root, digest] if command == "web-recover" => {
+            web_recovery::restore(Path::new(root), digest)?;
+        }
+        [command, root] if command == "native-recover" => {
+            native_recovery::restore(Path::new(root), None)?;
+        }
+        [command, root, digest] if command == "native-recover" => {
+            native_recovery::restore(Path::new(root), Some(digest))?;
         }
         [command, root, digest] if command == "worker-serve" => {
             worker::serve(Path::new(root), digest)?;
@@ -65,7 +92,7 @@ fn run() -> PackageResult<()> {
         }
         _ => {
             return Err(
-                "usage: amaterasu probe ROOT [CONTROL_MESSAGE_JSON] | service-ready ROOT | operational-ready ROOT | serve ROOT | service ROOT"
+                "usage: amaterasu probe ROOT [CONTROL_MESSAGE_JSON] | service-ready ROOT | operational-ready ROOT | web-recovery-status ROOT | web-recover ROOT DIGEST | native-recover ROOT [DIGEST] | serve ROOT | service ROOT | service-user ROOT ACTIVE_DIGEST (Linux user service)"
                     .into(),
             );
         }

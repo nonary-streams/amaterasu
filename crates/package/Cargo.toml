@@ -17,5 +17,6 @@ serde_json.workspace = true
 sha2.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
+ureq = { version = "3.4", default-features = false, features = ["rustls", "platform-verifier"] }
 [lints]
 workspace = true

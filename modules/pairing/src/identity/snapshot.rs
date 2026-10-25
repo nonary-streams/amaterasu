@@ -44,6 +44,23 @@ impl ConfiguredIdentity {
             private_key_path,
             now,
         )?;
+        Self::load_existing(
+            certificate_path,
+            private_key_path,
+            provider_revision,
+            validation_time,
+        )
+    }
+
+    pub(crate) fn load_existing(
+        certificate_path: &str,
+        private_key_path: &str,
+        provider_revision: u64,
+        validation_time: u64,
+    ) -> Result<Self, &'static str> {
+        if same_path(Path::new(certificate_path), Path::new(private_key_path)) {
+            return Err("unsafe_identity_path");
+        }
         let certificate_pem = read_identity_file(certificate_path)?;
         let private_key_pem = read_identity_file(private_key_path)?;
         let validation_identity = Identity {

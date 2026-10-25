@@ -15,6 +15,8 @@ fn negotiation() -> Negotiation {
         },
         Capabilities {
             transport: sdp::TransportSupport {
+                hevc: false,
+                av1: false,
                 stereo_audio: true,
                 enet_control: true,
                 encrypted_control: true,
@@ -24,7 +26,7 @@ fn negotiation() -> Negotiation {
                 encrypted_audio: true,
                 fec: true,
             },
-            color: sdp::ColorMode::Bt709Limited,
+            supported_colors: vec![sdp::ColorMode::Bt709Limited],
             max_width: 1920,
             max_height: 1080,
             max_fps: 60,
@@ -34,6 +36,38 @@ fn negotiation() -> Negotiation {
         },
     )
     .unwrap()
+}
+
+#[test]
+fn hevc_describe_marker_is_ticket_capability_scoped() {
+    let default = negotiation();
+    assert!(!validation::description(&default.capabilities).contains("sprop-parameter-sets"));
+    let mut enabled = negotiation();
+    enabled.capabilities.transport.hevc = true;
+    let description = validation::description(&enabled.capabilities);
+    assert!(description.contains("sprop-parameter-sets=AAAAAU\r\n"));
+    assert!(description.contains("H264/90000"));
+    assert!(!description.contains("HEVC/90000"));
+    assert!(!description.contains("AV1/90000"));
+}
+
+#[test]
+fn av1_describe_marker_is_ticket_capability_scoped() {
+    let mut enabled = negotiation();
+    enabled.capabilities.transport.av1 = true;
+    let description = validation::description(&enabled.capabilities);
+    assert!(description.contains("a=rtpmap:98 AV1/90000\r\n"));
+    assert!(!description.contains("sprop-parameter-sets"));
+    let video =
+        &description[description.find("m=video").unwrap()..description.find("m=audio").unwrap()];
+    assert!(
+        video.contains("AV1/90000"),
+        "marker belongs to the video section"
+    );
+
+    enabled.capabilities.transport.hevc = true;
+    let both = validation::description(&enabled.capabilities);
+    assert!(both.contains("sprop-parameter-sets=AAAAAU\r\n") && both.contains("AV1/90000"));
 }
 
 fn request(method: Method, target: &str, cseq: u32, session: bool) -> Request {
@@ -322,6 +356,29 @@ fn unsupported_media_cannot_reach_backend_actions() {
         input.body = body.replace(before, after).into_bytes();
         assert_eq!(machine.handle(7, &input), Err(Error::UnsupportedMedia));
         assert_eq!(machine.state(), State::Announce);
+    }
+}
+
+#[test]
+fn announced_color_requires_an_explicit_supported_mode() {
+    let mut machine = negotiation();
+    let mut announced = sdp::parse_announce(&announce().body).expect("valid ANNOUNCE");
+    for mode in [
+        sdp::ColorMode::Bt601Limited,
+        sdp::ColorMode::Bt601Full,
+        sdp::ColorMode::Bt709Limited,
+        sdp::ColorMode::Bt709Full,
+    ] {
+        announced.video.color = mode;
+        machine.capabilities.supported_colors = vec![mode];
+        assert_eq!(validation::media(&announced, &machine.capabilities), Ok(()));
+        machine.capabilities.supported_colors = vec![sdp::ColorMode::Bt709Limited];
+        if mode != sdp::ColorMode::Bt709Limited {
+            assert_eq!(
+                validation::media(&announced, &machine.capabilities),
+                Err(Error::UnsupportedMedia)
+            );
+        }
     }
 }
 

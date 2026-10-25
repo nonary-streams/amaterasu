@@ -276,6 +276,7 @@ fn metadata(id: u64, stream: &Stream) -> Value {
         "video_local":stream.video_local,
         "audio_local":stream.audio_local,
         "video":stream.video_settings,
+        "video_codec":stream.video_codec(),
         "video_batch_size_fallback":stream.video_batch_size_fallback,
         "audio":stream.audio_settings,
         "stream_audio":stream.stream_audio,

@@ -47,6 +47,7 @@ pub(super) fn validate(configuration: &RuntimeConfig) -> Result<(), String> {
     for (name, hook) in &configuration.hooks {
         validate_hook(name, hook, configuration)?;
     }
+    super::api::validate_approvals(configuration)?;
     Ok(())
 }
 

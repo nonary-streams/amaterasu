@@ -24,13 +24,22 @@ impl VideoPacket {
     }
 }
 
-#[derive(Default)]
+/// Joins encoder fragments into one access unit of the negotiated codec.
 pub(super) struct VideoAssembly {
+    codec: u32,
     packet: Option<VideoPacket>,
     fragments: usize,
 }
 
 impl VideoAssembly {
+    pub(super) fn new(codec: u32) -> Self {
+        Self {
+            codec,
+            packet: None,
+            fragments: 0,
+        }
+    }
+
     pub(super) fn ready(&self) -> bool {
         self.packet.as_ref().is_some_and(|packet| {
             packet.metadata.flags & (FLAG_END_OF_ACCESS_UNIT | FLAG_END_OF_STREAM) != 0
@@ -40,6 +49,11 @@ impl VideoAssembly {
     pub(super) fn push(&mut self, packet: VideoPacket) -> PlaneResult<()> {
         if self.ready() {
             return Err("video_pending_output");
+        }
+        // The transport accepts any codec it offered; only this session knows
+        // which one the client negotiated.
+        if packet.metadata.codec != self.codec {
+            return Err("video_codec_mismatch");
         }
         if let Some(current) = &mut self.packet {
             if packet.metadata.flags == FLAG_END_OF_STREAM

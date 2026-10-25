@@ -24,6 +24,21 @@ impl Pipeline {
         remaining: u64,
         send: &mut Send<'_>,
     ) {
+        let opens_session = matches!(
+            &operation,
+            Operation::Prepare(_)
+                | Operation::Start { .. }
+                | Operation::StartWhenAuthenticated { .. }
+        );
+        if opens_session
+            && (!self.journal.loaded
+                || self.journal.failed
+                || !self.recovery_ready
+                || self.recovery_blocked)
+        {
+            rpc::complete(send, request, error("restart_recovery_unconfirmed"));
+            return;
+        }
         if matches!(
             operation,
             Operation::Prepare(_)
@@ -188,7 +203,7 @@ impl Pipeline {
         &mut self,
         input: Incoming,
         session: u64,
-        configuration: StartConfig,
+        mut configuration: StartConfig,
         mode: StartMode,
         send: &mut Send<'_>,
     ) {
@@ -212,12 +227,20 @@ impl Pipeline {
             rpc::complete(send, request, error("session_not_found"));
             return;
         };
+        if let Err(code) = configuration.configuration.normalize_codec() {
+            rpc::complete(send, request, error(code));
+            return;
+        }
         if let Err(code) = configuration.validate(record.config.stream_audio) {
             rpc::complete(send, request, error(code));
             return;
         }
         if !configuration.matches_prepared_audio(&record.config) {
             rpc::complete(send, request, error("audio_configuration_mismatch"));
+            return;
+        }
+        if !configuration.matches_prepared_codec(&record.config) {
+            rpc::complete(send, request, error("video_codec_mismatch"));
             return;
         }
         if !configuration.matches_prepared_frame_limiter(&record.config) {
@@ -301,6 +324,7 @@ impl Pipeline {
             rpc::complete(send, request, record.response());
             return;
         }
+        let retrying_cleanup = record.state == State::CleanupFailed;
         let mut job = Job::new(
             session,
             Some(request),
@@ -319,6 +343,18 @@ impl Pipeline {
         record.history.stopping("stop_requested");
         record.state = State::Stopping;
         record.cleanup_error = None;
+        input::queue_rumble_zeros(record, now);
+        if retrying_cleanup {
+            if !record.rumble_pending.is_empty() {
+                record.rumble_stop_unconfirmed = true;
+                record.rumble_pending.clear();
+                record.rumble_active_until.clear();
+            }
+            record.plane = None;
+        }
+        if !record.rumble_pending.is_empty() {
+            job.step = Step::RumbleDrain;
+        }
         if let Some(plane) = record.plane.as_mut() {
             plane.stop();
         } else {
@@ -335,6 +371,11 @@ impl Pipeline {
             }
             if let Some(step) = job.next_cleanup(record) {
                 job.step = step;
+            } else {
+                // A previous cleanup attempt may already have retired every
+                // resource. Let the cleanup driver confirm journal retirement
+                // instead of dispatching the initial drain step again.
+                job.step = Step::WaitDrain;
             }
         }
         self.job = Some(job);

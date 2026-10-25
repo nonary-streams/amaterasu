@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "adapter.h"
+#include "kwin.h"
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
 #include <pipewire/pipewire.h>
@@ -21,6 +22,12 @@
 
 struct am_pw_session {
     GThread *thread;
+    char *named_output;
+    GMutex geometry_lock;
+    struct am_kwin_geometry geometry;
+#ifdef AMATERASU_KWIN
+    struct am_kwin *kwin;
+#endif
     GCancellable *cancel;
     GMainContext *main_context;
     GDBusConnection *bus;
@@ -28,9 +35,10 @@ struct am_pw_session {
     char *request_path;
     guint closed_subscription;
     atomic_bool stopped;
-    atomic_uint state, node, width, height, format, error;
+    atomic_uint state, stage, node, width, height, format, error, node_present, serial_present;
+    atomic_int pipewire_state, pipewire_error;
     uint32_t source_type, timeout_seconds;
-    uint64_t serial;
+    atomic_uint_fast64_t serial;
     struct pw_main_loop *loop;
     struct pw_context *context;
     struct pw_core *core;
@@ -38,6 +46,9 @@ struct am_pw_session {
     struct spa_hook stream_listener;
     struct spa_hook core_listener;
     am_pw_frame_callback callback;
+    am_pw_token_callback token_callback;
+    char *restore_token;
+    uint32_t persist;
     void *callback_context;
 };
 
@@ -88,7 +99,7 @@ int am_pw_probe(struct am_pw_probe *output) {
         g_variant_lookup(properties, "version", "u", &output->version);
         g_variant_lookup(properties, "AvailableSourceTypes", "u", &output->source_types);
         g_variant_lookup(properties, "AvailableCursorModes", "u", &output->cursor_modes);
-        output->available = output->version >= 2 && (output->source_types & 3) != 0 && (output->cursor_modes & 1) != 0;
+        output->available = output->version >= 2 && (output->source_types & 3) != 0 && (output->cursor_modes & 2) != 0;
         g_variant_unref(properties);
         g_variant_unref(reply);
     }
@@ -193,6 +204,7 @@ static gboolean select_portal_source(struct am_pw_session *session, gint64 deadl
     g_variant_builder_init(&builder, G_VARIANT_TYPE_VARDICT);
     g_variant_builder_add(&builder, "{sv}", "handle_token", g_variant_new_string(create_token));
     g_variant_builder_add(&builder, "{sv}", "session_handle_token", g_variant_new_string(session_token));
+    atomic_store(&session->stage, AM_PW_STAGE_CREATE_SESSION);
     GVariant *result = portal_request(session, "CreateSession", create_token,
         g_variant_new("(@a{sv})", g_variant_builder_end(&builder)), deadline);
     g_free(create_token); g_free(session_token);
@@ -212,18 +224,29 @@ static gboolean select_portal_source(struct am_pw_session *session, gint64 deadl
     g_variant_builder_add(&builder, "{sv}", "handle_token", g_variant_new_string(select_token));
     g_variant_builder_add(&builder, "{sv}", "types", g_variant_new_uint32(session->source_type));
     g_variant_builder_add(&builder, "{sv}", "multiple", g_variant_new_boolean(FALSE));
-    g_variant_builder_add(&builder, "{sv}", "cursor_mode", g_variant_new_uint32(1));
-    /* No restore_token, no persistent permission request. */
+    /* Embed the compositor cursor: this CPU provider has no cursor-metadata plane. */
+    g_variant_builder_add(&builder, "{sv}", "cursor_mode", g_variant_new_uint32(2));
+    if (session->persist) {
+        g_variant_builder_add(&builder, "{sv}", "persist_mode", g_variant_new_uint32(2));
+        if (session->restore_token)
+            g_variant_builder_add(&builder, "{sv}", "restore_token", g_variant_new_string(session->restore_token));
+    }
+    atomic_store(&session->stage, AM_PW_STAGE_SELECT_SOURCES);
     result = portal_request(session, "SelectSources", select_token,
         g_variant_new("(o@a{sv})", session->session_path, g_variant_builder_end(&builder)), deadline);
     g_free(select_token);
     if (!result) { g_free(uuid); return FALSE; }
     g_variant_unref(result);
     char *start_token = g_strdup_printf("amaterasu_start_%s", uuid);
+    atomic_store(&session->stage, AM_PW_STAGE_START);
     result = portal_request(session, "Start", start_token,
         g_variant_new("(os@a{sv})", session->session_path, "", options(start_token)), deadline);
     g_free(start_token); g_free(uuid);
     if (!result) return FALSE;
+    const char *restore_token = NULL;
+    if (session->persist && g_variant_lookup(result, "restore_token", "&s", &restore_token)
+        && strlen(restore_token) <= 4096 && session->token_callback)
+        session->token_callback(session->callback_context, restore_token);
     GVariant *streams = g_variant_lookup_value(result, "streams", G_VARIANT_TYPE("a(ua{sv})"));
     valid = streams && g_variant_n_children(streams) == 1;
     if (valid) {
@@ -232,7 +255,12 @@ static gboolean select_portal_source(struct am_pw_session *session, gint64 deadl
         GVariant *stream = g_variant_get_child_value(streams, 0);
         g_variant_get(stream, "(u@a{sv})", &node, &properties);
         atomic_store(&session->node, node);
-        g_variant_lookup(properties, "pipewire-serial", "t", &session->serial);
+        atomic_store(&session->node_present, 1);
+        uint64_t serial = 0;
+        if (g_variant_lookup(properties, "pipewire-serial", "t", &serial)) {
+            atomic_store(&session->serial, serial);
+            atomic_store(&session->serial_present, 1);
+        }
         g_variant_unref(properties); g_variant_unref(stream);
         valid = node != PW_ID_ANY;
     }
@@ -245,12 +273,19 @@ static gboolean select_portal_source(struct am_pw_session *session, gint64 deadl
 static void stream_state_changed(void *data, enum pw_stream_state previous,
     enum pw_stream_state state, const char *error) {
     (void)previous; (void)error;
-    if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED) fail(data, 4);
+    struct am_pw_session *session = data;
+    atomic_store(&session->pipewire_state, (int)state);
+    if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED) {
+        if (state == PW_STREAM_STATE_ERROR) atomic_store(&session->pipewire_error, -1);
+        fail(session, 4);
+    }
 }
 
 static void core_error(void *data, uint32_t id, int sequence, int result, const char *message) {
-    (void)id; (void)sequence; (void)result; (void)message;
-    fail(data, 4);
+    (void)id; (void)sequence; (void)message;
+    struct am_pw_session *session = data;
+    atomic_store(&session->pipewire_error, result);
+    fail(session, 4);
 }
 
 static void format_changed(void *data, uint32_t id, const struct spa_pod *parameter) {
@@ -279,6 +314,10 @@ static void format_changed(void *data, uint32_t id, const struct spa_pod *parame
     atomic_store(&session->width, information.size.width);
     atomic_store(&session->height, information.size.height);
     atomic_store(&session->format, format);
+    g_printerr("Amaterasu PipeWire negotiated %ux%u, rate %u/%u, maximum %u/%u\n",
+        information.size.width, information.size.height,
+        information.framerate.num, information.framerate.denom,
+        information.max_framerate.num, information.max_framerate.denom);
     uint8_t storage[512];
     struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
     const struct spa_pod *parameters[2];
@@ -335,6 +374,7 @@ static void process_frame(void *data) {
             if (copied == 1) {
                 uint32_t expected = AM_PW_SELECTING;
                 atomic_compare_exchange_strong(&session->state, &expected, AM_PW_READY);
+                atomic_store(&session->stage, AM_PW_STAGE_FRAME_RECEIVED);
             }
             else if (copied == 2) fail(session, 5);
         }
@@ -351,32 +391,40 @@ static const struct pw_stream_events stream_events = {
 };
 static const struct pw_core_events core_events = { PW_VERSION_CORE_EVENTS, .error = core_error };
 
-static gboolean connect_pipewire(struct am_pw_session *session) {
+static int portal_remote(struct am_pw_session *session) {
+    atomic_store(&session->stage, AM_PW_STAGE_OPEN_PIPEWIRE_REMOTE);
     GUnixFDList *descriptors = NULL;
     GVariant *reply = g_dbus_connection_call_with_unix_fd_list_sync(session->bus, PORTAL,
         PORTAL_PATH, SCREENCAST, "OpenPipeWireRemote",
         g_variant_new("(o@a{sv})", session->session_path, options("amaterasu_remote")),
         G_VARIANT_TYPE("(h)"), G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT_MS, NULL,
         &descriptors, session->cancel, NULL);
-    if (!reply) return FALSE;
+    if (!reply) return -1;
     gint index; g_variant_get(reply, "(h)", &index);
     int fd = descriptors ? g_unix_fd_list_get(descriptors, index, NULL) : -1;
     if (descriptors) g_object_unref(descriptors);
     g_variant_unref(reply);
-    if (fd < 0) return FALSE;
+    return fd;
+}
+
+static gboolean connect_pipewire(struct am_pw_session *session, int fd) {
+    if (fd < 0 && !session->named_output) return FALSE;
+    atomic_store(&session->stage, AM_PW_STAGE_CONNECT_PIPEWIRE);
     session->loop = pw_main_loop_new(NULL);
     if (!session->loop) { close(fd); return FALSE; }
     session->context = pw_context_new(pw_main_loop_get_loop(session->loop), NULL, 0);
     if (!session->context) { close(fd); return FALSE; }
     /* connect_fd transfers fd ownership to PipeWire, including its failure path. */
-    session->core = pw_context_connect_fd(session->context, fd, NULL, 0);
+    session->core = fd >= 0 ? pw_context_connect_fd(session->context, fd, NULL, 0)
+        : pw_context_connect(session->context, NULL, 0);
     if (!session->core) return FALSE;
     pw_core_add_listener(session->core, &session->core_listener, &core_events, session);
     struct pw_properties *properties = pw_properties_new(PW_KEY_MEDIA_TYPE, "Video",
         PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_ROLE, "Screen",
         PW_KEY_APP_NAME, "Amaterasu", NULL);
-    if (session->serial) {
-        char serial[32]; snprintf(serial, sizeof(serial), "%llu", (unsigned long long)session->serial);
+    uint64_t serial_value = atomic_load(&session->serial);
+    if (serial_value) {
+        char serial[32]; snprintf(serial, sizeof(serial), "%llu", (unsigned long long)serial_value);
         pw_properties_set(properties, PW_KEY_TARGET_OBJECT, serial);
     }
     session->stream = pw_stream_new(session->core, "Amaterasu portal capture", properties);
@@ -389,11 +437,14 @@ static gboolean connect_pipewire(struct am_pw_session *session) {
         SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
         SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
         SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(3, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRx),
-        SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(&SPA_RECTANGLE(1920, 1080), &SPA_RECTANGLE(1, 1), &SPA_RECTANGLE(8192, 8192)),
-        SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(30, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(240, 1)));
-    return pw_stream_connect(session->stream, PW_DIRECTION_INPUT,
-        session->serial ? PW_ID_ANY : atomic_load(&session->node),
+        /* Preserve the compositor's advertised source size. The video module
+         * fits the complete image to the client's requested stream dimensions. */
+        SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(60, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(240, 1)));
+    gboolean connected = pw_stream_connect(session->stream, PW_DIRECTION_INPUT,
+        serial_value ? PW_ID_ANY : atomic_load(&session->node),
         PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, &parameter, 1) >= 0;
+    if (connected) atomic_store(&session->stage, AM_PW_STAGE_WAITING_FOR_FRAMES);
+    return connected;
 }
 
 static void cleanup(struct am_pw_session *session) {
@@ -401,6 +452,9 @@ static void cleanup(struct am_pw_session *session) {
     if (session->core) { spa_hook_remove(&session->core_listener); pw_core_disconnect(session->core); }
     if (session->context) pw_context_destroy(session->context);
     if (session->loop) pw_main_loop_destroy(session->loop);
+#ifdef AMATERASU_KWIN
+    if (session->kwin) am_kwin_close(session->kwin);
+#endif
     if (session->bus) {
         if (session->closed_subscription) g_dbus_connection_signal_unsubscribe(session->bus, session->closed_subscription);
         close_object(session, session->request_path, "org.freedesktop.portal.Request");
@@ -411,58 +465,143 @@ static void cleanup(struct am_pw_session *session) {
     g_clear_pointer(&session->request_path, g_free);
 }
 
+static GMutex initialization_lock;
+static unsigned active_workers;
+static void acquire_pipewire(void) {
+    g_mutex_lock(&initialization_lock);
+    if (active_workers++ == 0) pw_init(NULL, NULL);
+    g_mutex_unlock(&initialization_lock);
+}
+static void release_pipewire(void) {
+    g_mutex_lock(&initialization_lock);
+    if (--active_workers == 0) pw_deinit();
+    g_mutex_unlock(&initialization_lock);
+}
+
 static gpointer worker(gpointer data) {
     struct am_pw_session *session = data;
     session->main_context = g_main_context_new();
     g_main_context_push_thread_default(session->main_context);
-    session->bus = connect_bus(session->cancel);
+    atomic_store(&session->stage, AM_PW_STAGE_CONNECTING_SESSION_BUS);
     gint64 deadline = g_get_monotonic_time() + (gint64)session->timeout_seconds * G_USEC_PER_SEC;
-    pw_init(NULL, NULL);
-    if (!session->bus) fail(session, 1);
-    else if (select_portal_source(session, deadline) && !atomic_load(&session->stopped)) {
-        if (!connect_pipewire(session)) fail(session, 4);
+    acquire_pipewire();
+    gboolean selected = FALSE;
+    int remote = -1;
+    if (session->named_output) {
+#ifdef AMATERASU_KWIN
+        session->kwin = am_kwin_open(session->named_output, &session->stopped, deadline);
+        uint32_t node = 0;
+        uint64_t serial = 0;
+        struct am_kwin_geometry geometry = {0};
+        selected = session->kwin && am_kwin_snapshot(session->kwin, &node, &serial, &geometry) == 0;
+        if (selected) {
+            g_mutex_lock(&session->geometry_lock); session->geometry = geometry; g_mutex_unlock(&session->geometry_lock);
+            atomic_store(&session->node, node);
+            atomic_store(&session->node_present, node != 0);
+            atomic_store(&session->serial, serial);
+            atomic_store(&session->serial_present, serial != 0);
+        } else fail(session, 8);
+#else
+        fail(session, 8);
+#endif
+    } else {
+        session->bus = connect_bus(session->cancel);
+        if (!session->bus) fail(session, 1);
+        else if (select_portal_source(session, deadline) && !atomic_load(&session->stopped)) {
+            remote = portal_remote(session);
+            selected = remote >= 0;
+            if (!selected) fail(session, 4);
+        }
+    }
+    if (selected && !atomic_load(&session->stopped)) {
+        if (!connect_pipewire(session, remote)) fail(session, 4);
         else while (!atomic_load(&session->stopped)) {
             while (g_main_context_iteration(session->main_context, FALSE)) {}
+#ifdef AMATERASU_KWIN
+            if (session->kwin) {
+                if (am_kwin_poll(session->kwin) < 0) { fail(session, 8); break; }
+                struct am_kwin_geometry geometry = {0}; uint32_t node = 0; uint64_t serial = 0;
+                if (am_kwin_snapshot(session->kwin, &node, &serial, &geometry) == 0) {
+                    g_mutex_lock(&session->geometry_lock); session->geometry = geometry; g_mutex_unlock(&session->geometry_lock);
+                }
+            }
+#endif
             uint32_t state = atomic_load(&session->state);
             if (state == AM_PW_FAILED || state == AM_PW_REVOKED) break;
             if (state != AM_PW_READY && g_get_monotonic_time() >= deadline) { fail(session, 7); break; }
-            if (pw_loop_iterate(pw_main_loop_get_loop(session->loop), 20) < 0) { fail(session, 4); break; }
+            if (pw_loop_iterate(pw_main_loop_get_loop(session->loop), 5) < 0) { fail(session, 4); break; }
         }
-    }
+    } else if (remote >= 0) close(remote);
     cleanup(session);
-    pw_deinit();
+    release_pipewire();
     g_main_context_pop_thread_default(session->main_context);
     g_main_context_unref(session->main_context);
     return NULL;
 }
 
-struct am_pw_session *am_pw_start(uint32_t source_type, uint32_t timeout_seconds,
-    am_pw_frame_callback callback, void *context) {
+static struct am_pw_session *start(uint32_t source_type, uint32_t timeout_seconds,
+    const char *restore_token, uint32_t persist, am_pw_token_callback token_callback,
+    am_pw_frame_callback callback, void *context, const char *named_output) {
     if ((source_type != 1 && source_type != 2) || !callback || timeout_seconds < 1 || timeout_seconds > 300) return NULL;
     struct am_pw_session *session = g_new0(struct am_pw_session, 1);
+    g_mutex_init(&session->geometry_lock);
     atomic_init(&session->stopped, false);
     atomic_init(&session->state, AM_PW_SELECTING);
+    atomic_init(&session->stage, AM_PW_STAGE_CONNECTING_SESSION_BUS);
     atomic_init(&session->node, 0);
     atomic_init(&session->width, 0);
     atomic_init(&session->height, 0);
     atomic_init(&session->format, 0);
     atomic_init(&session->error, 0);
+    atomic_init(&session->pipewire_state, INT32_MAX);
+    atomic_init(&session->pipewire_error, 0);
+    atomic_init(&session->node_present, 0);
+    atomic_init(&session->serial_present, 0);
+    atomic_init(&session->serial, 0);
     session->cancel = g_cancellable_new();
+    session->named_output = named_output ? g_strdup(named_output) : NULL;
     session->source_type = source_type;
     session->timeout_seconds = timeout_seconds;
     session->callback = callback;
+    session->restore_token = restore_token ? g_strdup(restore_token) : NULL;
+    session->persist = persist;
+    session->token_callback = token_callback;
     session->callback_context = context;
     session->thread = g_thread_try_new("amaterasu-portal", worker, session, NULL);
-    if (!session->thread) { g_object_unref(session->cancel); g_free(session); return NULL; }
+    if (!session->thread) { g_object_unref(session->cancel); g_free(session->restore_token); g_free(session->named_output); g_mutex_clear(&session->geometry_lock); g_free(session); return NULL; }
     return session;
 }
+
+struct am_pw_session *am_pw_start(uint32_t source_type, uint32_t timeout_seconds,
+    const char *restore_token, uint32_t persist, am_pw_token_callback token_callback,
+    am_pw_frame_callback callback, void *context) {
+    return start(source_type, timeout_seconds, restore_token, persist, token_callback, callback, context, NULL);
+}
+#ifdef AMATERASU_KWIN
+struct am_pw_session *am_pw_start_output(const char *output, uint32_t timeout_seconds,
+    am_pw_frame_callback callback, void *context) {
+    if (!output || strlen(output) != 9 || strncmp(output, "Virtual-", 8) != 0 || output[8] < '1' || output[8] > '8') return NULL;
+    return start(1, timeout_seconds, NULL, 0, NULL, callback, context, output);
+}
+#endif
 
 void am_pw_snapshot(struct am_pw_session *session, struct am_pw_snapshot *output) {
     if (!session || !output) return;
     *output = (struct am_pw_snapshot){ .state = atomic_load(&session->state),
+        .stage = atomic_load(&session->stage),
         .node = atomic_load(&session->node), .width = atomic_load(&session->width),
         .height = atomic_load(&session->height), .format = atomic_load(&session->format),
-        .error = atomic_load(&session->error) };
+        .error = atomic_load(&session->error), .pipewire_state = atomic_load(&session->pipewire_state),
+        .node_present = atomic_load(&session->node_present),
+        .serial_present = atomic_load(&session->serial_present),
+        .pipewire_error = atomic_load(&session->pipewire_error),
+        .serial = atomic_load(&session->serial) };
+    g_mutex_lock(&session->geometry_lock);
+    output->left=session->geometry.left; output->top=session->geometry.top;
+    output->logical_width=session->geometry.width; output->logical_height=session->geometry.height;
+    output->desktop_left=session->geometry.desktop_left; output->desktop_top=session->geometry.desktop_top;
+    output->desktop_width=session->geometry.desktop_width; output->desktop_height=session->geometry.desktop_height;
+    g_mutex_unlock(&session->geometry_lock);
 }
 
 void am_pw_destroy(struct am_pw_session *session) {
@@ -471,5 +610,8 @@ void am_pw_destroy(struct am_pw_session *session) {
     g_cancellable_cancel(session->cancel);
     g_thread_join(session->thread);
     g_object_unref(session->cancel);
+    g_free(session->restore_token);
+    g_free(session->named_output);
+    g_mutex_clear(&session->geometry_lock);
     g_free(session);
 }

@@ -1,3 +1,4 @@
+mod api;
 mod configuration;
 mod errors;
 mod events;
@@ -11,6 +12,7 @@ use amaterasu_contracts::{
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use api::{ApiInvocation, ApiRegistry};
 use events::EventBus;
 use hooks::HookRegistry;
 use requests::{RequestOptions, RequestRouter};
@@ -25,6 +27,7 @@ pub struct Broker {
     dropped_log_records: u64,
     logging_revision: u64,
     logging_policy_received: bool,
+    api: ApiRegistry,
 }
 
 const HOST_LIFECYCLE_QUEUE_CAPACITY: usize = 8;
@@ -40,6 +43,7 @@ impl Broker {
 
         Ok(Self {
             hooks: HookRegistry::new(configuration.hooks.clone()),
+            api: ApiRegistry::new(&configuration),
             configuration,
             requests: RequestRouter::default(),
             events: EventBus::default(),
@@ -127,16 +131,123 @@ impl Broker {
                     .unwrap_or_else(|| serde_json::json!({})),
             },
             Command::GetHostContext {} => {
-                if caller != "amaterasu.state" {
+                // Audio needs the host-owned state root on Linux to reconcile
+                // its own Pulse cleanup journal after a worker restart.
+                if caller != "amaterasu.state"
+                    && !(cfg!(target_os = "linux") && caller == "amaterasu.audio")
+                {
                     return errors::permission_denied();
                 }
                 Response::Result {
-                    payload: serde_json::to_value(&self.configuration.host_context)
-                        .expect("host context is serializable"),
+                    payload: serde_json::json!({
+                        "schema": self.configuration.host_context.schema,
+                        "state_root": self.configuration.host_context.state_root,
+                    }),
+                }
+            }
+            Command::GetPackageRoot {} => {
+                if caller != "amaterasu.management" {
+                    return errors::permission_denied();
+                }
+                match &self.configuration.host_context.package_root {
+                    Some(package_root) => Response::Result {
+                        payload: serde_json::json!({"package_root":package_root}),
+                    },
+                    None => Response::error(
+                        "package_root_unavailable",
+                        "host did not supply a package root",
+                    ),
+                }
+            }
+            Command::GetRunningPackageDigest {} => {
+                if caller != "amaterasu.management" {
+                    return errors::permission_denied();
+                }
+                match &self.configuration.host_context.running_package_digest {
+                    Some(digest) => Response::Result {
+                        payload: serde_json::json!({"digest": digest}),
+                    },
+                    None => Response::error(
+                        "running_package_unavailable",
+                        "host did not supply a loaded package digest",
+                    ),
                 }
             }
             Command::Register { service } => {
-                self.requests.register_service(caller, grants, service)
+                if self.api.owns_service(&service) {
+                    errors::permission_denied()
+                } else {
+                    self.requests.register_service(caller, grants, service)
+                }
+            }
+            Command::RegisterApi { method } => {
+                let registered = self.api.register(caller, grants, method.clone());
+                if registered.is_error() {
+                    registered
+                } else {
+                    self.requests
+                        .register_service(caller, grants, method.service)
+                }
+            }
+            Command::QueryApi {
+                service,
+                method,
+                interface_major,
+                min_minor,
+            } => self.api.query(
+                caller,
+                grants,
+                &service,
+                &method,
+                interface_major,
+                min_minor,
+            ),
+            Command::CallApi {
+                service,
+                method,
+                interface_major,
+                interface_minor,
+                payload,
+                timeout_ms,
+                operation_id,
+                parent,
+            } => {
+                let initiator = match parent {
+                    Some(parent_id) => {
+                        match self.requests.initiator_for_parent(caller, parent_id) {
+                            Ok(initiator) => initiator.to_owned(),
+                            Err(error) => return error,
+                        }
+                    }
+                    None => caller.to_owned(),
+                };
+                match self.api.callable(
+                    caller,
+                    &initiator,
+                    grants,
+                    ApiInvocation {
+                        service: &service,
+                        method: &method,
+                        major: interface_major,
+                        minor: interface_minor,
+                        payload: &payload,
+                    },
+                ) {
+                    Ok((payload, response_schema)) => self.requests.submit(
+                        caller,
+                        grants,
+                        RequestOptions {
+                            service,
+                            payload,
+                            timeout_ms,
+                            operation_id,
+                            parent,
+                            response_schema: Some(response_schema),
+                        },
+                        now,
+                    ),
+                    Err(error) => error,
+                }
             }
             Command::Request {
                 service,
@@ -145,12 +256,16 @@ impl Broker {
                 operation_id,
                 parent,
             } => {
+                if self.api.owns_service(&service) {
+                    return errors::permission_denied();
+                }
                 let options = RequestOptions {
                     service,
                     payload,
                     timeout_ms,
                     operation_id,
                     parent,
+                    response_schema: None,
                 };
                 self.requests.submit(caller, grants, options, now)
             }

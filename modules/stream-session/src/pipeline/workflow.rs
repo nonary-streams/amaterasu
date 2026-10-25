@@ -1,10 +1,11 @@
 use super::{
+    journal::Document,
     record::{Record, Resource, State},
     rpc,
 };
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Step {
     Open(Resource),
     Authenticate,
@@ -22,6 +23,9 @@ pub(super) enum Step {
     RecoverDisplay,
     FindLimiter,
     RestoreLimiter,
+    CreateOwnedVirtualDisplay,
+    FindOwnedVirtualDisplay,
+    RemoveOwnedVirtualDisplay,
     AcquireOutput,
     AcquireAudio,
     Activate,
@@ -32,6 +36,8 @@ pub(super) enum Step {
     InputBatch,
     FeedbackPeek,
     FeedbackAck,
+    PollGamepadFeedback,
+    RumbleDrain,
     DrainVideo,
     CloseCapture,
     WaitDrain,
@@ -43,6 +49,7 @@ pub(super) enum Step {
     FinishSession,
     ForceIdr,
     RecoverAudio,
+    PersistJournal,
 }
 
 pub(super) struct Job {
@@ -57,8 +64,14 @@ pub(super) struct Job {
     pub tried: std::collections::BTreeSet<Resource>,
     pub input_tried: bool,
     pub limiter_tried: bool,
-    pub display_tried: bool,
     pub virtual_display_tried: bool,
+    pub virtual_display_removing: bool,
+    pub display_tried: bool,
+    pub journal_resume: Option<Step>,
+    pub journal_document: Option<Document>,
+    pub journal_payload: Option<Value>,
+    pub journal_operation_id: Option<String>,
+    pub rumble_tried: bool,
 }
 
 impl Job {
@@ -75,8 +88,14 @@ impl Job {
             tried: Default::default(),
             input_tried: false,
             limiter_tried: false,
-            display_tried: false,
             virtual_display_tried: false,
+            virtual_display_removing: false,
+            display_tried: false,
+            journal_resume: None,
+            journal_document: None,
+            journal_payload: None,
+            journal_operation_id: None,
+            rumble_tried: false,
         }
     }
 
@@ -89,7 +108,13 @@ impl Job {
         };
         record.history.stopping(code);
         record.state = State::Stopping;
-        record.plane = None;
+        super::input::queue_rumble_zeros(record, now);
+        if let Some(plane) = record.plane.as_mut() {
+            plane.stop();
+        }
+        if record.rumble_pending.is_empty() {
+            record.plane = None;
+        }
         record.audio_recovery_needed = false;
         if let Some(pending) = self.pending.as_mut() {
             pending.cancel();
@@ -100,6 +125,11 @@ impl Job {
     }
 
     pub fn next_cleanup(&mut self, record: &Record) -> Option<Step> {
+        if !self.rumble_tried
+            && (!record.rumble_active_until.is_empty() || !record.rumble_pending.is_empty())
+        {
+            return Some(Step::RumbleDrain);
+        }
         if !self.input_tried {
             if record.input_lookup_required {
                 return Some(Step::FindInput);
@@ -126,6 +156,16 @@ impl Job {
                 return Some(Step::Find(resource));
             }
             self.tried.insert(resource);
+        }
+        if !self.virtual_display_tried
+            && record.virtual_display_attempted
+            && record.config.virtual_display_intent.is_none()
+        {
+            return Some(if self.virtual_display_removing {
+                Step::FindOwnedVirtualDisplay
+            } else {
+                Step::RemoveOwnedVirtualDisplay
+            });
         }
         if !self.limiter_tried {
             if record.limiter_attempted && record.limiter_lease.is_none() {
@@ -189,6 +229,12 @@ impl Job {
     pub fn command(&self, record: &Record) -> (String, Value) {
         let session = || record.resources[&Resource::Session];
         match self.step {
+            Step::PersistJournal => (
+                "amaterasu.state/1".into(),
+                self.journal_payload
+                    .clone()
+                    .expect("journal write step owns a payload"),
+            ),
             Step::Open(resource) => (resource.service(), record.open(resource)),
             Step::Authenticate => (
                 Resource::Control.service(),
@@ -210,6 +256,18 @@ impl Job {
                         "video_stream_format":start.configuration.video_stream_format}),
                 )
             }
+            Step::CreateOwnedVirtualDisplay => (
+                "amaterasu.virtual-display/1".into(),
+                super::virtual_display::owned_create(record),
+            ),
+            Step::FindOwnedVirtualDisplay => (
+                "amaterasu.virtual-display/1".into(),
+                super::virtual_display::owned_status(record),
+            ),
+            Step::RemoveOwnedVirtualDisplay => (
+                "amaterasu.virtual-display/1".into(),
+                super::virtual_display::owned_remove(record),
+            ),
             Step::ApplyLimiter => (
                 "amaterasu.frame-limiter/1".into(),
                 super::limiter::apply(record),
@@ -308,6 +366,11 @@ impl Job {
                 json!({"action":"feedback_ack","lease":record.input_lease,
                     "through_sequence":record.feedback_ack_through}),
             ),
+            Step::PollGamepadFeedback => (
+                "amaterasu.input/1".into(),
+                json!({"action":"poll_gamepad_feedback","lease":record.input_lease}),
+            ),
+            Step::RumbleDrain => (String::new(), Value::Null),
             Step::DrainVideo => (
                 Resource::Video.service(),
                 json!({"action":"drain","stream":record.resources[&Resource::Video]}),

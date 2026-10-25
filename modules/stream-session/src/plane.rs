@@ -34,6 +34,9 @@ pub enum FeedbackEnqueueError {
     QueueFull,
     Stopped,
 }
+// A 10 ms PCM source must be drained faster than video frames arrive. Keep
+// this bounded so one active session cannot monopolize the module tick.
+const PCM_READ_BUDGET: usize = 32;
 
 #[derive(Clone, Copy)]
 pub struct Handles {
@@ -44,6 +47,8 @@ pub struct Handles {
     pub control_transport: u64,
     pub stream_audio: bool,
     pub audio_channels: u32,
+    /// ABI codec identifier of the negotiated video codec.
+    pub video_codec: u32,
 }
 
 #[derive(Debug)]
@@ -53,9 +58,17 @@ pub struct ControlRecord {
     pub sequence: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RumbleCommand {
+    pub slot: u16,
+    pub low_frequency: u16,
+    pub high_frequency: u16,
+}
+
 #[derive(Debug, Default)]
 pub struct Progress {
     pub controls: Vec<ControlRecord>,
+    pub desktop_geometry: Option<CaptureGeometry>,
     /// Complete non-EOS access units admitted to the local transport queue.
     pub accepted_video_access_units: u64,
     /// Encoded audio and video payload bytes admitted to the local transport queue.
@@ -77,16 +90,21 @@ pub struct Plane {
 impl Plane {
     pub fn new(runtime: &RuntimeClient, handles: Handles) -> PlaneResult<Self> {
         Ok(Self {
-            pump: Pump::with_audio(
+            pump: Pump::with_media(
                 native::NativeBackend::new(runtime, handles)?,
                 handles.stream_audio,
                 handles.audio_channels,
+                handles.video_codec,
             ),
         })
     }
 
     pub fn tick(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
         self.pump.tick(media_active)
+    }
+
+    pub fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool> {
+        self.pump.backend.send_rumble(command)
     }
 
     /// Transfers one event into this session's bounded queue. `Queued` means the
@@ -118,8 +136,12 @@ impl Plane {
 }
 
 trait Backend {
+    fn desktop_geometry(&mut self) -> PlaneResult<Option<CaptureGeometry>> {
+        Ok(None)
+    }
     fn control(&mut self) -> PlaneResult<Option<ControlRecord>>;
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool>;
+    fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool>;
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>>;
     fn pcm(&mut self) -> PlaneResult<Option<PcmPacket>>;
     fn audio(&mut self) -> PlaneResult<Option<AudioPacket>>;
@@ -152,15 +174,15 @@ struct Pump<B> {
 impl<B: Backend> Pump<B> {
     #[cfg(test)]
     fn new(backend: B) -> Self {
-        Self::with_audio(backend, true, 2)
+        Self::with_media(backend, true, 2, CODEC_H264)
     }
 
-    fn with_audio(backend: B, stream_audio: bool, audio_channels: u32) -> Self {
+    fn with_media(backend: B, stream_audio: bool, audio_channels: u32, video_codec: u32) -> Self {
         Self {
             backend,
             stream_audio,
             audio_channels,
-            video: VideoAssembly::default(),
+            video: VideoAssembly::new(video_codec),
             pending_pcm: None,
             pending_audio: None,
             pending_feedback: VecDeque::new(),
@@ -198,6 +220,13 @@ impl<B: Backend> Pump<B> {
         // Check the authenticated provider before any media effect. A failed or
         // closed control stream ends pumping; routing metadata grants no authority.
         let mut progress = Progress::default();
+        progress.desktop_geometry =
+            self.backend
+                .desktop_geometry()
+                .map_err(|code| TickFailure {
+                    code,
+                    progress: Progress::default(),
+                })?;
         for _ in 0..READ_BUDGET {
             let message = match self.backend.control() {
                 Ok(message) => message,
@@ -382,46 +411,36 @@ impl<B: Backend> Pump<B> {
         }
 
         // Output backpressure stops both encoder polling and further PCM capture.
-        for _ in 0..READ_BUDGET {
-            if let Some(packet) = &self.pending_audio {
-                let header = packet.header();
-                if header.channels != self.audio_channels {
-                    return Err("unsupported_audio_channels");
+        // Drain several PCM packets per tick: video encoding may make ticks far
+        // slower than the capture device's 10 ms packet cadence.
+        for _ in 0..PCM_READ_BUDGET {
+            for _ in 0..READ_BUDGET {
+                if let Some(packet) = &self.pending_audio {
+                    let header = packet.header();
+                    if header.channels != self.audio_channels {
+                        return Err("unsupported_audio_channels");
+                    }
+                    if !self.backend.submit_audio(&header)? {
+                        return Ok(());
+                    }
+                    self.record_audio_admission(&header, progress);
+                    self.audio_ended = header.flags == AUDIO_PACKET_END_OF_STREAM;
+                    self.pending_audio = None;
                 }
-                if !self.backend.submit_audio(&header)? {
+                if self.audio_ended {
                     return Ok(());
                 }
-                self.record_audio_admission(&header, progress);
-                self.audio_ended = header.flags == AUDIO_PACKET_END_OF_STREAM;
-                self.pending_audio = None;
+                let Some(packet) = self.backend.audio()? else {
+                    break;
+                };
+                self.pending_audio = Some(packet);
             }
-            if self.audio_ended {
-                return Ok(());
+            if self.pending_pcm.is_none() && !self.stopping {
+                self.pending_pcm = self.backend.pcm()?;
             }
-            let Some(packet) = self.backend.audio()? else {
+            let Some(packet) = &self.pending_pcm else {
                 break;
             };
-            self.pending_audio = Some(packet);
-        }
-        if let Some(packet) = &self.pending_audio {
-            let header = packet.header();
-            if header.channels != self.audio_channels {
-                return Err("unsupported_audio_channels");
-            }
-            if !self.backend.submit_audio(&header)? {
-                return Ok(());
-            }
-            self.record_audio_admission(&header, progress);
-            self.audio_ended = header.flags == AUDIO_PACKET_END_OF_STREAM;
-            self.pending_audio = None;
-        }
-        if self.audio_ended {
-            return Ok(());
-        }
-        if self.pending_pcm.is_none() && !self.stopping {
-            self.pending_pcm = self.backend.pcm()?;
-        }
-        if let Some(packet) = &self.pending_pcm {
             if packet.header().channels != self.audio_channels {
                 return Err("unsupported_audio_channels");
             }

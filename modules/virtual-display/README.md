@@ -19,12 +19,12 @@ configuration setting names. When it is false, create returns `disabled` without
 touching the driver. When the module is enabled, create may manage a temporary
 monitor regardless of `dd_activate_virtual_display`. That setting requests
 stream-time topology activation; this service does not implement that behavior.
-An explicit create only creates a temporary monitor and cannot activate it or make
-it the only active display. Status reports the unsupported activation request.
+On Windows an explicit create cannot activate topology or make its monitor the
+only active display. Linux owned creation activates only its new output.
 If `dd_use_sunshine_virtual_display_driver` is false, create returns
 `unsupported_driver`; this service has no alternative driver and does not silently
-select Sunshine. Non-Windows create returns `unsupported_platform` when the module
-is enabled and the Sunshine driver is selected.
+select Sunshine. Builds without the optional Linux backend return
+`unsupported_platform` outside Windows.
 
 The provider needs only its service registration grant; clients need its call
 grant. On Windows, an enabled provider stores a private lease journal beneath
@@ -36,6 +36,72 @@ caller-specific IDs, `getrandom` supplies lease capabilities, and `windows-sys`
 provides documented Win32 bindings. Native code remains trusted, not sandboxed.
 
 ## API
+
+The optional Linux `linux-libvirtualdisplay` feature directly links the pinned
+`third-party/libvirtualdisplay` CMake driver target. Initialize that submodule
+before building. `linux_control::LinuxControlClient` calls the library's original
+C++ broker client through a small exception-safe C ABI; Amaterasu does not
+reimplement its wire protocol. The default endpoint remains
+`/run/vibeshine/vkms-control.sock`, where the installed broker enforces Unix UID
+connector ownership shared with Vibeshine. Query does not grant ownership, and
+set always reaches the broker even when the observed state already matches.
+
+With that feature, Linux create/remove use a separate monitor controller. A
+bounded actor serializes native effects outside the input/media tick. Each
+caller/UUID gets the lowest free connector the vibeshine DRM card actually
+exposes; already connected outputs are never adopted. DRM connector type ids are
+global and are not reset when the driver reloads, so a reloaded pool is named
+Virtual-9 through Virtual-16 rather than Virtual-1 through Virtual-8. The actor
+therefore lists `/sys/class/drm/card<N>-Virtual-<M>` entries whose card device
+is bound to a `vibeshine` or `vibeshine_drm` driver, or is the `vibeshine` faux
+device (stock vkms, also a faux device, is excluded). It reads sysfs metadata
+only and never opens a DRM node. Missing sysfs, no vibeshine connectors, or an
+id present on two vibeshine cards fails the create before any journal entry or
+broker effect. The broker accepts any `Virtual-<id>` public name (a positive
+32-bit id) and resolves it through the driver's `drm_name` mapping. Journal
+records accept the same names. The shared broker rechecks Unix UID
+ownership on every mutation. The private user journal at
+`$XDG_STATE_HOME/amaterasu/virtual-display-linux` (default
+`~/.local/state/amaterasu/virtual-display-linux`) is locked against other
+Amaterasu hosts and synced before connect. Startup removes interrupted owned
+connectors before admitting new ones. Failed cleanup retains ownership intent.
+
+KScreen activates only the new connector, selects the requested mode, sets 100%
+scale and SDR, and places it to the right of enabled outputs. Readback must match
+before status reports `ready`. KDE can apply a cached single-output layout when a
+connector appears. A bounded layout snapshot is synced before each hotplug, and
+values displaced by that transition are restored in the same atomic KScreen
+operation that configures the new output. Active streams discard the initial
+snapshot; removal snapshots the current layout so later user choices are retained.
+Interrupted hotplug recovery retains the pending snapshot. Independently
+unplugged monitors are never reconnected. Unsupported modes may require KScreen's custom-mode support. Connector disconnection removes
+the temporary display; compositor preferences for that connector may persist.
+Nonzero scale requests and permanent monitors remain unsupported on this backend.
+
+The Linux session profile's `--enable-virtual-display` selects
+`amaterasu-owned-display`. The stream coordinator derives an owned identity,
+creates the display before opening video, and routes capture to the returned
+`kwin:Virtual-N` output. Input receives current logical desktop geometry through
+the video v1.1 metadata tail. Stop closes video/capture before removing the owned
+connector; interruption retains journaled recovery. Native-module unload also
+performs best-effort exact cleanup. This is a shared KDE session with separate
+outputs, not an independent login or native-code sandbox.
+
+Build capture with `amaterasu-capture-pipewire/linux-kwin-screencast` as well.
+KDE must authorize the exact host executable's ScreenCast interface through its
+scoped desktop declaration. The service bundle emits this declaration and an
+installer; no global KWin permission check is disabled. The desktop user must
+also have access to the existing broker socket. A socket ACL must be reapplied
+on socket recreation, for example through an administrator-owned socket unit
+drop-in. Do not replace the broker, unload the driver, or steal Vibeshine's output.
+
+Tests cover sysfs connector discovery against a fake tree (reloaded ids,
+non-vibeshine and stock vkms cards, malformed names, ambiguity), free-connector
+allocation past Virtual-8, caller identity, durable intent before
+effects, bounded cleanup, process exclusion and interrupted recovery. Native
+qualification must separately exercise actual display creation, capture, input,
+playback and restoration. Private DRM frame export / GPU zero-copy interop and
+HDR capture are not implemented by this integration.
 
 Requests reject unknown fields. Examples:
 
@@ -180,8 +246,9 @@ cannot report a ready device path until a future API provides that binding.
 If the driver is unavailable or the lease has expired, recovery waits for
 confirmed exact departure; it does not issue a duplicate create. Driver identity
 retention/cleanup policy, persistent monitor manifests, adapter selection, HDR/ICC,
-DPI controls, and the incompatible SudoVDA protocol are not supported. There is no
-automatic session/launch coordination or Linux DRM virtual display backend yet.
+DPI controls, and the incompatible SudoVDA protocol are not supported. Linux per-stream ownership is described above. Application window routing,
+private DRM frame transport, persistent monitors and independent KDE logins
+remain outside that integration.
 
 Tests exercise setting defaults and separation, activation diagnostics and driver
 selection, caller isolation, stable identity/idempotency, readiness/feeding,

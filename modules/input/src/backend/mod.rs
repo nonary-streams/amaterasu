@@ -11,8 +11,17 @@ pub trait Backend {
     fn pen_touch_supported(&self) -> bool {
         false
     }
+    /// Whether this backend accepts this event type. This may include a
+    /// constrained emulation path that is distinct from native pen/touch.
+    fn supports_pen_touch_event(&self, _device: PenTouchDevice) -> bool {
+        self.pen_touch_supported()
+    }
     /// Returns a native limit for one device type; `None` uses the common lease limit.
     fn pen_touch_max_contacts(&self, _device: PenTouchDevice) -> Option<usize> {
+        None
+    }
+    /// Maximum contacts mapped through a mouse interface, if supported.
+    fn touch_as_mouse_max_contacts(&self) -> Option<usize> {
         None
     }
     fn controller_input_supported(&self) -> bool {
@@ -65,6 +74,13 @@ pub trait Backend {
     fn disable_controller_input(&mut self) -> InputResult<()> {
         Ok(())
     }
+    /// Returns one local, session-owned rumble event when the backend supports
+    /// reverse feedback. It is not a client-protocol capability by itself.
+    fn poll_gamepad_feedback(
+        &mut self,
+    ) -> InputResult<Option<amaterasu_input_companion::GamepadFeedback>> {
+        Ok(None)
+    }
     fn stop(&mut self) -> InputResult<()>;
 }
 #[cfg(windows)]
@@ -73,12 +89,16 @@ mod windows;
 pub use windows::WindowsBackend as NativeBackend;
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
+mod linux_companion;
+#[cfg(target_os = "linux")]
+mod linux_router;
+#[cfg(target_os = "linux")]
 mod owned_devices;
 #[cfg(any(windows, target_os = "linux", test))]
 mod owned_keys;
 #[cfg(target_os = "linux")]
-pub use linux::LinuxBackend as NativeBackend;
+pub use linux_router::LinuxBackendRouter as NativeBackend;
 #[cfg(not(any(windows, target_os = "linux")))]
 pub struct NativeBackend;
 #[cfg(not(any(windows, target_os = "linux")))]

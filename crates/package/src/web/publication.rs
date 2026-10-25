@@ -97,10 +97,49 @@ pub fn stage_bundle(
     keys: &BTreeMap<String, String>,
     now: u64,
 ) -> PackageResult<String> {
+    // The caller supplies only the locally trusted project bootstrap keys.
+    stage_bundle_with_scope(source, root, keys, None, now)
+}
+
+/// Select a bundle from an approved repository. Its signed sequence is scoped
+/// to the pinned publisher, so unrelated publishers may use independent
+/// numbering while replay or equivocation by one publisher remains blocked.
+pub fn stage_repository_bundle(
+    source: &Path,
+    root: &Path,
+    keys: &BTreeMap<String, String>,
+    publisher_fingerprint: &str,
+    now: u64,
+) -> PackageResult<String> {
+    crate::decode_hex::<32>(publisher_fingerprint)?;
+    if publisher_fingerprint != publisher_fingerprint.to_ascii_lowercase() || keys.len() != 1 {
+        return Err("repository UI selection requires exactly its pinned publisher key".into());
+    }
+    let public_key = keys
+        .get(publisher_fingerprint)
+        .ok_or("repository UI publisher key is absent")?;
+    if crate::sha256(&crate::decode_hex::<32>(public_key)?) != publisher_fingerprint {
+        return Err("repository UI publisher fingerprint does not match its key".into());
+    }
+    stage_bundle_with_scope(source, root, keys, Some(publisher_fingerprint), now)
+}
+
+fn stage_bundle_with_scope(
+    source: &Path,
+    root: &Path,
+    keys: &BTreeMap<String, String>,
+    publisher_fingerprint: Option<&str>,
+    now: u64,
+) -> PackageResult<String> {
     create_private_directory(root)?;
     let _lock = RootLock::acquire(root)?;
     let verified = verify_bundle(source, keys, now)?;
-    check_progression(root, &verified)?;
+    let previous = if root.join("selection.json").exists() {
+        Some(read_selection(root)?)
+    } else {
+        None
+    };
+    check_progression(previous.as_ref(), &verified, publisher_fingerprint)?;
     let bundles = root.join("bundles");
     create_private_directory(&bundles)?;
     require_directory(&bundles)?;
@@ -113,28 +152,134 @@ pub fn stage_bundle(
     } else {
         publish_copy(source, &bundles, &destination, &verified, keys, now)?;
     }
+    let mut publisher_floors = previous
+        .as_ref()
+        .map_or_else(BTreeMap::new, |old| old.publisher_floors.clone());
+    if let Some(fingerprint) = publisher_fingerprint {
+        publisher_floors.insert(
+            fingerprint.into(),
+            PublisherFloor {
+                sequence: verified.manifest.sequence,
+                digest: verified.digest.clone(),
+            },
+        );
+    }
+    let mut project_floor = previous.as_ref().and_then(|old| old.project_floor.clone());
+    if project_floor.is_none()
+        && publisher_fingerprint.is_some()
+        && let Some(old) = previous
+            .as_ref()
+            .filter(|old| old.publisher_floors.is_empty())
+    {
+        project_floor = Some(PublisherFloor {
+            sequence: old.highest_sequence,
+            digest: old.digest.clone(),
+        });
+    }
+    if publisher_fingerprint.is_none() {
+        project_floor = Some(PublisherFloor {
+            sequence: verified.manifest.sequence,
+            digest: verified.digest.clone(),
+        });
+    }
     let selection = Selection {
         digest: verified.digest.clone(),
-        highest_sequence: verified.manifest.sequence,
+        highest_sequence: verified
+            .manifest
+            .sequence
+            .max(previous.as_ref().map_or(0, |old| old.highest_sequence)),
+        active_sequence: Some(verified.manifest.sequence),
+        previous_digest: previous.as_ref().and_then(|old| {
+            if old.digest == verified.digest {
+                old.previous_digest.clone()
+            } else {
+                Some(old.digest.clone())
+            }
+        }),
+        publisher_floors,
+        project_floor,
     };
     write_json_atomically(&root.join("selection.json"), &selection)?;
     Ok(verified.digest)
 }
 
-fn check_progression(root: &Path, bundle: &VerifiedBundle) -> PackageResult<()> {
-    if root
-        .join("selection.json")
-        .try_exists()
-        .map_err(|error| error.to_string())?
-    {
-        let previous = read_selection(root)?;
-        if bundle.manifest.sequence < previous.highest_sequence
-            || (bundle.manifest.sequence == previous.highest_sequence
-                && bundle.digest != previous.digest)
+/// Administrator recovery to the last verified selection without lowering the
+/// accepted release floor. The caller must supply the currently authorized keys.
+pub fn restore_previous(
+    root: &Path,
+    keys: &BTreeMap<String, String>,
+    now: u64,
+) -> PackageResult<String> {
+    let _lock = RootLock::acquire(root)?;
+    let selection = read_selection(root)?;
+    let previous = selection
+        .previous_digest
+        .clone()
+        .ok_or("no previous web bundle available")?;
+    restore_selected_version(root, selection, &previous, keys, now)
+}
+
+/// Explicit administrator recovery to any retained, currently trusted signed
+/// bundle. The release floors remain unchanged even for a historical choice.
+pub fn restore_version(
+    root: &Path,
+    digest: &str,
+    keys: &BTreeMap<String, String>,
+    now: u64,
+) -> PackageResult<String> {
+    let _lock = RootLock::acquire(root)?;
+    let selection = read_selection(root)?;
+    restore_selected_version(root, selection, digest, keys, now)
+}
+
+fn restore_selected_version(
+    root: &Path,
+    mut selection: Selection,
+    digest: &str,
+    keys: &BTreeMap<String, String>,
+    now: u64,
+) -> PackageResult<String> {
+    let bundle = super::load_version(root, digest, keys, now)?;
+    selection.previous_digest = Some(selection.digest);
+    if selection.previous_digest.as_deref() == Some(digest) {
+        return Err("requested UI is already selected".into());
+    }
+    selection.digest = digest.into();
+    selection.active_sequence = Some(bundle.manifest.sequence);
+    write_json_atomically(&root.join("selection.json"), &selection)?;
+    Ok(digest.into())
+}
+
+fn check_progression(
+    previous: Option<&Selection>,
+    bundle: &VerifiedBundle,
+    publisher_fingerprint: Option<&str>,
+) -> PackageResult<()> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    if let Some(fingerprint) = publisher_fingerprint {
+        if let Some(floor) = previous.publisher_floors.get(fingerprint)
+            && (bundle.manifest.sequence < floor.sequence
+                || (bundle.manifest.sequence == floor.sequence && bundle.digest != floor.digest))
         {
-            return Err(
-                "web release must advance sequence; historical rollback is not enabled".into(),
-            );
+            return Err("publisher web release sequence replay or equivocation".into());
+        }
+    } else {
+        let project_floor = previous.project_floor.clone().or_else(|| {
+            previous
+                .publisher_floors
+                .is_empty()
+                .then(|| PublisherFloor {
+                    sequence: previous.highest_sequence,
+                    digest: previous.digest.clone(),
+                })
+        });
+        if let Some(floor) = project_floor
+            && (bundle.manifest.sequence < floor.sequence
+                || (bundle.manifest.sequence == floor.sequence && bundle.digest != floor.digest))
+        {
+            return Err("project web release sequence replay or equivocation".into());
         }
     }
     Ok(())

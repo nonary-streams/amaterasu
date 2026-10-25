@@ -3,7 +3,8 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 const NORMALIZED_MAXIMUM: u64 = u16::MAX as u64;
 
-/// A half-open rectangle in physical virtual-desktop pixels.
+/// A half-open rectangle in the platform's virtual-desktop pointer coordinates.
+/// Windows uses physical pixels; Wayland uses compositor logical coordinates.
 ///
 /// The origin may be negative. A valid rectangle is nonempty and every physical
 /// pixel coordinate through `origin + extent - 1` is representable by `i32`.
@@ -71,7 +72,8 @@ impl<'de> Deserialize<'de> for DesktopRect {
 
 /// The captured output and complete virtual desktop containing it.
 ///
-/// Both rectangles use the same physical-pixel coordinate system.
+/// Both rectangles use the same platform pointer coordinate system. Capture
+/// image pixels may use a different scale and must not be substituted here.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct CaptureGeometry {

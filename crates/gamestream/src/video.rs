@@ -1,8 +1,10 @@
-//! Bounded GameStream H.264/HEVC Annex B packetization, with Reed–Solomon parity.
+//! Bounded GameStream video packetization, with bounded Reed–Solomon parity.
 //!
+//! H.264 and HEVC travel as Annex B, AV1 as low-overhead OBU temporal units.
 //! This is the GameStream video framing protocol, not RFC 6184 fragmentation.
 //! See `video/README.md` for receiver references and compatibility limits.
 
+mod av1;
 mod fec;
 pub(crate) use fec::linear_combination;
 
@@ -13,6 +15,14 @@ const MAX_UDP_BYTES: usize = 65_507;
 const MAX_PACKETS: usize = 1023;
 const MAX_ACCESS_UNIT_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_INDEX_MASK: u32 = 0x00ff_ffff;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    Hevc,
+    Av1,
+}
 
 /// Negotiated video settings. Unsupported security/recovery modes fail explicitly.
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +45,7 @@ pub enum VideoError {
     FecWorkLimit,
     UnsupportedEncryption,
     InvalidAnnexB,
+    InvalidAv1,
     AccessUnitTooLarge,
     TooManyPackets,
 }
@@ -62,31 +73,29 @@ pub struct Reservation {
 /// timestamp from the stream's epoch; both may wrap as unsigned 32-bit values.
 pub struct VideoPacketizer {
     config: VideoConfig,
+    codec: VideoCodec,
     payload_bytes: usize,
     stream_index: u32,
 }
 
-/// Codec selected for one Annex B access unit. The packetizer validates the
-/// codec-specific NAL header and keeps the existing GameStream frame envelope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VideoCodec {
-    H264,
-    Hevc,
-}
-
 impl VideoPacketizer {
     pub fn new(config: VideoConfig) -> Result<Self, VideoError> {
+        Self::new_with_codec(config, VideoCodec::H264)
+    }
+
+    pub fn new_with_codec(config: VideoConfig, codec: VideoCodec) -> Result<Self, VideoError> {
         if config.encrypted {
             return Err(VideoError::UnsupportedEncryption);
         }
         fec::validate_config(config)?;
         // The first shard must hold the complete short frame header and the
-        // beginning of an Annex B NAL unit. Bound the actual IPv4 UDP payload.
+        // beginning of a NAL unit or OBU. Bound the actual IPv4 UDP payload.
         if !(NV_BYTES + FRAME_BYTES + 5..=MAX_UDP_BYTES - RTP_BYTES).contains(&config.packet_size) {
             return Err(VideoError::InvalidPacketSize);
         }
         Ok(Self {
             config,
+            codec,
             payload_bytes: config.packet_size - NV_BYTES,
             stream_index: 0,
         })
@@ -99,7 +108,7 @@ impl VideoPacketizer {
             return Err(VideoError::AccessUnitTooLarge);
         }
         if access_unit_len == 0 {
-            return Err(VideoError::InvalidAnnexB);
+            return Err(self.invalid_bitstream());
         }
         if self.config.fec_percentage != 0 {
             return fec::reservation(access_unit_len, self.config);
@@ -118,38 +127,60 @@ impl VideoPacketizer {
     /// Return complete UDP payloads, in transmission order, for one access unit.
     /// Without FEC the final datagram is short. FEC shards are zero-padded to
     /// the negotiated size, as required for recovery by the receiver.
+    ///
+    /// `encoder_keyframe` is the encoder's keyframe flag. AV1 announces it in
+    /// the frame header because Moonlight does not parse AV1. H.264 and HEVC
+    /// derive the IDR type from the NAL units, which the receiver also parses.
     pub fn packetize(
         &mut self,
         access_unit: &[u8],
+        encoder_keyframe: bool,
         frame_index: u32,
         timestamp_90khz: u32,
     ) -> Result<Vec<Vec<u8>>, VideoError> {
-        self.packetize_codec(VideoCodec::H264, access_unit, frame_index, timestamp_90khz)
+        self.packetize_with_latency(
+            access_unit,
+            encoder_keyframe,
+            frame_index,
+            timestamp_90khz,
+            0,
+        )
     }
 
-    /// Packetize one H.264 or HEVC Annex B access unit using the existing
-    /// GameStream custom frame and FEC headers.
-    pub fn packetize_codec(
+    /// [`Self::packetize`], also reporting how long the host held this frame,
+    /// in 0.1 ms units, in the frame header's host processing latency field
+    /// that Moonlight shows in its statistics. Zero means unknown.
+    pub fn packetize_with_latency(
         &mut self,
-        codec: VideoCodec,
         access_unit: &[u8],
+        encoder_keyframe: bool,
         frame_index: u32,
         timestamp_90khz: u32,
+        host_processing_latency: u16,
     ) -> Result<Vec<Vec<u8>>, VideoError> {
         if access_unit.len() > MAX_ACCESS_UNIT_BYTES {
             return Err(VideoError::AccessUnitTooLarge);
         }
         if self.config.fec_percentage != 0 {
-            return self.packetize_with_fec(codec, access_unit, frame_index, timestamp_90khz);
+            return self.packetize_with_fec(
+                access_unit,
+                encoder_keyframe,
+                frame_index,
+                timestamp_90khz,
+                host_processing_latency,
+            );
         }
         let total_bytes = access_unit.len() + FRAME_BYTES;
         let packet_count = total_bytes.div_ceil(self.payload_bytes);
         if packet_count > MAX_PACKETS {
             return Err(VideoError::TooManyPackets);
         }
-        let is_idr = validate_annex_b(access_unit, codec)?;
-        let frame_header =
-            short_frame_header(is_idr, ((total_bytes - 1) % self.payload_bytes + 1) as u16);
+        let is_idr = self.keyframe(access_unit, encoder_keyframe)?;
+        let frame_header = short_frame_header(
+            is_idr,
+            ((total_bytes - 1) % self.payload_bytes + 1) as u16,
+            host_processing_latency,
+        );
         let mut datagrams = Vec::with_capacity(packet_count);
         for packet_index in 0..packet_count {
             let start = packet_index * self.payload_bytes;
@@ -175,11 +206,41 @@ impl VideoPacketizer {
         self.stream_index = self.stream_index.wrapping_add(packet_count as u32) & STREAM_INDEX_MASK;
         Ok(datagrams)
     }
+
+    /// Validate the access unit for this codec and return whether the frame
+    /// header announces an IDR (keyframe) picture.
+    fn keyframe(&self, access_unit: &[u8], encoder_keyframe: bool) -> Result<bool, VideoError> {
+        match self.codec {
+            VideoCodec::H264 => validate_annex_b(access_unit),
+            VideoCodec::Hevc => validate_hevc_annex_b(access_unit),
+            VideoCodec::Av1 => av1::validate_temporal_unit(access_unit, encoder_keyframe),
+        }
+    }
+
+    fn invalid_bitstream(&self) -> VideoError {
+        match self.codec {
+            VideoCodec::H264 | VideoCodec::Hevc => VideoError::InvalidAnnexB,
+            VideoCodec::Av1 => VideoError::InvalidAv1,
+        }
+    }
 }
 
-fn short_frame_header(is_idr: bool, final_payload_bytes: u16) -> [u8; FRAME_BYTES] {
+/// The eight-byte short frame header that opens the first packet's payload.
+///
+/// Byte 0 is the short header type (1). Bytes 1..3 hold the little-endian host
+/// processing latency in 0.1 ms units, zero when unknown. Byte 3 is the frame type: 2 for IDR,
+/// 1 for an ordinary picture. Bytes 4..6 hold the little-endian length of the
+/// final data packet's payload, counting this header when that packet is also
+/// the first. Receivers truncate the final packet to that length for codecs
+/// that cannot tolerate trailing zero padding, such as AV1. Bytes 6..8 are zero.
+fn short_frame_header(
+    is_idr: bool,
+    final_payload_bytes: u16,
+    host_processing_latency: u16,
+) -> [u8; FRAME_BYTES] {
     let mut header = [0; FRAME_BYTES];
     header[0] = 1;
+    header[1..3].copy_from_slice(&host_processing_latency.to_le_bytes());
     header[3] = if is_idr { 2 } else { 1 };
     header[4..6].copy_from_slice(&final_payload_bytes.to_le_bytes());
     header
@@ -217,8 +278,9 @@ fn packet_header(
     packet
 }
 
-/// Check Annex B framing and supported NAL headers, not the encoded slice syntax.
-fn validate_annex_b(bytes: &[u8], codec: VideoCodec) -> Result<bool, VideoError> {
+/// Check H.264 Annex B framing and supported NAL headers, not the encoded
+/// slice syntax.
+fn validate_annex_b(bytes: &[u8]) -> Result<bool, VideoError> {
     let mut nal_start = None;
     let mut zero_run = 0;
     let mut has_picture = false;
@@ -230,7 +292,6 @@ fn validate_annex_b(bytes: &[u8], codec: VideoCodec) -> Result<bool, VideoError>
                     bytes,
                     start,
                     index - zero_run,
-                    codec,
                     &mut has_picture,
                     &mut has_idr,
                 )?;
@@ -246,7 +307,6 @@ fn validate_annex_b(bytes: &[u8], codec: VideoCodec) -> Result<bool, VideoError>
         bytes,
         start,
         bytes.len() - zero_run,
-        codec,
         &mut has_picture,
         &mut has_idr,
     )?;
@@ -256,47 +316,98 @@ fn validate_annex_b(bytes: &[u8], codec: VideoCodec) -> Result<bool, VideoError>
     Ok(has_idr)
 }
 
+/// Validate the two-byte HEVC NAL header and the recovery-prefix ordering
+/// expected by Moonlight. Initial support accepts closed-GOP IDR only; CRA and
+/// leading pictures require additional recovery handling.
+fn validate_hevc_annex_b(bytes: &[u8]) -> Result<bool, VideoError> {
+    let mut nal_start = None;
+    let mut zero_run = 0usize;
+    let mut prefix = 0u8;
+    let mut picture = None;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if byte == 1 && zero_run >= 2 {
+            if let Some(start) = nal_start {
+                validate_hevc_nal(bytes, start, index - zero_run, &mut prefix, &mut picture)?;
+            } else if index != zero_run {
+                return Err(VideoError::InvalidAnnexB);
+            }
+            nal_start = Some(index + 1);
+        }
+        zero_run = if byte == 0 { zero_run + 1 } else { 0 };
+    }
+    let start = nal_start.ok_or(VideoError::InvalidAnnexB)?;
+    validate_hevc_nal(
+        bytes,
+        start,
+        bytes.len() - zero_run,
+        &mut prefix,
+        &mut picture,
+    )?;
+    let picture_type = picture.ok_or(VideoError::InvalidAnnexB)?;
+    let is_idr = matches!(picture_type, 19 | 20);
+    if is_idr && prefix != 3 {
+        return Err(VideoError::InvalidAnnexB);
+    }
+    Ok(is_idr)
+}
+
+fn validate_hevc_nal(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    prefix: &mut u8,
+    picture: &mut Option<u8>,
+) -> Result<(), VideoError> {
+    if end.saturating_sub(start) < 2 {
+        return Err(VideoError::InvalidAnnexB);
+    }
+    let first = bytes[start];
+    let second = bytes[start + 1];
+    let kind = (first >> 1) & 0x3f;
+    if first & 0x80 != 0 || (first & 1) != 0 || second >> 3 != 0 || second & 0x07 == 0 {
+        return Err(VideoError::InvalidAnnexB);
+    }
+    match kind {
+        32 if *prefix == 0 && picture.is_none() => *prefix = 1,
+        33 if *prefix == 1 && picture.is_none() => *prefix = 2,
+        34 if *prefix == 2 && picture.is_none() => *prefix = 3,
+        0..=7 | 19 | 20 => {
+            let idr = matches!(kind, 19 | 20);
+            // Distinct VCL NAL types can carry different picture/recovery
+            // semantics. A single access unit must not silently collapse them
+            // to the same short-header IDR bit.
+            if picture.is_some_and(|previous| previous != kind)
+                || (idr && *prefix != 3)
+                || (*prefix != 0 && *prefix != 3)
+            {
+                return Err(VideoError::InvalidAnnexB);
+            }
+            *picture = Some(kind);
+        }
+        // Prefix/suffix SEI and access-unit delimiters carry no picture.
+        35 | 39 | 40 => {}
+        _ => return Err(VideoError::InvalidAnnexB),
+    }
+    Ok(())
+}
+
 fn validate_nal(
     bytes: &[u8],
     start: usize,
     end: usize,
-    codec: VideoCodec,
     has_picture: &mut bool,
     has_idr: &mut bool,
 ) -> Result<(), VideoError> {
     if start >= end {
         return Err(VideoError::InvalidAnnexB);
     }
-    match codec {
-        VideoCodec::H264 => {
-            let header = bytes[start];
-            let kind = header & 0x1f;
-            if header & 0x80 != 0 || !(1..=23).contains(&kind) {
-                return Err(VideoError::InvalidAnnexB);
-            }
-            *has_picture |= kind == 1 || kind == 5;
-            *has_idr |= kind == 5;
-        }
-        VideoCodec::Hevc => {
-            let header = bytes
-                .get(start..start + 2)
-                .ok_or(VideoError::InvalidAnnexB)?;
-            let nal_unit_type = (header[0] >> 1) & 0x3f;
-            let layer_id = ((header[0] & 1) << 5) | (header[1] >> 3);
-            let temporal_id_plus_one = header[1] & 0x07;
-            // This path supports single-layer HEVC and the defined NAL types
-            // through suffix SEI. Reserved and unspecified types fail closed.
-            if header[0] & 0x80 != 0
-                || layer_id != 0
-                || temporal_id_plus_one == 0
-                || nal_unit_type > 40
-            {
-                return Err(VideoError::InvalidAnnexB);
-            }
-            *has_picture |= nal_unit_type <= 31;
-            *has_idr |= matches!(nal_unit_type, 19 | 20);
-        }
+    let header = bytes[start];
+    let kind = header & 0x1f;
+    if header & 0x80 != 0 || !(1..=23).contains(&kind) {
+        return Err(VideoError::InvalidAnnexB);
     }
+    *has_picture |= kind == 1 || kind == 5;
+    *has_idr |= kind == 5;
     Ok(())
 }
 

@@ -45,7 +45,7 @@ feature parity with a deployed streaming host. **Pending** means not implemented
 
 | Area | Current status | Required acceptance gate |
 | --- | --- | --- |
-| Minimal native shell | Implemented supervised development serve/probe | Installed service entry, production bootstrap, signal shutdown and unattended policy |
+| Minimal native shell | Implemented supervised serve/probe and a signed LinuxSession user-service artifact; installation is unqualified | Qualify the generated unit, desktop-session environment, restart and signal teardown on the target host |
 | Independent module loading | Implemented foundation | Real Windows/Linux product modules through a frozen ABI |
 | Request/event/hook runtime | Implemented foundation and separately granted native interface binding | Domain schema registry, interface adapters, production quotas and workload tests |
 | Startup module settings | Implemented foundation | Secure installed policy provisioning and settings migration |
@@ -58,22 +58,22 @@ feature parity with a deployed streaming host. **Pending** means not implemented
 | Historical component selection | Implemented local mechanism | Authenticated historical catalog, dependency ranges and compatible data snapshots |
 | Authentication and permissions | Implemented credentials, session/token revocation and route scopes | Production recovery/provisioning, remote TLS, session refresh and multi-user policy |
 | Pairing and host identity | Implemented Gen7 HTTP/TLS pairing, durable identity and native TLS signing | Existing clients pair; imported host identity/pairings remain usable |
-| Moonlight-compatible streaming | HTTP/TLS pairing, application lists and configured public launch/cancel, encrypted RTSP, UDP discovery, media/control delivery and synthetic-tested session coordination implemented | Display optimization, complete media negotiation, input/feedback routing, reconnect, resume and real client playback |
+| Moonlight-compatible streaming | Mac Moonlight paired and briefly displayed the KDE desktop; the live session froze after a few seconds | Sustained video and audio, input, reconnect/resume, broader negotiation and real client qualification |
 | Media UDP transport | Implemented separate native provider, audio/video FEC, media encryption and ticket-token destination discovery | Session scheduling, pacing, control feedback, network qualification and client playback |
 | Reliable control transport | Implemented Rust ENet, authenticated control, paired launch/revocation and leased keyboard/mouse dispatch | Controller/feedback routing, congestion integration and real client sessions |
 | RTSP negotiation | Implemented encrypted TCP tickets, UDP discovery, armed startup and paired launch/revocation integration | Complete profile negotiation, reconnect/resume and real client qualification |
 | Browser streaming | Pending | WebRTC signaling, media, input, reconnect and mixed-protocol ownership |
 | WGC/DXGI capture | Implemented Windows DXGI and WGC CPU readback plus persistent global output selection for new streams; hardware unqualified | Desktop transitions, hotplug recovery, fallback, hybrid GPUs and pacing |
-| Linux capture | Pending | Supported KDE Wayland paths, PipeWire/DRM and pre-login constraints |
-| Video encoders | Implemented Windows hardware Media Foundation H.264; hardware unqualified | NVIDIA/AMD/Intel, codec negotiation/probing and adapter-specific capabilities |
+| Linux capture | Implemented consent-based KDE portal/PipeWire desktop capture; first live frames reached Moonlight | Sustained capture, hotplug and recovery qualification; optional KMS and pre-login paths remain unqualified |
+| Video encoders | Implemented Windows Media Foundation H.264, optional Linux software x264 and opt-in FFmpeg NVENC H.264 source; Linux NVENC hardware unqualified | Sustained pacing, real NVENC runtime/driver and target package qualification beyond loader ABI, broader codec negotiation and adapter-specific capabilities |
 | Video processing and HDR | Implemented BGRA-to-NV12 conversion, provider selection, force-IDR and graceful video drain; HDR pending | Color conversion, HDR metadata, processing, TrueHDR and SDR fallback |
 | Physical display management | Implemented Windows classic CCD transactions; hardware unqualified | Resolution, refresh, HDR, scaling, rotation and exact topology restoration |
 | Virtual-display adapters | Implemented Sunshine owned temporary-monitor adapter; driver unqualified | Driver protocols, persistent identity, readiness, fallback and cleanup |
 | Remote Monitor | Pending | Per-client retained monitors, isolated capture, layouts and peer-safe teardown |
 | Display recovery | Implemented durable journal and explicit owner recovery | Crashes, cancellation, stale snapshots, emergency recovery and final-owner release |
-| Audio | Implemented Windows WASAPI loopback, native PCM delivery and independently packaged Opus encoding; hardware unqualified | Real capture-to-encoder-to-transport qualification, clock synchronization, resampling, surround, endpoint roles and persistent recovery |
+| Audio | Implemented Windows WASAPI and Linux Pulse-compatible monitor capture with Opus delivery; live audio remains unqualified | Sustained client playback, clock synchronization, surround, endpoint roles and recovery under server changes |
 | Keyboard/mouse | Implemented authenticated session dispatch, captured-monitor coordinate validation, expiring input leases, Windows SendInput and Linux uinput backends; hardware unqualified | Native multi-monitor/mixed-DPI qualification, layout-change continuity, layouts/text, desktop ownership and crash-surviving release cleanup |
-| Controller input | Pending | Supported profiles, VHF/other backends, rumble, force feedback and adaptive triggers |
+| Controller input | Default-off Linux uinput gamepad path with digest-bound host grant and per-session cleanup; no live grant or device qualification | Independent security review, explicit activation approval, client input tests, feedback and additional controller profiles |
 | Application lifecycle | Implemented process containment, catalog/session launch, ordered preparation, reverse undo and retained cleanup failures | Windows/Linux runtime qualification, Windows graceful quit, launcher handoff, resume, durable restart reconciliation and crash-surviving cleanup watchers |
 | Library/catalog | Implemented scalable manual catalog and authorized name/ID export; 10k durable entries tested | Artwork, provider reconciliation, legacy aliases and per-app overrides |
 | Steam/Playnite/Lutris | Implemented explicit-root Steam discovery | Session-user discovery, sync/reconciliation, artwork, launch behavior, Playnite/Lutris providers and cleanup |
@@ -83,10 +83,12 @@ feature parity with a deployed streaming host. **Pending** means not implemented
 | Frontend | Implemented management pages and signed refresh-time updates; browser visual check pending | Setup, settings, library, devices, pairing, browser stream, diagnostics and maintenance |
 | Diagnostics/history | Implemented volatile caller-scoped records/counters | Cross-component privileged aggregation, session history, persistence, export and crash bundles |
 | Migration | Pending | Previewed import of supported settings, applications, host identity and pairings |
-| Drivers and installation | Pending | Separate driver install/update flow, service registration and OS permission setup |
+| Drivers and installation | Reviewable Linux user-service artifact and read-only deployment preflight implemented; not installed | Qualify user-session startup/restart, separate driver flows and OS permission setup |
 
 Windows and Linux are release targets. macOS is currently a development host only.
 SteamOS and broader Linux environments remain explicit follow-up work.
+The live Linux package predates the latest source changes; source tests do not
+establish sustained playback or authorize input, service, or display activation.
 
 ## Regression sources
 
@@ -98,6 +100,36 @@ The current unit tests cover abstract ownership and state behavior; they do not
 claim those hardware-specific regressions are fixed in this new project.
 
 ## Current verification evidence
+
+### Linux desktop-stream candidate (2026-10-24)
+
+The Mac client has paired and briefly displayed the KDE desktop, but the live
+stream then froze. Sustained playback and input on the user's machine remain
+unqualified; this candidate has not replaced the live host.
+
+The tested Linux candidate explicitly enables a bounded software H.264 path;
+the default build does not include that encoder. Feature-gated NVENC and
+VA-API H.264 paths have source and mock coverage but
+have not been qualified on a GPU. Gamepad feedback now has a lease-scoped Linux
+producer and authenticated Moonlight control sender, with conditional haptics
+acceptance and terminal-zero cleanup tests. The user's gamepad/input grant is
+still off; no native device or client feedback was exercised.
+
+The optional `linux-x265-hevc` build has a software Main, 8-bit 4:2:0,
+BT.709-limited path. Its real shim output passed feature-on encoder/video tests,
+FFprobe reported the expected profile and color fields, FFmpeg decoded one
+64×64 access unit, and the exact bytes survived GameStream packetization and
+reassembly. HEVC is still absent from encoder enumeration and Moonlight codec
+advertisement. A real Moonlight HEVC session, dynamic capability selection and
+runtime packaging have not been qualified.
+
+On the source revision before this ledger entry, the Linux command
+`cargo test --workspace --exclude amaterasu-playnite --locked --offline --features amaterasu-encode/software-x264 --quiet`
+passed 2,892 tests with 23 ignored. Playnite is excluded from that result.
+The feature-on command
+`cargo test --locked --offline -p amaterasu-encode -p amaterasu-video --features amaterasu-encode/linux-x265-hevc --quiet`
+passed 70 encoder and 124 video tests. These are software tests and do not
+establish live client, GPU, display-mutation or privileged input behavior.
 
 For the configuration increment, the locked full workspace test suite, strict
 workspace Clippy, rustfmt check, frontend tests, configuration inventory drift

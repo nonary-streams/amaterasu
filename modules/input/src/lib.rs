@@ -1,5 +1,6 @@
 //! Caller-owned keyboard, mouse, and capability-gated gamepad input with leases.
 mod backend;
+pub mod companion_client;
 mod controller;
 mod feedback;
 #[cfg(any(target_os = "linux", windows, test))]
@@ -30,9 +31,28 @@ struct Settings {
     allow_injection: bool,
     #[serde(default = "default_uinput_path")]
     uinput_path: String,
+    #[serde(default = "default_linux_companion_socket_path")]
+    linux_companion_socket_path: String,
+    #[serde(default)]
+    windows_backend: Option<String>,
 }
 fn default_uinput_path() -> String {
     "/dev/uinput".into()
+}
+#[cfg(target_os = "linux")]
+fn default_linux_companion_socket_path() -> String {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|runtime| std::path::PathBuf::from(runtime).join("amaterasu-input.sock"))
+        .unwrap_or_else(|| {
+            let uid = unsafe { libc::geteuid() };
+            std::path::PathBuf::from(format!("/run/user/{uid}/amaterasu-input.sock"))
+        })
+        .to_string_lossy()
+        .into_owned()
+}
+#[cfg(not(target_os = "linux"))]
+fn default_linux_companion_socket_path() -> String {
+    String::new()
 }
 struct InputModule {
     runtime: RuntimeClient,
@@ -105,18 +125,38 @@ impl ManagedModule for InputModule {
         };
         let settings: Settings = serde_json::from_value(payload)
             .map_err(|error| format!("invalid input settings: {error}"))?;
-        if cfg!(target_os = "linux") && !std::path::Path::new(&settings.uinput_path).is_absolute() {
-            return Err("uinput_path must be absolute".into());
+        #[cfg(target_os = "linux")]
+        if !std::path::Path::new(&settings.linux_companion_socket_path).is_absolute() {
+            return Err("linux_companion_socket_path must be absolute".into());
         }
+        #[cfg(windows)]
+        let backend = match settings.windows_backend.as_deref() {
+            None | Some("native") => NativeBackend::new(settings.uinput_path),
+            Some("vhf_companion") => NativeBackend::new_with_companion(true),
+            Some(_) => return Err("unknown Windows input backend".into()),
+        };
+        #[cfg(not(windows))]
+        let backend = {
+            if settings.windows_backend.is_some() {
+                return Err(
+                    "Windows input backend selection is unavailable on this platform".into(),
+                );
+            }
+            #[cfg(target_os = "linux")]
+            {
+                NativeBackend::new(settings.linux_companion_socket_path, settings.uinput_path)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                NativeBackend::new(settings.uinput_path)
+            }
+        };
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
         Ok(Self {
             runtime,
-            controller: Controller::new(
-                NativeBackend::new(settings.uinput_path),
-                settings.allow_injection,
-            ),
+            controller: Controller::new(backend, settings.allow_injection),
             product_settings: ProductSettings::new(),
             queued: VecDeque::new(),
         })

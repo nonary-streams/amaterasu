@@ -43,7 +43,7 @@ The action and all fields are strict. Open fields:
 | `video_port`, `audio_port` | Fixed destination UDP ports, 1–65535; both omitted for discovery |
 | `discovery` | Optional `{video_ping_payload,audio_ping_payload}`; both are distinct 16-character unpadded base64url strings |
 | `video_bind`, `audio_bind` | Optional local socket addresses, normally port zero |
-| `video` | Optional `{packet_size:1024,fec_percentage:20,min_parity_shards:2,max_fec_blocks:1,max_batch_size_kb:64}` |
+| `video` | Optional `{codec:"h264",packet_size:1024,fec_percentage:20,min_parity_shards:2,max_fec_blocks:1,max_batch_size_kb:64}`; `codecs:["h264","hevc","av1"]` replaces `codec` with an offer that the first video packet resolves |
 | `audio` | Required `{packet_ms:5\|10,channels:2,wire_payload_bytes:N,ssrc:0}`; `ssrc` defaults to zero |
 | `stream_audio` | Optional boolean, defaults to `true`; `false` keeps the negotiated audio lane but rejects audio payloads while accepting its EOS marker |
 | `ping_timeout_ms` | Optional discovery timeout in milliseconds, 0–2147483647; defaults to 10000 |
@@ -122,9 +122,18 @@ closes its sockets. These records are in-memory, not durable.
 
 ## Admission, packetization, and delivery
 
-Each video submit contains one complete H.264 Annex B access unit. Consumers
-must assemble producer fragments before calling; an arbitrary encoder fragment
-is not a frame. Accepted video producer sequences must strictly increase and
+Each video submit carries one access unit of the stream's codec: Annex B for
+`h264` and `hevc`, one low-overhead OBU temporal unit for `av1`. H.264 remains the
+default. When `codecs` lists several codecs, the client negotiates one after the
+transport opens; the first video packet whose ABI codec is in the list fixes the
+stream's codec, and later packets of another codec are rejected. A codec here is
+a transport input contract and does not by itself enable client negotiation or
+encoder support. HEVC and AV1 producers may split an access unit into fragments
+that end with `FLAG_END_OF_ACCESS_UNIT`; the transport keeps one bounded owned copy
+until the final fragment and announces a keyframe when any fragment carried
+`FLAG_KEYFRAME`. AV1 frame types come from that flag; H.264 and HEVC frame types
+come from their NAL units. Consumers must otherwise assemble producer fragments
+before calling; an arbitrary encoder fragment is not a frame. Accepted video producer sequences must strictly increase and
 timestamps cannot regress. Wire frame indices start at one and are bounded
 before wrap; timestamps use the producer's epoch converted to the 90 kHz RTP
 clock. The video packetizer creates data and negotiated parity before each

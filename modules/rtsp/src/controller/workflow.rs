@@ -157,6 +157,12 @@ impl Controller {
         record.session = response_session(payload).or(record.session);
         let prepared = (|| {
             if payload["ok"] != true || payload["state"] != "prepared" {
+                eprintln!(
+                    "amaterasu rtsp prepare not ready state={} code={} error={}",
+                    safe_provider_code(&payload["state"]),
+                    safe_provider_code(&payload["code"]),
+                    safe_provider_code(&payload["error"]),
+                );
                 return Err("prepare_rejected");
             }
             if record
@@ -253,6 +259,7 @@ impl Controller {
             Ok(())
         })();
         if let Err(code) = prepared {
+            eprintln!("amaterasu rtsp prepare failed code={code}");
             record.close(Some(code));
             self.revoke_ticket(record.id);
             self.schedule_cleanup(record, job.caller, now);
@@ -300,6 +307,14 @@ impl Controller {
             && response_session(payload) == record.session
             && matches!(state, Some("armed" | "starting" | "active"))
             && payload["cleanup_error"].is_null();
+        if !valid {
+            eprintln!(
+                "amaterasu rtsp arm rejected state={} code={} error={}",
+                safe_provider_code(&payload["state"]),
+                safe_provider_code(&payload["code"]),
+                safe_provider_code(&payload["error"]),
+            );
+        }
         if let Some(state) = state {
             record.stream_state = Some(state.into());
         }
@@ -404,6 +419,8 @@ impl Controller {
         // The stream-session Stop/Status has confirmed cleanup even if RTSP is
         // still waiting for the TEARDOWN reply to leave the network transport.
         record.display_applied = false;
+        record.cleanup_retry_count = 0;
+        record.cleanup_retry_at = None;
         if let Some((connection, action_ticket)) = job.network {
             let reply = record
                 .negotiation
@@ -457,6 +474,35 @@ impl Controller {
             let record = self.records.get_mut(&ticket).expect("selected record");
             record.close(Some("prepare_expired"));
             self.revoke_ticket(ticket);
+        }
+        let retry_ticket = self.records.iter_mut().find_map(|(ticket, record)| {
+            if record.state != State::CleanupFailed {
+                return None;
+            }
+            if let Some(retry_at) = record.cleanup_retry_at {
+                if now < retry_at {
+                    return None;
+                }
+                record.cleanup_retry_at = None;
+                record.cleanup_error = None;
+                record.state = State::Closing;
+                return Some(*ticket);
+            }
+
+            if record.cleanup_retry_count >= MAX_CLEANUP_RETRIES {
+                return None;
+            }
+
+            let delay = CLEANUP_RETRY_DELAYS_MS[usize::from(record.cleanup_retry_count)];
+            record.cleanup_retry_count += 1;
+            record.cleanup_retry_at = Some(now.saturating_add(delay));
+            None
+        });
+        if let Some(ticket) = retry_ticket {
+            let mut record = self.records.remove(&ticket).expect("selected retry record");
+            self.schedule_cleanup(&mut record, None, now);
+            self.records.insert(ticket, record);
+            return;
         }
         if let Some(ticket) = self
             .records
@@ -584,4 +630,17 @@ impl Controller {
         self.sequence = self.sequence.saturating_add(1);
         format!("{}-{phase}-{:016x}", record.operation(), self.sequence)
     }
+}
+
+fn safe_provider_code(value: &Value) -> &str {
+    value
+        .as_str()
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .unwrap_or("unavailable")
 }

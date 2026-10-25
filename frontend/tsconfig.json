@@ -21,11 +21,13 @@
     "src/management-policy.ts",
     "src/csrf-policy.ts",
     "src/settings.ts",
+    "src/updates.ts",
     "src/locale.ts",
     "src/host_metrics.ts",
     "src/updater.ts",
     "src/system_tray.ts",
     "src/pages.ts",
+    "src/management.ts",
     "src/app.ts"
   ]
 }

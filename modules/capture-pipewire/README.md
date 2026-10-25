@@ -1,8 +1,8 @@
-# Current-user portal/PipeWire capture
+# Current-user PipeWire capture
 
 This independently built trusted native library provides control and native
 `amaterasu.capture-pipewire/1`. It requires Linux with system PipeWire, GIO and
-the current user's ScreenCast portal. Build discovery uses pkg-config for
+the current user's ScreenCast portal in the default build. Build discovery uses pkg-config for
 `libpipewire-0.3`, `gio-2.0` and `gio-unix-2.0`; unavailable development libraries
 or cross compilation build an explicit unavailable backend. Runtime shared
 libraries are distribution prerequisites. Native API grants do not sandbox code.
@@ -10,7 +10,7 @@ libraries are distribution prerequisites. Native API grants do not sandbox code.
 Settings default to disabled selection and capture:
 
 ```json
-{"enabled":false,"selection_principals":[],"capture_principals":[],"idle_timeout_seconds":60,"selection_timeout_seconds":120}
+{"enabled":false,"selection_principals":[],"capture_principals":[],"idle_timeout_seconds":60,"selection_timeout_seconds":120,"remember_source":false,"allow_named_outputs":false}
 ```
 
 An administrator-controlled startup policy must enable capture and separately
@@ -18,13 +18,14 @@ allowlist authenticated immediate callers in `selection_principals` and
 `capture_principals`. The first set may request the portal picker; the second may
 enumerate selected metadata and open a capture lease. A picker caller and capture
 caller can differ, so runtime call/native grants must independently authorize the
-video module that receives frames. Each list permits at most 16 principals. Both
-timeouts accept 1 through 300 seconds. The startup availability
-probe reads portal version, source and cursor masks only. It never creates a
+video module that receives frames. Each list permits at most 16 principals. The
+selection timeout accepts 1 through 300 seconds and the ready idle timeout
+accepts 1 through 600 seconds. The startup availability probe reads portal
+version, source and cursor masks only. It never creates a
 session or opens a picker, including when disabled. `native_supported` identifies
 the built adapter; `availability.available` separately reports the startup probe.
 Missing session bus or portal has an explicit reason. No alternate user bus,
-headless source, inherited permission, restore token, or persistent grant is used.
+headless source or inherited permission is used. Persistent permission is opt-in as described below.
 
 All control actions are lower-case:
 
@@ -37,7 +38,7 @@ All control actions are lower-case:
   The optional offset must be zero and limit is 1 through 256.
 - `{"action":"select_source","source_type":"monitor","operation_id":"choose-1"}`
   asynchronously requests a user choice. `window` is also supported. This is the
-  only action that can present a portal picker; disabled or unallowlisted calls
+  normal initial approval action; disabled or unallowlisted calls
   fail before native worker allocation. A successful response initially reports
   `selection_state:"selecting"`. At most one selection or active lease is allowed.
 - `{"action":"poll_selection","operation_id":"choose-1"}` returns the
@@ -52,8 +53,8 @@ All control actions are lower-case:
   do not reopen the picker. Use a new operation ID to request a new choice.
 - `{"action":"open","output":"portal-...","operation_id":"video-1"}`
   requires a capture principal and acquires its single caller-owned native capture lease. Optional `constant_rate`
-  defaults to false; true fails with `unsupported_constant_rate`. Open never
-  presents a picker and fails with `source_selection_required` unless ready.
+  defaults to false; true fails with `unsupported_constant_rate`. Without a ready
+  source or an enabled saved authorization, Open fails with `source_selection_required`.
 - `{"action":"lookup","operation_id":"video-1"}` recovers only that
   caller's live lease. `{"action":"close","stream":123}` is idempotent for
   its owner and closes the source session. Close atomically stops admission of
@@ -70,8 +71,8 @@ active stream. Global accepted counters may include a sink that finished
 concurrently with a close.
 
 The private C adapter owns GDBus/PipeWire structs and worker cleanup. Selection
-uses CreateSession, SelectSources (one monitor/window, hidden cursor, no restore
-token) and Start, then opens only the restricted OpenPipeWireRemote FD. Portal
+uses CreateSession, SelectSources (one monitor/window, embedded cursor) and Start,
+then opens only the restricted OpenPipeWireRemote FD. Portal
 v6 serial targeting is used when supplied; earlier portals target their returned
 node while the session is alive. One worker iterates its private GLib context and
 PipeWire loop. Bus authentication and method I/O have cancellation/deadlines;
@@ -104,23 +105,62 @@ They do not qualify actual capture. Actual user permission, nonblack desktop
 frames, desktop-to-encoder/public streaming, client playback, high-load behavior
 and distribution dependencies remain separate acceptance gates.
 
-The settings editor has an explicit PipeWire source chooser for monitors and
-windows. It uses the fixed management routes
-`/v1/capture/pipewire_status`, `pipewire_selection_begin`,
-`pipewire_selection_poll` and `pipewire_selection_cancel` with dedicated
-`capture.read` and `capture.write` scopes. Status and selection responses expose
-only availability, state, source type and validated dimensions; portal nodes,
-output IDs and bus metadata stay internal. The browser keeps the random picker
-operation handle only in memory and does not save a portal session or restore
-token.
-
-Choosing a source is an explicit user action and never happens during launch.
-Before opening capture, video enumerates the current PipeWire selection and
-requires exactly one current output with supported BGRA format and dimensions
-matching the negotiated stream. Portal geometry and display mapping are not
-supported; an incompatible source fails before capture opens, with no Windows
-provider fallback.
+Selection is explicit: a caller must request the portal picker and then open a
+lease for the selected output. This provider does not select a source during
+module startup. The settings editor and video pipeline still need integration
+for user-facing portal selection and automatic capture-to-encoder streaming;
+portal geometry and display mapping are not supported by this provider.
 
 Primary references: [ScreenCast portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html)
 and [PipeWire capture interfaces](https://docs.pipewire.org/page_tutorial5.html).
 The implementation is original; no Vibeshine capture source was copied.
+
+## Remembering a source
+
+Set `remember_source:true` in the trusted capture startup policy to request portal
+`persist_mode=2` on portals version 4 or later. The first selection still requires
+the desktop user's approval. On success, the returned single-use restore token is
+atomically stored in a private 0600 file under the user's 0700
+`$XDG_STATE_HOME/amaterasu/portal` directory (normally `~/.local/state`). Tokens
+never appear in RPC replies or logs. The record is bound to the selecting module
+principal and source type, and only the latest approved source is retained.
+
+A subsequent Open using `portal-selected-session-source` may restore that exact
+authorization when its caller is allowed both capture and selection. The provider
+waits asynchronously for real frames within the caller's existing request deadline;
+it does not report a capture lease before restoration succeeds. Cancellation stops
+a pending restoration. Close and idle expiry still release the native portal
+session; they retain only the authorization for a later stream or process restart.
+An explicit cancel-selection operation also forgets its saved authorization.
+
+Each restoration consumes the old token before requesting the portal and stores
+the replacement returned by Start. Lost completion or a storage error cannot cause
+a token to be replayed; an unavailable saved approval may require a new selection.
+KDE remains responsible for honoring or revoking permission. A removed monitor,
+revoked permission or invalid token may make the portal show its picker again.
+This is persistent permission for the selected source, not automatic approval of
+arbitrary sources or bypass of the desktop's permission system. See the
+[ScreenCast persistence contract](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html#session-persistence).
+
+
+## Owned KDE outputs
+
+The optional `linux-kwin-screencast` feature adds an independent Wayland client
+for KDE's ScreenCast protocol. It uses generated upstream protocol descriptions
+from `third-party/protocols`, plus `wayland-client` and `wayland-scanner` at build
+time. An explicitly enabled `allow_named_outputs` policy lets authorized capture
+callers open `kwin:Virtual-1` through `kwin:Virtual-8` without a portal selection.
+The exact host executable must have KDE's scoped ScreenCast declaration installed;
+missing permission fails this path instead of borrowing a remembered portal source.
+
+Each named output owns its own Wayland/PipeWire worker and bounded frame mailbox.
+Cancellation closes only its pending operation. Active leases are caller-scoped;
+closing one client cannot close another source. Workers embed the compositor
+cursor, preserve source pixel dimensions, and publish current xdg-output logical
+geometry separately from image pixels. This geometry updates when another output
+appears or disappears. PipeWire global initialization is reference-counted across
+these workers, and all workers join before module unload.
+
+The ordinary portal path, saved grants and explicit user selection remain
+independent. Named capture remains a CPU BGRA path; this feature does not provide
+private DRM DMA-BUF / encoder zero-copy transport.

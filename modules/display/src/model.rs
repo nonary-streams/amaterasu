@@ -384,6 +384,316 @@ pub struct DisplayPath {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hdr_enabled: Option<bool>,
 }
+
+/// Versioned KScreen session state retained beside the CCD snapshot in a
+/// display journal. Legacy CCD journals omit this optional field.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct KScreenSnapshot {
+    pub version: u32,
+    pub outputs: Vec<KScreenOutputSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct KScreenOutputSnapshot {
+    pub id: String,
+    pub connected: bool,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<KScreenModeSnapshot>,
+    pub position: KScreenPosition,
+    pub scale: f64,
+    /// KScreen's rotation bit, retained without translating it to degrees.
+    pub rotation: u16,
+    pub priority: u32,
+    pub primary: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KScreenModeSnapshot {
+    pub id: String,
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KScreenPosition {
+    pub x: i32,
+    pub y: i32,
+}
+
+const KSCREEN_SNAPSHOT_VERSION: u32 = 1;
+const MAX_KSCREEN_OUTPUTS: usize = 64;
+const MAX_KSCREEN_SNAPSHOT_BYTES: usize = 12_000;
+
+impl KScreenSnapshot {
+    pub fn validate(&self) -> Result<(), DisplayError> {
+        if self.version != KSCREEN_SNAPSHOT_VERSION {
+            return Err(DisplayError::new(
+                "unsupported_snapshot_version",
+                "unsupported KScreen journal snapshot version",
+            ));
+        }
+        if self.outputs.len() > MAX_KSCREEN_OUTPUTS {
+            return Err(DisplayError::new(
+                "resource_exhausted",
+                "KScreen journal contains too many outputs",
+            ));
+        }
+
+        let mut ids = BTreeSet::new();
+        let mut active_count = 0;
+        let mut primary_count = 0;
+        for output in &self.outputs {
+            if output.id.is_empty()
+                || output.id.len() > 128
+                || !output
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                || !ids.insert(output.id.to_ascii_lowercase())
+                || (output.enabled && !output.connected)
+                || output.position.x.abs_diff(0) > 65_536
+                || output.position.y.abs_diff(0) > 65_536
+                || !output.scale.is_finite()
+                || !(0.25..=5.0).contains(&output.scale)
+                || !matches!(output.rotation, 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128)
+                || output.priority > 64
+                || output.primary != (output.priority == 1)
+                || (output.primary && (!output.connected || !output.enabled))
+                || (output.enabled && output.priority == 0)
+                || (output.enabled && output.mode.is_none())
+            {
+                return Err(DisplayError::new(
+                    "invalid_snapshot",
+                    "invalid KScreen output identity or topology state",
+                ));
+            }
+            if output.connected && output.enabled {
+                active_count += 1;
+                if output.primary {
+                    primary_count += 1;
+                }
+            }
+            if let Some(mode) = &output.mode
+                && (mode.id.is_empty()
+                    || mode.id.len() > 128
+                    || !mode.id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'_' | b'-' | b'.' | b'@' | b'x')
+                    })
+                    || !(1..=16_384).contains(&mode.width)
+                    || !(1..=16_384).contains(&mode.height)
+                    || !(1_000..=10_000_000).contains(&mode.refresh_millihz))
+            {
+                return Err(DisplayError::new(
+                    "invalid_snapshot",
+                    "invalid KScreen mode identity or timing",
+                ));
+            }
+        }
+        if primary_count > 1 || (active_count > 0 && primary_count != 1) {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "KScreen snapshot must have exactly one primary enabled output",
+            ));
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| DisplayError::new("invalid_snapshot", error.to_string()))?;
+        if encoded.len() > MAX_KSCREEN_SNAPSHOT_BYTES {
+            return Err(DisplayError::new(
+                "resource_exhausted",
+                "KScreen journal snapshot exceeds its size limit",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn revision(&self) -> Result<String, DisplayError> {
+        self.validate()?;
+        let mut outputs = self.outputs.clone();
+        outputs.sort_by(|left, right| left.id.cmp(&right.id));
+        let bytes = serde_json::to_vec(&(self.version, outputs))
+            .map_err(|error| DisplayError::new("invalid_snapshot", error.to_string()))?;
+        let mut first = 0xcbf29ce484222325_u64;
+        let mut second = 0x84222325cbf29ce4_u64;
+        for byte in bytes {
+            first = (first ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            second = (second ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+        Ok(format!("{first:016x}{second:016x}"))
+    }
+
+    pub fn validate_requested_topology(
+        &self,
+        configuration: &Configuration,
+    ) -> Result<(), DisplayError> {
+        self.validate()?;
+        configuration.validate()?;
+        let active_outputs = self
+            .outputs
+            .iter()
+            .filter(|output| output.connected && output.enabled)
+            .collect::<Vec<_>>();
+        if active_outputs.len() != configuration.displays.len()
+            || configuration.displays.iter().any(|display| {
+                !active_outputs
+                    .iter()
+                    .any(|output| output.id.eq_ignore_ascii_case(&display.id))
+            })
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "KScreen apply currently requires the same connected active outputs",
+            ));
+        }
+        let saved_primary = active_outputs.iter().find(|output| output.primary);
+        let requested_primary = configuration
+            .displays
+            .iter()
+            .find(|display| display.x == 0 && display.y == 0);
+        if saved_primary
+            .zip(requested_primary)
+            .is_none_or(|(saved, requested)| !saved.id.eq_ignore_ascii_case(&requested.id))
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "KScreen direct apply must preserve the current primary output",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn matches_configuration(&self, baseline: &Self, configuration: &Configuration) -> bool {
+        if self.validate_requested_topology(configuration).is_err()
+            || baseline.validate_requested_topology(configuration).is_err()
+        {
+            return false;
+        }
+        if self.outputs.iter().any(|current| {
+            current.connected
+                && !baseline
+                    .outputs
+                    .iter()
+                    .any(|saved| saved.id.eq_ignore_ascii_case(&current.id) && saved.connected)
+        }) {
+            return false;
+        }
+        if baseline.outputs.iter().any(|saved| {
+            let current = self
+                .outputs
+                .iter()
+                .find(|current| current.id.eq_ignore_ascii_case(&saved.id));
+            match current {
+                None => saved.connected,
+                Some(current) if !saved.enabled => {
+                    saved.connected != current.connected
+                        || saved.enabled != current.enabled
+                        || saved.mode != current.mode
+                        || saved.position != current.position
+                        || saved.scale != current.scale
+                        || saved.rotation != current.rotation
+                        || saved.priority != current.priority
+                        || saved.primary != current.primary
+                        || saved.hdr_enabled != current.hdr_enabled
+                }
+                Some(current) => {
+                    saved.connected != current.connected
+                        || saved.enabled != current.enabled
+                        || saved.scale != current.scale
+                        || saved.priority != current.priority
+                        || saved.primary != current.primary
+                }
+            }
+        }) {
+            return false;
+        }
+        configuration.displays.iter().all(|display| {
+            self.outputs
+                .iter()
+                .find(|output| output.id.eq_ignore_ascii_case(&display.id))
+                .is_some_and(|output| {
+                    let rotation = match display.rotation {
+                        Rotation::Identity => 1,
+                        Rotation::Rotate90 => 2,
+                        Rotation::Rotate180 => 4,
+                        Rotation::Rotate270 => 8,
+                    };
+                    output.position.x == display.x
+                        && output.position.y == display.y
+                        && output.rotation == rotation
+                        && output.mode.as_ref().is_some_and(|mode| {
+                            mode.width == display.width
+                                && mode.height == display.height
+                                && (u64::from(display.refresh.numerator) * 1000
+                                    + u64::from(display.refresh.denominator) / 2)
+                                    / u64::from(display.refresh.denominator)
+                                    == u64::from(mode.refresh_millihz)
+                        })
+                        && match display.hdr_enabled {
+                            Some(hdr) => output.hdr_enabled == Some(hdr),
+                            None => baseline
+                                .outputs
+                                .iter()
+                                .find(|saved| saved.id.eq_ignore_ascii_case(&display.id))
+                                .is_some_and(|saved| output.hdr_enabled == saved.hdr_enabled),
+                        }
+                })
+        })
+    }
+
+    /// Compare all saved connector state after restore while tolerating a
+    /// baseline-disconnected connector that remains absent.
+    pub fn matches_restoration(&self, current: &Self) -> bool {
+        if self.validate().is_err() || current.validate().is_err() {
+            return false;
+        }
+        if current.outputs.iter().any(|present| {
+            present.connected
+                && !self
+                    .outputs
+                    .iter()
+                    .any(|saved| saved.id.eq_ignore_ascii_case(&present.id) && saved.connected)
+        }) {
+            return false;
+        }
+        self.outputs.iter().all(|saved| {
+            let Some(present) = current
+                .outputs
+                .iter()
+                .find(|present| present.id.eq_ignore_ascii_case(&saved.id))
+            else {
+                return !saved.connected;
+            };
+            if saved.connected != present.connected {
+                return false;
+            }
+            saved.enabled == present.enabled
+                && match (&saved.mode, &present.mode) {
+                    (Some(saved_mode), Some(present_mode)) => {
+                        saved_mode.width == present_mode.width
+                            && saved_mode.height == present_mode.height
+                            && saved_mode.refresh_millihz == present_mode.refresh_millihz
+                    }
+                    (None, None) => true,
+                    _ => false,
+                }
+                && saved.position == present.position
+                && saved.scale == present.scale
+                && saved.rotation == present.rotation
+                && saved.priority == present.priority
+                && saved.primary == present.primary
+                && saved.hdr_enabled == present.hdr_enabled
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
@@ -576,12 +886,31 @@ impl Snapshot {
             })
     }
 }
+
+/// The untagged on-disk shape preserves legacy CCD journal JSON exactly while
+/// allowing Linux leases to store a KScreen-only recovery baseline.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum RecoveryBaseline {
+    Ccd(Snapshot),
+    KScreen(KScreenSnapshot),
+}
+impl RecoveryBaseline {
+    pub fn validate(&self) -> Result<(), DisplayError> {
+        match self {
+            Self::Ccd(snapshot) => snapshot.validate(),
+            Self::KScreen(snapshot) => snapshot.validate(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Journal {
     pub owner: String,
     pub lease: String,
-    pub snapshot: Snapshot,
+    /// Legacy CCD objects retain their exact JSON representation.
+    pub snapshot: RecoveryBaseline,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -668,7 +997,6 @@ impl DisplayError {
             message: message.into(),
         }
     }
-    #[cfg(any(windows, test))]
     pub fn after_mutation(mut self) -> Self {
         self.may_have_changed = true;
         self

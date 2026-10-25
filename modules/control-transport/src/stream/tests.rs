@@ -157,6 +157,41 @@ fn configured_ping_timeout_applies_to_authentication_and_authenticated_idle() {
 }
 
 #[test]
+fn moonlight_encrypted_periodic_ping_refreshes_authenticated_idle_deadline() {
+    let mut stream = stream_with_ping_timeout(250);
+    let mut client = client();
+
+    for now in [100, 200, 300, 400] {
+        // Moonlight's v7 control stream sends encrypted type 0x0200 every
+        // 100 ms. These are authenticated activity even when they carry no input.
+        let ping = client.seal(0x0200, &[4, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        stream.accept_control(0, Delivery::Reliable, &ping, now);
+        stream.check_timeout(now + 249);
+        assert_eq!(stream.failure, None);
+    }
+    assert_eq!(stream.authenticated_at, Some(400));
+    assert_eq!(stream.received_messages, 4);
+}
+
+#[test]
+fn terminal_failure_logs_only_the_first_fixed_internal_code() {
+    let mut stream = stream();
+    stream.fail("peer_disconnected");
+    stream.fail("udp_receive_failed");
+
+    assert_eq!(stream.failure, Some("peer_disconnected"));
+    assert_eq!(stream.metadata(7)["failure"], "peer_disconnected");
+    assert_eq!(
+        peer_poll_failure(PeerError::ClockRegression),
+        "peer_poll_clock_regression"
+    );
+    assert_eq!(
+        peer_enqueue_failure(PeerError::Busy),
+        "peer_enqueue_busy_after_admission"
+    );
+}
+
+#[test]
 fn zero_ping_timeout_expires_immediately_and_default_is_ten_seconds() {
     let mut immediate = stream_with_ping_timeout(0);
     immediate.tick(0);

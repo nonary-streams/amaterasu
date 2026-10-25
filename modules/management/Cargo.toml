@@ -17,5 +17,8 @@ httparse.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 url = "2"
 
+[dev-dependencies]
+ed25519-dalek.workspace = true
+
 [lints]
 workspace = true

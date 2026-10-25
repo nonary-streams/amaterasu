@@ -15,11 +15,13 @@ mod tray_events;
 mod csrf_adversarial_tests;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_package::repository::RepositoryStore;
 use peer_policy::PeerTier;
 use serde::Deserialize;
 use serde_json::json;
 use server::Server;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 const SERVICE: &str = "amaterasu.management/1";
@@ -42,6 +44,7 @@ struct Settings {
 struct ManagementModule {
     runtime: RuntimeClient,
     server: Option<Server>,
+    repositories: Option<RepositoryStore>,
     operational_health: Option<OperationalHealth>,
     product_settings: product_settings::ProductSettings,
     tray_events: tray_events::TrayEventConsumer,
@@ -71,6 +74,11 @@ impl ManagedModule for ManagementModule {
         let settings: Settings =
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
         validate_settings(&settings)?;
+        let repositories = settings
+            .web
+            .as_ref()
+            .map(|web| RepositoryStore::new(web.repository_directory()?))
+            .transpose()?;
         let tls_configuration = match (
             &settings.tls_certificate_path,
             &settings.tls_private_key_path,
@@ -99,6 +107,7 @@ impl ManagedModule for ManagementModule {
         Ok(Self {
             runtime,
             server,
+            repositories,
             operational_health: None,
             product_settings: product_settings::ProductSettings::default(),
             tray_events: tray_events::TrayEventConsumer::default(),
@@ -156,7 +165,58 @@ impl ManagedModule for ManagementModule {
                         &mut |command| self.runtime.send(command),
                     );
                 }
-                let payload = if payload == json!({"action":"status"}) {
+                let payload = if payload.get("action").and_then(serde_json::Value::as_str)
+                    == Some("repository_list")
+                    && caller == "amaterasu.management"
+                {
+                    match &self.repositories {
+                        Some(store) => match store.list(
+                            &amaterasu_package::current_target(),
+                            amaterasu_package::unix_timestamp(),
+                        ) {
+                            Ok(mut repositories) => {
+                                let offset = payload
+                                    .get("offset")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0)
+                                    as usize;
+                                let mut seen = 0usize;
+                                let mut included = 0usize;
+                                for repository in &mut repositories {
+                                    repository.candidates.retain(|_| {
+                                        let keep = seen >= offset && included < 32;
+                                        seen += 1;
+                                        if keep {
+                                            included += 1;
+                                        }
+                                        keep
+                                    });
+                                }
+                                let next_offset = (seen > offset.saturating_add(included))
+                                    .then_some(offset.saturating_add(included));
+                                json!({"ok":true,"repositories":repositories,"next_offset":next_offset})
+                            }
+                            Err(_) => json!({"ok":false,"code":"repository_state_unavailable"}),
+                        },
+                        None => json!({"ok":false,"code":"repository_state_unavailable"}),
+                    }
+                } else if payload == json!({"action":"package_selection_status"})
+                    && caller == "amaterasu.management"
+                {
+                    match self.runtime.send(Command::GetPackageRoot {}) {
+                        Ok(Response::Result { payload }) => payload
+                            .get("package_root")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|root| {
+                                package_selection_status_with_running(
+                                    root,
+                                    running_package_status(&self.runtime),
+                                )
+                            })
+                            .unwrap_or_else(package_selection_unavailable),
+                        _ => package_selection_unavailable(),
+                    }
+                } else if payload == json!({"action":"status"}) {
                     json!({"ok":true,"enabled":self.server.is_some(),"bound_address":self.server.as_ref().map(Server::address),"tls_address":self.server.as_ref().and_then(Server::tls_address)})
                 } else {
                     json!({"ok":false,"code":"invalid_request"})
@@ -182,6 +242,94 @@ fn upnp_exposure_payload(
         "wan_enabled":wan_enabled,
         "tls_address":if wan_enabled { tls_address.map(|address| address.to_string()) } else { None::<String> },
     })
+}
+
+fn package_selection_status(package_root: &str) -> Option<serde_json::Value> {
+    let root = Path::new(package_root);
+    if !root.is_absolute() {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(root).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let canonical = root.canonicalize().ok()?;
+    if canonical != root {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return None;
+        }
+    }
+
+    let selection = amaterasu_package::repository::read_native_selection(root).ok()?;
+    for digest in [
+        Some(selection.revision.as_str()),
+        selection.active.as_deref(),
+        selection.previous.as_deref(),
+        selection.pending.as_deref(),
+        selection.trial.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+    }
+
+    Some(json!({
+        "ok": true,
+        "revision": selection.revision,
+        "active": selection.active,
+        "previous": selection.previous,
+        "pending": selection.pending,
+        "trial": selection.trial,
+        "highest_sequence": selection.highest_sequence.to_string(),
+    }))
+}
+
+fn package_selection_status_with_running(
+    package_root: &str,
+    running: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let mut status = package_selection_status(package_root)?;
+    status["running"] = running;
+    Some(status)
+}
+
+fn running_package_status(runtime: &RuntimeClient) -> serde_json::Value {
+    match runtime.send(Command::GetRunningPackageDigest {}) {
+        Ok(Response::Result { payload }) => {
+            running_package_status_value(payload.get("digest").and_then(serde_json::Value::as_str))
+        }
+        _ => running_package_status_value(None),
+    }
+}
+
+fn running_package_status_value(digest: Option<&str>) -> serde_json::Value {
+    digest.filter(|digest| is_sha256(digest)).map_or_else(
+        || json!({"available":false}),
+        |digest| json!({"available":true,"digest":digest}),
+    )
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn package_selection_unavailable() -> serde_json::Value {
+    json!({"ok":false,"code":"package_selection_unavailable"})
 }
 
 impl ManagementModule {
@@ -383,6 +531,15 @@ amaterasu_module_sdk::export_module!(ManagementModule);
 mod tests {
     use super::*;
 
+    fn temporary_package_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-management-selection-{}",
+            amaterasu_package::random_identifier().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        root.canonicalize().unwrap()
+    }
+
     #[test]
     fn upnp_exposure_is_internal_and_only_publishes_wan_tls_listener() {
         let tls_address = "0.0.0.0:49999".parse().unwrap();
@@ -429,5 +586,112 @@ mod tests {
             let settings = serde_json::from_value(json!({"tls_bind":bind,"tls_certificate_path":"/cert.pem","tls_private_key_path":"/key.pem"})).unwrap();
             validate_settings(&settings).unwrap();
         }
+    }
+
+    #[test]
+    fn package_selection_status_reads_fresh_bounded_phase_fields_only() {
+        let root = temporary_package_root();
+        let active = "a".repeat(64);
+        let pending = "b".repeat(64);
+        let trial = "c".repeat(64);
+        amaterasu_package::write_json_atomically(
+            &root.join("selection.json"),
+            &json!({
+                "active": active.clone(),
+                "previous": null,
+                "pending": pending.clone(),
+                "trial": trial.clone(),
+                "highest_sequence": u64::MAX,
+                "repository_sets": {"set": {"repository_id":"private-publisher", "key_fingerprint":"d".repeat(64)}},
+                "repository_floors": {},
+                "healthy_sets": [],
+            }),
+        )
+        .unwrap();
+
+        let status = package_selection_status_with_running(
+            root.to_str().unwrap(),
+            running_package_status_value(Some(&"e".repeat(64))),
+        )
+        .unwrap();
+        assert_eq!(status["ok"], true);
+        assert!(is_sha256(status["revision"].as_str().unwrap()));
+        assert_eq!(status["active"], active);
+        assert_eq!(status["previous"], serde_json::Value::Null);
+        assert_eq!(status["pending"], pending);
+        assert_eq!(status["trial"], trial);
+        assert_eq!(status["highest_sequence"], u64::MAX.to_string());
+        assert_eq!(status["running"]["available"], true);
+        assert_eq!(status["running"]["digest"], "e".repeat(64));
+        assert!(status.get("package_root").is_none());
+        assert!(status.get("repository_sets").is_none());
+        assert!(!status.to_string().contains("private-publisher"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_selection_status_fails_closed_for_missing_malformed_or_unsafe_state() {
+        let root = temporary_package_root();
+        let empty = package_selection_status(root.to_str().unwrap()).unwrap();
+        assert_eq!(empty["active"], serde_json::Value::Null);
+        assert_eq!(empty["pending"], serde_json::Value::Null);
+        assert_eq!(
+            empty["revision"],
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+
+        std::fs::write(root.join("selection.json"), b"not json").unwrap();
+        assert!(package_selection_status(root.to_str().unwrap()).is_none());
+
+        amaterasu_package::write_json_atomically(
+            &root.join("selection.json"),
+            &json!({
+                "active": "A".repeat(64),
+                "previous": null,
+                "pending": null,
+                "trial": null,
+                "highest_sequence": 1,
+                "repository_sets": {},
+                "repository_floors": {},
+                "healthy_sets": [],
+            }),
+        )
+        .unwrap();
+        assert!(package_selection_status(root.to_str().unwrap()).is_none());
+        assert!(package_selection_status("relative/package-root").is_none());
+        assert_eq!(
+            running_package_status_value(None),
+            json!({"available":false})
+        );
+        assert_eq!(
+            running_package_status_value(Some("not-a-digest")),
+            json!({"available":false})
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_selection_status_rejects_symlinked_state_files_and_roots() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_package_root();
+        let target = root.join("target.json");
+        std::fs::write(
+            &target,
+            br#"{"active":null,"previous":null,"pending":null,"trial":null,"highest_sequence":0,"repository_sets":{},"repository_floors":{},"healthy_sets":[]}"#,
+        )
+        .unwrap();
+        symlink(&target, root.join("selection.json")).unwrap();
+        assert!(package_selection_status(root.to_str().unwrap()).is_none());
+
+        let alias = root.with_extension("alias");
+        symlink(&root, &alias).unwrap();
+        assert!(package_selection_status(alias.to_str().unwrap()).is_none());
+
+        std::fs::remove_file(alias).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

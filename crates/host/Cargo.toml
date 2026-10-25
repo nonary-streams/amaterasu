@@ -9,9 +9,16 @@ amaterasu-abi.workspace = true
 amaterasu-contracts.workspace = true
 amaterasu-logging.workspace = true
 amaterasu-package.workspace = true
+amaterasu-input-companion.workspace = true
 libloading.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+ed25519-dalek.workspace = true

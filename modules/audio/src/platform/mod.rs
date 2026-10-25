@@ -25,19 +25,21 @@ pub fn virtual_sink_cleanup_pending() -> bool {
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    not(windows),
-    expect(
-        dead_code,
-        reason = "device recovery options are consumed by the Windows capture backend"
-    )
-)]
 pub struct RecoveryConfig {
     pub endpoint: String,
     pub follow_console_default: bool,
     pub virtual_channels: Option<u32>,
+    pub capture_format: Option<crate::model::PcmCaptureFormat>,
+    #[cfg_attr(
+        not(windows),
+        expect(dead_code, reason = "Windows recovery format policy")
+    )]
     pub preferred_valid_bits: Option<u16>,
     pub capture_sink_without_routing: bool,
+    #[cfg_attr(
+        not(windows),
+        expect(dead_code, reason = "Windows recovery route policy")
+    )]
     pub explicit_route: bool,
     #[cfg(target_os = "linux")]
     route_lease: Option<std::sync::Arc<linux::RouteLease>>,
@@ -79,6 +81,7 @@ mod unsupported {
             _: &str,
             _: Option<&str>,
             _: Option<u32>,
+            _: Option<crate::model::PcmCaptureFormat>,
             _: bool,
             _: bool,
         ) -> AudioResult<Self> {

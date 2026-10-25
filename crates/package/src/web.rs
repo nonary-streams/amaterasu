@@ -1,7 +1,9 @@
 //! Independently signed static web bundles. A pointer replacement changes the UI
 //! without changing the native component selection or requiring a host restart.
 mod publication;
-pub use publication::{prepare_bundle, stage_bundle};
+pub use publication::{
+    prepare_bundle, restore_previous, restore_version, stage_bundle, stage_repository_bundle,
+};
 
 use crate::{
     PackageResult, ReleaseSignature, decode_hex, read_bounded, read_json, sha256,
@@ -37,6 +39,21 @@ pub struct Manifest {
 pub struct Selection {
     pub digest: String,
     pub highest_sequence: u64,
+    #[serde(default)]
+    pub active_sequence: Option<u64>,
+    #[serde(default)]
+    pub previous_digest: Option<String>,
+    #[serde(default)]
+    pub publisher_floors: BTreeMap<String, PublisherFloor>,
+    #[serde(default)]
+    pub project_floor: Option<PublisherFloor>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublisherFloor {
+    pub sequence: u64,
+    pub digest: String,
 }
 
 pub struct VerifiedBundle {
@@ -79,6 +96,33 @@ pub fn read_selection(root: &Path) -> PackageResult<Selection> {
     if selection.digest != selection.digest.to_ascii_lowercase() {
         return Err("invalid web selection digest".into());
     }
+    if let Some(previous) = &selection.previous_digest {
+        decode_hex::<32>(previous)?;
+        if previous != &previous.to_ascii_lowercase() || previous == &selection.digest {
+            return Err("invalid previous web selection digest".into());
+        }
+    }
+    if selection
+        .active_sequence
+        .is_some_and(|active| active > selection.highest_sequence)
+    {
+        return Err("web active sequence exceeds accepted sequence".into());
+    }
+    for (fingerprint, floor) in &selection.publisher_floors {
+        decode_hex::<32>(fingerprint)?;
+        decode_hex::<32>(&floor.digest)?;
+        if fingerprint != &fingerprint.to_ascii_lowercase()
+            || floor.digest != floor.digest.to_ascii_lowercase()
+        {
+            return Err("invalid publisher web release floor".into());
+        }
+    }
+    if let Some(floor) = &selection.project_floor {
+        decode_hex::<32>(&floor.digest)?;
+        if floor.digest != floor.digest.to_ascii_lowercase() {
+            return Err("invalid project web release floor".into());
+        }
+    }
     Ok(selection)
 }
 
@@ -90,7 +134,12 @@ pub fn load_selected(
     let selection = read_selection(root)?;
     let directory = safe_directory(root, &format!("bundles/{}", selection.digest))?;
     let bundle = verify_bundle(&directory, keys, now)?;
-    if bundle.digest != selection.digest || bundle.manifest.sequence != selection.highest_sequence {
+    if bundle.digest != selection.digest
+        || bundle.manifest.sequence
+            != selection
+                .active_sequence
+                .unwrap_or(selection.highest_sequence)
+    {
         return Err("web selection does not match signed bundle".into());
     }
     Ok(bundle)

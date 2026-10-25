@@ -30,7 +30,13 @@ impl Controller {
                     connection,
                     ticket,
                     reason,
-                } => self.disconnected(connection, ticket, reason),
+                } => {
+                    eprintln!(
+                        "amaterasu rtsp connection closed reason={reason} authenticated={}",
+                        ticket.is_some()
+                    );
+                    self.disconnected(connection, ticket, reason);
+                }
             }
         }
     }
@@ -48,6 +54,7 @@ impl Controller {
         request: Request,
         now: u64,
     ) {
+        eprintln!("amaterasu rtsp request method={:?}", request.method);
         let Some(mut record) = self.records.remove(&ticket) else {
             self.reply_status(connection, request.cseq, 454);
             return;
@@ -91,6 +98,8 @@ impl Controller {
                 if !completed {
                     record.negotiated_encryption = None;
                     record.client_feature_flags = None;
+                    record.negotiated_color = None;
+                    record.negotiated_video = None;
                 }
             }
             Ok(NegotiationStep::Action {
@@ -144,6 +153,11 @@ impl Controller {
                 });
             }
             Err(error) => {
+                eprintln!(
+                    "amaterasu rtsp rejection method={:?} status={} reason={error:?}",
+                    request.method,
+                    error.status()
+                );
                 let replied = self.reply_status(connection, request.cseq, error.status());
                 record.close(Some("negotiation_failed"));
                 if replied {
@@ -244,6 +258,7 @@ impl Controller {
         action_ticket: u64,
         failure: &'static str,
     ) {
+        eprintln!("amaterasu rtsp action failed reason={failure}");
         let reply = record
             .negotiation
             .as_mut()

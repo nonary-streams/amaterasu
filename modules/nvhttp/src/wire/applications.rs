@@ -1,5 +1,6 @@
 //! Collect one catalog revision completely before publishing a Moonlight app list.
 use super::{Call, Job, Purpose, Reply, Router, xml};
+use crate::launch::DESKTOP_APP_ID;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -44,16 +45,18 @@ pub(super) struct Applications {
     last_id: Option<u32>,
     entries: usize,
     pages: usize,
+    desktop_enabled: bool,
     body: String,
 }
 
 impl Applications {
-    pub fn new() -> Self {
+    pub fn new(desktop_enabled: bool) -> Self {
         Self {
             revision: None,
             last_id: None,
             entries: 0,
             pages: 0,
+            desktop_enabled,
             body: PREFIX.into(),
         }
     }
@@ -102,6 +105,12 @@ impl Applications {
 
     fn append(&mut self, entry: Entry) -> Result<(), Reply> {
         let id = numeric_id(&entry.id).map_err(|message| xml::error(502, message))?;
+        if self.desktop_enabled && id == DESKTOP_APP_ID {
+            return Err(xml::error(
+                502,
+                "catalog ID conflicts with the Desktop app ID",
+            ));
+        }
         if self.last_id.is_some_and(|previous| id <= previous) {
             return Err(xml::error(502, "catalog IDs are duplicated or not ordered"));
         }
@@ -116,8 +125,13 @@ impl Applications {
             "<App><AppTitle>{}</AppTitle><ID>{id}</ID><IsHdrSupported>0</IsHdrSupported></App>",
             xml::escape(&entry.name)
         );
+        let desktop_bytes = if self.desktop_enabled {
+            format!("<App><AppTitle>Desktop</AppTitle><ID>{DESKTOP_APP_ID}</ID><IsHdrSupported>0</IsHdrSupported></App>").len()
+        } else {
+            0
+        };
         if self.entries >= MAX_ENTRIES
-            || self.body.len() + entry_xml.len() + SUFFIX.len() > MAX_XML_BYTES
+            || self.body.len() + entry_xml.len() + desktop_bytes + SUFFIX.len() > MAX_XML_BYTES
         {
             return Err(xml::error(
                 413,
@@ -131,6 +145,9 @@ impl Applications {
     }
 
     fn finish(mut self) -> Reply {
+        if self.desktop_enabled {
+            self.body.push_str(&desktop_xml());
+        }
         self.body.push_str(SUFFIX);
         Reply {
             status: 200,
@@ -139,6 +156,12 @@ impl Applications {
             requires_paired_tls: true,
         }
     }
+}
+
+fn desktop_xml() -> String {
+    format!(
+        "<App><AppTitle>Desktop</AppTitle><ID>{DESKTOP_APP_ID}</ID><IsHdrSupported>0</IsHdrSupported></App>"
+    )
 }
 
 fn decode_page(payload: Value) -> Result<Page, Reply> {
@@ -198,7 +221,7 @@ impl Router {
         if self
             .jobs
             .values()
-            .filter(|job| matches!(job.purpose, Purpose::Applications))
+            .filter(|job| matches!(job.purpose, Purpose::Applications { .. }))
             .count()
             >= MAX_ACTIVE_LISTS
         {
@@ -206,7 +229,9 @@ impl Router {
         }
         self.queue(
             Some(connection),
-            Purpose::Applications,
+            Purpose::Applications {
+                desktop_enabled: self.launches.desktop_enabled(),
+            },
             json!({"action":"export_list","limit":PAGE_SIZE}),
             now + LIST_TIMEOUT,
             now,
@@ -230,9 +255,23 @@ impl Router {
             );
             return None;
         };
-        let result = result
-            .map_err(|_| xml::error(503, "catalog export request failed"))
-            .and_then(|payload| applications.accept(payload));
+        let result = match result {
+            Ok(payload)
+                if applications.desktop_enabled
+                    && applications.pages == 0
+                    && payload["ok"] == false
+                    && payload["error"]["code"] != "revision_conflict" =>
+            {
+                complete(&job, applications.finish(), replies);
+                return None;
+            }
+            Ok(payload) => applications.accept(payload),
+            Err(_) if applications.desktop_enabled && applications.pages == 0 => {
+                complete(&job, applications.finish(), replies);
+                return None;
+            }
+            Err(_) => Err(xml::error(503, "catalog export request failed")),
+        };
         match result {
             Ok(Some(cursor)) => {
                 job.applications = Some(applications);

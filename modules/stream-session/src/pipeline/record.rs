@@ -1,5 +1,6 @@
 use super::input::TouchPort;
 use super::{Drive, rpc, workflow::Step};
+use crate::plane::RumbleCommand;
 use crate::{
     model::{PrepareConfig, StartConfig},
     plane::Handles,
@@ -31,7 +32,7 @@ impl State {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Resource {
     Session,
     AudioEncoder,
@@ -102,6 +103,7 @@ pub(super) struct Record {
     pub capture_geometry: Option<CaptureGeometry>,
     pub input_absolute_pointer: bool,
     pub input_controller_supported: bool,
+    pub client_haptics_requested: bool,
     pub input_pen_touch_supported: bool,
     pub input_native_pen_touch: bool,
     pub touch_port: Option<TouchPort>,
@@ -112,6 +114,8 @@ pub(super) struct Record {
     pub limiter_attempted: bool,
     pub limiter_lease: Option<String>,
     pub limiter_state: String,
+    pub virtual_display_attempted: bool,
+    pub virtual_display_output: Option<String>,
     pub display_attempted: bool,
     pub display_lease: Option<String>,
     pub display_status_verified: bool,
@@ -119,7 +123,6 @@ pub(super) struct Record {
     pub display_applied: bool,
     pub owns_display_restore: bool,
     pub display_operation_id: Option<String>,
-    pub virtual_display_attempted: bool,
     pub virtual_display_reference_owned: bool,
     pub virtual_display_status_verified: bool,
     pub virtual_display_remove_attempted: bool,
@@ -131,7 +134,12 @@ pub(super) struct Record {
     pub input_expires_at: u64,
     pub input_renew_at: u64,
     pub feedback_poll_at: u64,
+    pub rumble_poll_at: u64,
     pub feedback_ack_through: Option<u64>,
+    pub rumble_pending: BTreeMap<u16, (RumbleCommand, Option<u64>)>,
+    pub rumble_active_until: BTreeMap<u16, u64>,
+    pub rumble_shutdown_deadline: Option<u64>,
+    pub rumble_stop_unconfirmed: bool,
     pub input_events: VecDeque<Value>,
     pub input_inflight: usize,
     pub input_events_sent: u64,
@@ -183,6 +191,7 @@ impl Record {
             capture_geometry: None,
             input_absolute_pointer: false,
             input_controller_supported: false,
+            client_haptics_requested: false,
             input_pen_touch_supported: false,
             input_native_pen_touch: false,
             touch_port: None,
@@ -193,6 +202,8 @@ impl Record {
             limiter_attempted: false,
             limiter_lease: None,
             limiter_state: "not_requested".into(),
+            virtual_display_attempted: false,
+            virtual_display_output: None,
             display_attempted: false,
             display_lease: None,
             display_status_verified: false,
@@ -200,7 +211,6 @@ impl Record {
             display_applied: false,
             owns_display_restore: false,
             display_operation_id: None,
-            virtual_display_attempted: false,
             virtual_display_reference_owned: false,
             virtual_display_status_verified: false,
             virtual_display_remove_attempted: false,
@@ -212,7 +222,12 @@ impl Record {
             input_expires_at: 0,
             input_renew_at: 0,
             feedback_poll_at: 0,
+            rumble_poll_at: 0,
             feedback_ack_through: None,
+            rumble_pending: BTreeMap::new(),
+            rumble_active_until: BTreeMap::new(),
+            rumble_shutdown_deadline: None,
+            rumble_stop_unconfirmed: false,
             input_events: VecDeque::new(),
             input_inflight: 0,
             input_events_sent: 0,
@@ -286,6 +301,13 @@ impl Record {
             control_transport: get(Resource::Control)?,
             stream_audio: self.config.stream_audio,
             audio_channels: self.config.audio.channels,
+            video_codec: self
+                .start
+                .as_ref()
+                .ok_or("missing_start_configuration")?
+                .configuration
+                .codec
+                .abi_id(),
         })
     }
 
@@ -340,10 +362,16 @@ impl Record {
             "unsupported_controls": self.unsupported_controls,
             "rejected_controls": self.rejected_controls,
             "input_active": self.input_lease.is_some(),
+            "remote_rumble_stop_unconfirmed": self.rumble_stop_unconfirmed,
             "absolute_input": self.input_lease.is_some()
                 && self.capture_geometry.is_some()
                 && self.input_absolute_pointer,
             "controller_input": self.input_lease.is_some()
+                && self.input_controller_supported,
+            "haptics_feedback_available": self.input_lease.is_some()
+                && self.input_controller_supported,
+            "haptics_feedback_enabled": self.client_haptics_requested
+                && self.input_lease.is_some()
                 && self.input_controller_supported,
             "input_events_sent": self.input_events_sent,
             "input_batches": self.input_batches,
@@ -390,7 +418,7 @@ impl Record {
             }
             Resource::Video => {
                 let start = self.start.as_ref().expect("validated start workflow");
-                json!({"action":"open","capture_provider":start.capture_provider,"output":start.output,
+                json!({"action":"open","capture_provider":start.capture_provider,"output":self.virtual_display_output.as_deref().unwrap_or(&start.output),
                     "constant_rate":start.constant_rate,"minimum_fps_target":start.minimum_fps_target,
                     "wgc_pacing_smoothing":start.wgc_pacing_smoothing,"encoder":start.encoder,
                     "configuration":start.configuration,"packet_boundaries":true})
@@ -402,6 +430,13 @@ impl Record {
                     "virtual_sink":start.virtual_sink,
                     "channels":start.channels,
                     "host_audio_enabled":start.host_audio_enabled});
+                if self.config.stream_audio {
+                    payload["capture_format"] = json!({
+                        "sample_rate": 48_000,
+                        "channels": self.config.audio.channels,
+                        "sample_format": "f32"
+                    });
+                }
                 if self.config.stream_audio && start.continuous_audio == Some(true) {
                     payload["continuous_audio"] = json!({"packet_ms":config.audio.packet_ms});
                 }

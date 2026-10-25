@@ -82,6 +82,13 @@ browser API calls.
 - Overview shows actual responses from catalog, sessions, applications, and Steam.
   Missing authority or failed services appear unavailable. Counts ending in `+`
   are bounded page counts, not invented global totals.
+- Host & devices shows pending pairing requests, allows an administrator with
+  `pairing.admin` to submit a four-digit device PIN, and reports host listeners,
+  streaming history health, and management sessions using their existing read
+  scopes. PIN input is cleared on submission and is not stored or rendered as
+  text. Approval advances the pairing protocol; it does not claim the device
+  completed pairing. If an approval response is interrupted, the page refreshes
+  current request status without replaying the PIN mutation.
 - Catalog list/search with revision-bound next/previous pagination, including empty
   search pages with valid continuations. Create, edit, and delete use expected
   catalog revisions; conflicts require refresh and are never retried silently.
@@ -117,6 +124,12 @@ browser API calls.
 - Process inventory and termination with confirmation, plus explicit status refresh.
 - Steam provider refresh, discovery pages, partial-scan warnings, and scan status.
 - Diagnostic records, bounded journal pagination, retention warnings, and counters.
+- Modules & UI reads verified publisher catalogs with `configuration.read`, separating
+  approved, revoked, and currently available choices. A separate status request
+  shows persisted native package selection phases and the host-reported package
+  digest loaded in the worker; this does not establish individual module health.
+  Approval, refresh, installation, staging, activation, and recovery remain explicit
+  CLI workflows; the page shows the host recovery/status commands without invoking them.
 - Host logging settings confirm the saved revision and separately read signed
   diagnostics status. The editor distinguishes pending application from healthy,
   disabled, and failed disk delivery; older status replies leave delivery unverified.

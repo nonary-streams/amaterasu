@@ -6078,6 +6078,43 @@ var Amaterasu;
         return saved;
     }
     Amaterasu.saveNvhttpHostSettings = saveNvhttpHostSettings;
+    async function saveNvhttpAudioSettings(api, current, streamAudio, audioSink) {
+        if (!Number.isSafeInteger(current.revision) || current.revision < 0 || current.revision >= Number.MAX_SAFE_INTEGER ||
+            typeof current.configured_hostname !== "string" || current.configured_hostname.length > 128 ||
+            /[\u0000-\u001f\u007f-\u009f]/.test(current.configured_hostname) ||
+            !Number.isSafeInteger(current.port) || current.port < 1029 || current.port > 65514 ||
+            typeof current.stream_audio !== "boolean" ||
+            !(current.configured_audio_sink === null || typeof current.configured_audio_sink === "string"))
+            throw new Error("Current Moonlight host settings cannot be safely updated.");
+        if (current.configured_audio_sink !== null)
+            parseAudioSinkSelection(current.configured_audio_sink);
+        if (typeof streamAudio !== "boolean")
+            throw new Error("Choose whether future streams should include host audio.");
+        const configuredAudioSink = parseAudioSinkSelection(audioSink);
+        const preservedPolicyFields = [
+            "port", "audio_sink_capture_only", "nvenc_spatial_aq", "lan_encryption_mode", "wan_encryption_mode",
+        ];
+        const persistedHostSettings = (reply) => Object.fromEntries(Object.entries(reply).filter(([field]) => (field.startsWith("configured_") && field !== "configured_audio_sink") ||
+            preservedPolicyFields.includes(field)));
+        const confirms = (reply) => reply.revision === current.revision + 1 &&
+            reply.stream_audio === streamAudio &&
+            reply.configured_audio_sink === configuredAudioSink &&
+            sameConfigurationValue(persistedHostSettings(reply), persistedHostSettings(current));
+        const updated = parseNvhttpSettingsReply(await api.post("nvhttp/settings_update", {
+            hostname: current.configured_hostname,
+            port: current.port,
+            expected_revision: current.revision,
+            stream_audio: streamAudio,
+            audio_sink: configuredAudioSink,
+        }));
+        if (!confirms(updated))
+            throw new Error("Audio preferences could not be confirmed without persisted host settings changing. Refresh and check the current values.");
+        const saved = parseNvhttpSettingsReply(await api.post("nvhttp/settings"));
+        if (!confirms(saved))
+            throw new Error("Audio preferences could not be confirmed after saving without persisted host settings changing. Refresh and check the current values.");
+        return saved;
+    }
+    Amaterasu.saveNvhttpAudioSettings = saveNvhttpAudioSettings;
     class NvhttpSettingsLoadGate {
         generation = 0;
         invalidate() {
@@ -6100,6 +6137,69 @@ var Amaterasu;
         }
     }
     Amaterasu.NvhttpSettingsLoadGate = NvhttpSettingsLoadGate;
+    function renderNvhttpAudioSettings(context, settings, endpoints, discoveryIssue, reload) {
+        const form = Amaterasu.el("form", "settings-form");
+        const streamAudio = Amaterasu.input("stream_audio_preference", "", "checkbox");
+        streamAudio.checked = settings.stream_audio;
+        const audioSink = Amaterasu.el("select");
+        audioSink.name = "audio_sink_preference";
+        const automatic = Amaterasu.el("option", "", "Automatic (host startup endpoint)");
+        automatic.value = "";
+        audioSink.append(automatic);
+        for (const endpoint of endpoints) {
+            if (!endpoint.name || endpoint.name.length > 512 || /[\u0000-\u001f\u007f-\u009f]/.test(endpoint.name))
+                continue;
+            const option = Amaterasu.el("option", "", `${endpoint.name}${endpoint.default_multimedia ? " (default)" : ""} (${endpoint.id})`);
+            option.value = endpoint.id;
+            audioSink.append(option);
+        }
+        const configuredAudioSink = settings.configured_audio_sink;
+        if (configuredAudioSink !== null && !endpoints.some(({ id }) => id === configuredAudioSink)) {
+            try {
+                if (parseAudioSinkSelection(configuredAudioSink) === configuredAudioSink) {
+                    const saved = Amaterasu.el("option", "", `Saved endpoint (not currently listed): ${configuredAudioSink}`);
+                    saved.value = configuredAudioSink;
+                    audioSink.append(saved);
+                }
+            }
+            catch {
+            }
+        }
+        audioSink.value = configuredAudioSink ?? "";
+        const status = Amaterasu.el("div");
+        const save = Amaterasu.el("button", "button primary", "Save audio preferences");
+        save.type = "submit";
+        save.disabled = !context.api.allows("configuration.write");
+        form.append(Amaterasu.field("Include host audio in future streams", streamAudio, "Applications and paired-device overrides may choose a different value."), Amaterasu.field("Audio capture endpoint", audioSink, "Automatic follows the host startup endpoint. A named endpoint applies to future streams."), ...(discoveryIssue ? [Amaterasu.el("p", "muted", discoveryIssue)] : []), ...(!context.api.allows("configuration.write")
+            ? [Amaterasu.el("p", "muted", "Saving audio preferences requires configuration.write permission.")]
+            : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+        form.addEventListener("submit", (event) => {
+            event.preventDefault();
+            if (!form.reportValidity())
+                return;
+            void Amaterasu.runAction(save, status, async () => {
+                if (!context.api.allows("configuration.write")) {
+                    status.replaceChildren(Amaterasu.el("p", "error", "Saving audio preferences requires configuration.write permission."));
+                    return;
+                }
+                try {
+                    await saveNvhttpAudioSettings(context.api, settings, streamAudio.checked, audioSink.value);
+                }
+                catch (error) {
+                    if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                        await reload();
+                        context.notify("Host settings changed elsewhere. Review the latest audio preferences before saving again.");
+                        return;
+                    }
+                    throw error;
+                }
+                await reload();
+                context.notify("Audio preferences saved and read back. They apply to future streams.");
+            });
+        });
+        return Amaterasu.panel("Future stream audio", form);
+    }
+    Amaterasu.renderNvhttpAudioSettings = renderNvhttpAudioSettings;
     async function recoverNvhttpSaveFailure(code, reload, notify) {
         if (code !== "revision_conflict" &&
             !["listener_apply_pending", "listener_apply_failed", "listener_not_active"].includes(code))
@@ -8449,7 +8549,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save input policy");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("Controller input", controller, "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue."), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick, "For the DS4 profile, maps Back to a touchpad click when that backend supports it. The preference stays saved if the selected backend cannot apply it."), Amaterasu.field("Motion sensors select DS4 when automatic", motionAsDs4, "In automatic mode, selects the PlayStation controller profile when the client reports motion sensors."), Amaterasu.field("Touchpad selects DS4 when automatic", touchpadAsDs4, "In automatic mode, selects the PlayStation controller profile when the client reports a touchpad."), Amaterasu.field("Proton DualSense compatibility", protonDualsenseCompatibility, "For Proton launches, preserve Sony audio and device names unless the application launch already sets those variables."), Amaterasu.field("Randomize DS5 inputtino MAC", ds5InputtinoRandomizeMac, "On Linux, randomize the emulated DS5 controller MAC instead of deriving it from the controller slot."), Amaterasu.field("Native pen and touch policy", nativePenTouch, "Windows-only global preference. Native pen/touch event transport and platform support are not implemented; saving this value does not activate pen or touch events."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), keybindings.field, Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux and Windows, when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other platforms do not inject gamepads."), Amaterasu.field("Gamepad profile", gamepadProfile, "Profiles listed by input status are supported by this backend. A saved platform-recognized profile outside that list remains visible and is labeled unavailable."), gamepadStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
+                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("Controller input", controller, "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue."), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick, "For the DS4 profile, maps Back to a touchpad click when that backend supports it. The preference stays saved if the selected backend cannot apply it."), Amaterasu.field("Motion sensors select DS4 when automatic", motionAsDs4, "In automatic mode, selects the PlayStation controller profile when the client reports motion sensors."), Amaterasu.field("Touchpad selects DS4 when automatic", touchpadAsDs4, "In automatic mode, selects the PlayStation controller profile when the client reports a touchpad."), Amaterasu.field("Proton DualSense compatibility", protonDualsenseCompatibility, "For Proton launches, preserve Sony audio and device names unless the application launch already sets those variables."), Amaterasu.field("Randomize DS5 inputtino MAC", ds5InputtinoRandomizeMac, "On Linux, randomize the emulated DS5 controller MAC instead of deriving it from the controller slot."), Amaterasu.field("Native pen and touch policy", nativePenTouch, "On Linux, the companion can map one Touch contact to mouse emulation when this setting is enabled and the caller has the mouse grant. Native Linux Pen events and multitouch are unsupported; this does not create a native touch device. Windows native pen/touch support depends on backend capability."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), keybindings.field, Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux and Windows, when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other platforms do not inject gamepads."), Amaterasu.field("Gamepad profile", gamepadProfile, "Profiles listed by input status are supported by this backend. A saved platform-recognized profile outside that list remains visible and is labeled unavailable."), gamepadStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
@@ -8672,6 +8772,7 @@ var Amaterasu;
                 automaticAudioSink.value = "";
                 audioSink.append(automaticAudioSink);
                 let audioDiscoveryIssue = null;
+                const audioEndpoints = [];
                 if (context.api.allows("media.read")) {
                     try {
                         const discovered = await context.api.post("media/audio_endpoints");
@@ -8679,8 +8780,12 @@ var Amaterasu;
                             return;
                         for (const endpoint of discovered.endpoints) {
                             try {
-                                if (!endpoint.id || parseAudioSinkSelection(endpoint.id) !== endpoint.id)
+                                if (!endpoint.id || typeof endpoint.name !== "string" ||
+                                    typeof endpoint.default_multimedia !== "boolean" ||
+                                    parseAudioSinkSelection(endpoint.id) !== endpoint.id ||
+                                    audioEndpoints.some((current) => current.id === endpoint.id))
                                     continue;
+                                audioEndpoints.push(endpoint);
                                 const option = Amaterasu.el("option", "", settingsTextLiteral(`${endpoint.name}${endpoint.default_multimedia ? " (default)" : ""} (${endpoint.id})`));
                                 option.value = endpoint.id;
                                 audioSink.append(option);
@@ -8880,7 +8985,7 @@ var Amaterasu;
                     });
                 });
                 if (hostLoads.isCurrent(generation))
-                    hostArea.replaceChildren(Amaterasu.panel("Moonlight host settings", form));
+                    hostArea.replaceChildren(Amaterasu.panel("Moonlight host settings", form), renderNvhttpAudioSettings(context, settings, audioEndpoints, audioDiscoveryIssue, loadHost));
             }
             catch (error) {
                 if (context.content.isConnected && (generation === null || hostLoads.isCurrent(generation)))
@@ -9005,6 +9110,304 @@ var Amaterasu;
         void loadPairing();
     }
     Amaterasu.renderSettings = renderSettings;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    function parsePackageSelectionStatus(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Package selection response is invalid.");
+        const reply = value;
+        if (reply.ok !== true)
+            throw new Error("Persisted package selection is unavailable.");
+        if (typeof reply.revision !== "string" || !/^[a-f0-9]{64}$/.test(reply.revision))
+            throw new Error("Package selection revision is invalid.");
+        const digest = (key) => {
+            const candidate = reply[key];
+            if (candidate === null)
+                return null;
+            if (typeof candidate !== "string" || !/^[a-f0-9]{64}$/.test(candidate))
+                throw new Error("Package selection digest is invalid.");
+            return candidate;
+        };
+        const highestSequence = reply.highest_sequence;
+        if (typeof highestSequence !== "string" ||
+            !/^(0|[1-9][0-9]{0,19})$/.test(highestSequence) ||
+            (highestSequence.length === 20 && highestSequence > "18446744073709551615"))
+            throw new Error("Package selection sequence is invalid.");
+        const runningReply = reply.running;
+        if (!runningReply || typeof runningReply !== "object" || Array.isArray(runningReply))
+            throw new Error("Running package status is invalid.");
+        const running = runningReply;
+        if (running.available === true) {
+            if (typeof running.digest !== "string" || !/^[a-f0-9]{64}$/.test(running.digest))
+                throw new Error("Running package digest is invalid.");
+        }
+        else if (running.available !== false || running.digest !== undefined) {
+            throw new Error("Running package status is invalid.");
+        }
+        return {
+            revision: reply.revision,
+            active: digest("active"),
+            previous: digest("previous"),
+            pending: digest("pending"),
+            trial: digest("trial"),
+            highestSequence,
+            running: {
+                available: running.available,
+                digest: running.available === true ? running.digest : null,
+            },
+        };
+    }
+    Amaterasu.parsePackageSelectionStatus = parsePackageSelectionStatus;
+    function summarizeRepositoryState(repositories) {
+        const approved = repositories.filter((repository) => !repository.revoked);
+        const revoked = repositories.filter((repository) => repository.revoked);
+        const candidates = approved.flatMap((repository) => repository.candidates);
+        return {
+            approved: approved.length,
+            revoked: revoked.length,
+            verifiedCandidates: candidates.length,
+            uiCandidates: candidates.filter((candidate) => candidate.kind === "web_bundle").length,
+            nativeSetCandidates: candidates.filter((candidate) => candidate.kind === "native_set").length,
+            repositories: repositories.map((repository) => ({
+                id: repository.id,
+                status: repository.revoked
+                    ? "Revoked"
+                    : repository.candidates.length
+                        ? "Verified catalog choices available for this host"
+                        : "Approved; no verified choices currently available for this host",
+                candidates: repository.revoked ? 0 : repository.candidates.length,
+            })),
+        };
+    }
+    Amaterasu.summarizeRepositoryState = summarizeRepositoryState;
+    function parseRepositoryList(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Repository response is invalid.");
+        const reply = value;
+        if (reply.ok !== true || !Array.isArray(reply.repositories))
+            throw new Error("Repository state is unavailable.");
+        return reply.repositories.map((item) => {
+            if (!item || typeof item !== "object" || Array.isArray(item))
+                throw new Error("Repository entry is invalid.");
+            const repository = item;
+            if (typeof repository.id !== "string" ||
+                typeof repository.location !== "string" ||
+                typeof repository.fingerprint !== "string" ||
+                typeof repository.revoked !== "boolean" ||
+                !Array.isArray(repository.candidates))
+                throw new Error("Repository entry is invalid.");
+            const candidates = repository.candidates.map((raw) => {
+                if (!raw || typeof raw !== "object" || Array.isArray(raw))
+                    throw new Error("Repository choice is invalid.");
+                const choice = raw;
+                if (typeof choice.slot !== "string" ||
+                    typeof choice.implementation !== "string" ||
+                    typeof choice.version !== "string" ||
+                    typeof choice.manifest_sha256 !== "string" ||
+                    !["native_set", "web_bundle"].includes(choice.kind))
+                    throw new Error("Repository choice is invalid.");
+                return choice;
+            });
+            return { ...repository, candidates };
+        });
+    }
+    Amaterasu.parseRepositoryList = parseRepositoryList;
+    function parseRepositoryPage(value) {
+        const repositories = parseRepositoryList(value);
+        const reply = value;
+        const nextOffset = reply.next_offset;
+        if (nextOffset !== null &&
+            (!Number.isSafeInteger(nextOffset) || nextOffset <= 0 || nextOffset > 4096))
+            throw new Error("Repository pagination is invalid.");
+        return { repositories, nextOffset: nextOffset };
+    }
+    Amaterasu.parseRepositoryPage = parseRepositoryPage;
+    function renderUpdates(context) {
+        const area = Amaterasu.el("div");
+        const statusArea = Amaterasu.el("div");
+        const selectionArea = Amaterasu.el("div");
+        let loadRequest = 0;
+        let selectionSnapshot;
+        let repositorySnapshot;
+        context.content.append(Amaterasu.sectionHeading("Modules & UI", "Choose verified implementations from approved publishers.", Amaterasu.button("Refresh", load)), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Publisher authority is broad"), Amaterasu.el("p", "", "Approving a publisher allows it to supply any native module slot, including management, and the UI. Native modules share their worker's user privileges, while a replacement UI runs in the signed-in browser session and can use its API authority. Approval does not grant elevation. A signature proves source, not safe behavior.")), Amaterasu.panel("Persisted package selection", selectionArea, Amaterasu.el("p", "muted", "Persisted phases are not a live runtime snapshot; the host reports the loaded package digest separately.")), Amaterasu.panel("Read-only repository status", statusArea, Amaterasu.el("p", "muted", "The authenticated API exposes repository listing only and has no approve, revoke, refresh, download, stage, install, activate, or restore actions. This page will not run shell commands.")), area);
+        async function load() {
+            const request = ++loadRequest;
+            selectionSnapshot = undefined;
+            repositorySnapshot = undefined;
+            if (!context.api.allows("configuration.read")) {
+                selectionSnapshot = null;
+                repositorySnapshot = null;
+                selectionArea.replaceChildren(Amaterasu.empty("Package selection unavailable", "This session needs configuration.read to inspect persisted package selection metadata."));
+                statusArea.replaceChildren(Amaterasu.empty("Repository status unavailable", "This session needs configuration.read to inspect approved publishers and their verified catalog choices."));
+                area.replaceChildren();
+                return;
+            }
+            selectionArea.replaceChildren(Amaterasu.el("p", "muted", "Loading persisted package selection…"));
+            statusArea.replaceChildren(Amaterasu.el("p", "muted", "Loading verified repository status…"));
+            area.replaceChildren(Amaterasu.el("p", "muted", "Loading verified repository choices…"));
+            const selectionRequest = loadPackageSelection(request);
+            void selectionRequest.then((selection) => {
+                if (!selectionArea.isConnected || request !== loadRequest)
+                    return;
+                selectionSnapshot = selection;
+                if (selection)
+                    renderSelection(selection, repositorySnapshot);
+            });
+            try {
+                const byId = new Map();
+                let offset = 0;
+                while (true) {
+                    const page = parseRepositoryPage(await context.api.post("repositories/list", { offset }));
+                    for (const repository of page.repositories) {
+                        const previous = byId.get(repository.id);
+                        if (previous && (previous.fingerprint !== repository.fingerprint || previous.revoked !== repository.revoked))
+                            throw new Error("Repository state changed during listing. Refresh to retry.");
+                        byId.set(repository.id, previous
+                            ? { ...previous, candidates: [...previous.candidates, ...repository.candidates] }
+                            : repository);
+                    }
+                    if (page.nextOffset === null)
+                        break;
+                    if (page.nextOffset <= offset)
+                        throw new Error("Repository pagination did not advance.");
+                    offset = page.nextOffset;
+                }
+                if (!area.isConnected || request !== loadRequest)
+                    return;
+                const repositories = [...byId.values()];
+                repositorySnapshot = repositories;
+                if (selectionSnapshot)
+                    renderSelection(selectionSnapshot, repositories);
+                renderStatus(repositories);
+                renderChoices(repositories);
+            }
+            catch (error) {
+                if (statusArea.isConnected && request === loadRequest) {
+                    repositorySnapshot = null;
+                    if (selectionSnapshot)
+                        renderSelection(selectionSnapshot, null);
+                    statusArea.replaceChildren(Amaterasu.errorPanel(error, load));
+                    area.replaceChildren();
+                }
+            }
+        }
+        async function loadPackageSelection(request) {
+            try {
+                return parsePackageSelectionStatus(await context.api.post("package-selection/status", {}));
+            }
+            catch (error) {
+                if (selectionArea.isConnected && request === loadRequest) {
+                    selectionArea.replaceChildren(Amaterasu.errorPanel(error, load));
+                }
+                return null;
+            }
+        }
+        function renderSelection(selection, repositories) {
+            const value = (digest) => digest ?? "None";
+            const candidateMatch = (digest) => {
+                if (!digest)
+                    return "No package digest recorded";
+                if (repositories === undefined)
+                    return "Loading current catalog match…";
+                if (repositories === null)
+                    return "Current approved catalog unavailable";
+                const matches = repositories.flatMap((repository) => repository.revoked
+                    ? []
+                    : repository.candidates
+                        .filter((candidate) => candidate.kind === "native_set" && candidate.manifest_sha256 === digest)
+                        .map((candidate) => `${repository.id}: ${candidate.implementation} ${candidate.version}`));
+                return matches.length
+                    ? matches.join(" · ")
+                    : "Absent from the current approved catalog";
+            };
+            selectionArea.replaceChildren(Amaterasu.table(["Running worker package (host report)", "Package digest"], [[
+                    selection.running.available ? "Loaded in this worker" : "Digest unavailable",
+                    selection.running.digest ?? "Unavailable",
+                ]]), Amaterasu.el("p", "muted", "The host supplies this digest from the verified package loaded in the worker. It does not establish individual module health."), Amaterasu.table(["Persisted phase", "Package digest", "Current approved catalog match"], [
+                ["Active selection", value(selection.active), candidateMatch(selection.active)],
+                ["Previous selection", value(selection.previous), candidateMatch(selection.previous)],
+                ["Pending selection", value(selection.pending), candidateMatch(selection.pending)],
+                ["Trial selection", value(selection.trial), candidateMatch(selection.trial)],
+                ["Highest accepted sequence", selection.highestSequence, "—"],
+            ]), Amaterasu.el("p", "muted", "Catalog matches require exact signed native manifest digest equality. They do not establish which publisher supplied the staged package or whether a trial passed."), ...(!selection.active ? [Amaterasu.el("p", "muted", "No active package digest is recorded in selection metadata.")] : []));
+        }
+        function renderStatus(repositories) {
+            const summary = summarizeRepositoryState(repositories);
+            statusArea.replaceChildren(Amaterasu.el("div", "section-meta", Amaterasu.badge(`${summary.approved} approved`, summary.approved ? "good" : ""), Amaterasu.badge(`${summary.revoked} revoked`), Amaterasu.badge(`${summary.verifiedCandidates} verified choices`), Amaterasu.el("span", "muted", `${summary.uiCandidates} UI bundles · ${summary.nativeSetCandidates} native sets for this host`)), summary.repositories.length
+                ? Amaterasu.table(["Publisher ID", "Read-only status", "Verified choices"], summary.repositories.map((repository) => [
+                    repository.id,
+                    repository.status,
+                    String(repository.candidates),
+                ]))
+                : Amaterasu.empty("No approved repositories", "To add a publisher, use the explicit development release CLI after independently confirming its public-key fingerprint."));
+        }
+        function renderChoices(repositories) {
+            const active = repositories.filter((repository) => !repository.revoked);
+            const repositorySelect = Amaterasu.el("select");
+            const slotSelect = Amaterasu.el("select");
+            const implementationSelect = Amaterasu.el("select");
+            const details = Amaterasu.el("div", "notice");
+            const choices = Amaterasu.panel("Choose an implementation", Amaterasu.field("Approved repository", repositorySelect), Amaterasu.field("Module slot or UI", slotSelect), Amaterasu.field("Implementation and version", implementationSelect), details);
+            const addOption = (select, value, label) => {
+                const option = Amaterasu.el("option", "", label);
+                option.value = value;
+                select.append(option);
+            };
+            active.forEach((repository, index) => addOption(repositorySelect, String(index), `${repository.id} · ${repository.fingerprint.slice(0, 16)}…`));
+            const selectedRepository = () => active[Number(repositorySelect.value)];
+            const selectedChoice = () => {
+                const repository = selectedRepository();
+                return repository?.candidates.filter((choice) => choice.slot === slotSelect.value)[Number(implementationSelect.value)];
+            };
+            const showChoice = () => {
+                const repository = selectedRepository();
+                const choice = selectedChoice();
+                if (!repository || !choice) {
+                    details.replaceChildren(Amaterasu.el("p", "muted", repository
+                        ? "No verified choice is available for this slot in the current host catalog. The repository may not have a current catalog, or its catalog may contain no choices for this host target."
+                        : active.length
+                            ? "Choose a publisher with a verified catalog candidate."
+                            : "No active approved publisher is available. Add or refresh one with the development release CLI."));
+                    return;
+                }
+                const command = choice.kind === "web_bundle"
+                    ? `amaterasu-release repository-install-ui ROOT ${repository.id} ${choice.implementation} ${choice.version} OUTPUT`
+                    : `amaterasu-release repository-download ROOT ${repository.id} ${choice.slot} ${choice.implementation} ${choice.version} OUTPUT`;
+                details.replaceChildren(Amaterasu.el("strong", "", `${choice.implementation} ${choice.version}`), Amaterasu.el("p", "", `Source: ${repository.location}`), Amaterasu.el("p", "", `Publisher key SHA-256: ${repository.fingerprint}`), Amaterasu.el("p", "", `Signed manifest SHA-256: ${choice.manifest_sha256}`), Amaterasu.el("p", "", choice.kind === "web_bundle"
+                    ? "Run this explicit administrator command to download, verify and select the UI. The previous UI remains recoverable at /recovery."
+                    : "This choice supplies a complete native component set. Download and stage it for review. A separate activate command explicitly authorizes its native code to run under the user account at the next development worker start or probe. Production native activation remains disabled."), Amaterasu.el("code", "", command), ...(choice.kind === "native_set" ? [
+                    Amaterasu.el("code", "", `amaterasu-release repository-stage-native ROOT ${repository.id} ${choice.slot} ${choice.implementation} ${choice.version} OUTPUT`),
+                    Amaterasu.el("code", "", "amaterasu-release repository-activate-native ROOT STAGED_DIGEST"),
+                ] : []));
+            };
+            const fillImplementations = () => {
+                implementationSelect.replaceChildren();
+                selectedRepository()?.candidates
+                    .filter((choice) => choice.slot === slotSelect.value)
+                    .forEach((choice, index) => addOption(implementationSelect, String(index), `${choice.implementation} · ${choice.version}`));
+                showChoice();
+            };
+            const fillSlots = () => {
+                slotSelect.replaceChildren();
+                const slots = [...new Set(selectedRepository()?.candidates.map((choice) => choice.slot) ?? [])];
+                slots.forEach((slot) => addOption(slotSelect, slot, slot === "amaterasu.ui" ? "UI" : slot));
+                fillImplementations();
+            };
+            repositorySelect.addEventListener("change", fillSlots);
+            slotSelect.addEventListener("change", fillImplementations);
+            implementationSelect.addEventListener("change", showChoice);
+            fillSlots();
+            if (!active.length) {
+                repositorySelect.disabled = true;
+                slotSelect.disabled = true;
+                implementationSelect.disabled = true;
+            }
+            area.replaceChildren(Amaterasu.panel("Approve a publisher", Amaterasu.el("p", "", "On this development host, use repository-approve with the publisher's public key and a SHA-256 fingerprint confirmed through an independent channel. The repository URL alone cannot establish key identity."), Amaterasu.el("code", "", "amaterasu-release repository-approve ROOT ID HTTPS_URL PUBLIC_KEY_HEX CONFIRMED_SHA256"), Amaterasu.el("p", "", "Then run repository-refresh ROOT ID to retrieve the signed catalog. Key rotation uses a new publisher ID; revoke the old ID explicitly.")), choices, Amaterasu.panel("Recovery and selected-package inspection", Amaterasu.el("p", "", "The management-owned /recovery page remains available when this UI bundle fails. For the host-owned read-only status and recovery path, use `amaterasu web-recovery-status ROOT`, then `amaterasu web-recover ROOT DIGEST` for a retained verified UI. `amaterasu native-recover ROOT [DIGEST]` restores a retained native set without loading it."), Amaterasu.el("p", "muted", "The repository listing provides catalog choices. `POST /v1/package-selection/status` separately reports persisted native selection phases and the loaded worker package digest; both status endpoints require `configuration.read`. `web-recovery-status` inspects UI selection; `web-recover` and `native-recover` restore retained verified sets. Release floors stay intact.")));
+        }
+        void load();
+    }
+    Amaterasu.renderUpdates = renderUpdates;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -10294,7 +10697,7 @@ var Amaterasu;
                     ? Amaterasu.messageOf(snapshot.reason)
                     : pagesTextMessage("Responded to the latest refresh"),
             ]);
-            area.replaceChildren(hero, metrics, Amaterasu.panel("Service access", Amaterasu.table(["Service", "Status", "Details"], serviceRows)), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Streaming is still being built"), Amaterasu.el("p", "", "Client pairing, capture, and stream connections are not available in this release. The management tools shown here are live.")));
+            area.replaceChildren(hero, metrics, Amaterasu.panel("Service access", Amaterasu.table(["Service", "Status", "Details"], serviceRows)), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Streaming is still being built"), Amaterasu.el("p", "", "Review pending device pairing from Host & devices. Capture controls and a browser streaming view are not available in this release.")));
         }
         void load();
     }
@@ -11040,16 +11443,111 @@ var Amaterasu;
         return counters;
     }
     Amaterasu.parseDiagnosticCountersReply = parseDiagnosticCountersReply;
+    const DIAGNOSTIC_SESSION_LIMIT = 4;
+    function diagnosticFailureStage(reason) {
+        if (typeof reason !== "string")
+            return "Failure · stage not identified";
+        const stages = {
+            capture_failed: "Capture",
+            capture_read_failed: "Capture",
+            capture_geometry_failed: "Capture",
+            drm_capture_failed: "Capture",
+            encoder_failed: "Video encoder",
+            encoder_drain_failed: "Video encoder",
+            software_encoder_failed: "Video encoder",
+            video_failed_after_admission: "Video pipeline · stage not identified",
+            audio_encoder_failed: "Audio encoder",
+            audio_capture_failed: "Audio capture",
+            audio_backend_failed: "Audio capture",
+            audio_packetization_failed: "Audio transport",
+            transport_drain_failed: "RTP / media transport",
+            udp_send_failed: "RTP / media transport",
+            udp_stalled: "RTP / media transport",
+            control_failed: "Control channel",
+            control_transport_failed: "Control channel",
+            peer_disconnected: "Control channel",
+            authenticated_peer_idle: "Control channel",
+            authentication_timeout: "Control channel",
+        };
+        return Object.hasOwn(stages, reason) ? `Failure · ${stages[reason]}` : "Failure · stage not identified";
+    }
+    function diagnosticSessionOutcome(detail) {
+        if (!detail)
+            return "Outcome unavailable";
+        const events = detail.events
+            .filter((event) => ["stream_stopping", "stream_stopped", "stream_cancelled", "stream_failed"].includes(event.event_type))
+            .sort((left, right) => right.recorded_at_unix - left.recorded_at_unix);
+        const terminal = events.find((event) => event.event_type !== "stream_stopping") ?? events[0];
+        if (!terminal) {
+            if (detail.events_truncated)
+                return "Outcome unavailable · event history is truncated";
+            return detail.session.ended_at_unix == null
+                ? "Active · no termination event"
+                : "Ended · no termination event recorded";
+        }
+        if (terminal.event_type === "stream_stopped")
+            return "Stopped";
+        if (terminal.event_type === "stream_cancelled")
+            return "Cancelled";
+        const payload = terminal.payload;
+        const reason = payload && typeof payload === "object" && !Array.isArray(payload)
+            ? payload.reason
+            : undefined;
+        if (terminal.event_type === "stream_stopping")
+            return reason == null ? "Stopping · termination not confirmed" : `Stopping · ${diagnosticFailureStage(reason)}`;
+        return diagnosticFailureStage(reason);
+    }
+    Amaterasu.diagnosticSessionOutcome = diagnosticSessionOutcome;
     function renderDiagnostics(context) {
         const area = Amaterasu.el("div");
+        const sessionsArea = Amaterasu.el("div");
         let after = 0;
         const history = [0];
         let loadRequest = 0;
-        context.content.append(Amaterasu.sectionHeading("Diagnostics", "Records and counters for this management console.", Amaterasu.button("Refresh", () => {
+        let sessionRequest = 0;
+        context.content.append(Amaterasu.sectionHeading("Diagnostics", "Caller-scoped records and counters, plus separately recorded stream outcomes.", Amaterasu.button("Refresh", () => {
             after = 0;
             history.splice(0, history.length, 0);
+            void loadRecentSessions();
             return load();
-        })), area);
+        })), area, Amaterasu.panel("Recent stream outcomes", sessionsArea, Amaterasu.el("p", "muted", "Session history is separate from caller-scoped diagnostics; no record-to-session correlation is implied. Only recognized termination codes receive a stage label.")));
+        async function loadRecentSessions() {
+            const request = ++sessionRequest;
+            if (!context.api.allows("session.read")) {
+                sessionsArea.replaceChildren(Amaterasu.empty("Session history unavailable", "This session needs session.read to inspect recent stream outcomes."));
+                return;
+            }
+            sessionsArea.replaceChildren(Amaterasu.el("p", "muted", "Loading recent stream outcomes…"));
+            try {
+                const list = parseHistoryListReply(await context.api.post("history/list_sessions", { limit: DIAGNOSTIC_SESSION_LIMIT, offset: 0 }), 0);
+                if (!context.content.isConnected || request !== sessionRequest)
+                    return;
+                if (!list.sessions.length) {
+                    sessionsArea.replaceChildren(Amaterasu.empty("No recorded streams", "Recent outcomes appear when session history is available and recording has captured a stream."));
+                    return;
+                }
+                const details = await Promise.all(list.sessions.map(async (session) => {
+                    try {
+                        const detail = parseHistoryDetailReply(await context.api.post("history/session_detail", { session_id: session.session_id }), session.session_id).detail;
+                        return { session, outcome: diagnosticSessionOutcome(detail) };
+                    }
+                    catch {
+                        return { session, outcome: "Outcome unavailable · refresh to retry" };
+                    }
+                }));
+                if (!context.content.isConnected || request !== sessionRequest)
+                    return;
+                sessionsArea.replaceChildren(Amaterasu.table(["Started", "State", "Recorded outcome"], details.map(({ session, outcome }) => [
+                    new Date(session.started_at_unix * 1000).toLocaleString(),
+                    session.ended_at_unix == null ? Amaterasu.badge("Active", "good") : "Ended",
+                    outcome,
+                ])), Amaterasu.el("p", "muted", `Showing at most ${DIAGNOSTIC_SESSION_LIMIT} recent sessions. Client and device identity are not displayed.`));
+            }
+            catch (error) {
+                if (context.content.isConnected && request === sessionRequest)
+                    sessionsArea.replaceChildren(Amaterasu.errorPanel(error, loadRecentSessions));
+            }
+        }
         async function load() {
             const request = ++loadRequest;
             const cursor = after;
@@ -11097,10 +11595,547 @@ var Amaterasu;
             }
         }
         void load();
+        void loadRecentSessions();
     }
     Amaterasu.renderDiagnostics = renderDiagnostics;
     function nullNode() {
         return document.createTextNode("");
+    }
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    function parsePendingPairings(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Pending pairing response is invalid.");
+        const reply = value;
+        if (reply.ok !== true || !Array.isArray(reply.pending))
+            throw new Error("Pending pairing response is invalid.");
+        const pending = reply.pending.map((item) => {
+            if (!item || typeof item !== "object" || Array.isArray(item))
+                throw new Error("Pending pairing entry is invalid.");
+            const entry = item;
+            if (typeof entry.pairing_id !== "string" ||
+                !/^[a-f0-9]{32}$/.test(entry.pairing_id) ||
+                typeof entry.client_id !== "string" ||
+                entry.client_id.length < 1 ||
+                entry.client_id.length > 64 ||
+                /[\u0000-\u001f\u007f-\u009f]/.test(entry.client_id) ||
+                typeof entry.name !== "string" ||
+                entry.name.length < 1 ||
+                entry.name.length > 128 ||
+                /[\u0000-\u001f\u007f-\u009f]/.test(entry.name) ||
+                !Number.isSafeInteger(entry.expires_at) ||
+                entry.expires_at < 0 ||
+                typeof entry.awaiting_pin !== "boolean")
+                throw new Error("Pending pairing entry is invalid.");
+            return {
+                pairing_id: entry.pairing_id,
+                client_id: entry.client_id,
+                name: entry.name,
+                expires_at: entry.expires_at,
+                awaiting_pin: entry.awaiting_pin,
+            };
+        });
+        return { ok: true, pending };
+    }
+    Amaterasu.parsePendingPairings = parsePendingPairings;
+    function parseHostStatus(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Host status response is invalid.");
+        const reply = value;
+        if (reply.ok !== true ||
+            typeof reply.hostname !== "string" ||
+            !Number.isSafeInteger(reply.revision) ||
+            !nullablePort(reply.active_http_port) ||
+            !nullablePort(reply.active_https_port) ||
+            !nullablePort(reply.active_rtsp_port) ||
+            !nullableText(reply.listener_error) ||
+            !nullableText(reply.rtsp_listener_error))
+            throw new Error("Host status response is invalid.");
+        return reply;
+    }
+    function nullablePort(value) {
+        return value === null ||
+            (Number.isSafeInteger(value) && value >= 1 && value <= 65535);
+    }
+    function nullableText(value) {
+        return value === null || typeof value === "string";
+    }
+    function parseSessionStatus(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Session status response is invalid.");
+        const reply = value;
+        if (reply.ok !== true ||
+            !Array.isArray(reply.sessions) ||
+            !(reply.next_offset === null ||
+                (Number.isSafeInteger(reply.next_offset) && reply.next_offset >= 0)))
+            throw new Error("Session status response is invalid.");
+        for (const item of reply.sessions) {
+            if (!item || typeof item !== "object" || Array.isArray(item))
+                throw new Error("Session status entry is invalid.");
+            const session = item;
+            if (!Number.isSafeInteger(session.id) ||
+                session.id < 0 ||
+                typeof session.key !== "string" ||
+                typeof session.state !== "string" ||
+                !["preparing", "active", "stopping", "stopped"].includes(session.state) ||
+                !(session.outcome === null || session.outcome === undefined ||
+                    ["completed", "cancelled", "failed"].includes(String(session.outcome))) ||
+                !(session.lease_count === undefined ||
+                    (Number.isSafeInteger(session.lease_count) && session.lease_count >= 0)))
+                throw new Error("Session status entry is invalid.");
+        }
+        return reply;
+    }
+    function parseRuntimeStatus(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Streaming status response is invalid.");
+        const reply = value;
+        if (!reply.status || typeof reply.status !== "object" || Array.isArray(reply.status))
+            throw new Error("Streaming status response is invalid.");
+        const status = reply.status;
+        if (reply.ok !== true ||
+            typeof status.available !== "boolean" ||
+            typeof status.configuration_ready !== "boolean" ||
+            !Number.isSafeInteger(status.active_streams) ||
+            status.active_streams < 0 ||
+            !Number.isSafeInteger(status.failed_operations) ||
+            status.failed_operations < 0)
+            throw new Error("Streaming status response is invalid.");
+        return reply;
+    }
+    function renderHostManagement(context) {
+        const pairingArea = Amaterasu.el("div");
+        const captureArea = Amaterasu.el("div");
+        const hostArea = Amaterasu.el("div");
+        const sessionArea = Amaterasu.el("div");
+        const runtimeArea = Amaterasu.el("div");
+        let pairingRequest = 0;
+        let hostRequest = 0;
+        let sessionRequest = 0;
+        let runtimeRequest = 0;
+        context.content.append(Amaterasu.sectionHeading("Host & devices", "Review pending device access and the status reported by this host.", Amaterasu.button("Refresh all", () => {
+            void loadPairings();
+            void loadHost();
+            void loadSessions();
+            void loadRuntime();
+        })), Amaterasu.panel("Pending device pairing", pairingArea), Amaterasu.panel("KDE desktop capture consent", captureArea), Amaterasu.panel("Host listeners", hostArea), Amaterasu.panel("Streaming status", runtimeArea), Amaterasu.panel("Management sessions", sessionArea));
+        async function loadPairings(notice) {
+            if (!context.content.isConnected)
+                return;
+            const request = ++pairingRequest;
+            if (!context.api.allows("pairing.admin")) {
+                pairingArea.replaceChildren(Amaterasu.el("p", "muted", "This account does not have permission to review or approve device pairing requests."));
+                return;
+            }
+            pairingArea.replaceChildren(...(notice ? [pairingApprovalNotice(notice)] : []), Amaterasu.el("p", "muted", "Loading pending pairing requests…"));
+            try {
+                const reply = parsePendingPairings(await context.api.post("pairing/pending"));
+                if (!context.content.isConnected || request !== pairingRequest)
+                    return;
+                if (reply.pending.length === 0) {
+                    pairingArea.replaceChildren(...(notice ? [pairingApprovalNotice(notice)] : []), Amaterasu.empty("No pending requests", "New device requests will appear here when this host receives them."), Amaterasu.button("Refresh requests", () => { void loadPairings(); }));
+                    return;
+                }
+                const cards = reply.pending.map((pending) => renderPendingPairing(pending));
+                pairingArea.replaceChildren(...(notice ? [pairingApprovalNotice(notice)] : []), ...cards, Amaterasu.button("Refresh requests", () => { void loadPairings(); }));
+            }
+            catch (error) {
+                if (context.content.isConnected && request === pairingRequest)
+                    pairingArea.replaceChildren(Amaterasu.errorPanel(error, loadPairings));
+            }
+        }
+        function renderPendingPairing(pending) {
+            const card = Amaterasu.el("article", "panel pairing-request");
+            const description = Amaterasu.el("p", "muted", pending.awaiting_pin
+                ? "Enter the four-digit PIN shown on the requesting device to approve this pairing step."
+                : "PIN approval was accepted. The device must complete its pairing exchange.");
+            const status = Amaterasu.el("div");
+            status.setAttribute("aria-live", "polite");
+            const details = Amaterasu.el("div", "pairing-details", Amaterasu.el("strong", "", pending.name), Amaterasu.el("small", "muted block", `Client ${pending.client_id}`), Amaterasu.el("small", "muted block", `Request expires ${new Date(pending.expires_at * 1000).toLocaleString()}`), Amaterasu.badge(pending.awaiting_pin ? "PIN required" : "Pairing in progress", pending.awaiting_pin ? "accent" : "good"));
+            card.append(details, description);
+            if (pending.awaiting_pin) {
+                const pin = Amaterasu.input("pairing_pin", "", "password");
+                pin.autocomplete = "off";
+                pin.spellcheck = false;
+                pin.inputMode = "numeric";
+                pin.maxLength = 4;
+                pin.pattern = "[0-9]{4}";
+                pin.required = true;
+                const approve = Amaterasu.el("button", "button primary", "Approve PIN");
+                approve.type = "submit";
+                const form = Amaterasu.el("form", "pairing-approval", Amaterasu.field("Four-digit PIN", pin), status, approve);
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    if (approve.disabled)
+                        return;
+                    const submittedPin = pin.value;
+                    pin.value = "";
+                    if (!/^\d{4}$/.test(submittedPin)) {
+                        status.replaceChildren(Amaterasu.errorPanel(new Error("Enter the four-digit PIN shown on the device.")));
+                        return;
+                    }
+                    void Amaterasu.runAction(approve, status, async () => {
+                        try {
+                            await context.api.post("pairing/approve_pin", {
+                                pairing_id: pending.pairing_id,
+                                pin: submittedPin,
+                            });
+                        }
+                        catch {
+                            if (!context.content.isConnected)
+                                return;
+                            const notice = "The approval response was not confirmed. The PIN was cleared and current pairing status was refreshed; review it before trying again.";
+                            context.notify("Approval was not confirmed. Current pairing status is being refreshed; the PIN was cleared.");
+                            await loadPairings(notice);
+                            return;
+                        }
+                        if (!context.content.isConnected)
+                            return;
+                        context.notify("PIN approval accepted. The device must complete its pairing exchange.");
+                        await loadPairings();
+                    });
+                });
+                card.append(form);
+            }
+            else {
+                card.append(status);
+            }
+            return card;
+        }
+        async function loadHost() {
+            const request = ++hostRequest;
+            if (!context.api.allows("configuration.read")) {
+                hostArea.replaceChildren(Amaterasu.el("p", "muted", "Host settings status requires configuration.read permission."));
+                return;
+            }
+            hostArea.replaceChildren(Amaterasu.el("p", "muted", "Loading host listener status…"));
+            try {
+                const host = parseHostStatus(await context.api.post("nvhttp/settings"));
+                if (!context.content.isConnected || request !== hostRequest)
+                    return;
+                const listener = (label, port, error) => [
+                    Amaterasu.el("strong", "", label),
+                    port === null
+                        ? Amaterasu.badge(error ? "Error reported" : "Not confirmed")
+                        : Amaterasu.badge(`Active · port ${port}`, "good"),
+                ];
+                const rows = [
+                    listener("HTTP", host.active_http_port, host.listener_error),
+                    listener("HTTPS", host.active_https_port, host.listener_error),
+                    listener("RTSP", host.active_rtsp_port, host.rtsp_listener_error),
+                ];
+                hostArea.replaceChildren(Amaterasu.el("p", "muted", `Host ${host.hostname} · settings revision ${host.revision}`), Amaterasu.table(["Listener", "Reported status"], rows), Amaterasu.button("Refresh host status", () => { void loadHost(); }));
+            }
+            catch (error) {
+                if (context.content.isConnected && request === hostRequest)
+                    hostArea.replaceChildren(Amaterasu.errorPanel(error, loadHost));
+            }
+        }
+        async function loadSessions() {
+            const request = ++sessionRequest;
+            if (!context.api.allows("session.read")) {
+                sessionArea.replaceChildren(Amaterasu.el("p", "muted", "Management session status requires session.read permission."));
+                return;
+            }
+            sessionArea.replaceChildren(Amaterasu.el("p", "muted", "Loading management sessions…"));
+            try {
+                const reply = parseSessionStatus(await context.api.post("session/list", { limit: 16 }));
+                if (!context.content.isConnected || request !== sessionRequest)
+                    return;
+                const rows = reply.sessions.map((session) => [
+                    Amaterasu.el("strong", "", session.key),
+                    Amaterasu.badge(session.state, session.state === "active" ? "good" : ""),
+                    String(session.lease_count ?? Object.keys(session.leases ?? {}).length),
+                    session.outcome ?? "—",
+                ]);
+                sessionArea.replaceChildren(rows.length
+                    ? Amaterasu.table(["Session", "State", "Leases", "Outcome"], rows)
+                    : Amaterasu.empty("No management sessions", "Sessions created through the management API will appear here."), reply.next_offset === null
+                    ? Amaterasu.el("p", "muted", `Showing ${reply.sessions.length} session${reply.sessions.length === 1 ? "" : "s"}.`)
+                    : Amaterasu.el("p", "muted", `Showing the first ${reply.sessions.length} sessions; more are available.`), Amaterasu.button("Refresh sessions", () => { void loadSessions(); }));
+            }
+            catch (error) {
+                if (context.content.isConnected && request === sessionRequest)
+                    sessionArea.replaceChildren(Amaterasu.errorPanel(error, loadSessions));
+            }
+        }
+        async function loadRuntime() {
+            const request = ++runtimeRequest;
+            if (!context.api.allows("session.read")) {
+                runtimeArea.replaceChildren(Amaterasu.el("p", "muted", "Streaming status requires session.read permission."));
+                return;
+            }
+            runtimeArea.replaceChildren(Amaterasu.el("p", "muted", "Loading streaming status…"));
+            try {
+                const reply = parseRuntimeStatus(await context.api.post("history/history_status"));
+                if (!context.content.isConnected || request !== runtimeRequest)
+                    return;
+                const state = reply.status;
+                runtimeArea.replaceChildren(Amaterasu.badge(state.available && state.configuration_ready ? "History service available" : "History service unavailable", state.available && state.configuration_ready ? "good" : ""), Amaterasu.el("p", "muted", `${state.active_streams} active stream${state.active_streams === 1 ? "" : "s"} reported · ${state.failed_operations} failed storage operation${state.failed_operations === 1 ? "" : "s"} since service start.`), Amaterasu.button("Refresh streaming status", () => { void loadRuntime(); }));
+            }
+            catch (error) {
+                if (context.content.isConnected && request === runtimeRequest)
+                    runtimeArea.replaceChildren(Amaterasu.errorPanel(error, loadRuntime));
+            }
+        }
+        void loadPairings();
+        renderCaptureConsent(context, captureArea);
+        void loadHost();
+        void loadSessions();
+        void loadRuntime();
+    }
+    Amaterasu.renderHostManagement = renderHostManagement;
+    function pairingApprovalNotice(message) {
+        const notice = Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Approval not confirmed"), Amaterasu.el("p", "", message));
+        notice.setAttribute("role", "status");
+        notice.setAttribute("aria-live", "polite");
+        return notice;
+    }
+    const PORTAL_POLL_INTERVAL_MS = 1000;
+    const PORTAL_POLL_LIMIT = 120;
+    function renderCaptureConsent(context, area) {
+        let operationId = null;
+        let pollTimer = null;
+        let pollCount = 0;
+        let requestInFlight = false;
+        let finished = false;
+        let observer = null;
+        const cleanedOperations = new Set();
+        const status = Amaterasu.el("div");
+        status.setAttribute("role", "status");
+        status.setAttribute("aria-live", "polite");
+        const choose = Amaterasu.button("Choose monitor in KDE…", () => { void beginSelection(); }, "primary");
+        const cancel = Amaterasu.button("Cancel selection", () => { void cancelSelection(); });
+        const permission = Amaterasu.el("p", "muted");
+        const help = Amaterasu.el("p", "muted", "This opens the KDE desktop portal only after you choose a monitor. After it reports ready, launch Moonlight Desktop promptly: the selected source is retained for up to 60 seconds. Selection does not confirm that a stream started.");
+        area.append(permission, help, choose, cancel, status);
+        cancel.hidden = true;
+        updatePermission();
+        function updatePermission() {
+            const canSelect = context.api.allows("capture.write");
+            const canPoll = context.api.allows("capture.read");
+            choose.disabled = !canSelect || !canPoll || Boolean(operationId) || !context.content.isConnected;
+            cancel.disabled = !canSelect || !operationId || requestInFlight;
+            permission.textContent = !canSelect
+                ? "Monitor selection and cancellation require capture.write permission."
+                : !canPoll
+                    ? "Selection status requires capture.read permission; no chooser will be opened."
+                    : "Monitor selection requires capture.write and capture.read permissions.";
+            cancel.hidden = !operationId;
+        }
+        function show(message, tone = "muted") {
+            status.replaceChildren(Amaterasu.el("p", tone, message));
+        }
+        function newOperationId() {
+            const bytes = new Uint8Array(16);
+            window.crypto.getRandomValues(bytes);
+            let suffix = "";
+            for (const byte of bytes)
+                suffix += byte.toString(16).padStart(2, "0");
+            return `desktop-${suffix}`;
+        }
+        function armUnmountCleanup() {
+            observer?.disconnect();
+            observer = new MutationObserver(() => {
+                if (!context.content.isConnected) {
+                    observer?.disconnect();
+                    observer = null;
+                    stopPolling();
+                    void cancelForCleanup();
+                }
+            });
+            observer.observe(document, { childList: true, subtree: true });
+        }
+        function stopPolling() {
+            if (pollTimer !== null)
+                window.clearTimeout(pollTimer);
+            pollTimer = null;
+            observer?.disconnect();
+            observer = null;
+        }
+        function finish(message, tone = "muted") {
+            finished = true;
+            stopPolling();
+            show(message, tone);
+            operationId = null;
+            requestInFlight = false;
+            updatePermission();
+        }
+        function schedulePoll() {
+            if (finished || !operationId || !context.content.isConnected)
+                return;
+            if (pollCount >= PORTAL_POLL_LIMIT) {
+                const expiredOperation = operationId;
+                finish("Monitor selection timed out. Start a new selection if you still want to choose a monitor.", "error");
+                void cancelForCleanup(expiredOperation);
+                return;
+            }
+            pollTimer = window.setTimeout(() => { void pollSelection(); }, PORTAL_POLL_INTERVAL_MS);
+        }
+        function selectionErrorMessage(error) {
+            const code = error && typeof error === "object" && "code" in error
+                ? String(error.code)
+                : "";
+            if (["source_selection_expired", "source_selection_timeout", "portal_selection_expired"].includes(code))
+                return { message: "The KDE consent request expired. Start a new selection to try again.", tone: "error" };
+            if (["source_selection_denied", "selection_permission_denied", "portal_selection_denied"].includes(code))
+                return { message: "KDE denied desktop capture consent. No source was selected.", tone: "error" };
+            if (["source_selection_cancelled", "portal_selection_cancelled"].includes(code))
+                return { message: "Monitor selection was cancelled.", tone: "muted" };
+            if (["portal_unavailable", "pipewire_unavailable"].includes(code))
+                return { message: "The KDE desktop portal is unavailable. Check that a desktop session is active, then try again.", tone: "error" };
+            return { message: "Unable to read monitor selection status. Check the connection and refresh before starting another selection.", tone: "error" };
+        }
+        function validateReply(value) {
+            if (!value || typeof value !== "object" || Array.isArray(value))
+                throw new Error("invalid selection response");
+            const reply = value;
+            if (reply.ok !== true || reply.operation_id !== operationId || reply.source_type !== "monitor" ||
+                !["selecting", "ready", "denied", "failed"].includes(String(reply.selection_state)))
+                throw new Error("invalid selection response");
+            return reply;
+        }
+        async function beginSelection() {
+            if (operationId || !context.content.isConnected)
+                return;
+            updatePermission();
+            if (choose.disabled || !context.api.allows("capture.write") || !context.api.allows("capture.read"))
+                return;
+            let createdId;
+            try {
+                createdId = newOperationId();
+            }
+            catch {
+                show("Secure operation ID generation is unavailable; no chooser was opened.", "error");
+                return;
+            }
+            operationId = createdId;
+            pollCount = 0;
+            finished = false;
+            requestInFlight = true;
+            show("Opening the KDE monitor consent prompt…");
+            updatePermission();
+            armUnmountCleanup();
+            try {
+                const reply = validateReply(await context.api.post("capture/select_portal_source", {
+                    source_type: "monitor",
+                    operation_id: createdId,
+                }));
+                if (!context.content.isConnected || operationId !== createdId) {
+                    void cancelForCleanup(createdId);
+                    return;
+                }
+                requestInFlight = false;
+                updatePermission();
+                acceptReply(reply);
+            }
+            catch (error) {
+                if (operationId !== createdId || !context.content.isConnected) {
+                    void cancelForCleanup(createdId);
+                    return;
+                }
+                const outcome = selectionErrorMessage(error);
+                finish(outcome.message, outcome.tone);
+                void cancelForCleanup(createdId);
+            }
+        }
+        function acceptReply(reply) {
+            if (reply.selection_state === "ready") {
+                finish("KDE selected a monitor. Launch Moonlight Desktop promptly within the 60-second selection lifetime. This confirms selection only, not a running stream.", "good");
+            }
+            else if (reply.selection_state === "denied") {
+                finish("KDE denied desktop capture consent. No source was selected.", "error");
+            }
+            else if (reply.selection_state === "failed") {
+                const error = { code: reply.error };
+                const outcome = selectionErrorMessage(error);
+                finish(outcome.message, outcome.tone);
+            }
+            else {
+                show("Selecting monitor… Approve the request in the KDE desktop portal. When it reports ready, launch Moonlight Desktop promptly within 60 seconds.");
+                schedulePoll();
+            }
+        }
+        async function pollSelection() {
+            const current = operationId;
+            if (!current || finished || requestInFlight || !context.content.isConnected)
+                return;
+            if (!context.api.allows("capture.read")) {
+                finish("Monitor selection status is unavailable because capture.read permission is missing.", "error");
+                void cancelForCleanup(current);
+                return;
+            }
+            requestInFlight = true;
+            pollCount += 1;
+            updatePermission();
+            try {
+                const reply = validateReply(await context.api.post("capture/poll_portal_selection", {
+                    operation_id: current,
+                }));
+                if (!context.content.isConnected || operationId !== current) {
+                    void cancelForCleanup(current);
+                    return;
+                }
+                requestInFlight = false;
+                updatePermission();
+                acceptReply(reply);
+            }
+            catch (error) {
+                if (!context.content.isConnected || operationId !== current) {
+                    void cancelForCleanup(current);
+                    return;
+                }
+                const outcome = selectionErrorMessage(error);
+                if (outcome.message.startsWith("Unable to read")) {
+                    requestInFlight = false;
+                    updatePermission();
+                    show(`${outcome.message} Retrying while this request remains active.`, "error");
+                    schedulePoll();
+                }
+                else {
+                    finish(outcome.message, outcome.tone);
+                }
+            }
+        }
+        async function cancelSelection() {
+            const current = operationId;
+            if (!current || requestInFlight || !context.api.allows("capture.write"))
+                return;
+            stopPolling();
+            requestInFlight = true;
+            updatePermission();
+            show("Cancelling monitor selection…");
+            try {
+                await context.api.post("capture/cancel_portal_selection", { operation_id: current });
+                if (!context.content.isConnected || operationId !== current)
+                    return;
+                finish("Monitor selection was cancelled.");
+            }
+            catch {
+                if (!context.content.isConnected || operationId !== current)
+                    return;
+                requestInFlight = false;
+                updatePermission();
+                show("Cancellation was not confirmed. Retry cancellation before leaving this page.", "error");
+                armUnmountCleanup();
+            }
+        }
+        async function cancelForCleanup(id = operationId) {
+            if (!id || cleanedOperations.has(id) || !context.api.allows("capture.write"))
+                return;
+            cleanedOperations.add(id);
+            try {
+                await context.api.post("capture/cancel_portal_selection", { operation_id: id });
+            }
+            catch {
+            }
+            if (operationId === id) {
+                operationId = null;
+                finished = true;
+                requestInFlight = false;
+            }
+        }
     }
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
@@ -11110,14 +12145,18 @@ var Amaterasu;
     }
     const pageNames = {
         overview: "Overview",
+        host: "Host & devices",
         catalog: "Library",
         settings: "Settings",
+        updates: "Modules & UI",
         sessions: "Sessions",
         applications: "Applications",
         steam: "Steam",
         diagnostics: "Diagnostics",
     };
     const pageIcons = {
+        updates: "+",
+        host: "⌂",
         overview: "▦",
         catalog: "⊞",
         settings: "≡",
@@ -11359,8 +12398,10 @@ var Amaterasu;
             };
             const renderers = {
                 overview: Amaterasu.renderOverview,
+                host: Amaterasu.renderHostManagement,
                 catalog: Amaterasu.renderCatalog,
                 settings: Amaterasu.renderSettings,
+                updates: Amaterasu.renderUpdates,
                 sessions: Amaterasu.renderSessions,
                 applications: Amaterasu.renderApplications,
                 steam: Amaterasu.renderSteam,

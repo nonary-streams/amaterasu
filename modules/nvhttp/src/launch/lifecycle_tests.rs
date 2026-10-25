@@ -7,11 +7,17 @@ fn application_preparation_can_exceed_startup_deadline_before_rtsp_admission() {
         ..Broker::default()
     };
 
-    assert!(controller.launch(10, request(1), peer(1), started).is_none());
+    assert!(
+        controller
+            .launch(10, request(1), peer(1), started)
+            .is_none()
+    );
     for _ in 0..128 {
-        assert!(controller
-            .poll(started, &mut |command| broker.send(command))
-            .is_empty());
+        assert!(
+            controller
+                .poll(started, &mut |command| broker.send(command))
+                .is_empty()
+        );
         if controller.records.values().next().unwrap().stage == Stage::AwaitApplicationReady {
             break;
         }
@@ -33,14 +39,20 @@ fn application_preparation_can_exceed_startup_deadline_before_rtsp_admission() {
             _ => None,
         })
         .expect("launch export request");
-    assert!(launch_export["return_on_admission"].as_bool().unwrap_or(false));
+    assert!(
+        launch_export["return_on_admission"]
+            .as_bool()
+            .unwrap_or(false)
+    );
 
     for elapsed_seconds in 1..=50 {
         let now = started + Duration::from_secs(elapsed_seconds);
         for _ in 0..3 {
-            assert!(controller
-                .poll(now, &mut |command| broker.send(command))
-                .is_empty());
+            assert!(
+                controller
+                    .poll(now, &mut |command| broker.send(command))
+                    .is_empty()
+            );
         }
     }
 
@@ -48,9 +60,7 @@ fn application_preparation_can_exceed_startup_deadline_before_rtsp_admission() {
     assert_eq!(record.stage, Stage::AwaitApplicationReady);
     assert_eq!(record.state, super::record::State::Starting);
     assert!(controller.busy());
-    assert!(!broker
-        .actions()
-        .contains(&("amaterasu.rtsp/1", "open")));
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
     let status_timeouts: Vec<_> = broker
         .commands
         .iter()
@@ -90,11 +100,17 @@ fn explicit_cancel_stops_application_while_preparation_is_still_running() {
         ..Broker::default()
     };
 
-    assert!(controller.launch(10, request(1), peer(1), started).is_none());
+    assert!(
+        controller
+            .launch(10, request(1), peer(1), started)
+            .is_none()
+    );
     for _ in 0..128 {
-        assert!(controller
-            .poll(started, &mut |command| broker.send(command))
-            .is_empty());
+        assert!(
+            controller
+                .poll(started, &mut |command| broker.send(command))
+                .is_empty()
+        );
         if controller.records.values().next().unwrap().stage == Stage::AwaitApplicationReady {
             break;
         }
@@ -104,11 +120,16 @@ fn explicit_cancel_stops_application_while_preparation_is_still_running() {
         Stage::AwaitApplicationReady
     );
 
-    assert!(controller
-        .cancel(20, &peer(1), started + Duration::from_secs(1))
-        .is_none());
-    let (connection, reply) =
-        poll_until_reply(&mut controller, &mut broker, started + Duration::from_secs(1));
+    assert!(
+        controller
+            .cancel(20, &peer(1), started + Duration::from_secs(1))
+            .is_none()
+    );
+    let (connection, reply) = poll_until_reply(
+        &mut controller,
+        &mut broker,
+        started + Duration::from_secs(1),
+    );
     assert_eq!(connection, 20);
     assert_eq!(reply.status, 200);
     assert!(broker.actions().contains(&("amaterasu.launch/1", "stop")));
@@ -125,11 +146,17 @@ fn application_readiness_reuses_an_existing_rtsp_ticket() {
         ..Broker::default()
     };
 
-    assert!(controller.launch(10, request(1), peer(1), started).is_none());
+    assert!(
+        controller
+            .launch(10, request(1), peer(1), started)
+            .is_none()
+    );
     for _ in 0..128 {
-        assert!(controller
-            .poll(started, &mut |command| broker.send(command))
-            .is_empty());
+        assert!(
+            controller
+                .poll(started, &mut |command| broker.send(command))
+                .is_empty()
+        );
         if controller.records.values().next().unwrap().stage == Stage::AwaitApplicationReady {
             break;
         }
@@ -145,8 +172,11 @@ fn application_readiness_reuses_an_existing_rtsp_ticket() {
     record.rtsp_requested = true;
     broker.application_state = "active";
 
-    let (connection, reply) =
-        poll_until_reply(&mut controller, &mut broker, started + Duration::from_secs(1));
+    let (connection, reply) = poll_until_reply(
+        &mut controller,
+        &mut broker,
+        started + Duration::from_secs(1),
+    );
 
     assert_eq!(connection, 10);
     assert_eq!(reply.status, 200);

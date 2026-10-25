@@ -4,9 +4,156 @@ mod harness;
 mod history;
 mod input;
 mod limiter;
+mod restart;
 mod virtual_display;
 use super::*;
 use harness::*;
+
+#[test]
+fn session_status_list_is_scoped_to_the_exact_authenticated_caller() {
+    let mut host = Harness::new();
+    host.pipeline.settings.allowed_principals =
+        vec!["amaterasu.rtsp".into(), "another.module".into()];
+    let rtsp_session = host.response_from(1, "amaterasu.rtsp", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let foreign_session = host.response_from(2, "another.module", {
+        let mut request = prepare();
+        request["operation_id"] = json!("foreign-launch");
+        request
+    })["session"]
+        .as_u64()
+        .unwrap();
+
+    let rtsp_status = host.response_from(3, "amaterasu.rtsp", json!({"action":"status"}));
+    let foreign_status = host.response_from(4, "another.module", json!({"action":"status"}));
+
+    assert_eq!(rtsp_status["total"], 1);
+    assert_eq!(rtsp_status["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(rtsp_status["sessions"][0]["session"], rtsp_session);
+    assert_eq!(foreign_status["total"], 1);
+    assert_eq!(foreign_status["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(foreign_status["sessions"][0]["session"], foreign_session);
+}
+
+#[test]
+fn negotiated_color_reaches_video_open_unchanged() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let session = prepared["session"].as_u64().expect("prepared session");
+    let mut request = start(session);
+    request["configuration"]["configuration"]["color_mode"] = json!("bt601_full");
+    let started = host.response(2, request);
+    assert_eq!(started["state"], "active", "{started}");
+    let video = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("video opened");
+    assert_eq!(video.payload["configuration"]["color_mode"], "bt601_full");
+}
+
+#[test]
+fn authenticated_start_codec_must_match_prepared_transport_codec() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["video"]["codec"] = json!("hevc");
+    let prepared = host.response(1, request);
+    let session = prepared["session"].as_u64().expect("prepared session");
+    let rejected = host.response(2, start(session));
+    assert_eq!(rejected["code"], "video_codec_mismatch");
+    assert!(!host.broker.calls.iter().any(|call| {
+        call.service == Resource::Video.service() && call.payload["action"] == "open"
+    }));
+
+    let mut matching = start(session);
+    matching["configuration"]["configuration"]["codec"] = json!("hevc");
+    let accepted = host.response(3, matching);
+    assert_eq!(accepted["state"], "active", "{accepted}");
+    let video = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("video opened only for matching codec");
+    assert_eq!(video.payload["configuration"]["codec"], "hevc");
+}
+
+#[test]
+fn codec_offer_reaches_the_transport_and_start_selects_av1_for_video() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["video"]["codecs"] = json!(["h264", "av1"]);
+    let prepared = host.response(1, request);
+    let session = prepared["session"].as_u64().expect("prepared session");
+    let media = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Media.service() && call.payload["action"] == "open")
+        .expect("media transport opened at prepare");
+    assert_eq!(media.payload["video"]["codecs"], json!(["h264", "av1"]));
+    assert!(media.payload["video"].get("codec").is_none());
+
+    let mut hevc = start(session);
+    hevc["configuration"]["configuration"]["codec"] = json!("hevc");
+    assert_eq!(host.response(2, hevc)["code"], "video_codec_mismatch");
+
+    let mut av1 = start(session);
+    av1["configuration"]["configuration"]["codec"] = json!("av1");
+    let accepted = host.response(3, av1);
+    assert_eq!(accepted["state"], "active", "{accepted}");
+    let video = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("video opened for an offered codec");
+    assert_eq!(video.payload["configuration"]["codec"], "av1");
+}
+
+#[test]
+fn negotiated_video_geometry_and_rate_are_allocated_only_at_authenticated_start() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let session = prepared["session"].as_u64().expect("prepared session");
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::Video.service()
+                && call.payload["action"] == "open")
+    );
+
+    let mut request = start(session);
+    request["configuration"]["configuration"] = json!({
+        "width": 1280,
+        "height": 720,
+        "fps": 30,
+        "bitrate": 8_000_000,
+        "max_reference_frames": 0,
+    });
+    let started = host.response(2, request);
+    assert_eq!(started["state"], "active", "{started}");
+
+    let video = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("video opens after authenticated start");
+    assert_eq!(video.payload["configuration"]["width"], 1280);
+    assert_eq!(video.payload["configuration"]["height"], 720);
+    assert_eq!(video.payload["configuration"]["fps"], 30);
+    assert_eq!(video.payload["configuration"]["bitrate"], 8_000_000);
+    assert!(video.payload["configuration"]["max_reference_frames"].is_null());
+    let forwarded_configuration: crate::model::VideoConfiguration =
+        serde_json::from_value(video.payload["configuration"].clone())
+            .expect("omitted zero uses the encoder's default reference selection");
+    assert_eq!(forwarded_configuration.max_reference_frames, 0);
+}
 
 #[test]
 fn stereo_512k_prepare_reaches_encoder_with_bounded_packet_size() {
@@ -68,6 +215,32 @@ fn stereo_512k_prepare_reaches_encoder_with_bounded_packet_size() {
 }
 
 #[test]
+fn prepared_stereo_session_requests_48khz_float_stereo_loopback() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let session = prepared["session"].as_u64().expect("prepared session");
+
+    let started = host.response(2, start(session));
+    assert_eq!(started["state"], "active", "{started}");
+
+    let audio_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| {
+            call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
+        })
+        .expect("audio capture opened");
+    assert_eq!(
+        audio_open.payload["capture_format"],
+        json!({"sample_rate":48000,"channels":2,"sample_format":"f32"})
+    );
+    // The fake provider returns the exact requested format. Reaching active
+    // means lifecycle validation accepted its 48 kHz float stereo metadata.
+    assert_eq!(host.broker.format_rate, 48_000);
+}
+
+#[test]
 fn surround_prepare_start_and_stop_preserve_layout_and_bounded_wire() {
     for (channels, mask, packet_ms, bitrate, bytes, wire) in [
         (6, 0x3f, 5, 1_536_000, 960, 976),
@@ -125,6 +298,10 @@ fn surround_prepare_start_and_stop_preserve_layout_and_bounded_wire() {
             })
             .unwrap();
         assert_eq!(capture.payload["channels"], channels);
+        assert_eq!(
+            capture.payload["capture_format"],
+            json!({"sample_rate":48000,"channels":channels,"sample_format":"f32"})
+        );
         assert_eq!(
             host.response(3, json!({"action":"stop","session":id}))["state"],
             "stopped"
@@ -755,6 +932,71 @@ fn constant_rate_mode_reaches_video_open_and_uses_a_distinct_capture_lease() {
 }
 
 #[test]
+fn pipewire_portal_source_reaches_video_open_with_its_capture_lease() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let id = prepared["session"].as_u64().unwrap();
+    let mut configuration = start(id);
+    configuration["configuration"]["capture_provider"] = json!("pipewire");
+    configuration["configuration"]["output"] = json!("portal-selected-session-source");
+
+    assert_eq!(host.response(2, configuration)["state"], "active");
+    let record = &host.pipeline.records[&id];
+    assert!(matches!(
+        record.start.as_ref().unwrap().capture_provider,
+        crate::model::CaptureProvider::PipeWire
+    ));
+    let video_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("PipeWire video open");
+    assert_eq!(video_open.payload["capture_provider"], "pipewire");
+    assert_eq!(
+        video_open.payload["output"],
+        "portal-selected-session-source"
+    );
+    assert_eq!(video_open.payload["encoder"], 0);
+}
+
+#[test]
+fn automatic_encoder_alias_reaches_video_open_without_becoming_index_zero() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let id = prepared["session"].as_u64().unwrap();
+    let mut configuration = start(id);
+    configuration["configuration"]["encoder"] = json!("auto");
+
+    assert_eq!(host.response(2, configuration)["state"], "active");
+    let video_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("video open");
+    assert_eq!(video_open.payload["encoder"], "auto");
+}
+
+#[test]
+fn explicit_encoder_index_reaches_video_open_unchanged() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let id = prepared["session"].as_u64().unwrap();
+    let mut configuration = start(id);
+    configuration["configuration"]["encoder"] = json!(7);
+
+    assert_eq!(host.response(2, configuration)["state"], "active");
+    let video_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("video open");
+    assert_eq!(video_open.payload["encoder"], 7);
+}
+
+#[test]
 fn wgc_pacing_smoothing_snapshot_reaches_video_open() {
     let mut enabled_host = Harness::new();
     let id = enabled_host.response(1, prepare())["session"]
@@ -880,6 +1122,37 @@ fn caller_isolation_retry_conflicts_and_terminal_tombstones() {
     );
     assert_eq!(host.response(6, prepare())["state"], "stopped");
     assert_eq!(host.broker.live_components(), 0);
+}
+
+#[test]
+fn duplicate_stale_session_stop_cannot_stop_a_reconnected_session() {
+    let mut host = Harness::new();
+    let stale = host.response(1, prepare())["session"]
+        .as_u64()
+        .expect("original session");
+    assert_eq!(
+        host.response(2, json!({"action":"stop","session":stale}))["state"],
+        "stopped"
+    );
+
+    let mut resumed_prepare = prepare();
+    resumed_prepare["operation_id"] = json!("fresh-resume-operation");
+    let fresh = host.response(3, resumed_prepare)["session"]
+        .as_u64()
+        .expect("fresh session");
+    assert_ne!(stale, fresh);
+
+    // A delayed duplicate cleanup from the interrupted RTSP instance remains
+    // bound to its old session ID and is idempotent at the stream-session owner.
+    assert_eq!(
+        host.response(4, json!({"action":"stop","session":stale}))["state"],
+        "stopped"
+    );
+    assert_eq!(host.pipeline.records[&fresh].state, State::Prepared);
+    assert_eq!(
+        host.response(5, json!({"action":"status","session":fresh}))["state"],
+        "prepared"
+    );
 }
 
 #[test]
@@ -1010,6 +1283,11 @@ fn cancelled_parent_and_lost_success_completion_release_allocations() {
     host.broker.cancel_parent(1);
     host.idle();
     assert_eq!(host.broker.live_components(), 0);
+    assert_eq!(host.broker.state_revision, 2);
+    assert_eq!(
+        host.broker.state_value.as_ref().unwrap()["entries"],
+        json!({})
+    );
     assert!(
         host.pipeline
             .records
@@ -1150,6 +1428,65 @@ fn malformed_software_configuration_never_opens_video() {
         host.response(2, started)["code"],
         "invalid_start_configuration"
     );
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::Video.service()
+                && call.payload["action"] == "open")
+    );
+}
+
+#[test]
+fn format_only_av1_selection_is_frozen_across_video_media_and_plane() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["video"]["codecs"] = json!(["h264", "av1"]);
+    let session = host.response(1, request)["session"].as_u64().unwrap();
+    let mut launch = start(session);
+    launch["configuration"]["configuration"]["video_stream_format"] =
+        json!({"codec":"av1","bit_depth":8,"dynamic_range":"sdr"});
+    assert_eq!(host.response(2, launch)["state"], "active");
+    let record = &host.pipeline.records[&session];
+    assert_eq!(
+        record.handles().unwrap().video_codec,
+        amaterasu_media::VideoCodec::Av1.abi_id()
+    );
+    let video = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .unwrap();
+    assert_eq!(video.payload["configuration"]["codec"], "av1");
+    assert_eq!(
+        video.payload["configuration"]["video_stream_format"]["codec"],
+        "av1"
+    );
+    let media = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| {
+            call.service == Resource::Media.service()
+                && call.payload["action"] == "configure_video_format"
+        })
+        .unwrap();
+    assert_eq!(media.payload["video_stream_format"]["codec"], "av1");
+}
+
+#[test]
+fn conflicting_video_codec_shapes_fail_before_video_allocation() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["video"]["codecs"] = json!(["h264", "hevc", "av1"]);
+    let session = host.response(1, request)["session"].as_u64().unwrap();
+    let mut launch = start(session);
+    launch["configuration"]["configuration"]["codec"] = json!("hevc");
+    launch["configuration"]["configuration"]["video_stream_format"] =
+        json!({"codec":"av1","bit_depth":8,"dynamic_range":"sdr"});
+    assert_eq!(host.response(2, launch)["code"], "conflicting_video_codec");
     assert!(
         !host
             .broker

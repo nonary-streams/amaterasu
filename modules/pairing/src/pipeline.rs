@@ -3,7 +3,8 @@ use crate::identity::{
     ConfiguredIdentity, IMPORTED_IDENTITY_MIGRATION_KEY, ImportedIdentityReconciliation, Shared,
     Snapshot,
 };
-use crate::protocol::{Document, Operation, Settings, error};
+use crate::identity_generation::{Generator, IdentityWorker};
+use crate::protocol::{Document, Identity, Operation, Settings, error};
 use crate::{SERVICE, STATE_SERVICE};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Map, Value, json};
@@ -53,8 +54,25 @@ enum Stage {
     },
 }
 
+struct Initialization {
+    request: Request,
+    document: Document,
+    revision: u64,
+    requested_at: u64,
+}
+
+struct IdentityGeneration {
+    worker: IdentityWorker<Identity>,
+    initialization: Option<Initialization>,
+}
+
 pub struct Pipeline {
     engine: Engine,
+    identity_generation: Option<IdentityGeneration>,
+    #[cfg(test)]
+    identity_generator: Option<Generator>,
+    #[cfg(test)]
+    configured_identity_loader: Option<Generator<ConfiguredIdentity>>,
     pending: Option<Pending>,
     deferred_import: Option<DeferredImport>,
     identity: Arc<Shared>,
@@ -74,6 +92,7 @@ enum HostConfigurationState {
     Disabled,
     Start,
     WaitingReadiness(u64),
+    LoadingIdentity(IdentityWorker<ConfiguredIdentity>),
     WaitingGet(u64),
     WaitingPairingState {
         request: u64,
@@ -116,6 +135,11 @@ impl Pipeline {
         };
         Self {
             engine: Engine::new(settings),
+            identity_generation: None,
+            #[cfg(test)]
+            identity_generator: None,
+            #[cfg(test)]
+            configured_identity_loader: None,
             pending: None,
             deferred_import: None,
             identity,
@@ -184,6 +208,13 @@ impl Pipeline {
         mut send: impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         self.progress_pairing_notice(&mut send);
+        if self.identity_generation.is_some() {
+            let result = self.advance_identity_generation(now, &mut send);
+            if result.is_err() {
+                self.identity.invalidate();
+            }
+            return result;
+        }
         let result = match self.advance_host_configuration(now, &mut send) {
             Ok(true) => {
                 let validation_time = self
@@ -213,6 +244,12 @@ impl Pipeline {
         now: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<bool> {
+        if let HostConfigurationState::LoadingIdentity(worker) = &mut self.host_configuration {
+            return match worker.take_finished() {
+                None => Ok(false),
+                Some(result) => self.finish_configured_identity(result, now),
+            };
+        }
         if matches!(
             &self.host_configuration,
             HostConfigurationState::WaitingPairingState { .. }
@@ -238,7 +275,8 @@ impl Pipeline {
             HostConfigurationState::WaitingReadiness(_) | HostConfigurationState::WaitingGet(_) => {
             }
             HostConfigurationState::WaitingPairingState { .. }
-            | HostConfigurationState::WaitingMigrationMarkerDelete { .. } => return Ok(false),
+            | HostConfigurationState::WaitingMigrationMarkerDelete { .. }
+            | HostConfigurationState::LoadingIdentity(_) => return Ok(false),
             HostConfigurationState::Start => {}
         }
         if matches!(&self.host_configuration, HostConfigurationState::Start) {
@@ -324,12 +362,46 @@ impl Pipeline {
         paths: EffectiveIdentityPaths,
         now: u64,
     ) -> ModuleResult<bool> {
-        match ConfiguredIdentity::load(
+        // The existing-only loader cannot generate RSA, including when files
+        // disappear after this check. Provisioning always runs on an owned worker.
+        if !std::path::Path::new(&paths.certificate_path).exists()
+            && !std::path::Path::new(&paths.private_key_path).exists()
+        {
+            self.identity.invalidate();
+            let loader: Generator<ConfiguredIdentity> = Box::new(move || {
+                ConfiguredIdentity::load(
+                    &paths.certificate_path,
+                    &paths.private_key_path,
+                    paths.provider_revision,
+                    now,
+                )
+            });
+            #[cfg(test)]
+            let loader = self.configured_identity_loader.take().unwrap_or(loader);
+            let worker = IdentityWorker::start(loader);
+            match worker {
+                Ok(worker) => {
+                    self.host_configuration = HostConfigurationState::LoadingIdentity(worker)
+                }
+                Err(_) => self.fail_host_configuration(now),
+            }
+            return Ok(false);
+        }
+        let result = ConfiguredIdentity::load_existing(
             &paths.certificate_path,
             &paths.private_key_path,
             paths.provider_revision,
             now,
-        ) {
+        );
+        self.finish_configured_identity(result, now)
+    }
+
+    fn finish_configured_identity(
+        &mut self,
+        result: Result<ConfiguredIdentity, &'static str>,
+        now: u64,
+    ) -> ModuleResult<bool> {
+        match result {
             Ok(identity) => {
                 let configured_identity = match self.refresh_identity.take() {
                     Some(previous)
@@ -888,6 +960,112 @@ impl Pipeline {
             }
         }
     }
+    fn start_identity_generation(
+        &mut self,
+        request: Request,
+        document: Document,
+        revision: u64,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        #[cfg(test)]
+        let generator = self
+            .identity_generator
+            .take()
+            .unwrap_or_else(|| Box::new(crate::crypto::generate_identity));
+        #[cfg(not(test))]
+        let generator: Generator = Box::new(crate::crypto::generate_identity);
+        match IdentityWorker::start(generator) {
+            Ok(worker) => {
+                self.identity_generation = Some(IdentityGeneration {
+                    worker,
+                    initialization: Some(Initialization {
+                        request,
+                        document,
+                        revision,
+                        requested_at: now,
+                    }),
+                });
+                Ok(())
+            }
+            Err(code) => complete(send, request.id, error(code)),
+        }
+    }
+
+    fn advance_identity_generation(
+        &mut self,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        let mut generation = self
+            .identity_generation
+            .take()
+            .expect("owned identity worker");
+        if let Some(initialization) = &generation.initialization {
+            let ended = if Instant::now() >= initialization.request.deadline {
+                Some("deadline_exceeded")
+            } else {
+                match send(Command::CheckRequest {
+                    request: initialization.request.id,
+                }) {
+                    Ok(Response::Ok) => None,
+                    Ok(_) => Some("request_ended"),
+                    Err(failure) => {
+                        self.identity_generation = Some(generation);
+                        return Err(failure);
+                    }
+                }
+            };
+            if let Some(code) = ended {
+                let initialization = generation
+                    .initialization
+                    .take()
+                    .expect("live initialization");
+                // Keep the owned worker even if completion transport fails.
+                let result = complete(send, initialization.request.id, error(code));
+                self.identity_generation = Some(generation);
+                return result;
+            }
+        }
+        match generation.worker.take_finished() {
+            Some(result) => {
+                let Some(initialization) = generation.initialization.take() else {
+                    return Ok(());
+                };
+                match result {
+                    Ok(identity) => {
+                        let initialization = Initialization {
+                            requested_at: now.max(initialization.requested_at),
+                            ..initialization
+                        };
+                        self.apply_loaded_with_identity(
+                            initialization,
+                            Operation::Initialize {},
+                            Some(identity),
+                            send,
+                        )
+                    }
+                    Err(code) => complete(send, initialization.request.id, error(code)),
+                }
+            }
+            None => {
+                let canceled = generation.initialization.is_none();
+                self.identity_generation = Some(generation);
+                if canceled {
+                    match send(Command::Poll {})? {
+                        Response::Pending => Ok(()),
+                        Response::Request { id, .. } => {
+                            complete(send, id, error("identity_generation_busy"))
+                        }
+                        _ => Err("pairing poll failure".into()),
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
     fn apply_loaded(
         &mut self,
         request: Request,
@@ -897,6 +1075,32 @@ impl Pipeline {
         now: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        self.apply_loaded_with_identity(
+            Initialization {
+                request,
+                document,
+                revision,
+                requested_at: now,
+            },
+            operation,
+            None,
+            send,
+        )
+    }
+
+    fn apply_loaded_with_identity(
+        &mut self,
+        initialization: Initialization,
+        operation: Operation,
+        generated_identity: Option<Identity>,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        let Initialization {
+            request,
+            document,
+            revision,
+            requested_at: now,
+        } = initialization;
         let loaded = match self.prepare_snapshot(&document, now) {
             Ok(snapshot) => snapshot,
             Err(code) => {
@@ -904,6 +1108,12 @@ impl Pipeline {
                 return complete(send, request.id, error(code));
             }
         };
+        if matches!(operation, Operation::Initialize {})
+            && document.identity.is_none()
+            && generated_identity.is_none()
+        {
+            return self.start_identity_generation(request, document, revision, now, send);
+        }
         // Only this operation replaces configuration on an existing certificate.
         // Publish the validated durable base while its CAS is pending; trust and
         // identity mutations retain their fail-closed invalidation boundary.
@@ -936,38 +1146,34 @@ impl Pipeline {
         let include_revision = matches!(&operation, Operation::ListClients {});
         let initialize = matches!(&operation, Operation::Initialize {});
         let persisted_identity = document.identity.clone();
-        let mut initialized_document = None;
         let mut engine_now = now;
-        let engine_document = match self.configured_identity() {
-            Some(configured_identity) if initialize && persisted_identity.is_none() => {
-                let generated_identity = match crate::crypto::generate_identity() {
-                    Ok(identity) => identity,
-                    Err(code) => {
-                        self.publish_identity(revision, loaded)?;
-                        return complete(send, request.id, error(code));
-                    }
-                };
-                engine_now = match SystemTime::now().duration_since(UNIX_EPOCH) {
-                    Ok(current_time) => now.max(current_time.as_secs()),
-                    Err(_) => {
-                        self.publish_identity(revision, loaded)?;
-                        return complete(send, request.id, error("clock_failure"));
-                    }
-                };
-                let durable_document = Document {
-                    identity: Some(generated_identity),
-                    clients: document.clients,
-                };
-                if let Err(code) = durable_document.validate(engine_now) {
-                    self.publish_identity(revision, loaded)?;
-                    return complete(send, request.id, error(code));
-                }
-                let engine_document = overlay_document(&durable_document, configured_identity);
-                initialized_document = Some(durable_document);
-                engine_document
+        let initialized_document = if initialize && persisted_identity.is_none() {
+            engine_now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                Ok(current_time) => now.max(current_time.as_secs()),
+                Err(_) => return complete(send, request.id, error("clock_failure")),
+            };
+            let durable_document = Document {
+                identity: generated_identity,
+                clients: document.clients.clone(),
+            };
+            if durable_document.identity.is_none() {
+                return complete(send, request.id, error("identity_failure"));
             }
-            Some(configured_identity) => overlay_document(&document, configured_identity),
-            None => document,
+            if let Err(code) = durable_document.validate(engine_now) {
+                self.publish_identity(revision, loaded)?;
+                return complete(send, request.id, error(code));
+            }
+            Some(durable_document)
+        } else {
+            None
+        };
+        let durable_document = initialized_document.as_ref().unwrap_or(&document);
+        let engine_document = match self.configured_identity() {
+            Some(configured_identity) => overlay_document(durable_document, configured_identity),
+            None => Document {
+                identity: durable_document.identity.clone(),
+                clients: durable_document.clients.clone(),
+            },
         };
         let is_server_certificate_request = matches!(&operation, Operation::GetServerCert { .. });
         match self
@@ -1027,7 +1233,15 @@ impl Pipeline {
                     self.identity.invalidate();
                     return complete(send, request.id, error("state_unavailable"));
                 };
-                let snapshot = match self.prepare_snapshot(&document, now) {
+                let snapshot_now = if initialize {
+                    match SystemTime::now().duration_since(UNIX_EPOCH) {
+                        Ok(current) => now.max(current.as_secs()),
+                        Err(_) => return complete(send, request.id, error("clock_failure")),
+                    }
+                } else {
+                    now
+                };
+                let snapshot = match self.prepare_snapshot(&document, snapshot_now) {
                     Ok(snapshot) => snapshot,
                     Err(code) => {
                         self.identity.invalidate();

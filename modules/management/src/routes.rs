@@ -35,6 +35,16 @@ pub fn resolve(path: &str) -> Option<Route> {
             "product_update",
             Some("configuration.write"),
         ),
+        ("repositories", "list") => (
+            "amaterasu.management/1",
+            "repository_list",
+            Some("configuration.read"),
+        ),
+        ("package-selection", "status") => (
+            "amaterasu.management/1",
+            "package_selection_status",
+            Some("configuration.read"),
+        ),
         ("catalog", action) => (
             "amaterasu.catalog/1",
             catalog_action(action)?,
@@ -243,6 +253,21 @@ pub fn resolve(path: &str) -> Option<Route> {
             let (action, scope) = display_action(action)?;
             ("amaterasu.display/1", action, Some(scope))
         }
+        ("capture", "select_portal_source") => (
+            "amaterasu.video/1",
+            "select_portal_source",
+            Some("capture.write"),
+        ),
+        ("capture", "poll_portal_selection") => (
+            "amaterasu.video/1",
+            "poll_portal_selection",
+            Some("capture.read"),
+        ),
+        ("capture", "cancel_portal_selection") => (
+            "amaterasu.video/1",
+            "cancel_portal_selection",
+            Some("capture.write"),
+        ),
         ("media", action) => {
             let (service, action) = media_discovery(action)?;
             (service, action, Some("media.read"))
@@ -275,7 +300,8 @@ pub fn resolve(path: &str) -> Option<Route> {
         scope,
         requires_empty_body: domain == "media"
             || (domain == "steam" && action == "force_sync")
-            || (domain == "host-metrics" && action == "stats_read"),
+            || (domain == "host-metrics" && action == "stats_read")
+            || (domain == "package-selection" && action == "package_selection_status"),
     })
 }
 
@@ -374,6 +400,61 @@ pub fn payload(route: Route, bytes: &[u8]) -> Result<Value, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portal_selection_routes_require_capture_scopes_and_bounded_fields() {
+        let select = resolve("/v1/capture/select_portal_source").unwrap();
+        let poll = resolve("/v1/capture/poll_portal_selection").unwrap();
+        let cancel = resolve("/v1/capture/cancel_portal_selection").unwrap();
+        for route in [select, poll, cancel] {
+            assert_eq!(route.service, "amaterasu.video/1");
+        }
+        assert_eq!(select.scope, Some("capture.write"));
+        assert_eq!(poll.scope, Some("capture.read"));
+        assert_eq!(cancel.scope, Some("capture.write"));
+        assert_eq!(
+            payload(
+                select,
+                br#"{"source_type":"monitor","operation_id":"desktop-1"}"#
+            )
+            .unwrap()["action"],
+            "select_portal_source"
+        );
+        assert!(payload(poll, br#"{"operation_id":"desktop-1"}"#).is_ok());
+        assert!(payload(cancel, br#"{"operation_id":"desktop-1"}"#).is_ok());
+        for body in [
+            br#"{"source_type":"device","operation_id":"desktop-1"}"#.as_slice(),
+            br#"{"source_type":"monitor","operation_id":""}"#,
+            br#"{"source_type":"monitor","operation_id":"line\nbreak"}"#,
+            br#"{"source_type":"monitor","operation_id":"desktop-1","pipewire_node":77}"#,
+            br#"{"source_type":"monitor","operation_id":"desktop-1","caller":"admin"}"#,
+        ] {
+            assert!(payload(select, body).is_err());
+        }
+        assert!(
+            payload(
+                poll,
+                br#"{"operation_id":"desktop-1","source_type":"monitor"}"#
+            )
+            .is_err()
+        );
+        assert!(resolve("/v1/capture/open").is_none());
+    }
+
+    #[test]
+    fn package_selection_status_is_an_empty_configuration_read_request() {
+        let route = resolve("/v1/package-selection/status").unwrap();
+        assert_eq!(route.service, "amaterasu.management/1");
+        assert_eq!(route.action, "package_selection_status");
+        assert_eq!(route.scope, Some("configuration.read"));
+        assert!(route.requires_empty_body);
+        assert_eq!(
+            payload(route, br#"{}"#).unwrap()["action"],
+            "package_selection_status"
+        );
+        assert!(payload(route, br#"{"package_root":"/unsafe"}"#).is_err());
+        assert!(resolve("/v1/package-selection/select").is_none());
+    }
 
     #[test]
     fn lutris_artwork_route_pins_provider_action_and_read_scope() {

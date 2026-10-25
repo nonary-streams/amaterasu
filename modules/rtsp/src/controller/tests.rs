@@ -25,6 +25,9 @@ struct Endpoint {
     verifier_reply: Option<Value>,
     deny_launch: bool,
     deny_settlement: bool,
+    recovery_results: VecDeque<Option<Value>>,
+    recovery_requests: BTreeMap<u64, Option<Value>>,
+    next_recovery_request: u64,
 }
 
 impl Endpoint {
@@ -37,7 +40,26 @@ impl Endpoint {
             {
                 Response::error("permission_denied", "no Launch grant")
             }
+            Command::Request { service, .. }
+                if service == "amaterasu.stream-session/1" && !self.recovery_results.is_empty() =>
+            {
+                self.next_recovery_request += 1;
+                let id = 700 + self.next_recovery_request;
+                self.recovery_requests
+                    .insert(id, self.recovery_results.pop_front().expect("nonempty"));
+                Response::Accepted { id }
+            }
             Command::Request { .. } => Response::Accepted { id: 71 },
+            Command::TakeResult { request }
+                if let Some(Some(payload)) = self.recovery_requests.get(request) =>
+            {
+                Response::Result {
+                    payload: payload.clone(),
+                }
+            }
+            Command::TakeResult { request } if self.recovery_requests.contains_key(request) => {
+                Response::Pending
+            }
             Command::TakeResult { .. } if self.verifier_reply.is_some() => Response::Result {
                 payload: self.verifier_reply.clone().unwrap(),
             },
@@ -102,6 +124,263 @@ fn open() -> Open {
     .expect("valid open")
 }
 
+fn startup_recovery_pending(controller: &mut Controller, deadline: u64) {
+    controller.startup_recovery = StartupRecovery::new(0x1234, deadline);
+}
+
+fn listed_stream_sessions(sessions: Value, total: usize) -> Value {
+    json!({"ok":true,"sessions":sessions,"total":total,"truncated":false})
+}
+
+#[test]
+fn startup_reconciliation_stops_only_sessions_in_rtsp_scoped_status_and_waits_terminal() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    startup_recovery_pending(&mut controller, 45_000);
+    let mut endpoint = Endpoint {
+        recovery_results: VecDeque::from([
+            Some(listed_stream_sessions(
+                json!([{"session":23,"state":"active","cleanup_error":null}]),
+                1,
+            )),
+            Some(json!({"ok":true,"session":23,"state":"stopping","cleanup_error":null})),
+            Some(json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})),
+        ]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+
+    for now in [0, 1, 2, 3, 253, 254, 255] {
+        controller.advance_startup_recovery(&runtime, now);
+    }
+
+    assert!(controller.startup_recovery.ready());
+    let actions: Vec<_> = endpoint
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.stream-session/1" => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(actions[0]["action"], "status");
+    assert!(actions[0]["session"].is_null());
+    assert_eq!(actions[1]["action"], "stop");
+    assert_eq!(actions[1]["session"], 23);
+    assert_eq!(actions[2]["action"], "status");
+    assert_eq!(actions[2]["session"], 23);
+    assert!(!actions.iter().any(|action| action["session"] == 24));
+}
+
+#[test]
+fn startup_reconciliation_clean_status_admits_new_launch_without_stop() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled":true,
+        "bind":"127.0.0.1:0",
+        "allowed_principals":["amaterasu.nvhttp"]
+    }))
+    .unwrap();
+    let mut controller = Controller::new(settings).unwrap();
+    startup_recovery_pending(&mut controller, 45_000);
+    let mut endpoint = Endpoint {
+        recovery_results: VecDeque::from([Some(listed_stream_sessions(json!([]), 0))]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+
+    controller.advance_startup_recovery(&runtime, 0);
+    controller.advance_startup_recovery(&runtime, 1);
+
+    assert!(controller.startup_recovery.ready());
+    assert!(endpoint.commands.iter().all(|command| !matches!(command,
+        Command::Request { payload, .. } if payload["action"] == "stop")));
+    controller.open(
+        OpenRequest {
+            request: 19,
+            caller: "amaterasu.nvhttp".into(),
+            config: open(),
+            deadline: 5_000,
+            display_preflight_deadline: None,
+        },
+        2,
+        &runtime,
+        false,
+    );
+    assert!(controller.job.is_some());
+    controller.advance_job(&runtime, 3);
+    assert!(endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.stream-session/1" && payload["action"] == "prepare")));
+}
+
+#[test]
+fn restart_reconciliation_stops_old_lease_before_fresh_resume_open() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled":true,
+        "bind":"127.0.0.1:0",
+        "allowed_principals":["amaterasu.nvhttp"]
+    }))
+    .unwrap();
+    let mut controller = Controller::new(settings).unwrap();
+    // A new RTSP controller instance has no ticket records. The stream-session
+    // broker still owns the previous in-memory Desktop lease.
+    startup_recovery_pending(&mut controller, 45_000);
+    let mut endpoint = Endpoint {
+        active_request: true,
+        recovery_results: VecDeque::from([
+            Some(listed_stream_sessions(
+                json!([{"session":23,"state":"active","cleanup_error":null}]),
+                1,
+            )),
+            Some(json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})),
+            Some(json!({
+                "ok":true,
+                "session":24,
+                "state":"prepared",
+                "audio_local":"127.0.0.1:51000",
+                "video_local":"127.0.0.1:51002",
+                "control_local":"127.0.0.1:51004",
+                "history_activity_id":null,
+                "rtsp_operation_id":null
+            })),
+        ]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+
+    let mut resumed = open();
+    resumed.operation_id = "nvhttp-resume-fresh".into();
+    controller.open(
+        OpenRequest {
+            request: 19,
+            caller: "amaterasu.nvhttp".into(),
+            config: resumed.clone(),
+            deadline: 10_000,
+            display_preflight_deadline: None,
+        },
+        0,
+        &runtime,
+        false,
+    );
+    assert_eq!(
+        endpoint.completions.last().unwrap().1["code"],
+        "startup_reconciliation_pending"
+    );
+    assert!(!endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { payload, .. } if payload["action"] == "prepare")));
+
+    for now in [1, 2, 3, 4, 5] {
+        controller.advance_startup_recovery(&runtime, now);
+    }
+    assert!(controller.startup_recovery.ready());
+
+    controller.open(
+        OpenRequest {
+            request: 20,
+            caller: "amaterasu.nvhttp".into(),
+            config: resumed,
+            deadline: 10_000,
+            display_preflight_deadline: None,
+        },
+        6,
+        &runtime,
+        false,
+    );
+    for now in 7..11 {
+        controller.advance_job(&runtime, now);
+    }
+
+    assert_eq!(endpoint.completions.last().unwrap().0, 20);
+    assert_eq!(endpoint.completions.last().unwrap().1["ok"], true);
+    let requests: Vec<_> = endpoint
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service,
+                payload,
+                operation_id,
+                ..
+            } if service == "amaterasu.stream-session/1" => Some((payload, operation_id.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].0["action"], "status");
+    assert_eq!(requests[1].0["action"], "stop");
+    assert_eq!(requests[1].0["session"], 23);
+    assert_eq!(requests[2].0["action"], "prepare");
+    let new_ticket = controller
+        .records
+        .values()
+        .find(|record| record.config.operation_id == "nvhttp-resume-fresh")
+        .expect("fresh resume ticket")
+        .id;
+    assert_eq!(
+        requests[2].0["operation_id"],
+        format!("rtsp-{new_ticket:016x}")
+    );
+    assert_ne!(requests[1].1, requests[2].1);
+    assert!(controller.records.values().any(|record| {
+        record.config.operation_id == "nvhttp-resume-fresh"
+            && record.session == Some(24)
+            && record.state == State::Ready
+    }));
+    assert!(
+        !requests
+            .iter()
+            .any(|(payload, _)| payload["action"] == "stop" && payload["session"] == 24)
+    );
+}
+
+#[test]
+fn startup_reconciliation_timeout_after_partial_stop_keeps_launch_fail_closed() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    startup_recovery_pending(&mut controller, 300);
+    let mut endpoint = Endpoint {
+        recovery_results: VecDeque::from([
+            Some(listed_stream_sessions(
+                json!([{"session":23,"state":"active","cleanup_error":null}]),
+                1,
+            )),
+            Some(json!({"ok":true,"session":23,"state":"stopping","cleanup_error":null})),
+            None,
+        ]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+
+    for now in [0, 1, 2, 3, 253, 299, 300] {
+        controller.advance_startup_recovery(&runtime, now);
+    }
+
+    assert!(controller.startup_recovery.blocked());
+    assert!(!controller.startup_recovery.ready());
+    let mut config = open();
+    config.operation_id = "new-launch".into();
+    controller.open(
+        OpenRequest {
+            request: 19,
+            caller: "amaterasu.nvhttp".into(),
+            config,
+            deadline: 1_000,
+            display_preflight_deadline: None,
+        },
+        301,
+        &runtime,
+        false,
+    );
+    assert!(
+        endpoint
+            .completions
+            .iter()
+            .any(|(_, reply)| { reply["code"] == "startup_reconciliation_timeout" })
+    );
+    assert!(!endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { payload, .. } if payload["action"] == "prepare")));
+}
+
 fn record(state: State) -> Record {
     Record {
         id: 5,
@@ -114,6 +393,8 @@ fn record(state: State) -> Record {
         negotiated_slices_per_frame: None,
         negotiated_video_stream_format: None,
         client_feature_flags: None,
+        negotiated_color: None,
+        negotiated_video: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -122,6 +403,8 @@ fn record(state: State) -> Record {
         next_status: 5_000,
         failure: None,
         cleanup_error: None,
+        cleanup_retry_count: 0,
+        cleanup_retry_at: None,
         uncertain: None,
         uncertain_phase: None,
         needs_lookup: false,
@@ -829,6 +1112,8 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         negotiated_slices_per_frame: None,
         negotiated_video_stream_format: None,
         client_feature_flags: None,
+        negotiated_color: None,
+        negotiated_video: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -837,6 +1122,8 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         next_status: 5_000,
         failure: None,
         cleanup_error: None,
+        cleanup_retry_count: 0,
+        cleanup_retry_at: None,
         uncertain: None,
         uncertain_phase: None,
         needs_lookup: true,
@@ -1646,6 +1933,147 @@ fn accepted_announce_encryption_flows_into_authenticated_play_start() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn accepted_color_survives_authenticated_start() {
+    let (mut record, mut announce) = announced_profile_record();
+    announce.video.color = amaterasu_gamestream::sdp::ColorMode::Bt601Full;
+    assert!(record.accept_announce(&announce));
+    let payload = record
+        .authenticated_start_payload(23)
+        .expect("accepted color");
+    assert_eq!(
+        payload["configuration"]["configuration"]["color_mode"],
+        "bt601_full"
+    );
+    assert!(
+        record.config.arm(23)["configuration"]["configuration"]
+            .get("color_mode")
+            .is_none()
+    );
+}
+
+#[test]
+fn negotiated_video_is_owned_by_its_rtsp_ticket() {
+    let (mut low_ticket, mut low_announce) = announced_profile_record();
+    low_ticket.id = 5;
+    low_ticket.session = Some(23);
+    low_ticket.config.profile.width = 1280;
+    low_ticket.config.profile.height = 720;
+    low_ticket.config.profile.fps = 30;
+    low_ticket.config.max_bitrate_kbps = Some(8_000);
+    low_ticket.config.negotiation_bounds = Some(crate::model::NegotiationBounds {
+        max_width: 1280,
+        max_height: 720,
+        max_fps: 30,
+        max_bitrate_kbps: 8_000,
+        max_reference_frames: 1,
+    });
+    low_announce.video.width = 1280;
+    low_announce.video.height = 720;
+    low_announce.video.fps = 30;
+    low_announce.video.bitrate_kbps = 8_000;
+    low_announce.video.max_reference_frames = 0;
+
+    let (mut high_ticket, high_announce) = announced_profile_record();
+    high_ticket.id = 6;
+    high_ticket.session = Some(24);
+    high_ticket.config.negotiation_bounds = Some(crate::model::NegotiationBounds {
+        max_width: 2560,
+        max_height: 1440,
+        max_fps: 120,
+        max_bitrate_kbps: 20_000,
+        max_reference_frames: 1,
+    });
+
+    assert!(low_ticket.accept_announce(&low_announce));
+    assert!(high_ticket.accept_announce(&high_announce));
+    let low_start = low_ticket.authenticated_start_payload(23).unwrap();
+    let high_start = high_ticket.authenticated_start_payload(24).unwrap();
+    let expected_video = json!({"width":1280,"height":720,"fps":30,"bitrate":8_000_000,"max_reference_frames":0,"color_mode":"bt709_limited", "slices_per_frame": 1, "video_stream_format": low_announce.video.format});
+    for (field, expected) in expected_video.as_object().unwrap() {
+        assert_eq!(
+            &low_start["configuration"]["configuration"][field], expected,
+            "{field}"
+        );
+    }
+    assert_eq!(high_start["configuration"]["configuration"]["width"], 1920);
+    assert_eq!(high_start["configuration"]["configuration"]["height"], 1080);
+    assert_eq!(high_start["configuration"]["configuration"]["fps"], 60);
+
+    assert!(!low_ticket.accept_announce(&high_announce));
+    assert!(low_ticket.authenticated_start_payload(23).is_none());
+    assert!(high_ticket.authenticated_start_payload(24).is_some());
+}
+
+#[test]
+fn authenticated_start_keeps_the_exact_ticket_codec() {
+    let (mut record, mut announce) = announced_profile_record();
+    record.config.profile.codec = amaterasu_media::VideoCodec::Hevc;
+    announce.video.format.codec = amaterasu_gamestream::sdp::VideoCodec::Hevc;
+    announce.video.color = amaterasu_gamestream::sdp::ColorMode::Bt709Limited;
+    assert!(record.accept_announce(&announce));
+    let start = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(start["configuration"]["configuration"]["codec"], "hevc");
+    assert_eq!(
+        record.config.prepare("hevc-prepare", None)["video"]["codec"],
+        "hevc"
+    );
+}
+
+#[test]
+fn codec_offer_drives_describe_markers_announce_and_start_codec() {
+    let (mut record, mut announce) = announced_profile_record();
+    let only_h264 = record.capabilities().transport;
+    assert!(!only_h264.hevc && !only_h264.av1);
+
+    record.config.profile.codecs = vec![
+        amaterasu_media::VideoCodec::H264,
+        amaterasu_media::VideoCodec::Av1,
+    ];
+    let offered = record.capabilities().transport;
+    assert!(offered.av1 && !offered.hevc);
+    let prepared = record.config.prepare("offer-prepare", None);
+    assert_eq!(prepared["video"]["codecs"], json!(["h264", "av1"]));
+    assert!(prepared["video"].get("codec").is_none());
+
+    announce.video.color = amaterasu_gamestream::sdp::ColorMode::Bt709Limited;
+    announce.video.format.codec = amaterasu_gamestream::sdp::VideoCodec::Hevc;
+    assert!(!record.accept_announce(&announce), "HEVC was not offered");
+    announce.video.format.codec = amaterasu_gamestream::sdp::VideoCodec::Av1;
+    assert!(record.accept_announce(&announce));
+    let start = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(start["configuration"]["configuration"]["codec"], "av1");
+
+    announce.video.format.codec = amaterasu_gamestream::sdp::VideoCodec::H264;
+    assert!(record.accept_announce(&announce));
+    let start = record.authenticated_start_payload(24).unwrap();
+    assert!(
+        start["configuration"]["configuration"]
+            .get("codec")
+            .is_none()
+    );
+}
+
+#[test]
+fn codec_offers_must_name_each_codec_once_and_replace_the_single_codec() {
+    let (mut record, _) = announced_profile_record();
+    record.config.profile.codecs = vec![
+        amaterasu_media::VideoCodec::Hevc,
+        amaterasu_media::VideoCodec::Av1,
+    ];
+    assert!(record.config.validate(false).is_ok());
+    record
+        .config
+        .profile
+        .codecs
+        .push(amaterasu_media::VideoCodec::Av1);
+    assert_eq!(record.config.validate(false), Err("invalid_profile"));
+    record.config.profile.codecs = vec![amaterasu_media::VideoCodec::Hevc];
+    record.config.profile.codec = amaterasu_media::VideoCodec::Hevc;
+    assert_eq!(record.config.validate(false), Err("invalid_profile"));
+}
+
 #[test]
 fn accepted_announce_freezes_pcm_haptics_flag_into_authenticated_start() {
     let (mut record, mut announce) = announced_profile_record();
@@ -1685,6 +2113,8 @@ fn rejected_announce_cannot_produce_an_authenticated_play_start() {
     assert!(!record.accept_announce(&announce));
     assert!(record.negotiated_encryption.is_none());
     assert!(record.client_feature_flags.is_none());
+    assert!(record.negotiated_color.is_none());
+    assert!(record.negotiated_video.is_none());
     assert!(record.authenticated_start_payload(23).is_none());
 }
 
@@ -1715,6 +2145,15 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
         record.negotiated_video_stream_format =
             Some(amaterasu_module_sdk::VideoStreamFormat::H264_SDR);
         record.client_feature_flags = Some(3);
+        record.negotiated_color = Some(amaterasu_gamestream::sdp::ColorMode::Bt709Limited);
+        record.negotiated_video = Some(crate::model::NegotiatedVideo {
+            codec: amaterasu_media::VideoCodec::H264,
+            width: record.config.profile.width,
+            height: record.config.profile.height,
+            fps: record.config.profile.fps,
+            bitrate_kbps: record.config.profile.bitrate_kbps,
+            max_reference_frames: record.config.profile.max_reference_frames,
+        });
         record.config.frame_limiter_settings = Some(snapshot.clone());
         record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());
         record.config.application_operation_id = Some("launch-one".into());

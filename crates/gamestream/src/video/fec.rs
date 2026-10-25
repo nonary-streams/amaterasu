@@ -91,18 +91,20 @@ pub(super) fn reservation(
 impl VideoPacketizer {
     pub(super) fn packetize_with_fec(
         &mut self,
-        codec: VideoCodec,
         access_unit: &[u8],
+        encoder_keyframe: bool,
         frame_index: u32,
         timestamp: u32,
+        host_processing_latency: u16,
     ) -> Result<Vec<Vec<u8>>, VideoError> {
         let total_bytes = access_unit.len() + FRAME_BYTES;
         let blocks = plan_blocks(total_bytes.div_ceil(self.payload_bytes), self.config)?;
-        let is_idr = validate_annex_b(access_unit, codec)?;
+        let is_idr = self.keyframe(access_unit, encoder_keyframe)?;
         let mut frame = Vec::with_capacity(total_bytes);
         frame.extend_from_slice(&short_frame_header(
             is_idr,
             ((total_bytes - 1) % self.payload_bytes + 1) as u16,
+            host_processing_latency,
         ));
         frame.extend_from_slice(access_unit);
         let total_packets = blocks

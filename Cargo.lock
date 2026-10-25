@@ -47,8 +47,11 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
+ "amaterasu-input-companion",
  "amaterasu-logging",
  "amaterasu-package",
+ "ed25519-dalek",
+ "libc",
  "libloading",
  "serde",
  "serde_json",
@@ -158,6 +161,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-capture-vkms"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-media",
+ "amaterasu-module-sdk",
+ "amaterasu-vkms-frame-helper",
+ "cc",
+ "getrandom 0.3.4",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-capture-wgc"
 version = "0.1.0"
 dependencies = [
@@ -261,6 +278,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "cc",
  "libloading",
+ "pkg-config",
  "serde",
  "serde_json",
  "windows",
@@ -317,9 +335,21 @@ name = "amaterasu-input"
 version = "0.1.0"
 dependencies = [
  "amaterasu-gamestream",
+ "amaterasu-input-companion",
  "amaterasu-input-policy",
  "amaterasu-module-sdk",
  "getrandom 0.3.4",
+ "libc",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "amaterasu-input-companion"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-storage",
  "libc",
  "serde",
  "serde_json",
@@ -384,6 +414,7 @@ dependencies = [
  "amaterasu-input-policy",
  "amaterasu-module-sdk",
  "amaterasu-package",
+ "ed25519-dalek",
  "httparse",
  "rustls",
  "serde",
@@ -396,8 +427,10 @@ name = "amaterasu-media"
 version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
+ "libc",
  "serde",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -451,6 +484,7 @@ dependencies = [
  "amaterasu-gamestream",
  "amaterasu-identity",
  "amaterasu-input-policy",
+ "amaterasu-media",
  "amaterasu-module-sdk",
  "amaterasu-network-policy",
  "amaterasu-upnp",
@@ -477,6 +511,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "ureq",
 ]
 
 [[package]]
@@ -523,8 +558,10 @@ dependencies = [
  "amaterasu-storage",
  "ed25519-dalek",
  "getrandom 0.3.4",
+ "libloading",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -534,6 +571,7 @@ dependencies = [
  "amaterasu-contracts",
  "amaterasu-gamestream",
  "amaterasu-input-policy",
+ "amaterasu-media",
  "amaterasu-module-sdk",
  "getrandom 0.3.4",
  "serde",
@@ -666,7 +704,9 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-media",
  "amaterasu-module-sdk",
+ "cc",
  "getrandom 0.3.4",
+ "pkg-config",
  "serde",
  "serde_json",
 ]
@@ -677,11 +717,20 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-contracts",
  "amaterasu-module-sdk",
+ "amaterasu-storage",
+ "cc",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
  "sha2",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "amaterasu-vkms-frame-helper"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

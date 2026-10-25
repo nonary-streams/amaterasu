@@ -1,6 +1,8 @@
 //! Native calls borrow copied headers only synchronously. Bindings are retained
 //! until every pending call and callback has returned, then released by the SDK.
 use super::*;
+use amaterasu_gamestream::control::{RUMBLE_MESSAGE_TYPE, RumbleFeedback, encode_rumble_feedback};
+use amaterasu_media::{CONTROL_RELIABLE, ControlMessage};
 use amaterasu_module_sdk::{NativeBinding, abi::*};
 use std::{
     ffi::c_void,
@@ -55,6 +57,62 @@ fn bind<T>(runtime: &RuntimeClient, service: &str) -> PlaneResult<NativeBinding>
 }
 
 impl Backend for NativeBackend {
+    fn desktop_geometry(&mut self) -> PlaneResult<Option<CaptureGeometry>> {
+        // SAFETY: the retained binding was validated for the v1.0 prefix. Only
+        // inspect the optional v1.1 tail when both version and size advertise it.
+        let prefix =
+            unsafe { self.video.table::<VideoApi>() }.map_err(|_| "native_layout_mismatch")?;
+        if prefix.base.header.minor < 1 {
+            return Ok(None);
+        }
+        let api =
+            unsafe { self.video.table::<VideoApiV1_1>() }.map_err(|_| "native_layout_mismatch")?;
+        let mut geometry = std::mem::MaybeUninit::uninit();
+        // SAFETY: STATUS_OK initializes this output slot before returning.
+        match unsafe { (api.geometry)(api.base.context, self.handles.video, geometry.as_mut_ptr()) }
+        {
+            STATUS_OK => {
+                let geometry = unsafe { geometry.assume_init() };
+                geometry
+                    .validate()
+                    .map_err(|_| "invalid_capture_geometry")?;
+                Ok(Some(geometry))
+            }
+            MEDIA_BUSY | MEDIA_PENDING | MEDIA_UNSUPPORTED | MEDIA_CLOSED => Ok(None),
+            _ => Err("video_geometry_failed"),
+        }
+    }
+
+    fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool> {
+        let payload = encode_rumble_feedback(RumbleFeedback {
+            slot: command.slot,
+            low_frequency: command.low_frequency,
+            high_frequency: command.high_frequency,
+        })
+        .map_err(|_| "invalid_rumble_feedback")?;
+        let message = ControlMessage {
+            message_type: u32::from(RUMBLE_MESSAGE_TYPE),
+            channel: 0,
+            delivery: CONTROL_RELIABLE,
+            reserved: 0,
+            data: payload.as_ptr(),
+            len: payload.len(),
+            sequence: 0,
+        };
+        // SAFETY: the authenticated control provider copies this bounded stack
+        // payload synchronously and owns encryption/sequence assignment.
+        let api = unsafe { self.control.table::<ControlTransportApi>() }
+            .map_err(|_| "native_layout_mismatch")?;
+        let status = unsafe {
+            (api.send)(
+                self.control.context(),
+                self.handles.control_transport,
+                &message,
+            )
+        };
+        accepted(status)
+    }
+
     fn control(&mut self) -> PlaneResult<Option<ControlRecord>> {
         let mut output = Delivery::default();
         // SAFETY: the owned binding and stack sink remain live for one callback.
@@ -70,7 +128,7 @@ impl Backend for NativeBackend {
                 },
             )
         };
-        output.finish(status)
+        output.finish(status, DeliveryLane::Control)
     }
 
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool> {
@@ -114,7 +172,7 @@ impl Backend for NativeBackend {
                 },
             )
         };
-        output.finish(status)
+        output.finish(status, DeliveryLane::Video)
     }
 
     fn pcm(&mut self) -> PlaneResult<Option<PcmPacket>> {
@@ -134,7 +192,7 @@ impl Backend for NativeBackend {
                 },
             )
         };
-        let packet = output.finish(status)?;
+        let packet = output.finish(status, DeliveryLane::Pcm)?;
         if packet
             .as_ref()
             .is_some_and(|packet| packet.header().channels != self.handles.audio_channels)
@@ -164,7 +222,7 @@ impl Backend for NativeBackend {
         if status == MEDIA_BACKEND_ERROR {
             Err("audio_encoder_failed")
         } else {
-            let packet = output.finish(status)?;
+            let packet = output.finish(status, DeliveryLane::Audio)?;
             if packet
                 .as_ref()
                 .is_some_and(|packet| packet.header().channels != self.handles.audio_channels)
@@ -240,6 +298,34 @@ struct Delivery<T> {
     result: Option<PlaneResult<T>>,
 }
 
+#[derive(Clone, Copy)]
+enum DeliveryLane {
+    Control,
+    Video,
+    Pcm,
+    Audio,
+}
+
+impl DeliveryLane {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Video => "video",
+            Self::Pcm => "pcm",
+            Self::Audio => "audio",
+        }
+    }
+
+    fn failure(self) -> &'static str {
+        match self {
+            Self::Control => "native_delivery_failed_control",
+            Self::Video => "native_delivery_failed_video",
+            Self::Pcm => "native_delivery_failed_pcm",
+            Self::Audio => "native_delivery_failed_audio",
+        }
+    }
+}
+
 impl<T> Default for Delivery<T> {
     fn default() -> Self {
         Self { result: None }
@@ -247,13 +333,24 @@ impl<T> Default for Delivery<T> {
 }
 
 impl<T> Delivery<T> {
-    fn finish(self, status: Status) -> PlaneResult<Option<T>> {
+    fn finish(self, status: Status, lane: DeliveryLane) -> PlaneResult<Option<T>> {
+        let callback = self.result.is_some();
         match (status, self.result) {
             (STATUS_OK, Some(result)) => result.map(Some),
             (MEDIA_BUSY | MEDIA_PENDING, None) => Ok(None),
             (_, Some(Err(error))) => Err(error),
             (MEDIA_CLOSED, _) => Err("native_stream_closed"),
-            _ => Err("native_delivery_failed"),
+            _ => {
+                // Only fixed lane names, numeric ABI status, and callback presence
+                // are logged. No borrowed media, control message, or peer data escapes.
+                eprintln!(
+                    "amaterasu native delivery failed lane={} status={} callback={}",
+                    lane.name(),
+                    status,
+                    callback
+                );
+                Err(lane.failure())
+            }
         }
     }
 }

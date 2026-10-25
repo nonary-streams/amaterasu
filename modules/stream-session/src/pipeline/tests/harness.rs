@@ -41,11 +41,15 @@ pub struct Broker {
     next: u64,
     pub replies: BTreeMap<u64, Value>,
     pub calls: Vec<Call>,
+    pub timeline: Rc<RefCell<Vec<&'static str>>>,
+    pub now: u64,
+    pub gamepad_poll_times: Vec<u64>,
     pub commands: Vec<Command>,
     pub fault: Option<(String, Fault)>,
     pub fail_cancel: bool,
     pub fail_open: Option<String>,
     pub fail_close: Option<String>,
+    pub fail_session_stop: bool,
     pub fail_audio_recover: bool,
     pub malformed_audio_recover: bool,
     pub authenticated: bool,
@@ -67,6 +71,7 @@ pub struct Broker {
     pub input_feedback_events: VecDeque<Value>,
     pub input_feedback_acks: Vec<u64>,
     pub feedback_ack_failures: usize,
+    pub gamepad_feedback: VecDeque<Value>,
     pub fail_input_batch: bool,
     pub fail_controller_input: bool,
     pub input_cleanup_required: bool,
@@ -115,6 +120,8 @@ pub struct Broker {
     pub display_apply_recovery_reply: bool,
     pub display_wrong_status_operation: bool,
     pub display_restore_failures: usize,
+    pub virtual_displays: BTreeMap<String, Value>,
+    pub virtual_display_fail_remove: bool,
     pub display_unavailable: bool,
     pub display_mutation_enabled: bool,
     pub display_race_on_lost_apply: bool,
@@ -128,6 +135,9 @@ pub struct Broker {
     pub virtual_display_pending_statuses: u8,
     pub virtual_display_create_failure: Option<String>,
     pub virtual_display_remove_failure: bool,
+    pub state_revision: u64,
+    pub state_value: Option<Value>,
+    pub state_fail_set: bool,
 }
 
 impl Broker {
@@ -183,6 +193,36 @@ impl Broker {
             .iter()
             .filter(|call| call.service == "amaterasu.session-history/1")
             .count()
+    }
+
+    pub fn seed_state(&mut self, value: Value, revision: u64) {
+        self.state_value = Some(value);
+        self.state_revision = revision;
+    }
+
+    pub fn seed_session(&mut self, key: &str) {
+        self.next += 1;
+        self.allocations.insert(
+            ("amaterasu.session/1".into(), key.into()),
+            Allocation {
+                id: self.next,
+                key: key.into(),
+                state: "active".into(),
+                leases: Default::default(),
+                request: json!({}),
+            },
+        );
+    }
+
+    pub fn session_is_stopped_without_leases(&self, key: &str) -> bool {
+        self.allocations
+            .get(&("amaterasu.session/1".into(), key.into()))
+            .is_some_and(|allocation| allocation.state == "stopped" && allocation.leases.is_empty())
+    }
+
+    pub fn has_session_key(&self, key: &str) -> bool {
+        self.allocations
+            .contains_key(&("amaterasu.session/1".into(), key.into()))
     }
 
     pub fn send(&mut self, command: Command) -> ModuleResult<Response> {
@@ -401,6 +441,22 @@ impl Broker {
                 _ => panic!("unexpected system tray action"),
             };
         }
+        if service == "amaterasu.state/1" {
+            return match action {
+                "get" => json!({"ok":true,"revision":self.state_revision,
+                    "found":self.state_value.is_some(),"value":self.state_value.clone()}),
+                "set" if self.state_fail_set => error("state_write_unavailable"),
+                "set" if call.payload["expected_revision"] != self.state_revision => {
+                    error("revision_conflict")
+                }
+                "set" => {
+                    self.state_value = Some(call.payload["value"].clone());
+                    self.state_revision += 1;
+                    json!({"ok":true,"revision":self.state_revision})
+                }
+                _ => panic!("unexpected state action"),
+            };
+        }
         if service == "amaterasu.session-history/1" {
             return match action {
                 "stream_activity_begin" => {
@@ -469,7 +525,29 @@ impl Broker {
             return self.frame_limiter(action, &call.payload);
         }
         if service == "amaterasu.virtual-display/1" {
-            return self.virtual_display(action, &call.payload);
+            if call.payload["reference_id"].is_string() {
+                return self.virtual_display(action, &call.payload);
+            }
+            let identity = call.payload["identity"].as_str().unwrap().to_owned();
+            return match action {
+                "create" => {
+                    let index = self.virtual_displays.len() + 2;
+                    let mut specification = call.payload.clone();
+                    specification.as_object_mut().unwrap().remove("action");
+                    let monitor = json!({"specification":specification,"state":"ready","capture_output":format!("kwin:Virtual-{index}"),"ready":{"active":true}});
+                    self.virtual_displays.insert(identity, monitor.clone());
+                    json!({"ok":true,"monitor":monitor})
+                }
+                "status" => {
+                    json!({"ok":true,"monitors":self.virtual_displays.get(&identity).cloned().into_iter().collect::<Vec<_>>()})
+                }
+                "remove" if self.virtual_display_fail_remove => error("broker_unavailable"),
+                "remove" => {
+                    self.virtual_displays.remove(&identity);
+                    json!({"ok":true,"removed":true,"identity":identity})
+                }
+                _ => panic!("unexpected virtual display action"),
+            };
         }
         if service == "amaterasu.display/1" {
             return self.display(action, &call.payload);
@@ -561,6 +639,9 @@ impl Broker {
             } else {
                 self.allocations.remove(&key);
             }
+            if service == "amaterasu.control-transport/1" {
+                self.timeline.borrow_mut().push("control_close");
+            }
             return json!({"ok":true,"stream":id,"state":"closing"});
         }
         if action == "recover" && service == "amaterasu.audio-encode/1" {
@@ -570,6 +651,9 @@ impl Broker {
             return json!({"ok":true,"stream":if self.malformed_audio_recover {id + 1} else {id},"packet_bytes":160});
         }
         if service == "amaterasu.session/1" {
+            if action == "stop" && self.fail_session_stop {
+                return error("stop_failed");
+            }
             let allocation = self.allocations.get_mut(&key).unwrap();
             match action {
                 "acquire" => {
@@ -912,6 +996,14 @@ impl Broker {
                 self.input_ttl_ms = payload["ttl_ms"].as_u64().unwrap();
                 json!({"ok":true,"lease":self.input_lease,"ttl_ms":self.input_ttl_ms})
             }
+            "poll_gamepad_feedback" => {
+                self.gamepad_poll_times.push(self.now);
+                if payload["lease"] != json!(self.input_lease) {
+                    return json!({"ok":false,"error":{"code":"permission_denied"}});
+                }
+                json!({"ok":true,"lease":self.input_lease,
+                    "feedback":self.gamepad_feedback.pop_front().unwrap_or(Value::Null)})
+            }
             "batch" => {
                 if payload["lease"] != json!(self.input_lease) {
                     return json!({"ok":false,"error":{"code":"permission_denied"}});
@@ -974,6 +1066,7 @@ impl Broker {
                 }
                 self.input_lease = None;
                 self.input_terminal = true;
+                self.timeline.borrow_mut().push("input_release");
                 json!({"ok":true,"released":true})
             }
             _ => panic!("unexpected input action"),
@@ -1075,7 +1168,10 @@ impl Broker {
                 reply
             }
             "amaterasu.audio/1" => {
-                let channels = allocation.request["channels"].as_u64().unwrap_or(2);
+                let channels = allocation.request["capture_format"]["channels"]
+                    .as_u64()
+                    .or_else(|| allocation.request["channels"].as_u64())
+                    .unwrap_or(2);
                 let mask = match channels {
                     6 => 0x3f,
                     8 => 0x63f,
@@ -1091,6 +1187,7 @@ impl Broker {
 #[derive(Default)]
 pub struct PlaneState {
     pub stopping: bool,
+    pub desktop_geometry: Option<amaterasu_media::CaptureGeometry>,
     pub ticks: usize,
     pub media_ticks: usize,
     pub media_ticks_when_stopped: Option<usize>,
@@ -1102,6 +1199,10 @@ pub struct PlaneState {
     pub observed_video_sequence_gaps: u64,
     pub feedback: Vec<amaterasu_gamestream::control::HostFeedback>,
     pub feedback_queue_full: usize,
+    pub rumble_commands: Vec<crate::plane::RumbleCommand>,
+    pub rumble_error: bool,
+    pub rumble_busy: bool,
+    pub timeline: Rc<RefCell<Vec<&'static str>>>,
 }
 struct FakePlane(Rc<RefCell<PlaneState>>);
 impl Drive for FakePlane {
@@ -1114,6 +1215,7 @@ impl Drive for FakePlane {
         state.media_ticks += usize::from(media_active);
         let progress = PlaneProgress {
             controls: std::mem::take(&mut state.controls),
+            desktop_geometry: state.desktop_geometry,
             accepted_video_access_units: std::mem::take(&mut state.accepted_video_access_units),
             accepted_media_payload_bytes: std::mem::take(&mut state.accepted_media_payload_bytes),
             observed_video_sequence_gaps: std::mem::take(&mut state.observed_video_sequence_gaps),
@@ -1122,6 +1224,20 @@ impl Drive for FakePlane {
             return Err(PlaneFailure { code, progress });
         }
         Ok(progress)
+    }
+    fn send_rumble(&mut self, _command: crate::plane::RumbleCommand) -> Result<bool, &'static str> {
+        let mut state = self.0.borrow_mut();
+        if state.rumble_error {
+            return Err("native_stream_closed");
+        }
+        if state.rumble_busy {
+            return Ok(false);
+        }
+        state.rumble_commands.push(_command);
+        if _command.low_frequency == 0 && _command.high_frequency == 0 {
+            state.timeline.borrow_mut().push("rumble_zero");
+        }
+        Ok(true)
     }
     fn stop(&mut self) {
         let mut state = self.0.borrow_mut();
@@ -1162,20 +1278,39 @@ pub struct Harness {
 }
 impl Harness {
     pub fn new() -> Self {
+        let timeline = Rc::new(RefCell::new(Vec::new()));
+        let mut broker = Broker::new();
+        broker.timeline = timeline.clone();
+        let plane_state = PlaneState {
+            timeline,
+            ..PlaneState::default()
+        };
         Self {
-            pipeline: Pipeline::new(Settings {
+            pipeline: Pipeline::new_for_test(Settings {
                 enabled: true,
                 allowed_principals: vec!["owner".into()],
                 ..Settings::default()
             })
             .unwrap(),
-            broker: Broker::new(),
-            plane: Rc::new(RefCell::new(PlaneState::default())),
+            broker,
+            plane: Rc::new(RefCell::new(plane_state)),
             now: 0,
         }
     }
+    pub fn with_restart_state(document: Value, revision: u64) -> Self {
+        let mut host = Self::new();
+        host.pipeline = Pipeline::new_for_restart_test(Settings {
+            enabled: true,
+            allowed_principals: vec!["owner".into()],
+            ..Settings::default()
+        })
+        .unwrap();
+        host.broker.seed_state(document, revision);
+        host
+    }
     pub fn tick(&mut self) {
         self.now += 1;
+        self.broker.now = self.now;
         let state = self.plane.clone();
         self.pipeline
             .tick_with(
@@ -1196,7 +1331,18 @@ impl Harness {
                 return value;
             }
         }
-        panic!("workflow did not complete");
+        let recent = self
+            .broker
+            .calls
+            .iter()
+            .rev()
+            .take(12)
+            .map(|call| format!("{}/{}", call.service, call.payload["action"]))
+            .collect::<Vec<_>>();
+        panic!(
+            "workflow did not complete at tick {}; state revision {}; recent calls {recent:?}",
+            self.now, self.broker.state_revision
+        );
     }
     pub fn idle(&mut self) {
         for _ in 0..150 {

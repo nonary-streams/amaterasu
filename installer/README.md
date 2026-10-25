@@ -1,5 +1,69 @@
 # Windows installer
 
+## Optional VHF keyboard/mouse package
+
+The VHF keyboard/mouse source is a separate root device and privileged
+companion. It is never installed by the ordinary Amaterasu MSI or by approving
+an update repository. `prepare-vhf-input.ps1 -OutputDirectory <new-directory>`
+builds the x64 UMDF driver and user-mode companion, checks the INF, and runs
+Inf2Cat. Cargo uses the explicit `x86_64-pc-windows-msvc` target, and sealing
+checks the PE machine type of both native payloads. The resulting catalog and
+companion are **unsigned and not
+installable**. `-WithoutPdb` permits a local diagnostic build when the installed
+VS PDB components are inconsistent; it also emits a linker map but does not
+replace release PDBs. The build needs VS2022, the WDK 26100 tool package,
+InfVerif, Inf2Cat, and Cargo. No signing key is accessed by this script.
+The optional installer also requires PowerShell 7 in its protected Program
+Files location and an explicitly supplied WDK SignTool and DevCon.
+Both executable tools must be Microsoft-signed and located under protected
+Program Files directories. A DevCon binary in a user-writable NuGet cache is
+rejected; an administrator will need a protected copy before a later approved
+installation. The installer does not move tools or change their ACLs.
+
+After a separately authorized signer signs the catalog and companion,
+`amaterasu-release seal-vhf-package PACKAGE CONFIRMED_SHA1_FINGERPRINT SIGNTOOL`
+checks that Windows trusts both signatures, that the exact independently
+confirmed signer matches both files, and that the catalog covers the INF and
+DLL. It records SHA-256 hashes in `manifest.json`. The same checks run again
+before any install mutation, and after copying into a protected stage. A
+repository URL or package-provided fingerprint is not approval. Missing
+SignTool, missing signatures, untrusted signatures, changed hashes, or missing
+catalog members fail closed. No certificate is silently enrolled.
+
+The separately invoked `install-vhf-package PACKAGE INSTALL_ROOT RUNTIME_ROOT
+CONFIRMED_SHA1_FINGERPRINT SIGNTOOL DEVCON` requires an elevated administrator,
+the standard Program Files Amaterasu install folder, and a protected runtime
+root. It stages only the four fixed artifacts, creates a demand-start
+`AmaterasuInputCompanion` LocalSystem service with its service SID, and uses the
+specified WDK DevCon to install only `ROOT\AMATERASUVHFINPUT`. It does not start
+the service or enable input. A durable journal records exact files, service,
+device instance, and published `oemNN.inf`. Device discovery checks the
+hardware-ID property and separately records the actual `ROOT\SYSTEM\NNNN`
+instance ID. If an OS operation's outcome is uncertain,
+`rollback-vhf-package INSTALL_ROOT RUNTIME_ROOT DEVCON` reconciles only that
+hardware ID and matching INF, including a root device without a bound driver;
+mismatches stop recovery. Rollback
+requires an explicit grant revocation and stopped companion service first.
+Install, rollback, grant, and revoke take the same runtime operation lock so
+two administrators cannot race through preflight and overwrite one journal.
+These installer commands are code paths for later approved deployment and have
+not been run against a machine.
+
+`grant-vhf-input INSTALL_ROOT RUNTIME_ROOT ACTIVE_SET_SHA256 1|0 1|0` is a
+separate administrator action. It requires the currently selected component
+set, a completed package installation, matching service/device identities, and
+a stopped Amaterasu host; it writes a protected, exact-digest keyboard/mouse
+policy. `revoke-vhf-input INSTALL_ROOT RUNTIME_ROOT` removes only that policy.
+The new backend has no SendInput fallback. Neither signing nor this policy
+turns native code into a sandbox. The installed companion, UMDF ACL and HID
+behavior still need controlled end-to-end validation before enabling it.
+
+The installed Ambidex lifecycle-test Amaterasu service currently runs from a
+ProgramData test tree with ordinary-user Modify rights. The optional installer
+must reject that root; a protected installation is a prerequisite for a
+privileged companion test. This finding does not alter or remove that test
+service.
+
 `build-installer.ps1` produces a per-machine x64 MSI and local Burn Setup
 bundle from a release workspace build. Their definitions are tracked here;
 generated WiX fragments and artifacts remain under `target/installer`.

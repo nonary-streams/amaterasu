@@ -11,6 +11,8 @@ pub struct Settings {
     pub capture_principals: BTreeSet<String>,
     pub idle_timeout_seconds: u32,
     pub selection_timeout_seconds: u32,
+    pub remember_source: bool,
+    pub allow_named_outputs: bool,
 }
 
 impl Default for Settings {
@@ -21,13 +23,15 @@ impl Default for Settings {
             capture_principals: BTreeSet::new(),
             idle_timeout_seconds: 60,
             selection_timeout_seconds: 120,
+            remember_source: false,
+            allow_named_outputs: false,
         }
     }
 }
 
 impl Settings {
     pub fn validate(&self) -> CaptureResult<()> {
-        if !(1..=300).contains(&self.idle_timeout_seconds)
+        if !(1..=600).contains(&self.idle_timeout_seconds)
             || !(1..=300).contains(&self.selection_timeout_seconds)
             || !valid_principals(&self.selection_principals)
             || !valid_principals(&self.capture_principals)
@@ -67,7 +71,7 @@ impl SourceType {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Status,
@@ -131,6 +135,76 @@ pub enum SourceState {
     Revoked,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct SourceDiagnostics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<SourceStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipewire_node: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipewire_serial: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipewire_state: Option<PipeWireState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipewire_error: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adapter_error_code: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStage {
+    ConnectingSessionBus,
+    CreateSession,
+    SelectSources,
+    Start,
+    #[serde(rename = "open_pipewire_remote")]
+    OpenPipeWireRemote,
+    #[serde(rename = "connect_pipewire")]
+    ConnectPipeWire,
+    WaitingForFrames,
+    FrameReceived,
+}
+
+impl SourceStage {
+    pub fn from_native(value: u32) -> Option<Self> {
+        Some(match value {
+            1 => Self::ConnectingSessionBus,
+            2 => Self::CreateSession,
+            3 => Self::SelectSources,
+            4 => Self::Start,
+            5 => Self::OpenPipeWireRemote,
+            6 => Self::ConnectPipeWire,
+            7 => Self::WaitingForFrames,
+            8 => Self::FrameReceived,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PipeWireState {
+    Unconnected,
+    Connecting,
+    Paused,
+    Streaming,
+    Error,
+}
+
+impl PipeWireState {
+    pub fn from_native(value: i32) -> Option<Self> {
+        Some(match value {
+            0 => Self::Unconnected,
+            1 => Self::Connecting,
+            2 => Self::Paused,
+            3 => Self::Streaming,
+            -1 => Self::Error,
+            _ => return None,
+        })
+    }
+}
+
 pub fn validate_operation_id(id: &str) -> CaptureResult<()> {
     if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
         Err("invalid_operation_id")
@@ -147,5 +221,26 @@ pub fn new_id() -> CaptureResult<u64> {
         Err("entropy_error")
     } else {
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn native_diagnostic_codes_map_to_safe_status_tokens() {
+        assert_eq!(SourceStage::from_native(4), Some(SourceStage::Start));
+        assert_eq!(
+            SourceStage::from_native(5),
+            Some(SourceStage::OpenPipeWireRemote)
+        );
+        assert_eq!(
+            SourceStage::from_native(6),
+            Some(SourceStage::ConnectPipeWire)
+        );
+        assert_eq!(SourceStage::from_native(99), None);
+        assert_eq!(PipeWireState::from_native(-1), Some(PipeWireState::Error));
+        assert_eq!(PipeWireState::from_native(i32::MAX), None);
     }
 }

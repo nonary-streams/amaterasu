@@ -2489,6 +2489,173 @@ test("Moonlight host editor confirms updated LAN and WAN encryption modes", asyn
   assert.equal(calls[0][1].wan_encryption_mode, 0);
 });
 
+test("focused future-stream audio save sends only audio fields and confirms readback", async () => {
+  const current = { ...nvhttpHostSettings(), effective_audio_sink: "startup.monitor" };
+  const saved = {
+    ...current,
+    revision: current.revision + 1,
+    stream_audio: true,
+    configured_audio_sink: "monitor.source.id",
+    effective_audio_sink: "monitor.source.id",
+  };
+  const updated = {
+    ...saved,
+    hostname: "Provider hostname one",
+    address_family: "both",
+    bind_address: "127.0.0.1",
+    http_addresses: ["127.0.0.1"],
+    https_addresses: null,
+    rtsp_addresses: ["127.0.0.1"],
+    active_http_port: null,
+    active_https_port: null,
+    active_rtsp_port: null,
+    listener_error: "listener apply pending",
+    rtsp_listener_error: "RTSP listener apply pending",
+  };
+  const readback = {
+    ...saved,
+    hostname: "Provider hostname two",
+    address_family: "ipv4",
+    bind_address: "0.0.0.0",
+    http_addresses: ["0.0.0.0"],
+    https_addresses: ["0.0.0.0"],
+    rtsp_addresses: ["0.0.0.0"],
+    active_http_port: 47989,
+    active_https_port: 47984,
+    active_rtsp_port: 47989,
+    listener_error: null,
+    rtsp_listener_error: null,
+  };
+  const calls = [];
+  const api = { async post(route, body = {}) {
+    calls.push([route, ordinary(body)]);
+    if (route === "nvhttp/settings_update") return updated;
+    assert.equal(route, "nvhttp/settings");
+    return readback;
+  } };
+  const result = await context.Amaterasu.saveNvhttpAudioSettings(
+    api, current, true, "monitor.source.id",
+  );
+
+  assert.deepEqual(ordinary(result), readback);
+  assert.deepEqual(calls, [
+    ["nvhttp/settings_update", {
+      hostname: current.configured_hostname,
+      port: current.port,
+      expected_revision: current.revision,
+      stream_audio: true,
+      audio_sink: "monitor.source.id",
+    }],
+    ["nvhttp/settings", {}],
+  ]);
+});
+
+test("focused audio save rejects changes to persisted host and security fields", async () => {
+  const current = nvhttpHostSettings();
+  const expectedAudio = {
+    ...current,
+    revision: current.revision + 1,
+    stream_audio: true,
+    configured_audio_sink: "monitor.source.id",
+  };
+  const unrelatedChanges = [
+    { configured_hostname: "Changed host" },
+    { configured_max_bitrate: 12000 },
+    { lan_encryption_mode: 2 },
+  ];
+  for (const changedFields of unrelatedChanges) {
+    const routes = [];
+    await assert.rejects(context.Amaterasu.saveNvhttpAudioSettings({ async post(route, body = {}) {
+      routes.push([route, ordinary(body)]);
+      assert.deepEqual(Object.keys(body).sort(), [
+        "audio_sink", "expected_revision", "hostname", "port", "stream_audio",
+      ]);
+      return route === "nvhttp/settings_update"
+        ? { ...expectedAudio, ...changedFields }
+        : expectedAudio;
+    } }, current, true, "monitor.source.id"), /persisted host settings changing/);
+    assert.deepEqual(routes.map(([route]) => route), ["nvhttp/settings_update"]);
+  }
+
+  const routes = [];
+  await assert.rejects(context.Amaterasu.saveNvhttpAudioSettings({ async post(route) {
+    routes.push(route);
+    return route === "nvhttp/settings_update"
+      ? expectedAudio
+      : { ...expectedAudio, wan_encryption_mode: 0, active_rtsp_port: null };
+  } }, current, true, "monitor.source.id"), /after saving without persisted host settings changing/);
+  assert.deepEqual(routes, ["nvhttp/settings_update", "nvhttp/settings"]);
+});
+
+test("focused future-stream audio save validates selectors and rejects mismatched readback", async () => {
+  const current = nvhttpHostSettings();
+  let calls = 0;
+  const api = { async post() { calls += 1; return current; } };
+  for (const [streamAudio, sink] of [
+    ["yes", ""],
+    [true, "bad\nendpoint"],
+    [true, "é".repeat(2049)],
+  ])
+    await assert.rejects(context.Amaterasu.saveNvhttpAudioSettings(api, current, streamAudio, sink));
+  assert.equal(calls, 0);
+
+  const updated = { ...current, revision: current.revision + 1, stream_audio: true,
+    configured_audio_sink: null };
+  await assert.rejects(context.Amaterasu.saveNvhttpAudioSettings({ async post(route) {
+    return route === "nvhttp/settings_update" ? updated : current;
+  } }, current, true, ""), /could not be confirmed after saving/);
+});
+
+test("focused future-stream audio editor gates writes by configuration permission", () => {
+  class Element {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.listeners = new Map();
+      this.isConnected = true;
+      this.value = "";
+    }
+    append(...children) { this.children.push(...children.filter((child) => child != null)); }
+    replaceChildren(...children) { this.children = [...children]; }
+    addEventListener(name, callback) { this.listeners.set(name, callback); }
+    setAttribute() {}
+    reportValidity() { return true; }
+    get options() { return this.children.filter((child) => child?.tagName === "option"); }
+    get textContent() { return this.children.map((child) => typeof child === "string" ? child : child.textContent).join(""); }
+    set textContent(value) { this.replaceChildren(value); }
+    fire(name, event) { this.listeners.get(name)?.(event); }
+  }
+  const find = (node, predicate) => {
+    if (predicate(node)) return node;
+    for (const child of node.children ?? []) {
+      if (typeof child === "string") continue;
+      const result = find(child, predicate);
+      if (result) return result;
+    }
+    return null;
+  };
+  const dom = vm.createContext({ TextEncoder, URL, Error,
+    document: { createElement: (name) => new Element(name) } });
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/settings.ts"]) {
+    vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
+    vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+  }
+  let writes = 0;
+  const panel = dom.Amaterasu.renderNvhttpAudioSettings({
+    content: new Element("main"),
+    api: { allows: () => false, async post() { writes += 1; throw new Error("must not write"); } },
+    notify() {},
+    navigate() {},
+  }, nvhttpHostSettings(), [], "Listing audio endpoints requires media.read.", async () => {});
+  const form = find(panel, (node) => node.tagName === "form");
+  const save = find(form, (node) => node.tagName === "button");
+  assert.ok(form);
+  assert.equal(save.disabled, true);
+  assert.match(panel.textContent, /requires configuration.write permission/);
+  form.fire("submit", { preventDefault() {} });
+  assert.equal(writes, 0);
+});
+
 test("Moonlight host editor rejects mismatched configured or unrelated fields and concurrent readback", async () => {
   const current = nvhttpHostSettings();
   const values = nvhttpHostUpdate();

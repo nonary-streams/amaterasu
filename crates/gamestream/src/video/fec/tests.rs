@@ -74,7 +74,7 @@ fn multiple_blocks_keep_one_frame_header_and_account_for_parity_sequence_gaps() 
         let original = frame(data_count);
         let mut sender = VideoPacketizer::new(config()).unwrap();
         sender.stream_index = 0xfffffe;
-        let packets = sender.packetize(&original, 7, 90000).unwrap();
+        let packets = sender.packetize(&original, false, 7, 90000).unwrap();
         let mut packet_offset = 0;
         let mut block_index = 0;
         let mut recovered_frame = Vec::new();
@@ -126,10 +126,8 @@ fn multiple_blocks_keep_one_frame_header_and_account_for_parity_sequence_gaps() 
 #[test]
 fn hevc_idr_uses_the_same_fec_frame_header_and_preserves_access_unit_bytes() {
     let access_unit = hevc_idr_access_unit();
-    let mut sender = VideoPacketizer::new(config()).unwrap();
-    let packets = sender
-        .packetize_codec(VideoCodec::Hevc, &access_unit, 7, 90000)
-        .unwrap();
+    let mut sender = VideoPacketizer::new_with_codec(config(), VideoCodec::Hevc).unwrap();
+    let packets = sender.packetize(&access_unit, true, 7, 90000).unwrap();
 
     assert_eq!(packets.len(), 3);
     assert_eq!(packets[0].len(), 80);
@@ -144,11 +142,11 @@ fn hevc_idr_uses_the_same_fec_frame_header_and_preserves_access_unit_bytes() {
 
 #[test]
 fn malformed_hevc_nal_is_rejected_before_fec_consumes_packet_indices() {
-    let mut sender = VideoPacketizer::new(config()).unwrap();
+    let mut sender = VideoPacketizer::new_with_codec(config(), VideoCodec::Hevc).unwrap();
     let invalid = [0, 0, 1, 0x26, 0x00, 0x80]; // temporal_id_plus1 is zero.
 
     assert_eq!(
-        sender.packetize_codec(VideoCodec::Hevc, &invalid, 7, 90000),
+        sender.packetize(&invalid, true, 7, 90000),
         Err(VideoError::InvalidAnnexB)
     );
     assert_eq!(sender.stream_index, 0);
@@ -158,7 +156,7 @@ fn malformed_hevc_nal_is_rejected_before_fec_consumes_packet_indices() {
 fn oversized_or_unrepresentable_fec_never_falls_back_to_no_parity() {
     let mut sender = VideoPacketizer::new(config()).unwrap();
     assert_eq!(
-        sender.packetize(&frame(849), 1, 0),
+        sender.packetize(&frame(849), false, 1, 0),
         Err(VideoError::TooManyPackets)
     );
     assert_eq!(sender.stream_index, 0);
@@ -168,7 +166,7 @@ fn oversized_or_unrepresentable_fec_never_falls_back_to_no_parity() {
     };
     let mut sender = VideoPacketizer::new(settings).unwrap();
     assert_eq!(
-        sender.packetize(&frame(1), 1, 0),
+        sender.packetize(&frame(1), false, 1, 0),
         Err(VideoError::InvalidFec)
     );
     assert_eq!(sender.stream_index, 0);
@@ -287,7 +285,7 @@ fn upstream_decoder_recovers_wire_packets_with_erasures_and_block_boundaries() {
     // Every two-erasure combination of a 2+2 block, including parity losses.
     let packets = VideoPacketizer::new(config())
         .unwrap()
-        .packetize(&frame(2), 1, 0)
+        .packetize(&frame(2), false, 1, 0)
         .unwrap();
     for first in 0..4 {
         for second in first + 1..4 {
@@ -299,7 +297,7 @@ fn upstream_decoder_recovers_wire_packets_with_erasures_and_block_boundaries() {
         sender.stream_index = 0xfffffe;
         let mut original = frame(count);
         original.truncate(original.len() - 3); // Validate zero padding after recovery.
-        let packets = sender.packetize(&original, 9, u32::MAX).unwrap();
+        let packets = sender.packetize(&original, false, 9, u32::MAX).unwrap();
         let mut offset = 0;
         while offset < packets.len() {
             let info = u32::from_le_bytes(packets[offset][28..32].try_into().unwrap());
@@ -330,11 +328,11 @@ fn negotiated_block_limit_prevents_legacy_multiblock_packets() {
         ..config()
     })
     .unwrap();
-    let packets = legacy.packetize(&frame(212), 1, 0).unwrap();
+    let packets = legacy.packetize(&frame(212), false, 1, 0).unwrap();
     assert!(packets.iter().all(|packet| packet[27] == 0));
     let next = legacy.stream_index;
     assert_eq!(
-        legacy.packetize(&frame(213), 2, 0),
+        legacy.packetize(&frame(213), false, 2, 0),
         Err(VideoError::TooManyPackets)
     );
     assert_eq!(legacy.stream_index, next);

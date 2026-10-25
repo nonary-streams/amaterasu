@@ -87,7 +87,6 @@ pub struct Router {
     transcripts: BTreeMap<String, pairing::Transcript>,
     jobs: BTreeMap<u64, Job>,
     cancellations: BTreeMap<u64, Instant>,
-    capabilities: capabilities::HostCapabilities,
     next_job: u64,
     next_call: u64,
 }
@@ -124,11 +123,14 @@ enum Purpose {
     LaunchIdentity {
         request: LaunchRequest,
         peer: PeerIdentity,
+        resume: bool,
     },
     /// Removes the certificate presented on this paired TLS connection.
     Unpair,
     Cleanup,
-    Applications,
+    Applications {
+        desktop_enabled: bool,
+    },
 }
 
 const PAIRING_SERVICE: &str = "amaterasu.pairing/1";
@@ -145,7 +147,6 @@ impl Router {
             transcripts: BTreeMap::new(),
             jobs: BTreeMap::new(),
             cancellations: BTreeMap::new(),
-            capabilities: capabilities::HostCapabilities::new(Instant::now()),
             next_job: 0,
             next_call: 0,
         }
@@ -154,6 +155,18 @@ impl Router {
     pub fn set_hostname(&mut self, hostname: String) {
         self.launches.set_device_name(&hostname);
         self.config.hostname = hostname;
+    }
+
+    pub fn set_encoder_snapshot(&mut self, snapshot: crate::encoder_snapshot::EncoderSnapshot) {
+        self.launches.set_encoder_snapshot(snapshot);
+    }
+
+    pub fn supports_streaming(&self) -> bool {
+        self.launches.supported()
+    }
+
+    pub fn stream_active(&self) -> bool {
+        self.launches.busy()
     }
 
     pub fn set_ports(&mut self, http_port: u16, https_port: u16) {
@@ -330,6 +343,7 @@ impl Router {
                         Purpose::LaunchIdentity {
                             request,
                             peer: identity,
+                            resume: false,
                         },
                         json!({
                             "action": "check_client_certificate",
@@ -355,17 +369,39 @@ impl Router {
                 };
                 self.launches.cancel(connection, &identity, now)
             }
-            "/unpair" => self.unpair(connection, &query, &peer, now),
             "/resume" => {
-                if trusted {
-                    Some(xml::error(
-                        501,
-                        "this Moonlight operation is not implemented",
-                    ))
-                } else {
-                    Some(xml::error(401, "authenticated paired TLS is required"))
+                if !trusted {
+                    return Some(xml::error(401, "authenticated paired TLS is required"));
                 }
+                let request = match streaming::launch_request(&query) {
+                    Ok(request) => request,
+                    Err(error) => return Some(xml::error(400, error)),
+                };
+                let identity = match peer.identity() {
+                    Ok(identity) => identity,
+                    Err(error) => return Some(xml::error(401, error)),
+                };
+                let certificate_pem = match peer.peer_certificate.as_deref().and_then(|der| {
+                    pem_rfc7468::encode_string("CERTIFICATE", pem_rfc7468::LineEnding::LF, der).ok()
+                }) {
+                    Some(certificate_pem) => certificate_pem,
+                    None => return Some(xml::error(401, "client certificate is unavailable")),
+                };
+                self.queue(
+                    Some(connection),
+                    Purpose::LaunchIdentity {
+                        request,
+                        peer: identity,
+                        resume: true,
+                    },
+                    json!({"action":"check_client_certificate", "certificate_pem":certificate_pem}),
+                    now + SERVICE_TIMEOUT,
+                    now,
+                )
+                .err()
+                .map(|error| xml::error(503, error))
             }
+            "/unpair" => self.unpair(connection, &query, &peer, now),
             _ => Some(xml::error(404, "unknown Moonlight route")),
         }
     }
@@ -425,8 +461,12 @@ impl Router {
             self.next_job,
             Job {
                 connection,
-                applications: matches!(purpose, Purpose::Applications)
-                    .then(applications::Applications::new),
+                applications: match purpose {
+                    Purpose::Applications { desktop_enabled } => {
+                        Some(applications::Applications::new(desktop_enabled))
+                    }
+                    _ => None,
+                },
                 purpose,
                 call: Call::Ready {
                     payload,
@@ -438,20 +478,35 @@ impl Router {
         Ok(())
     }
 
-    pub fn poll(&mut self, runtime: &RuntimeClient) -> Vec<(u64, Reply)> {
-        self.poll_with(Instant::now(), &mut |command| {
-            runtime.send_ephemeral(command)
-        })
+    pub fn poll_with_trust(
+        &mut self,
+        runtime: &RuntimeClient,
+        trusted: impl FnMut(&[u8]) -> bool,
+    ) -> Vec<(u64, Reply)> {
+        self.poll_with_identity(
+            Instant::now(),
+            &mut |command| runtime.send_ephemeral(command),
+            trusted,
+        )
     }
 
+    #[cfg(test)]
     fn poll_with(
         &mut self,
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> Vec<(u64, Reply)> {
+        self.poll_with_identity(now, send, |_| true)
+    }
+
+    fn poll_with_identity(
+        &mut self,
+        now: Instant,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+        trusted: impl FnMut(&[u8]) -> bool,
+    ) -> Vec<(u64, Reply)> {
         self.poll_cancellations(now, send);
-        self.poll_capabilities(now, send);
-        let mut replies = self.launches.poll(now, send);
+        let mut replies = self.launches.poll_with_trust(now, send, trusted);
         let keys: Vec<_> = self.jobs.keys().copied().collect();
         for key in keys {
             let Some(mut job) = self.jobs.remove(&key) else {
@@ -465,7 +520,7 @@ impl Router {
                 self.jobs.insert(key, job);
                 continue;
             };
-            let continued = if matches!(job.purpose, Purpose::Applications) {
+            let continued = if matches!(job.purpose, Purpose::Applications { .. }) {
                 self.resolve_applications(job, result, now, &mut replies)
             } else {
                 self.resolve(job, result, now, &mut replies)
@@ -614,7 +669,7 @@ impl Router {
 
 impl Purpose {
     fn service(&self) -> &'static str {
-        if matches!(self, Self::Applications) {
+        if matches!(self, Self::Applications { .. }) {
             applications::CATALOG_SERVICE
         } else {
             PAIRING_SERVICE

@@ -11,7 +11,9 @@ fn config() -> StreamingConfig {
             encoder: amaterasu_module_sdk::EncoderSelection::Index(0),
             audio_endpoint: "default".into(),
         },
+        desktop: DesktopSettings::default(),
         profile: StreamProfile {
+            codec: amaterasu_media::VideoCodec::H264,
             max_width: 1920,
             max_height: 1080,
             max_fps: 60,
@@ -30,6 +32,71 @@ fn config() -> StreamingConfig {
     }
 }
 
+fn encoder_entry(clsid: &str, codec: &str, hardware: bool) -> Value {
+    json!({"identity":{"clsid":clsid,"hardware_url":null,"friendly_name":clsid},
+        "name":clsid,"codec":codec,"hardware":hardware,"vendor_id":null})
+}
+
+fn encoders(entries: Vec<Value>) -> EncoderSnapshot {
+    EncoderSnapshot::parse(&json!({"ok":true,"enabled":true,"encoders":entries})).unwrap()
+}
+
+/// A hardware H.264 encoder: launches above the software limit offer H.264.
+fn hardware_h264() -> EncoderSnapshot {
+    encoders(vec![encoder_entry("test.hardware.h264", "h264", true)])
+}
+
+#[test]
+fn signed_stream_profile_codec_defaults_to_h264_and_serializes_hevc_explicitly() {
+    let mut configured = config();
+    let legacy = serde_json::to_value(&configured).unwrap();
+    assert!(legacy["profile"].get("codec").is_none());
+    assert_eq!(
+        serde_json::from_value::<StreamingConfig>(legacy)
+            .unwrap()
+            .profile
+            .codec,
+        amaterasu_media::VideoCodec::H264
+    );
+    configured.profile.codec = amaterasu_media::VideoCodec::Hevc;
+    assert!(configured.validate().is_ok());
+    let selected = serde_json::to_value(&configured).unwrap();
+    assert_eq!(selected["profile"]["codec"], "hevc");
+}
+
+#[test]
+fn linux_pipewire_profile_accepts_auto_encoder_selection() {
+    let mut value = serde_json::to_value(config()).unwrap();
+    value["capture"]["capture_provider"] = json!("pipewire");
+    value["capture"]["encoder"] = json!("auto");
+
+    let streaming: StreamingConfig = serde_json::from_value(value.clone()).unwrap();
+    assert!(streaming.validate().is_ok());
+    assert_eq!(
+        streaming.capture.capture_provider,
+        CaptureProvider::PipeWire
+    );
+    assert_eq!(
+        streaming.capture.encoder,
+        EncoderSelection::Backend(amaterasu_module_sdk::EncoderBackend::Auto)
+    );
+    let automatic_value = serde_json::to_value(&streaming).unwrap();
+    assert_eq!(automatic_value["capture"]["encoder"], "auto");
+    value["capture"]["encoder"] = json!(0);
+    let indexed: StreamingConfig = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(indexed.capture.encoder, EncoderSelection::Index(0));
+    let indexed_value = serde_json::to_value(&indexed).unwrap();
+    assert_eq!(indexed_value["capture"]["encoder"], 0);
+
+    value["capture"]["encoder"] = json!("software");
+    let software: StreamingConfig = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        software.capture.encoder,
+        EncoderSelection::Backend(amaterasu_module_sdk::EncoderBackend::Software)
+    );
+    assert!(software.validate().is_ok());
+}
+
 fn peer(marker: u8) -> PeerIdentity {
     peer_with_fec(marker, None)
 }
@@ -38,7 +105,10 @@ fn peer_with_fec(marker: u8, fec_percentage: Option<u8>) -> PeerIdentity {
     peer_with_overrides(marker, fec_percentage, None)
 }
 
-fn peer_with_proton_override(marker: u8, proton_dualsense_compatibility: Option<bool>) -> PeerIdentity {
+fn peer_with_proton_override(
+    marker: u8,
+    proton_dualsense_compatibility: Option<bool>,
+) -> PeerIdentity {
     let certificate = vec![marker; 32];
     PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
         .unwrap()
@@ -322,6 +392,7 @@ fn paired_physical_mode_freezes_independently_of_stream_cadence_and_retry() {
     let mut streaming = config();
     streaming.profile.max_fps = 120;
     let mut controller = Controller::new(Some(streaming)).unwrap();
+    controller.set_encoder_snapshot(hardware_h264());
     let paired = peer_with_display_mode(19, "1920x1080x59.94").unwrap();
     let mut stream = request(19);
     stream.fps = 120;
@@ -383,7 +454,12 @@ fn virtual_display_intent_is_frozen_and_admission_bound_before_rtsp_open() {
 
     assert!(controller.launch(10, request(33), peer(33), now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
-    assert_eq!(reply.status, 200, "{}", String::from_utf8_lossy(&reply.body));
+    assert_eq!(
+        reply.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
 
     let open = opened_rtsp_payload(&broker);
     let intent = &open["virtual_display_intent"];
@@ -392,7 +468,10 @@ fn virtual_display_intent_is_frozen_and_admission_bound_before_rtsp_open() {
     assert_eq!(intent["dd_activate_virtual_display"], false);
     assert_eq!(intent["request_virtual_display"], true);
     assert_eq!(open["application_display_settings"], settings);
-    assert_eq!(open["display_policy_snapshot"]["virtual_display_intent"], *intent);
+    assert_eq!(
+        open["display_policy_snapshot"]["virtual_display_intent"],
+        *intent
+    );
     assert_eq!(
         open["display_policy_snapshot"]["application_display_settings"],
         settings
@@ -403,9 +482,10 @@ fn virtual_display_intent_is_frozen_and_admission_bound_before_rtsp_open() {
         .commands
         .iter()
         .find_map(|command| match command {
-            Command::Request { service, payload, .. }
-                if service == "amaterasu.launch/1"
-                    && payload["action"] == "prepare_display_admission" =>
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1"
+                && payload["action"] == "prepare_display_admission" =>
             {
                 Some(payload)
             }
@@ -419,9 +499,9 @@ fn virtual_display_intent_is_frozen_and_admission_bound_before_rtsp_open() {
         .commands
         .iter()
         .find_map(|command| match command {
-            Command::Request { service, payload, .. }
-                if service == "amaterasu.launch/1" && payload["action"] == "launch_export" =>
-            {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
                 Some(payload)
             }
             _ => None,
@@ -922,7 +1002,11 @@ fn scoped_controller_compatibility_overrides_preserve_false_and_client_precedenc
         ..Broker::default()
     };
     let mut controller = Controller::new(Some(config())).unwrap();
-    assert!(controller.launch(10, request(1), client_peer, now).is_none());
+    assert!(
+        controller
+            .launch(10, request(1), client_peer, now)
+            .is_none()
+    );
     let _ = poll_until_reply(&mut controller, &mut broker, now);
 
     let rtsp_open = opened_rtsp_payload(&broker);
@@ -940,9 +1024,11 @@ fn scoped_controller_compatibility_overrides_preserve_false_and_client_precedenc
         ..Broker::default()
     };
     let mut application_controller = Controller::new(Some(config())).unwrap();
-    assert!(application_controller
-        .launch(11, request(2), peer(89), now)
-        .is_none());
+    assert!(
+        application_controller
+            .launch(11, request(2), peer(89), now)
+            .is_none()
+    );
     let _ = poll_until_reply(&mut application_controller, &mut application_broker, now);
     let rtsp_open = opened_rtsp_payload(&application_broker);
     assert_eq!(rtsp_open["motion_as_ds4"], false);
@@ -1119,7 +1205,11 @@ fn authenticated_surround_request_reaches_rtsp_and_binds_retry_identity() {
         let mut stream = request(channels as u8);
         stream.audio_channels = channels;
         let paired = peer_with_virtual_sink(channels as u8, Some("virtual.surround"));
-        assert!(controller.launch(10, stream.clone(), paired.clone(), now).is_none());
+        assert!(
+            controller
+                .launch(10, stream.clone(), paired.clone(), now)
+                .is_none()
+        );
         let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
         assert_eq!(reply.status, 200);
         let open = opened_rtsp_payload(&broker);
@@ -1128,11 +1218,17 @@ fn authenticated_surround_request_reaches_rtsp_and_binds_retry_identity() {
         assert_eq!(open["profile"]["audio_bitrate"], bitrate);
         controller.reply_delivered(10, now);
         assert_eq!(
-            controller.launch(11, stream.clone(), paired.clone(), now).unwrap().body,
+            controller
+                .launch(11, stream.clone(), paired.clone(), now)
+                .unwrap()
+                .body,
             reply.body
         );
         stream.audio_channels = if channels == 6 { 2 } else { 6 };
-        assert_eq!(controller.launch(12, stream, paired, now).unwrap().status, 409);
+        assert_eq!(
+            controller.launch(12, stream, paired, now).unwrap().status,
+            409
+        );
     }
 }
 
@@ -1154,10 +1250,15 @@ fn surround_without_virtual_sink_or_supported_bitrate_stops_before_launch() {
             let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
             assert_ne!(reply.status, 200);
         }
-        assert!(!broker.actions().iter().any(|(service, action)|
-            *service == "amaterasu.rtsp/1" && *action == "open"));
-        assert!(!broker.actions().iter().any(|(service, action)|
-            *service == "amaterasu.launch/1" && *action == "launch_export"));
+        assert!(
+            !broker
+                .actions()
+                .iter()
+                .any(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+        );
+        assert!(!broker.actions().iter().any(
+            |(service, action)| *service == "amaterasu.launch/1" && *action == "launch_export"
+        ));
     }
 }
 
@@ -1179,8 +1280,13 @@ fn surround_uses_frozen_application_sink_and_stream_audio_before_launch() {
         let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
         if application_stream_audio == Some(false) {
             assert_ne!(reply.status, 200);
-            assert!(!broker.actions().iter().any(|(service, action)|
-                *service == "amaterasu.launch/1" && *action == "launch_export"));
+            assert!(
+                !broker
+                    .actions()
+                    .iter()
+                    .any(|(service, action)| *service == "amaterasu.launch/1"
+                        && *action == "launch_export")
+            );
         } else {
             assert_eq!(reply.status, 200);
             let open = opened_rtsp_payload(&broker);
@@ -1360,7 +1466,12 @@ impl Default for Broker {
             application_catalog_revision: 1,
             rtsp_snapshot: None,
             rtsp_display_policy_snapshot: None,
-            rtsp_encoder: Value::Null,rtsp_sw_preset:Value::Null,rtsp_sw_tune:Value::Null,rtsp_min_threads:Value::Null,rtsp_qp:Value::Null,rtsp_nvenc_settings:Value::Null,
+            rtsp_encoder: Value::Null,
+            rtsp_sw_preset: Value::Null,
+            rtsp_sw_tune: Value::Null,
+            rtsp_min_threads: Value::Null,
+            rtsp_qp: Value::Null,
+            rtsp_nvenc_settings: Value::Null,
             rtsp_nvenc_spatial_aq: Value::Null,
             rtsp_display_request: None,
             rtsp_executable_path: None,
@@ -1531,11 +1642,16 @@ impl Broker {
                     } else {
                         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     };
-                    let mut configuration = self.display_snapshot_configuration.clone().unwrap_or_else(|| json!({"displays":self.display_snapshot_ids.iter().map(|id| json!({
+                    let mut configuration = self
+                        .display_snapshot_configuration
+                        .clone()
+                        .unwrap_or_else(|| {
+                            json!({"displays":self.display_snapshot_ids.iter().map(|id| json!({
                         "id":id,"width":1920,"height":1080,
                         "refresh":{"numerator":60,"denominator":1},
                         "x":0,"y":0
-                    })).collect::<Vec<_>>()}));
+                    })).collect::<Vec<_>>()})
+                        });
                     if self.display_configuration_drift && self.display_snapshot_calls > 1 {
                         configuration["displays"][0]["width"] = json!(1680);
                     }
@@ -1615,8 +1731,18 @@ impl Broker {
                     return json!({"ok":false,"code":"display_admission_denied"});
                 }
                 let mut effective = payload["global_overrides"].as_object().unwrap().clone();
-                effective.extend(payload["application_display_overrides"].as_object().unwrap().clone());
-                effective.extend(payload["client_display_overrides"].as_object().unwrap().clone());
+                effective.extend(
+                    payload["application_display_overrides"]
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+                effective.extend(
+                    payload["client_display_overrides"]
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
                 let mut snapshot = json!({
                     "catalog_revision":payload["catalog_revision"],
                     "global_revision":payload["global_revision"],
@@ -1849,6 +1975,36 @@ fn poll_until_reply(
     panic!("lifecycle did not produce a bounded reply")
 }
 
+fn poll_until_reply_with_trust(
+    controller: &mut Controller,
+    broker: &mut Broker,
+    now: Instant,
+    mut trusted: impl FnMut(&[u8]) -> bool,
+) -> (u64, Reply) {
+    for _ in 0..32 {
+        let replies =
+            controller.poll_with_trust(now, &mut |command| broker.send(command), &mut trusted);
+        if let Some(reply) = replies.into_iter().next() {
+            return reply;
+        }
+    }
+    panic!("trusted lifecycle did not produce a bounded reply")
+}
+
+fn poll_until_stopped(controller: &mut Controller, broker: &mut Broker, now: Instant, id: u64) {
+    for _ in 0..32 {
+        if controller
+            .records
+            .get(&id)
+            .is_some_and(|record| record.state == State::Stopped)
+        {
+            return;
+        }
+        controller.poll(now, &mut |command| broker.send(command));
+    }
+    panic!("cleanup did not reach Stopped")
+}
+
 fn launch_ready(controller: &mut Controller, broker: &mut Broker, now: Instant) {
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (connection, reply) = poll_until_reply(controller, broker, now);
@@ -1864,18 +2020,326 @@ fn launch_ready(controller: &mut Controller, broker: &mut Broker, now: Instant) 
 }
 
 #[test]
+fn desktop_launch_and_cancel_only_manage_rtsp_and_history() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let mut desktop_request = request(91);
+    desktop_request.app_id = DESKTOP_APP_ID;
+
+    assert!(
+        controller
+            .launch(91, desktop_request, peer(91), now)
+            .is_none()
+    );
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(connection, 91);
+    assert_eq!(reply.status, 200);
+    assert!(
+        String::from_utf8(reply.body)
+            .unwrap()
+            .contains("rtspenc://")
+    );
+    assert!(
+        !broker
+            .actions()
+            .iter()
+            .any(|(service, _)| *service == "amaterasu.launch/1")
+    );
+    controller.reply_delivered(connection, now);
+    assert_eq!(controller.current_game(&peer(91)), DESKTOP_APP_ID);
+
+    assert!(controller.cancel(92, &peer(91), now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(connection, 92);
+    assert_eq!(reply.status, 200);
+    assert_eq!(controller.current_game(&peer(91)), 0);
+    assert!(
+        !broker
+            .actions()
+            .iter()
+            .any(|(service, _)| *service == "amaterasu.launch/1")
+    );
+}
+
+#[test]
+fn pipewire_launch_carries_the_owned_display_request_to_rtsp() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    settings.capture.capture_provider = CaptureProvider::PipeWire;
+    settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let mut desktop_request = request(96);
+    desktop_request.app_id = DESKTOP_APP_ID;
+
+    assert!(
+        controller
+            .launch(96, desktop_request, peer(96), now)
+            .is_none()
+    );
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let rtsp_open = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .expect("RTSP open request");
+    assert_eq!(rtsp_open["capture"]["output"], OWNED_DISPLAY_OUTPUT);
+}
+
+#[test]
+fn desktop_launch_carries_portal_pipewire_source_to_rtsp_without_display_preflight() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    settings.capture.capture_provider = CaptureProvider::PipeWire;
+    settings.capture.output = "profile-output-must-not-be-used".into();
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    controller.set_output_name_settings(true, Some("configured-physical-display"));
+    let mut broker = Broker::default();
+    let mut desktop_request = request(95);
+    desktop_request.app_id = DESKTOP_APP_ID;
+
+    assert!(
+        controller
+            .launch(95, desktop_request, peer(95), now)
+            .is_none()
+    );
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(connection, 95);
+    assert_eq!(reply.status, 200);
+
+    let rtsp_open = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .expect("desktop RTSP open request");
+    assert_eq!(rtsp_open["capture"]["capture_provider"], "pipewire");
+    assert!(rtsp_open["display_policy_snapshot"].is_null());
+    assert!(rtsp_open["display_request"].is_null());
+    assert_eq!(
+        rtsp_open["capture"]["output"],
+        PORTAL_SELECTED_SESSION_SOURCE
+    );
+    assert!(!broker.actions().iter().any(|(service, action)| {
+        *service == "amaterasu.display/1"
+            || *service == "amaterasu.launch/1"
+            || (*service == "amaterasu.rtsp/1" && *action == "prepare_display_admission")
+    }));
+}
+
+#[test]
+fn desktop_resume_retires_rtsp_then_opens_a_fresh_ticket_without_app_calls() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let client = peer(93);
+    let mut first = request(93);
+    first.app_id = DESKTOP_APP_ID;
+    assert!(controller.launch(93, first, client.clone(), now).is_none());
+    let (connection, _) = poll_until_reply(&mut controller, &mut broker, now);
+    controller.reply_delivered(connection, now);
+
+    let mut resumed = request(93);
+    resumed.app_id = DESKTOP_APP_ID;
+    assert!(controller.resume(94, resumed, &client, now).is_none());
+    let (connection, reply) =
+        poll_until_reply_with_trust(&mut controller, &mut broker, now, |_| true);
+    assert_eq!(connection, 94);
+    assert_eq!(reply.status, 200);
+    assert!(
+        String::from_utf8(reply.body)
+            .unwrap()
+            .contains("<resume>1</resume>")
+    );
+    let open_payloads: Vec<_> = broker
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(open_payloads.len(), 2);
+    assert_ne!(
+        open_payloads[0]["operation_id"], open_payloads[1]["operation_id"],
+        "authenticated /resume must receive a fresh RTSP operation identity"
+    );
+    assert!(
+        !broker
+            .actions()
+            .iter()
+            .any(|(service, _)| *service == "amaterasu.launch/1")
+    );
+}
+
+#[test]
+fn revoked_pending_desktop_resume_is_closed_before_stopped_without_reopening_rtsp() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let client = peer(95);
+    let mut first = request(95);
+    first.app_id = DESKTOP_APP_ID;
+    assert!(controller.launch(95, first, client.clone(), now).is_none());
+    let (connection, _) = poll_until_reply(&mut controller, &mut broker, now);
+    controller.reply_delivered(connection, now);
+    let opens_before_resume = broker
+        .actions()
+        .iter()
+        .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+        .count();
+    assert_eq!(opens_before_resume, 1);
+
+    let mut resumed = request(95);
+    resumed.app_id = DESKTOP_APP_ID;
+    assert!(controller.resume(96, resumed, &client, now).is_none());
+    let closed = controller.revoke_untrusted(now, |_| false);
+    assert_eq!(closed, vec![96]);
+    assert!(controller.pending_resume.is_none());
+    poll_until_stopped(&mut controller, &mut broker, now, 1);
+    assert!(controller.records.get(&1).unwrap().revoked);
+    let opens_after_revoke = broker
+        .actions()
+        .iter()
+        .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+        .count();
+    assert_eq!(opens_after_revoke, opens_before_resume);
+}
+
+#[test]
+fn deferred_desktop_resume_revalidates_current_certificate_trust() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let client = peer(97);
+    let mut first = request(97);
+    first.app_id = DESKTOP_APP_ID;
+    assert!(controller.launch(97, first, client.clone(), now).is_none());
+    let (connection, _) = poll_until_reply(&mut controller, &mut broker, now);
+    controller.reply_delivered(connection, now);
+
+    let mut resumed = request(97);
+    resumed.app_id = DESKTOP_APP_ID;
+    assert!(controller.resume(98, resumed, &client, now).is_none());
+    let (connection, reply) =
+        poll_until_reply_with_trust(&mut controller, &mut broker, now, |_| false);
+    assert_eq!(connection, 98);
+    assert_eq!(reply.status, 401);
+    assert!(controller.records.get(&1).unwrap().revoked);
+    assert_eq!(
+        broker
+            .actions()
+            .iter()
+            .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn duplicate_resume_cancel_and_repeated_revocation_are_idempotent() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let client = peer(99);
+    let mut first = request(99);
+    first.app_id = DESKTOP_APP_ID;
+    assert!(controller.launch(99, first, client.clone(), now).is_none());
+    let (connection, _) = poll_until_reply(&mut controller, &mut broker, now);
+    controller.reply_delivered(connection, now);
+
+    let mut resumed = request(99);
+    resumed.app_id = DESKTOP_APP_ID;
+    assert!(
+        controller
+            .resume(100, resumed.clone(), &client, now)
+            .is_none()
+    );
+    assert_eq!(
+        controller
+            .resume(101, resumed, &client, now)
+            .unwrap()
+            .status,
+        409
+    );
+    assert!(controller.pending_resume.is_some());
+    assert!(controller.cancel(102, &client, now).is_none());
+    assert!(controller.pending_resume.is_none());
+
+    let first_revocation = controller.revoke_untrusted(now, |_| false);
+    assert_eq!(first_revocation, vec![102]);
+    let repeated_revocation = controller.revoke_untrusted(now, |_| false);
+    assert!(repeated_revocation.is_empty());
+    poll_until_stopped(&mut controller, &mut broker, now, 1);
+    assert_eq!(
+        broker
+            .actions()
+            .iter()
+            .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn desktop_app_id_is_rejected_when_opt_in_is_disabled() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut desktop_request = request(92);
+    desktop_request.app_id = DESKTOP_APP_ID;
+    let reply = controller
+        .launch(92, desktop_request, peer(92), now)
+        .unwrap();
+    assert_eq!(reply.status, 400);
+    assert!(!controller.busy());
+}
+
+#[test]
 fn history_reservation_precedes_preflight_and_releases_after_stream_cleanup() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
     let actions = broker.actions();
-    assert_eq!(actions[0], ("amaterasu.stream-session/1", "reserve_history_activity"));
-    let opened = broker.commands.iter().find_map(|command| match command {
-        Command::Request { service, payload, .. }
-            if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
-        _ => None,
-    }).unwrap();
+    assert_eq!(
+        actions[0],
+        ("amaterasu.stream-session/1", "reserve_history_activity")
+    );
+    let opened = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .unwrap();
     assert_eq!(opened["history_activity_id"], opened["operation_id"]);
     assert!(broker.history_reserved);
 
@@ -1883,9 +2347,17 @@ fn history_reservation_precedes_preflight_and_releases_after_stream_cleanup() {
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(reply.status, 200);
     let actions = broker.actions();
-    let position = |service, action| actions.iter().position(|entry| *entry == (service, action)).unwrap();
+    let position = |service, action| {
+        actions
+            .iter()
+            .position(|entry| *entry == (service, action))
+            .unwrap()
+    };
     assert!(position("amaterasu.rtsp/1", "close") < position("amaterasu.launch/1", "stop"));
-    assert!(position("amaterasu.launch/1", "stop") < position("amaterasu.stream-session/1", "release_history_activity"));
+    assert!(
+        position("amaterasu.launch/1", "stop")
+            < position("amaterasu.stream-session/1", "release_history_activity")
+    );
     assert!(!broker.history_reserved);
 }
 
@@ -1893,18 +2365,34 @@ fn history_reservation_precedes_preflight_and_releases_after_stream_cleanup() {
 fn missing_history_reservation_is_visible_and_does_not_tag_rtsp() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
-    let mut broker = Broker { history_reserve_unavailable: true, ..Broker::default() };
+    let mut broker = Broker {
+        history_reserve_unavailable: true,
+        ..Broker::default()
+    };
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(reply.status, 200);
-    assert!(String::from_utf8(reply.body).unwrap().contains("<historyActivityState>unavailable</historyActivityState>"));
-    let opened = broker.commands.iter().find_map(|command| match command {
-        Command::Request { service, payload, .. }
-            if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
-        _ => None,
-    }).unwrap();
+    assert!(
+        String::from_utf8(reply.body)
+            .unwrap()
+            .contains("<historyActivityState>unavailable</historyActivityState>")
+    );
+    let opened = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .unwrap();
     assert!(opened.get("history_activity_id").is_none());
-    assert!(!broker.actions().contains(&("amaterasu.stream-session/1", "release_history_activity")));
+    assert!(
+        !broker
+            .actions()
+            .contains(&("amaterasu.stream-session/1", "release_history_activity"))
+    );
 }
 
 #[test]
@@ -1919,12 +2407,20 @@ fn mismatched_history_reservation_does_not_tag_rtsp_and_is_released() {
     let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(reply.status, 200);
     controller.reply_delivered(connection, now);
-    assert_eq!(controller.records.values().next().unwrap().history_state, "unavailable");
-    let opened = broker.commands.iter().find_map(|command| match command {
-        Command::Request { service, payload, .. }
-            if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
-        _ => None,
-    }).unwrap();
+    assert_eq!(
+        controller.records.values().next().unwrap().history_state,
+        "unavailable"
+    );
+    let opened = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .unwrap();
     assert!(opened.get("history_activity_id").is_none());
     assert!(broker.history_reserved);
     assert!(controller.cancel(20, &peer(1), now).is_none());
@@ -1937,17 +2433,29 @@ fn mismatched_history_reservation_does_not_tag_rtsp_and_is_released() {
 fn lost_history_reservation_admission_retries_same_id_and_releases_on_cancel() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
-    let mut broker = Broker { lose_history_reserve_once: true, ..Broker::default() };
+    let mut broker = Broker {
+        lose_history_reserve_once: true,
+        ..Broker::default()
+    };
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(reply.status, 200);
     controller.reply_delivered(connection, now);
     assert!(broker.history_reserved);
-    let reserve_requests: Vec<_> = broker.commands.iter().filter_map(|command| match command {
-        Command::Request { service, payload, .. }
-            if service == "amaterasu.stream-session/1" && payload["action"] == "reserve_history_activity" => Some(payload),
-        _ => None,
-    }).collect();
+    let reserve_requests: Vec<_> = broker
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.stream-session/1"
+                && payload["action"] == "reserve_history_activity" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .collect();
     assert_eq!(reserve_requests.len(), 2);
     assert_eq!(reserve_requests[0], reserve_requests[1]);
     assert!(controller.cancel(20, &peer(1), now).is_none());
@@ -1992,8 +2500,14 @@ fn history_in_use_release_keeps_cleanup_owned_until_retry() {
     assert_eq!(second.status, 200);
     assert!(!broker.history_reserved);
     let actions = broker.actions();
-    let stopped = actions.iter().position(|entry| *entry == ("amaterasu.launch/1", "stop")).unwrap();
-    let first_release = actions.iter().position(|entry| *entry == ("amaterasu.stream-session/1", "release_history_activity")).unwrap();
+    let stopped = actions
+        .iter()
+        .position(|entry| *entry == ("amaterasu.launch/1", "stop"))
+        .unwrap();
+    let first_release = actions
+        .iter()
+        .position(|entry| *entry == ("amaterasu.stream-session/1", "release_history_activity"))
+        .unwrap();
     assert!(stopped < first_release);
 }
 
@@ -2012,11 +2526,20 @@ fn lost_history_release_result_accepts_idempotent_terminal_readback() {
     assert!(controller.cancel(21, &peer(1), now).is_none());
     let (_, retry) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(retry.status, 200);
-    let releases: Vec<_> = broker.commands.iter().filter_map(|command| match command {
-        Command::Request { service, payload, .. }
-            if service == "amaterasu.stream-session/1" && payload["action"] == "release_history_activity" => Some(payload),
-        _ => None,
-    }).collect();
+    let releases: Vec<_> = broker
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.stream-session/1"
+                && payload["action"] == "release_history_activity" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .collect();
     assert_eq!(releases.len(), 2);
     assert_eq!(releases[0], releases[1]);
 }
@@ -2341,6 +2864,16 @@ fn global_max_bitrate_is_sent_as_encoder_cap_and_snapshotted_at_admission() {
             .expect("RTSP open request");
         assert_eq!(rtsp_open["profile"]["bitrate_kbps"], 10_000);
         assert_eq!(rtsp_open["max_bitrate_kbps"], json!(expected));
+        assert_eq!(
+            rtsp_open["negotiation_bounds"],
+            json!({
+                "max_width": 1920,
+                "max_height": 1080,
+                "max_fps": 60,
+                "max_bitrate_kbps": expected.unwrap_or(10_000).min(10_000),
+                "max_reference_frames": 1,
+            })
+        );
     }
 }
 
@@ -2684,13 +3217,7 @@ fn scoped_capture_selection_prefers_client_then_application_then_global() {
             CaptureProvider::PipeWire,
             false,
         ),
-        (
-            CaptureMode::Wgcc,
-            None,
-            None,
-            CaptureProvider::Wgc,
-            true,
-        ),
+        (CaptureMode::Wgcc, None, None, CaptureProvider::Wgc, true),
     ];
 
     for (global, application, client, expected_provider, expected_constant_rate) in cases {
@@ -2727,17 +3254,15 @@ fn scoped_capture_selection_prefers_client_then_application_then_global() {
             .find_map(|command| match command {
                 Command::Request {
                     service, payload, ..
-                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => {
-                    Some(payload)
-                }
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
                 _ => None,
             })
             .expect("RTSP open request");
-        assert_eq!(open["capture"]["capture_provider"], json!(expected_provider));
         assert_eq!(
-            open["capture"]["constant_rate"],
-            expected_constant_rate
+            open["capture"]["capture_provider"],
+            json!(expected_provider)
         );
+        assert_eq!(open["capture"]["constant_rate"], expected_constant_rate);
     }
 }
 
@@ -2785,20 +3310,21 @@ fn proton_compatibility_freezes_client_application_global_precedence() {
                 "revision":4,
                 "values":{"proton_dualsense_compatibility":global}
             }),
-            application_input_overrides: application.map(|value| {
-                json!({"proton_dualsense_compatibility":value})
-            }),
+            application_input_overrides: application
+                .map(|value| json!({"proton_dualsense_compatibility":value})),
             ..Broker::default()
         };
 
-        assert!(controller
-            .launch(
-                10,
-                request(1),
-                peer_with_proton_override(index as u8 + 1, client),
-                now,
-            )
-            .is_none());
+        assert!(
+            controller
+                .launch(
+                    10,
+                    request(1),
+                    peer_with_proton_override(index as u8 + 1, client),
+                    now,
+                )
+                .is_none()
+        );
         let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
         assert_eq!(reply.status, 200);
         assert_eq!(broker.input_policy_requests, 1);
@@ -2845,15 +3371,21 @@ fn invalid_proton_policy_snapshot_fails_before_application_preflight() {
         let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
 
         assert_ne!(reply.status, 200);
-        assert!(broker
-            .actions()
-            .contains(&("amaterasu.input/1", "settings_get")));
-        assert!(!broker
-            .actions()
-            .contains(&("amaterasu.launch/1", "preflight_export")));
-        assert!(!broker
-            .actions()
-            .contains(&("amaterasu.launch/1", "launch_export")));
+        assert!(
+            broker
+                .actions()
+                .contains(&("amaterasu.input/1", "settings_get"))
+        );
+        assert!(
+            !broker
+                .actions()
+                .contains(&("amaterasu.launch/1", "preflight_export"))
+        );
+        assert!(
+            !broker
+                .actions()
+                .contains(&("amaterasu.launch/1", "launch_export"))
+        );
         assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
     }
 }
@@ -3159,13 +3691,17 @@ fn application_lossless_scaling_framegen_projects_into_the_frozen_launch_snapsho
         ),
         (
             5,
-            Some(json!({"frame_generation_provider":"game-provided","lossless_scaling_framegen":false})),
+            Some(
+                json!({"frame_generation_provider":"game-provided","lossless_scaling_framegen":false}),
+            ),
             json!("game-provided"),
             json!(null),
         ),
         (
             6,
-            Some(json!({"frame_generation_provider":"nvidia-smooth-motion","lossless_scaling_framegen":false})),
+            Some(
+                json!({"frame_generation_provider":"nvidia-smooth-motion","lossless_scaling_framegen":false}),
+            ),
             json!("nvidia-smooth-motion"),
             json!(null),
         ),
@@ -3177,37 +3713,49 @@ fn application_lossless_scaling_framegen_projects_into_the_frozen_launch_snapsho
         ),
         (
             8,
-            Some(json!({"frame_generation_provider":"lossless-scaling","lossless_scaling_framegen":false})),
+            Some(
+                json!({"frame_generation_provider":"lossless-scaling","lossless_scaling_framegen":false}),
+            ),
             json!("none"),
             json!(null),
         ),
         (
             9,
-            Some(json!({"frame_generation_mode":"off","frame_generation_provider":"game-provided","lossless_scaling_framegen":true})),
+            Some(
+                json!({"frame_generation_mode":"off","frame_generation_provider":"game-provided","lossless_scaling_framegen":true}),
+            ),
             json!("none"),
             json!(null),
         ),
         (
             10,
-            Some(json!({"frame_generation_mode":"nvidia-smooth-motion","frame_generation_provider":"game-provided","lossless_scaling_framegen":false})),
+            Some(
+                json!({"frame_generation_mode":"nvidia-smooth-motion","frame_generation_provider":"game-provided","lossless_scaling_framegen":false}),
+            ),
             json!("nvidia-smooth-motion"),
             json!(null),
         ),
         (
             11,
-            Some(json!({"frame_generation_mode":"game-provided","lossless_scaling_framegen":false})),
+            Some(
+                json!({"frame_generation_mode":"game-provided","lossless_scaling_framegen":false}),
+            ),
             json!("game-provided"),
             json!(null),
         ),
         (
             12,
-            Some(json!({"frame_generation_mode":"lossless-scaling","lossless_scaling_framegen":false,"lossless_scaling_target_fps":144})),
+            Some(
+                json!({"frame_generation_mode":"lossless-scaling","lossless_scaling_framegen":false,"lossless_scaling_target_fps":144}),
+            ),
             json!("lossless-scaling"),
             json!(144_000),
         ),
         (
             13,
-            Some(json!({"frame_generation_mode":"game-provided","lossless_scaling_target_fps":144})),
+            Some(
+                json!({"frame_generation_mode":"game-provided","lossless_scaling_target_fps":144}),
+            ),
             json!("game-provided"),
             json!(null),
         ),
@@ -3240,8 +3788,7 @@ fn application_lossless_scaling_framegen_projects_into_the_frozen_launch_snapsho
             })
             .expect("launch export request");
         assert_eq!(
-            launch_payload["frame_limiter_settings"]["game_frame_generation_mode"],
-            expected_mode,
+            launch_payload["frame_limiter_settings"]["game_frame_generation_mode"], expected_mode,
             "application override case {offset}"
         );
         assert_eq!(
@@ -3582,10 +4129,11 @@ fn malformed_preflight_override_fails_before_application_launch() {
             .actions()
             .contains(&("amaterasu.launch/1", "launch_export"))
     );
-    assert!(broker.actions().contains(&(
-        "amaterasu.stream-session/1",
-        "release_history_activity"
-    )));
+    assert!(
+        broker
+            .actions()
+            .contains(&("amaterasu.stream-session/1", "release_history_activity"))
+    );
     assert!(!broker.history_reserved);
 }
 
@@ -3602,8 +4150,16 @@ fn whitespace_executable_path_fails_preflight_before_launch_or_rtsp_open() {
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
 
     assert_ne!(reply.status, 200);
-    assert!(broker.actions().contains(&("amaterasu.launch/1", "preflight_export")));
-    assert!(!broker.actions().contains(&("amaterasu.launch/1", "launch_export")));
+    assert!(
+        broker
+            .actions()
+            .contains(&("amaterasu.launch/1", "preflight_export"))
+    );
+    assert!(
+        !broker
+            .actions()
+            .contains(&("amaterasu.launch/1", "launch_export"))
+    );
     assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
 }
 
@@ -3682,7 +4238,12 @@ fn sparse_application_display_fields_are_frozen_before_launch_and_checked_on_rea
     };
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
-    assert_eq!(reply.status, 200, "{}", String::from_utf8_lossy(&reply.body));
+    assert_eq!(
+        reply.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
     let record = controller.records.values().next().unwrap();
     assert_eq!(record.application_catalog_revision, Some(1));
     assert_eq!(
@@ -3809,7 +4370,10 @@ fn pipewire_display_topology_mapping_stays_explicitly_unsupported() {
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_ne!(reply.status, 200);
-    assert_eq!(controller.records.values().next().unwrap().failure, Some("capture_display_mapping_unsupported"));
+    assert_eq!(
+        controller.records.values().next().unwrap().failure,
+        Some("capture_display_mapping_unsupported")
+    );
     assert!(!broker.commands.iter().any(|command| matches!(command,
         Command::Request { service, .. } if service == "amaterasu.display/1")));
 }
@@ -3897,10 +4461,19 @@ fn display_and_frame_limiter_open_share_frozen_application_identity() {
     let open = opened_rtsp_payload(&broker);
     assert!(open["display_request"].is_object());
     assert!(open["frame_limiter_settings"].is_object());
-    assert_eq!(open["application_operation_id"], record.application_operation);
+    assert_eq!(
+        open["application_operation_id"],
+        record.application_operation
+    );
     assert_eq!(open["app_id"], super::app_id(1));
-    assert_eq!(open["catalog_revision"], record.application_catalog_revision.unwrap());
-    assert_eq!(open["display_policy_snapshot"]["catalog_revision"], open["catalog_revision"]);
+    assert_eq!(
+        open["catalog_revision"],
+        record.application_catalog_revision.unwrap()
+    );
+    assert_eq!(
+        open["display_policy_snapshot"]["catalog_revision"],
+        open["catalog_revision"]
+    );
 }
 
 #[test]
@@ -4163,12 +4736,23 @@ fn expired_preflight_settles_without_scheduling_application_cleanup() {
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     for _ in 0..8 {
-        assert!(controller.poll(now, &mut |command| broker.send(command)).is_empty());
-        if broker.actions().contains(&("amaterasu.launch/1", "preflight_export")) {
+        assert!(
+            controller
+                .poll(now, &mut |command| broker.send(command))
+                .is_empty()
+        );
+        if broker
+            .actions()
+            .contains(&("amaterasu.launch/1", "preflight_export"))
+        {
             break;
         }
     }
-    assert!(broker.actions().contains(&("amaterasu.launch/1", "preflight_export")));
+    assert!(
+        broker
+            .actions()
+            .contains(&("amaterasu.launch/1", "preflight_export"))
+    );
     let expired = now + std::time::Duration::from_secs(41);
     assert!(
         controller
@@ -4278,9 +4862,15 @@ fn lost_rtsp_admission_is_settled_before_owned_lookup_without_reopening() {
     assert_eq!(rtsp_requests.len(), 3);
     assert_eq!(rtsp_requests[0].1, rtsp_requests[1].1);
     let record = controller.records.values().next().expect("launch record");
-    assert_eq!(rtsp_requests[0].1["application_operation_id"], record.application_operation);
+    assert_eq!(
+        rtsp_requests[0].1["application_operation_id"],
+        record.application_operation
+    );
     assert_eq!(rtsp_requests[0].1["app_id"], super::app_id(1));
-    assert_eq!(rtsp_requests[0].1["catalog_revision"], record.application_catalog_revision.unwrap());
+    assert_eq!(
+        rtsp_requests[0].1["catalog_revision"],
+        record.application_catalog_revision.unwrap()
+    );
     assert!(rtsp_requests[0].1.get("display_request").is_none());
     assert_eq!(
         rtsp_requests[0].1["frame_limiter_settings"],
@@ -4646,33 +5236,74 @@ fn dual_uncertain_cleanup_calls_are_both_retained_and_reconciled_before_success(
 
 #[test]
 fn software_scopes_freeze_and_qp_resolves_client_before_application_before_global() {
-    let now=Instant::now();
+    let now = Instant::now();
     for (client_override, client_threads, client_qp, application_qp, expected_qp) in [
         (None, None, None, None, 28),
         (Some(""), Some(-7), Some(31), Some(30), 31),
         (None, None, None, Some(30), 30),
     ] {
-        let mut controller=Controller::new(Some(config())).unwrap();
+        let mut controller = Controller::new(Some(config())).unwrap();
         controller.set_global_qp(28);
-        controller.set_software_encoder_options(SoftwareEncoderOptions {sw_preset:Some("fast".into()),sw_tune:Some("film".into()),encoder:Some(amaterasu_module_sdk::EncoderBackend::Auto),min_threads:Some(4)});
-        let mut application_overrides=json!({"sw_preset":"slow","sw_tune":"film,zerolatency","encoder":"software","min_threads":6});
-        if let Some(qp)=application_qp { application_overrides["qp"]=json!(qp); }
-        let mut broker=Broker {application_input_overrides:Some(application_overrides),..Default::default()};
-        let cert=vec![9;32];
-        let client=PeerIdentity::new("127.0.0.1".parse().unwrap(),cert.clone()).unwrap().with_paired_identity("client-9".into(),fingerprint(&cert),ClientConfigOverrides {sw_preset:client_override.map(str::to_owned),sw_tune:None,encoder:None,min_threads:client_threads,qp:client_qp,..Default::default()}).unwrap();
-        assert!(controller.launch(10,request(9),client,now).is_none());
-        controller.set_software_encoder_options(SoftwareEncoderOptions {sw_preset:Some("ultrafast".into()),sw_tune:Some("animation".into()),encoder:None,min_threads:Some(32)});
+        controller.set_software_encoder_options(SoftwareEncoderOptions {
+            sw_preset: Some("fast".into()),
+            sw_tune: Some("film".into()),
+            encoder: Some(amaterasu_module_sdk::EncoderBackend::Auto),
+            min_threads: Some(4),
+        });
+        let mut application_overrides = json!({"sw_preset":"slow","sw_tune":"film,zerolatency","encoder":"software","min_threads":6});
+        if let Some(qp) = application_qp {
+            application_overrides["qp"] = json!(qp);
+        }
+        let mut broker = Broker {
+            application_input_overrides: Some(application_overrides),
+            ..Default::default()
+        };
+        let cert = vec![9; 32];
+        let client = PeerIdentity::new("127.0.0.1".parse().unwrap(), cert.clone())
+            .unwrap()
+            .with_paired_identity(
+                "client-9".into(),
+                fingerprint(&cert),
+                ClientConfigOverrides {
+                    sw_preset: client_override.map(str::to_owned),
+                    sw_tune: None,
+                    encoder: None,
+                    min_threads: client_threads,
+                    qp: client_qp,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(controller.launch(10, request(9), client, now).is_none());
+        controller.set_software_encoder_options(SoftwareEncoderOptions {
+            sw_preset: Some("ultrafast".into()),
+            sw_tune: Some("animation".into()),
+            encoder: None,
+            min_threads: Some(32),
+        });
         controller.set_global_qp(35);
-        let (_,reply)=poll_until_reply(&mut controller,&mut broker,now);assert_eq!(reply.status,200);
-        let open=opened_rtsp_payload(&broker);
-        assert_eq!(open["sw_preset"],client_override.unwrap_or("slow"));
-        assert_eq!(open["sw_tune"],"film,zerolatency");
-        assert_eq!(open["capture"]["encoder"],"software");
-        assert_eq!(open["min_threads"],client_threads.unwrap_or(6));
-        assert_eq!(open["qp"],expected_qp);
-        let cert=vec![10;32];
-        let unpaired=PeerIdentity::new("127.0.0.1".parse().unwrap(),cert.clone()).unwrap();
-        assert!(unpaired.with_paired_identity("client-9".into(),fingerprint(&[9;32]),ClientConfigOverrides {sw_preset:Some("slow".into()),..Default::default()}).is_err());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200);
+        let open = opened_rtsp_payload(&broker);
+        assert_eq!(open["sw_preset"], client_override.unwrap_or("slow"));
+        assert_eq!(open["sw_tune"], "film,zerolatency");
+        assert_eq!(open["capture"]["encoder"], "software");
+        assert_eq!(open["min_threads"], client_threads.unwrap_or(6));
+        assert_eq!(open["qp"], expected_qp);
+        let cert = vec![10; 32];
+        let unpaired = PeerIdentity::new("127.0.0.1".parse().unwrap(), cert.clone()).unwrap();
+        assert!(
+            unpaired
+                .with_paired_identity(
+                    "client-9".into(),
+                    fingerprint(&[9; 32]),
+                    ClientConfigOverrides {
+                        sw_preset: Some("slow".into()),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
     }
 }
 
@@ -4729,12 +5360,33 @@ fn nvenc_scopes_freeze_client_over_application_over_global_and_verify_readback()
 
 #[test]
 fn malformed_software_application_options_fail_before_rtsp_and_launch() {
-    for overrides in [json!({"sw_preset":false}),json!({"sw_tune":"x".repeat(257)}),json!({"encoder":"nvenc"}),json!({"min_threads":2147483648_i64}),json!({"min_threads":1.5}),json!({"qp":-2147483649_i64}),json!({"qp":1.5})] {
-        let now=Instant::now();let mut controller=Controller::new(Some(config())).unwrap();
-        let mut broker=Broker {application_input_overrides:Some(overrides),..Default::default()};
-        assert!(controller.launch(10,request(8),peer(8),now).is_none());
-        let (_,reply)=poll_until_reply(&mut controller,&mut broker,now);assert_ne!(reply.status,200);
-        assert!(!broker.actions().iter().any(|(service,action)|(*service=="amaterasu.rtsp/1"&&*action=="open")||(*service=="amaterasu.launch/1"&&*action=="launch_export")));
+    for overrides in [
+        json!({"sw_preset":false}),
+        json!({"sw_tune":"x".repeat(257)}),
+        json!({"encoder":"nvenc"}),
+        json!({"min_threads":2147483648_i64}),
+        json!({"min_threads":1.5}),
+        json!({"qp":-2147483649_i64}),
+        json!({"qp":1.5}),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker {
+            application_input_overrides: Some(overrides),
+            ..Default::default()
+        };
+        assert!(controller.launch(10, request(8), peer(8), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_ne!(reply.status, 200);
+        assert!(
+            !broker
+                .actions()
+                .iter()
+                .any(
+                    |(service, action)| (*service == "amaterasu.rtsp/1" && *action == "open")
+                        || (*service == "amaterasu.launch/1" && *action == "launch_export")
+                )
+        );
     }
 }
 
@@ -4873,4 +5525,188 @@ fn changed_application_keybindings_after_preflight_cannot_open_rtsp() {
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_ne!(reply.status, 200);
     assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+}
+
+fn uhd_profile(encoder: EncoderSelection) -> StreamingConfig {
+    let mut streaming = config();
+    streaming.capture.encoder = encoder;
+    streaming.profile.max_width = 3840;
+    streaming.profile.max_height = 2160;
+    streaming.profile.max_fps = 120;
+    streaming
+}
+
+fn uhd_request(key: u8) -> LaunchRequest {
+    LaunchRequest {
+        width: 3840,
+        height: 2160,
+        fps: 120,
+        ..request(key)
+    }
+}
+
+fn nvenc_and_x264() -> EncoderSnapshot {
+    encoders(vec![
+        encoder_entry("amaterasu.hardware.nvenc-cuda.h264", "h264", true),
+        encoder_entry("amaterasu.hardware.nvenc-cuda.hevc", "hevc", true),
+        encoder_entry("amaterasu.hardware.nvenc-cuda.av1", "av1", true),
+        encoder_entry("amaterasu.software.x264", "h264", false),
+    ])
+}
+
+const AUTO_ENCODER: EncoderSelection =
+    EncoderSelection::Backend(amaterasu_module_sdk::EncoderBackend::Auto);
+
+#[test]
+fn hardware_encoders_offer_every_codec_to_rtsp_up_to_the_profile_maximum() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+    controller.set_encoder_snapshot(nvenc_and_x264());
+    let mut broker = Broker::default();
+
+    assert!(
+        controller
+            .launch(10, uhd_request(61), peer(61), now)
+            .is_none()
+    );
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let open = opened_rtsp_payload(&broker);
+    assert_eq!(open["profile"]["codecs"], json!(["av1", "hevc", "h264"]));
+    assert!(open["profile"].get("codec").is_none());
+    assert_eq!(open["negotiation_bounds"]["max_width"], 3840);
+    assert_eq!(open["negotiation_bounds"]["max_height"], 2160);
+    assert_eq!(open["negotiation_bounds"]["max_fps"], 120);
+}
+
+#[test]
+fn software_only_launches_above_full_hd_sixty_are_refused_before_any_effect() {
+    let now = Instant::now();
+    for (snapshot, message) in [
+        (
+            Some(encoders(vec![encoder_entry(
+                "amaterasu.software.x264",
+                "h264",
+                false,
+            )])),
+            "no hardware encoder for this stream mode",
+        ),
+        (None, "encoder capabilities are not known yet"),
+        (Some(encoders(vec![])), "no video encoder is available"),
+    ] {
+        let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+        if let Some(snapshot) = snapshot {
+            controller.set_encoder_snapshot(snapshot);
+        }
+        let mut broker = Broker::default();
+        let reply = controller
+            .launch(10, uhd_request(62), peer(62), now)
+            .expect("immediate refusal");
+        assert_eq!(reply.status, 503);
+        assert!(String::from_utf8(reply.body).unwrap().contains(message));
+        assert!(controller.records.is_empty());
+        assert!(
+            controller
+                .poll(now, &mut |command| broker.send(command))
+                .is_empty()
+        );
+        assert!(broker.commands.is_empty());
+    }
+}
+
+#[test]
+fn software_codecs_keep_negotiation_within_the_software_limit() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+    controller.set_encoder_snapshot(encoders(vec![
+        encoder_entry("amaterasu.hardware.nvenc-cuda.hevc", "hevc", true),
+        encoder_entry("amaterasu.software.x264", "h264", false),
+    ]));
+    let mut broker = Broker::default();
+    let full_hd = LaunchRequest {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        ..request(63)
+    };
+    assert!(controller.launch(10, full_hd, peer(63), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    let open = opened_rtsp_payload(&broker);
+    assert_eq!(open["profile"]["codecs"], json!(["hevc", "h264"]));
+    assert_eq!(
+        (
+            &open["negotiation_bounds"]["max_width"],
+            &open["negotiation_bounds"]["max_height"],
+            &open["negotiation_bounds"]["max_fps"],
+        ),
+        (&json!(1920), &json!(1080), &json!(60))
+    );
+}
+
+#[test]
+fn a_numeric_encoder_selection_offers_only_that_encoder_codec() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(uhd_profile(EncoderSelection::Index(1)))).unwrap();
+    controller.set_encoder_snapshot(nvenc_and_x264());
+    let mut broker = Broker::default();
+    assert!(
+        controller
+            .launch(10, uhd_request(64), peer(64), now)
+            .is_none()
+    );
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(
+        opened_rtsp_payload(&broker)["profile"]["codecs"],
+        json!(["hevc"])
+    );
+}
+
+#[test]
+fn an_h264_only_offer_keeps_the_legacy_rtsp_profile_shape() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_encoder_snapshot(hardware_h264());
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(65), peer(65), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    let profile = &opened_rtsp_payload(&broker)["profile"];
+    assert!(profile.get("codecs").is_none() && profile.get("codec").is_none());
+}
+
+#[test]
+fn codec_advertisement_tracks_configuration_and_the_latest_snapshot() {
+    assert_eq!(
+        Controller::new(None).unwrap().codec_advertisement(),
+        CodecAdvertisement::NONE
+    );
+    let mut controller = Controller::new(Some(config())).unwrap();
+    assert_eq!(controller.codec_advertisement().codec_mode_support, 0x1);
+    controller.set_encoder_snapshot(nvenc_and_x264());
+    assert_eq!(
+        controller.codec_advertisement(),
+        CodecAdvertisement {
+            codec_mode_support: 0x10101,
+            max_luma_pixels_hevc: 1_869_449_984,
+        }
+    );
+}
+
+#[test]
+fn scoped_software_selection_uses_the_frozen_snapshot_to_constrain_codec_negotiation() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(uhd_profile(AUTO_ENCODER))).unwrap();
+    controller.set_encoder_snapshot(nvenc_and_x264());
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({"encoder":"software"})),
+        ..Default::default()
+    };
+    assert!(controller.launch(10, request(84), peer(84), now).is_none());
+    controller.set_encoder_snapshot(encoders(vec![]));
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let open = opened_rtsp_payload(&broker);
+    assert_eq!(open["capture"]["encoder"], "software");
+    assert!(open["profile"].get("codecs").is_none());
+    assert_eq!(open["negotiation_bounds"]["max_width"], 1920);
+    assert_eq!(open["negotiation_bounds"]["max_fps"], 60);
 }

@@ -25,6 +25,7 @@ pub(super) fn launch(launch: &TrustedLaunch, capabilities: &Capabilities) -> Res
         || !(16..=2160).contains(&capabilities.max_height)
         || !(1..=120).contains(&capabilities.max_fps)
         || !(100..=100000).contains(&capabilities.max_bitrate_kbps)
+        || capabilities.supported_colors.is_empty()
     {
         return Err(Error::InvalidLaunch);
     }
@@ -126,10 +127,13 @@ pub(super) fn transport(value: Option<&str>) -> Result<(), Error> {
 pub(super) fn media(value: &sdp::Announce, capabilities: &Capabilities) -> Result<(), Error> {
     value
         .check_support(&capabilities.transport)
-        .map_err(|_| Error::UnsupportedMedia)?;
+        .map_err(|error| {
+            eprintln!("amaterasu rtsp announce capability rejection reason={error:?}");
+            Error::UnsupportedMedia
+        })?;
     if value.control != sdp::ControlProtocol::EncryptedEnet
         || !value.encryption.control_v2
-        || value.video.color != capabilities.color
+        || !capabilities.supported_colors.contains(&value.video.color)
         || value.video.width > capabilities.max_width
         || value.video.height > capabilities.max_height
         || value.video.fps > capabilities.max_fps
@@ -137,6 +141,22 @@ pub(super) fn media(value: &sdp::Announce, capabilities: &Capabilities) -> Resul
         || (capabilities.require_video_encryption && !value.encryption.video)
         || (capabilities.require_audio_encryption && !value.encryption.audio)
     {
+        eprintln!(
+            "amaterasu rtsp announce profile rejection control={} control_v2={} color={} geometry={} fps={} bitrate={} video_encryption={} audio_encryption={}",
+            value.control == sdp::ControlProtocol::EncryptedEnet,
+            value.encryption.control_v2,
+            capabilities.supported_colors.contains(&value.video.color),
+            value.video.width <= capabilities.max_width
+                && value.video.height <= capabilities.max_height,
+            value.video.fps <= capabilities.max_fps,
+            value.video.bitrate_kbps <= capabilities.max_bitrate_kbps,
+            !capabilities.require_video_encryption || value.encryption.video,
+            !capabilities.require_audio_encryption || value.encryption.audio,
+        );
+        eprintln!(
+            "amaterasu rtsp announce color requested={:?} supported={:?}",
+            value.video.color, capabilities.supported_colors
+        );
         return Err(Error::UnsupportedMedia);
     }
     Ok(())
@@ -157,7 +177,23 @@ pub(super) fn description(capabilities: &Capabilities) -> String {
         } else {
             0
         };
+    // Moonlight's HEVC selection uses this legacy SDP marker even though the
+    // video rtpmap remains H264. Emit it only for a ticket whose end-to-end
+    // capability was enabled by the host; ordinary H.264 tickets stay exact.
+    let hevc_marker = if transport.hevc {
+        "a=fmtp:96 sprop-parameter-sets=AAAAAU\r\n"
+    } else {
+        ""
+    };
+    // Moonlight selects AV1 when this payload contains "AV1/90000" and both
+    // sides support it, preferring it over HEVC. Like the HEVC marker, it is
+    // emitted only for a ticket whose AV1 path is enabled end to end.
+    let av1_marker = if transport.av1 {
+        "a=rtpmap:98 AV1/90000\r\n"
+    } else {
+        ""
+    };
     format!(
-        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Amaterasu\r\nt=0 0\r\na=x-ss-general.featureFlags:0\r\na=x-ss-general.encryptionSupported:{supported}\r\na=x-ss-general.encryptionRequested:{requested}\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\nm=audio 0 RTP/AVP 97\r\na=rtpmap:97 opus/48000/2\r\n"
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Amaterasu\r\nt=0 0\r\na=x-ss-general.featureFlags:0\r\na=x-ss-general.encryptionSupported:{supported}\r\na=x-ss-general.encryptionRequested:{requested}\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n{hevc_marker}{av1_marker}m=audio 0 RTP/AVP 97\r\na=rtpmap:97 opus/48000/2\r\n"
     )
 }

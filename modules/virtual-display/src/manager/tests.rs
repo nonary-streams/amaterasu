@@ -102,7 +102,7 @@ fn create() -> Operation {
         refresh_millihz: 60000,
         name: "Test display".into(),
         reference_id: None,
-        dd_virtual_display_scale: 0,
+        dd_virtual_display_scale: None,
     }
 }
 fn create_with_scale(dd_virtual_display_scale: i32) -> Operation {
@@ -113,7 +113,7 @@ fn create_with_scale(dd_virtual_display_scale: i32) -> Operation {
         refresh_millihz: 60000,
         name: "Test display".into(),
         reference_id: None,
-        dd_virtual_display_scale,
+        dd_virtual_display_scale: Some(dd_virtual_display_scale),
     }
 }
 fn create_with_reference(reference_id: &str) -> Operation {
@@ -124,7 +124,7 @@ fn create_with_reference(reference_id: &str) -> Operation {
         refresh_millihz: 60000,
         name: "Test display".into(),
         reference_id: Some(reference_id.into()),
-        dd_virtual_display_scale: 0,
+        dd_virtual_display_scale: Some(0),
     }
 }
 fn tick(manager: &mut Manager<Fake>) {
@@ -629,7 +629,8 @@ fn omitted_create_scale_defaults_to_retain_and_preserves_old_payloads() {
     else {
         panic!("create payload should deserialize as Create");
     };
-    assert_eq!(*dd_virtual_display_scale, 0);
+    // An omitted scale falls back to the module setting, which retains.
+    assert_eq!(*dd_virtual_display_scale, None);
 
     let (mut manager, calls) = setup(true);
     assert_eq!(manager.handle("alice", operation)["ok"], true);
@@ -787,6 +788,33 @@ fn settings_default_to_reference_values_and_accept_stable_names() {
     assert!(configured.dd_activate_virtual_display);
     assert!(!configured.dd_use_sunshine_virtual_display_driver);
     assert_eq!(configured.dd_virtual_display_permanent_count, None);
+}
+
+#[test]
+fn virtual_display_layout_defaults_to_exclusive_and_refuses_unimplemented_variants() {
+    use crate::model::VirtualDisplayLayout;
+    let defaults = serde_json::from_value::<Settings>(json!({})).unwrap();
+    assert_eq!(
+        defaults.virtual_display_layout,
+        VirtualDisplayLayout::Exclusive
+    );
+    let extended =
+        serde_json::from_value::<Settings>(json!({"virtual_display_layout": "extended"})).unwrap();
+    assert_eq!(
+        extended.virtual_display_layout,
+        VirtualDisplayLayout::Extended
+    );
+    for unimplemented in [
+        "extended_primary",
+        "extended_isolated",
+        "extended_primary_isolated",
+    ] {
+        assert!(
+            serde_json::from_value::<Settings>(json!({"virtual_display_layout": unimplemented}))
+                .is_err(),
+            "{unimplemented}"
+        );
+    }
 }
 
 #[test]

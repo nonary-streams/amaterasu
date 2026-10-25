@@ -1,10 +1,13 @@
 use super::{
     AudioSinkCaptureOnlyOverrides, CLEANUP_POLL_INTERVAL, Controller, INITIAL_DEADLINE,
-    MAX_APPLICATION_CLEANUP_BUDGET_MS, MONITOR_INTERVAL, Send, app_id,
+    MAX_APPLICATION_CLEANUP_BUDGET_MS, MONITOR_INTERVAL, Send, StreamingConfig, app_id,
     call::{Call, Outcome},
     capture_sink_without_routing, key_hex, private_error,
     record::{Record, Stage, State},
     success_reply,
+};
+use crate::encoder_snapshot::{
+    CodecOffer, SOFTWARE_MAX_FPS, SOFTWARE_MAX_HEIGHT, SOFTWARE_MAX_WIDTH,
 };
 use crate::frame_limiter::FrameLimiterSettings;
 use crate::wire::Reply;
@@ -82,6 +85,7 @@ impl Controller {
             record.retrying_uncertainty = false;
         }
         let phase = next_phase(&record);
+        eprintln!("amaterasu launch phase start={phase:?}");
         let call = self.make_call(&mut record, phase);
         let deadline = if matches!(
             phase,
@@ -116,6 +120,7 @@ impl Controller {
             Outcome::Rejected => self.rejected(job, now, replies),
             Outcome::Settled => self.settled(job, now, replies),
             Outcome::Uncertain => {
+                eprintln!("amaterasu launch phase uncertain={:?}", job.phase);
                 let record = self.records.get_mut(&job.record).expect("workflow record");
                 let entering_cleanup =
                     !matches!(record.state, State::Stopping | State::CleanupFailed);
@@ -153,6 +158,33 @@ impl Controller {
                 self.finish_or_retain(job.record, now, replies);
             }
         }
+    }
+
+    fn advance_after_history(config: Option<&StreamingConfig>, record: &mut Record, now: Instant) {
+        if record.state != State::Starting {
+            return;
+        }
+        if !record.desktop {
+            record.stage = Stage::PreflightApplication;
+            return;
+        }
+        let Some(config) = config else {
+            fail_record(record, "streaming_disabled", now);
+            return;
+        };
+        let mut profile = config.profile.clone();
+        if let Err(code) =
+            project_application_policy(record, &ApplicationConfigOverrides::default(), &mut profile)
+        {
+            fail_record(record, code, now);
+            return;
+        }
+        record.application_display_overrides = Some(json!({}));
+        // Desktop has no catalog application or display mutation admission.
+        // A synthetic snapshot lacks those attestations and RTSP rejects it.
+        record.display_policy_snapshot = None;
+        record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
+        record.stage = Stage::OpenRtsp;
     }
 
     fn make_call(&mut self, record: &mut Record, phase: Phase) -> Call {
@@ -271,7 +303,7 @@ impl Controller {
                     "audio_endpoint":record.audio_endpoint,
                     "host_audio_enabled":record.request.host_audio_enabled,
                 });
-                let profile = json!({
+                let mut profile = json!({
                     "width": record.request.width,
                     "height": record.request.height,
                     "fps": record.request.fps,
@@ -287,6 +319,22 @@ impl Controller {
                     "encrypt_video": config.profile.encrypt_video,
                     "encrypt_audio": config.profile.encrypt_audio,
                     "permit_legacy_audio_iv_wrap": config.profile.permit_legacy_audio_iv_wrap,
+                });
+                let offer = &record.video_codec_offer;
+                if offer.codecs != [amaterasu_media::VideoCodec::H264] {
+                    profile["codecs"] = json!(offer.codecs);
+                }
+                let (max_width, max_height, max_fps) = negotiation_mode_limit(config, offer);
+                let negotiation_bounds = json!({
+                    "max_width": max_width,
+                    "max_height": max_height,
+                    "max_fps": max_fps,
+                    "max_bitrate_kbps": record.effective_max_bitrate_kbps
+                        .filter(|maximum| *maximum > 0)
+                        .map_or(config.profile.bitrate_kbps, |maximum| {
+                            maximum.min(config.profile.bitrate_kbps)
+                        }),
+                    "max_reference_frames": config.profile.max_reference_frames,
                 });
                 (
                     RTSP_SERVICE,
@@ -343,6 +391,7 @@ impl Controller {
                         "display_admission_token": record.display_admission_token,
                         "capture": capture,
                         "profile": profile,
+                        "negotiation_bounds": negotiation_bounds,
                     }),
                     15_000,
                 )
@@ -421,6 +470,11 @@ impl Controller {
         now: Instant,
         replies: &mut Vec<(u64, Reply)>,
     ) {
+        eprintln!(
+            "amaterasu launch phase result={:?} ok={}",
+            job.phase,
+            payload["ok"] == true
+        );
         let record = self.records.get_mut(&job.record).expect("workflow record");
         match job.phase {
             Phase::ReserveHistory => {
@@ -452,7 +506,7 @@ impl Controller {
                     match proton_policy_response(&payload) {
                         Ok(value) => {
                             record.global_proton_dualsense_compatibility = Some(value);
-                            record.stage = Stage::PreflightApplication;
+                            Self::advance_after_history(self.config.as_ref(), record, now);
                         }
                         Err(code) => fail_record(record, code, now),
                     }
@@ -474,6 +528,11 @@ impl Controller {
                         .unwrap_or(record.global_capture_mode);
                     (record.capture_provider, record.constant_rate) =
                         selected_capture_mode.resolve(record.bootstrap_capture_provider);
+                    if record.capture_provider == super::CaptureProvider::PipeWire
+                        && record.capture_output != super::OWNED_DISPLAY_OUTPUT
+                    {
+                        record.capture_output = super::PORTAL_SELECTED_SESSION_SOURCE.to_owned();
+                    }
                     record.application_preflight_token = Some(token);
                     record.application_catalog_revision = Some(catalog_revision);
                     record.application_cleanup_budget_ms = Some(cleanup_budget_ms);
@@ -681,7 +740,12 @@ impl Controller {
                         complete_launch(record, now, replies);
                     }
                 }
-                Ok((ticket, _, _, _)) => {
+                Ok((ticket, _, state, healthy)) => {
+                    eprintln!(
+                        "amaterasu launch rtsp not ready state={state} healthy={healthy} failure={} cleanup_error={}",
+                        safe_rtsp_provider_code(&payload["failure"]),
+                        safe_rtsp_provider_code(&payload["cleanup_error"]),
+                    );
                     record.rtsp_ticket = Some(ticket);
                     record.request_cleanup(None, now);
                 }
@@ -756,6 +820,7 @@ impl Controller {
     }
 
     fn rejected(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
+        eprintln!("amaterasu launch phase rejected={:?}", job.phase);
         let record = self.records.get_mut(&job.record).expect("workflow record");
         match job.phase {
             Phase::ReserveHistory => {
@@ -820,6 +885,7 @@ impl Controller {
     }
 
     fn settled(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
+        eprintln!("amaterasu launch phase settled={:?}", job.phase);
         let record = self.records.get_mut(&job.record).expect("workflow record");
         record.stage = Stage::Cleanup;
         match job.phase {
@@ -954,6 +1020,20 @@ impl Phase {
     }
 }
 
+/// RTSP may accept any client mode up to the profile maximum, but an offer
+/// that includes a software-only codec stays within the software limit.
+fn negotiation_mode_limit(config: &StreamingConfig, offer: &CodecOffer) -> (u32, u32, u32) {
+    let profile = &config.profile;
+    if !offer.software_limited {
+        return (profile.max_width, profile.max_height, profile.max_fps);
+    }
+    (
+        profile.max_width.min(SOFTWARE_MAX_WIDTH),
+        profile.max_height.min(SOFTWARE_MAX_HEIGHT),
+        profile.max_fps.min(SOFTWARE_MAX_FPS),
+    )
+}
+
 fn needs_work(record: &Record, now: Instant) -> bool {
     if record.state == State::CleanupFailed {
         return false;
@@ -1000,7 +1080,9 @@ fn next_phase(record: &Record) -> Phase {
         Stage::AwaitApplicationReady => Phase::AwaitApplication,
         Stage::PrepareDisplayAdmission => Phase::PrepareDisplayAdmission,
         Stage::OpenRtsp => Phase::OpenRtsp,
-        Stage::Live if record.monitor_application_next => Phase::MonitorApplication,
+        Stage::Live if !record.desktop && record.monitor_application_next => {
+            Phase::MonitorApplication
+        }
         Stage::Live => Phase::MonitorRtsp,
         Stage::Cleanup
             if record.rtsp_requested
@@ -1650,6 +1732,7 @@ fn fail_record(record: &mut Record, code: &'static str, now: Instant) {
 }
 
 fn complete_launch(record: &mut Record, now: Instant, replies: &mut Vec<(u64, Reply)>) {
+    eprintln!("amaterasu launch preparation complete");
     record.state = State::AwaitingDelivery;
     record.stage = Stage::AwaitingDelivery;
     if let Some(connection) = record.launch_connection {
@@ -1709,6 +1792,15 @@ fn project_application_policy(
     if let Some(backend) = record.effective_software_encoder.encoder {
         record.selected_encoder = amaterasu_module_sdk::EncoderSelection::Backend(backend);
     }
+    let mode = crate::encoder_snapshot::StreamMode {
+        width: record.request.width,
+        height: record.request.height,
+        fps: record.request.fps,
+    };
+    record.video_codec_offer = match &record.encoder_snapshot {
+        Some(snapshot) => snapshot.offer(record.selected_encoder.clone(), mode)?,
+        None => crate::encoder_snapshot::unknown_encoders_offer(mode)?,
+    };
     record.scoped_ds4_back_as_touchpad_click = record
         .peer
         .client_ds4_back_as_touchpad_click
@@ -2588,6 +2680,10 @@ fn application_preflight_response(
     payload: &Value,
 ) -> Result<ApplicationPreflight, &'static str> {
     if payload["ok"] != true || payload["app_id"] != app_id(record.request.app_id) {
+        eprintln!(
+            "amaterasu application preflight rejected code={}",
+            safe_rtsp_provider_code(&payload["code"])
+        );
         return Err("invalid_application_preflight_response");
     }
     let token = payload["preflight_token"]
@@ -2855,6 +2951,10 @@ fn rtsp_response<'a>(
     payload: &'a Value,
 ) -> Result<(u64, &'a str, &'a str, bool), &'static str> {
     if payload["ok"] != true {
+        eprintln!(
+            "amaterasu launch rtsp provider rejected code={}",
+            safe_rtsp_provider_code(&payload["code"])
+        );
         return Err(match payload["code"].as_str() {
             Some("ticket_not_found") => "ticket_not_found",
             _ => "invalid_rtsp_response",
@@ -2885,7 +2985,13 @@ fn rtsp_response<'a>(
                     .unwrap_or(&Value::Null),
             )
         || payload["frame_limiter_executable_path"].as_str() != record.executable_path.as_deref()
-        || payload.get("display_policy_snapshot") != record.display_policy_snapshot.as_ref()
+        || payload.get("display_policy_snapshot")
+            != Some(
+                record
+                    .display_policy_snapshot
+                    .as_ref()
+                    .unwrap_or(&Value::Null),
+            )
         || payload.get("display_request")
             != Some(record.display_request.as_ref().unwrap_or(&Value::Null))
         || (record.display_request.is_some()
@@ -2917,6 +3023,19 @@ fn rtsp_response<'a>(
         })
         .ok_or("invalid_rtsp_response")?;
     Ok((ticket, url, state, payload["cleanup_error"].is_null()))
+}
+
+fn safe_rtsp_provider_code(value: &Value) -> &str {
+    value
+        .as_str()
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .unwrap_or("unavailable")
 }
 
 fn clean_rtsp_terminal(record: &Record, payload: &Value) -> bool {
@@ -3055,5 +3174,28 @@ fn reply_failure(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
             connection,
             private_error(503, "stream cleanup is incomplete"),
         ));
+    }
+}
+
+#[cfg(test)]
+mod rtsp_provider_code_tests {
+    use super::safe_rtsp_provider_code;
+    use serde_json::json;
+
+    #[test]
+    fn provider_code_trace_retains_bounded_codes_without_reflecting_sensitive_fields() {
+        assert_eq!(
+            safe_rtsp_provider_code(&json!("source_selection_expired")),
+            "source_selection_expired"
+        );
+        assert_eq!(
+            safe_rtsp_provider_code(&json!("key_hex=secret")),
+            "unavailable"
+        );
+        assert_eq!(
+            safe_rtsp_provider_code(&json!("a".repeat(65))),
+            "unavailable"
+        );
+        assert_eq!(safe_rtsp_provider_code(&json!(null)), "unavailable");
     }
 }

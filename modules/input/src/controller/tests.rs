@@ -10,6 +10,8 @@ use std::rc::Rc;
 
 #[derive(Default)]
 struct FakeBackend {
+    gamepad_feedback: Option<amaterasu_input_companion::GamepadFeedback>,
+    touch_as_mouse_max_contacts: Option<usize>,
     trace: Rc<RefCell<Vec<Event>>>,
     starts: usize,
     stops: usize,
@@ -46,6 +48,19 @@ struct FakeBackend {
     pen_touch_advances: usize,
 }
 impl Backend for FakeBackend {
+    fn poll_gamepad_feedback(
+        &mut self,
+    ) -> InputResult<Option<amaterasu_input_companion::GamepadFeedback>> {
+        Ok(self.gamepad_feedback.take())
+    }
+    fn touch_as_mouse_max_contacts(&self) -> Option<usize> {
+        self.touch_as_mouse_max_contacts
+    }
+    fn supports_pen_touch_event(&self, device: PenTouchDevice) -> bool {
+        self.supports_pen_touch
+            || (device == PenTouchDevice::Touch && self.touch_as_mouse_max_contacts.is_some())
+    }
+
     fn name(&self) -> &'static str {
         "test_only_fake"
     }
@@ -2258,7 +2273,7 @@ fn original_modifier_release_failure_preserves_owner_until_recovery() {
     let cleanup_up = moonlight_key(0x10, KeyState::Up, 0, false);
     assert_eq!(
         trace.as_slice(),
-        &[down, up, cleanup_up.clone(), cleanup_up]
+        &[down, cleanup_up.clone(), cleanup_up.clone(), cleanup_up]
     );
     drop(trace);
 
@@ -2606,8 +2621,9 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
 }
 
 #[test]
-fn moonlight_modifier_sources_are_distinct_and_native_encodings_cannot_mix() {
+fn explicitly_remapped_modifier_sources_are_distinct_and_native_encodings_cannot_mix() {
     let mut controller = Controller::new(FakeBackend::default(), true);
+    controller.set_keybindings(&KeyBindings::from_flat(vec![0xa0, 0x41]).unwrap());
     let token = acquire(&mut controller, Instant::now());
     let generic_shift = Event::Key {
         key: Key::MoonlightVk {
@@ -4411,4 +4427,395 @@ fn failed_acquisition_restores_global_keybindings_before_the_next_attempt() {
         true
     );
     assert_eq!(controller.backend.keybindings, global);
+}
+
+#[test]
+fn gamepad_feedback_poll_requires_the_lease_owner_and_enabled_backend() {
+    let feedback = amaterasu_input_companion::GamepadFeedback {
+        slot: 1,
+        strong_motor: 32000,
+        weak_motor: 16000,
+        duration_ms: 250,
+    };
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            gamepad_feedback: Some(feedback),
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let lease = acquire(&mut controller, now);
+
+    let denied = controller.handle(
+        "other",
+        Operation::PollGamepadFeedback {
+            lease: lease.clone(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(denied["error"]["code"], "permission_denied");
+
+    let failed_delivery = controller.handle(
+        "owner",
+        Operation::PollGamepadFeedback {
+            lease: lease.clone(),
+        },
+        now,
+        &mut || Err(InputError::new("cancelled", "request ended before poll")),
+    );
+    assert_eq!(failed_delivery["error"]["code"], "cancelled");
+    assert_eq!(controller.backend.gamepad_feedback, Some(feedback));
+
+    let received = controller.handle(
+        "owner",
+        Operation::PollGamepadFeedback {
+            lease: lease.clone(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(received["ok"], true);
+    assert_eq!(received["lease"], lease);
+    assert_eq!(received["feedback"]["slot"], 1);
+    assert_eq!(received["feedback"]["strong_motor"], 32000);
+
+    controller.backend.controller_input_supported = false;
+    let unavailable = controller.handle(
+        "owner",
+        Operation::PollGamepadFeedback { lease },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(unavailable["feedback"], serde_json::Value::Null);
+}
+
+#[test]
+fn controller_disable_still_allows_terminal_rumble_zero_to_flush() {
+    let terminal_zero = amaterasu_input_companion::GamepadFeedback {
+        slot: 1,
+        strong_motor: 0,
+        weak_motor: 0,
+        duration_ms: 0,
+    };
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            gamepad_feedback: Some(terminal_zero),
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let lease = acquire(&mut controller, now);
+    controller.set_controller_enabled(false, now).unwrap();
+
+    let response = controller.handle(
+        "owner",
+        Operation::PollGamepadFeedback { lease },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(response["feedback"]["duration_ms"], 0);
+}
+
+#[test]
+fn scoped_ds4_back_mapping_survives_global_updates_and_restores_after_release() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let now = Instant::now();
+    let acquired = controller.handle(
+        "owner",
+        Operation::Acquire {
+            operation_id: Some("ds4-back-mapping".into()),
+            ttl_ms: None,
+            back_button_timeout: None,
+            controller: None,
+            gamepad: Some(GamepadProfile::Auto),
+            ds4_back_as_touchpad_click: Some(false),
+            motion_as_ds4: None,
+            touchpad_as_ds4: None,
+            ds5_inputtino_randomize_mac: None,
+            keybindings: None,
+            native_pen_touch: None,
+            keyboard: None,
+            mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(acquired["ok"], true);
+    assert_eq!(acquired["ds4_back_as_touchpad_click"], false);
+    let lease = controller.lease.as_ref().unwrap();
+    assert_eq!(lease.requested_ds4_back_as_touchpad_click, Some(false));
+    assert!(!lease.ds4_back_as_touchpad_click);
+    assert!(!controller.backend.ds4_back_as_touchpad_click);
+
+    controller.set_ds4_back_as_touchpad_click(false);
+    controller.set_ds4_back_as_touchpad_click(true);
+    assert!(!controller.backend.ds4_back_as_touchpad_click);
+
+    controller.handle(
+        "owner",
+        Operation::Release {
+            lease: acquired["lease"].as_str().unwrap().into(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert!(controller.backend.ds4_back_as_touchpad_click);
+}
+
+#[test]
+fn modifier_alias_release_failure_preserves_owner_until_recovery() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let now = Instant::now();
+    let token = acquire(&mut controller, now);
+    let down = moonlight_key(0x10, KeyState::Down, 0, false);
+    let up = moonlight_key(0xa0, KeyState::Up, 0, false);
+    assert_eq!(
+        batch(&mut controller, &token, vec![down.clone()])["ok"],
+        true
+    );
+    assert_eq!(controller.pressed.len(), 1);
+
+    let unrelated = controller.handle(
+        "other",
+        Operation::Release {
+            lease: token.clone(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(unrelated["error"]["code"], "permission_denied");
+    assert_eq!(controller.pressed.len(), 1);
+
+    controller.backend.fail_release = true;
+    let failed = batch(&mut controller, &token, vec![up.clone()]);
+    assert_eq!(failed["error"]["code"], "injection_failed");
+    assert_eq!(failed["cleanup_required"], true);
+    assert_eq!(controller.pressed.len(), 1);
+    assert_eq!(
+        controller.handle("other", acquire_operation(), now, &mut || Ok(()))["error"]["code"],
+        "input_busy"
+    );
+
+    controller.backend.fail_release = false;
+    controller.expire(now + Duration::from_millis(101));
+    assert!(controller.lease.is_none());
+    assert!(controller.pressed.is_empty());
+    let trace = controller.backend.trace.borrow();
+    let cleanup_up = moonlight_key(0x10, KeyState::Up, 0, false);
+    assert_eq!(
+        trace.as_slice(),
+        &[down, cleanup_up.clone(), cleanup_up.clone(), cleanup_up]
+    );
+    drop(trace);
+
+    let replacement = controller.handle("other", acquire_operation(), now, &mut || Ok(()));
+    assert_eq!(replacement["ok"], true);
+    assert_ne!(replacement["lease"], token);
+    assert_eq!(
+        controller.handle(
+            "owner",
+            Operation::Release { lease: token },
+            now,
+            &mut || Ok(()),
+        )["error"]["code"],
+        "permission_denied"
+    );
+}
+
+#[test]
+fn moonlight_modifier_aliases_share_ownership_and_native_encodings_cannot_mix() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let token = acquire(&mut controller, Instant::now());
+    let generic_shift = Event::Key {
+        key: Key::MoonlightVk {
+            code: 0x10,
+            normalized: true,
+            repeat_modifiers: 0,
+            temporary_modifier: false,
+        },
+        state: KeyState::Down,
+    };
+    let left_shift_up = Event::Key {
+        key: Key::MoonlightVk {
+            code: 0xa0,
+            normalized: true,
+            repeat_modifiers: 0,
+            temporary_modifier: false,
+        },
+        state: KeyState::Up,
+    };
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![generic_shift.clone(), left_shift_up.clone()]
+        )["ok"],
+        true
+    );
+    assert!(controller.pressed.is_empty());
+
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![generic_shift, key(42, KeyState::Up)]
+        )["error"]["code"],
+        "invalid_sequence"
+    );
+    assert!(controller.pressed.is_empty());
+}
+
+#[test]
+fn touch_as_mouse_status_does_not_claim_native_pen_touch_support() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            touch_as_mouse_max_contacts: Some(1),
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let response = controller.handle("owner", acquire_operation(), now, &mut || Ok(()));
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["native_pen_touch"], true); // Event-delivery gate.
+    assert_eq!(response["pen_touch_supported"], false); // No native device.
+    assert_eq!(response["touch_as_mouse_max_contacts"], 1);
+    let status = controller.status("owner", now);
+    assert_eq!(status["native_pen_touch"], true); // Gate, not capability.
+    assert_eq!(status["pen_touch_supported"], false);
+    assert_eq!(status["touch_as_mouse_max_contacts"], 1);
+    assert_eq!(status["lease"]["pen_touch_supported"], false);
+    assert_eq!(status["lease"]["touch_as_mouse_max_contacts"], 1);
+
+    let lease = response["lease"].as_str().unwrap();
+    assert_eq!(
+        batch(
+            &mut controller,
+            lease,
+            vec![pen_touch(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                1,
+                2
+            )]
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        batch(
+            &mut controller,
+            lease,
+            vec![pen_touch(
+                8,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                3,
+                4
+            )]
+        )["error"]["code"],
+        "resource_exhausted"
+    );
+    assert_eq!(
+        batch(
+            &mut controller,
+            lease,
+            vec![pen_touch(
+                PEN_POINTER_ID,
+                PenTouchDevice::Pen,
+                PenTouchPhase::Down,
+                1,
+                2,
+            )]
+        )["error"]["code"],
+        "unsupported_event"
+    );
+    assert_eq!(controller.backend.trace.borrow().len(), 1);
+}
+
+#[test]
+fn native_pen_touch_setting_is_only_the_event_gate_for_mouse_emulation() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            touch_as_mouse_max_contacts: Some(1),
+            ..Default::default()
+        },
+        true,
+    );
+    controller.set_native_pen_touch(false);
+    let token = acquire(&mut controller, Instant::now());
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![pen_touch(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                1,
+                2
+            )]
+        )["ok"],
+        true
+    );
+    assert!(controller.backend.trace.borrow().is_empty());
+    assert_eq!(
+        controller.status("owner", Instant::now())["pen_touch_supported"],
+        false
+    );
+    assert_eq!(
+        controller.status("owner", Instant::now())["native_pen_touch"],
+        false
+    );
+    assert_eq!(
+        controller.status("owner", Instant::now())["touch_as_mouse_max_contacts"],
+        1
+    );
+}
+
+#[test]
+fn touch_as_mouse_still_requires_the_existing_mouse_device_policy() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            touch_as_mouse_max_contacts: Some(1),
+            ..Default::default()
+        },
+        true,
+    );
+    controller
+        .set_device_policy(
+            DevicePolicy {
+                keyboard: true,
+                mouse: false,
+            },
+            Instant::now(),
+        )
+        .unwrap();
+    let token = acquire(&mut controller, Instant::now());
+
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![pen_touch(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                1,
+                2
+            )]
+        )["ok"],
+        true
+    );
+    assert!(controller.backend.trace.borrow().is_empty());
 }

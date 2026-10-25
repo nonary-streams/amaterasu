@@ -1,5 +1,5 @@
 //! Local-only publisher tooling. Generated keys are not production release identities.
-use amaterasu_contracts::{Grants, RuntimeConfig};
+use amaterasu_contracts::Grants;
 use amaterasu_package::{
     ActivationState, BootstrapConfig, ComponentManifest, PackageResult, ReleaseManifest,
     ReleaseSignature, RootLock, VerificationPolicy, create_machine_private_directory,
@@ -11,12 +11,14 @@ use amaterasu_storage::write_atomically;
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::c_void;
 
 use crate::profiles::linux_session::{
     apply_management_bind, linux_session_policy, options::LinuxSessionOptions,
 };
 use crate::profiles::{
-    ComponentDefinition, PackageProfile, RUNTIME_ID, development_policy, installer_policy,
+    ComponentDefinition, PackageProfile, RUNTIME_ID, desktop_stream_smoke_policy,
+    development_policy, installer_policy,
 };
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -29,6 +31,8 @@ const PROVISION_JOURNAL: &str = ".installer-provision.json";
 const POLICY_TRANSITION_JOURNAL: &str = ".installer-policy-transition.json";
 const POLICY_TRANSITION_BACKUPS: &str = "installer-policy-backups";
 const MAX_TRANSITION_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const X264_BUILD_MARKER: &[u8] = b"AMATERASU_X264_BUILD=";
+const FFMPEG_ABI_MARKER: &[u8] = b"AMATERASU_FFMPEG_ABI=";
 const TLS_BIND_ENV: &str = "AMATERASU_MANAGEMENT_TLS_BIND";
 const TLS_CERT_ENV: &str = "AMATERASU_MANAGEMENT_TLS_CERTIFICATE_PATH";
 const TLS_KEY_ENV: &str = "AMATERASU_MANAGEMENT_TLS_PRIVATE_KEY_PATH";
@@ -180,25 +184,24 @@ fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
 }
 
 pub fn initialize(root: &Path) -> PackageResult<()> {
-    initialize_root(root, development_policy, |_| {})
+    initialize_profile(root, DevelopmentProfile::Standard)
 }
 
-/// Initialises a development root whose policy is the Linux session profile.
-/// The policy lives in the root's `bootstrap.json`, so the profile options are
-/// fixed here and a later `pack-linux-session` only supplies signed libraries.
+pub fn initialize_desktop_stream_smoke(root: &Path, allow_remote: bool) -> PackageResult<()> {
+    initialize_profile(root, DevelopmentProfile::DesktopStreamSmoke(allow_remote))
+}
+
 pub fn initialize_linux_session(root: &Path, options: &LinuxSessionOptions) -> PackageResult<()> {
-    initialize_root(
-        root,
-        |root| linux_session_policy(root, options),
-        |management| apply_management_bind(management, options.management_port),
-    )
+    initialize_profile(root, DevelopmentProfile::LinuxSession(options))
 }
 
-fn initialize_root(
-    root: &Path,
-    policy: impl FnOnce(&Path) -> PackageResult<RuntimeConfig>,
-    configure_management: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
-) -> PackageResult<()> {
+enum DevelopmentProfile<'a> {
+    Standard,
+    DesktopStreamSmoke(bool),
+    LinuxSession(&'a LinuxSessionOptions),
+}
+
+fn initialize_profile(root: &Path, profile: DevelopmentProfile<'_>) -> PackageResult<()> {
     let tls = InstallerTls::from_environment()?;
     if root.join("bootstrap.json").exists() || root.join("development-key.json").exists() {
         return Err(
@@ -218,7 +221,13 @@ fn initialize_root(
             DEVELOPMENT_KEY_ID.into(),
             encode_hex(signing_key.verifying_key().as_bytes()),
         )]),
-        policy: policy(root)?,
+        policy: match &profile {
+            DevelopmentProfile::Standard => development_policy(root)?,
+            DevelopmentProfile::DesktopStreamSmoke(allow_remote) => {
+                desktop_stream_smoke_policy(root, *allow_remote)?
+            }
+            DevelopmentProfile::LinuxSession(options) => linux_session_policy(root, options)?,
+        },
     };
     let web_directory = root.join("web");
     create_private_directory(&web_directory)?;
@@ -226,14 +235,15 @@ fn initialize_root(
         "enabled": false,
         "web": {"directory": web_directory.canonicalize().map_err(|error| error.to_string())?, "trusted_keys": bootstrap.trusted_keys}
     }));
-    configure_management(
-        bootstrap
+    if let DevelopmentProfile::LinuxSession(options) = &profile {
+        let management = bootstrap
             .policy
             .settings
             .get_mut("amaterasu.management")
             .and_then(serde_json::Value::as_object_mut)
-            .ok_or("development bootstrap lacks management settings")?,
-    );
+            .ok_or("development bootstrap lacks management settings")?;
+        apply_management_bind(management, options.management_port);
+    }
     if let Some(tls) = &tls {
         let state_root = root.join("data/state");
         create_private_directory(&state_root)?;
@@ -2111,6 +2121,127 @@ mod provision_tests {
         assert_eq!(sets, 1);
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn linux_x264_preflight_rejects_encoder_without_compiled_feature() {
+        assert!(
+            validate_linux_x264_inputs(b"feature-disabled encoder", |_| true)
+                .unwrap_err()
+                .contains("lacks an embedded software-x264 ABI marker")
+        );
+    }
+
+    #[test]
+    fn linux_x264_preflight_rejects_missing_or_incompatible_system_runtime() {
+        let error = validate_linux_x264_inputs(b"AMATERASU_X264_BUILD=164\0", |build| {
+            assert_eq!(build, 164);
+            false
+        })
+        .unwrap_err();
+        assert!(error.contains("required system x264 runtime for build 164"));
+    }
+
+    #[test]
+    fn optional_ffmpeg_abi_preflight_checks_only_marked_encoder_artifacts() {
+        assert_eq!(
+            validate_optional_linux_ffmpeg_inputs(b"x264-only artifact", |_, _| panic!(
+                "unmarked artifact must not require FFmpeg"
+            ))
+            .unwrap(),
+            None
+        );
+        let marked = b"AMATERASU_FFMPEG_ABI=63,61\0";
+        assert_eq!(
+            validate_optional_linux_ffmpeg_inputs(marked, |avcodec, avutil| {
+                avcodec == 63 && avutil == 61
+            })
+            .unwrap(),
+            Some((63, 61))
+        );
+        assert!(
+            validate_optional_linux_ffmpeg_inputs(marked, |_, _| false)
+                .unwrap_err()
+                .contains("required system FFmpeg runtime")
+        );
+    }
+
+    #[test]
+    fn malformed_or_duplicate_ffmpeg_abi_markers_fail_closed() {
+        for artifact in [
+            b"AMATERASU_FFMPEG_ABI=63,\0".as_slice(),
+            b"AMATERASU_FFMPEG_ABI=0,61\0".as_slice(),
+            b"AMATERASU_FFMPEG_ABI=63,61,1\0".as_slice(),
+            b"AMATERASU_FFMPEG_ABI=63,61".as_slice(),
+            b"AMATERASU_FFMPEG_ABI=63,61\0AMATERASU_FFMPEG_ABI=63,61\0".as_slice(),
+        ] {
+            assert!(embedded_ffmpeg_abi(artifact).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_desktop_x264_preflight_fails_before_package_directory_is_created() {
+        let root = fixture("linux-x264-preflight");
+        let artifacts = root.join("artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"software-x264 feature absent",
+        )
+        .unwrap();
+        let output = root.join("package");
+        let signing_key = SigningKey::from_bytes(&[19; 32]);
+
+        let error = build_signed_package(
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSession,
+            &signing_key,
+            DEVELOPMENT_KEY_ID,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("lacks an embedded software-x264 ABI marker"));
+        assert!(
+            !output.exists(),
+            "failed preflight must not stage a package"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_x264_runtime_fails_before_signed_desktop_package_is_staged() {
+        let root = fixture("linux-x264-runtime-missing");
+        let artifacts = root.join("artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"AMATERASU_X264_BUILD=164\0",
+        )
+        .unwrap();
+        let output = root.join("package");
+        let signing_key = SigningKey::from_bytes(&[20; 32]);
+
+        let error = build_signed_package_with_runtime_probe(
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSession,
+            &signing_key,
+            DEVELOPMENT_KEY_ID,
+            |build| build == 0,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("required system x264 runtime for build 164"));
+        assert!(
+            !output.exists(),
+            "failed preflight must not stage a package"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 fn build_signed_package(
@@ -2121,9 +2252,32 @@ fn build_signed_package(
     signing_key: &SigningKey,
     key_id: &str,
 ) -> PackageResult<()> {
+    build_signed_package_with_runtime_probe(
+        artifacts,
+        output,
+        sequence,
+        profile,
+        signing_key,
+        key_id,
+        x264_runtime_available,
+    )
+}
+
+fn build_signed_package_with_runtime_probe(
+    artifacts: &Path,
+    output: &Path,
+    sequence: u64,
+    profile: PackageProfile,
+    signing_key: &SigningKey,
+    key_id: &str,
+    runtime_available: impl FnOnce(u32) -> bool,
+) -> PackageResult<()> {
     if output.try_exists().map_err(|error| error.to_string())? {
         return Err("package output already exists; use a new directory for each release".into());
     }
+    let linux_x264_encoder = matches!(profile, PackageProfile::LinuxSession)
+        .then(|| preflight_linux_x264(artifacts, runtime_available))
+        .transpose()?;
     create_private_directory(output)?;
 
     let mut components = Vec::new();
@@ -2133,7 +2287,16 @@ fn build_signed_package(
         } else {
             "0.1.0".to_owned()
         };
-        components.push(copy_component(artifacts, output, definition, &version)?);
+        let component = if definition.id == "amaterasu.encode" {
+            if let Some(encoder) = linux_x264_encoder.as_deref() {
+                copy_component_bytes(output, definition, &version, encoder)?
+            } else {
+                copy_component(artifacts, output, definition, &version)?
+            }
+        } else {
+            copy_component(artifacts, output, definition, &version)?
+        };
+        components.push(component);
     }
 
     let manifest = ReleaseManifest {
@@ -2155,21 +2318,240 @@ fn build_signed_package(
     sign_manifest_with_key(output, &manifest, signing_key, key_id)
 }
 
+/// A Linux Desktop package must be built from the x264-enabled encoder and a
+/// host with the matching system runtime. The ABI version is read from a
+/// marker embedded in the exact encoder artifact this function later signs.
+fn preflight_linux_x264(
+    artifacts: &Path,
+    runtime_available: impl FnOnce(u32) -> bool,
+) -> PackageResult<Vec<u8>> {
+    if !cfg!(target_os = "linux") {
+        return Err("Linux Desktop packages must be staged on a Linux build host".into());
+    }
+    let encoder = read_bounded(
+        &artifacts.join(library_filename("amaterasu_encode")),
+        256 * 1024 * 1024,
+    )?;
+    validate_linux_x264_inputs(&encoder, runtime_available)?;
+    validate_optional_linux_ffmpeg_inputs(&encoder, ffmpeg_runtime_available)?;
+    let video = artifacts.join(library_filename("amaterasu_video"));
+    if video.is_file() {
+        crate::linux_video_runtime::validate(&read_bounded(&video, 256 * 1024 * 1024)?)?;
+    }
+    Ok(encoder)
+}
+
+fn validate_optional_linux_ffmpeg_inputs(
+    encoder: &[u8],
+    runtime_available: impl FnOnce(u32, u32) -> bool,
+) -> PackageResult<Option<(u32, u32)>> {
+    let Some((avcodec, avutil)) = embedded_ffmpeg_abi(encoder)? else {
+        return Ok(None);
+    };
+    if !runtime_available(avcodec, avutil) {
+        return Err(format!(
+            "required system FFmpeg runtime for avcodec {avcodec} and avutil {avutil} is unavailable or incompatible"
+        ));
+    }
+    Ok(Some((avcodec, avutil)))
+}
+
+pub(crate) fn embedded_ffmpeg_abi(encoder: &[u8]) -> PackageResult<Option<(u32, u32)>> {
+    let offsets = encoder
+        .windows(FFMPEG_ABI_MARKER.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == FFMPEG_ABI_MARKER).then_some(offset))
+        .collect::<Vec<_>>();
+    let [offset] = offsets.as_slice() else {
+        return if offsets.is_empty() {
+            Ok(None)
+        } else {
+            Err("encoder has duplicate FFmpeg ABI markers".into())
+        };
+    };
+    let suffix = &encoder[*offset + FFMPEG_ABI_MARKER.len()..];
+    let end = suffix
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or("encoder FFmpeg ABI marker is unterminated")?;
+    if end == 0 || end > 24 {
+        return Err("encoder FFmpeg ABI marker is malformed".into());
+    }
+    let marker = std::str::from_utf8(&suffix[..end])
+        .map_err(|_| "encoder FFmpeg ABI marker is malformed")?;
+    let (avcodec, avutil) = marker
+        .split_once(',')
+        .ok_or("encoder FFmpeg ABI marker is malformed")?;
+    let parse_major = |value: &str| -> PackageResult<u32> {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("encoder FFmpeg ABI marker is malformed".into());
+        }
+        value
+            .parse::<u32>()
+            .ok()
+            .filter(|major| *major > 0)
+            .ok_or_else(|| "encoder FFmpeg ABI marker is malformed".into())
+    };
+    Ok(Some((parse_major(avcodec)?, parse_major(avutil)?)))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn ffmpeg_runtime_available(avcodec: u32, avutil: u32) -> bool {
+    let required = [
+        (
+            format!("libavcodec.so.{avcodec}"),
+            &[
+                "avcodec_find_encoder_by_name",
+                "avcodec_alloc_context3",
+                "avcodec_open2",
+                "avcodec_send_frame",
+                "avcodec_receive_packet",
+                "avcodec_free_context",
+                "av_packet_alloc",
+                "av_packet_unref",
+                "av_packet_free",
+            ][..],
+        ),
+        (
+            format!("libavutil.so.{avutil}"),
+            &[
+                "av_frame_alloc",
+                "av_frame_free",
+                "av_frame_get_buffer",
+                "av_frame_make_writable",
+                "av_dict_set",
+                "av_dict_free",
+            ][..],
+        ),
+    ];
+    required.into_iter().all(|(name, symbols)| {
+        // SAFETY: names contain only bounded positive ABI majors from the
+        // signed encoder artifact. Only system loader candidates are opened;
+        // retrieved pointers are checked for presence and never called.
+        let Ok(library) = (unsafe { libloading::Library::new(name) }) else {
+            return false;
+        };
+        symbols.iter().all(|symbol| {
+            // SAFETY: symbol lookup checks presence only; the pointer is not called.
+            unsafe { library.get::<*mut c_void>(symbol.as_bytes()).is_ok() }
+        })
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn ffmpeg_runtime_available(_: u32, _: u32) -> bool {
+    false
+}
+
+fn validate_linux_x264_inputs(
+    encoder: &[u8],
+    runtime_available: impl FnOnce(u32) -> bool,
+) -> PackageResult<()> {
+    let build = embedded_x264_build(encoder)
+        .ok_or("Linux Desktop encoder artifact lacks an embedded software-x264 ABI marker")?;
+    if !runtime_available(build) {
+        return Err(format!(
+            "required system x264 runtime for build {} is unavailable or incompatible",
+            build
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn embedded_x264_build(encoder: &[u8]) -> Option<u32> {
+    let offsets = encoder
+        .windows(X264_BUILD_MARKER.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == X264_BUILD_MARKER).then_some(offset))
+        .collect::<Vec<_>>();
+    let [offset] = offsets.as_slice() else {
+        return None;
+    };
+    let digits = encoder[*offset + X264_BUILD_MARKER.len()..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .copied()
+        .collect::<Vec<_>>();
+    if digits.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(&digits)
+        .ok()?
+        .parse::<u32>()
+        .ok()
+        .filter(|build| *build > 0)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn x264_runtime_available(build: u32) -> bool {
+    let library_names = [format!("libx264.so.{build}"), "libx264.so".into()];
+    for name in library_names {
+        // SAFETY: candidates are fixed system loader names derived from the
+        // embedded x264 ABI marker; no user path or package artifact is loaded.
+        let Ok(library) = (unsafe { libloading::Library::new(name) }) else {
+            continue;
+        };
+        let symbols = [
+            "x264_param_default_preset",
+            "x264_param_apply_profile",
+            "x264_param_cleanup",
+            "x264_picture_init",
+            "x264_encoder_close",
+            "x264_encoder_encode",
+            "x264_encoder_delayed_frames",
+            "x264_encoder_maximum_delayed_frames",
+            "x264_encoder_parameters",
+        ];
+        let symbols_available = symbols.iter().all(|symbol| {
+            // SAFETY: symbol lookup checks presence only; the pointers are not called.
+            unsafe { library.get::<*mut c_void>(symbol.as_bytes()).is_ok() }
+        });
+        let versioned_open = format!("x264_encoder_open_{build}");
+        // SAFETY: symbol lookup checks presence only; the pointer is not called.
+        let open_available = unsafe {
+            library
+                .get::<*mut c_void>(versioned_open.as_bytes())
+                .is_ok()
+        };
+        if symbols_available && open_available {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn x264_runtime_available(_: u32) -> bool {
+    false
+}
+
 fn copy_component(
     artifacts: &Path,
     output: &Path,
     definition: &ComponentDefinition,
     version: &str,
 ) -> PackageResult<ComponentManifest> {
+    let bytes = read_bounded(
+        &artifacts.join(library_filename(definition.library)),
+        256 * 1024 * 1024,
+    )?;
+    copy_component_bytes(output, definition, version, &bytes)
+}
+
+fn copy_component_bytes(
+    output: &Path,
+    definition: &ComponentDefinition,
+    version: &str,
+    bytes: &[u8],
+) -> PackageResult<ComponentManifest> {
     let filename = library_filename(definition.library);
-    let bytes = read_bounded(&artifacts.join(&filename), 256 * 1024 * 1024)?;
-    fs::write(output.join(&filename), &bytes).map_err(|error| error.to_string())?;
+    fs::write(output.join(&filename), bytes).map_err(|error| error.to_string())?;
 
     Ok(ComponentManifest {
         id: definition.id.into(),
         version: version.into(),
         file: filename,
-        sha256: sha256(&bytes),
+        sha256: sha256(bytes),
         size: bytes.len() as u64,
         abi_major: amaterasu_abi::ABI_MAJOR,
         runtime: definition.id == RUNTIME_ID,

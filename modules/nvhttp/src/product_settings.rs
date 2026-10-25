@@ -36,6 +36,11 @@ const GLOBAL_RAW_PREPARATION_SETTINGS_VERSION: u64 = 17;
 const FRAME_LIMITER_SETTINGS_VERSION: u64 = 17;
 const ENCRYPTION_MODE_SETTINGS_VERSION: u64 = 17;
 const DISPLAY_POLICY_SETTINGS_VERSION: u64 = 18;
+// The Linux Desktop profile requests video encryption. The default LAN policy
+// permits that choice while still allowing other profiles to negotiate it.
+#[cfg(target_os = "linux")]
+const DEFAULT_LAN_ENCRYPTION_MODE: u8 = 1;
+#[cfg(not(target_os = "linux"))]
 const DEFAULT_LAN_ENCRYPTION_MODE: u8 = 0;
 const DEFAULT_WAN_ENCRYPTION_MODE: u8 = 1;
 const SOFTWARE_ENCODER_SETTINGS_VERSION: u64 = 19;
@@ -4101,6 +4106,22 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn new_linux_host_supports_automatic_video_encryption() {
+        use amaterasu_gamestream::network::{NetworkEncryptionPolicy, VideoEncryptionMode};
+
+        let settings = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        let policy = NetworkEncryptionPolicy {
+            lan_mode: VideoEncryptionMode::try_from(i64::from(settings.lan_encryption_mode()))
+                .unwrap(),
+            wan_mode: VideoEncryptionMode::try_from(i64::from(settings.wan_encryption_mode()))
+                .unwrap(),
+        };
+        assert!(policy.accepts_video_encryption_for_peer("192.168.0.134".parse().unwrap(), true));
+        assert!(policy.accepts_video_encryption_for_peer("192.168.0.134".parse().unwrap(), false));
+    }
+
     fn v17_update_confirmation(mut payload: Value) -> Value {
         payload["version"] = json!(SETTINGS_VERSION);
         let values = payload["values"]
@@ -4396,7 +4417,9 @@ mod tests {
                     encoder: amaterasu_module_sdk::EncoderSelection::Index(0),
                     audio_endpoint: audio_endpoint.into(),
                 },
+                desktop: crate::launch::DesktopSettings::default(),
                 profile: crate::launch::StreamProfile {
+                    codec: amaterasu_media::VideoCodec::H264,
                     max_width: 1920,
                     max_height: 1080,
                     max_fps: 60,
@@ -5735,6 +5758,20 @@ mod tests {
     }
 
     #[test]
+    fn automatic_capture_reports_pipewire_bootstrap_provider() {
+        let mut bootstrap = bootstrap_with_capture_output("portal-selected-session-source");
+        bootstrap
+            .streaming
+            .as_mut()
+            .expect("test streaming config")
+            .capture
+            .capture_provider = crate::launch::CaptureProvider::PipeWire;
+        let settings = ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
+
+        assert_eq!(settings.capture_provider(), Some("pipewire"));
+    }
+
+    #[test]
     fn v4_output_selection_survives_restart_and_null_uses_bootstrap_output() {
         let bootstrap = bootstrap_with_capture_output("bootstrap-display-id");
         let selected_document = json!({
@@ -6485,8 +6522,8 @@ mod tests {
                     "display_policy_revision":3,
                 }),
                 json!({
-                    "lan_encryption_mode":0,
-                    "wan_encryption_mode":1,
+                    "lan_encryption_mode":DEFAULT_LAN_ENCRYPTION_MODE,
+                    "wan_encryption_mode":DEFAULT_WAN_ENCRYPTION_MODE,
                     "audio_sink_capture_only":false,
                     "configured_external_ip":null,
                 }),

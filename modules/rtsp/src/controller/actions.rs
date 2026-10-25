@@ -91,6 +91,18 @@ impl Controller {
             deadline,
             display_preflight_deadline,
         } = input;
+        if !self.startup_recovery.ready() {
+            rpc::complete(
+                runtime,
+                request,
+                error(if self.startup_recovery.blocked() {
+                    self.startup_recovery.blocked_code()
+                } else {
+                    "startup_reconciliation_pending"
+                }),
+            );
+            return;
+        }
         if !self.settings.enabled {
             rpc::complete(runtime, request, error("disabled"));
             return;
@@ -230,6 +242,8 @@ impl Controller {
             negotiated_slices_per_frame: None,
             negotiated_video_stream_format: None,
             client_feature_flags: None,
+            negotiated_color: None,
+            negotiated_video: None,
             url,
             session_token,
             udp_discovery,
@@ -238,6 +252,8 @@ impl Controller {
             next_status: expires,
             failure: None,
             cleanup_error: None,
+            cleanup_retry_count: 0,
+            cleanup_retry_at: None,
             uncertain: None,
             uncertain_phase: None,
             needs_lookup: true,

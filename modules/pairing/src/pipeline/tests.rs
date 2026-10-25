@@ -184,13 +184,15 @@ impl Harness {
         time: u64,
     ) -> Value {
         self.enqueue(caller, payload);
-        for _ in 0..5 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
             pipeline
                 .tick_at(time, |command| self.send(command))
                 .unwrap();
             if let Some(output) = self.output.take() {
                 return output;
             }
+            std::thread::sleep(Duration::from_millis(1));
         }
         panic!("pairing request stalled")
     }
@@ -569,6 +571,32 @@ fn generated_host_identity_is_self_signed_and_matches_its_private_key() {
             &Signature::try_from(certificate.signature.as_bytes().unwrap()).unwrap(),
         )
         .unwrap();
+}
+
+#[test]
+fn initialize_validates_generated_identity_after_key_generation() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    let request_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(60);
+
+    let response = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"initialize"}),
+        request_time,
+    );
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(state.writes, 1);
+    let persisted: Document = serde_json::from_value(state.document.unwrap()).unwrap();
+    let current = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(persisted.validate(current).is_ok());
 }
 
 #[test]
@@ -1464,13 +1492,15 @@ impl HostConfigurationHarness {
         time: u64,
     ) -> Value {
         self.enqueue(caller, payload);
-        for _ in 0..12 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
             pipeline
                 .tick_at(time, |command| self.send(command))
                 .unwrap();
             if let Some(output) = self.output.take() {
                 return output;
             }
+            std::thread::sleep(Duration::from_millis(1));
         }
         panic!("configured pairing request stalled")
     }
@@ -2726,4 +2756,263 @@ fn presented_client_unpair_rejects_malformed_and_oversized_certificates() {
         check_client(&mut state, &mut pipeline, CLIENT_CERT)["paired"],
         1
     );
+}
+
+/// Releases a deliberately blocked worker even if an assertion fails, so a
+/// teardown regression reports a failure instead of leaving a native thread.
+struct DelayedIdentityWork {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    started: std::sync::mpsc::Receiver<()>,
+}
+
+impl DelayedIdentityWork {
+    fn generator<T: Send + 'static>(
+        result: impl FnOnce() -> Result<T, &'static str> + Send + 'static,
+    ) -> (Self, Generator<T>) {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, started_wait) = std::sync::mpsc::channel();
+        let generator = Box::new(move || {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+            result()
+        });
+        (
+            Self {
+                release: Some(release),
+                started: started_wait,
+            },
+            generator,
+        )
+    }
+
+    fn wait_started(&self) {
+        self.started.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    fn finish(&mut self) {
+        self.release.take().unwrap().send(()).unwrap();
+    }
+}
+
+impl Drop for DelayedIdentityWork {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+fn generated_fixture() -> Result<Identity, &'static str> {
+    Ok(Identity {
+        host_id: "00000000-0000-4000-8000-000000000002".into(),
+        certificate_pem: HOST_CERT.into(),
+        private_key_pem: HOST_KEY.into(),
+    })
+}
+
+fn start_delayed_initialization(
+    pipeline: &mut Pipeline,
+    state: &mut Harness,
+) -> DelayedIdentityWork {
+    let (delay, generator) = DelayedIdentityWork::generator(generated_fixture);
+    pipeline.identity_generator = Some(generator);
+    state.enqueue("console", json!({"action":"initialize"}));
+    for _ in 0..2 {
+        pipeline
+            .tick_at(now(), |command| state.send(command))
+            .unwrap();
+    }
+    delay.wait_started();
+    assert!(pipeline.identity_generation.is_some());
+    delay
+}
+
+fn drain_identity_work(pipeline: &mut Pipeline, state: &mut Harness) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pipeline.identity_generation.is_some() && Instant::now() < deadline {
+        pipeline
+            .tick_at(now(), |command| state.send(command))
+            .unwrap();
+        std::thread::yield_now();
+    }
+    assert!(pipeline.identity_generation.is_none());
+}
+
+#[test]
+fn pending_identity_generation_leaves_host_ticks_and_configuration_work_responsive() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    let mut delay = start_delayed_initialization(&mut pipeline, &mut state);
+    let started = Instant::now();
+    let mut configuration_requests_completed = 0;
+    for _ in 0..20 {
+        pipeline
+            .tick_at(now(), |command| state.send(command))
+            .unwrap();
+        // The host executes other modules on this same scheduler thread. Work
+        // after pairing's tick must progress before the generator is released.
+        configuration_requests_completed += 1;
+    }
+    assert_eq!(configuration_requests_completed, 20);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(state.output.is_none());
+    assert_eq!(state.writes, 0);
+    assert!(pipeline.identity.get(now()).is_err());
+    delay.finish();
+    drain_identity_work(&mut pipeline, &mut state);
+    assert_eq!(state.writes, 1);
+    assert!(
+        pipeline.identity.get(now()).is_err(),
+        "save has not acknowledged yet"
+    );
+    pipeline
+        .tick_at(now(), |command| state.send(command))
+        .unwrap();
+    assert_eq!(state.output.as_ref().unwrap()["ok"], true);
+    assert!(pipeline.identity.get(now()).is_ok());
+}
+
+#[test]
+fn cancellation_and_deadline_discard_generated_identity_and_keep_one_owned_worker() {
+    for deadline_ended in [false, true] {
+        let mut state = Harness::new();
+        let mut pipeline = Pipeline::new(settings());
+        let mut delay = start_delayed_initialization(&mut pipeline, &mut state);
+        if deadline_ended {
+            pipeline
+                .identity_generation
+                .as_mut()
+                .unwrap()
+                .initialization
+                .as_mut()
+                .unwrap()
+                .request
+                .deadline = Instant::now();
+        } else {
+            state.check_cancelled = true;
+        }
+        pipeline
+            .tick_at(now(), |command| state.send(command))
+            .unwrap();
+        assert_eq!(
+            state.output.as_ref().unwrap()["code"],
+            if deadline_ended {
+                "deadline_exceeded"
+            } else {
+                "request_ended"
+            }
+        );
+        assert!(
+            pipeline
+                .identity_generation
+                .as_ref()
+                .unwrap()
+                .initialization
+                .is_none()
+        );
+        state.enqueue("console", json!({"action":"initialize"}));
+        pipeline
+            .tick_at(now(), |command| state.send(command))
+            .unwrap();
+        assert_eq!(
+            state.output.as_ref().unwrap()["code"],
+            "identity_generation_busy"
+        );
+        delay.finish();
+        drain_identity_work(&mut pipeline, &mut state);
+        assert_eq!(state.writes, 0);
+        assert!(state.document.is_none());
+        assert!(pipeline.identity.get(now()).is_err());
+    }
+}
+
+#[test]
+fn pipeline_teardown_joins_the_owned_identity_worker() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    let mut delay = start_delayed_initialization(&mut pipeline, &mut state);
+    let (dropping, dropping_wait) = std::sync::mpsc::channel();
+    let (dropped, dropped_wait) = std::sync::mpsc::channel();
+    let teardown = std::thread::spawn(move || {
+        dropping.send(()).unwrap();
+        drop(pipeline);
+        dropped.send(()).unwrap();
+    });
+    dropping_wait.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(
+        dropped_wait
+            .recv_timeout(Duration::from_millis(50))
+            .is_err()
+    );
+    delay.finish();
+    dropped_wait.recv_timeout(Duration::from_secs(2)).unwrap();
+    teardown.join().unwrap();
+    assert_eq!(state.writes, 0);
+}
+
+#[test]
+fn missing_configured_identity_provisioning_yields_ticks_and_invalidates_stale_tls() {
+    let (directory, effective) = configured_fixture_files();
+    let mut harness = HostConfigurationHarness::new(effective.clone());
+    harness.state_document = Some(stored_document_with_fixture_identity(json!([])));
+    let mut pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+    let time = now();
+    assert_eq!(
+        harness.request(&mut pipeline, "console", json!({"action":"identity"}), time)["ok"],
+        true
+    );
+    assert!(pipeline.identity.get(time).is_ok());
+    fs::remove_file(effective["cert"].as_str().unwrap()).unwrap();
+    fs::remove_file(effective["pkey"].as_str().unwrap()).unwrap();
+    let (mut delay, loader) = DelayedIdentityWork::generator(move || {
+        ConfiguredIdentity::load(
+            effective["cert"].as_str().unwrap(),
+            effective["pkey"].as_str().unwrap(),
+            4,
+            time,
+        )
+    });
+    pipeline.configured_identity_loader = Some(loader);
+    let refresh_time = time + HOST_CONFIGURATION_REFRESH_SECONDS;
+    for _ in 0..3 {
+        pipeline
+            .tick_at(refresh_time, |command| harness.send(command))
+            .unwrap();
+    }
+    delay.wait_started();
+    assert!(matches!(
+        pipeline.host_configuration,
+        HostConfigurationState::LoadingIdentity(_)
+    ));
+    assert!(pipeline.identity.get(refresh_time).is_err());
+    let started = Instant::now();
+    for _ in 0..20 {
+        pipeline
+            .tick_at(refresh_time, |command| harness.send(command))
+            .unwrap();
+    }
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(matches!(
+        pipeline.host_configuration,
+        HostConfigurationState::LoadingIdentity(_)
+    ));
+    delay.finish();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while matches!(
+        pipeline.host_configuration,
+        HostConfigurationState::LoadingIdentity(_)
+    ) && Instant::now() < deadline
+    {
+        pipeline
+            .tick_at(refresh_time, |command| harness.send(command))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(matches!(
+        pipeline.host_configuration,
+        HostConfigurationState::Ready { .. }
+    ));
+    assert_eq!(harness.state_writes, 0);
+    fs::remove_dir_all(directory).unwrap();
 }

@@ -174,6 +174,7 @@ owner field:
       "encoder": 0,
       "audio_endpoint": "default"
     },
+    "desktop": { "enabled": false },
     "profile": {
       "max_width": 1920,
       "max_height": 1080,
@@ -194,11 +195,38 @@ owner field:
 }
 ```
 
-Unknown or missing nested fields fail startup. Maximum dimensions must be even and
+The optional `streaming.desktop.enabled` flag defaults to `false`. When enabled,
+NVHTTP advertises a `Desktop` app with reserved Moonlight ID `2147483647`; a catalog
+collision fails the app-list request. Desktop launch, resume, and cancellation still
+require the paired TLS client and use the normal RTSP session path without a catalog
+entry or application process. Resume retires the existing RTSP ticket and opens a
+fresh ticket for that same paired client.
+
+Unknown or missing required nested fields fail startup. Maximum dimensions must be even and
 within 16–3840 by 16–2160; maximum FPS is 1–120. Bitrate, audio, packet duration,
 and reference-frame bounds are validated before listeners start. Video FEC and
 packetization settings are additionally checked by the same packetizer used for
 the stream.
+
+### Video codecs
+
+The profile does not choose a codec. NVHTTP enumerates `amaterasu.encode/1` at
+startup and then every five minutes while no stream is active, retrying failures
+with backoff and keeping the last good snapshot. From each encoder entry it reads
+only `codec` (`"h264"`, `"hevc"` or `"av1"`; other values are kept for numeric
+indexing but never offered) and `hardware`. At `/launch` it fixes the codecs that
+launch may negotiate: with `"encoder":"auto"` every codec that has an encoder, and
+with a numeric `encoder` only the codec of that enumerated entry. A codec whose only
+encoders are software is offered only when the requested mode is at most 1920x1080
+at 60 FPS, and such an offer also limits RTSP negotiation to that mode. A launch
+for which no codec qualifies is refused with HTTP 503 before any application,
+display, or RTSP effect: `no hardware encoder for this stream mode`, `no video
+encoder is available`, or, before the first enumeration completes for a mode above
+the software limit, `encoder capabilities are not known yet`. Until that first
+enumeration completes the host offers H.264 only. RTSP receives the offer as
+`profile.codecs` (omitted when it is H.264 alone) and the client picks one in
+ANNOUNCE. The legacy `profile.codec` field is still accepted but no longer has any
+effect.
 
 ## Global capture output
 
@@ -397,37 +425,28 @@ BMP noncharacters U+FFFE/U+FFFF and controls.
   rejected. moonlight-qt calls only the plaintext form, to clean up failed pairings
   (`nvpairingmanager.cpp:248-366`); a pairing transcript that the client abandoned
   therefore expires on its own after 120 seconds.
-- `/resume` requires trusted paired TLS and returns an explicit 501 (untrusted
-  callers get 401). It is not implemented, and is not faked by replaying a fresh
-  launch. See the audit table for why this matters to reconnecting clients.
+- `/resume` requires trusted paired TLS and complete launch metadata. It resumes
+  an enabled Desktop session owned by that certificate by retiring its RTSP session
+  and opening a fresh encrypted ticket. Catalog application resume remains unsupported.
 
 Without streaming configuration, server info advertises `appversion=7.1.0.0` and
-`StreamingSupported=0`. Configured streaming advertises `appversion=7.1.431.0` and
-`StreamingSupported=1`. Both report accepted startup policy, not a runtime probe.
+`StreamingSupported=0`. Configured Linux streaming advertises
+`appversion=7.1.431.-1` so Moonlight enables the Sunshine-compatible RTSP
+encryption exchange; Windows retains `7.1.431.0`. Configured streaming advertises
+`StreamingSupported=1`. This reports accepted startup policy; it is not a runtime
+GPU or capture probe. `ServerCodecModeSupport` is derived from the encoder
+snapshot: `SCM_H264` (0x1) always, `SCM_HEVC` (0x100) when an HEVC encoder is
+enumerated, and `SCM_AV1_MAIN8` (0x10000) when an AV1 encoder is. 10-bit and 4:4:4
+modes are never advertised. `MaxLumaPixelsHEVC` is `1869449984` with an HEVC
+encoder and `0` otherwise; Moonlight treats any nonzero value as HEVC support.
+Other unavailable hardware and HDR fields remain zero.
 
-`ServerCodecModeSupport` is never zero: moonlight-qt passes it through unchanged and
-moonlight-common-c `LiStartConnection` aborts when it is zero (`Connection.c:228-233`),
-so the H.264 bit (`0x1`) is always advertised, also when streaming is unsupported or the
-capability query fails. The remaining bits come from a cached snapshot of
-`amaterasu.encode/1` `enumerate` (contract C3):
-
-- The router refreshes the snapshot from its poll loop every 30 seconds while streaming
-  is configured. `/serverinfo` only reads the cache and never waits for the encoder.
-- `SCM_HEVC` (`0x100`) and a nonzero `MaxLumaPixelsHEVC` (the conventional
-  `1869449984`) are set only when the enabled encoder module lists a hardware `hevc`
-  encoder. No encoder backend lists HEVC today (the encoder and stream-session still
-  reject an HEVC configuration), so this gate is dormant and real clients see H.264
-  only. An HEVC entry must not appear in the enumeration before the encoder and the
-  stream path can actually deliver 8-bit HEVC.
-- A missing `amaterasu.encode/1` call grant, a rejected or malformed reply, a request
-  that exceeds five seconds, or a snapshot older than 90 seconds discards the snapshot,
-  so the reply falls back to H.264 only with `MaxLumaPixelsHEVC=0`.
-- No 10-bit, 4:4:4, or AV1 bit is ever set, and `/applist` keeps `IsHdrSupported=0`,
-  until the media path delivers real 10-bit output.
-- `mac` is the address of the first physical network interface read from
-  `/sys/class/net` on Linux, or `00:00:00:00:00:00` when none can be read. `GfeVersion`
-  stays `0.0.0.0` (see the wire audit table).
-
+The module refreshes one shared encoder snapshot at startup and, while idle, every
+five minutes. Refresh failures retain the last good snapshot and retry with bounded
+backoff; request handlers read the cache. Each launch freezes that snapshot, then
+constrains its RTSP codec offer to the effective scoped encoder selection (including
+stable identity, numeric index, and software-only policy). The MAC address comes from
+the first physical Linux network interface when available, with a zero fallback.
 `state` is globally busy while any owned launch remains active or has
 unconfirmed cleanup. `currentgame` contains the app ID only for the owning paired
 certificate and remains zero for other clients.
@@ -472,7 +491,7 @@ by `NvComputer::NvComputer` (`app/backend/nvcomputer.cpp:131-221`) unless noted.
 | `hostname` | `nvcomputer.cpp:136` | configured hostname | Empty becomes "UNKNOWN". |
 | `uniqueid` | `nvcomputer.cpp:141` | persistent host id | Identity of the PC in the client's list. |
 | `mac` | `nvcomputer.cpp:142-148` | first physical interface, else zeros | Wake-on-LAN only; all-zero means unknown. |
-| `ServerCodecModeSupport` | `nvcomputer.cpp:150-157`, `session.cpp:1798`, `session.cpp:1144-1300` | `1` (H.264), plus `0x100` for a proven HEVC encoder | `Connection.c:228-233` aborts `LiStartConnection` with -1 when zero. Fixed: was hardcoded 0. |
+| `ServerCodecModeSupport` | `nvcomputer.cpp:150-157`, `session.cpp:1798`, `session.cpp:1144-1300` | H.264 baseline while streaming is configured, plus enumerated HEVC and AV1 bits | `Connection.c:228-233` aborts `LiStartConnection` with -1 when zero. |
 | `MaxLumaPixelsHEVC` | `nvcomputer.cpp:159-165`, `session.cpp:1174,1216,1377` | `0`, or `1869449984` with HEVC | Zero removes HEVC from the client's formats. |
 | `FrameLimiter*` | `framelimitercapabilities.h:16-37` | omitted | Vibeshine extension; absent means unsupported. |
 | `DisplayMode` list (`Width`, `Height`, `RefreshRate`) | `nvhttp.cpp:274-300` | omitted | Only used for NVIDIA servers (`session.cpp:1749-1760`). |
@@ -514,9 +533,9 @@ to zero as soon as cleanup starts.
 `/resume` (`session.cpp:1775`): moonlight-qt sends `resume` instead of `launch`
 whenever `/serverinfo` reports a nonzero `currentgame` for its certificate, which is
 the normal state after closing a stream without choosing "quit app" (the default
-preference). Amaterasu answers 501, so a reconnect to a still-running session fails
-with "Host returned error" until the user quits the app from the client. This is a
-known unimplemented requirement, not a quiet fallback.
+preference). Amaterasu supports this transition for the enabled Desktop application,
+with fresh certificate authorization before opening the replacement RTSP ticket.
+Catalog application resume remains an unimplemented parity requirement.
 
 Error mapping (`nvhttp.cpp:550-575`, `:153-165`): any non-2xx HTTP status becomes a
 network error and the host shows offline. Only an XML `status_code` inside a 2xx
@@ -548,26 +567,21 @@ representation, preserving the bit pattern.
 
 The bounded normal metadata allowlist is `uniqueid`, `uuid`, `additionalStates`,
 `clientName`, `sops`, the `clientHdrCap*` fields, `hdrMode`, `localAudioPlayMode`,
-`surroundAudioInfo`, `remoteControllersBitmap`, `gcmap`, `psmap`, `gcpersist`, and
-`corever`. Unknown fields are rejected, including executable, path, arguments,
-environment, or catalog-owner overrides. The current profile accepts SDR and core
-version 1. `localAudioPlayMode` accepts only `0` or `1` and defaults to `0`; it
-snapshots whether audio capture should prefer host audio, with the Windows audio
-module applying its Steam-sink fallback when host audio is disabled or the ordinary
-sink is unavailable. `surroundAudioInfo` is `channel_mask << 16 | channel_count` and
-accepts exactly stereo (`196610`), 5.1 (`4128774`), and 7.1 (`104792072`). HDR
-requests (`hdrMode=1` or nonzero `clientHdrCap*`) fail before the application
-service is called, so a successful reply never implies an HDR stream.
-
-Three groups are deliberately accepted and ignored, because moonlight-qt sends them
-on every default launch and rejecting them would fail every stream. `sops` is `0` or
-`1` (the client default is `1`); this host never tunes a game's own settings.
-`remoteControllersBitmap`, `gcmap`, and `psmap` are bounded decimal slot bitmaps
-(moonlight-qt reports player 1 present as `1` even without a pad,
-`gamepad.cpp:994-1004`), and `gcpersist` is `0` or `1`. Controllers attach through
-the control stream, so none of these pre-allocates input devices; controller
-forwarding itself remains pending real-client verification. `additionalStates` is
-accepted only as a decimal Boolean.
+`surroundAudioInfo`, `remoteControllersBitmap`, `gcmap`, `gcpmap`, `psmap`,
+`gcpersist`, `clientVrrRequested`, `continuousAudio`, and `corever`.
+Unknown fields are rejected, including executable, path, arguments,
+environment, or catalog-owner overrides. The current profile accepts SDR,
+negotiated stereo or surround playback, core version 1, and Boolean `sops` hints.
+`surroundAudioInfo` uses Moonlight's `channel_mask << 16 | channel_count` encoding:
+196610 for stereo, 4128774 for 5.1, and 104792072 for 7.1. Controller slot masks
+are bounded to 16 bits; `gcpersist` is Boolean. These hints do not grant native
+input access or override the configured controller lifecycle. `localAudioPlayMode` accepts
+only `0` or `1` and defaults to `0`; it snapshots whether audio capture should
+prefer host audio, with the Windows audio module applying its Steam-sink fallback
+when host audio is disabled or the ordinary sink is unavailable. HDR remains
+unsupported, and SOPS/VRR hints do not apply display or game settings. Actual
+surround capture and encoding still require the selected provider's support.
+`additionalStates` is accepted only as a decimal Boolean.
 
 The lifecycle calls the launch service's exported-app API with only the immutable
 numeric catalog ID and a private operation ID. Catalog policy resolves the trusted
@@ -716,8 +730,9 @@ Behavioral references were the pinned sibling's Gen7 server-info/pairing behavio
 and the primary Moonlight Qt client in `app/backend/nvpairingmanager.cpp`,
 `nvhttp.cpp`, and `nvcomputer.cpp`. The implementation does not copy or translate
 sibling source. Gen6/SHA-1, discovery,
-resume, HDR, surround audio, display optimization, and controller
-input forwarding remain unimplemented here.
+catalog application resume and HDR remain unimplemented here. Surround capture,
+display optimization, and controller forwarding depend on the selected providers;
+mock protocol tests do not establish real-client or hardware acceptance.
 
 The enabled transport accepts `:0` for ephemeral ports; non-loopback binding
 requires `allow_remote:true`. Its control status reports `enabled`, actual

@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Streaming behavior belongs to a managed library, not the native shell.
 mod model;
 mod pipeline;

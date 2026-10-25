@@ -129,29 +129,86 @@ def test_operation_errors_do_not_roll_back_activation(harness: PlatformHarness) 
     assert harness.state()["active"] == active_before
 
 
+def wait_for_diagnostics(console) -> None:
+    deadline = time.monotonic() + 15
+    while True:
+        status = console.request("amaterasu.diagnostics/1", {"action": "status"})
+        assert status["ok"], status
+        if status["ready"]:
+            assert status["logging_configuration_revision"] == 1, status
+            return
+        assert time.monotonic() < deadline, status
+        time.sleep(0.02)
+
+
 def test_diagnostics(harness: PlatformHarness) -> None:
-    recorded, queried, incremented, counters = harness.requests(
-        "amaterasu.diagnostics/1",
-        {
+    # Local import avoids the Console/PlatformHarness module dependency cycle.
+    from test_host_service import Console
+    from test_management_api import Api
+
+    bootstrap_path = harness.root / "bootstrap.json"
+    bootstrap = json.loads(bootstrap_path.read_text())
+    bootstrap["policy"]["settings"]["amaterasu.management"].update(
+        enabled=True, bind="127.0.0.1:0"
+    )
+    bootstrap_path.write_text(json.dumps(bootstrap))
+
+    service = "amaterasu.diagnostics/1"
+    console = Console(harness)
+    try:
+        api = Api(console)
+        setup = console.request("amaterasu.authentication/1", {
+            "action": "setup", "username": "administrator",
+            "password": "local-diagnostics-smoke-password-only",
+        })
+        assert setup["ok"], setup
+        token = console.request("amaterasu.authentication/1", {
+            "action": "issue_token", "scopes": ["configuration.read", "configuration.write"],
+            "ttl_seconds": 3600,
+        })
+        assert token["ok"], token
+        status, configuration, _ = api.post("/v1/host-configuration/get", token=token["bearer"])
+        assert status == 200 and configuration["ok"], configuration
+        assert configuration["revision"] == 0, configuration
+        # Diagnostics requires a persisted authoritative logging policy, rather
+        # than the revision-zero default document. Initialize it exactly once
+        # through the authenticated management API before testing journal actions.
+        status, initialized, _ = api.post("/v1/host-configuration/update", {
+            "expected_revision": 0, **configuration["values"],
+        }, token["bearer"])
+        assert status == 200 and initialized["ok"], initialized
+        assert initialized["revision"] == 1, initialized
+        # Logging policy hydration needs the persistent host's background ticks.
+        # Poll only status; each mutation below is submitted exactly once.
+        wait_for_diagnostics(console)
+        recorded = console.request(service, {
             "action": "record",
             "level": "info",
             "target": "integration",
             "message": "module loaded",
             "fields": {"component": "diagnostics"},
-        },
-        {"action": "query", "after": 0, "limit": 4},
-        {"action": "increment", "name": "requests", "amount": 2},
-        {"action": "counters"},
-    )
-    assert recorded["ok"] and recorded["sequence"] == 1, recorded
-    assert queried["records"][0]["message"] == "module loaded", queried
-    assert not queried["resync_required"] and not queried["has_more"], queried
-    assert incremented["value"] == 2, incremented
-    assert counters["counters"] == {"requests": 2}, counters
+        })
+        queried = console.request(service, {"action": "query", "after": 0, "limit": 4})
+        incremented = console.request(service, {"action": "increment", "name": "requests", "amount": 2})
+        counters = console.request(service, {"action": "counters"})
+        assert recorded["ok"] and recorded["sequence"] == 1, recorded
+        assert queried["records"][0]["message"] == "module loaded", queried
+        assert not queried["resync_required"] and not queried["has_more"], queried
+        assert incremented["value"] == 2, incremented
+        assert counters["counters"] == {"requests": 2}, counters
+        console.eof()
+    finally:
+        console.close()
 
     # Diagnostics explicitly has in-memory retention, unlike the durable catalog.
-    restarted = harness.requests("amaterasu.diagnostics/1", {"action": "query"})[0]
-    assert restarted["ok"] and restarted["records"] == [], restarted
+    restarted_console = Console(harness)
+    try:
+        wait_for_diagnostics(restarted_console)
+        restarted = restarted_console.request(service, {"action": "query"})
+        assert restarted["ok"] and restarted["records"] == [], restarted
+        restarted_console.eof()
+    finally:
+        restarted_console.close()
 
 
 def test_catalog(harness: PlatformHarness) -> None:
@@ -277,7 +334,11 @@ def test_steam_disabled_policy(harness: PlatformHarness) -> None:
     }, responses
     assert all(response["ok"] for response in responses[1:]), responses
     result = responses[-1]
-    assert not result["enabled"] and not result["scanning"] and result["games"] == [], result
+    # Linux follows the reference policy and keeps Steam enabled even when the
+    # persisted document disables discovery. Automatic catalog sync stays off.
+    assert result["enabled"] == sys.platform.startswith("linux"), result
+    assert not result["scanning"] and result["games"] == [], result
+    assert not result["catalog_sync"]["enabled"], result
 
 
 def test_disabled_native_devices(harness: PlatformHarness) -> None:

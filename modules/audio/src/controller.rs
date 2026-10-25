@@ -35,6 +35,7 @@ struct OperationRecord {
     endpoint: String,
     virtual_sink: Option<String>,
     channels: Option<u32>,
+    capture_format: Option<PcmCaptureFormat>,
     host_audio_enabled: bool,
     capture_sink_without_routing: bool,
     continuous_audio: Option<ContinuousAudio>,
@@ -50,6 +51,7 @@ struct OpenRequest {
     endpoint: String,
     virtual_sink: Option<String>,
     channels: Option<u32>,
+    capture_format: Option<PcmCaptureFormat>,
     continuous_audio: Option<ContinuousAudio>,
     policy: OpenPolicy,
     operation: Option<String>,
@@ -354,6 +356,7 @@ impl Controller {
                 endpoint,
                 virtual_sink,
                 channels,
+                capture_format,
                 host_audio_enabled,
                 operation_id,
                 capture_sink_without_routing,
@@ -363,6 +366,7 @@ impl Controller {
                     endpoint,
                     virtual_sink,
                     channels,
+                    capture_format,
                     continuous_audio: None,
                     policy: OpenPolicy {
                         host_audio_enabled,
@@ -375,6 +379,7 @@ impl Controller {
                 endpoint,
                 virtual_sink,
                 channels,
+                capture_format,
                 host_audio_enabled,
                 operation_id,
                 capture_sink_without_routing,
@@ -385,6 +390,7 @@ impl Controller {
                     endpoint,
                     virtual_sink: virtual_sink.clone(),
                     channels,
+                    capture_format,
                     continuous_audio: Some(continuous_audio),
                     policy: OpenPolicy {
                         host_audio_enabled,
@@ -412,6 +418,7 @@ impl Controller {
             endpoint,
             virtual_sink,
             mut channels,
+            capture_format,
             continuous_audio,
             policy,
             operation,
@@ -421,6 +428,9 @@ impl Controller {
         }
         if let Some(continuous_audio) = continuous_audio {
             continuous_audio.validate()?;
+        }
+        if let Some(capture_format) = capture_format {
+            capture_format.validate()?;
         }
         if !endpoint.is_empty() {
             validate_endpoint(&endpoint)?;
@@ -442,6 +452,7 @@ impl Controller {
                 if record.endpoint != endpoint
                     || record.virtual_sink != virtual_sink
                     || record.channels != channels
+                    || record.capture_format != capture_format
                     || record.host_audio_enabled != policy.host_audio_enabled
                     || record.capture_sink_without_routing != policy.capture_sink_without_routing
                     || record.continuous_audio != continuous_audio
@@ -469,6 +480,7 @@ impl Controller {
             &endpoint,
             virtual_sink.as_deref(),
             channels,
+            capture_format,
             policy.host_audio_enabled,
             policy.capture_sink_without_routing,
         )?;
@@ -495,6 +507,7 @@ impl Controller {
                     endpoint,
                     virtual_sink,
                     channels,
+                    capture_format,
                     host_audio_enabled: policy.host_audio_enabled,
                     capture_sink_without_routing: policy.capture_sink_without_routing,
                     continuous_audio,

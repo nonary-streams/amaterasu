@@ -18,6 +18,8 @@ fn changed(name: &str, value: &str) -> String {
 
 fn all_support() -> TransportSupport {
     TransportSupport {
+        hevc: false,
+        av1: false,
         stereo_audio: true,
         enet_control: true,
         encrypted_control: true,
@@ -26,6 +28,67 @@ fn all_support() -> TransportSupport {
         encrypted_video: true,
         encrypted_audio: true,
         fec: true,
+    }
+}
+
+#[test]
+fn hevc_sdr_announce_is_parsed_but_requires_end_to_end_capability() {
+    let hevc = changed("x-nv-vqos[0].bitStreamFormat", "1")
+        .replace("a=x-nv-clientSupportHevc:0 ", "a=x-nv-clientSupportHevc:1 ");
+    let announce = parse_announce(hevc.as_bytes()).unwrap();
+    assert_eq!(announce.video.format.codec, VideoCodec::Hevc);
+    assert_eq!(
+        announce.check_support(&all_support()),
+        Err(Error::Unsupported("HEVC video"))
+    );
+    let mut enabled = all_support();
+    enabled.hevc = true;
+    announce.check_support(&enabled).unwrap();
+
+    let h264_capable = changed("x-nv-clientSupportHevc", "1");
+    assert_eq!(
+        parse_announce(h264_capable.as_bytes())
+            .unwrap()
+            .video
+            .format
+            .codec,
+        VideoCodec::H264
+    );
+    assert!(parse_announce(changed("x-nv-vqos[0].bitStreamFormat", "1").as_bytes()).is_err());
+}
+
+#[test]
+fn bit_stream_format_selects_h264_hevc_and_av1_and_rejects_other_codecs() {
+    let av1 =
+        changed("x-nv-vqos[0].bitStreamFormat", "2").replace("a=x-nv-clientSupportHevc:0 \r\n", "");
+    assert!(!av1.contains("clientSupportHevc"));
+    let announce = parse_announce(av1.as_bytes()).unwrap();
+    assert_eq!(announce.video.format.codec, VideoCodec::Av1);
+    assert_eq!(
+        announce.check_support(&all_support()),
+        Err(Error::Unsupported("AV1 video"))
+    );
+    let mut enabled = all_support();
+    enabled.av1 = true;
+    announce.check_support(&enabled).unwrap();
+    // HEVC support alone does not admit AV1, nor AV1 support HEVC.
+    enabled.av1 = false;
+    enabled.hevc = true;
+    assert!(announce.check_support(&enabled).is_err());
+
+    assert_eq!(
+        parse_announce(FIXTURE.as_bytes())
+            .unwrap()
+            .video
+            .format
+            .codec,
+        VideoCodec::H264
+    );
+    for unsupported in ["3", "4", "-1"] {
+        assert!(
+            parse_announce(changed("x-nv-vqos[0].bitStreamFormat", unsupported).as_bytes())
+                .is_err()
+        );
     }
 }
 
@@ -41,6 +104,7 @@ fn primary_client_shape_negotiates_exact_h264_sdr_requirements() {
     assert_eq!(result.video.configured_bitrate_kbps, Some(20000));
     assert_eq!(result.video.slices_per_frame, 1);
     assert_eq!(result.video.color, ColorMode::Bt709Limited);
+    assert_eq!(result.video.format.codec, VideoCodec::H264);
     assert_eq!(result.packet_size, 1392);
     assert_eq!(result.audio.packet_duration_ms, 5);
     assert_eq!(result.fec.minimum_packets, 2);
@@ -86,6 +150,11 @@ fn selected_codec_and_dynamic_range_produce_the_shared_video_format() {
             "a=x-nv-video[0].dynamicRangeMode:0 ",
             &format!("a=x-nv-video[0].dynamicRangeMode:{range_mode} "),
         );
+        let announce = if codec == VideoCodec::Hevc {
+            announce.replace("a=x-nv-clientSupportHevc:0 ", "a=x-nv-clientSupportHevc:1 ")
+        } else {
+            announce
+        };
         let parsed = parse_announce(announce.as_bytes()).unwrap();
         assert_eq!(
             parsed.video.format,
@@ -115,6 +184,21 @@ fn unsupported_codec_and_dynamic_range_combinations_are_rejected() {
             "accepted bitStreamFormat={bitstream_format}, dynamicRangeMode={range_mode}"
         );
     }
+}
+
+#[test]
+fn client_csc_modes_have_distinct_matrix_and_range() {
+    for (wire, expected) in [
+        ("0", ColorMode::Bt601Limited),
+        ("1", ColorMode::Bt601Full),
+        ("2", ColorMode::Bt709Limited),
+        ("3", ColorMode::Bt709Full),
+    ] {
+        let parsed = parse_announce(changed("x-nv-video[0].encoderCscMode", wire).as_bytes())
+            .expect("supported color mode");
+        assert_eq!(parsed.video.color, expected);
+    }
+    assert!(parse_announce(changed("x-nv-video[0].encoderCscMode", "4").as_bytes()).is_err());
 }
 
 #[test]

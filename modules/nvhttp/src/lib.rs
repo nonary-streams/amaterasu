@@ -2,6 +2,8 @@
 #![recursion_limit = "256"]
 
 mod audio_driver_install;
+mod encoder_refresh;
+mod encoder_snapshot;
 mod frame_limiter;
 pub mod global_flags;
 mod launch;
@@ -242,6 +244,7 @@ struct NvhttpModule {
     network_settings: NetworkSettings,
     upnp_lifecycle: upnp::UpnpLifecycle,
     management_exposure: upnp::ManagementExposure,
+    encoder_refresh: encoder_refresh::EncoderRefresh,
     next_listener_rebind: Instant,
     listener_rebind_delay: Duration,
     audio_driver_install: audio_driver_install::AudioDriverInstallSync,
@@ -318,6 +321,7 @@ impl ManagedModule for NvhttpModule {
             network_settings: NetworkSettings::default(),
             upnp_lifecycle: upnp::UpnpLifecycle::new(),
             management_exposure: upnp::ManagementExposure::default(),
+            encoder_refresh: encoder_refresh::EncoderRefresh::default(),
             next_listener_rebind: Instant::now(),
             listener_rebind_delay: Duration::from_secs(1),
             audio_driver_install: audio_driver_install::AudioDriverInstallSync::default(),
@@ -388,6 +392,13 @@ impl ManagedModule for NvhttpModule {
             router.set_global_wgc_pacing_smoothing(
                 self.product_settings.effective_wgc_pacing_smoothing(),
             );
+            if router.supports_streaming() {
+                self.encoder_refresh
+                    .tick(&self.runtime, router.stream_active());
+                if let Some(snapshot) = self.encoder_refresh.take_update() {
+                    router.set_encoder_snapshot(snapshot);
+                }
+            }
         }
         if self.product_settings.loaded() {
             self.network_settings.tick(
@@ -481,6 +492,13 @@ impl ManagedModule for NvhttpModule {
                                 .as_ref()
                                 .is_some_and(|identity| identity.trusted(certificate))
                         });
+                if incoming.request.target.split('?').next() == Some("/launch") {
+                    // Deliberately omit the query: Moonlight sends session keys there.
+                    eprintln!(
+                        "amaterasu nvhttp launch request secure={} trusted={trusted}",
+                        incoming.secure
+                    );
+                }
                 if let Some(reply) = router.dispatch(
                     incoming.id,
                     incoming.request,
@@ -502,7 +520,11 @@ impl ManagedModule for NvhttpModule {
                     }
                 }
             }
-            for (id, reply) in router.poll(&self.runtime) {
+            for (id, reply) in router.poll_with_trust(&self.runtime, |certificate| {
+                self.identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.trusted(certificate))
+            }) {
                 let accepted = server.respond_checked(id, reply, |certificate| {
                     self.identity
                         .as_ref()

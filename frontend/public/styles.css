@@ -361,6 +361,29 @@ small {
   margin-bottom: 18px;
   font-size: 12px;
 }
+.pairing-request {
+  margin: 0 0 12px;
+  padding: 18px;
+  background: #111721;
+}
+.pairing-details {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+.pairing-approval {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+.pairing-approval .field {
+  flex: 1;
+  min-width: 180px;
+  margin-bottom: 0;
+}
 .overview-hero {
   display: flex;
   align-items: center;

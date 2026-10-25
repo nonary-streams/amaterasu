@@ -15,6 +15,8 @@ use std::mem::MaybeUninit;
 use std::path::Path;
 
 pub(crate) mod management_tls;
+#[cfg(test)]
+mod teardown_tests;
 
 const HOST_CONFIGURATION_COMPONENT: &str = "amaterasu.host-configuration";
 const STEAM_COMPONENT: &str = "amaterasu.steam";
@@ -23,6 +25,36 @@ pub(crate) fn path_to_unicode_string(path: &Path) -> Result<String, String> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| "native path cannot be represented as Unicode".to_owned())
+}
+
+fn inject_package_root(
+    runtime_config: &mut amaterasu_contracts::RuntimeConfig,
+    root: &Path,
+) -> PackageResult<()> {
+    let package_root = root.canonicalize().map_err(|error| error.to_string())?;
+    if !package_root.is_dir() {
+        return Err("package root is not a directory".into());
+    }
+    // Overwrite every package-supplied host-context value after verification.
+    runtime_config.host_context.package_root = Some(path_to_unicode_string(&package_root)?);
+    Ok(())
+}
+
+fn inject_running_package_digest(
+    runtime_config: &mut amaterasu_contracts::RuntimeConfig,
+    digest: &str,
+) -> PackageResult<()> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("verified package digest is invalid".into());
+    }
+    // A signed package may carry host-context fields, so overwrite the value
+    // only after package verification with the digest of these loaded bytes.
+    runtime_config.host_context.running_package_digest = Some(digest.into());
+    Ok(())
 }
 
 pub struct LoadedComponents {
@@ -44,12 +76,14 @@ impl Drop for LoadedComponents {
 
 impl LoadedComponents {
     pub fn load(
+        root: &Path,
         directory: &Path,
         package: &VerifiedPackage,
         state_root: &Path,
         product_logger: Option<ProductLogger>,
         progress: &mut dyn FnMut(usize) -> PackageResult<()>,
     ) -> PackageResult<Self> {
+        crate::privilege::require_user_process()?;
         let runtime_component = package
             .manifest
             .components
@@ -66,6 +100,8 @@ impl LoadedComponents {
             HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(),
             amaterasu_contracts::Grants::default(),
         );
+        inject_package_root(&mut runtime_config, root)?;
+        inject_running_package_digest(&mut runtime_config, &package.digest)?;
         if package
             .manifest
             .components
@@ -98,28 +134,47 @@ impl LoadedComponents {
             serde_json::to_vec(&runtime_config).map_err(|error| error.to_string())?;
         let mut runtime =
             RuntimeLibrary::load(&directory.join(&runtime_component.file), &configuration)?;
+        let components = ordered_components(&package.manifest.components)?;
         let lifecycle_endpoint = runtime.endpoint(HOST_LIFECYCLE_CONTROL_PRINCIPAL)?;
-        progress(1)?;
-        let mut modules = Vec::new();
+        Self::load_features(
+            runtime,
+            product_logger,
+            lifecycle_endpoint,
+            components
+                .into_iter()
+                .filter(|component| !component.runtime),
+            |runtime, component| {
+                let endpoint = runtime.endpoint(&component.id)?;
+                FeatureLibrary::load(&directory.join(&component.file), &component.id, &endpoint)
+            },
+            progress,
+        )
+    }
 
-        for (index, component) in ordered_components(&package.manifest.components)?
-            .into_iter()
-            .filter(|component| !component.runtime)
-            .enumerate()
-        {
-            let endpoint = runtime.endpoint(&component.id)?;
-            let module =
-                FeatureLibrary::load(&directory.join(&component.file), &component.id, &endpoint)?;
-            modules.push(module);
-            progress(index + 2)?;
-        }
-        Ok(Self {
-            modules,
+    fn load_features<Component>(
+        runtime: RuntimeLibrary,
+        product_logger: Option<ProductLogger>,
+        lifecycle_endpoint: HostApi,
+        components: impl IntoIterator<Item = Component>,
+        mut load: impl FnMut(&mut RuntimeLibrary, Component) -> PackageResult<FeatureLibrary>,
+        progress: &mut dyn FnMut(usize) -> PackageResult<()>,
+    ) -> PackageResult<Self> {
+        // Own partial initialization immediately so every error path stops consumers
+        // before their native providers, including progress and endpoint failures.
+        let mut loaded = Self {
+            modules: Vec::new(),
             product_logger,
             pending_log_policy: None,
             lifecycle_endpoint,
             runtime,
-        })
+        };
+        progress(1)?;
+        for (index, component) in components.into_iter().enumerate() {
+            let module = load(&mut loaded.runtime, component)?;
+            loaded.modules.push(module);
+            progress(index + 2)?;
+        }
+        Ok(loaded)
     }
 
     pub fn tick(&mut self) -> PackageResult<()> {
@@ -521,10 +576,46 @@ fn require_success(status: Status, operation: &str) -> PackageResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        inject_host_configuration_root, inject_steam_artwork_cache_parent, path_to_unicode_string,
+        inject_host_configuration_root, inject_package_root, inject_running_package_digest,
+        inject_steam_artwork_cache_parent, path_to_unicode_string,
     };
     use amaterasu_contracts::RuntimeConfig;
     use serde_json::json;
+
+    #[test]
+    fn package_root_overrides_package_controlled_host_context() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-host-package-root-{}-{}",
+            std::process::id(),
+            amaterasu_package::random_identifier().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut config = RuntimeConfig::default();
+        config.host_context.package_root = Some("package-controlled".into());
+        inject_package_root(&mut config, &root).unwrap();
+        assert_eq!(
+            config.host_context.package_root.as_deref(),
+            root.canonicalize().unwrap().to_str()
+        );
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn running_digest_overrides_package_controlled_host_context() {
+        let mut config = RuntimeConfig::default();
+        config.host_context.running_package_digest = Some("package-controlled".into());
+        let digest = "a".repeat(64);
+        inject_running_package_digest(&mut config, &digest).unwrap();
+        assert_eq!(
+            config.host_context.running_package_digest.as_deref(),
+            Some(digest.as_str())
+        );
+        assert!(inject_running_package_digest(&mut config, "invalid").is_err());
+        assert_eq!(
+            config.host_context.running_package_digest.as_deref(),
+            Some(digest.as_str())
+        );
+    }
 
     #[test]
     fn host_configuration_root_overrides_signed_component_settings() {

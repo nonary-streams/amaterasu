@@ -4,6 +4,7 @@ fn mutating_display_fixture(option: &str, two_displays: bool) -> (Controller, Br
     streaming.capture.capture_provider = CaptureProvider::Wgc;
     streaming.capture.output = "\\\\.\\DISPLAY2".into();
     let mut controller = Controller::new(Some(streaming)).unwrap();
+    controller.set_encoder_snapshot(hardware_h264());
     controller.set_global_display_policy(
         9,
         json!({
@@ -60,53 +61,116 @@ fn inactive_ensure_active_attests_appended_target_without_changing_active_displa
     let paired = peer_with_display_mode(52, "1920x1080x59.94").unwrap();
     let mut stream = request(52);
     stream.fps = 120;
-    assert!(controller.launch(10, stream.clone(), paired.clone(), now).is_none());
+    assert!(
+        controller
+            .launch(10, stream.clone(), paired.clone(), now)
+            .is_none()
+    );
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(reply.status, 200);
     let open = opened_rtsp_payload(&broker);
     let request = &open["display_request"];
     assert_eq!(open["profile"]["fps"], 120);
-    assert_eq!(request["configuration"]["displays"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        request["configuration"]["displays"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(request["configuration"]["displays"][0]["id"], "monitor.one");
     assert_eq!(request["configuration"]["displays"][0]["x"], 0);
     assert_eq!(request["configuration"]["displays"][0]["width"], 1600);
     assert_eq!(request["configuration"]["displays"][1]["id"], "Monitor.Two");
     assert_eq!(request["configuration"]["displays"][1]["x"], 1600);
-    assert_eq!(request["configuration"]["displays"][1]["refresh"], json!({"numerator":59940,"denominator":1000}));
-    assert_eq!(request["configuration"]["displays"][1]["hdr_enabled"], Value::Null);
+    assert_eq!(
+        request["configuration"]["displays"][1]["refresh"],
+        json!({"numerator":59940,"denominator":1000})
+    );
+    assert_eq!(
+        request["configuration"]["displays"][1]["hdr_enabled"],
+        Value::Null
+    );
     assert_eq!(request["mode_policy"]["display_id"], "Monitor.Two");
-    assert_eq!(request["mode_policy"]["configuration_option"], "ensure_active");
+    assert_eq!(
+        request["mode_policy"]["configuration_option"],
+        "ensure_active"
+    );
     assert_eq!(open["display_admission_token"], "ab".repeat(32));
     controller.reply_delivered(10, now);
-    assert_eq!(controller.launch(11, stream, paired, now).unwrap().body, reply.body);
-    assert_eq!(broker.actions().iter().filter(|(service, action)|
-        *service == "amaterasu.rtsp/1" && *action == "open").count(), 1);
+    assert_eq!(
+        controller.launch(11, stream, paired, now).unwrap().body,
+        reply.body
+    );
+    assert_eq!(
+        broker
+            .actions()
+            .iter()
+            .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+            .count(),
+        1
+    );
 }
 
 #[test]
 fn inactive_stream_mode_fallback_requires_static_refresh_policy() {
     let now = Instant::now();
     let (mut controller, mut broker) = inactive_display_fixture("ensure_active");
-    controller.set_global_display_policy(9, json!({
-        "dd_configuration_option":"ensure_active",
-        "dd_refresh_rate_option":"disabled",
-        "dd_hdr_option":"disabled",
-    }));
+    controller.set_global_display_policy(
+        9,
+        json!({
+            "dd_configuration_option":"ensure_active",
+            "dd_refresh_rate_option":"disabled",
+            "dd_hdr_option":"disabled",
+        }),
+    );
     assert!(controller.launch(10, request(54), peer(54), now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(reply.status, 200);
     let display_request = &opened_rtsp_payload(&broker)["display_request"];
-    assert_eq!(display_request["configuration"]["displays"][1]["width"], 1280);
-    assert_eq!(display_request["configuration"]["displays"][1]["height"], 720);
-    assert_eq!(display_request["configuration"]["displays"][1]["refresh"], json!({"numerator":60000,"denominator":1000}));
-    assert_eq!(display_request["mode_policy"]["context"]["client_display_mode_override"], false);
+    assert_eq!(
+        display_request["configuration"]["displays"][1]["width"],
+        1280
+    );
+    assert_eq!(
+        display_request["configuration"]["displays"][1]["height"],
+        720
+    );
+    assert_eq!(
+        display_request["configuration"]["displays"][1]["refresh"],
+        json!({"numerator":60000,"denominator":1000})
+    );
+    assert_eq!(
+        display_request["mode_policy"]["context"]["client_display_mode_override"],
+        false
+    );
 }
 
 #[test]
 fn inactive_route_fails_closed_on_drift_ambiguity_and_other_options() {
-    for case in ["ensure_primary", "ensure_only_display", "verify_only", "revision", "bytes", "ambiguous", "duplicate_id", "missing", "auto_without_mode", "position_out_of_range"] {
+    for case in [
+        "ensure_primary",
+        "ensure_only_display",
+        "verify_only",
+        "revision",
+        "bytes",
+        "ambiguous",
+        "duplicate_id",
+        "missing",
+        "auto_without_mode",
+        "position_out_of_range",
+    ] {
         let now = Instant::now();
-        let option = if matches!(case, "revision" | "bytes" | "ambiguous" | "duplicate_id" | "missing" | "auto_without_mode" | "position_out_of_range") {
+        let option = if matches!(
+            case,
+            "revision"
+                | "bytes"
+                | "ambiguous"
+                | "duplicate_id"
+                | "missing"
+                | "auto_without_mode"
+                | "position_out_of_range"
+        ) {
             "ensure_active"
         } else {
             case
@@ -115,19 +179,39 @@ fn inactive_route_fails_closed_on_drift_ambiguity_and_other_options() {
         match case {
             "revision" => broker.display_revision_drift = true,
             "bytes" => broker.display_configuration_drift = true,
-            "ambiguous" => broker.display_entries.push(json!({"id":"monitor.other","source":"\\\\.\\DISPLAY2","active":false})),
-            "duplicate_id" => broker.display_entries.push(json!({"id":"monitor.two","source":"\\\\.\\DISPLAY3","active":false})),
-            "missing" => { broker.display_entries.pop(); },
-            "position_out_of_range" => broker.display_snapshot_configuration.as_mut().unwrap()["displays"][0]["x"] = json!(65_536),
-            _ => {},
+            "ambiguous" => broker
+                .display_entries
+                .push(json!({"id":"monitor.other","source":"\\\\.\\DISPLAY2","active":false})),
+            "duplicate_id" => broker
+                .display_entries
+                .push(json!({"id":"monitor.two","source":"\\\\.\\DISPLAY3","active":false})),
+            "missing" => {
+                broker.display_entries.pop();
+            }
+            "position_out_of_range" => {
+                broker.display_snapshot_configuration.as_mut().unwrap()["displays"][0]["x"] =
+                    json!(65_536)
+            }
+            _ => {}
         }
         assert!(controller.launch(10, request(53), peer(53), now).is_none());
         let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
         assert_ne!(reply.status, 200, "{case}");
-        assert!(!broker.actions().iter().any(|(service, action)|
-            *service == "amaterasu.launch/1" && *action == "launch_export"), "{case}");
-        assert!(!broker.actions().iter().any(|(service, action)|
-            *service == "amaterasu.rtsp/1" && *action == "open"), "{case}");
+        assert!(
+            !broker
+                .actions()
+                .iter()
+                .any(|(service, action)| *service == "amaterasu.launch/1"
+                    && *action == "launch_export"),
+            "{case}"
+        );
+        assert!(
+            !broker
+                .actions()
+                .iter()
+                .any(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open"),
+            "{case}"
+        );
     }
 }
 
@@ -234,24 +318,36 @@ fn selected_two_monitor_mutation_attests_full_topology_and_physical_5994_mode() 
     let position = |service: &str, action: &str| {
         actions
             .iter()
-            .position(|(seen_service, seen_action)| *seen_service == service && *seen_action == action)
+            .position(|(seen_service, seen_action)| {
+                *seen_service == service && *seen_action == action
+            })
             .expect("required launch phase")
     };
-    assert!(position("amaterasu.launch/1", "preflight_export")
-        < position("amaterasu.launch/1", "prepare_display_admission"));
-    assert!(position("amaterasu.launch/1", "prepare_display_admission")
-        < position("amaterasu.rtsp/1", "open"));
-    assert!(position("amaterasu.rtsp/1", "open")
-        < position("amaterasu.launch/1", "launch_export"));
-    let export = broker.commands.iter().find_map(|command| match command {
-        Command::Request { service, payload, .. }
-            if service == "amaterasu.launch/1" && payload["action"] == "launch_export" =>
-        {
-            Some(payload)
-        }
-        _ => None,
-    }).unwrap();
-    assert_eq!(export["display_admission_token"], open["display_admission_token"]);
+    assert!(
+        position("amaterasu.launch/1", "preflight_export")
+            < position("amaterasu.launch/1", "prepare_display_admission")
+    );
+    assert!(
+        position("amaterasu.launch/1", "prepare_display_admission")
+            < position("amaterasu.rtsp/1", "open")
+    );
+    assert!(position("amaterasu.rtsp/1", "open") < position("amaterasu.launch/1", "launch_export"));
+    let export = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        export["display_admission_token"],
+        open["display_admission_token"]
+    );
     controller.reply_delivered(10, now);
     let retry = controller
         .launch(11, stream, paired, now)
@@ -271,10 +367,34 @@ fn selected_two_monitor_mutation_attests_full_topology_and_physical_5994_mode() 
 fn signed_display_option_precedence_is_frozen_through_launch_and_rtsp() {
     for (case, application_option, client_option, expected, mutating) in [
         ("global", None, None, "ensure_active", true),
-        ("application", Some("ensure_primary"), None, "ensure_primary", true),
-        ("client", Some("ensure_primary"), Some("ensure_only_display"), "ensure_only_display", true),
-        ("client_disabled", Some("ensure_primary"), Some("disabled"), "disabled", false),
-        ("application_verify", Some("verify_only"), None, "verify_only", false),
+        (
+            "application",
+            Some("ensure_primary"),
+            None,
+            "ensure_primary",
+            true,
+        ),
+        (
+            "client",
+            Some("ensure_primary"),
+            Some("ensure_only_display"),
+            "ensure_only_display",
+            true,
+        ),
+        (
+            "client_disabled",
+            Some("ensure_primary"),
+            Some("disabled"),
+            "disabled",
+            false,
+        ),
+        (
+            "application_verify",
+            Some("verify_only"),
+            None,
+            "verify_only",
+            false,
+        ),
     ] {
         let now = Instant::now();
         let (mut controller, mut broker) = mutating_display_fixture("ensure_active", true);
@@ -293,7 +413,12 @@ fn signed_display_option_precedence_is_frozen_through_launch_and_rtsp() {
             )
             .unwrap();
         let stream = request(46);
-        assert!(controller.launch(10, stream.clone(), paired.clone(), now).is_none(), "{case}");
+        assert!(
+            controller
+                .launch(10, stream.clone(), paired.clone(), now)
+                .is_none(),
+            "{case}"
+        );
         controller.set_global_display_policy(10, json!({"dd_configuration_option":"disabled"}));
         let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
         assert_eq!(reply.status, 200, "{case}");
@@ -302,32 +427,73 @@ fn signed_display_option_precedence_is_frozen_through_launch_and_rtsp() {
         let policy = &open["display_policy_snapshot"];
         assert_eq!(policy["global_revision"], 9, "{case}");
         assert_eq!(policy["catalog_revision"], 1, "{case}");
-        assert_eq!(policy["global_overrides"]["dd_configuration_option"], "ensure_active", "{case}");
-        assert_eq!(policy["effective_overrides"]["dd_configuration_option"], expected, "{case}");
-        assert_eq!(policy["application_overrides"].get("dd_configuration_option").cloned(),
-            application_option.map(|option| json!(option)), "{case}");
-        assert_eq!(policy["client_overrides"].get("dd_configuration_option").cloned(),
-            client_option.map(|option| json!(option)), "{case}");
+        assert_eq!(
+            policy["global_overrides"]["dd_configuration_option"], "ensure_active",
+            "{case}"
+        );
+        assert_eq!(
+            policy["effective_overrides"]["dd_configuration_option"], expected,
+            "{case}"
+        );
+        assert_eq!(
+            policy["application_overrides"]
+                .get("dd_configuration_option")
+                .cloned(),
+            application_option.map(|option| json!(option)),
+            "{case}"
+        );
+        assert_eq!(
+            policy["client_overrides"]
+                .get("dd_configuration_option")
+                .cloned(),
+            client_option.map(|option| json!(option)),
+            "{case}"
+        );
         let admission = broker.commands.iter().find_map(|command| match command {
-            Command::Request { service, payload, .. }
-                if service == "amaterasu.launch/1" && payload["action"] == "prepare_display_admission" => Some(payload),
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1"
+                && payload["action"] == "prepare_display_admission" =>
+            {
+                Some(payload)
+            }
             _ => None,
         });
         assert_eq!(admission.is_some(), mutating, "{case}");
         if let Some(admission) = admission {
             assert_eq!(admission["global_revision"], 9, "{case}");
             assert_eq!(admission["catalog_revision"], 1, "{case}");
-            assert_eq!(admission["application_display_overrides"], policy["application_overrides"], "{case}");
-            assert_eq!(admission["client_display_overrides"], policy["client_overrides"], "{case}");
-            assert_eq!(open["display_request"]["mode_policy"]["configuration_option"], expected, "{case}");
+            assert_eq!(
+                admission["application_display_overrides"], policy["application_overrides"],
+                "{case}"
+            );
+            assert_eq!(
+                admission["client_display_overrides"], policy["client_overrides"],
+                "{case}"
+            );
+            assert_eq!(
+                open["display_request"]["mode_policy"]["configuration_option"], expected,
+                "{case}"
+            );
             assert_eq!(open["display_admission_token"], "ab".repeat(32), "{case}");
         } else {
             assert!(open["display_request"].is_null(), "{case}");
         }
         controller.reply_delivered(10, now);
-        assert_eq!(controller.launch(11, stream, paired, now).unwrap().body, reply.body, "{case}");
-        assert_eq!(broker.actions().iter().filter(|(service, action)|
-            *service == "amaterasu.rtsp/1" && *action == "open").count(), 1, "{case}");
+        assert_eq!(
+            controller.launch(11, stream, paired, now).unwrap().body,
+            reply.body,
+            "{case}"
+        );
+        assert_eq!(
+            broker
+                .actions()
+                .iter()
+                .filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+                .count(),
+            1,
+            "{case}"
+        );
     }
 }
 
@@ -373,8 +539,7 @@ fn unsupported_or_changed_display_facts_fail_before_application_success() {
         "admission_hash",
     ] {
         let now = Instant::now();
-        let (mut controller, mut broker) =
-            mutating_display_fixture("ensure_only_display", true);
+        let (mut controller, mut broker) = mutating_display_fixture("ensure_only_display", true);
         match case {
             "inactive_target" => broker.display_entries[1]["active"] = json!(false),
             "rotation_null" => broker.display_snapshot_configuration.as_mut().unwrap()["displays"][1]["rotation"] = Value::Null,
@@ -398,11 +563,18 @@ fn unsupported_or_changed_display_facts_fail_before_application_success() {
                 "{case}"
             );
         } else {
-            assert!(broker.rtsp_closed, "staged display must be restored after launch drift");
+            assert!(
+                broker.rtsp_closed,
+                "staged display must be restored after launch drift"
+            );
         }
         if matches!(
             case,
-            "inactive_target" | "rotation_null" | "topology_bytes" | "hdr_auto" | "optimize_unknown"
+            "inactive_target"
+                | "rotation_null"
+                | "topology_bytes"
+                | "hdr_auto"
+                | "optimize_unknown"
         ) {
             assert!(
                 !broker
@@ -420,8 +592,7 @@ fn unsupported_or_changed_display_facts_fail_before_application_success() {
 fn failed_display_stage_never_starts_application_and_failed_export_restores_rtsp() {
     for case in ["apply_failed", "readback_missing", "export_rejected"] {
         let now = Instant::now();
-        let (mut controller, mut broker) =
-            mutating_display_fixture("ensure_only_display", true);
+        let (mut controller, mut broker) = mutating_display_fixture("ensure_only_display", true);
         broker.reject_rtsp_display_apply = case == "apply_failed";
         broker.missing_rtsp_display_readback = case == "readback_missing";
         broker.reject_launch_export = case == "export_rejected";
@@ -431,16 +602,21 @@ fn failed_display_stage_never_starts_application_and_failed_export_restores_rtsp
         let actions = broker.actions();
         if case != "export_rejected" {
             assert!(
-                !actions.iter().any(|(service, action)|
-                    *service == "amaterasu.launch/1" && *action == "launch_export"),
+                !actions
+                    .iter()
+                    .any(|(service, action)| *service == "amaterasu.launch/1"
+                        && *action == "launch_export"),
                 "{case}"
             );
         }
         if case != "apply_failed" {
             assert!(broker.rtsp_closed, "{case}: staged RTSP must be closed");
         }
-        assert!(!actions.iter().any(|(service, action)|
-            *service == "amaterasu.display/1" && *action == "apply"));
+        assert!(
+            !actions
+                .iter()
+                .any(|(service, action)| *service == "amaterasu.display/1" && *action == "apply")
+        );
     }
 }
 
@@ -451,24 +627,41 @@ fn lost_prelaunch_export_result_at_deadline_restores_display_and_reconciles_appl
     broker.hold_launch_export_result = true;
     let stream = request(45);
     let paired = peer(45);
-    assert!(controller.launch(10, stream.clone(), paired.clone(), now).is_none());
+    assert!(
+        controller
+            .launch(10, stream.clone(), paired.clone(), now)
+            .is_none()
+    );
 
     for _ in 0..32 {
         if broker.held_launch_export_request.is_some() {
             break;
         }
-        assert!(controller.poll(now, &mut |command| broker.send(command)).is_empty());
+        assert!(
+            controller
+                .poll(now, &mut |command| broker.send(command))
+                .is_empty()
+        );
     }
-    let held_request = broker.held_launch_export_request.expect("export was accepted");
+    let held_request = broker
+        .held_launch_export_request
+        .expect("export was accepted");
     let record = controller.records.values().next().unwrap();
     assert_eq!(record.state, State::Starting);
-    assert!(record.rtsp_ticket.is_some(), "display lease was applied before export");
+    assert!(
+        record.rtsp_ticket.is_some(),
+        "display lease was applied before export"
+    );
     assert!(record.application_launch.is_none());
     let deadline = record.deadline;
     assert_eq!(deadline, now + INITIAL_DEADLINE);
 
     let near_deadline = deadline - Duration::from_millis(1);
-    assert!(controller.poll(near_deadline, &mut |command| broker.send(command)).is_empty());
+    assert!(
+        controller
+            .poll(near_deadline, &mut |command| broker.send(command))
+            .is_empty()
+    );
     assert_eq!(
         controller
             .launch(11, stream.clone(), paired.clone(), near_deadline)
@@ -479,28 +672,54 @@ fn lost_prelaunch_export_result_at_deadline_restores_display_and_reconciles_appl
     );
     let (connection, reply) = poll_until_reply(&mut controller, &mut broker, deadline);
     assert_eq!(connection, 10);
-    assert_ne!(reply.status, 200, "deadline must not produce a launch success");
-    assert!(broker.rtsp_closed, "RTSP Close restores the staged display lease");
-    assert!(broker.application_stopped, "owned Launch lookup found and stopped the app");
+    assert_ne!(
+        reply.status, 200,
+        "deadline must not produce a launch success"
+    );
+    assert!(
+        broker.rtsp_closed,
+        "RTSP Close restores the staged display lease"
+    );
+    assert!(
+        broker.application_stopped,
+        "owned Launch lookup found and stopped the app"
+    );
     let actions = broker.actions();
     let position = |service: &str, action: &str| {
         actions
             .iter()
-            .position(|(seen_service, seen_action)| *seen_service == service && *seen_action == action)
+            .position(|(seen_service, seen_action)| {
+                *seen_service == service && *seen_action == action
+            })
             .expect("required cleanup action")
     };
     assert!(position("amaterasu.rtsp/1", "open") < position("amaterasu.launch/1", "launch_export"));
-    assert!(position("amaterasu.launch/1", "launch_export") < position("amaterasu.rtsp/1", "close"));
+    assert!(
+        position("amaterasu.launch/1", "launch_export") < position("amaterasu.rtsp/1", "close")
+    );
     assert!(position("amaterasu.launch/1", "lookup") < position("amaterasu.launch/1", "stop"));
     assert!(broker.commands.iter().any(|command| matches!(
         command,
         Command::Cancel { request } if *request == held_request
     )));
     assert_eq!(
-        actions.iter().filter(|(service, action)|
-            *service == "amaterasu.launch/1" && *action == "launch_export").count(),
+        actions
+            .iter()
+            .filter(
+                |(service, action)| *service == "amaterasu.launch/1" && *action == "launch_export"
+            )
+            .count(),
         1
     );
-    assert_eq!(controller.records.values().next().unwrap().state, State::Failed);
-    assert_eq!(controller.launch(12, stream, paired, deadline).unwrap().status, 409);
+    assert_eq!(
+        controller.records.values().next().unwrap().state,
+        State::Failed
+    );
+    assert_eq!(
+        controller
+            .launch(12, stream, paired, deadline)
+            .unwrap()
+            .status,
+        409
+    );
 }

@@ -1,6 +1,7 @@
 //! Typed inner messages. Call only after modern control GCM authentication.
 mod feedback;
 mod input;
+mod rumble;
 #[cfg(test)]
 mod tests;
 mod translate;
@@ -14,6 +15,10 @@ pub use input::{
     ControllerArrival, ControllerBattery, ControllerBatteryState, ControllerMotion,
     ControllerMotionType, ControllerState, ControllerTouch, ControllerTouchEvent, Input, PenTouch,
     PointerDevice, PointerEvent,
+};
+pub use rumble::{
+    MAX_CONTROLLER_SLOT, RUMBLE_MESSAGE_TYPE, RumbleFeedback, RumbleFeedbackError,
+    encode_rumble_feedback,
 };
 pub use translate::{
     AbsoluteViewport, InputBatch, InputEvent, InputTranslator, KeyState as TranslatedKeyState,

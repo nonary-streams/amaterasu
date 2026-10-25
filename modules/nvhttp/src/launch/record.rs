@@ -2,6 +2,7 @@ use super::{
     CaptureMode, CaptureProvider, LaunchRequest, PeerIdentity, PhysicalDisplayMode,
     VideoEncryptionPolicySnapshot,
 };
+use crate::encoder_snapshot::{CodecOffer, EncoderSnapshot};
 use crate::frame_limiter::FrameLimiterSettings;
 use crate::launch::{DEFAULT_CLEANUP_BUDGET, MONITOR_INTERVAL, STREAM_CLEANUP_MARGIN_MS};
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
@@ -57,6 +58,8 @@ pub enum Stage {
 
 pub struct Record {
     pub id: u64,
+    pub desktop: bool,
+    pub resumed: bool,
     pub peer: PeerIdentity,
     pub request: LaunchRequest,
     /// Frozen requested physical mode; this does not assert a host display topology.
@@ -139,6 +142,10 @@ pub struct Record {
     pub global_minimum_fps_target: f64,
     /// Client-over-application stream controls resolved for this launch.
     pub effective_video_max_batch_size_kb: u8,
+    /// Codecs RTSP may negotiate for this launch, fixed at admission from
+    /// the encoder snapshot and the requested stream mode.
+    pub video_codec_offer: CodecOffer,
+    pub encoder_snapshot: Option<EncoderSnapshot>,
     pub effective_max_bitrate_kbps: Option<u32>,
     pub effective_qp: i32,
     pub effective_minimum_fps_target: f64,
@@ -230,6 +237,13 @@ impl Record {
         });
         Self {
             id,
+            encoder_snapshot: None,
+            video_codec_offer: CodecOffer {
+                codecs: vec![amaterasu_media::VideoCodec::H264],
+                software_limited: true,
+            },
+            desktop: false,
+            resumed: false,
             peer,
             request,
             physical_display_mode,

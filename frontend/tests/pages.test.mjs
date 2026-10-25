@@ -958,11 +958,130 @@ test("diagnostics rejects malformed signed records, cursors and unsafe counters"
   ]) assert.throws(() => pages.parseDiagnosticCountersReply(counters));
 });
 
+function diagnosticSession(id, overrides = {}) {
+  return {
+    session_id: id,
+    protocol: "moonlight",
+    client_name: `private-client-${id}`,
+    device_name: `private-device-${id}`,
+    app_name: `private-app-${id}`,
+    width: 1920,
+    height: 1080,
+    target_fps: 60,
+    target_bitrate_kbps: 12000,
+    codec: "h264",
+    started_at_unix: 10,
+    ended_at_unix: 20,
+    duration_seconds: 10,
+    ...overrides,
+  };
+}
+
+function diagnosticHistoryDetail(session, events = []) {
+  return { ok: true, detail: {
+    session,
+    sample_count: 0,
+    event_count: events.length,
+    samples_truncated: false,
+    events_truncated: false,
+    samples: [],
+    events: events.map((event, index) => ({
+      session_id: session.session_id,
+      recorded_at_unix: 15 + index,
+      payload: null,
+      ...event,
+    })),
+  } };
+}
+
+test("diagnostics shows bounded redacted session outcomes without implying record correlation", async () => {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  const sessions = [diagnosticSession("session-private-1"), diagnosticSession("session-private-2")];
+  const calls = [];
+  pages.renderDiagnostics({ content, notify() {}, navigate() {}, api: {
+    allows: (scope) => scope === "session.read" || scope === "diagnostics.read",
+    async post(route, payload = {}) {
+      calls.push({ route, payload });
+      if (route === "diagnostics/query") return diagnosticReply(payload.after, "ordinary caller record");
+      if (route === "diagnostics/counters") return { ok: true, counters: {} };
+      if (route === "history/list_sessions") return { ok: true, sessions, next_offset: null };
+      if (route === "history/session_detail" && payload.session_id === sessions[0].session_id)
+        return diagnosticHistoryDetail(sessions[0], [{ event_type: "stream_failed", payload: { state: "failed", reason: "capture_read_failed" } }]);
+      if (route === "history/session_detail")
+        return diagnosticHistoryDetail(sessions[1], [{ event_type: "stream_failed", payload: { reason: "future_private_reason" } }]);
+      throw new Error(`Unexpected route ${route}`);
+    },
+  } });
+  await waitFor(() => content.textContent.includes("Failure · Capture") && content.textContent.includes("stage not identified"), "session outcome summaries");
+  assert.match(content.textContent, /caller-scoped diagnostics/);
+  assert.match(content.textContent, /no record-to-session correlation is implied/);
+  assert.match(content.textContent, /Client and device identity are not displayed/);
+  assert.doesNotMatch(content.textContent, /private-client|private-device|private-app|session-private|future_private_reason/);
+  assert.equal(calls.filter((call) => call.route === "history/list_sessions")[0].payload.limit, 4);
+  assert.equal(calls.filter((call) => call.route === "history/session_detail").length, 2);
+});
+
+test("diagnostics session outcome panel reports missing history and enforces session.read", async () => {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  const calls = [];
+  pages.renderDiagnostics({ content, notify() {}, navigate() {}, api: {
+    allows: (scope) => scope === "diagnostics.read",
+    async post(route) {
+      calls.push(route);
+      if (route === "diagnostics/query") return diagnosticReply(0, "ready");
+      if (route === "diagnostics/counters") return { ok: true, counters: {} };
+      throw new Error(`Unexpected route ${route}`);
+    },
+  } });
+  await waitFor(() => content.textContent.includes("needs session.read"), "session permission state");
+  assert.equal(calls.some((route) => route.startsWith("history/")), false);
+
+  const missing = diagnosticHistoryDetail(diagnosticSession("missing-event"), []);
+  assert.equal(pages.diagnosticSessionOutcome(missing.detail), "Ended · no termination event recorded");
+  missing.detail.events_truncated = true;
+  assert.match(pages.diagnosticSessionOutcome(missing.detail), /history is truncated/);
+  assert.equal(pages.diagnosticSessionOutcome(null), "Outcome unavailable");
+});
+
+test("diagnostics ignores stale recent-session replies after refresh", async () => {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  const pendingLists = [];
+  const fresh = diagnosticSession("fresh-session");
+  const stale = diagnosticSession("stale-session");
+  pages.renderDiagnostics({ content, notify() {}, navigate() {}, api: {
+    allows: () => true,
+    async post(route, payload = {}) {
+      if (route === "diagnostics/query") return diagnosticReply(payload.after, "diagnostic ready");
+      if (route === "diagnostics/counters") return { ok: true, counters: {} };
+      if (route === "history/list_sessions") return new Promise((resolve) => pendingLists.push(resolve));
+      if (route === "history/session_detail") {
+        const session = payload.session_id === fresh.session_id ? fresh : stale;
+        return diagnosticHistoryDetail(session, [{ event_type: session === fresh ? "stream_stopped" : "stream_cancelled" }]);
+      }
+      throw new Error(`Unexpected route ${route}`);
+    },
+  } });
+  await waitFor(() => pendingLists.length === 1, "initial history load");
+  findButton(content, "Refresh").click();
+  await waitFor(() => pendingLists.length === 2, "refreshed history load");
+  pendingLists[1]({ ok: true, sessions: [fresh], next_offset: null });
+  await waitFor(() => content.textContent.includes("Stopped"), "fresh redacted history");
+  pendingLists[0]({ ok: true, sessions: [stale], next_offset: null });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.doesNotMatch(content.textContent, /stale-session|private-client-stale/);
+  assert.match(content.textContent, /Stopped/);
+  assert.doesNotMatch(content.textContent, /Cancelled/);
+});
+
 test("diagnostics ignores older page replies and errors after refresh", async () => {
   const pending = [];
   const content = new FakeElement("main");
   content.setConnected(true);
   pages.renderDiagnostics({ content, notify() {}, navigate() {}, api: {
+    allows: () => true,
     async post(route, payload) {
       if (route === "diagnostics/counters") return { ok: true, counters: { reads: 1 } };
       if (route === "diagnostics/query")
@@ -999,6 +1118,7 @@ test("diagnostics resync clears back navigation into evicted records", async () 
   const content = new FakeElement("main");
   content.setConnected(true);
   pages.renderDiagnostics({ content, notify() {}, navigate() {}, api: {
+    allows: () => true,
     async post(route, payload) {
       if (route === "diagnostics/counters") return { ok: true, counters: {} };
       if (route === "diagnostics/query")

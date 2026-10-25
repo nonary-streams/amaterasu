@@ -1,18 +1,28 @@
 //! PulseAudio capture for Linux, including PipeWire's Pulse compatibility server.
+mod cleanup_journal;
+
 use super::RecoveryConfig;
 use crate::{
-    model::{AudioResult, Endpoint, Format, Packet},
+    model::{AudioResult, Endpoint, Format, Packet, PcmCaptureFormat},
     virtual_sink::{self, select_endpoint},
 };
 use amaterasu_media::{AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, PCM_F32};
+use cleanup_journal::{
+    CleanupJournal, CleanupState, RouteIntent, RouteRestoreAction, SinkCleanupAction, SinkIntent,
+    SinkObservation, can_add_sink_intent, can_start_sink_load, deactivate_prior_process_sinks,
+    has_unquiesced_sink_load, route_restore_action, sink_cleanup_action, sink_cleanup_requested,
+};
 use std::{
+    any::Any,
     collections::{BTreeMap, VecDeque},
     ffi::{CStr, CString, c_char, c_int, c_void},
     mem::size_of,
     panic::{AssertUnwindSafe, catch_unwind},
+    path::Path,
     ptr,
     sync::{
         Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Sender},
     },
     thread::{self, JoinHandle},
@@ -33,6 +43,7 @@ const PA_ERR_ACCESS: c_int = 1;
 const PA_ERR_TIMEOUT: c_int = 8;
 const PA_ERR_AUTHKEY: c_int = 9;
 const PA_ERR_INVALIDSERVER: c_int = 13;
+const PA_OPERATION_RUNNING: c_int = 0;
 const PA_OPERATION_DONE: c_int = 1;
 const PA_OPERATION_CANCELLED: c_int = 2;
 const PA_STREAM_READY: c_int = 2;
@@ -42,8 +53,18 @@ const PA_SAMPLE_FLOAT32LE: c_int = 5;
 const AUDIO_RATE: u32 = 48_000;
 const FRAMES_PER_PACKET: u32 = 480;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_QUERY_FAILURE_LIMIT: u8 = 3;
+const STARTUP_OPEN_MAX_ATTEMPTS: usize = 2;
+const STARTUP_OPEN_RETRY_DELAY: Duration = Duration::from_millis(200);
+const STARTUP_OPEN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1_800);
+const STARTUP_OPEN_TOTAL_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_CAPTURE_CHUNK: usize = 1024 * 1024;
+static NEXT_MANAGED_SINK: AtomicU64 = AtomicU64::new(1);
+static NEXT_SINK_CLEANUP_SLOT: AtomicU64 = AtomicU64::new(0);
+static CLEANUP_JOURNAL: OnceLock<Mutex<Option<CleanupJournal>>> = OnceLock::new();
+static CLEANUP_JOURNAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[repr(C)]
 struct PaMainloop {
@@ -202,6 +223,7 @@ unsafe extern "C" {
         userdata: *mut c_void,
     ) -> *mut PaOperation;
     fn pa_operation_get_state(operation: *const PaOperation) -> c_int;
+    fn pa_operation_cancel(operation: *mut PaOperation);
     fn pa_operation_unref(operation: *mut PaOperation);
     fn pa_proplist_gets(proplist: *const PaProplist, key: *const c_char) -> *const c_char;
 }
@@ -235,6 +257,7 @@ struct Sink {
     monitor_source: String,
     channel_positions: Vec<c_int>,
     owner_module: u32,
+    managed_token: Option<String>,
 }
 
 #[derive(Default)]
@@ -242,6 +265,143 @@ struct ServerInfoResult {
     completed: bool,
     failed: bool,
     default_sink: Option<String>,
+}
+
+struct PendingServerInfoQuery {
+    operation: Operation,
+    result: Box<ServerInfoResult>,
+    started_at: Instant,
+}
+
+enum QueryPoll<T> {
+    Pending,
+    Complete(AudioResult<T>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PulseOperationState {
+    Running,
+    Done,
+    Cancelled,
+    Unknown,
+}
+
+fn pulse_operation_state(state: c_int) -> PulseOperationState {
+    match state {
+        PA_OPERATION_RUNNING => PulseOperationState::Running,
+        PA_OPERATION_DONE => PulseOperationState::Done,
+        PA_OPERATION_CANCELLED => PulseOperationState::Cancelled,
+        _ => PulseOperationState::Unknown,
+    }
+}
+
+fn default_query_timed_out(started_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(started_at) >= DEFAULT_QUERY_TIMEOUT
+}
+
+fn next_default_query_failure_count(failures: u8) -> u8 {
+    failures.saturating_add(1).min(DEFAULT_QUERY_FAILURE_LIMIT)
+}
+
+fn default_query_failures_after_result(failures: u8, succeeded: bool) -> u8 {
+    if succeeded {
+        0
+    } else {
+        next_default_query_failure_count(failures)
+    }
+}
+
+fn default_queries_disabled(failures: u8) -> bool {
+    failures >= DEFAULT_QUERY_FAILURE_LIMIT
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefaultRouteDecision {
+    Pending,
+    Unchanged,
+    Changed,
+    Retry,
+    Reopen,
+    Failed(&'static str),
+}
+
+fn transient_default_query_error(error: &str) -> bool {
+    matches!(
+        error,
+        "audio_operation_timeout"
+            | "audio_server_timeout"
+            | "audio_server_unavailable"
+            | "audio_backend_failed"
+    )
+}
+
+fn default_route_decision(
+    result: Option<AudioResult<Option<String>>>,
+    expected_sink: &str,
+    retries_exhausted: bool,
+) -> DefaultRouteDecision {
+    match result {
+        None if retries_exhausted => DefaultRouteDecision::Reopen,
+        None => DefaultRouteDecision::Pending,
+        Some(Ok(Some(current))) if current == expected_sink => DefaultRouteDecision::Unchanged,
+        Some(Ok(_)) => DefaultRouteDecision::Changed,
+        Some(Err(error)) if transient_default_query_error(error) && retries_exhausted => {
+            DefaultRouteDecision::Reopen
+        }
+        Some(Err(error)) if transient_default_query_error(error) => DefaultRouteDecision::Retry,
+        Some(Err(error)) => DefaultRouteDecision::Failed(error),
+    }
+}
+
+fn startup_open_is_side_effect_free(
+    requested: &str,
+    virtual_sink: Option<&str>,
+    host_audio_enabled: bool,
+    capture_sink_without_routing: bool,
+) -> bool {
+    virtual_sink.is_none()
+        && host_audio_enabled
+        && ((requested.is_empty() || requested == "default") || capture_sink_without_routing)
+}
+
+fn transient_startup_open_error(error: &str) -> bool {
+    matches!(
+        error,
+        "audio_server_timeout"
+            | "audio_server_unavailable"
+            | "audio_operation_timeout"
+            | "audio_backend_failed"
+            | "audio_capture_unavailable"
+    )
+}
+
+fn should_retry_startup_open(error: &str, attempt: usize, side_effect_free: bool) -> bool {
+    side_effect_free && attempt < STARTUP_OPEN_MAX_ATTEMPTS && transient_startup_open_error(error)
+}
+
+fn startup_operation_timeout(deadline: Instant, now: Instant) -> AudioResult<Duration> {
+    let remaining = deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or("audio_operation_timeout")?;
+    Ok(CONTROL_TIMEOUT.min(remaining))
+}
+
+fn wait_for_startup_open_retry(stop: &AtomicBool, deadline: Instant) -> bool {
+    let retry_deadline = Instant::now() + STARTUP_OPEN_RETRY_DELAY;
+    if retry_deadline >= deadline {
+        return false;
+    }
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let remaining = retry_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::park_timeout(remaining.min(Duration::from_millis(10)));
+    }
 }
 
 #[derive(Default)]
@@ -263,13 +423,39 @@ struct IndexResult {
     index: Option<u32>,
 }
 
+#[derive(Default)]
+struct PendingCallbackStates {
+    states: Vec<Box<dyn Any>>,
+}
+
+impl PendingCallbackStates {
+    fn retain<T: 'static>(&mut self, state: Box<T>) {
+        self.states.push(state);
+    }
+}
+
+fn finish_operation_wait<T: 'static>(
+    result: AudioResult<()>,
+    callback_state: Box<T>,
+    pending_callback_states: &mut PendingCallbackStates,
+) -> AudioResult<Box<T>> {
+    match result {
+        Ok(()) => Ok(callback_state),
+        Err(error) => {
+            pending_callback_states.retain(callback_state);
+            Err(error)
+        }
+    }
+}
+
 struct Operation(*mut PaOperation);
 
 impl Drop for Operation {
     fn drop(&mut self) {
         if !self.0.is_null() {
             // SAFETY: this guard owns the unique operation reference returned
-            // by libpulse and releases it after its callback has completed.
+            // by libpulse. Error paths cancel before unref and retain userdata
+            // until this client's mainloop has been destroyed.
             unsafe { pa_operation_unref(self.0) };
         }
     }
@@ -278,10 +464,18 @@ impl Drop for Operation {
 struct PulseClient {
     mainloop: *mut PaMainloop,
     context: *mut PaContext,
+    pending_callback_states: PendingCallbackStates,
+    pending_default_query: Option<PendingServerInfoQuery>,
+    default_queries_disabled: bool,
+    default_query_failures: u8,
 }
 
 impl PulseClient {
     fn connect() -> AudioResult<Self> {
+        Self::connect_with_timeout(CONTROL_TIMEOUT)
+    }
+
+    fn connect_with_timeout(timeout: Duration) -> AudioResult<Self> {
         let name = CString::new("Amaterasu Audio").expect("static client name contains no NUL");
         // SAFETY: all returned handles are checked and then owned by PulseClient.
         let mainloop = unsafe { pa_mainloop_new() };
@@ -302,7 +496,14 @@ impl PulseClient {
             unsafe { pa_mainloop_free(mainloop) };
             return Err("audio_backend_unavailable");
         }
-        let mut client = Self { mainloop, context };
+        let mut client = Self {
+            mainloop,
+            context,
+            pending_callback_states: PendingCallbackStates::default(),
+            pending_default_query: None,
+            default_queries_disabled: false,
+            default_query_failures: 0,
+        };
         // Disable PulseAudio's autospawn behavior: the audio module connects to
         // the user's existing service and never starts or restarts it.
         // SAFETY: context is live; null selects the user's configured server.
@@ -311,7 +512,7 @@ impl PulseClient {
         {
             return Err(context_connection_error(context));
         }
-        client.wait_until_connected(CONTROL_TIMEOUT)?;
+        client.wait_until_connected(timeout)?;
         Ok(client)
     }
 
@@ -387,51 +588,192 @@ impl PulseClient {
         }
     }
 
-    fn wait_operation(&mut self, pointer: *mut PaOperation) -> AudioResult<()> {
+    fn wait_operation<T: 'static>(
+        &mut self,
+        pointer: *mut PaOperation,
+        callback_state: Box<T>,
+    ) -> AudioResult<Box<T>> {
+        self.wait_operation_with_timeout(pointer, callback_state, CONTROL_TIMEOUT)
+    }
+
+    fn wait_operation_with_timeout<T: 'static>(
+        &mut self,
+        pointer: *mut PaOperation,
+        callback_state: Box<T>,
+        timeout: Duration,
+    ) -> AudioResult<Box<T>> {
         if pointer.is_null() {
             return Err("audio_backend_failed");
         }
         let operation = Operation(pointer);
-        self.wait_until(CONTROL_TIMEOUT, || {
+        let result = self.wait_until(timeout, || {
             // SAFETY: operation guard keeps the operation alive until this call ends.
             match unsafe { pa_operation_get_state(operation.0) } {
                 PA_OPERATION_DONE => Some(Ok(())),
                 PA_OPERATION_CANCELLED => Some(Err("audio_backend_failed")),
                 _ => None,
             }
-        })
+        });
+        if result.is_err() {
+            // SAFETY: this operation is uniquely owned and all PulseAudio API
+            // access occurs on this client thread. Cancel disables its result
+            // callback; retaining the boxed state until mainloop teardown also
+            // covers any callback already queued before cancellation.
+            unsafe { pa_operation_cancel(operation.0) };
+        }
+        finish_operation_wait(result, callback_state, &mut self.pending_callback_states)
     }
 
     fn default_sink(&mut self) -> AudioResult<Option<String>> {
-        let mut result = ServerInfoResult::default();
-        // SAFETY: callback userdata points to a stack result that remains live
-        // until wait_operation returns and the operation has completed.
+        self.default_sink_with_timeout(CONTROL_TIMEOUT)
+    }
+
+    fn default_sink_with_timeout(&mut self, timeout: Duration) -> AudioResult<Option<String>> {
+        let result = self.server_info_with_timeout(timeout)?;
+        Ok(result.default_sink)
+    }
+
+    fn start_default_sink_query(&mut self) -> AudioResult<()> {
+        if self.pending_default_query.is_some() || self.default_queries_disabled {
+            return Ok(());
+        }
+        let mut result = Box::new(ServerInfoResult::default());
+        // SAFETY: callback userdata remains owned by this client until the
+        // query completes or the mainloop is destroyed during client teardown.
         let operation = unsafe {
             pa_context_get_server_info(
                 self.context,
                 Some(server_info_callback),
-                (&mut result as *mut ServerInfoResult).cast(),
+                (&mut *result as *mut ServerInfoResult).cast(),
             )
         };
-        self.wait_operation(operation)?;
+        if operation.is_null() {
+            self.note_default_query_failure();
+            return Err("audio_backend_failed");
+        }
+        self.pending_default_query = Some(PendingServerInfoQuery {
+            operation: Operation(operation),
+            result,
+            started_at: Instant::now(),
+        });
+        Ok(())
+    }
+
+    fn poll_default_sink_query(&mut self) -> QueryPoll<Option<String>> {
+        let (operation_state, started_at) = {
+            let Some(query) = self.pending_default_query.as_ref() else {
+                return QueryPoll::Pending;
+            };
+            // SAFETY: the pending query uniquely owns a live operation reference.
+            (
+                pulse_operation_state(unsafe { pa_operation_get_state(query.operation.0) }),
+                query.started_at,
+            )
+        };
+        match operation_state {
+            PulseOperationState::Running | PulseOperationState::Unknown
+                if !default_query_timed_out(started_at, Instant::now()) =>
+            {
+                QueryPoll::Pending
+            }
+            PulseOperationState::Running | PulseOperationState::Unknown => {
+                let query = self
+                    .pending_default_query
+                    .take()
+                    .expect("the timed-out default query is still present");
+                // SAFETY: this client exclusively owns the operation and all
+                // Pulse calls run on this thread. Retain userdata because a
+                // callback queued before cancellation can still arrive.
+                unsafe { pa_operation_cancel(query.operation.0) };
+                self.pending_callback_states.retain(query.result);
+                self.note_default_query_failure();
+                QueryPoll::Complete(Err("audio_operation_timeout"))
+            }
+            PulseOperationState::Done => {
+                let mut query = self
+                    .pending_default_query
+                    .take()
+                    .expect("the completed default query is still present");
+                if query.result.failed || !query.result.completed {
+                    self.note_default_query_failure();
+                    QueryPoll::Complete(Err("audio_backend_failed"))
+                } else {
+                    self.default_query_failures =
+                        default_query_failures_after_result(self.default_query_failures, true);
+                    self.default_queries_disabled =
+                        default_queries_disabled(self.default_query_failures);
+                    QueryPoll::Complete(Ok(query.result.default_sink.take()))
+                }
+            }
+            PulseOperationState::Cancelled => {
+                let query = self
+                    .pending_default_query
+                    .take()
+                    .expect("the cancelled default query is still present");
+                // A callback already queued by libpulse can still run after
+                // cancellation; retain its userdata until this client's mainloop
+                // is destroyed, matching the synchronous operation path.
+                self.pending_callback_states.retain(query.result);
+                self.note_default_query_failure();
+                QueryPoll::Complete(Err("audio_backend_failed"))
+            }
+        }
+    }
+
+    fn note_default_query_failure(&mut self) {
+        self.default_query_failures =
+            default_query_failures_after_result(self.default_query_failures, false);
+        self.default_queries_disabled = default_queries_disabled(self.default_query_failures);
+    }
+
+    /// Completes a server query queued after earlier commands on this context.
+    /// A successful result fences effects submitted earlier on this connection;
+    /// queries on a replacement connection are not equivalent.
+    fn quiesce_prior_commands(&mut self) -> AudioResult<()> {
+        self.server_info().map(|_| ())
+    }
+
+    fn server_info(&mut self) -> AudioResult<Box<ServerInfoResult>> {
+        self.server_info_with_timeout(CONTROL_TIMEOUT)
+    }
+
+    fn server_info_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> AudioResult<Box<ServerInfoResult>> {
+        let mut result = Box::new(ServerInfoResult::default());
+        // SAFETY: callback userdata points to heap-owned result state retained
+        // until completion or until this client's mainloop has been destroyed.
+        let operation = unsafe {
+            pa_context_get_server_info(
+                self.context,
+                Some(server_info_callback),
+                (&mut *result as *mut ServerInfoResult).cast(),
+            )
+        };
+        let result = self.wait_operation_with_timeout(operation, result, timeout)?;
         if result.failed || !result.completed {
             return Err("audio_backend_failed");
         }
-        Ok(result.default_sink)
+        Ok(result)
     }
 
     fn sinks(&mut self) -> AudioResult<Vec<Sink>> {
-        let mut result = SinkListResult::default();
-        // SAFETY: callback userdata points to a stack result that stays live
-        // until the list operation has completed on this mainloop.
+        self.sinks_with_timeout(CONTROL_TIMEOUT)
+    }
+
+    fn sinks_with_timeout(&mut self, timeout: Duration) -> AudioResult<Vec<Sink>> {
+        let mut result = Box::new(SinkListResult::default());
+        // SAFETY: callback userdata points to heap-owned result state retained
+        // until completion or until this client's mainloop has been destroyed.
         let operation = unsafe {
             pa_context_get_sink_info_list(
                 self.context,
                 Some(sink_info_callback),
-                (&mut result as *mut SinkListResult).cast(),
+                (&mut *result as *mut SinkListResult).cast(),
             )
         };
-        self.wait_operation(operation)?;
+        let result = self.wait_operation_with_timeout(operation, result, timeout)?;
         if result.failed || !result.completed {
             return Err("audio_backend_failed");
         }
@@ -440,18 +782,18 @@ impl PulseClient {
 
     fn set_default_sink(&mut self, name: &str) -> AudioResult<()> {
         let name = CString::new(name).map_err(|_| "invalid_endpoint")?;
-        let mut result = BooleanResult::default();
-        // SAFETY: the endpoint CString and callback state remain live until the
-        // asynchronous operation has completed.
+        let mut result = Box::new(BooleanResult::default());
+        // SAFETY: the endpoint CString remains live through operation creation;
+        // boxed callback state is retained through completion or cancellation.
         let operation = unsafe {
             pa_context_set_default_sink(
                 self.context,
                 name.as_ptr(),
                 Some(success_callback),
-                (&mut result as *mut BooleanResult).cast(),
+                (&mut *result as *mut BooleanResult).cast(),
             )
         };
-        self.wait_operation(operation)?;
+        let result = self.wait_operation(operation, result)?;
         if result.completed && result.succeeded {
             Ok(())
         } else {
@@ -459,42 +801,43 @@ impl PulseClient {
         }
     }
 
-    fn load_null_sink(&mut self, name: &str, channels: u32) -> AudioResult<u32> {
+    fn load_null_sink(&mut self, name: &str, channels: u32, owner_token: &str) -> AudioResult<u32> {
         let layout = null_sink_layout(channels)?;
         let arguments = CString::new(format!(
-            "sink_name={name} rate={AUDIO_RATE} format=float32le channels={channels} channel_map={} sink_properties=device.description=AmaterasuAudio",
+            "sink_name={name} rate={AUDIO_RATE} format=float32le channels={channels} channel_map={} sink_properties=\"device.description=AmaterasuAudio amaterasu.audio.owner={owner_token}\"",
             layout.pulse_map
         ))
         .map_err(|_| "invalid_virtual_sink")?;
         let module = CString::new("module-null-sink").expect("static module name contains no NUL");
-        let mut result = IndexResult::default();
-        // SAFETY: module arguments and callback state live until the operation
-        // completes; only known generated sink names reach this function.
+        let mut result = Box::new(IndexResult::default());
+        // SAFETY: module arguments live through operation creation; boxed
+        // callback state is retained through completion or cancellation.
         let operation = unsafe {
             pa_context_load_module(
                 self.context,
                 module.as_ptr(),
                 arguments.as_ptr(),
                 Some(index_callback),
-                (&mut result as *mut IndexResult).cast(),
+                (&mut *result as *mut IndexResult).cast(),
             )
         };
-        self.wait_operation(operation)?;
+        let result = self.wait_operation(operation, result)?;
         result.index.ok_or("virtual_sink_unavailable")
     }
 
     fn unload_module(&mut self, index: u32) -> AudioResult<()> {
-        let mut result = BooleanResult::default();
-        // SAFETY: callback state remains live until the module operation ends.
+        let mut result = Box::new(BooleanResult::default());
+        // SAFETY: boxed callback state is retained through completion or
+        // cancellation of the module operation.
         let operation = unsafe {
             pa_context_unload_module(
                 self.context,
                 index,
                 Some(success_callback),
-                (&mut result as *mut BooleanResult).cast(),
+                (&mut *result as *mut BooleanResult).cast(),
             )
         };
-        self.wait_operation(operation)?;
+        let result = self.wait_operation(operation, result)?;
         if result.completed && result.succeeded {
             Ok(())
         } else {
@@ -502,11 +845,12 @@ impl PulseClient {
         }
     }
 
-    fn record_stream(
+    fn record_stream_with_timeout(
         &mut self,
         source: &str,
         channels: u32,
         positions: &[c_int],
+        timeout: Duration,
     ) -> AudioResult<PulseStream> {
         if positions.len() != channels as usize || !(1..=8).contains(&channels) {
             return Err("unsupported_channel_layout");
@@ -540,7 +884,7 @@ impl PulseClient {
         if unsafe { pa_stream_connect_record(capture.0, source.as_ptr(), &attributes, 0) } < 0 {
             return Err("audio_capture_unavailable");
         }
-        self.wait_until(CONTROL_TIMEOUT, || {
+        self.wait_until(timeout, || {
             // SAFETY: PulseStream guard owns a live stream until setup completes.
             match unsafe { pa_stream_get_state(capture.0) } {
                 PA_STREAM_READY => Some(Ok(())),
@@ -581,8 +925,15 @@ fn context_error_code(error: c_int) -> &'static str {
 impl Drop for PulseClient {
     fn drop(&mut self) {
         // SAFETY: context and mainloop are uniquely owned and destroyed in
-        // dependency order after every stream has released its context use.
+        // dependency order. `pending_callback_states` is a field and therefore
+        // remains alive through this body, including mainloop teardown, before
+        // Rust drops that field after this method returns.
         unsafe {
+            if let Some(query) = &self.pending_default_query {
+                // SAFETY: the pending query uniquely owns this operation and
+                // callback userdata remains in the query until teardown ends.
+                pa_operation_cancel(query.operation.0);
+            }
             if !self.context.is_null() {
                 pa_context_disconnect(self.context);
                 pa_context_unref(self.context);
@@ -713,6 +1064,7 @@ unsafe fn read_sink_info(info: &PaSinkInfo) -> Option<Sink> {
         monitor_source,
         channel_positions,
         owner_module: info.owner_module,
+        managed_token: unsafe { proplist_string(info.proplist, c"amaterasu.audio.owner") },
     })
 }
 
@@ -766,6 +1118,34 @@ fn null_sink_layout(channels: u32) -> AudioResult<NullSinkLayout> {
     }
 }
 
+fn capture_channel_layout(
+    endpoint_positions: &[c_int],
+    virtual_channels: Option<u32>,
+    requested: Option<PcmCaptureFormat>,
+) -> AudioResult<(Vec<c_int>, u32)> {
+    if let Some(channels) = virtual_channels {
+        let layout = null_sink_layout(channels)?;
+        if let Some(requested) = requested {
+            requested.validate()?;
+            if requested.channels != channels {
+                return Err("invalid_capture_format");
+            }
+        }
+        return Ok((layout.positions.to_vec(), channels));
+    }
+
+    if let Some(requested) = requested {
+        requested.validate()?;
+        let layout = null_sink_layout(requested.channels)?;
+        return Ok((layout.positions.to_vec(), requested.channels));
+    }
+
+    if !(1..=8).contains(&endpoint_positions.len()) {
+        return Err("unsupported_format");
+    }
+    Ok((endpoint_positions.to_vec(), endpoint_positions.len() as u32))
+}
+
 fn pa_channel_map(channels: u32, positions: &[c_int]) -> AudioResult<PaChannelMap> {
     if positions.len() != channels as usize || positions.len() > PA_CHANNELS_MAX {
         return Err("unsupported_channel_layout");
@@ -804,20 +1184,48 @@ fn channel_mask(positions: &[c_int]) -> u32 {
 #[derive(Debug)]
 pub(super) struct ManagedVirtualSink {
     name: String,
+    owner_token: String,
     channels: u32,
     module_index: Mutex<Option<u32>>,
 }
 
 impl ManagedVirtualSink {
     fn ensure(&self, client: &mut PulseClient) -> AudioResult<()> {
-        if client
-            .sinks()?
-            .iter()
-            .any(|sink| sink.endpoint.id == self.name)
+        if read_cleanup_state()?
+            .sinks
+            .get(&self.name)
+            .is_some_and(|intent| intent.module_index.is_none() && !intent.load_quiesced)
         {
+            return Err("audio_sink_load_pending");
+        }
+        let sinks = client.sinks()?;
+        if sinks.iter().any(|sink| {
+            sink.endpoint.id == self.name
+                && sink.managed_token.as_deref() == Some(self.owner_token.as_str())
+        }) {
             return Ok(());
         }
-        let index = client.load_null_sink(&self.name, self.channels)?;
+        if sinks.iter().any(|sink| sink.endpoint.id == self.name) {
+            return Err("virtual_sink_name_conflict");
+        }
+        persist_sink_intent(&self.name, &self.owner_token, None, false, true)?;
+        let index = match client.load_null_sink(&self.name, self.channels, &self.owner_token) {
+            Ok(index) => index,
+            Err(error) => {
+                if client.quiesce_prior_commands().is_ok() {
+                    let _ = mark_sink_load_quiesced(&self.name, &self.owner_token);
+                }
+                retry_virtual_sink_cleanups_with_client(client, Some(&self.name));
+                return Err(error);
+            }
+        };
+        if let Err(error) =
+            persist_sink_intent(&self.name, &self.owner_token, Some(index), true, false)
+        {
+            let _ = request_sink_cleanup(&self.name, &self.owner_token);
+            retry_virtual_sink_cleanups_with_client(client, Some(&self.name));
+            return Err(error);
+        }
         *self
             .module_index
             .lock()
@@ -828,88 +1236,407 @@ impl ManagedVirtualSink {
 
 impl Drop for ManagedVirtualSink {
     fn drop(&mut self) {
-        let Some(index) = *self
+        if self
             .module_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-        else {
+            .is_none()
+        {
             return;
-        };
+        }
+        let _ = request_sink_cleanup(&self.name, &self.owner_token);
         let _cleanup_guard = virtual_sink_cleanup_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cleaned = PulseClient::connect()
-            .and_then(|mut client| unload_owned_virtual_sink(&mut client, &self.name, index))
-            .is_ok();
-        if !cleaned {
-            remember_virtual_sink_cleanup(&self.name, index);
+        if let Ok(mut client) = PulseClient::connect() {
+            retry_virtual_sink_cleanups_with_client(&mut client, Some(&self.name));
         }
     }
 }
 
-#[derive(Clone, Debug)]
-struct PendingVirtualSinkCleanup {
-    name: String,
-    module_index: u32,
-}
-
-static PENDING_VIRTUAL_SINK_CLEANUPS: OnceLock<
-    Mutex<BTreeMap<(String, u32), PendingVirtualSinkCleanup>>,
-> = OnceLock::new();
 static VIRTUAL_SINK_CLEANUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn pending_virtual_sink_cleanups()
--> &'static Mutex<BTreeMap<(String, u32), PendingVirtualSinkCleanup>> {
-    PENDING_VIRTUAL_SINK_CLEANUPS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
 
 fn virtual_sink_cleanup_lock() -> &'static Mutex<()> {
     VIRTUAL_SINK_CLEANUP_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn remember_virtual_sink_cleanup(name: &str, module_index: u32) {
-    let mut pending = pending_virtual_sink_cleanups()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    pending
-        .entry((name.to_owned(), module_index))
-        .or_insert_with(|| PendingVirtualSinkCleanup {
-            name: name.to_owned(),
-            module_index,
-        });
+fn cleanup_journal_lock() -> &'static Mutex<()> {
+    CLEANUP_JOURNAL_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn read_cleanup_state() -> AudioResult<CleanupState> {
+    let _guard = cleanup_journal_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let journal = CLEANUP_JOURNAL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    journal
+        .as_ref()
+        .ok_or("audio_cleanup_journal_unavailable")?
+        .read()
+}
+
+fn update_cleanup_state(update: impl FnOnce(&mut CleanupState)) -> AudioResult<()> {
+    let _guard = cleanup_journal_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let journal = CLEANUP_JOURNAL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let journal = journal
+        .as_ref()
+        .ok_or("audio_cleanup_journal_unavailable")?;
+    let mut state = journal.read()?;
+    update(&mut state);
+    journal.write(&state)
+}
+
+fn persist_sink_intent(
+    name: &str,
+    owner_token: &str,
+    module_index: Option<u32>,
+    lease_active: bool,
+    cleanup_requested: bool,
+) -> AudioResult<()> {
+    let _guard = cleanup_journal_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let journal = CLEANUP_JOURNAL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let journal = journal
+        .as_ref()
+        .ok_or("audio_cleanup_journal_unavailable")?;
+    let mut state = journal.read()?;
+    if !can_add_sink_intent(&state, name) {
+        return Err("audio_cleanup_journal_capacity_reached");
+    }
+    state.sinks.insert(
+        name.to_owned(),
+        SinkIntent {
+            owner_token: owner_token.to_owned(),
+            module_index,
+            lease_active,
+            cleanup_requested,
+            load_quiesced: module_index.is_some(),
+            unload_submitted: false,
+            unload_confirmed: false,
+            unload_quiesced: false,
+        },
+    );
+    journal.write(&state)
+}
+
+fn mark_sink_load_quiesced(name: &str, owner_token: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(intent) = state
+            .sinks
+            .get_mut(name)
+            .filter(|intent| intent.owner_token == owner_token && intent.module_index.is_none())
+        {
+            found = true;
+            intent.load_quiesced = true;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn request_sink_cleanup(name: &str, owner_token: &str) -> AudioResult<()> {
+    update_cleanup_state(|state| {
+        if let Some(intent) = state
+            .sinks
+            .get_mut(name)
+            .filter(|intent| intent.owner_token == owner_token)
+        {
+            intent.lease_active = false;
+            intent.cleanup_requested = true;
+        }
+    })
+}
+
+fn mark_sink_unload_submitted(name: &str, owner_token: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(intent) = state
+            .sinks
+            .get_mut(name)
+            .filter(|intent| intent.owner_token == owner_token)
+        {
+            found = true;
+            intent.unload_submitted = true;
+            intent.unload_confirmed = false;
+            intent.unload_quiesced = false;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn mark_sink_unload_quiesced(name: &str, owner_token: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(intent) = state
+            .sinks
+            .get_mut(name)
+            .filter(|intent| intent.owner_token == owner_token)
+        {
+            found = true;
+            intent.unload_quiesced = true;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn mark_sink_unload_confirmed(name: &str, owner_token: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(intent) = state
+            .sinks
+            .get_mut(name)
+            .filter(|intent| intent.owner_token == owner_token)
+        {
+            found = true;
+            intent.unload_confirmed = true;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn remove_sink_intent(name: &str, owner_token: &str) -> AudioResult<()> {
+    update_cleanup_state(|state| {
+        if state
+            .sinks
+            .get(name)
+            .is_some_and(|intent| intent.owner_token == owner_token)
+        {
+            state.sinks.remove(name);
+        }
+    })
+}
+
+fn persist_route_intent(target_sink: &str, original_sink: &str) -> AudioResult<()> {
+    update_cleanup_state(|state| {
+        state.route = Some(RouteIntent {
+            target_sink: target_sink.to_owned(),
+            original_sink: original_sink.to_owned(),
+            assignment_confirmed: false,
+            assignment_quiesced: false,
+            restoration_submitted: false,
+            restoration_confirmed: false,
+            restoration_quiesced: false,
+        });
+    })
+}
+
+fn mark_route_assignment_quiesced(target_sink: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(route) = state
+            .route
+            .as_mut()
+            .filter(|route| route.target_sink == target_sink)
+        {
+            found = true;
+            route.assignment_quiesced = true;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn confirm_route_intent(target_sink: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(route) = state
+            .route
+            .as_mut()
+            .filter(|route| route.target_sink == target_sink)
+        {
+            found = true;
+            route.assignment_confirmed = true;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn mark_route_restoration_submitted(target_sink: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(route) = state
+            .route
+            .as_mut()
+            .filter(|route| route.target_sink == target_sink)
+        {
+            found = true;
+            route.restoration_submitted = true;
+            route.restoration_confirmed = false;
+            route.restoration_quiesced = false;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn mark_route_restoration_quiesced(target_sink: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(route) = state
+            .route
+            .as_mut()
+            .filter(|route| route.target_sink == target_sink)
+        {
+            found = true;
+            route.restoration_quiesced = true;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn mark_route_restoration_confirmed(target_sink: &str) -> AudioResult<()> {
+    let mut found = false;
+    update_cleanup_state(|state| {
+        if let Some(route) = state
+            .route
+            .as_mut()
+            .filter(|route| route.target_sink == target_sink)
+        {
+            found = true;
+            route.restoration_confirmed = true;
+        }
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err("audio_cleanup_journal_conflict")
+    }
+}
+
+fn clear_route_intent(target_sink: &str) -> AudioResult<()> {
+    let mut conflict = false;
+    update_cleanup_state(|state| match state.route.as_ref() {
+        Some(route) if route.target_sink == target_sink => state.route = None,
+        Some(_) => conflict = true,
+        None => (),
+    })?;
+    if conflict {
+        Err("audio_cleanup_journal_conflict")
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 fn owns_virtual_sink_module(sinks: &[Sink], sink_name: &str, module_index: u32) -> bool {
     sinks
         .iter()
         .any(|sink| sink.endpoint.id == sink_name && sink.owner_module == module_index)
 }
 
-fn unload_owned_virtual_sink(
-    client: &mut PulseClient,
-    sink_name: &str,
-    module_index: u32,
-) -> AudioResult<()> {
-    if !owns_virtual_sink_module(&client.sinks()?, sink_name, module_index) {
-        return Ok(());
-    }
-    client.unload_module(module_index)
-}
-
 fn retry_virtual_sink_cleanups_with_client(client: &mut PulseClient, name_filter: Option<&str>) {
-    let pending = pending_virtual_sink_cleanups()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-        .filter(|cleanup| name_filter.is_none_or(|name| cleanup.name == name))
-        .cloned()
+    let Ok(state) = read_cleanup_state() else {
+        return;
+    };
+    let pending = state
+        .sinks
+        .into_iter()
+        .filter(|(_, intent)| sink_cleanup_requested(intent))
+        .filter(|(name, _)| name_filter.is_none_or(|filter| name == filter))
         .collect::<Vec<_>>();
-    for cleanup in pending {
-        if unload_owned_virtual_sink(client, &cleanup.name, cleanup.module_index).is_ok() {
-            pending_virtual_sink_cleanups()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&(cleanup.name, cleanup.module_index));
+    if pending.is_empty() {
+        return;
+    }
+    let cleanup_slot =
+        NEXT_SINK_CLEANUP_SLOT.fetch_add(1, Ordering::Relaxed) as usize % pending.len();
+    let pending = pending.into_iter().skip(cleanup_slot).take(1);
+    let Ok(sinks) = client.sinks() else {
+        return;
+    };
+    for (name, intent) in pending {
+        let sink = sinks.iter().find(|sink| sink.endpoint.id == name);
+        let observation = sink.map_or(SinkObservation::Absent, |sink| {
+            match sink.managed_token.as_deref() {
+                Some(token) => SinkObservation::Owned {
+                    owner_token: token,
+                    module_index: sink.owner_module,
+                },
+                None => SinkObservation::Foreign,
+            }
+        });
+        match sink_cleanup_action(&intent, observation) {
+            SinkCleanupAction::KeepTombstone => continue,
+            SinkCleanupAction::ClearConfirmedAbsent => {
+                let _ = remove_sink_intent(&name, &intent.owner_token);
+                continue;
+            }
+            SinkCleanupAction::Unload(module_index) => {
+                if intent.module_index.is_none()
+                    && persist_sink_intent(
+                        &name,
+                        &intent.owner_token,
+                        Some(module_index),
+                        false,
+                        true,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                if mark_sink_unload_submitted(&name, &intent.owner_token).is_err() {
+                    continue;
+                }
+                if client.unload_module(module_index).is_err() {
+                    if client.quiesce_prior_commands().is_ok() {
+                        let _ = mark_sink_unload_quiesced(&name, &intent.owner_token);
+                    } else {
+                        continue;
+                    }
+                } else if mark_sink_unload_confirmed(&name, &intent.owner_token).is_err() {
+                    continue;
+                }
+            }
+        }
+        let Ok(after_unload) = client.sinks() else {
+            continue;
+        };
+        if !after_unload.iter().any(|remaining| {
+            remaining.endpoint.id == name
+                && remaining.managed_token.as_deref() == Some(intent.owner_token.as_str())
+        }) {
+            let _ = remove_sink_intent(&name, &intent.owner_token);
         }
     }
 }
@@ -928,10 +1655,7 @@ fn retry_virtual_sink_cleanups() {
 }
 
 pub fn virtual_sink_cleanup_pending() -> bool {
-    !pending_virtual_sink_cleanups()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_empty()
+    read_cleanup_state().is_ok_and(|state| state.sinks.values().any(sink_cleanup_requested))
 }
 
 static VIRTUAL_SINKS: OnceLock<Mutex<BTreeMap<String, Weak<ManagedVirtualSink>>>> = OnceLock::new();
@@ -941,18 +1665,26 @@ fn managed_virtual_sink(
     channels: u32,
 ) -> AudioResult<Arc<ManagedVirtualSink>> {
     let layout = null_sink_layout(channels)?;
-    let name = format!("amaterasu_stream_{}_{}ch", std::process::id(), channels);
+    let sequence = NEXT_MANAGED_SINK.fetch_add(1, Ordering::Relaxed);
+    let token = format!("{}-{sequence}", std::process::id());
+    let name = format!(
+        "amaterasu_stream_{}_{}ch_{sequence}",
+        std::process::id(),
+        channels
+    );
     let cleanup_guard = virtual_sink_cleanup_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     retry_virtual_sink_cleanups_with_client(client, Some(&name));
-    if pending_virtual_sink_cleanups()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .keys()
-        .any(|(pending_name, _)| pending_name == &name)
-    {
+    if read_cleanup_state()?.sinks.contains_key(&name) {
         return Err("virtual_sink_cleanup_pending");
+    }
+    let state = read_cleanup_state()?;
+    if !can_start_sink_load(&state, &name) {
+        if has_unquiesced_sink_load(&state) {
+            return Err("audio_sink_load_pending");
+        }
+        return Err("audio_cleanup_journal_capacity_reached");
     }
     let registry = VIRTUAL_SINKS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut registry = registry
@@ -966,17 +1698,29 @@ fn managed_virtual_sink(
         return Ok(existing);
     }
 
-    let existing_sink = client
-        .sinks()?
-        .into_iter()
-        .find(|sink| sink.endpoint.id == name);
-    let module_index = if existing_sink.is_some() {
-        None
-    } else {
-        Some(client.load_null_sink(&name, channels)?)
+    if client.sinks()?.iter().any(|sink| sink.endpoint.id == name) {
+        return Err("virtual_sink_name_conflict");
+    }
+    persist_sink_intent(&name, &token, None, false, true)?;
+    let index = match client.load_null_sink(&name, channels, &token) {
+        Ok(index) => index,
+        Err(error) => {
+            if client.quiesce_prior_commands().is_ok() {
+                let _ = mark_sink_load_quiesced(&name, &token);
+            }
+            retry_virtual_sink_cleanups_with_client(client, Some(&name));
+            return Err(error);
+        }
     };
+    if let Err(error) = persist_sink_intent(&name, &token, Some(index), true, false) {
+        let _ = request_sink_cleanup(&name, &token);
+        retry_virtual_sink_cleanups_with_client(client, Some(&name));
+        return Err(error);
+    }
+    let module_index = Some(index);
     let lease = Arc::new(ManagedVirtualSink {
         name: name.clone(),
+        owner_token: token,
         channels,
         module_index: Mutex::new(module_index),
     });
@@ -993,6 +1737,7 @@ struct ActiveRoute {
     endpoint: String,
     original: Option<String>,
     references: usize,
+    assignment_confirmed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1022,28 +1767,6 @@ fn route_plan(
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum RestoreAction {
-    WaitForDefault,
-    Release,
-    Restore(String),
-}
-
-fn restore_action(
-    endpoint: &str,
-    original: Option<&str>,
-    current_default: Option<&str>,
-) -> RestoreAction {
-    match current_default {
-        None => RestoreAction::WaitForDefault,
-        Some(current) if current != endpoint => RestoreAction::Release,
-        Some(_) => match original {
-            Some(original) if original != endpoint => RestoreAction::Restore(original.to_owned()),
-            _ => RestoreAction::Release,
-        },
-    }
-}
-
 #[derive(Default, Debug)]
 struct RouteRegistry {
     active: Option<ActiveRoute>,
@@ -1062,20 +1785,8 @@ fn record_pending_route(registry: &mut RouteRegistry, endpoint: &str, original: 
         endpoint: endpoint.to_owned(),
         original,
         references: 0,
+        assignment_confirmed: false,
     });
-}
-
-fn finish_route_restore(
-    registry: &mut RouteRegistry,
-    action: &RestoreAction,
-    restoration_succeeded: bool,
-) {
-    match action {
-        RestoreAction::WaitForDefault => {}
-        RestoreAction::Release => registry.active = None,
-        RestoreAction::Restore(_) if restoration_succeeded => registry.active = None,
-        RestoreAction::Restore(_) => {}
-    }
 }
 
 #[derive(Debug)]
@@ -1087,6 +1798,35 @@ static ROUTES: OnceLock<Mutex<RouteRegistry>> = OnceLock::new();
 
 fn route_registry() -> &'static Mutex<RouteRegistry> {
     ROUTES.get_or_init(|| Mutex::new(RouteRegistry::default()))
+}
+
+// PipeWire's PulseAudio compatibility server can acknowledge a default change
+// before policy has published it through server info. Observe that transition;
+// never submit a second write or wait through a third-party route change.
+fn wait_for_route_readback(
+    desired: &str,
+    previous: &str,
+    timeout: Duration,
+    mut read: impl FnMut(Duration) -> AudioResult<Option<String>>,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match read(remaining.min(Duration::from_millis(50))) {
+            Ok(Some(current)) if current == desired => return true,
+            Ok(Some(current)) if current != previous => return false,
+            Err(_) => return false,
+            _ => {}
+        }
+        thread::park_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(5)),
+        );
+    }
 }
 
 fn acquire_route(
@@ -1112,6 +1852,13 @@ fn acquire_route(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     retry_route_restore(client, &mut registry);
 
+    if registry.active.is_none() {
+        let _ = reconcile_persisted_route(client);
+        if read_cleanup_state()?.route.is_some() {
+            return Err("audio_route_restore_pending");
+        }
+    }
+
     if let Some(active) = &mut registry.active {
         if active.references == 0 {
             return Err("audio_route_restore_failed");
@@ -1136,15 +1883,38 @@ fn acquire_route(
         return Ok(None);
     }
     if needs_assignment {
-        // Record ownership before asking PulseAudio to change the global route.
-        // The request may apply even if its callback or the verification query
-        // fails; zero references keeps that state visible to the retry worker.
-        record_pending_route(&mut registry, endpoint, original);
-        if client.set_default_sink(endpoint).is_err()
-            || !client
-                .default_sink()
-                .is_ok_and(|current| current.as_deref() == Some(endpoint))
-        {
+        let original_sink = original.as_deref().ok_or("audio_route_failed")?;
+        if client.default_sink()?.as_deref() != Some(original_sink) {
+            return Err("audio_route_changed");
+        }
+        // Durable intent precedes the global route mutation. If the callback
+        // is lost, a restart can check the target before attempting restore.
+        persist_route_intent(endpoint, original_sink)?;
+        record_pending_route(&mut registry, endpoint, original.clone());
+        if client.set_default_sink(endpoint).is_err() {
+            eprintln!("Amaterasu audio route assignment was not acknowledged");
+            if client.quiesce_prior_commands().is_ok() {
+                let _ = mark_route_assignment_quiesced(endpoint);
+            }
+            retry_route_restore(client, &mut registry);
+            return Err("audio_route_failed");
+        }
+        if confirm_route_intent(endpoint).is_err() {
+            retry_route_restore(client, &mut registry);
+            return Err("audio_cleanup_journal_unavailable");
+        }
+        if let Some(active) = registry.active.as_mut() {
+            active.assignment_confirmed = true;
+        }
+        if !wait_for_route_readback(
+            endpoint,
+            original
+                .as_deref()
+                .expect("assignment requires a previous route"),
+            Duration::from_millis(250),
+            |timeout| client.default_sink_with_timeout(timeout),
+        ) {
+            eprintln!("Amaterasu audio route assignment acknowledged but readback differs");
             retry_route_restore(client, &mut registry);
             return Err("audio_route_failed");
         }
@@ -1159,6 +1929,7 @@ fn acquire_route(
             endpoint: endpoint.to_owned(),
             original,
             references: 1,
+            assignment_confirmed: true,
         });
     }
     Ok(Some(Arc::new(RouteLease {
@@ -1195,17 +1966,83 @@ fn retry_route_restore(client: &mut PulseClient, registry: &mut RouteRegistry) {
     else {
         return;
     };
-    let endpoint = active.endpoint.clone();
-    let original = active.original.clone();
-    let Ok(current_default) = client.default_sink() else {
-        return;
+    let intent = match read_cleanup_state().ok().and_then(|state| state.route) {
+        Some(intent) => intent,
+        None => {
+            let Some(original_sink) = active.original.clone() else {
+                registry.active = None;
+                return;
+            };
+            RouteIntent {
+                target_sink: active.endpoint.clone(),
+                original_sink,
+                assignment_confirmed: active.assignment_confirmed,
+                assignment_quiesced: false,
+                restoration_submitted: false,
+                restoration_confirmed: false,
+                restoration_quiesced: false,
+            }
+        }
     };
-    let action = restore_action(&endpoint, original.as_deref(), current_default.as_deref());
-    let restoration_succeeded = match &action {
-        RestoreAction::Restore(original) => client.set_default_sink(original).is_ok(),
-        RestoreAction::WaitForDefault | RestoreAction::Release => false,
+    if reconcile_route_intent(client, &intent) {
+        registry.active = None;
+    }
+}
+
+fn reconcile_route_intent(client: &mut PulseClient, intent: &RouteIntent) -> bool {
+    let Ok(Some(current_default)) = client.default_sink() else {
+        return false;
     };
-    finish_route_restore(registry, &action, restoration_succeeded);
+    match route_restore_action(intent, Some(&current_default)) {
+        RouteRestoreAction::Wait | RouteRestoreAction::KeepTombstone => false,
+        RouteRestoreAction::Release => clear_route_intent(&intent.target_sink).is_ok(),
+        RouteRestoreAction::RestoreOriginal => {
+            // Re-read immediately before the write. PulseAudio has no compare-
+            // and-set route API, so this prevents overwriting any user change
+            // already visible to us at restoration time.
+            let Ok(Some(current_default)) = client.default_sink() else {
+                return false;
+            };
+            match route_restore_action(intent, Some(&current_default)) {
+                RouteRestoreAction::Release => clear_route_intent(&intent.target_sink).is_ok(),
+                RouteRestoreAction::KeepTombstone | RouteRestoreAction::Wait => false,
+                RouteRestoreAction::RestoreOriginal => {
+                    if mark_route_restoration_submitted(&intent.target_sink).is_err() {
+                        return false;
+                    }
+                    if client.set_default_sink(&intent.original_sink).is_err() {
+                        if client.quiesce_prior_commands().is_ok() {
+                            let _ = mark_route_restoration_quiesced(&intent.target_sink);
+                        }
+                        return false;
+                    }
+                    if mark_route_restoration_confirmed(&intent.target_sink).is_err() {
+                        return false;
+                    }
+                    if wait_for_route_readback(
+                        &intent.original_sink,
+                        &intent.target_sink,
+                        Duration::from_millis(250),
+                        |timeout| client.default_sink_with_timeout(timeout),
+                    ) {
+                        clear_route_intent(&intent.target_sink).is_ok()
+                    } else {
+                        false
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn reconcile_persisted_route(client: &mut PulseClient) -> bool {
+    let Ok(state) = read_cleanup_state() else {
+        return false;
+    };
+    let Some(intent) = state.route else {
+        return true;
+    };
+    reconcile_route_intent(client, &intent)
 }
 
 fn resolve_virtual<'a>(sinks: &'a [Sink], selector: &str) -> Option<&'a Sink> {
@@ -1249,13 +2086,25 @@ pub fn route_restore_pending() -> bool {
     let mut registry = registry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !registry.restore_pending() {
+    if registry
+        .active
+        .as_ref()
+        .is_some_and(|active| active.references > 0)
+    {
+        return false;
+    }
+    let persisted_route_pending = read_cleanup_state().is_ok_and(|state| state.route.is_some());
+    if !registry.restore_pending() && !persisted_route_pending {
         return false;
     }
     if let Ok(mut client) = PulseClient::connect() {
-        retry_route_restore(&mut client, &mut registry);
+        if registry.restore_pending() {
+            retry_route_restore(&mut client, &mut registry);
+        } else {
+            let _ = reconcile_persisted_route(&mut client);
+        }
     }
-    registry.restore_pending()
+    registry.restore_pending() || read_cleanup_state().is_ok_and(|state| state.route.is_some())
 }
 
 pub struct Capture {
@@ -1274,19 +2123,111 @@ pub struct Capture {
 }
 
 impl Capture {
+    pub fn open_with_bounded_retry(
+        requested: &str,
+        virtual_sink: Option<&str>,
+        channels: Option<u32>,
+        capture_format: Option<PcmCaptureFormat>,
+        host_audio_enabled: bool,
+        capture_sink_without_routing: bool,
+        stop: &AtomicBool,
+    ) -> AudioResult<Self> {
+        let side_effect_free = startup_open_is_side_effect_free(
+            requested,
+            virtual_sink,
+            host_audio_enabled,
+            capture_sink_without_routing,
+        );
+        if stop.load(Ordering::Acquire) {
+            return Err("audio_worker_stopped");
+        }
+        if !side_effect_free {
+            return Self::open(
+                requested,
+                virtual_sink,
+                channels,
+                capture_format,
+                host_audio_enabled,
+                capture_sink_without_routing,
+            );
+        }
+        let startup_deadline = Instant::now() + STARTUP_OPEN_TOTAL_TIMEOUT;
+        for attempt in 1..=STARTUP_OPEN_MAX_ATTEMPTS {
+            if stop.load(Ordering::Acquire) {
+                return Err("audio_worker_stopped");
+            }
+            let attempt_deadline =
+                (Instant::now() + STARTUP_OPEN_ATTEMPT_TIMEOUT).min(startup_deadline);
+            match Self::open_with_deadline(
+                requested,
+                virtual_sink,
+                channels,
+                capture_format,
+                host_audio_enabled,
+                capture_sink_without_routing,
+                Some(attempt_deadline),
+            ) {
+                Ok(capture) => return Ok(capture),
+                Err(error) if should_retry_startup_open(error, attempt, side_effect_free) => {
+                    if stop.load(Ordering::Acquire) {
+                        return Err("audio_worker_stopped");
+                    }
+                    if !wait_for_startup_open_retry(stop, startup_deadline) {
+                        if stop.load(Ordering::Acquire) {
+                            return Err("audio_worker_stopped");
+                        }
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err("audio_backend_failed")
+    }
+
     pub fn open(
         requested: &str,
         virtual_sink: Option<&str>,
         channels: Option<u32>,
+        capture_format: Option<PcmCaptureFormat>,
         host_audio_enabled: bool,
         capture_sink_without_routing: bool,
+    ) -> AudioResult<Self> {
+        Self::open_with_deadline(
+            requested,
+            virtual_sink,
+            channels,
+            capture_format,
+            host_audio_enabled,
+            capture_sink_without_routing,
+            None,
+        )
+    }
+
+    fn open_with_deadline(
+        requested: &str,
+        virtual_sink: Option<&str>,
+        channels: Option<u32>,
+        capture_format: Option<PcmCaptureFormat>,
+        host_audio_enabled: bool,
+        capture_sink_without_routing: bool,
+        deadline: Option<Instant>,
     ) -> AudioResult<Self> {
         if requested.len() > 4096 || requested.chars().any(char::is_control) {
             return Err("invalid_endpoint");
         }
-        let mut client = PulseClient::connect()?;
-        let default_sink = client.default_sink()?;
-        let mut sinks = client.sinks()?;
+        let mut client = PulseClient::connect_with_timeout(startup_operation_timeout(
+            deadline.unwrap_or_else(|| Instant::now() + CONTROL_TIMEOUT),
+            Instant::now(),
+        )?)?;
+        let default_sink = client.default_sink_with_timeout(startup_operation_timeout(
+            deadline.unwrap_or_else(|| Instant::now() + CONTROL_TIMEOUT),
+            Instant::now(),
+        )?)?;
+        let mut sinks = client.sinks_with_timeout(startup_operation_timeout(
+            deadline.unwrap_or_else(|| Instant::now() + CONTROL_TIMEOUT),
+            Instant::now(),
+        )?)?;
         let mut managed_sink = None;
         let (selected, is_virtual, virtual_channels, effective_capture_only) =
             if let Some(selector) = virtual_sink {
@@ -1317,16 +2258,11 @@ impl Capture {
                 (selected, false, None, capture_sink_without_routing)
             };
 
-        let (channel_positions, channels) = if let Some(channels) = virtual_channels {
-            let layout = null_sink_layout(channels)?;
-            (layout.positions.to_vec(), channels)
-        } else {
-            let channels = selected.channel_positions.len();
-            if !(1..=8).contains(&channels) {
-                return Err("unsupported_format");
-            }
-            (selected.channel_positions.clone(), channels as u32)
-        };
+        let (channel_positions, channels) = capture_channel_layout(
+            &selected.channel_positions,
+            virtual_channels,
+            capture_format,
+        )?;
         let mut format = Format::new(AUDIO_RATE, channels, PCM_F32)?;
         format.channel_mask = channel_mask(&channel_positions);
 
@@ -1344,17 +2280,24 @@ impl Capture {
             is_virtual,
         )?;
 
-        open_selected(CaptureSetup {
-            client,
-            selected,
-            format,
-            channel_positions,
-            virtual_channels,
-            follow_console_default: follows_default,
-            capture_sink_without_routing: effective_capture_only,
-            route_lease,
-            virtual_sink_lease: managed_sink,
-        })
+        open_selected_with_timeout(
+            CaptureSetup {
+                client,
+                selected,
+                format,
+                channel_positions,
+                virtual_channels,
+                capture_format,
+                follow_console_default: follows_default,
+                capture_sink_without_routing: effective_capture_only,
+                route_lease,
+                virtual_sink_lease: managed_sink,
+            },
+            startup_operation_timeout(
+                deadline.unwrap_or_else(|| Instant::now() + CONTROL_TIMEOUT),
+                Instant::now(),
+            )?,
+        )
     }
 
     pub fn reopen(config: &RecoveryConfig) -> AudioResult<Self> {
@@ -1383,6 +2326,7 @@ impl Capture {
             format,
             channel_positions: config.channel_positions.clone(),
             virtual_channels: config.virtual_channels,
+            capture_format: config.capture_format,
             follow_console_default: config.follow_console_default,
             capture_sink_without_routing: config.capture_sink_without_routing,
             route_lease: config.route_lease.clone(),
@@ -1411,10 +2355,47 @@ impl Capture {
         ) {
             return Err("device_lost");
         }
+        let mut query_start_error = None;
         if self.follow_console_default && Instant::now() >= self.next_default_check {
             self.next_default_check = Instant::now() + DEFAULT_CHECK_INTERVAL;
-            if self.client.default_sink()?.as_deref() != Some(self.endpoint.as_str()) {
-                return Err("default_endpoint_changed");
+            query_start_error = self.client.start_default_sink_query().err();
+        }
+        if self.follow_console_default {
+            let decision = if let Some(error) = query_start_error {
+                default_route_decision(
+                    Some(Err(error)),
+                    &self.endpoint,
+                    self.client.default_queries_disabled,
+                )
+            } else {
+                match self.client.poll_default_sink_query() {
+                    QueryPoll::Pending => default_route_decision(
+                        None,
+                        &self.endpoint,
+                        self.client.default_queries_disabled,
+                    ),
+                    QueryPoll::Complete(result) => default_route_decision(
+                        Some(result),
+                        &self.endpoint,
+                        self.client.default_queries_disabled,
+                    ),
+                }
+            };
+            match decision {
+                DefaultRouteDecision::Changed => return Err("default_endpoint_changed"),
+                // Reopen the same follow-default capture through its existing
+                // recovery path after the bounded probe budget is exhausted.
+                // That drops this client and its retained callbacks, then
+                // resolves the current default without mutating the route.
+                DefaultRouteDecision::Reopen => return Err("default_endpoint_changed"),
+                DefaultRouteDecision::Retry => {
+                    // A failed control-plane probe does not establish that the
+                    // monitor stream failed. Keep capturing and retry later;
+                    // Pulse context/stream loss is detected independently above.
+                    self.next_default_check = Instant::now() + DEFAULT_CHECK_INTERVAL;
+                }
+                DefaultRouteDecision::Failed(error) => return Err(error),
+                DefaultRouteDecision::Pending | DefaultRouteDecision::Unchanged => {}
             }
         }
         let frame_bytes = self.format.packet_bytes(FRAMES_PER_PACKET)?;
@@ -1500,6 +2481,7 @@ struct CaptureSetup {
     format: Format,
     channel_positions: Vec<c_int>,
     virtual_channels: Option<u32>,
+    capture_format: Option<PcmCaptureFormat>,
     follow_console_default: bool,
     capture_sink_without_routing: bool,
     route_lease: Option<Arc<RouteLease>>,
@@ -1507,27 +2489,34 @@ struct CaptureSetup {
 }
 
 fn open_selected(setup: CaptureSetup) -> AudioResult<Capture> {
+    open_selected_with_timeout(setup, CONTROL_TIMEOUT)
+}
+
+fn open_selected_with_timeout(setup: CaptureSetup, timeout: Duration) -> AudioResult<Capture> {
     let CaptureSetup {
         mut client,
         selected,
         format,
         channel_positions,
         virtual_channels,
+        capture_format,
         follow_console_default,
         capture_sink_without_routing,
         route_lease,
         virtual_sink_lease,
     } = setup;
-    let stream = client.record_stream(
+    let stream = client.record_stream_with_timeout(
         &selected.monitor_source,
         format.channels,
         &channel_positions,
+        timeout,
     )?;
     let now = Instant::now();
     let recovery_config = RecoveryConfig {
         endpoint: selected.endpoint.id.clone(),
         follow_console_default,
         virtual_channels,
+        capture_format,
         preferred_valid_bits: None,
         capture_sink_without_routing,
         explicit_route: route_lease.is_some(),
@@ -1567,14 +2556,32 @@ struct RestoreWorker {
 
 static RESTORE_WORKER: OnceLock<Mutex<Option<RestoreWorker>>> = OnceLock::new();
 
-pub fn startup() {
+pub fn startup(state_root: &Path) -> AudioResult<()> {
     let workers = RESTORE_WORKER.get_or_init(|| Mutex::new(None));
     let mut workers = workers
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(worker) = workers.as_mut() {
         worker.owners = worker.owners.saturating_add(1);
-        return;
+        return Ok(());
+    }
+
+    let journal = CleanupJournal::open(state_root)?;
+    let mut state = journal.read()?;
+    // No capture leases from the previous module instance can survive this
+    // process start. Convert its active sink ownership into cleanup work.
+    deactivate_prior_process_sinks(&mut state);
+    journal.write(&state)?;
+    {
+        let mut configured = CLEANUP_JOURNAL
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *configured = Some(journal);
+    }
+    if let Ok(mut client) = PulseClient::connect() {
+        let _ = reconcile_persisted_route(&mut client);
+        retry_virtual_sink_cleanups_with_client(&mut client, None);
     }
     let (stop, stopped) = mpsc::channel();
     let Ok(worker_thread) = thread::Builder::new()
@@ -1591,38 +2598,140 @@ pub fn startup() {
             }
         })
     else {
-        return;
+        return Err("audio_restore_worker_unavailable");
     };
     *workers = Some(RestoreWorker {
         stop,
         thread: worker_thread,
         owners: 1,
     });
+    Ok(())
 }
 
 pub fn shutdown() {
-    let worker = RESTORE_WORKER.get().and_then(|workers| {
+    let (worker, final_shutdown) = RESTORE_WORKER.get().map_or((None, false), |workers| {
         let mut workers = workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let worker = workers.as_mut()?;
+        let Some(worker) = workers.as_mut() else {
+            return (None, false);
+        };
         if worker.owners > 1 {
             worker.owners -= 1;
-            None
+            (None, false)
         } else {
-            workers.take()
+            (workers.take(), true)
         }
     });
     if let Some(worker) = worker {
         let _ = worker.stop.send(());
         let _ = worker.thread.join();
     }
-    retry_virtual_sink_cleanups();
+    if final_shutdown {
+        // One final bounded pass. Failed or indeterminate operations remain in
+        // the durable journal for the next worker start.
+        if let Ok(mut client) = PulseClient::connect() {
+            let _ = reconcile_persisted_route(&mut client);
+            retry_virtual_sink_cleanups_with_client(&mut client, None);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acknowledged_route_can_publish_after_stale_server_info() {
+        let mut observations = [None, Some("old"), Some("new")].into_iter();
+        assert!(wait_for_route_readback(
+            "new",
+            "old",
+            Duration::from_millis(100),
+            |_| Ok(observations
+                .next()
+                .expect("bounded sequence")
+                .map(str::to_owned)),
+        ));
+        assert!(observations.next().is_none());
+    }
+
+    #[test]
+    fn route_confirmation_stops_at_a_user_change_or_backend_failure() {
+        for observation in [
+            Ok(Some("user-selected".to_owned())),
+            Err("audio_backend_failed"),
+        ] {
+            let mut reads = 0;
+            assert!(!wait_for_route_readback(
+                "new",
+                "old",
+                Duration::from_millis(100),
+                |_| {
+                    reads += 1;
+                    observation.clone()
+                },
+            ));
+            assert_eq!(reads, 1);
+        }
+    }
+
+    #[test]
+    fn unchanged_route_confirmation_has_a_deadline() {
+        let started = Instant::now();
+        let mut reads = 0;
+        assert!(!wait_for_route_readback(
+            "new",
+            "old",
+            Duration::from_millis(15),
+            |budget| {
+                assert!(budget <= Duration::from_millis(15));
+                reads += 1;
+                Ok(Some("old".into()))
+            },
+        ));
+        assert!(reads > 0);
+        assert!(started.elapsed() >= Duration::from_millis(15));
+    }
+
+    #[test]
+    fn failed_operation_wait_keeps_userdata_valid_for_a_late_callback() {
+        for failure in ["audio_operation_timeout", "audio_server_unavailable"] {
+            let mut callback_state = Box::new(BooleanResult::default());
+            let userdata = (&mut *callback_state as *mut BooleanResult).cast();
+            let mut pending = PendingCallbackStates::default();
+
+            let outcome = finish_operation_wait(Err(failure), callback_state, &mut pending);
+            assert!(outcome.is_err());
+
+            // Model libpulse delivering a callback that was already queued
+            // when the operation wait returned. The client-owned box keeps
+            // this exact production callback's userdata valid.
+            unsafe { success_callback(ptr::null_mut(), 1, userdata) };
+
+            let state = pending.states[0]
+                .downcast_ref::<BooleanResult>()
+                .expect("the pending callback state retains its concrete type");
+            assert!(state.completed);
+            assert!(state.succeeded);
+        }
+    }
+
+    #[test]
+    fn completed_operation_wait_returns_callback_state_to_its_caller() {
+        let mut pending = PendingCallbackStates::default();
+        let callback_state = Box::new(BooleanResult {
+            completed: true,
+            succeeded: true,
+        });
+
+        let result = finish_operation_wait(Ok(()), callback_state, &mut pending)
+            .expect("completed operation returns its result state");
+
+        assert!(result.completed);
+        assert!(result.succeeded);
+        assert!(pending.states.is_empty());
+    }
 
     #[test]
     fn context_connect_wait_accepts_every_documented_transition_state() {
@@ -1681,6 +2790,246 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_capture_keeps_endpoint_channels_unless_a_session_format_is_requested() {
+        let endpoint_positions = [1, 2, 3, 7, 5, 6];
+        assert_eq!(
+            capture_channel_layout(&endpoint_positions, None, None).unwrap(),
+            (endpoint_positions.to_vec(), 6)
+        );
+
+        let requested = PcmCaptureFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            sample_format: crate::model::PcmSampleFormat::F32,
+        };
+        assert_eq!(
+            capture_channel_layout(&endpoint_positions, None, Some(requested)).unwrap(),
+            (STEREO_POSITIONS.to_vec(), 2)
+        );
+    }
+
+    #[test]
+    fn virtual_capture_rejects_a_session_format_with_different_channels() {
+        let requested = PcmCaptureFormat {
+            sample_rate: 48_000,
+            channels: 6,
+            sample_format: crate::model::PcmSampleFormat::F32,
+        };
+        assert_eq!(
+            capture_channel_layout(STEREO_POSITIONS, Some(2), Some(requested)),
+            Err("invalid_capture_format")
+        );
+    }
+
+    #[test]
+    fn default_route_probe_keeps_capture_live_while_query_is_pending_or_fails() {
+        assert_eq!(
+            default_route_decision(None, "sink.selected", false),
+            DefaultRouteDecision::Pending
+        );
+        for error in [
+            "audio_operation_timeout",
+            "audio_server_unavailable",
+            "audio_backend_failed",
+        ] {
+            assert_eq!(
+                default_route_decision(Some(Err(error)), "sink.selected", false),
+                DefaultRouteDecision::Retry
+            );
+        }
+        assert_eq!(
+            default_route_decision(
+                Some(Err("audio_server_access_denied")),
+                "sink.selected",
+                false
+            ),
+            DefaultRouteDecision::Failed("audio_server_access_denied")
+        );
+        assert_eq!(
+            default_route_decision(
+                Some(Ok(Some("sink.selected".into()))),
+                "sink.selected",
+                false
+            ),
+            DefaultRouteDecision::Unchanged
+        );
+    }
+
+    #[test]
+    fn stalled_default_query_times_out_and_cancellation_retries_are_bounded() {
+        let started_at = Instant::now();
+        assert!(!default_query_timed_out(
+            started_at,
+            started_at + DEFAULT_QUERY_TIMEOUT - Duration::from_nanos(1)
+        ));
+        assert!(default_query_timed_out(
+            started_at,
+            started_at + DEFAULT_QUERY_TIMEOUT
+        ));
+
+        let mut failures = 0;
+        for attempt in 1..=DEFAULT_QUERY_FAILURE_LIMIT {
+            assert_eq!(
+                default_route_decision(Some(Err("audio_backend_failed")), "sink.selected", false),
+                DefaultRouteDecision::Retry
+            );
+            failures = default_query_failures_after_result(failures, false);
+            assert_eq!(failures, attempt);
+            assert_eq!(
+                default_queries_disabled(failures),
+                attempt == DEFAULT_QUERY_FAILURE_LIMIT,
+            );
+        }
+
+        // A successful probe after transient failures resets the retry budget
+        // and allows follow-default monitoring to continue checking the route.
+        let failures = default_query_failures_after_result(failures, true);
+        assert_eq!(failures, 0);
+        assert!(!default_queries_disabled(failures));
+        assert_eq!(
+            default_route_decision(None, "sink.selected", false),
+            DefaultRouteDecision::Pending
+        );
+        assert_eq!(
+            default_route_decision(None, "sink.selected", true),
+            DefaultRouteDecision::Reopen
+        );
+        assert_eq!(
+            default_route_decision(Some(Err("audio_backend_failed")), "sink.selected", true),
+            DefaultRouteDecision::Reopen
+        );
+        assert_eq!(
+            default_route_decision(
+                Some(Err("audio_server_access_denied")),
+                "sink.selected",
+                true
+            ),
+            DefaultRouteDecision::Failed("audio_server_access_denied")
+        );
+    }
+
+    #[test]
+    fn pulse_operation_state_mapping_distinguishes_running_done_and_cancelled() {
+        assert_eq!(
+            pulse_operation_state(PA_OPERATION_RUNNING),
+            PulseOperationState::Running
+        );
+        assert_eq!(
+            pulse_operation_state(PA_OPERATION_DONE),
+            PulseOperationState::Done
+        );
+        assert_eq!(
+            pulse_operation_state(PA_OPERATION_CANCELLED),
+            PulseOperationState::Cancelled
+        );
+        assert_eq!(pulse_operation_state(-1), PulseOperationState::Unknown);
+    }
+
+    #[test]
+    fn default_route_probe_only_reopens_when_a_completed_query_observes_a_change() {
+        assert_eq!(
+            default_route_decision(
+                Some(Ok(Some("sink.user_choice".into()))),
+                "sink.selected",
+                false
+            ),
+            DefaultRouteDecision::Changed
+        );
+        assert_eq!(
+            default_route_decision(Some(Ok(None)), "sink.selected", false),
+            DefaultRouteDecision::Changed
+        );
+    }
+
+    #[test]
+    fn startup_open_retries_only_capture_modes_that_skip_route_and_sink_mutation() {
+        assert!(startup_open_is_side_effect_free(
+            "default", None, true, false
+        ));
+        assert!(startup_open_is_side_effect_free(
+            "speaker.fixed",
+            None,
+            true,
+            true
+        ));
+        assert!(!startup_open_is_side_effect_free(
+            "speaker.fixed",
+            None,
+            true,
+            false
+        ));
+        assert!(!startup_open_is_side_effect_free(
+            "default", None, false, false
+        ));
+        assert!(!startup_open_is_side_effect_free(
+            "default",
+            Some("virtual.sink"),
+            true,
+            false
+        ));
+
+        assert_eq!(
+            route_plan("speaker.fixed", Some("other"), false, false, false),
+            RoutePlan::Skip
+        );
+        assert_eq!(
+            route_plan("speaker.fixed", Some("other"), true, true, false),
+            RoutePlan::Skip
+        );
+    }
+
+    #[test]
+    fn startup_open_retries_only_known_transient_pulse_failures_and_is_bounded() {
+        for error in [
+            "audio_server_timeout",
+            "audio_server_unavailable",
+            "audio_operation_timeout",
+            "audio_backend_failed",
+            "audio_capture_unavailable",
+        ] {
+            assert!(should_retry_startup_open(error, 1, true), "{error}");
+            assert!(!should_retry_startup_open(error, 2, true), "{error}");
+            assert!(!should_retry_startup_open(error, 1, false), "{error}");
+        }
+        for error in [
+            "audio_server_access_denied",
+            "audio_server_configuration_invalid",
+            "endpoint_not_found",
+            "invalid_capture_format",
+        ] {
+            assert!(!should_retry_startup_open(error, 1, true), "{error}");
+        }
+    }
+
+    #[test]
+    fn startup_open_operations_share_a_bounded_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            startup_operation_timeout(now + Duration::from_secs(2), now),
+            Ok(Duration::from_secs(2))
+        );
+        assert_eq!(
+            startup_operation_timeout(now + Duration::from_secs(10), now),
+            Ok(CONTROL_TIMEOUT)
+        );
+        assert_eq!(
+            startup_operation_timeout(now, now),
+            Err("audio_operation_timeout")
+        );
+    }
+
+    #[test]
+    fn startup_retry_budget_stays_inside_the_resource_open_rpc_timeout() {
+        const RESOURCE_OPEN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+        let max_attempts_and_delay =
+            STARTUP_OPEN_ATTEMPT_TIMEOUT + STARTUP_OPEN_RETRY_DELAY + STARTUP_OPEN_ATTEMPT_TIMEOUT;
+
+        assert!(max_attempts_and_delay < RESOURCE_OPEN_RPC_TIMEOUT);
+        assert!(STARTUP_OPEN_TOTAL_TIMEOUT < RESOURCE_OPEN_RPC_TIMEOUT);
+        assert!(max_attempts_and_delay <= STARTUP_OPEN_TOTAL_TIMEOUT);
+    }
+
+    #[test]
     fn pulse_capture_uses_sized_float_pcm_and_estimated_silence_flags() {
         let format = Format::new(AUDIO_RATE, 6, PCM_F32).unwrap();
         assert_eq!(format.packet_bytes(FRAMES_PER_PACKET).unwrap(), 480 * 6 * 4);
@@ -1701,6 +3050,7 @@ mod tests {
             monitor_source: "render.device.monitor".into(),
             channel_positions: STEREO_POSITIONS.to_vec(),
             owner_module: PA_INVALID_INDEX,
+            managed_token: None,
         };
         let sinks = [sink];
         assert!(resolve_regular(&sinks, "render.device", None).is_some());
@@ -1765,6 +3115,7 @@ mod tests {
             monitor_source: "amaterasu_stream_42_2ch.monitor".into(),
             channel_positions: STEREO_POSITIONS.to_vec(),
             owner_module: 19,
+            managed_token: Some("test-owner".into()),
         };
 
         assert!(owns_virtual_sink_module(
@@ -1811,40 +3162,20 @@ mod tests {
             route_plan("sink", Some("sink"), false, false, true),
             RoutePlan::Track
         );
-        assert_eq!(
-            restore_action("sink", Some("before"), Some("sink")),
-            RestoreAction::Restore("before".into())
-        );
-        assert_eq!(
-            restore_action("sink", Some("before"), Some("user-choice")),
-            RestoreAction::Release
-        );
-        assert_eq!(
-            restore_action("sink", Some("before"), None),
-            RestoreAction::WaitForDefault
-        );
     }
 
     #[test]
-    fn failed_route_verification_and_restore_keep_owned_cleanup_pending() {
-        let mut registry = RouteRegistry::default();
-        record_pending_route(&mut registry, "selected", Some("original".into()));
-        assert!(registry.restore_pending());
-
-        // A failed verification query cannot distinguish a changed route from
-        // an unavailable server, so retain ownership for the next retry.
-        let unavailable = restore_action("selected", Some("original"), None);
-        assert_eq!(unavailable, RestoreAction::WaitForDefault);
-        finish_route_restore(&mut registry, &unavailable, false);
-        assert!(registry.restore_pending());
-
-        let restore = restore_action("selected", Some("original"), Some("selected"));
-        assert_eq!(restore, RestoreAction::Restore("original".into()));
-        finish_route_restore(&mut registry, &restore, false);
-        assert!(registry.restore_pending());
-
-        finish_route_restore(&mut registry, &restore, true);
+    fn periodic_route_reconciler_does_not_release_a_live_stream_route() {
+        let registry = RouteRegistry {
+            active: Some(ActiveRoute {
+                endpoint: "selected".into(),
+                original: Some("original".into()),
+                references: 1,
+                assignment_confirmed: true,
+            }),
+        };
         assert!(!registry.restore_pending());
+        assert_eq!(registry.active.as_ref().unwrap().references, 1);
     }
 
     #[test]
@@ -1853,10 +3184,10 @@ mod tests {
         let mut client = PulseClient::connect().expect("user Pulse server is available");
         let name = format!("amaterasu_test_{}_2ch", std::process::id());
         let module_index = client
-            .load_null_sink(&name, 2)
+            .load_null_sink(&name, 2, "ignored-test-owner")
             .expect("test null sink loads");
         let result = (|| {
-            let mut capture = Capture::open(&name, None, None, true, true)
+            let mut capture = Capture::open(&name, None, None, None, true, true)
                 .expect("capture-only open binds to the virtual monitor");
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
@@ -1875,6 +3206,59 @@ mod tests {
         })();
         let _ = client.unload_module(module_index);
         result.expect("monitor produces silent virtual packets");
+    }
+
+    #[test]
+    #[ignore = "60-second native Pulse worker qualification; creates an owned null sink without changing defaults or routing playback"]
+    fn sustains_private_monitor_worker_for_one_minute() {
+        use crate::worker::{Source, Worker};
+        let mut client = PulseClient::connect().expect("user Pulse server is available");
+        let name = format!("amaterasu_qual_{}", std::process::id());
+        let module_index = client
+            .load_null_sink(&name, 2, "sustained-test-owner")
+            .expect("owned null sink loads");
+        // Unwind inside the scope so even assertion failures unload our sink.
+        let result = std::panic::catch_unwind(|| {
+            let (mut worker, endpoint, format) =
+                Worker::open(name.clone(), None, None, None, true, true)
+                    .expect("worker binds only the private monitor");
+            assert_eq!(endpoint, name);
+            assert_eq!(format.sample_rate, 48_000);
+            let started = Instant::now();
+            let mut packets = 0;
+            let mut last_timestamp = None;
+            let mut next_pause = Duration::from_secs(1);
+            while started.elapsed() < Duration::from_secs(60) {
+                for _ in 0..32 {
+                    let Some(packet) = worker.read().expect("native PCM worker remains healthy")
+                    else {
+                        break;
+                    };
+                    assert_eq!(packet.sequence, packets);
+                    if let Some(previous) = last_timestamp {
+                        assert!(packet.timestamp_us >= previous);
+                    }
+                    last_timestamp = Some(packet.timestamp_us);
+                    packets += 1;
+                }
+                assert_eq!(worker.health().failure, None);
+                if started.elapsed() >= next_pause {
+                    // Model ordinary downstream scheduling delay, then catch up.
+                    thread::sleep(Duration::from_millis(100));
+                    next_pause += Duration::from_secs(1);
+                } else {
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+            assert!(packets >= 4_000, "insufficient PCM progress: {packets}");
+            assert_eq!(worker.health().dropped_packets, 0);
+        });
+        client
+            .unload_module(module_index)
+            .expect("owned null sink unloads");
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 

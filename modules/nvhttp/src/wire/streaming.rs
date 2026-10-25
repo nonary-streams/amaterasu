@@ -20,8 +20,10 @@ const LAUNCH_FIELDS: &[&str] = &[
     "surroundAudioInfo",
     "remoteControllersBitmap",
     "gcmap",
+    "gcpmap",
     "psmap",
     "gcpersist",
+    "clientVrrRequested",
     "corever",
     "continuousAudio",
 ];
@@ -75,9 +77,8 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
         return Err("invalid request identifier");
     }
     optional_boolean(query, "additionalStates")?;
-    // moonlight-qt sends `sops=1` by default. It only asks the host to tune the
-    // game's own settings, which this host never does, so both values are
-    // accepted and ignored rather than failing every default launch.
+    // Moonlight can request SOPS for a Desktop stream. It is a client hint;
+    // Amaterasu never changes the host display or application settings for it.
     optional_boolean(query, "sops")?;
     require_optional_value(query, "hdrMode", "0", "HDR streaming is unsupported")?;
     require_optional_value(
@@ -106,14 +107,14 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
     )?;
     optional_boolean(query, "localAudioPlayMode")?;
     optional_boolean(query, "continuousAudio")?;
-    // moonlight-qt reports player 1 as present (`gcmap=1`) even without a
-    // pad. The bitmaps only say which controller slots exist at launch time;
-    // controllers still attach through the control stream, so they are bounded
-    // and ignored here.
-    for field in ["remoteControllersBitmap", "gcmap", "psmap"] {
-        controller_bitmap(query, field)?;
+    // Slot hints are independent from permission to inject native input. Moonlight
+    // reports player one in single-controller mode even without an attached pad.
+    for field in ["remoteControllersBitmap", "gcmap", "gcpmap", "psmap"] {
+        optional_decimal_mask(query, field, u16::MAX as u32)?;
     }
     optional_boolean(query, "gcpersist")?;
+    // This is only a client pacing capability hint; accepting it does not enable host VRR.
+    optional_boolean(query, "clientVrrRequested")?;
     require_optional_value(query, "corever", "1", "unsupported Moonlight core version")
 }
 
@@ -121,20 +122,11 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
 /// `SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION` in moonlight-common-c.
 fn surround_audio_channels(value: Option<&str>) -> Result<u32, &'static str> {
     match value {
-        None | Some("196610") => Ok(2), // stereo: mask 0x3, 2 channels
-        Some("4128774") => Ok(6),       // 5.1: mask 0x3F, 6 channels
-        Some("104792072") => Ok(8),     // 7.1: mask 0x63F, 8 channels
+        None | Some("196610") => Ok(2),
+        // Moonlight encodes channel_mask << 16 | channel_count.
+        Some("4128774") => Ok(6),
+        Some("104792072") => Ok(8),
         Some(_) => Err("unsupported surround audio configuration"),
-    }
-}
-
-fn controller_bitmap(query: &Query, name: &str) -> Result<(), &'static str> {
-    match query.get(name) {
-        None => Ok(()),
-        Some(value) => match decimal_u32(value) {
-            Ok(bitmap) if bitmap <= 0xFFFF => Ok(()),
-            _ => Err("invalid controller bitmap"),
-        },
     }
 }
 
@@ -142,6 +134,14 @@ fn optional_boolean(query: &Query, name: &str) -> Result<(), &'static str> {
     match query.get(name) {
         None | Some("0" | "1") => Ok(()),
         Some(_) => Err("invalid boolean query field"),
+    }
+}
+
+fn optional_decimal_mask(query: &Query, name: &str, maximum: u32) -> Result<(), &'static str> {
+    match query.get(name) {
+        None => Ok(()),
+        Some(value) if decimal_u32(value).is_ok_and(|mask| mask <= maximum) => Ok(()),
+        Some(_) => Err("invalid controller capability mask"),
     }
 }
 
@@ -224,7 +224,7 @@ mod tests {
             "&additionalStates=1&sops=0&hdrMode=0&clientHdrCapVersion=0",
             "&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=0",
             "&clientHdrCapDisplayData=&localAudioPlayMode=0&surroundAudioInfo=196610",
-            "&remoteControllersBitmap=0&gcmap=0&gcpersist=0&corever=1"
+            "&remoteControllersBitmap=0&gcmap=0&psmap=0&gcpersist=0&corever=1"
         ))
         .unwrap();
         assert_eq!(request.app_id, 7);
@@ -240,6 +240,25 @@ mod tests {
         );
         assert_eq!(request.key_id, 0x8000_0000);
         assert!(!request.host_audio_enabled);
+    }
+
+    #[test]
+    fn parses_macos_desktop_launch_metadata_without_exposing_a_session_key() {
+        let request = parse(concat!(
+            "appid=2147483647&mode=3840x2160x120",
+            "&rikey=00000000000000000000000000000000&rikeyid=-475305041",
+            "&additionalStates=1&sops=1&localAudioPlayMode=1",
+            "&surroundAudioInfo=196610&remoteControllersBitmap=0",
+            "&gcmap=0&gcpmap=0&gcpersist=0&corever=1"
+        ))
+        .unwrap();
+        assert_eq!(request.app_id, i32::MAX as u32);
+        assert_eq!(
+            (request.width, request.height, request.fps),
+            (3840, 2160, 120)
+        );
+        assert_eq!(request.key_id, (-475_305_041_i32) as u32);
+        assert!(request.host_audio_enabled);
     }
 
     #[test]
@@ -317,6 +336,7 @@ mod tests {
             "remoteControllersBitmap=65536",
             "gcmap=-1",
             "psmap=x",
+            "gcpmap=65536",
             "gcpersist=2",
             "corever=2",
             "additionalStates=2",
@@ -348,8 +368,9 @@ mod tests {
     fn surround_audio_info_accepts_only_exact_supported_client_layouts() {
         let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
         assert_eq!(parse(base).unwrap().audio_channels, 2);
-        // Values computed from moonlight-common-c's AUDIO_CONFIGURATION_* macros.
-        for (value, channels) in [("196610", 2), ("4128774", 6), ("104792072", 8)] {
+        // AUDIO_CONFIGURATION_* masks and channel counts in Moonlight's Limelight.h.
+        for (mask, channels) in [(0x3_u32, 2), (0x3F, 6), (0x63F, 8)] {
+            let value = (mask << 16) | channels;
             assert_eq!(
                 parse(&format!("{base}&surroundAudioInfo={value}"))
                     .unwrap()
@@ -367,6 +388,15 @@ mod tests {
             "+4128774",
             "4128774 ",
             "104792073",
+            "",
+            "0",
+            "6",
+            "393222",
+            "524296",
+            "393223",
+            "524294",
+            "+4128774",
+            "4128774 ",
         ] {
             assert!(
                 parse(&format!("{base}&surroundAudioInfo={value}")).is_err(),
@@ -444,5 +474,46 @@ mod tests {
                 "accepted {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_bounded_controller_slot_hints_without_authorizing_input() {
+        let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
+        for field in ["remoteControllersBitmap", "gcmap", "gcpmap", "psmap"] {
+            for value in ["0", "1", "65535"] {
+                assert!(
+                    parse(&format!("{base}&{field}={value}")).is_ok(),
+                    "rejected {value}"
+                );
+            }
+            for value in ["65536", "-1", "+1", "1.0", " 1", "1 ", ""] {
+                assert!(
+                    parse(&format!("{base}&{field}={value}")).is_err(),
+                    "accepted {value:?}"
+                );
+            }
+        }
+        for value in ["0", "1"] {
+            assert!(parse(&format!("{base}&gcpersist={value}")).is_ok());
+        }
+        for value in ["2", "-1", "", "true"] {
+            assert!(parse(&format!("{base}&gcpersist={value}")).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_optional_vrr_request_hint_but_rejects_malformed_values() {
+        let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
+        assert!(parse(base).is_ok());
+        for value in ["0", "1"] {
+            assert!(parse(&format!("{base}&clientVrrRequested={value}")).is_ok());
+        }
+        for value in ["2", "-1", "", "true"] {
+            assert!(parse(&format!("{base}&clientVrrRequested={value}")).is_err());
+        }
+        assert!(matches!(
+            parse(&format!("{base}&clientVrrRequested=1&vrrUnsupported=1")),
+            Err("unsupported query field")
+        ));
     }
 }

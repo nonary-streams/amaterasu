@@ -18,6 +18,9 @@ mod tests {
     include!("launch/lifecycle_tests.rs");
 }
 
+use crate::encoder_snapshot::{
+    CodecAdvertisement, CodecOffer, EncoderSnapshot, StreamMode, unknown_encoders_offer,
+};
 use crate::frame_limiter::FrameLimiterSettings;
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use crate::wire::{ClientConfigOverrides, Reply, xml};
@@ -37,6 +40,11 @@ pub(crate) type Transport = ModuleResult<Response>;
 pub(crate) type Send<'a> = dyn FnMut(Command) -> Transport + 'a;
 
 const MAX_RECORDS: usize = 32;
+pub(crate) const DESKTOP_APP_ID: u32 = i32::MAX as u32;
+pub(crate) const PORTAL_SELECTED_SESSION_SOURCE: &str = "portal-selected-session-source";
+/// Asks the stream session to allocate a per-stream virtual output and
+/// capture it directly, instead of a user-selected portal source.
+pub(crate) const OWNED_DISPLAY_OUTPUT: &str = "amaterasu-owned-display";
 const INITIAL_DEADLINE: Duration = Duration::from_secs(40);
 const DEFAULT_CLEANUP_BUDGET: Duration = Duration::from_secs(20);
 // Launch/1 contract: provider 321s plus eight raw undos of 300s and 3s containment.
@@ -442,11 +450,19 @@ fn fingerprint(certificate: &[u8]) -> String {
         .collect()
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DesktopSettings {
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamingConfig {
     pub capture: CaptureConfig,
     pub profile: StreamProfile,
+    #[serde(default)]
+    pub desktop: DesktopSettings,
 }
 
 impl StreamingConfig {
@@ -532,6 +548,14 @@ pub enum CaptureProvider {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamProfile {
+    /// Legacy single-codec setting, still accepted in stored configuration.
+    /// It no longer selects the codec: each launch offers the codecs its
+    /// encoders support and the client negotiates one in RTSP ANNOUNCE.
+    #[serde(
+        default,
+        skip_serializing_if = "amaterasu_media::VideoCodec::is_default"
+    )]
+    pub codec: amaterasu_media::VideoCodec,
     pub max_width: u32,
     pub max_height: u32,
     pub max_fps: u32,
@@ -562,6 +586,7 @@ impl StreamProfile {
         {
             return Err("invalid_streaming_profile");
         }
+        // Framing and FEC limits do not depend on the codec.
         amaterasu_gamestream::video::VideoPacketizer::new(
             amaterasu_gamestream::video::VideoConfig {
                 packet_size: self.packet_size,
@@ -584,8 +609,17 @@ impl StreamProfile {
     }
 }
 
+struct PendingResume {
+    connection: u64,
+    record: u64,
+    request: LaunchRequest,
+    peer: PeerIdentity,
+}
+
 pub struct Controller {
     config: Option<StreamingConfig>,
+    /// Latest encoder enumeration; `None` until the first one completes.
+    encoder_snapshot: Option<EncoderSnapshot>,
     configured_output_name: Option<String>,
     configured_audio_sink: Option<String>,
     configured_virtual_sink: Option<String>,
@@ -611,6 +645,7 @@ pub struct Controller {
     nvenc_spatial_aq: bool,
     device_name: String,
     records: BTreeMap<u64, Record>,
+    pending_resume: Option<PendingResume>,
     job: Option<Job>,
     nonce: [u8; 16],
     next_id: u64,
@@ -626,6 +661,7 @@ impl Controller {
         getrandom::fill(&mut nonce).map_err(|_| "random_unavailable")?;
         Ok(Self {
             config,
+            encoder_snapshot: None,
             configured_output_name: None,
             configured_audio_sink: None,
             configured_virtual_sink: None,
@@ -651,6 +687,7 @@ impl Controller {
             nvenc_spatial_aq: false,
             device_name: "Amaterasu".into(),
             records: BTreeMap::new(),
+            pending_resume: None,
             job: None,
             nonce,
             next_id: 0,
@@ -660,6 +697,46 @@ impl Controller {
 
     pub fn supported(&self) -> bool {
         self.config.is_some()
+    }
+
+    pub fn set_encoder_snapshot(&mut self, snapshot: EncoderSnapshot) {
+        self.encoder_snapshot = Some(snapshot);
+    }
+
+    /// Serverinfo codec values. Until encoders are enumerated, only the
+    /// H.264 baseline is advertised.
+    pub fn codec_advertisement(&self) -> CodecAdvertisement {
+        if self.config.is_none() {
+            return CodecAdvertisement::NONE;
+        }
+        self.encoder_snapshot.as_ref().map_or(
+            EncoderSnapshot::default().advertisement(),
+            EncoderSnapshot::advertisement,
+        )
+    }
+
+    /// The codecs this launch may negotiate, or the reason no encoder can
+    /// serve the requested mode. This runs before any launch state exists.
+    fn codec_offer(
+        &self,
+        config: &StreamingConfig,
+        request: &LaunchRequest,
+    ) -> Result<CodecOffer, &'static str> {
+        let mode = StreamMode {
+            width: request.width,
+            height: request.height,
+            fps: request.fps,
+        };
+        match &self.encoder_snapshot {
+            Some(snapshot) => snapshot.offer(config.capture.encoder.clone(), mode),
+            None => unknown_encoders_offer(mode),
+        }
+    }
+
+    pub(crate) fn desktop_enabled(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| config.desktop.enabled)
     }
 
     pub fn set_output_name_settings(&mut self, ready: bool, configured_output_name: Option<&str>) {
@@ -778,8 +855,10 @@ impl Controller {
         if !peer.paired() {
             return Some(private_error(401, "authenticated paired TLS is required"));
         }
+        let desktop = request.app_id == DESKTOP_APP_ID;
         if request.app_id == 0
             || request.app_id > i32::MAX as u32
+            || (desktop && !config.desktop.enabled)
             || !config.profile.accepts(&request)
             || !matches!(request.audio_channels, 2 | 6 | 8)
             || (request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
@@ -831,6 +910,15 @@ impl Controller {
         let selected_capture_mode = peer.client_capture.unwrap_or(global_capture_mode);
         let (capture_provider, constant_rate) =
             selected_capture_mode.resolve(bootstrap_capture_provider);
+        let capture_output = if capture_provider == CaptureProvider::PipeWire {
+            if config.capture.output == OWNED_DISPLAY_OUTPUT {
+                OWNED_DISPLAY_OUTPUT.to_owned()
+            } else {
+                PORTAL_SELECTED_SESSION_SOURCE.to_owned()
+            }
+        } else {
+            capture_output
+        };
 
         if let Some(record) = self
             .records
@@ -857,6 +945,10 @@ impl Controller {
         {
             return Some(private_error(503, "another stream is active"));
         }
+        let video_codec_offer = match self.codec_offer(config, &request) {
+            Ok(offer) => offer,
+            Err(message) => return Some(private_error(503, message)),
+        };
 
         let id = match self.allocate_id() {
             Ok(id) => id,
@@ -900,6 +992,9 @@ impl Controller {
             connection,
             now + INITIAL_DEADLINE,
         );
+        record.desktop = desktop;
+        record.video_codec_offer = video_codec_offer;
+        record.encoder_snapshot = self.encoder_snapshot.clone();
         record.global_display_revision = self.global_display_revision;
         record.global_software_encoder = self.software_encoder.clone();
         record.effective_software_encoder = self
@@ -923,6 +1018,14 @@ impl Controller {
     }
 
     pub fn cancel(&mut self, connection: u64, peer: &PeerIdentity, now: Instant) -> Option<Reply> {
+        let cancel_pending_resume = self.pending_resume.as_ref().is_some_and(|pending| {
+            self.records.get(&pending.record).is_some_and(|record| {
+                record.peer.certificate == peer.certificate && record.state == State::Stopping
+            })
+        });
+        if cancel_pending_resume {
+            self.pending_resume = None;
+        }
         let Some(record) = self
             .records
             .values_mut()
@@ -933,9 +1036,17 @@ impl Controller {
             }
             return Some(cancel_reply());
         };
+        if cancel_pending_resume && record.state == State::Stopping {
+            record.cancel_connection = Some(connection);
+            return None;
+        }
         if record.state == State::Stopping || record.cancel_connection.is_some() {
             return Some(private_error(409, "stream cleanup is already in progress"));
         }
+        eprintln!(
+            "amaterasu launch cancel requested state={:?} stage={:?}",
+            record.state, record.stage
+        );
         record.cancel_connection = Some(connection);
         let retry = if record.state == State::CleanupFailed {
             record.retry_cleanup(now)
@@ -957,6 +1068,70 @@ impl Controller {
         None
     }
 
+    pub(crate) fn resume(
+        &mut self,
+        connection: u64,
+        request: LaunchRequest,
+        peer: &PeerIdentity,
+        now: Instant,
+    ) -> Option<Reply> {
+        let Some(config) = &self.config else {
+            return Some(private_error(503, "streaming is disabled"));
+        };
+        if !config.desktop.enabled || request.app_id != DESKTOP_APP_ID {
+            return Some(private_error(404, "Desktop session is unavailable"));
+        }
+        if !self.output_settings_ready {
+            return Some(private_error(503, "stream settings are loading"));
+        }
+        if !peer.paired() {
+            return Some(private_error(401, "authenticated paired TLS is required"));
+        }
+        if !config.profile.accepts(&request)
+            || !matches!(request.audio_channels, 2 | 6 | 8)
+            || (request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
+            || (request.audio_channels == 8 && config.profile.audio_bitrate < 512_000)
+            || request
+                .device_name
+                .as_deref()
+                .is_some_and(|name| !valid_device_name(name))
+        {
+            return Some(private_error(400, "unsupported streaming request"));
+        }
+        if self.pending_resume.is_some() {
+            return Some(private_error(409, "Desktop resume is already in progress"));
+        }
+        // Refuse before tearing down the live session the resume would replace.
+        if let Err(message) = self.codec_offer(config, &request) {
+            return Some(private_error(503, message));
+        }
+        if self.records.values().any(|record| {
+            record.request.remote_input_key == request.remote_input_key
+                && (record.peer != *peer || record.request != request)
+        }) {
+            return Some(private_error(
+                409,
+                "launch key conflicts with an existing request",
+            ));
+        }
+        let Some(record) = self.records.values_mut().find(|record| {
+            record.desktop
+                && record.peer.certificate == peer.certificate
+                && record.state == State::Ready
+        }) else {
+            return Some(private_error(404, "live Desktop session was not found"));
+        };
+        let id = record.id;
+        record.request_cleanup(None, now);
+        self.pending_resume = Some(PendingResume {
+            connection,
+            record: id,
+            request,
+            peer: peer.clone(),
+        });
+        None
+    }
+
     pub fn current_game(&self, peer: &PeerIdentity) -> u32 {
         self.records
             .values()
@@ -966,13 +1141,73 @@ impl Controller {
             .map_or(0, |record| record.request.app_id)
     }
 
+    #[cfg(test)]
     pub fn poll(&mut self, now: Instant, send: &mut Send<'_>) -> Vec<(u64, Reply)> {
+        self.poll_with_trust(now, send, |_| true)
+    }
+
+    pub fn poll_with_trust(
+        &mut self,
+        now: Instant,
+        send: &mut Send<'_>,
+        mut trusted: impl FnMut(&[u8]) -> bool,
+    ) -> Vec<(u64, Reply)> {
         let mut replies = Vec::new();
         if let Some(mut job) = self.job.take() {
             self.advance(&mut job, now, send, &mut replies);
         }
         if self.job.is_none() {
             self.schedule(now);
+        }
+        let resume_ready = self.pending_resume.as_ref().is_some_and(|pending| {
+            self.records.get(&pending.record).is_some_and(|record| {
+                record.state.terminal() || record.state == State::CleanupFailed
+            }) && self.job.is_none()
+        });
+        if resume_ready && let Some(pending) = self.pending_resume.take() {
+            if self
+                .records
+                .get(&pending.record)
+                .is_some_and(|record| record.state == State::Stopped)
+            {
+                let resume_trusted = self
+                    .records
+                    .get(&pending.record)
+                    .is_some_and(|record| !record.revoked && trusted(&pending.peer.certificate));
+                if !resume_trusted {
+                    if let Some(record) = self.records.get_mut(&pending.record) {
+                        record.revoked = true;
+                    }
+                    replies.push((
+                        pending.connection,
+                        private_error(401, "paired client is no longer trusted"),
+                    ));
+                } else {
+                    if let Some(old_record) = self.records.get_mut(&pending.record)
+                        && old_record.request.remote_input_key == pending.request.remote_input_key
+                    {
+                        // A resumed RTSP ticket may legitimately reuse Moonlight's key.
+                        // The old record is terminal and no longer owns live input.
+                        old_record.request.remote_input_key = [0; 16];
+                    }
+                    if let Some(reply) =
+                        self.launch(pending.connection, pending.request, pending.peer, now)
+                    {
+                        replies.push((pending.connection, reply));
+                    } else if let Some(record) = self
+                        .records
+                        .values_mut()
+                        .find(|record| record.launch_connection == Some(pending.connection))
+                    {
+                        record.resumed = true;
+                    }
+                }
+            } else {
+                replies.push((
+                    pending.connection,
+                    private_error(503, "Desktop cleanup failed"),
+                ));
+            }
         }
         replies
     }
@@ -1001,6 +1236,13 @@ impl Controller {
     }
 
     pub fn connection_closed(&mut self, connection: u64, now: Instant) {
+        if self
+            .pending_resume
+            .as_ref()
+            .is_some_and(|pending| pending.connection == connection)
+        {
+            self.pending_resume = None;
+        }
         let mut affected = None;
         for record in self.records.values_mut() {
             if record.launch_connection == Some(connection) {
@@ -1025,6 +1267,14 @@ impl Controller {
         mut trusted: impl FnMut(&[u8]) -> bool,
     ) -> Vec<u64> {
         let mut close = Vec::new();
+        if self
+            .pending_resume
+            .as_ref()
+            .is_some_and(|pending| !trusted(&pending.peer.certificate))
+            && let Some(pending) = self.pending_resume.take()
+        {
+            close.push(pending.connection);
+        }
         let mut affected = Vec::new();
         for record in self.records.values_mut() {
             if !record.state.terminal() && !record.revoked && !trusted(&record.peer.certificate) {
@@ -1075,6 +1325,16 @@ impl Controller {
 }
 
 fn private_error(status: u16, message: &str) -> Reply {
+    let reason = if message.len() <= 64
+        && message
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'_' | b' '))
+    {
+        message
+    } else {
+        "redacted"
+    };
+    eprintln!("amaterasu launch rejection status={status} reason={reason}");
     let mut reply = xml::error(status, message);
     reply.requires_paired_tls = true;
     reply
@@ -1087,7 +1347,7 @@ fn success_reply(record: &Record) -> Reply {
     let physical_width = record.physical_display_mode.width.to_string();
     let physical_height = record.physical_display_mode.height.to_string();
     let physical_refresh = record.physical_display_mode.refresh_millihz.to_string();
-    let fields = [
+    let mut fields = vec![
         (
             "sessionUrl0",
             record.rtsp_url.as_deref().unwrap_or_default(),
@@ -1121,6 +1381,9 @@ fn success_reply(record: &Record) -> Reply {
                 .unwrap_or_default(),
         ),
     ];
+    if record.resumed {
+        fields.push(("resume", "1"));
+    }
     let mut reply = xml::response(200, "OK", &fields);
     reply.requires_paired_tls = true;
     reply

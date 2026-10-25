@@ -109,67 +109,243 @@ pub(crate) fn video_packet(bytes: &[u8], sequence: u64) -> EncodedPacket {
 }
 
 #[test]
-fn hevc_packets_use_codec_aware_packetization_and_reject_mismatches() {
+fn negotiated_hevc_accepts_only_hevc_packets_without_consuming_rejected_sequence() {
     let (video, audio) = receivers();
-    let request = request(&video, &audio, false);
-    let hevc_format = amaterasu_module_sdk::VideoStreamFormat {
-        codec: amaterasu_module_sdk::VideoCodec::Hevc,
-        bit_depth: 8,
-        dynamic_range: amaterasu_module_sdk::DynamicRange::Sdr,
-    };
-    let mut stream = Stream::open("owner", &request).unwrap();
-    let mut hevc = Vec::new();
-    for (nal_unit_type, payload) in [
-        (32_u8, 0x01_u8), // VPS
-        (33, 0x02),       // SPS
-        (34, 0x03),       // PPS
-        (19, 0x80),       // IDR_W_RADL
-    ] {
-        hevc.extend_from_slice(&[0, 0, 0, 1, nal_unit_type << 1, 1, payload]);
-    }
-
-    let h264 = [0, 0, 0, 1, 0x65, 1];
-    let mismatched_payload = video_packet(&h264, 0);
-
-    let hevc_packet = EncodedPacket {
+    let mut settings = request(&video, &audio, false);
+    settings.video.codec = VideoCodec::Hevc;
+    let mut stream = Stream::open("owner", &settings).unwrap();
+    let access_unit: Vec<_> = [32u8, 33, 34, 19]
+        .into_iter()
+        .flat_map(|kind| [0, 0, 0, 1, kind << 1, 1])
+        .collect();
+    let h264 = video_packet(&access_unit, 0);
+    // SAFETY: the local access unit remains allocated through both calls.
+    assert_eq!(
+        unsafe { stream.submit_video(&h264) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(stream.next_frame_index, Some(1));
+    let hevc = EncodedPacket {
         codec: CODEC_HEVC,
-        ..video_packet(&hevc, 0)
+        flags: FLAG_KEYFRAME | FLAG_END_OF_ACCESS_UNIT,
+        ..h264
     };
-    // Legacy Open without an explicit format remains H.264 until the
-    // authenticated post-ANNOUNCE configuration freezes the negotiated codec.
+    // SAFETY: the local access unit remains allocated through the call.
+    assert_eq!(unsafe { stream.submit_video(&hevc) }, STATUS_OK);
+    assert_eq!(stream.next_frame_index, Some(2));
+    let wrong_eos = EncodedPacket {
+        codec: CODEC_H264,
+        flags: FLAG_END_OF_STREAM,
+        len: 0,
+        ..hevc
+    };
+    // SAFETY: EOS has no borrowed payload.
     assert_eq!(
-        unsafe { stream.submit_video(&hevc_packet) },
+        unsafe { stream.submit_video(&wrong_eos) },
         STATUS_INVALID_ARGUMENT
     );
+    assert!(!stream.video_ended);
+}
+
+#[test]
+fn hevc_fragments_commit_one_access_unit_only_after_final_boundary() {
+    let (video, audio) = receivers();
+    let mut settings = request(&video, &audio, false);
+    settings.video.codec = VideoCodec::Hevc;
+    settings.video.fec_percentage = 0;
+    settings.video.min_parity_shards = 0;
+    let mut stream = Stream::open("owner", &settings).unwrap();
+    let access_unit: Vec<_> = [32u8, 33, 34, 19]
+        .into_iter()
+        .flat_map(|kind| [0, 0, 0, 1, kind << 1, 1])
+        .collect();
+    let first = EncodedPacket {
+        codec: CODEC_HEVC,
+        flags: FLAG_KEYFRAME,
+        data: access_unit.as_ptr(),
+        len: 9,
+        timestamp_us: 16_667,
+        sequence: 1,
+    };
+    let last = EncodedPacket {
+        flags: FLAG_KEYFRAME | FLAG_END_OF_ACCESS_UNIT,
+        data: access_unit[9..].as_ptr(),
+        len: access_unit.len() - 9,
+        ..first
+    };
+    assert_eq!(unsafe { stream.submit_video(&first) }, STATUS_OK);
+    assert_eq!(stream.next_frame_index, Some(1));
     assert_eq!(stream.video_sequence, None);
-    stream.configure_video_format(hevc_format).unwrap();
-    // An H.264 payload cannot pass after authenticated negotiation selected HEVC.
+    assert_eq!(stream.delivery.queued(), 0);
+    let eos = EncodedPacket {
+        flags: FLAG_END_OF_STREAM,
+        data: std::ptr::null(),
+        len: 0,
+        ..first
+    };
     assert_eq!(
-        unsafe { stream.submit_video(&mismatched_payload) },
+        unsafe { stream.submit_video(&eos) },
         STATUS_INVALID_ARGUMENT
     );
-    assert_eq!(stream.video_codec, None);
-    assert_eq!(stream.video_sequence, None);
-    assert_eq!(unsafe { stream.submit_video(&hevc_packet) }, STATUS_OK);
-    assert_eq!(stream.video_codec, Some(VideoCodec::Hevc));
+    assert_eq!(stream.drain(), STATUS_INVALID_ARGUMENT);
+    let wrong_sequence = EncodedPacket {
+        sequence: 2,
+        ..last
+    };
+    assert_eq!(
+        unsafe { stream.submit_video(&wrong_sequence) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        stream.pending_video.as_ref().unwrap().bytes,
+        access_unit[..9]
+    );
+
+    stream
+        .delivery
+        .push(Medium::Video, vec![vec![0]; MAX_DATAGRAMS]);
+    assert_eq!(unsafe { stream.submit_video(&last) }, MEDIA_BUSY);
+    assert_eq!(
+        stream.pending_video.as_ref().unwrap().bytes,
+        access_unit[..9]
+    );
+    assert_eq!(stream.next_frame_index, Some(1));
+    stream.delivery = Delivery::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+        video.local_addr().unwrap(),
+        audio.local_addr().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(unsafe { stream.submit_video(&last) }, STATUS_OK);
+    assert!(stream.pending_video.is_none());
+    assert_eq!(stream.video_sequence, Some(1));
+    assert_eq!(stream.next_frame_index, Some(2));
+    assert_eq!(
+        unsafe { stream.submit_video(&last) },
+        STATUS_INVALID_ARGUMENT
+    );
+}
+
+/// TD, sequence header and one frame OBU: a minimal AV1 keyframe unit.
+const AV1_KEYFRAME: [u8; 11] = [0x12, 0x00, 0x0a, 0x02, 0xaa, 0xbb, 0x32, 0x03, 1, 2, 3];
+const AV1_DELTA: [u8; 7] = [0x12, 0x00, 0x32, 0x03, 4, 5, 6];
+
+fn offered_stream(video: &UdpSocket, audio: &UdpSocket) -> Stream {
+    let mut settings = request(video, audio, false);
+    settings.video.codecs = vec![VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1];
+    settings.video.fec_percentage = 0;
+    settings.video.min_parity_shards = 0;
+    Stream::open("owner", &settings).unwrap()
+}
+
+#[test]
+fn first_offered_codec_packet_selects_av1_for_the_rest_of_the_stream() {
+    let (video, audio) = receivers();
+    let mut stream = offered_stream(&video, &audio);
+    assert_eq!(stream.video_codec(), None);
+    let keyframe = EncodedPacket {
+        codec: CODEC_AV1,
+        flags: FLAG_KEYFRAME | FLAG_END_OF_ACCESS_UNIT,
+        data: AV1_KEYFRAME.as_ptr(),
+        len: AV1_KEYFRAME.len(),
+        timestamp_us: 0,
+        sequence: 0,
+    };
+    // SAFETY: the static unit outlives every call below.
+    assert_eq!(unsafe { stream.submit_video(&keyframe) }, STATUS_OK);
+    assert_eq!(stream.video_codec(), Some(VideoCodec::Av1));
+    let h264 = video_packet(&[0, 0, 0, 1, 0x65, 1], 1);
+    assert_eq!(
+        unsafe { stream.submit_video(&h264) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(stream.next_frame_index, Some(2));
     stream.delivery.tick();
     let datagram = receive(&video);
-    assert_eq!(datagram[35], 2); // Same GameStream IDR frame-header value.
+    // The short frame header announces IDR from the encoder flag and the
+    // final payload length (header plus unit) for padding-intolerant AV1.
+    assert_eq!(&datagram[32..40], &[1, 0, 0, 2, 19, 0, 0, 0]);
+    assert_eq!(&datagram[40..], &AV1_KEYFRAME);
+}
 
-    let switched_codec = video_packet(&h264, 1);
+#[test]
+fn unoffered_codecs_are_rejected_before_selection() {
+    let (video, audio) = receivers();
+    let mut settings = request(&video, &audio, false);
+    settings.video.codecs = vec![VideoCodec::H264, VideoCodec::Av1];
+    let mut stream = Stream::open("owner", &settings).unwrap();
+    let hevc = EncodedPacket {
+        codec: CODEC_HEVC,
+        flags: FLAG_KEYFRAME | FLAG_END_OF_ACCESS_UNIT,
+        ..video_packet(&[0, 0, 0, 1, 0x40, 1], 0)
+    };
+    // SAFETY: the packet borrows a temporary that lives through the call.
     assert_eq!(
-        unsafe { stream.submit_video(&switched_codec) },
+        unsafe { stream.submit_video(&hevc) },
         STATUS_INVALID_ARGUMENT
     );
-    let unknown_codec = EncodedPacket {
-        codec: u32::MAX,
-        ..hevc_packet
+    assert_eq!(stream.video_codec(), None);
+    let frame = [0, 0, 0, 1, 0x65, 1];
+    assert_eq!(
+        unsafe { stream.submit_video(&video_packet(&frame, 0)) },
+        STATUS_OK
+    );
+    assert_eq!(stream.video_codec(), Some(VideoCodec::H264));
+}
+
+#[test]
+fn av1_fragments_assemble_one_temporal_unit_and_keep_the_keyframe_flag() {
+    let (video, audio) = receivers();
+    let mut stream = offered_stream(&video, &audio);
+    let first = EncodedPacket {
+        codec: CODEC_AV1,
+        flags: FLAG_KEYFRAME,
+        data: AV1_KEYFRAME.as_ptr(),
+        len: 4,
+        timestamp_us: 16_667,
+        sequence: 1,
+    };
+    let last = EncodedPacket {
+        flags: FLAG_END_OF_ACCESS_UNIT,
+        data: AV1_KEYFRAME[4..].as_ptr(),
+        len: AV1_KEYFRAME.len() - 4,
+        ..first
+    };
+    // SAFETY: the static unit outlives every call below.
+    assert_eq!(unsafe { stream.submit_video(&first) }, STATUS_OK);
+    assert_eq!(stream.delivery.queued(), 0);
+    assert_eq!(stream.next_frame_index, Some(1));
+    assert_eq!(unsafe { stream.submit_video(&last) }, STATUS_OK);
+    assert_eq!(stream.next_frame_index, Some(2));
+    let delta = EncodedPacket {
+        codec: CODEC_AV1,
+        flags: FLAG_END_OF_ACCESS_UNIT,
+        data: AV1_DELTA.as_ptr(),
+        len: AV1_DELTA.len(),
+        timestamp_us: 33_333,
+        sequence: 2,
+    };
+    assert_eq!(unsafe { stream.submit_video(&delta) }, STATUS_OK);
+    // A keyframe without its sequence header is not a recovery point.
+    let headerless_key = EncodedPacket {
+        flags: FLAG_KEYFRAME | FLAG_END_OF_ACCESS_UNIT,
+        timestamp_us: 50_000,
+        sequence: 3,
+        ..delta
     };
     assert_eq!(
-        unsafe { stream.submit_video(&unknown_codec) },
+        unsafe { stream.submit_video(&headerless_key) },
         STATUS_INVALID_ARGUMENT
     );
-    assert_eq!(stream.video_sequence, Some(0));
+    assert_eq!(stream.next_frame_index, Some(3));
+    stream.delivery.tick();
+    let key = receive(&video);
+    assert_eq!(key[35], 2);
+    assert_eq!(&key[40..], &AV1_KEYFRAME);
+    let delta = receive(&video);
+    assert_eq!(&delta[32..40], &[1, 0, 0, 1, 15, 0, 0, 0]);
+    assert_eq!(&delta[40..], &AV1_DELTA);
 }
 
 pub(crate) fn audio_packet(bytes: &[u8], sequence: u64) -> EncodedAudioPacket {
@@ -537,6 +713,8 @@ fn one_batch_larger_than_hard_byte_limit_is_invalid_instead_of_permanently_busy(
     let (video, audio) = receivers();
     let mut settings = request(&video, &audio, false);
     settings.video = VideoSettings {
+        codec: VideoCodec::H264,
+        codecs: Vec::new(),
         packet_size: 65_507 - 16,
         fec_percentage: 0,
         min_parity_shards: 0,
@@ -616,4 +794,79 @@ fn wait_for_peer(stream: &mut Stream, medium: crate::datagrams::Medium) {
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+#[test]
+fn frames_stamped_on_the_host_clock_report_their_host_processing_latency() {
+    let (video, audio) = receivers();
+    let mut stream = offered_stream(&video, &audio);
+    let mut keyframe = video_packet(&[0, 0, 0, 1, 0x65, 0x88], 0);
+    keyframe.flags |= FLAG_END_OF_ACCESS_UNIT;
+    keyframe.timestamp_us = host_monotonic_micros() - 5_000;
+    // SAFETY: the packet bytes outlive this synchronous submission.
+    assert_eq!(unsafe { stream.submit_video(&keyframe) }, STATUS_OK);
+    stream.delivery.tick();
+    let datagram = receive(&video);
+    let latency = u16::from_le_bytes([datagram[33], datagram[34]]);
+    // 5 ms in 0.1 ms units, plus however long this test took to packetize.
+    assert!((50..100).contains(&latency), "{latency}");
+}
+
+#[test]
+fn authenticated_format_freezes_codec_and_rejects_later_reconfiguration() {
+    use amaterasu_module_sdk::{DynamicRange, VideoCodec as NegotiatedCodec, VideoStreamFormat};
+    let (video, audio) = receivers();
+    let mut settings = request(&video, &audio, false);
+    settings.video.codecs = vec![VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1];
+    let mut stream = Stream::open("owner", &settings).unwrap();
+    let av1 = VideoStreamFormat {
+        codec: NegotiatedCodec::Av1,
+        bit_depth: 8,
+        dynamic_range: DynamicRange::Sdr,
+    };
+    stream.configure_video_format(av1).unwrap();
+    assert_eq!(stream.video_codec(), Some(VideoCodec::Av1));
+    assert_eq!(
+        stream.configure_video_format(VideoStreamFormat::H264_SDR),
+        Err("video_format_conflict")
+    );
+    let packet = EncodedPacket {
+        codec: CODEC_AV1,
+        flags: FLAG_KEYFRAME | FLAG_END_OF_ACCESS_UNIT,
+        data: AV1_KEYFRAME.as_ptr(),
+        len: AV1_KEYFRAME.len(),
+        timestamp_us: 0,
+        sequence: 0,
+    };
+    // SAFETY: the static temporal unit remains allocated through the call.
+    assert_eq!(unsafe { stream.submit_video(&packet) }, STATUS_OK);
+    assert_eq!(
+        stream.configure_video_format(av1),
+        Err("video_format_already_in_use")
+    );
+}
+
+#[test]
+fn explicit_open_format_selects_hevc_and_rejects_hdr_before_binding() {
+    use amaterasu_module_sdk::{DynamicRange, VideoCodec as NegotiatedCodec, VideoStreamFormat};
+    let (video, audio) = receivers();
+    let mut settings = request(&video, &audio, false);
+    settings.video_stream_format = Some(VideoStreamFormat {
+        codec: NegotiatedCodec::Hevc,
+        bit_depth: 8,
+        dynamic_range: DynamicRange::Sdr,
+    });
+    assert_eq!(
+        Stream::open("owner", &settings).unwrap().video_codec(),
+        Some(VideoCodec::Hevc)
+    );
+    settings.video_stream_format = Some(VideoStreamFormat {
+        codec: NegotiatedCodec::Hevc,
+        bit_depth: 10,
+        dynamic_range: DynamicRange::Hdr,
+    });
+    assert!(matches!(
+        Stream::open("owner", &settings),
+        Err("unsupported_video_format")
+    ));
 }

@@ -1,12 +1,39 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+#[cfg(any(not(amaterasu_libvirtualdisplay), test))]
 use sha2::{Digest, Sha256};
 
 const MAX_PERMANENT_MONITOR_COUNT: u64 = 4;
 
+/// How an owned virtual output joins the desktop, named after Vibeshine's
+/// `virtual_display_layout`. Its isolated and primary-only variants are not
+/// implemented and are refused when settings are parsed.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VirtualDisplayLayout {
+    /// Every other display is turned off for the stream and restored after it.
+    #[default]
+    Exclusive,
+    /// The other displays stay on and the owned output extends the desktop.
+    Extended,
+}
+
 pub struct Settings {
     pub enabled: bool,
+    // Keep the persisted wire setting even when this build lacks the Linux compositor backend.
+    #[cfg_attr(
+        all(not(amaterasu_libvirtualdisplay), not(test)),
+        expect(
+            dead_code,
+            reason = "layout is consumed only by the optional Linux compositor backend"
+        )
+    )]
+    pub virtual_display_layout: VirtualDisplayLayout,
+    /// Default scale for owned outputs when a create request names none:
+    /// Vibeshine's `dd_virtual_display_scale` (0 retains the compositor's
+    /// choice, -1 is automatic, otherwise a supported percentage).
+    pub dd_virtual_display_scale: crate::scale::ScaleSetting,
     pub dd_activate_virtual_display: bool,
     pub dd_use_sunshine_virtual_display_driver: bool,
     /// None preserves the distinction between an omitted setting and explicit zero.
@@ -17,6 +44,8 @@ pub struct Settings {
 #[serde(default, deny_unknown_fields)]
 struct SettingsInput {
     enabled: bool,
+    virtual_display_layout: VirtualDisplayLayout,
+    dd_virtual_display_scale: i32,
     dd_activate_virtual_display: bool,
     dd_use_sunshine_virtual_display_driver: bool,
     dd_virtual_display_permanent_count: Present<Value>,
@@ -27,6 +56,8 @@ impl Default for SettingsInput {
     fn default() -> Self {
         Self {
             enabled: false,
+            virtual_display_layout: VirtualDisplayLayout::default(),
+            dd_virtual_display_scale: 0,
             dd_activate_virtual_display: false,
             dd_use_sunshine_virtual_display_driver: true,
             dd_virtual_display_permanent_count: Present::default(),
@@ -53,6 +84,13 @@ where
     {
         T::deserialize(deserializer).map(|value| Self(Some(value)))
     }
+}
+
+fn present_integer<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    i32::deserialize(deserializer).map(Some)
 }
 
 impl<'de> Deserialize<'de> for Settings {
@@ -88,8 +126,12 @@ impl<'de> Deserialize<'de> for Settings {
             })
             .transpose()?;
 
+        let scale = crate::scale::ScaleSetting::try_from(input.dd_virtual_display_scale)
+            .map_err(|()| D::Error::custom("unsupported dd_virtual_display_scale"))?;
         Ok(Self {
             enabled: input.enabled,
+            virtual_display_layout: input.virtual_display_layout,
+            dd_virtual_display_scale: scale,
             dd_activate_virtual_display: input.dd_activate_virtual_display,
             dd_use_sunshine_virtual_display_driver: input.dd_use_sunshine_virtual_display_driver,
             dd_virtual_display_permanent_count: permanent_count,
@@ -101,6 +143,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            virtual_display_layout: VirtualDisplayLayout::default(),
+            dd_virtual_display_scale: crate::scale::ScaleSetting::Retain,
             dd_activate_virtual_display: false,
             dd_use_sunshine_virtual_display_driver: true,
             dd_virtual_display_permanent_count: None,
@@ -120,8 +164,10 @@ pub enum Operation {
         /// Stable caller-scoped reference for shared monitor ownership.
         #[serde(default)]
         reference_id: Option<String>,
-        #[serde(default)]
-        dd_virtual_display_scale: i32,
+        /// Overrides the module's `dd_virtual_display_scale` for this output.
+        /// Omitted means the module setting; an explicit null is invalid.
+        #[serde(default, deserialize_with = "present_integer")]
+        dd_virtual_display_scale: Option<i32>,
     },
     Status {
         identity: Option<String>,
@@ -181,6 +227,7 @@ pub fn valid_reference_id(reference_id: &str) -> bool {
     amaterasu_contracts::virtual_display::valid_reference_id(reference_id)
 }
 
+#[cfg(any(not(amaterasu_libvirtualdisplay), test))]
 pub fn display_id(caller: &str, identity: &str) -> u64 {
     let mut digest = Sha256::new();
     digest.update(b"amaterasu.virtual-display/1\0");

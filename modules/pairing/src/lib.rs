@@ -2,6 +2,7 @@
 mod crypto;
 mod engine;
 mod identity;
+mod identity_generation;
 pub mod migration;
 mod pipeline;
 mod protocol;

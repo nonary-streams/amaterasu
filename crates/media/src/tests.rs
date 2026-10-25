@@ -64,6 +64,30 @@ fn packet_validation_distinguishes_payloads_from_end_of_stream() {
         sequence: 1,
     };
     assert!(packet.validate().is_ok());
+    assert!(
+        EncodedPacket {
+            codec: CODEC_HEVC,
+            ..packet
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        EncodedPacket {
+            codec: CODEC_AV1 + 1,
+            ..packet
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        EncodedPacket {
+            codec: CODEC_AV1,
+            ..packet
+        }
+        .validate()
+        .is_ok()
+    );
     assert!(EncodedPacket { len: 0, ..packet }.validate().is_err());
     assert!(
         EncodedPacket {
@@ -317,4 +341,133 @@ fn pacing_timestamp_sink_preserves_source_time_and_validates_freshness() {
     // SAFETY: invalid freshness is rejected before entering the callback.
     assert_eq!(unsafe { sink.send(&frame, 2) }, STATUS_INVALID_ARGUMENT);
     assert_eq!(observed, [123, u64::from(CAPTURE_FRAME_FRESH)]);
+}
+
+#[test]
+fn video_geometry_tail_preserves_every_legacy_prefix_offset() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(offset_of!(VideoApiV1_1, base), offset_of!(VideoApi, base));
+    assert_eq!(
+        offset_of!(VideoApiV1_1, receive),
+        offset_of!(VideoApi, receive)
+    );
+    assert_eq!(offset_of!(VideoApiV1_1, geometry), size_of::<VideoApi>());
+}
+
+fn dmabuf_frame() -> DmaBufFrame {
+    let mut planes = [DmaBufPlane::UNUSED; DMABUF_MAX_PLANES];
+    planes[0] = DmaBufPlane {
+        fd: 7,
+        acquire_fence_fd: -1,
+        offset: 0,
+        pitch: 7680,
+    };
+    DmaBufFrame {
+        width: 1920,
+        height: 1080,
+        fourcc: u32::from_le_bytes(*b"XR24"),
+        plane_count: 1,
+        modifier: DRM_FORMAT_MOD_INVALID,
+        planes,
+        color: DMABUF_COLOR_SRGB,
+        reserved: 0,
+        timestamp_us: 10,
+        sequence: 1,
+    }
+}
+
+#[test]
+fn dmabuf_validation_requires_exact_used_and_unused_planes() {
+    let frame = dmabuf_frame();
+    assert!(frame.validate().is_ok());
+    assert_eq!(frame.used_planes().len(), 1);
+    let mut missing_fd = frame;
+    missing_fd.planes[0].fd = -1;
+    assert!(missing_fd.validate().is_err());
+    let mut stray_plane = frame;
+    stray_plane.planes[1].fd = 9;
+    assert!(stray_plane.validate().is_err());
+    let mut zero_pitch = frame;
+    zero_pitch.planes[0].pitch = 0;
+    assert!(zero_pitch.validate().is_err());
+    for invalid in [
+        DmaBufFrame { width: 0, ..frame },
+        DmaBufFrame {
+            height: DMABUF_MAX_DIMENSION + 1,
+            ..frame
+        },
+        DmaBufFrame { fourcc: 0, ..frame },
+        DmaBufFrame {
+            plane_count: 0,
+            ..frame
+        },
+        DmaBufFrame {
+            plane_count: 5,
+            ..frame
+        },
+        DmaBufFrame { color: 0, ..frame },
+        DmaBufFrame {
+            reserved: 1,
+            ..frame
+        },
+    ] {
+        assert!(invalid.validate().is_err());
+    }
+    let hdr = DmaBufFrame {
+        color: DMABUF_COLOR_BT2020_PQ,
+        ..frame
+    };
+    assert!(hdr.validate().is_ok());
+}
+
+#[test]
+fn dmabuf_sink_rejects_invalid_frames_and_freshness_before_callback() {
+    unsafe extern "C" fn write(
+        context: *mut c_void,
+        frame: *const DmaBufFrame,
+        fresh: u32,
+    ) -> Status {
+        // SAFETY: the test passes a live counter and a frame valid for this call.
+        unsafe {
+            *(context as *mut u64) += (*frame).sequence + u64::from(fresh);
+        }
+        STATUS_OK
+    }
+    let mut calls = 0u64;
+    let sink = DmaBufFrameSink {
+        context: (&mut calls as *mut u64).cast(),
+        write,
+    };
+    let frame = dmabuf_frame();
+    // SAFETY: context and frame outlive these synchronous calls.
+    unsafe {
+        assert_eq!(sink.send(&frame, CAPTURE_FRAME_FRESH), STATUS_OK);
+        assert_ne!(sink.send(&frame, 2), STATUS_OK);
+        assert_ne!(
+            sink.send(&DmaBufFrame { width: 0, ..frame }, CAPTURE_FRAME_FRESH),
+            STATUS_OK
+        );
+    }
+    assert_eq!(calls, 2);
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn dmabuf_and_gpu_table_layouts_are_stable() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(size_of::<DmaBufPlane>(), 16);
+    assert_eq!(size_of::<DmaBufFrame>(), 112);
+    assert_eq!(offset_of!(DmaBufFrame, modifier), 16);
+    assert_eq!(offset_of!(DmaBufFrame, planes), 24);
+    assert_eq!(offset_of!(DmaBufFrame, color), 88);
+    assert_eq!(offset_of!(DmaBufFrame, timestamp_us), 96);
+    assert_eq!(size_of::<DmaBufFrameSink>(), 16);
+    assert_eq!(CAPTURE_API_V1_4_SIZE, 72);
+    assert_eq!(offset_of!(CaptureApiV1_4, read_dmabuf_frame), 64);
+    assert_eq!(CAPTURE_API_V1_5_SIZE, 80);
+    assert_eq!(offset_of!(CaptureApiV1_5, latest_presentation), 72);
+    assert_eq!(size_of::<PresentationStatus>(), 16);
+    assert_eq!(ENCODER_API_V1_0_SIZE, 56);
+    assert_eq!(ENCODER_API_V1_1_SIZE, 64);
+    assert_eq!(offset_of!(EncoderApiV1_1, submit_dmabuf), 56);
 }

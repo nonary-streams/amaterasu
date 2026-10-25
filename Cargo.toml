@@ -10,12 +10,14 @@ members = [
     "crates/network-policy",
     "crates/logging",
     "crates/contracts",
+    "crates/input-companion",
     "crates/runtime",
     "crates/package",
     "crates/storage",
     "crates/module-sdk",
     "crates/host",
     "crates/release",
+    "crates/vkms-frame-helper",
     "fixtures/echo",
     "fixtures/media-probe",
     "fixtures/stream-source",
@@ -40,10 +42,11 @@ members = [
     "modules/input",
     "modules/virtual-display",
     "modules/capture-dxgi",
-    "modules/capture-wgc",
     "modules/capture-pipewire",
-    "modules/capture-x11",
     "modules/capture-kms",
+    "modules/capture-wgc",
+    "modules/capture-x11",
+    "modules/capture-vkms",
     "modules/audio",
     "modules/audio-encode",
     "modules/media-transport",
@@ -75,6 +78,7 @@ amaterasu-input-policy = { path = "crates/input-policy" }
 amaterasu-network-policy = { path = "crates/network-policy" }
 amaterasu-logging = { path = "crates/logging" }
 amaterasu-contracts = { path = "crates/contracts" }
+amaterasu-input-companion = { path = "crates/input-companion" }
 amaterasu-package = { path = "crates/package" }
 amaterasu-module-sdk = { path = "crates/module-sdk" }
 amaterasu-storage = { path = "crates/storage" }

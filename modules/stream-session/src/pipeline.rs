@@ -5,6 +5,7 @@ mod history;
 mod history_activity;
 mod host_metrics_activity;
 mod input;
+mod journal;
 mod lifecycle;
 mod limiter;
 mod record;
@@ -29,11 +30,15 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use record::{Record, Resource, State, error};
 use rpc::Send;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    time::Instant,
+};
 use workflow::{Job, Step};
 
 trait Drive {
     fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure>;
+    fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str>;
     fn stop(&mut self);
     fn is_drained(&self) -> bool;
     fn recover_audio(&mut self);
@@ -46,6 +51,9 @@ trait Drive {
 impl Drive for Plane {
     fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure> {
         Plane::tick(self, media_active)
+    }
+    fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str> {
+        Plane::send_rumble(self, command)
     }
     fn stop(&mut self) {
         Plane::stop(self);
@@ -77,6 +85,12 @@ pub struct Pipeline {
     history_after: u64,
     history_activities: history_activity::HistoryActivities,
     tray_activity: session_effects::TrayActivityEffects,
+    journal: journal::LifecycleJournal,
+    recovery_initialized: bool,
+    recovery_queue: VecDeque<u64>,
+    recovery_ids: BTreeSet<u64>,
+    recovery_ready: bool,
+    recovery_blocked: bool,
 }
 
 impl Pipeline {
@@ -93,7 +107,27 @@ impl Pipeline {
             history_after: 0,
             history_activities: history_activity::HistoryActivities::default(),
             tray_activity: session_effects::TrayActivityEffects::default(),
+            journal: journal::LifecycleJournal::new()?,
+            recovery_initialized: false,
+            recovery_queue: VecDeque::new(),
+            recovery_ids: BTreeSet::new(),
+            recovery_ready: false,
+            recovery_blocked: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(settings: Settings) -> Result<Self, &'static str> {
+        let mut pipeline = Self::new(settings)?;
+        pipeline.journal = journal::LifecycleJournal::empty_for_test();
+        pipeline.recovery_initialized = true;
+        pipeline.recovery_ready = true;
+        Ok(pipeline)
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_restart_test(settings: Settings) -> Result<Self, &'static str> {
+        Self::new(settings)
     }
 
     /// Unload cannot drive asynchronous provider cleanup. Release native bindings
@@ -216,7 +250,11 @@ impl Pipeline {
                 settled = false;
             } else {
                 settled &= display::shutdown(record, send);
-                settled &= virtual_display::shutdown(record, send);
+                settled &= if record.config.virtual_display_intent.is_some() {
+                    virtual_display::shutdown(record, send)
+                } else {
+                    virtual_display::owned_shutdown(record, send)
+                };
             }
         }
         settled &= self.history_activities.shutdown(send);
@@ -243,6 +281,21 @@ impl Pipeline {
         send: &mut Send<'_>,
         factory: &mut Factory<'_>,
     ) -> ModuleResult<()> {
+        if !self.journal.loaded {
+            match self.journal.progress_load(send, now) {
+                journal::LoadProgress::Waiting => return Ok(()),
+                journal::LoadProgress::Failed => {
+                    self.recovery_blocked = true;
+                }
+                journal::LoadProgress::Ready => {}
+            }
+        }
+        if self.journal.loaded && !self.recovery_initialized {
+            self.initialize_recovery(now)?;
+        }
+        if self.job.is_none() && !self.recovery_queue.is_empty() {
+            self.start_next_recovery(now);
+        }
         self.pump(now);
         self.history_activities.progress(now, &self.records, send);
         if let Some(job) = self.job.as_mut()
@@ -256,6 +309,7 @@ impl Pipeline {
         self.progress_session_effects(now, send);
         self.tray_activity.progress(now, send);
         if let Some(mut job) = self.job.take() {
+            let session = job.session;
             let mut record = self
                 .records
                 .remove(&job.session)
@@ -264,6 +318,37 @@ impl Pipeline {
             self.records.insert(record.id, record);
             if retain {
                 self.job = Some(job);
+            } else if self.recovery_ids.remove(&session) {
+                if self.journal.document.entries.contains_key(&session) {
+                    self.recovery_blocked = true;
+                }
+                self.recovery_ready = self.recovery_queue.is_empty()
+                    && self.journal.document.entries.is_empty()
+                    && !self.recovery_blocked;
+            }
+            return Ok(());
+        }
+        if !self.recovery_ready || self.recovery_blocked || self.journal.failed {
+            // Keep the module responsive, but never admit new launch state while
+            // durable recovery is unreadable or an owned resource is uncertain.
+            match send(Command::Poll {})? {
+                Response::Request {
+                    id,
+                    caller,
+                    service,
+                    payload,
+                    ..
+                } => {
+                    if service == SERVICE
+                        && let Ok(operation) = serde_json::from_value::<Operation>(payload)
+                    {
+                        self.receive(id, caller, operation, now, 0, send);
+                    } else {
+                        rpc::complete(send, id, error("restart_recovery_unconfirmed"));
+                    }
+                }
+                Response::Pending => {}
+                _ => return Err("stream session poll failed".into()),
             }
             return Ok(());
         }
@@ -311,6 +396,56 @@ impl Pipeline {
             }
             _ => Err("stream session poll failed".into()),
         }
+    }
+
+    fn initialize_recovery(&mut self, now: u64) -> ModuleResult<()> {
+        self.recovery_initialized = true;
+        let entries: Vec<_> = self.journal.entries().cloned().collect();
+        for entry in entries {
+            if !self
+                .settings
+                .allowed_principals
+                .iter()
+                .any(|principal| principal == &entry.owner)
+            {
+                self.recovery_blocked = true;
+                self.journal.failed = true;
+                self.recovery_ready = false;
+                return Ok(());
+            }
+            let record = match entry.recovery_record() {
+                Ok(record) => record,
+                Err(_) => {
+                    self.recovery_blocked = true;
+                    self.journal.failed = true;
+                    self.recovery_ready = false;
+                    return Ok(());
+                }
+            };
+            let id = record.id;
+            if self.records.insert(id, record).is_some() {
+                self.recovery_blocked = true;
+                self.journal.failed = true;
+                self.recovery_ready = false;
+                return Ok(());
+            }
+            self.recovery_queue.push_back(id);
+            self.recovery_ids.insert(id);
+        }
+        self.recovery_ready = self.recovery_queue.is_empty();
+        if !self.recovery_ready {
+            self.start_next_recovery(now);
+        }
+        Ok(())
+    }
+
+    fn start_next_recovery(&mut self, now: u64) {
+        let Some(id) = self.recovery_queue.pop_front() else {
+            return;
+        };
+        let mut job = Job::new(id, None, Step::WaitDrain, now.saturating_add(30_000));
+        job.cleanup = true;
+        self.job = Some(job);
     }
 
     fn progress_history(&mut self, now: u64, send: &mut Send<'_>) {
@@ -379,7 +514,10 @@ impl Pipeline {
                                 || (record.feedback_ack_through.is_some()
                                     && now >= record.feedback_poll_at)
                                 || !record.input_events.is_empty()
-                                || now >= record.feedback_poll_at))))
+                                || now >= record.feedback_poll_at
+                                || (record.input_controller_supported
+                                    && record.client_haptics_requested
+                                    && now >= record.rumble_poll_at)))))
                 || (record.state == State::Armed && now >= record.next_auth_poll)
         };
         let next = self
@@ -404,6 +542,12 @@ impl Pipeline {
             )
         } else if record.audio_recovery_needed {
             (Step::RecoverAudio, now.saturating_add(5000))
+        } else if record.input_lease.is_some()
+            && record.input_controller_supported
+            && record.client_haptics_requested
+            && now >= record.rumble_poll_at
+        {
+            (Step::PollGamepadFeedback, now.saturating_add(5000))
         } else if record.input_lease.is_some() && now >= record.input_renew_at {
             (
                 Step::RenewInput,
@@ -449,6 +593,31 @@ impl Pipeline {
             crypto::Direction,
         };
         for record in self.records.values_mut() {
+            for slot in record
+                .rumble_active_until
+                .iter()
+                .filter_map(|(slot, expires)| (*expires <= now).then_some(*slot))
+                .collect::<Vec<_>>()
+            {
+                record.rumble_active_until.remove(&slot);
+                record.rumble_pending.insert(
+                    slot,
+                    (
+                        crate::plane::RumbleCommand {
+                            slot,
+                            low_frequency: 0,
+                            high_frequency: 0,
+                        },
+                        None,
+                    ),
+                );
+                record
+                    .rumble_shutdown_deadline
+                    .get_or_insert(now.saturating_add(200));
+            }
+            if record.state == State::Stopping && record.rumble_shutdown_deadline.is_none() {
+                input::queue_rumble_zeros(record, now);
+            }
             if matches!(record.state, State::Prepared | State::Armed)
                 && now >= record.prepared_until
             {
@@ -462,13 +631,77 @@ impl Pipeline {
             {
                 input::stop_for_input_failure(record, "input_lease_expired");
             }
+            if record.state == State::Active
+                && record
+                    .rumble_shutdown_deadline
+                    .is_some_and(|deadline| now >= deadline)
+                && record
+                    .rumble_pending
+                    .values()
+                    .any(|(command, _)| command.low_frequency == 0 && command.high_frequency == 0)
+            {
+                record.rumble_stop_unconfirmed = true;
+                record.error.get_or_insert("rumble_zero_delivery_timeout");
+                record.outcome = State::Failed;
+                record.state = State::Stopping;
+                record.rumble_pending.clear();
+                record.rumble_active_until.clear();
+            }
             let Some(plane) = record.plane.as_mut() else {
                 continue;
             };
+            if record.error == Some("rumble_zero_delivery_timeout") {
+                plane.stop();
+            }
+            if let Some((slot, (command, expires_at))) = record
+                .rumble_pending
+                .first_key_value()
+                .map(|(slot, value)| (*slot, *value))
+            {
+                match plane.send_rumble(command) {
+                    Ok(true) => {
+                        record.rumble_pending.remove(&slot);
+                        if command.low_frequency == 0 && command.high_frequency == 0 {
+                            record.rumble_active_until.remove(&slot);
+                            record.rumble_stop_unconfirmed = true;
+                            if !record.rumble_pending.values().any(|(pending, _)| {
+                                pending.low_frequency == 0 && pending.high_frequency == 0
+                            }) {
+                                record.rumble_shutdown_deadline = None;
+                            }
+                        } else if let Some(expires_at) = expires_at {
+                            record.rumble_active_until.insert(slot, expires_at);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        record.rumble_stop_unconfirmed = true;
+                        record.rumble_pending.clear();
+                        record.rumble_active_until.clear();
+                        record.error.get_or_insert("rumble_delivery_failed");
+                        record.outcome = State::Failed;
+                        record.state = State::Stopping;
+                        record.rumble_shutdown_deadline = Some(now);
+                        plane.stop();
+                    }
+                }
+            }
             let media_active = matches!(record.state, State::Active | State::Stopping);
             let result = plane.tick(media_active);
             match result {
                 Ok(progress) => {
+                    if virtual_display::requested(record)
+                        && record.capture_geometry != progress.desktop_geometry
+                    {
+                        record.capture_geometry = progress.desktop_geometry;
+                        if let Err(code) =
+                            input::configure_translator(record, record.input_absolute_pointer)
+                        {
+                            record.error = Some(code);
+                            record.state = State::Stopping;
+                            record.outcome = State::Failed;
+                        }
+                    }
                     record.history.observe_media(
                         progress.accepted_video_access_units,
                         progress.accepted_media_payload_bytes,
@@ -499,6 +732,7 @@ impl Pipeline {
                                     record,
                                     input,
                                     self.settings.enable_input,
+                                    now,
                                 ) {
                                     input::stop_for_input_failure(record, code);
                                 }

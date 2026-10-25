@@ -56,7 +56,7 @@ CRLF input fail explicitly. Unknown extension attributes outside recognized
 media/security families may be ignored within these bounds; unknown parameters
 inside those families fail rather than accidentally enabling a new media mode.
 
-The intentionally limited profile is H.264, SDR, 4:2:0, one slice, even dimensions
+The default profile is H.264, SDR, 4:2:0, one slice, even dimensions
 16–3840 by 16–2160, and integer 1–120 fps. Color modes are BT.601 or BT.709,
 limited or full range. A supplied nonzero refresh rate must agree with FPS within
 0.5 Hz. Reference frame requests are zero (host choice) or one. Encoder minimum,
@@ -65,7 +65,10 @@ Moonlight configured bitrate is preserved separately and must not be smaller.
 Packet size is 256–1392 bytes, divisible by 16, excluding the 16-byte RTP header.
 Audio is stereo, channel mask 3, ordinary quality, with 5 or 10 ms packets.
 
-HEVC, AV1, HDR, 4:4:4, multiple slices, surround audio, dynamic resolution,
+HEVC Main SDR bitstream format 1 is parsed only when the client explicitly
+indicates HEVC support. It remains rejected by default support and by the
+current RTSP capability until an encoder and session can actually supply it.
+AV1, HDR, 4:4:4, multiple slices, surround audio, dynamic resolution,
 intra refresh, recovery mode, BLL-FEC, variable bitrate negotiation and unknown
 critical feature bits fail explicitly. Gen3 binary attributes, Gen4 defaults,
 fractional FPS strings and generic RFC SDP media profiles are not supported.

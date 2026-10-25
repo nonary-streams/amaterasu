@@ -1,9 +1,11 @@
+mod direct;
 use crate::{
     admission::Admission,
     backend::{Backend, SourceSession},
     buffers::Mailbox,
     model::{
-        CaptureResult, Operation, Settings, SourceState, SourceType, new_id, validate_operation_id,
+        CaptureResult, Operation, Settings, SourceDiagnostics, SourceState, SourceType, new_id,
+        validate_operation_id,
     },
 };
 use serde_json::{Value, json};
@@ -20,6 +22,7 @@ struct SelectionRecord {
     source_type: SourceType,
     output: String,
     state: SourceState,
+    diagnostics: SourceDiagnostics,
 }
 
 struct Selection {
@@ -60,10 +63,12 @@ impl Reply {
 pub struct Reader {
     pub mailbox: Arc<Mailbox>,
     pub admission: Arc<Admission>,
+    pub geometry: Option<amaterasu_media::CaptureGeometry>,
 }
 
 pub struct Controller<B: Backend> {
     backend: B,
+    direct: direct::DirectSources,
     settings: Settings,
     selection: Option<Selection>,
     selections: BTreeMap<(String, String), SelectionRecord>,
@@ -79,6 +84,7 @@ impl<B: Backend> Controller<B> {
     pub fn new(backend: B, settings: Settings) -> Self {
         Self {
             backend,
+            direct: direct::DirectSources::default(),
             settings,
             selection: None,
             selections: BTreeMap::new(),
@@ -108,6 +114,9 @@ impl<B: Backend> Controller<B> {
             Operation::CancelSelection { operation_id } => {
                 validate_operation_id(&operation_id)?;
                 self.poll_selection(caller, &operation_id)?;
+                if let Some(record) = self.selections.get(&(caller.into(), operation_id.clone())) {
+                    self.backend.forget(caller, record.source_type);
+                }
                 if self.selection.as_ref().is_some_and(|selection| {
                     selection.owner == caller && selection.operation == operation_id
                 }) {
@@ -120,9 +129,18 @@ impl<B: Backend> Controller<B> {
                 output,
                 operation_id,
                 constant_rate,
-            } => self.open(caller, output, operation_id, constant_rate.unwrap_or(false)),
+            } => self.open(
+                caller,
+                output,
+                operation_id,
+                constant_rate.unwrap_or(false),
+                now,
+            ),
             Operation::Lookup { operation_id } => {
                 validate_operation_id(&operation_id)?;
+                if let Some(response) = self.direct.lookup(caller, &operation_id) {
+                    return Ok(Reply::existing(response));
+                }
                 self.lease
                     .as_ref()
                     .filter(|lease| {
@@ -174,15 +192,16 @@ impl<B: Backend> Controller<B> {
             return Err("unsupported_source_type");
         }
         let output = format!("portal-{:016x}", new_id()?);
-        let source = self
-            .backend
-            .select(source_type, self.settings.selection_timeout_seconds)?;
+        let source =
+            self.backend
+                .select(caller, source_type, self.settings.selection_timeout_seconds)?;
         self.selections.insert(
             key.clone(),
             SelectionRecord {
                 source_type,
                 output,
                 state: SourceState::Selecting,
+                diagnostics: SourceDiagnostics::default(),
             },
         );
         self.last_selection = Some(key);
@@ -213,6 +232,7 @@ impl<B: Backend> Controller<B> {
         output: String,
         operation: Option<String>,
         constant_rate: bool,
+        now: u64,
     ) -> CaptureResult<Reply> {
         if !self.settings.enabled {
             return Err("capture_disabled");
@@ -222,6 +242,48 @@ impl<B: Backend> Controller<B> {
         }
         if constant_rate {
             return Err("unsupported_constant_rate");
+        }
+        if output.starts_with("kwin:") {
+            if !self.settings.allow_named_outputs {
+                return Err("named_capture_disabled");
+            }
+            return self.direct.open(
+                &self.backend,
+                caller,
+                output,
+                operation,
+                now,
+                self.settings.selection_timeout_seconds,
+            );
+        }
+        if output == "portal-selected-session-source"
+            && self.selection.is_none()
+            && self.settings.remember_source
+            && self.settings.selection_principals.contains(caller)
+        {
+            // Reuse one internal operation slot across reconnects. Restoration
+            // can only use this caller's previously approved monitor token.
+            if let Some(source) = [SourceType::Monitor, SourceType::Window]
+                .into_iter()
+                .find(|source| self.backend.can_restore(caller, *source))
+            {
+                let operation = "remembered-source".to_owned();
+                self.selections
+                    .remove(&(caller.to_owned(), operation.clone()));
+                self.select(caller, source, operation, now)?;
+            }
+        }
+        if output == "portal-selected-session-source"
+            && self.settings.remember_source
+            && self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.owner == caller)
+            && self
+                .current_record()
+                .is_some_and(|record| record.state == SourceState::Selecting)
+        {
+            return Err("source_restore_pending");
         }
         if let Some(operation) = &operation {
             validate_operation_id(operation)?;
@@ -238,7 +300,7 @@ impl<B: Backend> Controller<B> {
             .current_record()
             .filter(|record| matches!(record.state, SourceState::Ready { .. }))
             .ok_or("source_selection_required")?;
-        if record.output != output {
+        if record.output != output && output != "portal-selected-session-source" {
             return Err("output_not_found");
         }
         if self.lease.is_some() {
@@ -269,6 +331,9 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn reader(&self, caller: &str, stream: u64) -> CaptureResult<Reader> {
+        if let Some(reader) = self.direct.reader(caller, stream) {
+            return reader;
+        }
         let lease = self
             .lease
             .as_ref()
@@ -284,10 +349,14 @@ impl<B: Backend> Controller<B> {
         Ok(Reader {
             mailbox: selection.source.mailbox(),
             admission: lease.admission.clone(),
+            geometry: selection.source.geometry(),
         })
     }
 
     pub fn close(&mut self, caller: &str, id: u64) -> CaptureResult<()> {
+        if self.direct.close(caller, id) {
+            return Ok(());
+        }
         if self.closed.get(&id).is_some_and(|owner| owner == caller) {
             return Ok(());
         }
@@ -320,10 +389,13 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn refresh(&mut self, now: u64) {
+        self.direct
+            .refresh(now, self.settings.selection_timeout_seconds);
         let Some(selection) = self.selection.as_mut() else {
             return;
         };
         let mut state = selection.source.state();
+        let diagnostics = selection.source.diagnostics();
         if matches!(state, SourceState::Ready { .. }) {
             let ready = *selection.ready_at.get_or_insert(now);
             if self.lease.is_none()
@@ -337,15 +409,36 @@ impl<B: Backend> Controller<B> {
         {
             state = SourceState::Failed("source_selection_timeout");
         }
-        self.selections
+        let record = self
+            .selections
             .get_mut(&(selection.owner.clone(), selection.operation.clone()))
-            .expect("selected record")
-            .state = state;
+            .expect("selected record");
+        record.state = state;
+        record.diagnostics = diagnostics;
         if matches!(
             state,
             SourceState::Denied | SourceState::Failed(_) | SourceState::Revoked
         ) {
             self.stop_selection(state);
+        }
+    }
+
+    pub fn cancel_pending_open(&mut self, caller: &str, operation: &Operation) {
+        if let Operation::Open {
+            operation_id: Some(operation),
+            ..
+        } = operation
+        {
+            self.direct.cancel_pending(caller, operation);
+        }
+    }
+    pub fn cancel_pending_restore(&mut self, caller: &str) {
+        if self.lease.is_none()
+            && self.selection.as_ref().is_some_and(|selection| {
+                selection.owner == caller && selection.operation == "remembered-source"
+            })
+        {
+            self.stop_selection(SourceState::Failed("request_ended"));
         }
     }
 
@@ -442,7 +535,7 @@ impl<B: Backend> Controller<B> {
         let copied = mailbox
             .as_ref()
             .map_or(0, |mailbox| mailbox.copied.load(Ordering::Relaxed));
-        let streams: Vec<_> = self
+        let mut streams: Vec<_> = self
             .lease
             .as_ref()
             .filter(|lease| lease.owner == caller)
@@ -453,16 +546,20 @@ impl<B: Backend> Controller<B> {
             })
             .into_iter()
             .collect();
+        streams.extend(self.direct.streams(caller));
         let availability = self.backend.availability();
         json!({"ok":true,"enabled":self.settings.enabled,"native_supported":availability.native_supported,
+            "remember_source":self.settings.remember_source,
             "availability":availability,"selection_state":phase,"selection":selection_json,
             "selection_choices":self.choices(),"streams":streams,"geometry_supported":false,
-            "opened":self.opened,"closed":self.closed.len(),"active":usize::from(self.lease.is_some()),
+            "opened":self.opened,"closed":self.closed.len(),"active":usize::from(self.lease.is_some()) + self.direct.active_count(),
+            "named_outputs_enabled":self.settings.allow_named_outputs,"named_capture_linked":cfg!(amaterasu_kwin),
             "frames_copied":self.frames_copied + copied,"frames_accepted":self.frames_accepted + accepted})
     }
 
     pub fn shutdown(&mut self) {
         self.settings.enabled = false;
+        self.direct.shutdown();
         self.stop_selection(SourceState::Failed("capture_shutdown"));
     }
 }
@@ -483,6 +580,7 @@ fn state_name(state: SourceState) -> &'static str {
 fn selection_reply(record: &SelectionRecord, operation: Option<&str>) -> Value {
     json!({"ok":true,"operation_id":operation,"source_type":record.source_type,
         "selection_state":state_name(record.state),"output":output_metadata(record),
+        "diagnostics":record.diagnostics,
         "error":match record.state { SourceState::Failed(error) => Some(error), SourceState::Revoked => Some("source_revoked"),
             SourceState::Denied => Some("source_selection_denied"), _ => None }})
 }

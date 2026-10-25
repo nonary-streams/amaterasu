@@ -335,6 +335,263 @@ fn run_controlled_service(root: &Path) -> PackageResult<()> {
     run_managed_service(root, || stop_requested.load(Ordering::Acquire), || {})
 }
 
+#[cfg(target_os = "linux")]
+static USER_SERVICE_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+extern "C" fn request_user_service_stop(_: libc::c_int) {
+    USER_SERVICE_STOP_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "linux")]
+struct UserServiceSignals {
+    previous_term: libc::sighandler_t,
+    previous_int: libc::sighandler_t,
+}
+
+#[cfg(target_os = "linux")]
+impl UserServiceSignals {
+    fn install() -> PackageResult<Self> {
+        USER_SERVICE_STOP_REQUESTED.store(false, Ordering::Relaxed);
+        // SAFETY: the handler only stores to a lock-free atomic and performs no
+        // allocation, logging, or other non-signal-safe work.
+        let previous_term = unsafe {
+            libc::signal(
+                libc::SIGTERM,
+                request_user_service_stop as *const () as libc::sighandler_t,
+            )
+        };
+        if previous_term == libc::SIG_ERR {
+            return Err("could not install SIGTERM handler for user service".into());
+        }
+        // SAFETY: same minimal signal-safe handler; restore SIGTERM if this
+        // second registration fails.
+        let previous_int = unsafe {
+            libc::signal(
+                libc::SIGINT,
+                request_user_service_stop as *const () as libc::sighandler_t,
+            )
+        };
+        if previous_int == libc::SIG_ERR {
+            // SAFETY: previous_term was returned by libc::signal above.
+            unsafe { libc::signal(libc::SIGTERM, previous_term) };
+            return Err("could not install SIGINT handler for user service".into());
+        }
+        Ok(Self {
+            previous_term,
+            previous_int,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for UserServiceSignals {
+    fn drop(&mut self) {
+        // SAFETY: restore the process handlers returned by libc::signal.
+        unsafe {
+            libc::signal(libc::SIGTERM, self.previous_term);
+            libc::signal(libc::SIGINT, self.previous_int);
+        }
+    }
+}
+
+/// Runs the active signed package under a systemd --user manager. The expected
+/// digest pins the unit to one immutable component set; SIGTERM/SIGINT enter
+/// orderly component teardown and Linux input revocation.
+#[cfg(target_os = "linux")]
+pub fn user_service(root: &Path, expected_digest: &str) -> PackageResult<()> {
+    // SAFETY: geteuid takes no pointers and only reports the calling process uid.
+    if unsafe { libc::geteuid() } == 0 {
+        return Err("Linux user service refuses to run as root".into());
+    }
+    let root = validate_user_service_root(root)?;
+    if !valid_package_digest(expected_digest) {
+        return Err("pinned active package digest is invalid".into());
+    }
+    let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
+    if bootstrap.development || bootstrap.allow_unsigned || bootstrap.trusted_keys.is_empty() {
+        return Err("Linux user service requires a production signed-package root".into());
+    }
+    let _signals = UserServiceSignals::install()?;
+    run_linux_user_service(&root, expected_digest)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_user_service_root(root: &Path) -> PackageResult<std::path::PathBuf> {
+    use std::path::Component;
+
+    if !root.is_absolute()
+        || root
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err("Linux user service root must be an absolute normalized path".into());
+    }
+    let mut current = std::path::PathBuf::new();
+    for component in root.components() {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err("Linux user service root cannot contain symlinks".into());
+        }
+    }
+    let canonical = root.canonicalize().map_err(|error| error.to_string())?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| error.to_string())?;
+    if canonical == Path::new("/") || !metadata.is_dir() {
+        return Err("Linux user service root must be a non-root directory".into());
+    }
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid takes no pointers and only reports the current uid.
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+        return Err(
+            "Linux user service root must be user-owned and not group/world writable".into(),
+        );
+    }
+    Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn valid_package_digest(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_active_package_pin(expected: &str, active: &str) -> PackageResult<()> {
+    if !valid_package_digest(expected) || expected != active {
+        return Err("active package digest does not match the service unit pin".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_user_service(root: &Path, expected_digest: &str) -> PackageResult<()> {
+    let _lock = RootLock::acquire(root)?;
+    let digest = crate::supervisor::select_active(root)?;
+    validate_active_package_pin(expected_digest, &digest)?;
+    let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
+    if bootstrap.development || bootstrap.allow_unsigned || bootstrap.trusted_keys.is_empty() {
+        return Err("Linux user service requires a production signed-package root".into());
+    }
+    let selection: ActivationState = read_json(&root.join("selection.json"))?;
+    if selection.active.as_deref() != Some(digest.as_str()) || selection.pending.is_some() {
+        return Err("Linux user service active selection changed during startup".into());
+    }
+    let state_root = validate_user_state_root(&root.join("data/state"))?;
+    let mut input = crate::linux_input::Supervisor::new(root, &digest)?;
+    let mut restarts = crate::protocol::RestartBudget::default();
+    let result = loop {
+        let outcome = (|| {
+            let mut components =
+                load_linux_user_components(root, &digest, &bootstrap, &state_root)?;
+            components.tick()?;
+            components.health()?;
+            let pid = std::process::id();
+            let starttime = crate::linux_input::process_starttime(pid)?;
+            input.refresh(root, &digest, pid, starttime)?;
+            publish_service_readiness(root, &digest)?;
+
+            while !USER_SERVICE_STOP_REQUESTED.load(Ordering::Relaxed) {
+                components.tick()?;
+                components.health()?;
+                if let Some(action) = components.take_host_lifecycle_action()? {
+                    input.revoke();
+                    drop(components);
+                    return Ok(Some(action));
+                }
+                input.refresh(root, &digest, pid, starttime)?;
+                std::thread::sleep(crate::timing::TICK_INTERVAL);
+            }
+            input.revoke();
+            drop(components);
+            Ok(None)
+        })();
+        input.revoke();
+        remove_service_readiness(root);
+        match outcome {
+            Ok(Some(HostLifecycleAction::Restart)) => {
+                let Some(delay) = restarts.next_delay() else {
+                    break Err("user service restart budget exhausted".into());
+                };
+                std::thread::sleep(delay);
+            }
+            Ok(Some(HostLifecycleAction::Quit) | None) => break Ok(()),
+            Err(error) => break Err(error),
+        }
+    };
+    remove_service_readiness(root);
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn load_linux_user_components(
+    root: &Path,
+    digest: &str,
+    bootstrap: &BootstrapConfig,
+    state_root: &Path,
+) -> PackageResult<crate::loading::LoadedComponents> {
+    let package_path = package_directory(root, digest)?;
+    let mut progress = |_: usize| Ok(());
+    let mut component_progress = |_: usize, _: usize| Ok(());
+    crate::publisher_selection::with_verified_selected(
+        root,
+        digest,
+        bootstrap,
+        crate::publisher_selection::SelectionPurpose::Worker,
+        &mut component_progress,
+        |package| {
+            if !package.signed
+                || package.digest != digest
+                || package.manifest.host_context_schema != 1
+            {
+                return Err("user service package lost its signed active identity".into());
+            }
+            let logging = crate::logging_config::HostLoggingConfig::from_global(
+                bootstrap.policy.settings.get("global"),
+                state_root,
+            )?;
+            let mut package = package;
+            logging.inject(&mut package.runtime_config)?;
+            crate::loading::LoadedComponents::load(
+                root,
+                &package_path,
+                &package,
+                state_root,
+                logging.start_product_logger(),
+                &mut progress,
+            )
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn validate_user_state_root(path: &Path) -> PackageResult<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !path.is_absolute() {
+        return Err("Linux user service state root must be absolute".into());
+    }
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err("Linux user service state root cannot contain symlinks".into());
+        }
+    }
+    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| error.to_string())?;
+    // SAFETY: geteuid takes no pointers and only reports the current uid.
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(
+            "Linux user service state root must be user-owned and not group/world writable".into(),
+        );
+    }
+    Ok(canonical)
+}
+
 pub(crate) fn run_managed_service(
     root: &Path,
     mut stop_requested: impl FnMut() -> bool,
@@ -342,14 +599,20 @@ pub(crate) fn run_managed_service(
 ) -> PackageResult<()> {
     let _lock = RootLock::acquire(root)?;
     let digest = crate::supervisor::select_active(root)?;
+    #[cfg(target_os = "linux")]
+    let mut linux_input = crate::linux_input::Supervisor::new(root, &digest)?;
     let mut restarts = crate::protocol::RestartBudget::default();
     let mut worker = start_with_recovery(root, &digest, &mut restarts, false)?;
+    #[cfg(target_os = "linux")]
+    linux_input.refresh(root, &digest, worker.child.id(), worker.creation_time)?;
     publish_service_readiness(root, &digest)?;
     on_started();
 
     while !stop_requested() {
         match worker.check_idle() {
             Ok(Some(HostLifecycleAction::Restart)) => {
+                #[cfg(target_os = "linux")]
+                linux_input.revoke();
                 let Some(replacement) = apply_worker_action(
                     HostLifecycleAction::Restart,
                     worker,
@@ -366,12 +629,18 @@ pub(crate) fn run_managed_service(
             Ok(Some(HostLifecycleAction::Quit)) => break,
             Ok(None) => {}
             Err(_) => {
+                #[cfg(target_os = "linux")]
+                linux_input.revoke();
                 drop(worker);
                 worker = restart(root, &digest, &mut restarts, false)?;
             }
         }
+        #[cfg(target_os = "linux")]
+        linux_input.refresh(root, &digest, worker.child.id(), worker.creation_time)?;
         std::thread::sleep(Duration::from_millis(20));
     }
+    #[cfg(target_os = "linux")]
+    linux_input.revoke();
     let result = worker.shutdown();
     remove_service_readiness(root);
     result
@@ -453,6 +722,8 @@ enum WorkerEvent {
 
 struct Worker {
     child: Child,
+    #[cfg(target_os = "linux")]
+    creation_time: u64,
     input: Option<ChildStdin>,
     output: Receiver<Result<String, String>>,
     last_heartbeat: Instant,
@@ -475,10 +746,21 @@ impl Worker {
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "linux")]
+        let creation_time = match crate::linux_input::process_starttime(child.id()) {
+            Ok(starttime) => starttime,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         let input = child.stdin.take();
         let stdout = child.stdout.take().ok_or("worker stdout missing")?;
         let mut worker = Self {
             child,
+            #[cfg(target_os = "linux")]
+            creation_time,
             input,
             output: crate::protocol::lines(stdout),
             last_heartbeat: Instant::now(),
@@ -740,5 +1022,14 @@ mod readiness_tests {
         std::fs::write(root.join(SERVICE_READY_FILE), b"{}").unwrap();
         assert!(probe_service_readiness(&root).is_err());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_service_requires_the_exact_valid_active_digest_pin() {
+        let digest = "a".repeat(64);
+        assert!(validate_active_package_pin(&digest, &digest).is_ok());
+        assert!(validate_active_package_pin(&digest, &"b".repeat(64)).is_err());
+        assert!(validate_active_package_pin("../selection.json", &digest).is_err());
     }
 }

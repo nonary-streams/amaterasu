@@ -12,8 +12,6 @@ use super::{
     ABS_TILT_Y, ABS_X, ABS_Y, BTN_STYLUS, BTN_STYLUS2, BTN_TOOL_PEN, BTN_TOOL_RUBBER, BTN_TOUCH,
     Device, EV_ABS, EV_KEY, InputError, InputResult, MAX_TOUCH_SLOTS,
 };
-#[cfg(test)]
-use crate::model::PEN_POINTER_ID;
 use crate::model::{
     Event, PEN_BUTTON_PRIMARY, PEN_BUTTON_SECONDARY, PEN_BUTTON_TERTIARY, PenTool, PenTouchDevice,
     PenTouchPhase, pen_tilt_axes,
@@ -40,9 +38,9 @@ struct TrackedContact {
     last_event: Event,
     down_written: bool,
     // A failed write may have sent an input_event prefix. Count this contact
-    // until terminal cleanup even when the write reported failure before any
-    // event was actually accepted; uinput does not expose that distinction.
+    // until terminal cleanup when the tracking ID reached the device.
     native_write_attempted: bool,
+    tracking_id_written: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -133,7 +131,7 @@ impl ContactTracker {
     fn inject(
         &mut self,
         event: &Event,
-        mut emit: impl FnMut(Target, &[(u16, u16, i32)], &mut bool) -> InputResult<()>,
+        mut emit: impl FnMut(Target, &[(u16, u16, i32)], &mut bool, &mut usize) -> InputResult<()>,
     ) -> InputResult<()> {
         event.validate()?;
         let Event::PenTouch {
@@ -160,7 +158,7 @@ impl ContactTracker {
         pointer_id: u32,
         phase: PenTouchPhase,
         event: &Event,
-        emit: &mut impl FnMut(Target, &[(u16, u16, i32)], &mut bool) -> InputResult<()>,
+        emit: &mut impl FnMut(Target, &[(u16, u16, i32)], &mut bool, &mut usize) -> InputResult<()>,
     ) -> InputResult<()> {
         self.validate_pen_lifecycle(pointer_id, phase, event)?;
         let active_pointer = self
@@ -193,6 +191,7 @@ impl ContactTracker {
                             last_event: event.clone(),
                             down_written: false,
                             native_write_attempted: false,
+                            tracking_id_written: false,
                         },
                         initial_metadata: metadata,
                         metadata,
@@ -248,7 +247,8 @@ impl ContactTracker {
         }
         let frame = pen_frame(&frame_event, frame_metadata)?;
         let mut attempted = false;
-        let result = emit(Target::Pen, &frame, &mut attempted);
+        let mut events_written = 0;
+        let result = emit(Target::Pen, &frame, &mut attempted, &mut events_written);
         self.pen.as_mut().unwrap().contact.native_write_attempted |= attempted;
         result?;
         match phase {
@@ -278,7 +278,7 @@ impl ContactTracker {
         pointer_id: u32,
         phase: PenTouchPhase,
         event: &Event,
-        emit: &mut impl FnMut(Target, &[(u16, u16, i32)], &mut bool) -> InputResult<()>,
+        emit: &mut impl FnMut(Target, &[(u16, u16, i32)], &mut bool, &mut usize) -> InputResult<()>,
     ) -> InputResult<()> {
         self.validate_touch_lifecycle(pointer_id, phase, event)?;
         match phase {
@@ -301,6 +301,7 @@ impl ContactTracker {
                                 last_event: event.clone(),
                                 down_written: false,
                                 native_write_attempted: false,
+                                tracking_id_written: false,
                             },
                         },
                     );
@@ -330,31 +331,32 @@ impl ContactTracker {
         // A failed Down may have reserved a slot without creating a uinput
         // device. The first successful Move must establish its tracking ID.
         let recovering_down = phase == PenTouchPhase::Move && !down_written;
-        let frame_event = if recovering_down {
-            with_phase(event, PenTouchPhase::Down)
-        } else {
-            event.clone()
-        };
+        let frame_event = event.clone();
         if matches!(phase, PenTouchPhase::Up | PenTouchPhase::Cancel)
             && !touch.contact.native_write_attempted
         {
             self.touches.remove(&pointer_id);
             return Ok(());
         }
-        let native_contacts = self
-            .touches
-            .values()
-            .filter(|touch| touch.contact.native_write_attempted)
-            .count();
-        let active_contacts = native_contacts + usize::from(!touch.contact.native_write_attempted);
-        let frame = touch_frame(&frame_event, slot, active_contacts)?;
+        let active_contacts = self.terminal_contact_count();
+        let frame = touch_frame(&frame_event, slot, active_contacts, recovering_down)?;
         let mut attempted = false;
-        let result = emit(Target::Touch, &frame, &mut attempted);
+        let mut events_written = 0;
+        let result = emit(Target::Touch, &frame, &mut attempted, &mut events_written);
         self.touches
             .get_mut(&pointer_id)
             .unwrap()
             .contact
             .native_write_attempted |= attempted;
+        if (phase == PenTouchPhase::Down || recovering_down)
+            && tracking_id_in_written_prefix(&frame, events_written)
+        {
+            self.touches
+                .get_mut(&pointer_id)
+                .expect("attempted touch retains its contact")
+                .contact
+                .tracking_id_written = true;
+        }
         result?;
         match phase {
             PenTouchPhase::Down => {
@@ -363,6 +365,11 @@ impl ContactTracker {
                     .expect("successful touch down retains its contact")
                     .contact
                     .down_written = true;
+                self.touches
+                    .get_mut(&pointer_id)
+                    .expect("successful touch down retains its contact")
+                    .contact
+                    .tracking_id_written = true;
             }
             PenTouchPhase::Move => {
                 if recovering_down {
@@ -371,6 +378,11 @@ impl ContactTracker {
                         .expect("successful recovery retains its contact")
                         .contact
                         .down_written = true;
+                    self.touches
+                        .get_mut(&pointer_id)
+                        .expect("successful recovery retains its contact")
+                        .contact
+                        .tracking_id_written = true;
                 }
             }
             PenTouchPhase::Up | PenTouchPhase::Cancel => {
@@ -399,6 +411,16 @@ impl ContactTracker {
         Ok(TouchSlot { slot, tracking_id })
     }
 
+    /// Counts contacts whose positive tracking ID was accepted by uinput.
+    /// A reservation or failed write prefix before ABS_MT_TRACKING_ID cannot
+    /// keep the shared BTN_TOUCH key held.
+    fn terminal_contact_count(&self) -> usize {
+        self.touches
+            .values()
+            .filter(|touch| touch.contact.tracking_id_written)
+            .count()
+    }
+
     fn allocate_tracking_id(&mut self) -> i32 {
         let mut candidate = self.next_tracking_id.max(0);
         loop {
@@ -420,7 +442,7 @@ impl ContactTracker {
 
     fn release_all(
         &mut self,
-        mut emit: impl FnMut(Target, &[(u16, u16, i32)], &mut bool) -> InputResult<()>,
+        mut emit: impl FnMut(Target, &[(u16, u16, i32)], &mut bool, &mut usize) -> InputResult<()>,
     ) -> InputResult<()> {
         let mut first_error = None;
         if let Some(pen) = self.pen.clone() {
@@ -430,7 +452,8 @@ impl ContactTracker {
                 let cancel_event = with_phase(&pen.contact.last_event, PenTouchPhase::Cancel);
                 let frame = pen_frame(&cancel_event, pen.metadata)?;
                 let mut attempted = false;
-                match emit(Target::Pen, &frame, &mut attempted) {
+                let mut events_written = 0;
+                match emit(Target::Pen, &frame, &mut attempted, &mut events_written) {
                     Ok(()) => self.pen = None,
                     Err(error) => first_error = Some(error),
                 }
@@ -446,16 +469,11 @@ impl ContactTracker {
                 continue;
             }
             let cancel_event = with_phase(&touch.contact.last_event, PenTouchPhase::Cancel);
-            let native_contacts = self
-                .touches
-                .values()
-                .filter(|contact| contact.contact.native_write_attempted)
-                .count();
-            let active_contacts =
-                native_contacts + usize::from(!touch.contact.native_write_attempted);
-            let frame = touch_frame(&cancel_event, touch.slot, active_contacts)?;
+            let active_contacts = self.terminal_contact_count();
+            let frame = touch_frame(&cancel_event, touch.slot, active_contacts, false)?;
             let mut attempted = false;
-            match emit(Target::Touch, &frame, &mut attempted) {
+            let mut events_written = 0;
+            match emit(Target::Touch, &frame, &mut attempted, &mut events_written) {
                 Ok(()) => {
                     self.touches.remove(&pointer_id);
                 }
@@ -481,6 +499,7 @@ impl ContactTracker {
         for touch in self.touches.values_mut() {
             touch.contact.down_written = false;
             touch.contact.native_write_attempted = false;
+            touch.contact.tracking_id_written = false;
         }
     }
 
@@ -494,7 +513,7 @@ impl ContactTracker {
     fn replay_active_touches(
         &mut self,
         terminal_pointer: Option<u32>,
-        mut emit: impl FnMut(Target, &[(u16, u16, i32)], &mut bool) -> InputResult<()>,
+        mut emit: impl FnMut(Target, &[(u16, u16, i32)], &mut bool, &mut usize) -> InputResult<()>,
     ) -> InputResult<()> {
         let mut active_contacts = 0;
         for (pointer_id, touch) in &mut self.touches {
@@ -512,12 +531,16 @@ impl ContactTracker {
                 continue;
             }
             let down = with_phase(&touch.replay_event, PenTouchPhase::Down);
-            let frame = touch_frame(&down, touch.slot, active_contacts + 1)?;
+            let frame = touch_frame(&down, touch.slot, active_contacts + 1, false)?;
             let mut attempted = false;
-            let result = emit(Target::Touch, &frame, &mut attempted);
+            let mut events_written = 0;
+            let result = emit(Target::Touch, &frame, &mut attempted, &mut events_written);
             touch.contact.native_write_attempted |= attempted;
+            touch.contact.tracking_id_written |=
+                tracking_id_in_written_prefix(&frame, events_written);
             result?;
             touch.contact.down_written = true;
+            touch.contact.tracking_id_written = true;
             active_contacts += 1;
         }
         Ok(())
@@ -562,14 +585,19 @@ impl LinuxPenTouch {
     ) -> InputResult<()> {
         destroy_device(&mut self.touch_device)?;
         self.tracker.reset_touch_device_state();
-        self.tracker
-            .replay_active_touches(terminal_pointer, |_, frame, attempted| {
+        self.tracker.replay_active_touches(
+            terminal_pointer,
+            |_, frame, attempted, events_written| {
                 if self.touch_device.is_none() {
                     self.touch_device = Some(create()?);
                 }
                 *attempted = true;
-                self.touch_device.as_ref().unwrap().emit(frame)
-            })?;
+                self.touch_device
+                    .as_ref()
+                    .unwrap()
+                    .emit_with_progress(frame, events_written)
+            },
+        )?;
         self.touch_write_failed = false;
         Ok(())
     }
@@ -627,7 +655,7 @@ impl LinuxPenTouch {
             pen_write_failed,
             touch_write_failed,
         } = self;
-        tracker.inject(event, |target, frame, attempted| {
+        tracker.inject(event, |target, frame, attempted, events_written| {
             let device = match target {
                 Target::Pen => &mut *pen_device,
                 Target::Touch => &mut *touch_device,
@@ -655,7 +683,7 @@ impl LinuxPenTouch {
                 InputError::new("backend_inactive", "uinput device is not active")
             })?;
             *attempted = true;
-            let result = device.emit(frame);
+            let result = device.emit_with_progress(frame, events_written);
             if target == Target::Pen && result.is_err() {
                 *pen_write_failed = true;
             }
@@ -676,7 +704,7 @@ impl LinuxPenTouch {
         } = self;
         // Send per-pointer terminal frames first. If a write fails, destroying
         // our owned devices still removes all contacts from those devices.
-        let _release_result = tracker.release_all(|target, frame, attempted| {
+        let _release_result = tracker.release_all(|target, frame, attempted, events_written| {
             let device = match target {
                 Target::Pen => pen_device.as_ref(),
                 Target::Touch => touch_device.as_ref(),
@@ -684,7 +712,7 @@ impl LinuxPenTouch {
             match device {
                 Some(device) => {
                     *attempted = true;
-                    device.emit(frame)
+                    device.emit_with_progress(frame, events_written)
                 }
                 // A Down can fail while opening UInput before any device
                 // exists; there is then no kernel contact to release.
@@ -776,6 +804,18 @@ fn pointer_id_of(event: &Event) -> Option<u32> {
         Event::PenTouch { pointer_id, .. } => Some(*pointer_id),
         _ => None,
     }
+}
+
+fn tracking_id_in_written_prefix(frame: &[(u16, u16, i32)], events_written: usize) -> bool {
+    frame
+        .iter()
+        .enumerate()
+        .any(|(index, (event_type, code, value))| {
+            index < events_written
+                && *event_type == EV_ABS
+                && *code == ABS_MT_TRACKING_ID
+                && *value >= 0
+        })
 }
 
 fn ensure_active_pointer(active_pointer: Option<u32>, pointer_id: u32) -> InputResult<()> {
@@ -917,6 +957,7 @@ fn touch_frame(
     event: &Event,
     slot: TouchSlot,
     active_contacts: usize,
+    recovering_down: bool,
 ) -> InputResult<Vec<(u16, u16, i32)>> {
     let Event::PenTouch {
         device: PenTouchDevice::Touch,
@@ -938,6 +979,9 @@ fn touch_frame(
     let mut frame = vec![(EV_ABS, ABS_MT_SLOT, slot.slot)];
     match phase {
         PenTouchPhase::Down => frame.push((EV_ABS, ABS_MT_TRACKING_ID, slot.tracking_id)),
+        PenTouchPhase::Move if recovering_down => {
+            frame.push((EV_ABS, ABS_MT_TRACKING_ID, slot.tracking_id));
+        }
         PenTouchPhase::Move => {}
         PenTouchPhase::Up | PenTouchPhase::Cancel => {
             frame.push((EV_ABS, ABS_MT_TRACKING_ID, -1));
@@ -968,9 +1012,9 @@ fn touch_frame(
             // ABS_MT_ORIENTATION has no unknown value; zero is the neutral angle.
             frame.push((EV_ABS, ABS_MT_ORIENTATION, 0));
         }
-        if *phase == PenTouchPhase::Down {
+        if *phase == PenTouchPhase::Down || recovering_down {
             // A prior frame may have stopped after TRACKING_ID but before the
-            // shared touch key. Reassert it for every complete Down report.
+            // shared touch key. Reassert it for Down and recovered Move frames.
             frame.push((EV_KEY, BTN_TOUCH, 1));
         }
     } else {
@@ -1048,6 +1092,7 @@ fn with_phase(event: &Event, phase: PenTouchPhase) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PEN_POINTER_ID;
 
     fn fake_device(path: &str) -> Device {
         Device {
@@ -1489,21 +1534,35 @@ mod tests {
     #[derive(Default)]
     struct FakeWriter {
         frames: Vec<RecordedFrame>,
+        accepted_events: Vec<usize>,
         fail_next: bool,
         partial_next: Option<usize>,
     }
 
     impl FakeWriter {
-        fn emit(&mut self, target: Target, frame: &[(u16, u16, i32)]) -> InputResult<()> {
+        fn emit(
+            &mut self,
+            target: Target,
+            frame: &[(u16, u16, i32)],
+            events_written: &mut usize,
+        ) -> InputResult<()> {
             if let Some(event_count) = self.partial_next.take() {
                 self.frames.push((target, frame[..event_count].to_vec()));
+                self.accepted_events.push(event_count);
+                *events_written = event_count;
                 return Err(InputError::new("injection_failed", "partial fake write"));
             }
             self.frames.push((target, frame.to_vec()));
             if self.fail_next {
                 self.fail_next = false;
+                // This mode models failure before the first event is accepted.
+                // Keep the attempted frame for retry assertions, but do not
+                // confuse it with an event prefix delivered to uinput.
+                self.accepted_events.push(0);
                 Err(InputError::new("injection_failed", "fake device loss"))
             } else {
+                self.accepted_events.push(frame.len());
+                *events_written = frame.len();
                 Ok(())
             }
         }
@@ -1537,9 +1596,9 @@ mod tests {
         writer: &mut FakeWriter,
         event: &Event,
     ) -> InputResult<()> {
-        tracker.inject(event, |target, frame, attempted| {
+        tracker.inject(event, |target, frame, attempted, events_written| {
             *attempted = true;
-            writer.emit(target, frame)
+            writer.emit(target, frame, events_written)
         })
     }
 
@@ -1578,9 +1637,9 @@ mod tests {
         tracker.reset_touch_device_state();
         let frame_count = writer.frames.len();
         tracker
-            .replay_active_touches(None, |target, frame, attempted| {
+            .replay_active_touches(None, |target, frame, attempted, events_written| {
                 *attempted = true;
-                writer.emit(target, frame)
+                writer.emit(target, frame, events_written)
             })
             .unwrap();
         assert_eq!(writer.frames.len(), frame_count + 2);
@@ -1710,6 +1769,7 @@ mod tests {
             event_at(&writer.frames[0].1, EV_ABS, ABS_MT_TRACKING_ID),
             Some(0)
         );
+        assert_eq!(writer.accepted_events[0], 2);
         assert_eq!(event_at(&writer.frames[0].1, EV_KEY, BTN_TOUCH), None);
         assert!(
             tracker
@@ -1748,7 +1808,7 @@ mod tests {
         let second_down = event(8, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 40);
         assert!(
             tracker
-                .inject(&first_down, |_, _, _| Err(InputError::new(
+                .inject(&first_down, |_, _, _, _| Err(InputError::new(
                     "injection_failed",
                     "open failed"
                 )))
@@ -1765,7 +1825,7 @@ mod tests {
         emit(&mut tracker, &mut writer, &second_down).unwrap();
         assert_eq!(event_at(&writer.frames[0].1, EV_KEY, BTN_TOUCH), Some(1));
         tracker
-            .inject(&with_phase(&first_down, PenTouchPhase::Up), |_, _, _| {
+            .inject(&with_phase(&first_down, PenTouchPhase::Up), |_, _, _, _| {
                 panic!("uncreated contact must not emit a native release")
             })
             .unwrap();
@@ -1889,9 +1949,9 @@ mod tests {
         assert!(tracker.is_empty());
         emit(&mut tracker, &mut writer, &down).unwrap();
         tracker
-            .release_all(|target, frame, attempted| {
+            .release_all(|target, frame, attempted, events_written| {
                 *attempted = true;
-                writer.emit(target, frame)
+                writer.emit(target, frame, events_written)
             })
             .unwrap();
         assert!(tracker.is_empty());
@@ -1899,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn move_after_failed_down_starts_touch_and_uncertain_contacts_keep_shared_tip() {
+    fn move_after_failed_down_starts_touch_and_reserved_contacts_do_not_hold_tip() {
         let mut tracker = ContactTracker::default();
         let mut writer = FakeWriter {
             fail_next: true,
@@ -1908,12 +1968,15 @@ mod tests {
         let first_down = event(7, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 20);
         let second_down = event(8, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 40);
         assert!(emit(&mut tracker, &mut writer, &first_down).is_err());
+        assert_eq!(writer.accepted_events[0], 0);
         writer.fail_next = true;
         assert!(emit(&mut tracker, &mut writer, &second_down).is_err());
+        assert_eq!(writer.accepted_events[1], 0);
 
         let first_move = event(7, PenTouchDevice::Touch, PenTouchPhase::Move, 11, 21);
         writer.fail_next = true;
         assert!(emit(&mut tracker, &mut writer, &first_move).is_err());
+        assert_eq!(writer.accepted_events[2], 0);
         assert!(!tracker.touches.get(&7).unwrap().contact.down_written);
         emit(&mut tracker, &mut writer, &first_move).unwrap();
         let recovered = &writer.frames[3].1;
@@ -1928,9 +1991,8 @@ mod tests {
             &event(7, PenTouchDevice::Touch, PenTouchPhase::Up, 11, 21),
         )
         .unwrap();
-        // The second failed write may have installed a tracking ID. Its
-        // uncertain native contact keeps the shared tip until it is reconciled.
-        assert_eq!(event_at(&writer.frames[4].1, EV_KEY, BTN_TOUCH), None);
+        // No bytes reached the second reserved contact, so it cannot hold the native tip.
+        assert_eq!(event_at(&writer.frames[4].1, EV_KEY, BTN_TOUCH), Some(0));
 
         let second_move = event(8, PenTouchDevice::Touch, PenTouchPhase::Move, 31, 41);
         emit(&mut tracker, &mut writer, &second_move).unwrap();
@@ -2370,9 +2432,9 @@ mod tests {
         writer.fail_next = true;
         let move_frame_count = writer.frames.len();
         let first_release = tracker
-            .release_all(|target, frame, attempted| {
+            .release_all(|target, frame, attempted, events_written| {
                 *attempted = true;
-                writer.emit(target, frame)
+                writer.emit(target, frame, events_written)
             })
             .unwrap_err();
         assert_eq!(first_release.code, "injection_failed");
@@ -2385,9 +2447,9 @@ mod tests {
                     && event_at(frame, EV_ABS, ABS_MT_TRACKING_ID) == Some(-1))
         );
         tracker
-            .release_all(|target, frame, attempted| {
+            .release_all(|target, frame, attempted, events_written| {
                 *attempted = true;
-                writer.emit(target, frame)
+                writer.emit(target, frame, events_written)
             })
             .unwrap();
         assert!(tracker.is_empty());

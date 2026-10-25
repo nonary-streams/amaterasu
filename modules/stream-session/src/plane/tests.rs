@@ -40,6 +40,10 @@ impl Backend for Fake {
         self.feedback_sent.push(message.clone());
         Ok(true)
     }
+
+    fn send_rumble(&mut self, _command: RumbleCommand) -> PlaneResult<bool> {
+        Ok(true)
+    }
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>> {
         self.video_reads += 1;
         if self.video_failure_after_submit && !self.videos_sent.is_empty() {
@@ -162,6 +166,32 @@ fn haptics_pcm(sequence: u32) -> HostFeedback {
 }
 
 #[test]
+fn a_video_tick_drains_multiple_queued_pcm_packets_without_losing_order() {
+    let mut backend = Fake::default();
+    backend.pcms.extend((0..25).map(|_| pcm()));
+    let mut pump = Pump::with_media(backend, true, 2, CODEC_H264);
+
+    pump.tick(true).unwrap();
+    assert_eq!(pump.backend.pcm_sent, 25);
+    assert_eq!(pump.backend.pcm_reads, 26); // The empty poll ends the batch.
+    assert_eq!(pump.backend.audio_reads, 26);
+}
+
+#[test]
+fn pcm_drain_is_bounded_per_video_tick() {
+    let mut backend = Fake::default();
+    backend
+        .pcms
+        .extend((0..(PCM_READ_BUDGET + 1)).map(|_| pcm()));
+    let mut pump = Pump::with_media(backend, true, 2, CODEC_H264);
+
+    pump.tick(true).unwrap();
+    assert_eq!(pump.backend.pcm_sent, PCM_READ_BUDGET);
+    pump.tick(true).unwrap();
+    assert_eq!(pump.backend.pcm_sent, PCM_READ_BUDGET + 1);
+}
+
+#[test]
 fn surround_pcm_and_encoded_packets_cross_plane_and_drain() {
     for channels in [6, 8] {
         let pcm_bytes = vec![0; 480 * channels as usize * 4];
@@ -196,7 +226,7 @@ fn surround_pcm_and_encoded_packets_cross_plane_and_drain() {
         backend
             .audios
             .push_back(unsafe { AudioPacket::copy(&encoded).unwrap() });
-        let mut pump = Pump::with_audio(backend, true, channels);
+        let mut pump = Pump::with_media(backend, true, channels, CODEC_H264);
         assert_eq!(pump.tick(true).unwrap().accepted_media_payload_bytes, 3);
         assert_eq!(pump.backend.audio_sent, [encoded_bytes]);
         assert_eq!(pump.backend.pcm_sent, 1);
@@ -501,7 +531,7 @@ fn disabled_audio_retries_only_eos_without_polling_capture_or_encoder() {
     backend.videos.push_back(video(&[], FLAG_END_OF_STREAM, 0));
     backend.audios.push_back(audio(false));
     backend.pcms.push_back(pcm());
-    let mut pump = Pump::with_audio(backend, false, 2);
+    let mut pump = Pump::with_media(backend, false, 2, CODEC_H264);
 
     pump.tick(true).unwrap();
     assert!(pump.video_ended);
@@ -554,6 +584,49 @@ fn stop_flushes_accepted_pcm_then_both_eos_before_transport_drain() {
     assert_eq!(pump.backend.pcm_reads, 1);
 }
 
+fn av1_video(bytes: &[u8], flags: u32, sequence: u64) -> VideoPacket {
+    let packet = EncodedPacket {
+        codec: CODEC_AV1,
+        flags,
+        data: bytes.as_ptr(),
+        len: bytes.len(),
+        timestamp_us: sequence * 1000,
+        sequence,
+    };
+    // SAFETY: input slice remains initialized for the copy.
+    unsafe { VideoPacket::copy(&packet).unwrap() }
+}
+
+#[test]
+fn av1_fragments_assemble_into_one_temporal_unit_with_the_keyframe_flag() {
+    let mut backend = Fake::default();
+    backend.videos.extend([
+        av1_video(&[0x12, 0x00], FLAG_KEYFRAME, 1),
+        av1_video(&[0x0a, 0x01, 0xaa], 0, 1),
+        av1_video(&[0x32, 0x01, 0xbb], FLAG_END_OF_ACCESS_UNIT, 1),
+    ]);
+    let mut pump = Pump::with_media(backend, true, 2, CODEC_AV1);
+    let progress = pump.tick(true).unwrap();
+    assert_eq!(progress.accepted_video_access_units, 1);
+    let (flags, bytes) = &pump.backend.videos_sent[0];
+    assert_eq!(*flags, FLAG_KEYFRAME | FLAG_END_OF_ACCESS_UNIT);
+    assert_eq!(bytes, &[0x12, 0x00, 0x0a, 0x01, 0xaa, 0x32, 0x01, 0xbb]);
+}
+
+#[test]
+fn packets_of_another_codec_than_negotiated_fail_before_submission() {
+    let mut backend = Fake::default();
+    backend
+        .videos
+        .push_back(video(&[0, 0, 1, 0x65], FLAG_END_OF_ACCESS_UNIT, 1));
+    let mut pump = Pump::with_media(backend, true, 2, CODEC_AV1);
+    assert_eq!(
+        pump.tick(true).err().map(|failure| failure.code),
+        Some("video_codec_mismatch")
+    );
+    assert!(pump.backend.videos_sent.is_empty());
+}
+
 #[test]
 fn missing_access_unit_boundary_is_a_sticky_failure_never_a_guessed_frame() {
     for next in [
@@ -595,7 +668,7 @@ fn control_failure_prevents_all_media_polling() {
 
 #[test]
 fn assembler_fragment_count_and_pcm_format_are_explicitly_bounded() {
-    let mut assembly = VideoAssembly::default();
+    let mut assembly = VideoAssembly::new(CODEC_H264);
     for _ in 0..1024 {
         assembly.push(video(&[1], 0, 1)).unwrap();
     }

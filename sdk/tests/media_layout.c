@@ -23,6 +23,14 @@ _Static_assert(sizeof(AmaterasuCaptureApiV1_2) == 56, "capture v1.2 table layout
 _Static_assert(AMATERASU_CAPTURE_API_V1_2_SIZE == 56, "capture v1.2 minimum size");
 _Static_assert(offsetof(AmaterasuCaptureApiV1_2, read_frame_with_freshness) == 48, "capture freshness callback offset");
 _Static_assert(sizeof(AmaterasuEncoderApi) == 56, "encoder table layout");
+_Static_assert(sizeof(AmaterasuEncoderApiV1_1) == 64, "encoder v1.1 table layout");
+_Static_assert(offsetof(AmaterasuEncoderApiV1_1, submit_dmabuf) == 56, "encoder dmabuf offset");
+_Static_assert(sizeof(AmaterasuDmaBufPlane) == 16, "dmabuf plane layout");
+_Static_assert(sizeof(AmaterasuDmaBufFrame) == 112, "dmabuf frame layout");
+_Static_assert(offsetof(AmaterasuDmaBufFrame, planes) == 24, "dmabuf planes offset");
+_Static_assert(offsetof(AmaterasuDmaBufFrame, color) == 88, "dmabuf color offset");
+_Static_assert(offsetof(AmaterasuDmaBufFrame, timestamp_us) == 96, "dmabuf timestamp offset");
+_Static_assert(sizeof(AmaterasuDmaBufFrameSink) == 16, "dmabuf sink layout");
 _Static_assert(sizeof(AmaterasuVideoApi) == 40, "video table layout");
 _Static_assert(sizeof(AmaterasuAudioFrame) == 56, "audio frame layout");
 _Static_assert(offsetof(AmaterasuAudioFrame, data) == 24, "audio data offset");

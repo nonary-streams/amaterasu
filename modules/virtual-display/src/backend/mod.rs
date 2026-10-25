@@ -49,9 +49,11 @@ pub trait Driver {
 
 #[cfg(not(windows))]
 #[derive(Default)]
+#[cfg_attr(all(amaterasu_libvirtualdisplay, test), allow(dead_code))]
 pub struct NativeDriver;
 
 impl NativeDriver {
+    #[cfg_attr(all(amaterasu_libvirtualdisplay, test), allow(dead_code))]
     pub fn new() -> Self {
         #[cfg(windows)]
         {

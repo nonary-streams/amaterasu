@@ -579,6 +579,23 @@ mod linux {
         }
 
         #[test]
+        fn install_root_cwd_alone_does_not_attribute_a_launcher() {
+            let mut process = synthetic_process(12, 1, "/usr/bin/launcher", 1000);
+            process.working_directory = Some(PathBuf::from("/games/title"));
+            assert!(!has_install_tree_evidence(
+                &process,
+                Path::new("/games/title"),
+                None,
+            ));
+            process.working_directory = Some(PathBuf::from("/games/title/game"));
+            assert!(has_install_tree_evidence(
+                &process,
+                Path::new("/games/title"),
+                None,
+            ));
+        }
+
+        #[test]
         fn only_new_install_tree_processes_and_their_descendants_are_associated() {
             let mut tracker = tracker();
             let baseline_process = Process {

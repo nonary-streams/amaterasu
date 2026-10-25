@@ -51,12 +51,12 @@ impl Engine {
         now: u64,
     ) -> Result<Change, &'static str> {
         self.admit(caller, &operation)?;
+        let now = self.latest_time.max(now);
         document.validate(now)?;
-        self.latest_time = self.latest_time.max(now);
-        let now = self.latest_time;
+        self.latest_time = now;
         self.pending.retain(|_, pending| pending.expires_at > now);
         match operation {
-            Operation::Initialize {} => Self::initialize(document, now),
+            Operation::Initialize {} => Self::initialize(document),
             Operation::ImportIdentity {
                 certificate_pem,
                 private_key_pem,
@@ -157,13 +157,9 @@ impl Engine {
         json!({"ok":true,"pending":pending})
     }
 
-    fn initialize(mut document: Document, now: u64) -> Result<Change, &'static str> {
-        if let Some(identity) = &document.identity {
-            return Ok(Change::Read(identity_response(identity)));
-        }
-        document.identity = Some(crypto::generate_identity()?);
-        let response = identity_response(document.identity.as_ref().ok_or("identity_failure")?);
-        write(document, response, now)
+    fn initialize(document: Document) -> Result<Change, &'static str> {
+        let identity = document.identity.as_ref().ok_or("not_initialized")?;
+        Ok(Change::Read(identity_response(identity)))
     }
     fn import(
         mut document: Document,

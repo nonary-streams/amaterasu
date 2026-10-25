@@ -1,6 +1,6 @@
 //! The Linux session product profile.
 //!
-//! This composition carries the real input, audio, KMS capture, virtual display
+//! This composition carries real input, audio, KMS and portal capture, virtual display
 //! and encoder libraries so a Moonlight client can reach a Linux host. It is
 //! separate from `LinuxProbe`, which holds qualification fixtures, and from
 //! `Platform`, which is the Windows product. Every effect-bearing component
@@ -16,10 +16,11 @@ pub mod options;
 mod tests;
 
 use super::{
-    APPLICATION, AUDIO, AUDIO_ENCODE, AUTHENTICATION, CAPTURE_KMS, CATALOG, CONFIGURATION,
-    CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, FRAME_LIMITER, HOST_METRICS, INPUT,
-    LAUNCH, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NVHTTP, PAIRING, RTSP, RUNTIME, RUNTIME_ID,
-    SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO, VIRTUAL_DISPLAY, names,
+    APPLICATION, AUDIO, AUDIO_ENCODE, AUTHENTICATION, CAPTURE_KMS, CAPTURE_PIPEWIRE, CAPTURE_VKMS,
+    CATALOG, CONFIGURATION, CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, FRAME_LIMITER,
+    HOST_METRICS, INPUT, LAUNCH, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NVHTTP, PAIRING, RTSP,
+    RUNTIME, RUNTIME_ID, SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO,
+    VIRTUAL_DISPLAY, names,
 };
 use amaterasu_contracts::{Grants, RuntimeConfig};
 use amaterasu_package::{PackageResult, create_private_directory};
@@ -32,13 +33,13 @@ use std::path::Path;
 /// development policy holds 4 and the installer policy 3. Advance this whenever
 /// the administrator principals or the allowed scopes below
 /// change, including a revert. TTL-only edits do not bump it.
-pub const AUTHORIZATION_POLICY_GENERATION: u64 = 5;
+pub const AUTHORIZATION_POLICY_GENERATION: u64 = 8;
 
 pub const ADMINISTRATOR_PRINCIPALS: [&str; 2] = ["amaterasu.console", "amaterasu.management"];
 
-/// Management scopes without the diagnostics scopes (that component is absent)
-/// and without the portal capture scopes (no portal capture in this profile).
-pub const ALLOWED_SCOPES: [&str; 16] = [
+/// Management scopes without diagnostics; capture scopes authorize the
+/// current user's explicit XDG Desktop Portal source selection.
+pub const ALLOWED_SCOPES: [&str; 18] = [
     "catalog.read",
     "catalog.write",
     "configuration.read",
@@ -54,6 +55,8 @@ pub const ALLOWED_SCOPES: [&str; 16] = [
     "pairing.admin",
     "display.read",
     "display.write",
+    "capture.read",
+    "capture.write",
     "media.read",
 ];
 
@@ -79,46 +82,65 @@ const LINUX_SESSION_PAIRING: ComponentDefinition = ComponentDefinition {
     ..PAIRING
 };
 
-/// Launch without the Playnite provider; Lutris and Steam launches stay reachable.
+/// Launch without Playnite; Steam and Lutris integrations remain available.
 const LINUX_SESSION_LAUNCH: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.lutris/1",
         "amaterasu.catalog/1",
         "amaterasu.state/1",
         "amaterasu.session/1",
         "amaterasu.application/1",
-        "amaterasu.lutris/1",
     ],
     dependencies: &[
+        "amaterasu.lutris",
         RUNTIME_ID,
         "amaterasu.catalog",
         "amaterasu.state",
         "amaterasu.session",
         "amaterasu.application",
-        "amaterasu.lutris",
     ],
     ..LAUNCH
 };
 
-/// The video module offering only the KMS provider, whose capture-kms library
-/// serves both physical outputs and managed virtual outputs.
+/// Video supports explicitly selected KMS outputs and captures owned virtual
+/// outputs as DMA-BUF scanout through
+/// capture-vkms when its frame helper is usable, and otherwise through a
+/// current-user PipeWire stream (KWin ScreenCast or the portal).
 const LINUX_SESSION_VIDEO: ComponentDefinition = ComponentDefinition {
     id: VIDEO_COMPONENT_ID,
-    calls: &["amaterasu.capture-kms/1", "amaterasu.encode/1"],
-    native_uses: &["amaterasu.capture-kms/1", "amaterasu.encode/1"],
-    dependencies: &[RUNTIME_ID, "amaterasu.capture-kms", "amaterasu.encode"],
+    calls: &[
+        "amaterasu.capture-kms/1",
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
+        "amaterasu.encode/1",
+    ],
+    native_uses: &[
+        "amaterasu.capture-kms/1",
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
+        "amaterasu.encode/1",
+    ],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.capture-kms",
+        "amaterasu.capture-pipewire",
+        "amaterasu.capture-vkms",
+        "amaterasu.encode",
+    ],
     ..VIDEO
 };
 
 // The grant chain. A parented request carries the intersection of every
-// ancestor's call grants, so each service a stream reaches must appear on
-// NVHTTP, RTSP, and the stream session as well as on the component that
-// finally calls it:
+// ancestor's call grants, so PipeWire call authority must transit NVHTTP,
+// RTSP, and the stream session. Native-use authority stays on the Linux video
+// component, which is the only module that directly invokes capture frames:
 //   nvhttp -> rtsp -> stream-session -> video / media-transport / control-transport
-//   video -> encode / capture-kms
+//   video -> encode / current-user PipeWire capture
 //   stream-session -> session / display / virtual-display / input / audio / audio-encode
 //   nvhttp -> launch / catalog / application / session / input / pairing / encode
 const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.lutris/1",
         "amaterasu.configuration/1",
         "amaterasu.input/1",
         "amaterasu.pairing/1",
@@ -127,7 +149,6 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.launch/1",
         "amaterasu.display/1",
         "amaterasu.virtual-display/1",
-        "amaterasu.lutris/1",
         "amaterasu.application/1",
         "amaterasu.rtsp/1",
         "amaterasu.stream-session/1",
@@ -138,6 +159,8 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
         "amaterasu.capture-kms/1",
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
         "amaterasu.encode/1",
     ],
     dependencies: &[
@@ -168,6 +191,8 @@ const LINUX_SESSION_RTSP: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
         "amaterasu.capture-kms/1",
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
         "amaterasu.encode/1",
     ],
     ..RTSP
@@ -175,6 +200,7 @@ const LINUX_SESSION_RTSP: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.host-metrics/1",
         "amaterasu.input/1",
         "amaterasu.session/1",
         "amaterasu.display/1",
@@ -186,12 +212,14 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
         "amaterasu.capture-kms/1",
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
         "amaterasu.encode/1",
         "amaterasu.session-history/1",
-        "amaterasu.host-metrics/1",
         "amaterasu.frame-limiter/1",
     ],
     dependencies: &[
+        "amaterasu.host-metrics",
         "amaterasu.input",
         RUNTIME_ID,
         "amaterasu.session",
@@ -199,7 +227,6 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.virtual-display",
         "amaterasu.state",
         "amaterasu.session-history",
-        "amaterasu.host-metrics",
         VIDEO_COMPONENT_ID,
         "amaterasu.audio",
         "amaterasu.audio-encode",
@@ -212,6 +239,9 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.steam/1",
+        "amaterasu.host-metrics/1",
+        "amaterasu.lutris/1",
         // Loopback `/healthz` drives the fixed status-only operation of this
         // component against its authentication, catalog and pairing dependencies.
         "amaterasu.management/1",
@@ -222,13 +252,16 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.session/1",
         "amaterasu.application/1",
         "amaterasu.input/1",
-        "amaterasu.steam/1",
-        "amaterasu.lutris/1",
         "amaterasu.pairing/1",
         "amaterasu.display/1",
         "amaterasu.launch/1",
-        // Read-only output enumeration for choosing a capture output.
+        // Authenticated status and portal-selection delegation through video.
+        // Retain the capture call grant for management -> video -> PipeWire
+        // nested authority intersection; management does not depend on or
+        // invoke the provider directly.
         "amaterasu.capture-kms/1",
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
         "amaterasu.audio/1",
         "amaterasu.audio-encode/1",
         "amaterasu.encode/1",
@@ -240,9 +273,11 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
         "amaterasu.session-history/1",
-        "amaterasu.host-metrics/1",
     ],
     dependencies: &[
+        "amaterasu.steam",
+        "amaterasu.host-metrics",
+        "amaterasu.lutris",
         RUNTIME_ID,
         "amaterasu.authentication",
         "amaterasu.state",
@@ -251,12 +286,9 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.session",
         "amaterasu.application",
         "amaterasu.input",
-        "amaterasu.steam",
-        "amaterasu.lutris",
         "amaterasu.pairing",
         "amaterasu.display",
         "amaterasu.launch",
-        "amaterasu.capture-kms",
         "amaterasu.audio",
         "amaterasu.audio-encode",
         "amaterasu.encode",
@@ -266,7 +298,6 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport",
         "amaterasu.control-transport",
         "amaterasu.session-history",
-        "amaterasu.host-metrics",
     ],
     ..MANAGEMENT
 };
@@ -278,10 +309,10 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     CONFIGURATION,
     SESSION_HISTORY,
     HOST_METRICS,
-    CATALOG,
-    APPLICATION,
     STEAM,
     LUTRIS,
+    CATALOG,
+    APPLICATION,
     AUTHENTICATION,
     LINUX_SESSION_MANAGEMENT,
     LINUX_SESSION_PAIRING,
@@ -291,6 +322,8 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     INPUT,
     VIRTUAL_DISPLAY,
     CAPTURE_KMS,
+    CAPTURE_PIPEWIRE,
+    CAPTURE_VKMS,
     AUDIO,
     AUDIO_ENCODE,
     ENCODE,
@@ -419,19 +452,34 @@ fn settings(
     insert("amaterasu.encode", json!({"enabled": true}));
     insert("amaterasu.audio-encode", json!({"enabled": true}));
 
-    // Effect-bearing components stay disabled until an explicit option.
+    // The portal owns the explicit user-consent prompt. Capture remains
+    // disabled until selected in the portal; video processing is separately
+    // enabled through the profile option.
     insert(
         VIDEO_COMPONENT_ID,
-        json!({"enabled": options.enable_capture, "capture_providers": ["kms"]}),
+        json!({"enabled": options.enable_capture, "capture_providers": ["kms", "pipewire", "vkms"]}),
     );
+    let mut capture_settings = portal_capture_settings();
+    if options.enable_virtual_display {
+        capture_settings["allow_named_outputs"] = json!(true);
+    }
+    insert("amaterasu.capture-pipewire", capture_settings);
+    insert("amaterasu.capture-vkms", vkms_capture_settings(options));
     insert(
         "amaterasu.capture-kms",
         json!({"enabled": options.enable_capture}),
     );
     insert("amaterasu.audio", json!({"enabled": options.enable_audio}));
+    // Owned displays are the only screen while streaming (Vibeshine's default
+    // exclusive layout) and are scaled to keep about 864 logical rows, since
+    // KWin otherwise remembers a 100% scale for these connectors.
     insert(
         "amaterasu.virtual-display",
-        json!({"enabled": options.enable_virtual_display}),
+        json!({
+            "enabled": options.enable_virtual_display,
+            "virtual_display_layout": "exclusive",
+            "dd_virtual_display_scale": -1,
+        }),
     );
     insert(
         "amaterasu.input",
@@ -454,16 +502,38 @@ fn authentication_settings() -> Value {
     })
 }
 
+fn portal_capture_settings() -> Value {
+    json!({
+        "enabled": true,
+        "selection_principals": [VIDEO_COMPONENT_ID, MANAGEMENT.id],
+        "capture_principals": [VIDEO_COMPONENT_ID],
+    })
+}
+
+/// Direct scanout capture needs the operator-installed privileged helper.
+/// Without `--frame-helper` the provider stays disabled and video keeps
+/// capturing owned outputs through PipeWire.
+fn vkms_capture_settings(options: &LinuxSessionOptions) -> Value {
+    match &options.frame_helper {
+        Some(helper) => json!({
+            "enabled": options.enable_capture,
+            "capture_principals": [VIDEO_COMPONENT_ID],
+            "frame_helper": helper,
+        }),
+        None => json!({"enabled": false}),
+    }
+}
+
 fn catalog_settings(options: &LinuxSessionOptions) -> Value {
     let owner = options.catalog_owner.principal();
     json!({
         "launch_principals": ["amaterasu.launch"],
-        "export_principals": {"amaterasu.nvhttp": owner},
+        // NVHTTP advertises the reserved Desktop app ID directly. Do not also
+        // create an ordinary catalog row named Desktop.
+        "seed_desktop_entry": false,
         "steam_id_export_principals": {"amaterasu.lutris": owner},
-        "import_principals": {
-            "amaterasu.steam": owner,
-            "amaterasu.lutris": owner,
-        },
+        "import_principals": {"amaterasu.steam": owner, "amaterasu.lutris": owner},
+        "export_principals": {"amaterasu.nvhttp": owner},
     })
 }
 
@@ -480,22 +550,29 @@ fn nvhttp_settings(options: &LinuxSessionOptions) -> Value {
     })
 }
 
-/// The first supported stream is 1920x1080 at 60 Hz: software x264 cannot
-/// sustain the host desktop's own 3024x1890 at 90 Hz, and larger requests are
-/// refused instead of silently degraded.
+/// Streams reach 3840x2160 at 120 Hz when a hardware encoder serves the
+/// negotiated codec. NVHTTP refuses a launch above 1920x1080 at 60 Hz that only
+/// a software encoder could serve: software x264 cannot sustain the host
+/// desktop's own 3024x1890 at 90 Hz, and such requests are refused instead of
+/// silently degraded.
 fn streaming_settings(options: &LinuxSessionOptions) -> Value {
     json!({
         "capture": {
-            "capture_provider": "kms",
-            "output": options.capture_output,
+            "capture_provider": if options.capture_output == options::DEFAULT_CAPTURE_OUTPUT { "pipewire" } else { "kms" },
+            "output": if options.capture_output != options::DEFAULT_CAPTURE_OUTPUT { options.capture_output.as_str() } else if options.enable_virtual_display { "amaterasu-owned-display" } else { "portal-selected-session-source" },
+            // Automatic selection lets the video module open a hardware
+            // encoder for whichever codec the client negotiates, then the
+            // software encoder. A numeric index would pin one codec.
             "encoder": "auto",
             "audio_endpoint": options.audio_endpoint,
         },
         "profile": {
-            "max_width": 1920,
-            "max_height": 1080,
-            "max_fps": 60,
-            "bitrate_kbps": 20_000,
+            "max_width": 3840,
+            "max_height": 2160,
+            "max_fps": 120,
+            // A ceiling on the client's requested bitrate, which Moonlight
+            // scales with the mode (about 64 Mbps by default at 4K60).
+            "bitrate_kbps": 100_000,
             "max_reference_frames": 1,
             "packet_size": 1024,
             "fec_percentage": 20,
@@ -507,6 +584,7 @@ fn streaming_settings(options: &LinuxSessionOptions) -> Value {
             "encrypt_audio": true,
             "permit_legacy_audio_iv_wrap": false,
         },
+        "desktop": {"enabled": true},
     })
 }
 

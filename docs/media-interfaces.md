@@ -41,6 +41,37 @@ all calls; consumers release their bindings before provider DLLs unload. Factory
 descriptors are copied at registration; their code/context still need stable
 lifetimes. Bound product tables remain provider-owned until release.
 
+## DMA-BUF frames
+
+Capture v1.4 (`CaptureApiV1_4.read_dmabuf_frame`) and encoder v1.1
+(`EncoderApiV1_1.submit_dmabuf`) carry Linux GPU frames as `DmaBufFrame`: DRM
+fourcc and modifier, one to four planes with fd, offset, pitch and an optional
+acquire sync_file, explicit color (`SRGB` or `BT2020_PQ`), timestamp and sequence.
+Both tails are additive; consumers check the advertised minor and table size
+before reading them, and fall back to CPU frames on `MEDIA_UNSUPPORTED`.
+Descriptors are borrowed for the call exactly like CPU bytes. An encoder that
+accepts a frame duplicates the fds before returning, waits for the acquire fences
+on its own GPU timeline, and copies the pixels into storage it owns before the
+next presentation can reuse the producer's buffer. Keeping a DMA-BUF open pins the
+allocation; it does not stop the compositor from rendering into it again.
+
+Capture v1.5 adds `latest_presentation`, a non-blocking query of the newest
+completed presentation (`PresentationStatus { sequence, timestamp_us }`). A
+consumer polls it each tick and reads a frame only when the sequence advances,
+so frames are pushed at the compositor's presentation rate, including variable
+refresh, rather than sampled on a fixed timer.
+
+Encoded video leaving the video service is stamped on the shared host
+monotonic clock (`amaterasu_media::host_monotonic_micros`: CLOCK_MONOTONIC on
+Linux, the performance counter on Windows) at capture or presentation. The media
+transport compares it with the same clock at packetization and reports the
+difference, in 0.1 ms units, as the GameStream frame header's host processing
+latency that Moonlight shows. A timestamp in the future or over five seconds old
+is reported as unknown (zero).
+
+Codec 3 is AV1: each packet is one low-overhead OBU temporal unit, starting with
+a temporal delimiter. AV1 has no start codes, so transports frame it by length.
+
 These interfaces are draft. CPU readback and conversion define the initial
 integration boundary, but GPU texture interop, codec capability negotiation,
 HDR/color metadata, cursor composition, rotation, Linux capture/encoding, and

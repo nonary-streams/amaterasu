@@ -27,7 +27,8 @@ pub struct UdpDiscovery {
 
 pub struct Capabilities {
     pub transport: sdp::TransportSupport,
-    pub color: sdp::ColorMode,
+    /// Color modes implemented by the selected capture-to-encoder path.
+    pub supported_colors: Vec<sdp::ColorMode>,
     pub max_width: u32,
     pub max_height: u32,
     pub max_fps: u32,
@@ -261,8 +262,10 @@ impl Negotiation {
                 if request.header("content-type") != Some("application/sdp") {
                     return Err(Error::InvalidHeaders);
                 }
-                let announce =
-                    sdp::parse_announce(&request.body).map_err(|_| Error::UnsupportedMedia)?;
+                let announce = sdp::parse_announce(&request.body).map_err(|error| {
+                    eprintln!("amaterasu rtsp announce parse rejection reason={error:?}");
+                    Error::UnsupportedMedia
+                })?;
                 validation::media(&announce, &self.capabilities)?;
                 Ok((action(request, Action::Announce(announce)), State::Play))
             }

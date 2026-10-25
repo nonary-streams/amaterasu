@@ -39,6 +39,8 @@ pub enum ColorMode {
     Bt709Full,
 }
 
+pub use amaterasu_contracts::encoder::VideoCodec;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlProtocol {
     Enet,
@@ -105,6 +107,10 @@ pub struct Announce {
 /// Default denies audio, control, encryption and parity generation.
 #[derive(Default)]
 pub struct TransportSupport {
+    /// HEVC Main SDR encoder, packetizer and session configuration are all ready.
+    pub hevc: bool,
+    /// AV1 Main 8-bit SDR encoder, packetizer and session configuration are all ready.
+    pub av1: bool,
     pub stereo_audio: bool,
     pub enet_control: bool,
     pub encrypted_control: bool,
@@ -120,6 +126,16 @@ impl Announce {
     /// before committing ANNOUNCE; resource allocation and session checks follow.
     pub fn check_support(&self, support: &TransportSupport) -> Result<(), Error> {
         let requirements = [
+            (
+                self.video.format.codec == VideoCodec::Hevc,
+                support.hevc,
+                "HEVC video",
+            ),
+            (
+                self.video.format.codec == VideoCodec::Av1,
+                support.av1,
+                "AV1 video",
+            ),
             (true, support.stereo_audio, "stereo audio"),
             (true, support.enet_control, "ENet control"),
             (

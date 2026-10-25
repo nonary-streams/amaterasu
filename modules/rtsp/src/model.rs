@@ -3,6 +3,8 @@ use amaterasu_gamestream::{
     rtsp::negotiation::UdpDiscovery,
     sdp::{Announce, ColorMode, ControlProtocol},
 };
+#[cfg(test)]
+use amaterasu_module_sdk::EncoderBackend;
 use amaterasu_module_sdk::EncoderSelection;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -289,6 +291,7 @@ pub struct Capture {
     #[serde(default)]
     pub host_audio_enabled: bool,
 }
+
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureProvider {
@@ -304,6 +307,16 @@ pub enum CaptureProvider {
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
+    /// The only codec the client may negotiate when `codecs` is empty.
+    #[serde(
+        default,
+        skip_serializing_if = "amaterasu_media::VideoCodec::is_default"
+    )]
+    pub codec: amaterasu_media::VideoCodec,
+    /// Codecs the host's encoders can serve for this launch, as signed by
+    /// NVHTTP. DESCRIBE advertises them and ANNOUNCE must choose one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codecs: Vec<amaterasu_media::VideoCodec>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -330,6 +343,8 @@ pub(crate) struct EncryptionSnapshot {
 impl Default for Profile {
     fn default() -> Self {
         Self {
+            codec: amaterasu_media::VideoCodec::H264,
+            codecs: Vec::new(),
             width: 1920,
             height: 1080,
             fps: 60,
@@ -358,6 +373,19 @@ fn audio_channel_mask(channels: u32) -> u32 {
 }
 
 impl Profile {
+    /// The codecs this ticket offers the client.
+    pub fn offered_codecs(&self) -> &[amaterasu_media::VideoCodec] {
+        if self.codecs.is_empty() {
+            std::slice::from_ref(&self.codec)
+        } else {
+            &self.codecs
+        }
+    }
+
+    fn offers(&self, codec: amaterasu_media::VideoCodec) -> bool {
+        self.offered_codecs().contains(&codec)
+    }
+
     pub fn effective_video_max_batch_size_kb(&self) -> u8 {
         match self.video_max_batch_size_kb {
             16 | 32 | 64 => self.video_max_batch_size_kb,
@@ -365,6 +393,7 @@ impl Profile {
         }
     }
 
+    #[cfg(test)]
     pub fn matches(&self, announce: &Announce) -> bool {
         self.matches_video(announce)
             && self.matches_audio(announce)
@@ -372,13 +401,13 @@ impl Profile {
     }
 
     fn matches_video(&self, announce: &Announce) -> bool {
-        announce.video.width == self.width
+        self.offers(sdp_codec(announce.video.format.codec))
+            && announce.video.width == self.width
             && announce.video.height == self.height
             && announce.video.fps == self.fps
             && announce.video.bitrate_kbps == self.bitrate_kbps
             && announce.video.max_reference_frames == self.max_reference_frames
-            && announce.video.color == ColorMode::Bt709Limited
-            && announce.video.format == amaterasu_module_sdk::VideoStreamFormat::H264_SDR
+            && supported_color(announce.video.color)
             && announce.encryption.video == self.encrypt_video
     }
 
@@ -415,7 +444,21 @@ impl Profile {
             return Err("invalid_profile");
         }
 
-        amaterasu_gamestream::video::VideoPacketizer::new(
+        let unique_codecs = self
+            .codecs
+            .iter()
+            .enumerate()
+            .all(|(index, codec)| !self.codecs[..index].contains(codec));
+        if !self.codecs.is_empty() && (!self.codec.is_default() || !unique_codecs) {
+            return Err("invalid_profile");
+        }
+        // Framing and FEC limits do not depend on the codec.
+        let codec = match self.offered_codecs()[0] {
+            amaterasu_media::VideoCodec::H264 => amaterasu_gamestream::video::VideoCodec::H264,
+            amaterasu_media::VideoCodec::Hevc => amaterasu_gamestream::video::VideoCodec::Hevc,
+            amaterasu_media::VideoCodec::Av1 => amaterasu_gamestream::video::VideoCodec::Av1,
+        };
+        amaterasu_gamestream::video::VideoPacketizer::new_with_codec(
             amaterasu_gamestream::video::VideoConfig {
                 packet_size: self.packet_size,
                 fec_percentage: self.fec_percentage,
@@ -424,9 +467,81 @@ impl Profile {
                 // Encryption is applied by media transport after packetization.
                 encrypted: false,
             },
+            codec,
         )
         .map_err(|_| "invalid_profile")?;
         Ok(())
+    }
+}
+
+fn sdp_codec(codec: amaterasu_gamestream::sdp::VideoCodec) -> amaterasu_media::VideoCodec {
+    match codec {
+        amaterasu_gamestream::sdp::VideoCodec::H264 => amaterasu_media::VideoCodec::H264,
+        amaterasu_gamestream::sdp::VideoCodec::Hevc => amaterasu_media::VideoCodec::Hevc,
+        amaterasu_gamestream::sdp::VideoCodec::Av1 => amaterasu_media::VideoCodec::Av1,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NegotiationBounds {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub max_fps: u32,
+    pub max_bitrate_kbps: u32,
+    pub max_reference_frames: u32,
+}
+
+impl NegotiationBounds {
+    fn validate(&self) -> Result<(), &'static str> {
+        if !(16..=3840).contains(&self.max_width)
+            || !(16..=2160).contains(&self.max_height)
+            || !self.max_width.is_multiple_of(2)
+            || !self.max_height.is_multiple_of(2)
+            || !(1..=120).contains(&self.max_fps)
+            || !(100..=100_000).contains(&self.max_bitrate_kbps)
+            || self.max_reference_frames > 1
+        {
+            return Err("invalid_negotiation_bounds");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NegotiatedVideo {
+    pub codec: amaterasu_media::VideoCodec,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate_kbps: u32,
+    pub max_reference_frames: u32,
+}
+
+impl NegotiatedVideo {
+    pub fn validate(self) -> bool {
+        (16..=3840).contains(&self.width)
+            && (16..=2160).contains(&self.height)
+            && self.width.is_multiple_of(2)
+            && self.height.is_multiple_of(2)
+            && (1..=120).contains(&self.fps)
+            && (100..=100_000).contains(&self.bitrate_kbps)
+            && self.bitrate_kbps.checked_mul(1_000).is_some()
+            && self.max_reference_frames <= 1
+    }
+}
+
+fn supported_color(color: ColorMode) -> bool {
+    if cfg!(target_os = "linux") {
+        matches!(
+            color,
+            ColorMode::Bt601Limited
+                | ColorMode::Bt601Full
+                | ColorMode::Bt709Limited
+                | ColorMode::Bt709Full
+        )
+    } else {
+        color == ColorMode::Bt709Limited
     }
 }
 
@@ -474,6 +589,10 @@ pub struct Open {
     pub display_policy_snapshot: Option<serde_json::Value>,
     #[serde(default)]
     pub video_encryption_policy: Option<VideoEncryptionPolicySnapshot>,
+    /// Signed release ceilings for client-selected video ANNOUNCE values.
+    /// Missing bounds preserve the legacy exact-profile contract.
+    #[serde(default)]
+    pub negotiation_bounds: Option<NegotiationBounds>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
     #[serde(default)]
@@ -700,6 +819,18 @@ impl Open {
         self.nvenc_settings
             .validate()
             .map_err(|_| "invalid_nvenc_settings")?;
+        if let Some(bounds) = self.negotiation_bounds {
+            bounds.validate()?;
+            let requested = self.effective_profile();
+            if requested.width > bounds.max_width
+                || requested.height > bounds.max_height
+                || requested.fps > bounds.max_fps
+                || requested.bitrate_kbps > bounds.max_bitrate_kbps
+                || requested.max_reference_frames > bounds.max_reference_frames
+            {
+                return Err("profile_exceeds_negotiation_bounds");
+            }
+        }
         decode_key(&self.key_hex)
     }
 
@@ -727,18 +858,53 @@ impl Open {
         profile
     }
 
+    #[cfg(test)]
     pub(crate) fn matches_announce(&self, announce: &Announce) -> bool {
+        self.negotiate_announce(announce).is_some()
+    }
+
+    pub(crate) fn negotiate_announce(&self, announce: &Announce) -> Option<NegotiatedVideo> {
         let channels = self.channels.unwrap_or(2);
         let profile = self.effective_profile();
-        if channels == 2 {
-            return profile.matches(announce);
+        let audio_matches = if channels == 2 {
+            profile.matches_audio(announce)
+        } else {
+            announce.audio.packet_duration_ms == profile.packet_ms
+                && announce.encryption.audio == profile.encrypt_audio
+                && announce.audio.channels == channels
+                && announce.audio.channel_mask == audio_channel_mask(channels)
+        };
+        let video = NegotiatedVideo {
+            codec: sdp_codec(announce.video.format.codec),
+            width: announce.video.width,
+            height: announce.video.height,
+            fps: announce.video.fps,
+            bitrate_kbps: announce.video.bitrate_kbps,
+            max_reference_frames: announce.video.max_reference_frames,
+        };
+        let video_matches = if let Some(bounds) = self.negotiation_bounds {
+            profile.offers(video.codec)
+                && video.validate()
+                && video.width <= bounds.max_width
+                && video.height <= bounds.max_height
+                && video.fps <= bounds.max_fps
+                && video.bitrate_kbps <= bounds.max_bitrate_kbps
+                && video.max_reference_frames <= bounds.max_reference_frames
+                && supported_color(announce.video.color)
+                && announce.encryption.video == profile.encrypt_video
+        } else {
+            profile.matches_video(announce)
+        };
+        if announce.video.format.bit_depth != 8
+            || announce.video.format.dynamic_range != amaterasu_module_sdk::DynamicRange::Sdr
+            || !video_matches
+            || !audio_matches
+            || !profile.matches_transport(announce)
+            || (self.frame_limiter_settings.is_some() && video.fps != profile.fps)
+        {
+            return None;
         }
-        profile.matches_video(announce)
-            && profile.matches_transport(announce)
-            && announce.audio.packet_duration_ms == profile.packet_ms
-            && announce.encryption.audio == profile.encrypt_audio
-            && announce.audio.channels == channels
-            && announce.audio.channel_mask == audio_channel_mask(channels)
+        Some(video)
     }
 
     fn validate_operation_id(&self) -> Result<(), &'static str> {
@@ -879,6 +1045,11 @@ impl Open {
             "encrypt_audio": self.profile.encrypt_audio,
             "permit_legacy_audio_iv_wrap": self.profile.permit_legacy_audio_iv_wrap,
         });
+        if !self.profile.codecs.is_empty() {
+            payload["video"]["codecs"] = serde_json::json!(self.profile.codecs);
+        } else if !self.profile.codec.is_default() {
+            payload["video"]["codec"] = serde_json::json!(self.profile.codec);
+        }
         if let Some(channels @ (6 | 8)) = self.channels {
             payload["audio"]["channels"] = serde_json::json!(channels);
             payload["audio"]["channel_mask"] = serde_json::json!(audio_channel_mask(channels));
@@ -2171,8 +2342,12 @@ mod tests {
     }
 
     fn changed_announce(name: &str, value: &str) -> String {
+        replace_announce_attribute(PRIMARY_ANNOUNCE, name, value)
+    }
+
+    fn replace_announce_attribute(announcement: &str, name: &str, value: &str) -> String {
         let prefix = format!("a={name}:");
-        PRIMARY_ANNOUNCE
+        announcement
             .split_inclusive("\r\n")
             .map(|line| {
                 if line.starts_with(&prefix) {
@@ -3014,6 +3189,154 @@ mod tests {
         );
     }
 
+    fn bounded_video_open() -> Open {
+        let mut request = open();
+        request.profile = matching_profile();
+        request.negotiation_bounds = Some(NegotiationBounds {
+            max_width: 2560,
+            max_height: 1440,
+            max_fps: 120,
+            max_bitrate_kbps: 20_000,
+            max_reference_frames: 1,
+        });
+        request
+    }
+
+    fn encrypted_announce() -> Announce {
+        parse_announce(changed_announce("x-ss-general.encryptionEnabled", "7").as_bytes())
+            .expect("Moonlight H.264/Opus fixture")
+    }
+
+    #[test]
+    fn signed_codec_is_kept_from_announce_through_prepare_and_start() {
+        let mut request = bounded_video_open();
+        let mut h264 = encrypted_announce();
+        assert!(request.negotiate_announce(&h264).is_some());
+        request.profile.codec = amaterasu_media::VideoCodec::Hevc;
+        assert!(request.negotiate_announce(&h264).is_none());
+        h264.video.format.codec = amaterasu_gamestream::sdp::VideoCodec::Hevc;
+        h264.video.color = amaterasu_gamestream::sdp::ColorMode::Bt709Limited;
+        let selected = request.negotiate_announce(&h264).unwrap();
+        assert_eq!(selected.codec, amaterasu_media::VideoCodec::Hevc);
+        assert_eq!(
+            request.prepare("hevc-codec-ticket", None)["video"]["codec"],
+            "hevc"
+        );
+    }
+
+    #[test]
+    fn signed_bounds_accept_client_selected_video_values_and_preserve_prepare_transport() {
+        let request = bounded_video_open();
+        assert!(request.validate(false).is_ok());
+        let mut wire = changed_announce("x-ss-general.encryptionEnabled", "7");
+        for (name, value) in [
+            ("x-nv-video[0].clientViewportWd", "1280"),
+            ("x-nv-video[0].clientViewportHt", "720"),
+            ("x-nv-video[0].maxFPS", "30"),
+            ("x-nv-video[0].clientRefreshRateX100", "3000"),
+            ("x-nv-video[0].initialBitrateKbps", "8000"),
+            ("x-nv-video[0].initialPeakBitrateKbps", "8000"),
+            ("x-nv-vqos[0].bw.minimumBitrateKbps", "8000"),
+            ("x-nv-vqos[0].bw.maximumBitrateKbps", "8000"),
+            ("x-nv-video[0].maxNumReferenceFrames", "0"),
+        ] {
+            wire = replace_announce_attribute(&wire, name, value);
+        }
+        let announce = parse_announce(wire.as_bytes()).expect("bounded Moonlight SDP");
+
+        assert_eq!(
+            request.negotiate_announce(&announce),
+            Some(NegotiatedVideo {
+                codec: amaterasu_media::VideoCodec::H264,
+                width: 1280,
+                height: 720,
+                fps: 30,
+                bitrate_kbps: 8_000,
+                max_reference_frames: 0,
+            })
+        );
+        let prepared = request.prepare("bounded-video", None);
+        assert_eq!(prepared["video"]["packet_size"], 1392);
+        assert_eq!(prepared["audio"]["packet_ms"], 5);
+    }
+
+    #[test]
+    fn signed_video_bounds_enforce_ceiling_lower_bounds_even_geometry_and_overflow() {
+        let request = bounded_video_open();
+        let mut ceiling = encrypted_announce();
+        ceiling.video.width = 2560;
+        ceiling.video.height = 1440;
+        ceiling.video.fps = 120;
+        ceiling.video.bitrate_kbps = 20_000;
+        ceiling.video.max_reference_frames = 1;
+        assert!(request.negotiate_announce(&ceiling).is_some());
+
+        let mut minimum = encrypted_announce();
+        minimum.video.width = 16;
+        minimum.video.height = 16;
+        minimum.video.fps = 1;
+        minimum.video.bitrate_kbps = 100;
+        minimum.video.max_reference_frames = 0;
+        assert!(request.negotiate_announce(&minimum).is_some());
+
+        let mut out_of_range = ceiling.clone();
+        out_of_range.video.width = 2562;
+        assert!(request.negotiate_announce(&out_of_range).is_none());
+        let mut invalid_height = ceiling.clone();
+        invalid_height.video.height = 1442;
+        assert!(request.negotiate_announce(&invalid_height).is_none());
+        let mut invalid_fps = ceiling.clone();
+        invalid_fps.video.fps = 121;
+        assert!(request.negotiate_announce(&invalid_fps).is_none());
+        let mut invalid_reference_frames = ceiling.clone();
+        invalid_reference_frames.video.max_reference_frames = 2;
+        assert!(
+            request
+                .negotiate_announce(&invalid_reference_frames)
+                .is_none()
+        );
+
+        for (width, height, fps, bitrate) in [
+            (14, 16, 1, 100),
+            (1279, 720, 30, 8_000),
+            (16, 16, 0, 100),
+            (16, 16, 1, 99),
+            (16, 16, 1, u32::MAX),
+        ] {
+            let mut below_or_invalid = ceiling.clone();
+            below_or_invalid.video.width = width;
+            below_or_invalid.video.height = height;
+            below_or_invalid.video.fps = fps;
+            below_or_invalid.video.bitrate_kbps = bitrate;
+            below_or_invalid.video.max_reference_frames = 0;
+            assert!(request.negotiate_announce(&below_or_invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_signed_video_bounds_are_rejected_at_open() {
+        for bounds in [
+            NegotiationBounds {
+                max_width: u32::MAX,
+                max_height: 1440,
+                max_fps: 120,
+                max_bitrate_kbps: 20_000,
+                max_reference_frames: 1,
+            },
+            NegotiationBounds {
+                max_width: 2560,
+                max_height: 1440,
+                max_fps: 120,
+                max_bitrate_kbps: 100_001,
+                max_reference_frames: 1,
+            },
+        ] {
+            let mut request = bounded_video_open();
+            request.negotiation_bounds = Some(bounds);
+            assert_eq!(request.validate(false), Err("invalid_negotiation_bounds"));
+        }
+    }
+
     #[test]
     fn zero_maximum_bitrate_cap_preserves_requested_rate() {
         let mut request = open();
@@ -3097,6 +3420,27 @@ mod tests {
 
         request.capture.capture_provider = CaptureProvider::Dxgi;
         assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
+    }
+
+    #[test]
+    fn pipewire_capture_is_valid_and_serializes_portal_source_to_stream_session() {
+        let mut request = open();
+        request.capture.capture_provider = CaptureProvider::PipeWire;
+        request.capture.output = "portal-selected-session-source".into();
+
+        assert!(request.validate(false).is_ok());
+        let start = request.arm(41)["configuration"].clone();
+        assert_eq!(start["capture_provider"], "pipewire");
+        assert_eq!(start["output"], "portal-selected-session-source");
+        assert_eq!(start["encoder"], 0);
+        let decoded: CaptureProvider = serde_json::from_value(start["capture_provider"].clone())
+            .expect("serialized PipeWire provider is accepted by the session model");
+        assert!(matches!(decoded, CaptureProvider::PipeWire));
+
+        request.capture.encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+        assert_eq!(request.arm(41)["configuration"]["encoder"], "auto");
+        request.capture.encoder = EncoderSelection::Index(7);
+        assert_eq!(request.arm(41)["configuration"]["encoder"], 7);
     }
 
     #[test]

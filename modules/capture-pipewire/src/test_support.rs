@@ -3,20 +3,22 @@ use crate::{
     backend::{Backend, SourceSession},
     buffers::{Mailbox, Plane},
     controller::Controller,
-    model::{Availability, CaptureResult, Settings, SourceState, SourceType},
+    model::{Availability, CaptureResult, Settings, SourceDiagnostics, SourceState, SourceType},
 };
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 pub struct Driver {
     pub state: Mutex<SourceState>,
+    pub diagnostics: Mutex<SourceDiagnostics>,
     pub mailbox: Arc<Mailbox>,
     pub selections: AtomicUsize,
     pub drops: AtomicUsize,
     pub state_reads: AtomicUsize,
     pub revoke_at_read: AtomicUsize,
+    pub restore_available: AtomicBool,
 }
 
 impl Driver {
@@ -50,10 +52,20 @@ pub struct FakeBackend {
 struct FakeSession(Arc<Driver>);
 
 impl Backend for FakeBackend {
+    fn can_restore(&self, _: &str, _: SourceType) -> bool {
+        self.driver.restore_available.load(Ordering::SeqCst)
+    }
+    fn forget(&self, _: &str, _: SourceType) {
+        self.driver.restore_available.store(false, Ordering::SeqCst);
+    }
+    fn select_output(&self, _: &str, _: u32) -> CaptureResult<Box<dyn SourceSession>> {
+        self.driver.selections.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(FakeSession(self.driver.clone())))
+    }
     fn availability(&self) -> Availability {
         self.availability
     }
-    fn select(&self, _: SourceType, _: u32) -> CaptureResult<Box<dyn SourceSession>> {
+    fn select(&self, _: &str, _: SourceType, _: u32) -> CaptureResult<Box<dyn SourceSession>> {
         self.driver.selections.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(FakeSession(self.driver.clone())))
     }
@@ -65,6 +77,9 @@ impl SourceSession for FakeSession {
             *self.0.state.lock().unwrap() = SourceState::Revoked;
         }
         *self.0.state.lock().unwrap()
+    }
+    fn diagnostics(&self) -> SourceDiagnostics {
+        *self.0.diagnostics.lock().unwrap()
     }
     fn mailbox(&self) -> Arc<Mailbox> {
         self.0.mailbox.clone()
@@ -79,11 +94,13 @@ impl Drop for FakeSession {
 pub fn setup(settings: Settings) -> (Controller<FakeBackend>, Arc<Driver>) {
     let driver = Arc::new(Driver {
         state: Mutex::new(SourceState::Selecting),
+        diagnostics: Mutex::new(SourceDiagnostics::default()),
         mailbox: Arc::new(Mailbox::default()),
         selections: AtomicUsize::new(0),
         drops: AtomicUsize::new(0),
         state_reads: AtomicUsize::new(0),
         revoke_at_read: AtomicUsize::new(usize::MAX),
+        restore_available: AtomicBool::new(false),
     });
     let backend = FakeBackend {
         driver: driver.clone(),
@@ -106,5 +123,7 @@ pub fn settings() -> Settings {
         capture_principals: ["amaterasu.video".into()].into(),
         idle_timeout_seconds: 2,
         selection_timeout_seconds: 5,
+        remember_source: false,
+        allow_named_outputs: false,
     }
 }
