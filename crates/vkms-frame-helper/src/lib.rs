@@ -8,6 +8,12 @@
 //! environment. It exits when the peer closes the socket.
 #[cfg(target_os = "linux")]
 pub mod channel;
+#[cfg(target_os = "linux")]
+pub mod client;
+#[cfg(target_os = "linux")]
+pub mod drm_node;
+#[cfg(target_os = "linux")]
+pub mod process;
 pub mod protocol;
 
 /// Descriptor number of the inherited socket in the helper process.
