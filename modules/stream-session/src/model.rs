@@ -46,11 +46,15 @@ impl Settings {
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoWire {
+    /// The single codec of this stream when `codecs` is empty.
     #[serde(
         default,
         skip_serializing_if = "amaterasu_media::VideoCodec::is_default"
     )]
     pub codec: amaterasu_media::VideoCodec,
+    /// Codecs offered before RTSP ANNOUNCE; authenticated start selects one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codecs: Vec<amaterasu_media::VideoCodec>,
     pub packet_size: usize,
     pub fec_percentage: u8,
     pub min_parity_shards: u8,
@@ -65,6 +69,7 @@ impl Default for VideoWire {
     fn default() -> Self {
         Self {
             codec: amaterasu_media::VideoCodec::H264,
+            codecs: Vec::new(),
             packet_size: 1024,
             fec_percentage: 20,
             min_parity_shards: 2,
@@ -637,15 +642,31 @@ impl AudioWire {
 }
 
 impl VideoWire {
+    /// The codecs authenticated start may select for this prepared transport.
+    pub fn offered_codecs(&self) -> &[amaterasu_media::VideoCodec] {
+        if self.codecs.is_empty() {
+            std::slice::from_ref(&self.codec)
+        } else {
+            &self.codecs
+        }
+    }
+
     fn validate(&self) -> Result<(), &'static str> {
-        if self.max_batch_size_kb > 64 {
+        let unique_codecs = self
+            .codecs
+            .iter()
+            .enumerate()
+            .all(|(index, codec)| !self.codecs[..index].contains(codec));
+        if self.max_batch_size_kb > 64
+            || (!self.codecs.is_empty() && (!self.codec.is_default() || !unique_codecs))
+        {
             return Err("invalid_video_configuration");
         }
-        let codec = match self.codec {
+        // Framing and FEC limits do not depend on the codec.
+        let codec = match self.offered_codecs()[0] {
             amaterasu_media::VideoCodec::H264 => amaterasu_gamestream::video::VideoCodec::H264,
             amaterasu_media::VideoCodec::Hevc => amaterasu_gamestream::video::VideoCodec::Hevc,
-            // AV1 has no GameStream packetizer yet.
-            amaterasu_media::VideoCodec::Av1 => return Err("invalid_video_configuration"),
+            amaterasu_media::VideoCodec::Av1 => amaterasu_gamestream::video::VideoCodec::Av1,
         };
         amaterasu_gamestream::video::VideoPacketizer::new_with_codec(
             amaterasu_gamestream::video::VideoConfig {
@@ -780,7 +801,10 @@ pub enum EncoderBackend {
 }
 impl StartConfig {
     pub fn matches_prepared_codec(&self, prepared: &PrepareConfig) -> bool {
-        self.configuration.codec == prepared.video.codec
+        prepared
+            .video
+            .offered_codecs()
+            .contains(&self.configuration.codec)
     }
 
     pub fn matches_prepared_frame_limiter(&self, prepared: &PrepareConfig) -> bool {
@@ -991,6 +1015,46 @@ mod tests {
     fn start_json() -> Value {
         json!({"output":"display-1","encoder":0,"audio_endpoint":"default",
             "configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}})
+    }
+
+    #[test]
+    fn prepared_codec_offer_admits_each_offered_start_codec_only() {
+        let mut config = prepare_json();
+        config["video"] = json!({"codecs":["h264","hevc","av1"]});
+        let prepared: PrepareConfig = serde_json::from_value(config).unwrap();
+        assert!(prepared.validate(false).is_ok());
+        for (codec, expected) in [("h264", true), ("hevc", true), ("av1", true)] {
+            let mut start = start_json();
+            start["configuration"]["codec"] = json!(codec);
+            let start: StartConfig = serde_json::from_value(start).unwrap();
+            assert_eq!(start.matches_prepared_codec(&prepared), expected, "{codec}");
+        }
+
+        let mut config = prepare_json();
+        config["video"] = json!({"codecs":["h264","av1"]});
+        let prepared: PrepareConfig = serde_json::from_value(config).unwrap();
+        let mut start = start_json();
+        start["configuration"]["codec"] = json!("hevc");
+        let start: StartConfig = serde_json::from_value(start).unwrap();
+        assert!(!start.matches_prepared_codec(&prepared));
+
+        // The single-codec form remains exact.
+        let mut config = prepare_json();
+        config["video"] = json!({"codec":"av1"});
+        let prepared: PrepareConfig = serde_json::from_value(config).unwrap();
+        assert!(prepared.validate(false).is_ok());
+        let start: StartConfig = serde_json::from_value(start_json()).unwrap();
+        assert!(!start.matches_prepared_codec(&prepared));
+
+        for invalid in [
+            json!({"codecs":["av1","av1"]}),
+            json!({"codec":"hevc","codecs":["hevc"]}),
+        ] {
+            let mut config = prepare_json();
+            config["video"] = invalid;
+            let prepared: PrepareConfig = serde_json::from_value(config).unwrap();
+            assert_eq!(prepared.validate(false), Err("invalid_video_configuration"));
+        }
     }
 
     #[test]
@@ -1463,7 +1527,7 @@ mod tests {
             assert!(serde_json::from_value::<PrepareConfig>(config).is_err());
         }
         let mut config = start_json();
-        config["configuration"]["codec"] = json!("av1");
+        config["configuration"]["codec"] = json!("vp9");
         assert!(serde_json::from_value::<StartConfig>(config).is_err());
         let mut config = start_json();
         config["capture_provider"] = json!("arbitrary/service");

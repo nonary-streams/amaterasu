@@ -61,7 +61,7 @@ fn multiple_blocks_keep_one_frame_header_and_account_for_parity_sequence_gaps() 
         let original = frame(data_count);
         let mut sender = VideoPacketizer::new(config()).unwrap();
         sender.stream_index = 0xfffffe;
-        let packets = sender.packetize(&original, 7, 90000).unwrap();
+        let packets = sender.packetize(&original, false, 7, 90000).unwrap();
         let mut packet_offset = 0;
         let mut block_index = 0;
         let mut recovered_frame = Vec::new();
@@ -114,7 +114,7 @@ fn multiple_blocks_keep_one_frame_header_and_account_for_parity_sequence_gaps() 
 fn oversized_or_unrepresentable_fec_never_falls_back_to_no_parity() {
     let mut sender = VideoPacketizer::new(config()).unwrap();
     assert_eq!(
-        sender.packetize(&frame(849), 1, 0),
+        sender.packetize(&frame(849), false, 1, 0),
         Err(VideoError::TooManyPackets)
     );
     assert_eq!(sender.stream_index, 0);
@@ -124,7 +124,7 @@ fn oversized_or_unrepresentable_fec_never_falls_back_to_no_parity() {
     };
     let mut sender = VideoPacketizer::new(settings).unwrap();
     assert_eq!(
-        sender.packetize(&frame(1), 1, 0),
+        sender.packetize(&frame(1), false, 1, 0),
         Err(VideoError::InvalidFec)
     );
     assert_eq!(sender.stream_index, 0);
@@ -243,7 +243,7 @@ fn upstream_decoder_recovers_wire_packets_with_erasures_and_block_boundaries() {
     // Every two-erasure combination of a 2+2 block, including parity losses.
     let packets = VideoPacketizer::new(config())
         .unwrap()
-        .packetize(&frame(2), 1, 0)
+        .packetize(&frame(2), false, 1, 0)
         .unwrap();
     for first in 0..4 {
         for second in first + 1..4 {
@@ -255,7 +255,7 @@ fn upstream_decoder_recovers_wire_packets_with_erasures_and_block_boundaries() {
         sender.stream_index = 0xfffffe;
         let mut original = frame(count);
         original.truncate(original.len() - 3); // Validate zero padding after recovery.
-        let packets = sender.packetize(&original, 9, u32::MAX).unwrap();
+        let packets = sender.packetize(&original, false, 9, u32::MAX).unwrap();
         let mut offset = 0;
         while offset < packets.len() {
             let info = u32::from_le_bytes(packets[offset][28..32].try_into().unwrap());
@@ -286,11 +286,11 @@ fn negotiated_block_limit_prevents_legacy_multiblock_packets() {
         ..config()
     })
     .unwrap();
-    let packets = legacy.packetize(&frame(212), 1, 0).unwrap();
+    let packets = legacy.packetize(&frame(212), false, 1, 0).unwrap();
     assert!(packets.iter().all(|packet| packet[27] == 0));
     let next = legacy.stream_index;
     assert_eq!(
-        legacy.packetize(&frame(213), 2, 0),
+        legacy.packetize(&frame(213), false, 2, 0),
         Err(VideoError::TooManyPackets)
     );
     assert_eq!(legacy.stream_index, next);

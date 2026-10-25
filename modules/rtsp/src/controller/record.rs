@@ -112,8 +112,8 @@ impl Record {
         payload["configuration"]["configuration"]["bitrate"] = serde_json::json!(bitrate);
         payload["configuration"]["configuration"]["max_reference_frames"] =
             serde_json::json!(video.max_reference_frames);
-        if video.codec == amaterasu_media::VideoCodec::Hevc {
-            payload["configuration"]["configuration"]["codec"] = serde_json::json!("hevc");
+        if !video.codec.is_default() {
+            payload["configuration"]["configuration"]["codec"] = serde_json::json!(video.codec);
         }
         payload["configuration"]["configuration"]["color_mode"] = serde_json::json!(match color {
             amaterasu_gamestream::sdp::ColorMode::Bt601Limited => "bt601_limited",
@@ -150,9 +150,11 @@ impl Record {
     pub fn capabilities(&self) -> Capabilities {
         let effective_profile = self.config.effective_profile();
         let bounds = self.config.negotiation_bounds;
+        let offered = effective_profile.offered_codecs();
         Capabilities {
             transport: amaterasu_gamestream::sdp::TransportSupport {
-                hevc: false,
+                hevc: offered.contains(&amaterasu_media::VideoCodec::Hevc),
+                av1: offered.contains(&amaterasu_media::VideoCodec::Av1),
                 stereo_audio: true,
                 enet_control: true,
                 encrypted_control: true,

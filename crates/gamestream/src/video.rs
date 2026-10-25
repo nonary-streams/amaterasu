@@ -1,8 +1,10 @@
-//! Bounded GameStream Annex B packetization, with bounded Reed–Solomon parity.
+//! Bounded GameStream video packetization, with bounded Reed–Solomon parity.
 //!
+//! H.264 and HEVC travel as Annex B, AV1 as low-overhead OBU temporal units.
 //! This is the GameStream video framing protocol, not RFC 6184 fragmentation.
 //! See `video/README.md` for receiver references and compatibility limits.
 
+mod av1;
 mod fec;
 pub(crate) use fec::linear_combination;
 
@@ -19,6 +21,7 @@ pub enum VideoCodec {
     #[default]
     H264,
     Hevc,
+    Av1,
 }
 
 /// Negotiated video settings. Unsupported security/recovery modes fail explicitly.
@@ -42,6 +45,7 @@ pub enum VideoError {
     FecWorkLimit,
     UnsupportedEncryption,
     InvalidAnnexB,
+    InvalidAv1,
     AccessUnitTooLarge,
     TooManyPackets,
 }
@@ -85,7 +89,7 @@ impl VideoPacketizer {
         }
         fec::validate_config(config)?;
         // The first shard must hold the complete short frame header and the
-        // beginning of an Annex B NAL unit. Bound the actual IPv4 UDP payload.
+        // beginning of a NAL unit or OBU. Bound the actual IPv4 UDP payload.
         if !(NV_BYTES + FRAME_BYTES + 5..=MAX_UDP_BYTES - RTP_BYTES).contains(&config.packet_size) {
             return Err(VideoError::InvalidPacketSize);
         }
@@ -104,7 +108,7 @@ impl VideoPacketizer {
             return Err(VideoError::AccessUnitTooLarge);
         }
         if access_unit_len == 0 {
-            return Err(VideoError::InvalidAnnexB);
+            return Err(self.invalid_bitstream());
         }
         if self.config.fec_percentage != 0 {
             return fec::reservation(access_unit_len, self.config);
@@ -123,9 +127,14 @@ impl VideoPacketizer {
     /// Return complete UDP payloads, in transmission order, for one access unit.
     /// Without FEC the final datagram is short. FEC shards are zero-padded to
     /// the negotiated size, as required for recovery by the receiver.
+    ///
+    /// `encoder_keyframe` is the encoder's keyframe flag. AV1 announces it in
+    /// the frame header because Moonlight does not parse AV1. H.264 and HEVC
+    /// derive the IDR type from the NAL units, which the receiver also parses.
     pub fn packetize(
         &mut self,
         access_unit: &[u8],
+        encoder_keyframe: bool,
         frame_index: u32,
         timestamp_90khz: u32,
     ) -> Result<Vec<Vec<u8>>, VideoError> {
@@ -133,14 +142,19 @@ impl VideoPacketizer {
             return Err(VideoError::AccessUnitTooLarge);
         }
         if self.config.fec_percentage != 0 {
-            return self.packetize_with_fec(access_unit, frame_index, timestamp_90khz);
+            return self.packetize_with_fec(
+                access_unit,
+                encoder_keyframe,
+                frame_index,
+                timestamp_90khz,
+            );
         }
         let total_bytes = access_unit.len() + FRAME_BYTES;
         let packet_count = total_bytes.div_ceil(self.payload_bytes);
         if packet_count > MAX_PACKETS {
             return Err(VideoError::TooManyPackets);
         }
-        let is_idr = validate_annex_b(access_unit, self.codec)?;
+        let is_idr = self.keyframe(access_unit, encoder_keyframe)?;
         let frame_header =
             short_frame_header(is_idr, ((total_bytes - 1) % self.payload_bytes + 1) as u16);
         let mut datagrams = Vec::with_capacity(packet_count);
@@ -168,8 +182,33 @@ impl VideoPacketizer {
         self.stream_index = self.stream_index.wrapping_add(packet_count as u32) & STREAM_INDEX_MASK;
         Ok(datagrams)
     }
+
+    /// Validate the access unit for this codec and return whether the frame
+    /// header announces an IDR (keyframe) picture.
+    fn keyframe(&self, access_unit: &[u8], encoder_keyframe: bool) -> Result<bool, VideoError> {
+        match self.codec {
+            VideoCodec::H264 => validate_annex_b(access_unit),
+            VideoCodec::Hevc => validate_hevc_annex_b(access_unit),
+            VideoCodec::Av1 => av1::validate_temporal_unit(access_unit, encoder_keyframe),
+        }
+    }
+
+    fn invalid_bitstream(&self) -> VideoError {
+        match self.codec {
+            VideoCodec::H264 | VideoCodec::Hevc => VideoError::InvalidAnnexB,
+            VideoCodec::Av1 => VideoError::InvalidAv1,
+        }
+    }
 }
 
+/// The eight-byte short frame header that opens the first packet's payload.
+///
+/// Byte 0 is the short header type (1). Bytes 1..3 hold the host processing
+/// latency, unknown here and so zero. Byte 3 is the frame type: 2 for IDR,
+/// 1 for an ordinary picture. Bytes 4..6 hold the little-endian length of the
+/// final data packet's payload, counting this header when that packet is also
+/// the first. Receivers truncate the final packet to that length for codecs
+/// that cannot tolerate trailing zero padding, such as AV1. Bytes 6..8 are zero.
 fn short_frame_header(is_idr: bool, final_payload_bytes: u16) -> [u8; FRAME_BYTES] {
     let mut header = [0; FRAME_BYTES];
     header[0] = 1;
@@ -210,11 +249,9 @@ fn packet_header(
     packet
 }
 
-/// Check Annex B framing and supported NAL headers, not the encoded slice syntax.
-fn validate_annex_b(bytes: &[u8], codec: VideoCodec) -> Result<bool, VideoError> {
-    if codec == VideoCodec::Hevc {
-        return validate_hevc_annex_b(bytes);
-    }
+/// Check H.264 Annex B framing and supported NAL headers, not the encoded
+/// slice syntax.
+fn validate_annex_b(bytes: &[u8]) -> Result<bool, VideoError> {
     let mut nal_start = None;
     let mut zero_run = 0;
     let mut has_picture = false;

@@ -221,10 +221,20 @@ fn signed_linux_session_policy_advertises_reserved_desktop_without_catalog_row()
 }
 
 #[test]
-fn linux_profile_uses_numeric_nvhttp_encoder_selection() {
+fn linux_profile_selects_encoders_automatically_for_the_negotiated_codec() {
     let encoder = &streaming_settings(&LinuxSessionOptions::default())["capture"]["encoder"];
-    assert!(encoder.is_number());
-    assert_eq!(encoder, &json!(0));
+    assert_eq!(encoder, &json!("auto"));
+}
+
+#[test]
+fn linux_profile_allows_hardware_modes_up_to_uhd_at_120_hz() {
+    let profile = &streaming_settings(&LinuxSessionOptions::default())["profile"];
+    assert_eq!(profile["max_width"], 3840);
+    assert_eq!(profile["max_height"], 2160);
+    assert_eq!(profile["max_fps"], 120);
+    assert_eq!(profile["bitrate_kbps"], 100_000);
+    // The legacy single-codec field stays absent: codecs come from encoders.
+    assert!(profile.get("codec").is_none());
 }
 
 #[test]

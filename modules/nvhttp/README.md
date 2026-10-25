@@ -166,6 +166,26 @@ and reference-frame bounds are validated before listeners start. Video FEC and
 packetization settings are additionally checked by the same packetizer used for
 the stream.
 
+### Video codecs
+
+The profile does not choose a codec. NVHTTP enumerates `amaterasu.encode/1` at
+startup and then every five minutes while no stream is active, retrying failures
+with backoff and keeping the last good snapshot. From each encoder entry it reads
+only `codec` (`"h264"`, `"hevc"` or `"av1"`; other values are kept for numeric
+indexing but never offered) and `hardware`. At `/launch` it fixes the codecs that
+launch may negotiate: with `"encoder":"auto"` every codec that has an encoder, and
+with a numeric `encoder` only the codec of that enumerated entry. A codec whose only
+encoders are software is offered only when the requested mode is at most 1920x1080
+at 60 FPS, and such an offer also limits RTSP negotiation to that mode. A launch
+for which no codec qualifies is refused with HTTP 503 before any application,
+display, or RTSP effect: `no hardware encoder for this stream mode`, `no video
+encoder is available`, or, before the first enumeration completes for a mode above
+the software limit, `encoder capabilities are not known yet`. Until that first
+enumeration completes the host offers H.264 only. RTSP receives the offer as
+`profile.codecs` (omitted when it is H.264 alone) and the client picks one in
+ANNOUNCE. The legacy `profile.codec` field is still accepted but no longer has any
+effect.
+
 ## Global capture output
 
 The NVHTTP settings API reads and updates the global `output_name` setting. Reads
@@ -355,8 +375,12 @@ Without streaming configuration, server info advertises `appversion=7.1.0.0` and
 `appversion=7.1.431.-1` so Moonlight enables the Sunshine-compatible RTSP
 encryption exchange; Windows retains `7.1.431.0`. Configured streaming advertises
 `StreamingSupported=1`. This reports accepted startup policy; it is not a runtime
-GPU, encoder, or capture probe. `ServerCodecModeSupport` advertises only H.264
-for configured streaming; unavailable hardware and HDR fields remain zero.
+GPU or capture probe. `ServerCodecModeSupport` is derived from the encoder
+snapshot: `SCM_H264` (0x1) always, `SCM_HEVC` (0x100) when an HEVC encoder is
+enumerated, and `SCM_AV1_MAIN8` (0x10000) when an AV1 encoder is. 10-bit and 4:4:4
+modes are never advertised. `MaxLumaPixelsHEVC` is `1869449984` with an HEVC
+encoder and `0` otherwise; Moonlight treats any nonzero value as HEVC support.
+Other unavailable hardware and HDR fields remain zero.
 `state` is globally busy while any owned launch remains active or has
 unconfirmed cleanup. `currentgame` contains the app ID only for the owning paired
 certificate and remains zero for other clients.

@@ -154,6 +154,18 @@ impl Router {
         self.config.hostname = hostname;
     }
 
+    pub fn set_encoder_snapshot(&mut self, snapshot: crate::encoder_snapshot::EncoderSnapshot) {
+        self.launches.set_encoder_snapshot(snapshot);
+    }
+
+    pub fn supports_streaming(&self) -> bool {
+        self.launches.supported()
+    }
+
+    pub fn stream_active(&self) -> bool {
+        self.launches.busy()
+    }
+
     pub fn set_ports(&mut self, http_port: u16, https_port: u16) {
         self.config.http_port = http_port;
         self.config.https_port = https_port;

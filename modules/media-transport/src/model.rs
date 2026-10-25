@@ -43,11 +43,16 @@ impl Settings {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoSettings {
+    /// The single codec this stream carries when `codecs` is empty.
     #[serde(default, skip_serializing_if = "VideoCodec::is_default")]
     pub codec: VideoCodec,
+    /// Codecs the client may still negotiate after this transport opens. The
+    /// first video packet selects one of them for the life of the stream.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codecs: Vec<VideoCodec>,
     pub packet_size: usize,
     pub fec_percentage: u8,
     pub min_parity_shards: u8,
@@ -64,6 +69,7 @@ impl Default for VideoSettings {
     fn default() -> Self {
         Self {
             codec: VideoCodec::H264,
+            codecs: Vec::new(),
             packet_size: 1024,
             fec_percentage: 20,
             min_parity_shards: 2,
@@ -74,25 +80,45 @@ impl Default for VideoSettings {
 }
 
 impl VideoSettings {
-    pub fn valid_batch_size_kb(self) -> bool {
+    pub fn valid_batch_size_kb(&self) -> bool {
         self.max_batch_size_kb <= 64
     }
 
-    pub fn effective(self) -> Self {
-        Self {
-            max_batch_size_kb: self.effective_batch_size_kb(),
-            ..self
+    /// The codecs a video packet may use before one is selected.
+    pub fn offered_codecs(&self) -> &[VideoCodec] {
+        if self.codecs.is_empty() {
+            std::slice::from_ref(&self.codec)
+        } else {
+            &self.codecs
         }
     }
 
-    pub fn effective_batch_size_kb(self) -> u8 {
+    /// A codec list replaces the single `codec` field rather than adding to it,
+    /// and names each codec at most once.
+    pub fn valid_codec_offer(&self) -> bool {
+        let unique = self
+            .codecs
+            .iter()
+            .enumerate()
+            .all(|(index, codec)| !self.codecs[..index].contains(codec));
+        self.codecs.is_empty() || (self.codec.is_default() && unique)
+    }
+
+    pub fn effective(&self) -> Self {
+        Self {
+            max_batch_size_kb: self.effective_batch_size_kb(),
+            ..self.clone()
+        }
+    }
+
+    pub fn effective_batch_size_kb(&self) -> u8 {
         match self.max_batch_size_kb {
             16 | 32 | 64 => self.max_batch_size_kb,
             _ => 64,
         }
     }
 
-    pub fn batch_size_fallback(self) -> bool {
+    pub fn batch_size_fallback(&self) -> bool {
         self.max_batch_size_kb != 0 && !matches!(self.max_batch_size_kb, 16 | 32 | 64)
     }
 }
@@ -233,7 +259,7 @@ impl Open {
         if !allow_remote && !self.peer_ip.is_loopback() {
             return Err("remote_disabled");
         }
-        if !self.video.valid_batch_size_kb() {
+        if !self.video.valid_batch_size_kb() || !self.video.valid_codec_offer() {
             return Err("invalid_video_configuration");
         }
         for bind in [self.video_bind, self.audio_bind].into_iter().flatten() {
@@ -337,6 +363,9 @@ pub fn validate_ping_timeout_ms(value: i64) -> TransportResult<u64> {
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+// Each request is parsed, handled and dropped within one control call, so the
+// larger Open variant costs nothing worth an extra allocation.
+#[allow(clippy::large_enum_variant)]
 pub enum Operation {
     Open(Open),
     Lookup { operation_id: String },
@@ -490,10 +519,41 @@ mod tests {
         let hevc: VideoSettings =
             serde_json::from_value(serde_json::json!({"codec":"hevc"})).unwrap();
         assert!(hevc.codec == VideoCodec::Hevc);
-        assert_eq!(serde_json::to_value(hevc).unwrap()["codec"], "hevc");
+        assert_eq!(serde_json::to_value(&hevc).unwrap()["codec"], "hevc");
+        let av1: VideoSettings =
+            serde_json::from_value(serde_json::json!({"codec":"av1"})).unwrap();
+        assert!(av1.offered_codecs() == [VideoCodec::Av1]);
         assert!(
-            serde_json::from_value::<VideoSettings>(serde_json::json!({"codec":"av1"})).is_err()
+            serde_json::from_value::<VideoSettings>(serde_json::json!({"codec":"vp9"})).is_err()
         );
+    }
+
+    #[test]
+    fn codec_offer_replaces_the_single_codec_and_rejects_duplicates() {
+        let offer: VideoSettings =
+            serde_json::from_value(serde_json::json!({"codecs":["h264","hevc","av1"]})).unwrap();
+        assert!(offer.valid_codec_offer());
+        assert!(offer.offered_codecs() == [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1]);
+        assert_eq!(
+            serde_json::to_value(&offer).unwrap()["codecs"],
+            serde_json::json!(["h264", "hevc", "av1"])
+        );
+        let single = VideoSettings::default();
+        assert!(single.valid_codec_offer());
+        assert!(single.offered_codecs() == [VideoCodec::H264]);
+        assert!(
+            serde_json::to_value(&single)
+                .unwrap()
+                .get("codecs")
+                .is_none()
+        );
+        for invalid in [
+            serde_json::json!({"codecs":["hevc","hevc"]}),
+            serde_json::json!({"codec":"hevc","codecs":["hevc","av1"]}),
+        ] {
+            let settings: VideoSettings = serde_json::from_value(invalid).unwrap();
+            assert!(!settings.valid_codec_offer());
+        }
     }
 
     #[test]

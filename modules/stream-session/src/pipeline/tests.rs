@@ -81,6 +81,39 @@ fn authenticated_start_codec_must_match_prepared_transport_codec() {
 }
 
 #[test]
+fn codec_offer_reaches_the_transport_and_start_selects_av1_for_video() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["video"]["codecs"] = json!(["h264", "av1"]);
+    let prepared = host.response(1, request);
+    let session = prepared["session"].as_u64().expect("prepared session");
+    let media = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Media.service() && call.payload["action"] == "open")
+        .expect("media transport opened at prepare");
+    assert_eq!(media.payload["video"]["codecs"], json!(["h264", "av1"]));
+    assert!(media.payload["video"].get("codec").is_none());
+
+    let mut hevc = start(session);
+    hevc["configuration"]["configuration"]["codec"] = json!("hevc");
+    assert_eq!(host.response(2, hevc)["code"], "video_codec_mismatch");
+
+    let mut av1 = start(session);
+    av1["configuration"]["configuration"]["codec"] = json!("av1");
+    let accepted = host.response(3, av1);
+    assert_eq!(accepted["state"], "active", "{accepted}");
+    let video = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("video opened for an offered codec");
+    assert_eq!(video.payload["configuration"]["codec"], "av1");
+}
+
+#[test]
 fn negotiated_video_geometry_and_rate_are_allocated_only_at_authenticated_start() {
     let mut host = Harness::new();
     let prepared = host.response(1, prepare());

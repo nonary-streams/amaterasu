@@ -1,6 +1,7 @@
-# GameStream Annex B packetization
+# GameStream video packetization
 
-`VideoPacketizer` creates complete UDP payloads from an H.264 or HEVC Annex B access unit,
+`VideoPacketizer` creates complete UDP payloads from an H.264 or HEVC Annex B access
+unit or an AV1 low-overhead temporal unit,
 with optional systematic Reed–Solomon parity. It has no sockets, encryption keys,
 encoder, pacing loop, or streaming session state. This library alone does not
 make Moonlight streaming available.
@@ -52,6 +53,22 @@ RASL, mixed access-point types, multilayer headers and malformed two-byte NAL
 headers. It does not parse slice syntax or prove Main profile, color signaling,
 parameter-set references or a single coded picture. HEVC must remain unadvertised
 until encoder output and negotiated session configuration match these limits.
+
+`VideoCodec::Av1` carries one temporal unit per access unit as raw OBUs, with no
+start codes and no rewriting. Moonlight does not parse AV1: it takes the frame type
+from byte 3 of the short frame header and, because AV1 parsers do not tolerate the
+zero padding that FEC adds, truncates the final data packet to the little-endian
+length in bytes 4..6. That length is the final data packet's payload after the NV
+header, including the eight-byte frame header when the frame fits in one packet;
+the packetizer writes it for every codec. `packetize` takes the encoder's keyframe
+flag, and for AV1 the header announces IDR (2) exactly when that flag is set; for
+H.264 and HEVC the flag is ignored and the NAL types decide. AV1 validation is
+structural: the unit opens with one empty temporal delimiter, every OBU has a clear
+forbidden bit, `obu_has_size_field` set, a well-formed extension byte and a leb128
+size inside the unit, reserved and tile-list OBU types are rejected, a sequence
+header precedes any frame, a frame or frame header OBU is present, and a keyframe
+carries a sequence header so that it is a usable recovery point. Frame header
+syntax, tiles, profile, and reference structure are not parsed.
 
 ## FEC and bounds
 

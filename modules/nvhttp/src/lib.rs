@@ -1,6 +1,8 @@
 //! Bounded HTTP/TLS transport for Moonlight-compatible control and pairing.
 #![recursion_limit = "256"]
 
+mod encoder_refresh;
+mod encoder_snapshot;
 mod frame_limiter;
 mod launch;
 mod network_settings;
@@ -192,6 +194,7 @@ struct NvhttpModule {
     warm: WarmIdentity,
     product_settings: ProductSettings,
     network_settings: NetworkSettings,
+    encoder_refresh: encoder_refresh::EncoderRefresh,
     next_listener_rebind: Instant,
     listener_rebind_delay: Duration,
 }
@@ -258,6 +261,7 @@ impl ManagedModule for NvhttpModule {
             warm: WarmIdentity::new(),
             product_settings,
             network_settings: NetworkSettings::default(),
+            encoder_refresh: encoder_refresh::EncoderRefresh::default(),
             next_listener_rebind: Instant::now(),
             listener_rebind_delay: Duration::from_secs(1),
         })
@@ -314,6 +318,13 @@ impl ManagedModule for NvhttpModule {
             router.set_global_wgc_pacing_smoothing(
                 self.product_settings.effective_wgc_pacing_smoothing(),
             );
+            if router.supports_streaming() {
+                self.encoder_refresh
+                    .tick(&self.runtime, router.stream_active());
+                if let Some(snapshot) = self.encoder_refresh.take_update() {
+                    router.set_encoder_snapshot(snapshot);
+                }
+            }
         }
         if self.product_settings.loaded() {
             self.network_settings.tick(

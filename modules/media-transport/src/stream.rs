@@ -26,6 +26,8 @@ pub struct Stream {
     pub audio_local: SocketAddr,
     pub delivery: Delivery,
     video: VideoPacketizer,
+    /// The negotiated codec, fixed by the first accepted video packet.
+    video_codec: Option<VideoCodec>,
     audio: AudioPacketizer,
     video_sealer: Option<VideoSealer>,
     audio_sealer: Option<AudioSealer>,
@@ -43,6 +45,7 @@ pub struct Stream {
 struct PendingVideo {
     sequence: u64,
     timestamp_us: u64,
+    keyframe: bool,
     bytes: Vec<u8>,
 }
 
@@ -72,6 +75,8 @@ impl Stream {
         }
         .map_err(|_| "udp_bind_failed")?;
         let video_settings = request.video.effective();
+        let video_codec = (video_settings.offered_codecs().len() == 1)
+            .then(|| video_settings.offered_codecs()[0]);
         delivery.set_video_max_batch_size_kb(video_settings.max_batch_size_kb);
         let (video_local, audio_local) = delivery.addresses().map_err(|_| "udp_bind_failed")?;
         Ok(Self {
@@ -86,6 +91,7 @@ impl Stream {
             audio_local,
             delivery,
             video,
+            video_codec,
             audio,
             video_sealer,
             audio_sealer,
@@ -102,6 +108,11 @@ impl Stream {
             next_frame_index: Some(1),
             discarded_audio_fec_shards: 0,
         })
+    }
+
+    /// The codec this stream carries, once negotiated or fixed at open.
+    pub fn video_codec(&self) -> Option<VideoCodec> {
+        self.video_codec
     }
 
     pub fn encryption(&self) -> (bool, bool) {
@@ -169,14 +180,10 @@ impl Stream {
         if let Err(status) = packet.validate() {
             return status;
         }
-        let expected_codec = match self.video_settings.codec {
-            VideoCodec::H264 => CODEC_H264,
-            VideoCodec::Hevc => CODEC_HEVC,
-            VideoCodec::Av1 => CODEC_AV1,
+        let codec = match self.select_video_codec(packet.codec) {
+            Ok(codec) => codec,
+            Err(status) => return status,
         };
-        if packet.codec != expected_codec {
-            return STATUS_INVALID_ARGUMENT;
-        }
         if packet.flags & FLAG_END_OF_STREAM != 0 {
             if self.pending_video.is_some() {
                 return STATUS_INVALID_ARGUMENT;
@@ -184,11 +191,12 @@ impl Stream {
             self.video_ended = true;
             return STATUS_OK;
         }
-        // The HEVC encoder may emit several Annex B fragments for one access
+        // HEVC and AV1 encoders may emit several fragments for one access
         // unit. Retain only a bounded owned copy until its final fragment;
         // neither a sequence nor a frame index is committed early. Legacy
         // H.264 packets without a boundary flag remain complete access units.
-        if self.video_settings.codec == VideoCodec::Hevc {
+        let keyframe = packet.flags & FLAG_KEYFRAME != 0;
+        if codec != VideoCodec::H264 {
             let end = packet.flags & FLAG_END_OF_ACCESS_UNIT != 0;
             let previous = self.pending_video.as_ref();
             if previous.is_some_and(|pending| {
@@ -219,8 +227,10 @@ impl Stream {
                 let pending = self.pending_video.get_or_insert_with(|| PendingVideo {
                     sequence: packet.sequence,
                     timestamp_us: packet.timestamp_us,
+                    keyframe: false,
                     bytes: Vec::new(),
                 });
+                pending.keyframe |= keyframe;
                 pending.bytes.extend_from_slice(fragment);
                 return STATUS_OK;
             }
@@ -228,8 +238,12 @@ impl Stream {
                 let mut access_unit = Vec::with_capacity(total_len);
                 access_unit.extend_from_slice(&pending.bytes);
                 access_unit.extend_from_slice(fragment);
-                let status =
-                    self.submit_access_unit(&access_unit, packet.sequence, packet.timestamp_us);
+                let status = self.submit_access_unit(
+                    &access_unit,
+                    keyframe || pending.keyframe,
+                    packet.sequence,
+                    packet.timestamp_us,
+                );
                 if status == STATUS_OK {
                     self.pending_video = None;
                 }
@@ -238,12 +252,36 @@ impl Stream {
         }
         // SAFETY: caller's packet allocation is borrowed only through packetization.
         let access_unit = unsafe { packet.bytes().unwrap() };
-        self.submit_access_unit(access_unit, packet.sequence, packet.timestamp_us)
+        self.submit_access_unit(access_unit, keyframe, packet.sequence, packet.timestamp_us)
+    }
+
+    /// Match a packet's ABI codec against the stream. The first packet of an
+    /// offered codec selects it; the packetizer has consumed no state yet, so
+    /// it is rebuilt for that codec.
+    fn select_video_codec(&mut self, abi_codec: u32) -> Result<VideoCodec, Status> {
+        let codec = self
+            .video_settings
+            .offered_codecs()
+            .iter()
+            .copied()
+            .find(|codec| codec.abi_id() == abi_codec)
+            .ok_or(STATUS_INVALID_ARGUMENT)?;
+        match self.video_codec {
+            Some(selected) if selected == codec => Ok(codec),
+            Some(_) => Err(STATUS_INVALID_ARGUMENT),
+            None => {
+                self.video = video_packetizer(&self.video_settings, codec)
+                    .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+                self.video_codec = Some(codec);
+                Ok(codec)
+            }
+        }
     }
 
     fn submit_access_unit(
         &mut self,
         access_unit: &[u8],
+        keyframe: bool,
         sequence: u64,
         timestamp_us: u64,
     ) -> Status {
@@ -276,7 +314,10 @@ impl Stream {
             return MEDIA_BUSY;
         }
         let clock = (u128::from(timestamp_us) * 90_000 / 1_000_000) as u32;
-        let datagrams = match self.video.packetize(access_unit, frame_index, clock) {
+        let datagrams = match self
+            .video
+            .packetize(access_unit, keyframe, frame_index, clock)
+        {
             Ok(datagrams) => datagrams,
             Err(_) => return STATUS_INVALID_ARGUMENT,
         };
@@ -418,23 +459,8 @@ fn packetizers(request: &Open) -> TransportResult<(VideoPacketizer, AudioPacketi
     if encrypted_video && request.video.packet_size > 65_507 - 16 - VIDEO_PREFIX_BYTES {
         return Err("invalid_video_configuration");
     }
-    let codec = match request.video.codec {
-        VideoCodec::H264 => WireVideoCodec::H264,
-        VideoCodec::Hevc => WireVideoCodec::Hevc,
-        // AV1 has no GameStream packetizer yet.
-        VideoCodec::Av1 => return Err("invalid_video_configuration"),
-    };
-    let video = VideoPacketizer::new_with_codec(
-        VideoConfig {
-            packet_size: request.video.packet_size,
-            fec_percentage: request.video.fec_percentage,
-            min_parity_shards: request.video.min_parity_shards,
-            max_fec_blocks: request.video.max_fec_blocks,
-            encrypted: false,
-        },
-        codec,
-    )
-    .map_err(|_| "invalid_video_configuration")?;
+    let codec = request.video.offered_codecs()[0];
+    let video = video_packetizer(&request.video, codec)?;
     let audio = AudioPacketizer::new(AudioConfig {
         sample_rate: 48_000,
         channels: request.audio.channels,
@@ -444,6 +470,30 @@ fn packetizers(request: &Open) -> TransportResult<(VideoPacketizer, AudioPacketi
     })
     .map_err(|_| "invalid_audio_configuration")?;
     Ok((video, audio))
+}
+
+/// Packet framing and FEC are codec independent; the codec selects only the
+/// bitstream validation and frame-type source.
+fn video_packetizer(
+    settings: &VideoSettings,
+    codec: VideoCodec,
+) -> TransportResult<VideoPacketizer> {
+    let wire_codec = match codec {
+        VideoCodec::H264 => WireVideoCodec::H264,
+        VideoCodec::Hevc => WireVideoCodec::Hevc,
+        VideoCodec::Av1 => WireVideoCodec::Av1,
+    };
+    VideoPacketizer::new_with_codec(
+        VideoConfig {
+            packet_size: settings.packet_size,
+            fec_percentage: settings.fec_percentage,
+            min_parity_shards: settings.min_parity_shards,
+            max_fec_blocks: settings.max_fec_blocks,
+            encrypted: false,
+        },
+        wire_codec,
+    )
+    .map_err(|_| "invalid_video_configuration")
 }
 
 fn ciphers(request: &Open) -> TransportResult<(Option<VideoSealer>, Option<AudioSealer>)> {

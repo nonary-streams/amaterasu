@@ -2,6 +2,7 @@ use super::{
     CaptureProvider, LaunchRequest, PeerIdentity, PhysicalDisplayMode,
     VideoEncryptionPolicySnapshot,
 };
+use crate::encoder_snapshot::CodecOffer;
 use crate::frame_limiter::FrameLimiterSettings;
 use crate::launch::{CLEANUP_DEADLINE, MONITOR_INTERVAL};
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
@@ -119,6 +120,9 @@ pub struct Record {
     pub global_minimum_fps_target: f64,
     /// Client-over-application stream controls resolved for this launch.
     pub effective_video_max_batch_size_kb: u8,
+    /// Codecs RTSP may negotiate for this launch, fixed at admission from
+    /// the encoder snapshot and the requested stream mode.
+    pub video_codec_offer: CodecOffer,
     pub effective_max_bitrate_kbps: Option<u32>,
     pub effective_minimum_fps_target: f64,
     pub global_wgc_pacing_smoothing: bool,
@@ -195,6 +199,10 @@ impl Record {
         });
         Self {
             id,
+            video_codec_offer: CodecOffer {
+                codecs: vec![amaterasu_media::VideoCodec::H264],
+                software_limited: true,
+            },
             desktop: false,
             resumed: false,
             peer,

@@ -65,6 +65,7 @@ fn owner_launch_exports_signed_video_ceilings_and_effective_bitrate_bound() {
     streaming.profile.max_fps = 120;
     streaming.profile.bitrate_kbps = 20_000;
     let mut controller = Controller::new(Some(streaming)).unwrap();
+    controller.set_encoder_snapshot(hardware_h264());
     controller.set_global_max_bitrate_kbps(Some(8_000));
     let mut broker = Broker::default();
 

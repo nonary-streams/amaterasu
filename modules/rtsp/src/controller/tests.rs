@@ -1996,6 +1996,59 @@ fn authenticated_start_keeps_the_exact_ticket_codec() {
 }
 
 #[test]
+fn codec_offer_drives_describe_markers_announce_and_start_codec() {
+    let (mut record, mut announce) = announced_profile_record();
+    let only_h264 = record.capabilities().transport;
+    assert!(!only_h264.hevc && !only_h264.av1);
+
+    record.config.profile.codecs = vec![
+        amaterasu_media::VideoCodec::H264,
+        amaterasu_media::VideoCodec::Av1,
+    ];
+    let offered = record.capabilities().transport;
+    assert!(offered.av1 && !offered.hevc);
+    let prepared = record.config.prepare("offer-prepare", None);
+    assert_eq!(prepared["video"]["codecs"], json!(["h264", "av1"]));
+    assert!(prepared["video"].get("codec").is_none());
+
+    announce.video.color = amaterasu_gamestream::sdp::ColorMode::Bt709Limited;
+    announce.video.codec = amaterasu_gamestream::sdp::VideoCodec::Hevc;
+    assert!(!record.accept_announce(&announce), "HEVC was not offered");
+    announce.video.codec = amaterasu_gamestream::sdp::VideoCodec::Av1;
+    assert!(record.accept_announce(&announce));
+    let start = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(start["configuration"]["configuration"]["codec"], "av1");
+
+    announce.video.codec = amaterasu_gamestream::sdp::VideoCodec::H264;
+    assert!(record.accept_announce(&announce));
+    let start = record.authenticated_start_payload(24).unwrap();
+    assert!(
+        start["configuration"]["configuration"]
+            .get("codec")
+            .is_none()
+    );
+}
+
+#[test]
+fn codec_offers_must_name_each_codec_once_and_replace_the_single_codec() {
+    let (mut record, _) = announced_profile_record();
+    record.config.profile.codecs = vec![
+        amaterasu_media::VideoCodec::Hevc,
+        amaterasu_media::VideoCodec::Av1,
+    ];
+    assert!(record.config.validate(false).is_ok());
+    record
+        .config
+        .profile
+        .codecs
+        .push(amaterasu_media::VideoCodec::Av1);
+    assert_eq!(record.config.validate(false), Err("invalid_profile"));
+    record.config.profile.codecs = vec![amaterasu_media::VideoCodec::Hevc];
+    record.config.profile.codec = amaterasu_media::VideoCodec::Hevc;
+    assert_eq!(record.config.validate(false), Err("invalid_profile"));
+}
+
+#[test]
 fn rejected_announce_cannot_produce_an_authenticated_play_start() {
     let (mut record, announce) = announced_profile_record();
     record.config.profile.encrypt_audio = false;

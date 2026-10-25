@@ -363,6 +363,7 @@ impl Router {
                         current_game,
                         self.launches.busy(),
                         self.launches.supported(),
+                        self.launches.codec_advertisement(),
                     ),
                     None => xml::error(503, "host identity is unavailable"),
                 };

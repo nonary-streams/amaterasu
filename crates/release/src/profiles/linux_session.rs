@@ -475,24 +475,29 @@ fn nvhttp_settings(options: &LinuxSessionOptions) -> Value {
     })
 }
 
-/// The first supported stream is 1920x1080 at 60 Hz: software x264 cannot
-/// sustain the host desktop's own 3024x1890 at 90 Hz, and larger requests are
-/// refused instead of silently degraded.
+/// Streams reach 3840x2160 at 120 Hz when a hardware encoder serves the
+/// negotiated codec. NVHTTP refuses a launch above 1920x1080 at 60 Hz that only
+/// a software encoder could serve: software x264 cannot sustain the host
+/// desktop's own 3024x1890 at 90 Hz, and such requests are refused instead of
+/// silently degraded.
 fn streaming_settings(options: &LinuxSessionOptions) -> Value {
     json!({
         "capture": {
             "capture_provider": "pipewire",
             "output": if options.enable_virtual_display { "amaterasu-owned-display" } else { "portal-selected-session-source" },
-            // NVHTTP's bootstrap schema selects encoders with a numeric ID;
-            // zero delegates encoder choice to its runtime probe.
-            "encoder": 0,
+            // Automatic selection lets the video module open a hardware
+            // encoder for whichever codec the client negotiates, then the
+            // software encoder. A numeric index would pin one codec.
+            "encoder": "auto",
             "audio_endpoint": options.audio_endpoint,
         },
         "profile": {
-            "max_width": 1920,
-            "max_height": 1080,
-            "max_fps": 60,
-            "bitrate_kbps": 20_000,
+            "max_width": 3840,
+            "max_height": 2160,
+            "max_fps": 120,
+            // A ceiling on the client's requested bitrate, which Moonlight
+            // scales with the mode (about 64 Mbps by default at 4K60).
+            "bitrate_kbps": 100_000,
             "max_reference_frames": 1,
             "packet_size": 1024,
             "fec_percentage": 20,

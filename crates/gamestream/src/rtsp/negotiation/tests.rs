@@ -16,6 +16,7 @@ fn negotiation() -> Negotiation {
         Capabilities {
             transport: sdp::TransportSupport {
                 hevc: false,
+                av1: false,
                 stereo_audio: true,
                 enet_control: true,
                 encrypted_control: true,
@@ -47,6 +48,26 @@ fn hevc_describe_marker_is_ticket_capability_scoped() {
     assert!(description.contains("sprop-parameter-sets=AAAAAU\r\n"));
     assert!(description.contains("H264/90000"));
     assert!(!description.contains("HEVC/90000"));
+    assert!(!description.contains("AV1/90000"));
+}
+
+#[test]
+fn av1_describe_marker_is_ticket_capability_scoped() {
+    let mut enabled = negotiation();
+    enabled.capabilities.transport.av1 = true;
+    let description = validation::description(&enabled.capabilities);
+    assert!(description.contains("a=rtpmap:98 AV1/90000\r\n"));
+    assert!(!description.contains("sprop-parameter-sets"));
+    let video =
+        &description[description.find("m=video").unwrap()..description.find("m=audio").unwrap()];
+    assert!(
+        video.contains("AV1/90000"),
+        "marker belongs to the video section"
+    );
+
+    enabled.capabilities.transport.hevc = true;
+    let both = validation::description(&enabled.capabilities);
+    assert!(both.contains("sprop-parameter-sets=AAAAAU\r\n") && both.contains("AV1/90000"));
 }
 
 fn request(method: Method, target: &str, cseq: u32, session: bool) -> Request {

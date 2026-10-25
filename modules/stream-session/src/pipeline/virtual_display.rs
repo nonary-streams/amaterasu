@@ -61,7 +61,7 @@ pub(super) fn accept_ready(record: &mut Record, payload: &Value) -> Result<bool,
         Some("ready") => {
             let output = monitor["capture_output"]
                 .as_str()
-                .filter(|output| (1..=8).any(|index| *output == format!("kwin:Virtual-{index}")))
+                .filter(|output| is_kwin_virtual_output(output))
                 .ok_or("invalid_virtual_display_output")?;
             let configuration = &record
                 .start
@@ -81,6 +81,16 @@ pub(super) fn accept_ready(record: &mut Record, payload: &Value) -> Result<bool,
         _ => Err("virtual_display_not_ready"),
     }
 }
+/// KWin names virtual outputs `Virtual-N`. Connector numbers keep counting
+/// across driver reloads, so any canonical index up to 64 is accepted.
+fn is_kwin_virtual_output(output: &str) -> bool {
+    output
+        .strip_prefix("kwin:Virtual-")
+        .filter(|index| !index.starts_with('0') && index.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|index| index.parse::<u8>().ok())
+        .is_some_and(|index| (1..=64).contains(&index))
+}
+
 pub(super) fn absent(record: &Record, payload: &Value) -> bool {
     payload["ok"] == true
         && (payload["removed"] == true && payload["identity"] == identity(record)
@@ -108,4 +118,35 @@ pub(super) fn shutdown(record: &Record, send: &mut rpc::Send<'_>) -> bool {
         }
     }
     pending.shutdown(send)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_kwin_virtual_output;
+
+    #[test]
+    fn kwin_virtual_outputs_accept_any_canonical_index_up_to_sixty_four() {
+        for accepted in [
+            "kwin:Virtual-1",
+            "kwin:Virtual-8",
+            "kwin:Virtual-9",
+            "kwin:Virtual-16",
+            "kwin:Virtual-64",
+        ] {
+            assert!(is_kwin_virtual_output(accepted), "{accepted}");
+        }
+        for rejected in [
+            "kwin:Virtual-0",
+            "kwin:Virtual-65",
+            "kwin:Virtual-09",
+            "kwin:Virtual-+9",
+            "kwin:Virtual-",
+            "kwin:Virtual-9 ",
+            "kwin:Virtual-256",
+            "kwin:DP-1",
+            "Virtual-9",
+        ] {
+            assert!(!is_kwin_virtual_output(rejected), "{rejected}");
+        }
+    }
 }

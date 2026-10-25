@@ -268,6 +268,13 @@ impl Record {
             control_transport: get(Resource::Control)?,
             stream_audio: self.config.stream_audio,
             audio_channels: self.config.audio.channels,
+            video_codec: self
+                .start
+                .as_ref()
+                .ok_or("missing_start_configuration")?
+                .configuration
+                .codec
+                .abi_id(),
         })
     }
 

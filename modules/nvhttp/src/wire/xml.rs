@@ -1,4 +1,5 @@
 use super::{Reply, RouterConfig};
+use crate::encoder_snapshot::CodecAdvertisement;
 
 pub fn escape(value: &str) -> String {
     let mut output = String::new();
@@ -51,7 +52,10 @@ pub fn server_info(
     current_game: u32,
     busy: bool,
     streaming_supported: bool,
+    codecs: CodecAdvertisement,
 ) -> Reply {
+    let codec_mode_support = codecs.codec_mode_support.to_string();
+    let max_luma_pixels_hevc = codecs.max_luma_pixels_hevc.to_string();
     response(
         200,
         "OK",
@@ -86,14 +90,11 @@ pub fn server_info(
                     "AMATERASU_SERVER_FREE"
                 },
             ),
-            // Moonlight's SCM_H264 bit is 1. A zero mask makes its core
-            // abort before RTSP even when /launch succeeded. We advertise
-            // only baseline H.264 for an enabled streaming profile.
-            (
-                "ServerCodecModeSupport",
-                if streaming_supported { "1" } else { "0" },
-            ),
-            ("MaxLumaPixelsHEVC", "0"),
+            // Moonlight's SCM_* codec bits and its nonzero-means-HEVC luma
+            // limit, both derived from the enumerated encoders. A zero mask
+            // makes Moonlight abort before RTSP even when /launch succeeded.
+            ("ServerCodecModeSupport", codec_mode_support.as_str()),
+            ("MaxLumaPixelsHEVC", max_luma_pixels_hevc.as_str()),
             (
                 "StreamingSupported",
                 if streaming_supported { "1" } else { "0" },
