@@ -692,6 +692,33 @@ fn settings_default_to_reference_values_and_accept_stable_names() {
 }
 
 #[test]
+fn virtual_display_layout_defaults_to_exclusive_and_refuses_unimplemented_variants() {
+    use crate::model::VirtualDisplayLayout;
+    let defaults = serde_json::from_value::<Settings>(json!({})).unwrap();
+    assert_eq!(
+        defaults.virtual_display_layout,
+        VirtualDisplayLayout::Exclusive
+    );
+    let extended =
+        serde_json::from_value::<Settings>(json!({"virtual_display_layout": "extended"})).unwrap();
+    assert_eq!(
+        extended.virtual_display_layout,
+        VirtualDisplayLayout::Extended
+    );
+    for unimplemented in [
+        "extended_primary",
+        "extended_isolated",
+        "extended_primary_isolated",
+    ] {
+        assert!(
+            serde_json::from_value::<Settings>(json!({"virtual_display_layout": unimplemented}))
+                .is_err(),
+            "{unimplemented}"
+        );
+    }
+}
+
+#[test]
 fn permanent_monitor_count_preserves_unset_and_explicit_zero() {
     let defaults = serde_json::from_value::<Settings>(json!({})).unwrap();
     assert_eq!(defaults.dd_virtual_display_permanent_count, None);

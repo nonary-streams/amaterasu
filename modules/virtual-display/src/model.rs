@@ -6,8 +6,22 @@ use sha2::{Digest, Sha256};
 
 const MAX_PERMANENT_MONITOR_COUNT: u64 = 4;
 
+/// How an owned virtual output joins the desktop, named after Vibeshine's
+/// `virtual_display_layout`. Its isolated and primary-only variants are not
+/// implemented and are refused when settings are parsed.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VirtualDisplayLayout {
+    /// Every other display is turned off for the stream and restored after it.
+    #[default]
+    Exclusive,
+    /// The other displays stay on and the owned output extends the desktop.
+    Extended,
+}
+
 pub struct Settings {
     pub enabled: bool,
+    pub virtual_display_layout: VirtualDisplayLayout,
     pub dd_activate_virtual_display: bool,
     pub dd_use_sunshine_virtual_display_driver: bool,
     /// None preserves the distinction between an omitted setting and explicit zero.
@@ -18,6 +32,7 @@ pub struct Settings {
 #[serde(default, deny_unknown_fields)]
 struct SettingsInput {
     enabled: bool,
+    virtual_display_layout: VirtualDisplayLayout,
     dd_activate_virtual_display: bool,
     dd_use_sunshine_virtual_display_driver: bool,
     dd_virtual_display_permanent_count: Present<Value>,
@@ -28,6 +43,7 @@ impl Default for SettingsInput {
     fn default() -> Self {
         Self {
             enabled: false,
+            virtual_display_layout: VirtualDisplayLayout::default(),
             dd_activate_virtual_display: false,
             dd_use_sunshine_virtual_display_driver: true,
             dd_virtual_display_permanent_count: Present::default(),
@@ -91,6 +107,7 @@ impl<'de> Deserialize<'de> for Settings {
 
         Ok(Self {
             enabled: input.enabled,
+            virtual_display_layout: input.virtual_display_layout,
             dd_activate_virtual_display: input.dd_activate_virtual_display,
             dd_use_sunshine_virtual_display_driver: input.dd_use_sunshine_virtual_display_driver,
             dd_virtual_display_permanent_count: permanent_count,
@@ -102,6 +119,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            virtual_display_layout: VirtualDisplayLayout::default(),
             dd_activate_virtual_display: false,
             dd_use_sunshine_virtual_display_driver: true,
             dd_virtual_display_permanent_count: None,

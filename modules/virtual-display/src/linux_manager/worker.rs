@@ -1,8 +1,14 @@
 //! Serialized native effects run outside the host's input/media tick.
 use super::{
-    Event, Record, Work, compositor::Compositor, connectors::ConnectorInventory, journal::Journal,
+    Event, Record, Work,
+    compositor::{Compositor, Placement},
+    connectors::ConnectorInventory,
+    journal::Journal,
 };
-use crate::{linux_control::LinuxControlClient, model::Specification};
+use crate::{
+    linux_control::LinuxControlClient,
+    model::{Specification, VirtualDisplayLayout},
+};
 use std::sync::mpsc::{Receiver, SyncSender};
 
 pub(super) trait Broker: Send {
@@ -26,9 +32,26 @@ struct Controller<B: Broker, C: Compositor, I: ConnectorInventory> {
     broker: B,
     compositor: C,
     connectors: I,
+    layout: VirtualDisplayLayout,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
+    /// Exclusive placement leaves the outputs of other journaled Amaterasu
+    /// streams enabled; only displays Amaterasu does not own are turned off.
+    fn placement(&self, owned: &str) -> Placement {
+        match self.layout {
+            VirtualDisplayLayout::Extended => Placement::Extended,
+            VirtualDisplayLayout::Exclusive => Placement::Exclusive {
+                keep: self
+                    .journal
+                    .records
+                    .iter()
+                    .map(|record| record.output.clone())
+                    .filter(|output| output != owned)
+                    .collect(),
+            },
+        }
+    }
     fn remove(&mut self, key: &(String, String)) -> Result<(), String> {
         let Some(mut record) = self
             .journal
@@ -86,6 +109,7 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             layout: None,
         };
         record.layout = self.compositor.snapshot(&record.output)?;
+        let placement = self.placement(&record.output);
         self.journal.insert(record.clone())?;
         let result = (|| {
             self.broker.set_connected(&record.output, true)?;
@@ -96,14 +120,19 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
                 &record.output,
                 &record.specification,
                 record.layout.as_ref(),
+                &placement,
             )?;
             if !self.broker.connected(&record.output)? {
                 return Err("owned connector disappeared".into());
             }
-            // Once configured, future removal preserves the current layout,
-            // including user changes made during this active stream.
-            record.layout = None;
-            self.journal.update(record.clone())?;
+            // An extended stream's removal preserves the then-current layout,
+            // including user changes made during it. An exclusive stream keeps
+            // the pre-stream snapshot: removal re-enables the displays it
+            // turned off, exactly as they were.
+            if placement == Placement::Extended {
+                record.layout = None;
+                self.journal.update(record.clone())?;
+            }
             Ok(record.clone())
         })();
         if result.is_err() {
@@ -112,11 +141,13 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         result
     }
 }
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
     journal: Journal,
     broker: B,
     compositor: C,
     connectors: I,
+    layout: VirtualDisplayLayout,
     jobs: Receiver<Work>,
     events: SyncSender<Event>,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -126,6 +157,7 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
         broker,
         compositor,
         connectors,
+        layout,
         stopped: stopped.clone(),
     };
     let error = controller.recover();

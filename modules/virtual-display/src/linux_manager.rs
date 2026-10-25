@@ -108,6 +108,7 @@ impl Manager {
             let (sender, jobs) = mpsc::sync_channel(16);
             let (events, receiver) = mpsc::sync_channel(16);
             let stopped = manager.stopped.clone();
+            let layout = manager.settings.virtual_display_layout;
             let worker = std::thread::Builder::new()
                 .name("amaterasu-displays".into())
                 .spawn(move || {
@@ -116,6 +117,7 @@ impl Manager {
                         crate::linux_control::LinuxControlClient::default(),
                         compositor::KScreen,
                         connectors::SysfsConnectors::default(),
+                        layout,
                         jobs,
                         events,
                         stopped,

@@ -70,17 +70,34 @@ impl ConnectorInventory for FakeConnectors {
 }
 struct FakeCompositor {
     fail: bool,
+    placements: Vec<(String, Placement)>,
+    restored: Vec<bool>,
+}
+impl FakeCompositor {
+    fn new() -> Self {
+        Self {
+            fail: false,
+            placements: Vec::new(),
+            restored: Vec::new(),
+        }
+    }
 }
 impl Compositor for FakeCompositor {
     fn snapshot(&mut self, changing: &str) -> Result<Option<super::super::layout::Layout>, String> {
         super::super::layout::Layout::capture(&serde_json::json!({"outputs":[{"name":"Virtual-1","connected":true,"enabled":true,"currentModeId":"1","modes":[{"id":"1","size":{"width":3840,"height":2160},"refreshRate":60}],"pos":{"x":0,"y":0},"scale":2.5,"rotation":1,"hdr":false,"wcg":true,"priority":1}]}), changing).map(Some)
     }
+    fn restore(&mut self, layout: Option<&super::super::layout::Layout>) -> Result<(), String> {
+        self.restored.push(layout.is_some());
+        Ok(())
+    }
     fn configure(
         &mut self,
-        _: &str,
+        output: &str,
         _: &Specification,
         _: Option<&super::super::layout::Layout>,
+        placement: &Placement,
     ) -> Result<(), String> {
+        self.placements.push((output.into(), placement.clone()));
         if self.fail {
             Err("compositor failed".into())
         } else {
@@ -106,8 +123,9 @@ fn fixture() -> (
     let controller = Controller {
         journal: Journal::open(&root).unwrap(),
         broker,
-        compositor: FakeCompositor { fail: false },
+        compositor: FakeCompositor::new(),
         connectors: FakeConnectors::named(1..=8),
+        layout: VirtualDisplayLayout::Extended,
         stopped: Default::default(),
     };
     (root, controller)
@@ -169,8 +187,9 @@ fn interrupted_cleanup_retains_intent_and_restart_only_recovers_owned_connectors
     let mut restarted = Controller {
         journal: Journal::open(&root).unwrap(),
         broker,
-        compositor: FakeCompositor { fail: false },
+        compositor: FakeCompositor::new(),
         connectors: FakeConnectors::named(1..=8),
+        layout: VirtualDisplayLayout::Extended,
         stopped: Default::default(),
     };
     assert!(restarted.recover().is_none());
@@ -239,8 +258,9 @@ fn reloaded_pool_allocates_the_connectors_that_exist_past_virtual_8() {
     let mut restarted = Controller {
         journal: Journal::open(&root).unwrap(),
         broker,
-        compositor: FakeCompositor { fail: false },
+        compositor: FakeCompositor::new(),
         connectors,
+        layout: VirtualDisplayLayout::Extended,
         stopped: Default::default(),
     };
     assert_eq!(restarted.journal.records[0].output, "Virtual-10");
@@ -278,6 +298,62 @@ fn connector_discovery_failure_or_exhaustion_admits_no_effect() {
     );
     assert!(controller.journal.records.is_empty());
     assert!(controller.broker.effects.lock().unwrap().is_empty());
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn exclusive_streams_keep_peer_outputs_and_restore_the_pre_stream_desktop() {
+    let (root, mut controller) = fixture();
+    controller.layout = VirtualDisplayLayout::Exclusive;
+    let first = controller
+        .create("stream-session".into(), specification(FIRST))
+        .unwrap();
+    let second = controller
+        .create("stream-session".into(), specification(SECOND))
+        .unwrap();
+    assert_eq!(
+        controller.compositor.placements,
+        [
+            ("Virtual-2".into(), Placement::Exclusive { keep: vec![] }),
+            (
+                "Virtual-3".into(),
+                Placement::Exclusive {
+                    keep: vec!["Virtual-2".into()]
+                }
+            ),
+        ]
+    );
+    // The snapshot taken before the effect stays journaled, so removal
+    // re-enables the displays this stream turned off.
+    assert!(
+        controller
+            .journal
+            .records
+            .iter()
+            .all(|record| record.layout.is_some())
+    );
+    controller.remove(&first.key()).unwrap();
+    controller.remove(&second.key()).unwrap();
+    assert_eq!(controller.compositor.restored, [true, true]);
+    assert!(controller.journal.records.is_empty());
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn extended_streams_restore_the_layout_current_at_removal() {
+    let (root, mut controller) = fixture();
+    let record = controller
+        .create("stream-session".into(), specification(FIRST))
+        .unwrap();
+    assert_eq!(
+        controller.compositor.placements,
+        [("Virtual-2".into(), Placement::Extended)]
+    );
+    assert!(controller.journal.records[0].layout.is_none());
+    controller.remove(&record.key()).unwrap();
+    // Removal snapshots afresh, so the restore still carries a layout.
+    assert_eq!(controller.compositor.restored, [true]);
     drop(controller);
     fs::remove_dir_all(root).unwrap();
 }

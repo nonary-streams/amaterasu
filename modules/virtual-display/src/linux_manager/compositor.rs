@@ -1,4 +1,5 @@
-//! Configure only the newly owned connector in the current KDE session.
+//! Configure the newly owned connector in the current KDE session, either
+//! beside the existing desktop or as its only enabled display.
 use super::layout::Layout;
 use crate::model::Specification;
 use serde_json::Value;
@@ -8,6 +9,16 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+/// Where the owned output goes relative to the rest of the desktop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Placement {
+    /// Right of the existing desktop, which keeps its current layout.
+    Extended,
+    /// The only enabled display apart from `keep`, the outputs of other
+    /// Amaterasu streams, which stay on and are never displaced.
+    Exclusive { keep: Vec<String> },
+}
 
 pub(super) trait Compositor: Send {
     fn snapshot(&mut self, _changing: &str) -> Result<Option<Layout>, String> {
@@ -21,6 +32,7 @@ pub(super) trait Compositor: Send {
         output: &str,
         specification: &Specification,
         layout: Option<&Layout>,
+        placement: &Placement,
     ) -> Result<(), String>;
 }
 pub(super) struct KScreen;
@@ -45,6 +57,7 @@ impl Compositor for KScreen {
         output: &str,
         specification: &Specification,
         layout: Option<&Layout>,
+        placement: &Placement,
     ) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut configuration = loop {
@@ -66,6 +79,9 @@ impl Compositor for KScreen {
         }
         let selected = mode(&configuration, output, specification)
             .ok_or("requested owned display mode is unavailable")?;
+        if let Placement::Exclusive { keep } = placement {
+            return configure_exclusive(&configuration, output, &selected, keep);
+        }
         let right = match layout {
             Some(layout) => layout.right_edge(),
             None => right_edge(&configuration, output)?,
@@ -74,19 +90,12 @@ impl Compositor for KScreen {
             Some(layout) => layout.arguments(&configuration)?,
             None => Vec::new(),
         };
-        arguments.extend([
-            format!("output.{output}.enable"),
-            format!("output.{output}.mode.{selected}"),
-            format!("output.{output}.scale.1"),
-            format!("output.{output}.rotation.none"),
-            format!("output.{output}.position.{right},0"),
-            format!("output.{output}.hdr.disable"),
-            format!("output.{output}.wcg.disable"),
-            format!(
-                "output.{output}.priority.{}",
-                layout.map_or(1, Layout::next_priority)
-            ),
-        ]);
+        arguments.extend(owned_output_arguments(
+            output,
+            &selected,
+            right,
+            layout.map_or(1, Layout::next_priority) as usize,
+        ));
         run(&arguments)?;
         let confirmed = query()?;
         if layout.is_some_and(|layout| !layout.matches(&confirmed)) {
@@ -94,19 +103,89 @@ impl Compositor for KScreen {
         }
         let actual = find_output(&confirmed, output)
             .ok_or("owned display disappeared after configuration")?;
-        if actual["enabled"] != true
-            || actual["scale"].as_f64() != Some(1.0)
-            || actual["pos"]["x"].as_i64() != Some(right)
-            || actual["pos"]["y"].as_i64() != Some(0)
-            || actual["currentModeId"].as_str() != Some(&selected)
-            || actual["rotation"] != 1
-            || actual["hdr"] != false
-            || actual["wcg"] != false
-        {
+        if !owned_output_matches(actual, &selected, right) {
             return Err("owned display configuration readback differs".into());
         }
         Ok(())
     }
+}
+/// Turns off every other enabled display except `keep`, makes the owned output
+/// the primary display at the origin (or right of the kept outputs), and
+/// confirms the result. The caller journaled the prior layout for restore.
+fn configure_exclusive(
+    configuration: &Value,
+    output: &str,
+    selected: &str,
+    keep: &[String],
+) -> Result<(), String> {
+    let right = right_edge_of(configuration, |name| keep.iter().any(|kept| kept == name))?;
+    // Kept peer outputs retain their order; this stream's output follows them.
+    let priority = keep.len() + 1;
+    let mut arguments = exclusive_disable_arguments(configuration, output, keep)?;
+    arguments.extend(owned_output_arguments(output, selected, right, priority));
+    run(&arguments)?;
+    let confirmed = query()?;
+    let actual =
+        find_output(&confirmed, output).ok_or("owned display disappeared after configuration")?;
+    if !owned_output_matches(actual, selected, right)
+        || !exclusive_disable_arguments(&confirmed, output, keep)?.is_empty()
+    {
+        return Err("exclusive owned display configuration readback differs".into());
+    }
+    Ok(())
+}
+/// `disable` for every connected, enabled display that is neither the owned
+/// output nor kept. Empty once the desktop is exclusive.
+fn exclusive_disable_arguments(
+    configuration: &Value,
+    owned: &str,
+    keep: &[String],
+) -> Result<Vec<String>, String> {
+    let outputs = configuration["outputs"]
+        .as_array()
+        .filter(|outputs| outputs.len() <= 64)
+        .ok_or("invalid KScreen output list")?;
+    let mut arguments = Vec::new();
+    for other in outputs {
+        let name = other["name"].as_str().ok_or("missing output name")?;
+        let kept = name == owned || keep.iter().any(|kept| kept == name);
+        if !kept && other["connected"] == true && other["enabled"] == true {
+            if !valid_output_name(name) {
+                return Err("unsupported KScreen output name".into());
+            }
+            arguments.push(format!("output.{name}.disable"));
+        }
+    }
+    Ok(arguments)
+}
+fn valid_output_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+fn owned_output_arguments(output: &str, selected: &str, x: i64, priority: usize) -> Vec<String> {
+    vec![
+        format!("output.{output}.enable"),
+        format!("output.{output}.mode.{selected}"),
+        format!("output.{output}.scale.1"),
+        format!("output.{output}.rotation.none"),
+        format!("output.{output}.position.{x},0"),
+        format!("output.{output}.hdr.disable"),
+        format!("output.{output}.wcg.disable"),
+        format!("output.{output}.priority.{priority}"),
+    ]
+}
+fn owned_output_matches(actual: &Value, selected: &str, x: i64) -> bool {
+    actual["enabled"] == true
+        && actual["scale"].as_f64() == Some(1.0)
+        && actual["pos"]["x"].as_i64() == Some(x)
+        && actual["pos"]["y"].as_i64() == Some(0)
+        && actual["currentModeId"].as_str() == Some(selected)
+        && actual["rotation"] == 1
+        && actual["hdr"] == false
+        && actual["wcg"] == false
 }
 fn query() -> Result<Value, String> {
     serde_json::from_slice(&run(&["-j".into()])?).map_err(|_| "invalid KScreen JSON".into())
@@ -133,13 +212,20 @@ fn mode(configuration: &Value, output: &str, spec: &Specification) -> Option<Str
         .map(str::to_owned)
 }
 fn right_edge(configuration: &Value, owned: &str) -> Result<i64, String> {
+    right_edge_of(configuration, |name| name != owned)
+}
+/// Right edge, in logical pixels, of the connected and enabled outputs that
+/// `included` selects; zero when it selects none.
+fn right_edge_of(configuration: &Value, included: impl Fn(&str) -> bool) -> Result<i64, String> {
     let outputs = configuration["outputs"]
         .as_array()
         .filter(|outputs| outputs.len() <= 64)
         .ok_or("invalid KScreen output list")?;
     let mut right = 0i64;
     for output in outputs.iter().filter(|output| {
-        output["name"] != owned && output["connected"] == true && output["enabled"] == true
+        output["name"].as_str().is_some_and(&included)
+            && output["connected"] == true
+            && output["enabled"] == true
     }) {
         let x = output["pos"]["x"]
             .as_i64()
@@ -217,5 +303,45 @@ mod tests {
             {"name":"Virtual-2","connected":true,"enabled":true,"pos":{"x":0},"size":{"width":1920,"height":1080},"scale":1,"rotation":1}]});
         assert_eq!(right_edge(&configuration, "Virtual-2").unwrap(), 1536);
         assert_eq!(configuration["outputs"][0]["pos"]["x"], 0);
+    }
+    #[test]
+    fn exclusive_turns_off_only_other_enabled_displays_amaterasu_does_not_own() {
+        let configuration = json!({"outputs":[
+            {"name":"HDMI-A-1","connected":true,"enabled":true},
+            {"name":"DP-1","connected":true,"enabled":false},
+            {"name":"DP-2","connected":false,"enabled":true},
+            {"name":"Virtual-2","connected":true,"enabled":true},
+            {"name":"Virtual-3","connected":true,"enabled":true}]});
+        assert_eq!(
+            exclusive_disable_arguments(&configuration, "Virtual-3", &["Virtual-2".into()])
+                .unwrap(),
+            ["output.HDMI-A-1.disable"]
+        );
+        assert_eq!(
+            exclusive_disable_arguments(&configuration, "Virtual-3", &[]).unwrap(),
+            ["output.HDMI-A-1.disable", "output.Virtual-2.disable"]
+        );
+        let exclusive = json!({"outputs":[
+            {"name":"HDMI-A-1","connected":true,"enabled":false},
+            {"name":"Virtual-3","connected":true,"enabled":true}]});
+        assert!(
+            exclusive_disable_arguments(&exclusive, "Virtual-3", &[])
+                .unwrap()
+                .is_empty()
+        );
+        let hostile = json!({"outputs":[{"name":"HDMI.mode.1","connected":true,"enabled":true}]});
+        assert!(exclusive_disable_arguments(&hostile, "Virtual-3", &[]).is_err());
+    }
+    #[test]
+    fn exclusive_output_sits_right_of_kept_peers_only() {
+        let configuration = json!({"outputs":[
+            {"name":"HDMI-A-1","connected":true,"enabled":true,"pos":{"x":0},"size":{"width":1920,"height":1080},"scale":1,"rotation":1},
+            {"name":"Virtual-2","connected":true,"enabled":true,"pos":{"x":1920},"size":{"width":2560,"height":1440},"scale":1,"rotation":1}]});
+        let kept = |name: &str| name == "Virtual-2";
+        assert_eq!(right_edge_of(&configuration, kept).unwrap(), 4480);
+        assert_eq!(right_edge_of(&configuration, |_| false).unwrap(), 0);
+        let arguments = owned_output_arguments("Virtual-3", "7", 0, 1);
+        assert!(arguments.contains(&"output.Virtual-3.position.0,0".into()));
+        assert!(arguments.contains(&"output.Virtual-3.priority.1".into()));
     }
 }
