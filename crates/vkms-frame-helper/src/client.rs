@@ -4,7 +4,7 @@
 //! leaves the request stream out of step, so the client then refuses further
 //! use; the owner replaces the helper process.
 use crate::{
-    channel::SeqpacketChannel,
+    channel::{ChannelShutdown, SeqpacketChannel},
     protocol::{
         self, Failure, FrameDescriptor, HELPER_ADMIN_PERMITTED, MAX_PLANES, RESPONSE_LEN, Reply,
         Request, RequestRecord,
@@ -91,6 +91,14 @@ impl HelperClient {
 
     pub fn is_usable(&self) -> bool {
         self.usable
+    }
+
+    /// A handle another thread can use to wake a request blocked on this
+    /// client, such as a WAIT. The interrupted request fails as `Closed`,
+    /// the client is unusable afterward, and the helper sees end of stream
+    /// and exits once its current driver call returns.
+    pub fn shutdown_handle(&self) -> io::Result<ChannelShutdown> {
+        self.channel.shutdown_handle()
     }
 
     pub fn hello(&mut self) -> Result<HelperHello, ClientError> {

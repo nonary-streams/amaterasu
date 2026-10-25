@@ -79,6 +79,14 @@ impl SeqpacketChannel {
         self.socket
     }
 
+    /// A second reference to this socket that another thread can use to end
+    /// the conversation while this endpoint is blocked in a receive.
+    pub fn shutdown_handle(&self) -> io::Result<ChannelShutdown> {
+        Ok(ChannelShutdown {
+            socket: self.socket.try_clone()?,
+        })
+    }
+
     /// Effective user id of the connected peer.
     pub fn peer_uid(&self) -> io::Result<u32> {
         // SAFETY: ucred is plain data; zero is a valid initial value.
@@ -223,6 +231,27 @@ impl SeqpacketChannel {
             truncated: message.msg_flags & libc::MSG_TRUNC != 0,
             descriptors_truncated: message.msg_flags & libc::MSG_CTRUNC != 0,
         })
+    }
+}
+
+/// Ends a channel's conversation from any thread. It holds its own
+/// close-on-exec duplicate of the socket, so it stays valid however long it
+/// outlives the channel, and a closed channel number can never be reused
+/// under it.
+#[derive(Debug)]
+pub struct ChannelShutdown {
+    socket: OwnedFd,
+}
+
+impl ChannelShutdown {
+    /// Shuts the socket down in both directions. A receive blocked on the
+    /// channel and every later one report end of stream at once, later sends
+    /// fail, and the peer sees end of stream. Repeating it has no effect.
+    pub fn shutdown(&self) {
+        // SAFETY: shutdown(2) only changes the state of this owned, open
+        // socket; it touches no memory. An ENOTCONN after an earlier
+        // shutdown is harmless and ignored.
+        unsafe { libc::shutdown(self.socket.as_raw_fd(), libc::SHUT_RDWR) };
     }
 }
 

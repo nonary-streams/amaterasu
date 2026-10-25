@@ -276,3 +276,21 @@ fn waits_return_the_newest_presentation() {
     );
     thread.join().unwrap();
 }
+
+#[test]
+fn a_shutdown_handle_interrupts_a_pending_wait() {
+    let (client, _helper) = SeqpacketChannel::pair().unwrap();
+    let mut client = HelperClient::new(client);
+    let handle = client.shutdown_handle().unwrap();
+    let waiter = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let result = client.wait(41, 0, 1000);
+        (result, started.elapsed(), client)
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    handle.shutdown();
+    let (result, waited, client) = waiter.join().unwrap();
+    assert!(matches!(result, Err(ClientError::Closed)));
+    assert!(waited < Duration::from_millis(500));
+    assert!(!client.is_usable());
+}
