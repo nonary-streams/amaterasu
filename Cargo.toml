@@ -41,6 +41,7 @@ members = [
     "modules/capture-pipewire",
     "modules/capture-kms",
     "modules/capture-wgc",
+    "modules/capture-vkms",
     "modules/audio",
     "modules/audio-encode",
     "modules/media-transport",

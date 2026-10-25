@@ -1,0 +1,26 @@
+[package]
+name = "amaterasu-capture-vkms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+amaterasu-module-sdk.workspace = true
+amaterasu-media.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+getrandom.workspace = true
+# Shared wire protocol and descriptor channel; the privileged code is only in
+# the helper binary, not in this library.
+amaterasu-vkms-frame-helper = { path = "../../crates/vkms-frame-helper" }
+
+# libc is already in the workspace lock; it provides the DRM mode-object
+# ioctls, fstat and the spawn-time descriptor setup.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

@@ -139,6 +139,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-capture-vkms"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-media",
+ "amaterasu-module-sdk",
+ "amaterasu-vkms-frame-helper",
+ "getrandom 0.3.4",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-capture-wgc"
 version = "0.1.0"
 dependencies = [
