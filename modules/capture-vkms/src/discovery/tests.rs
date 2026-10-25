@@ -80,9 +80,7 @@ fn an_active_output_resolves_to_its_card_and_crtc() {
     );
     assert_eq!(binding.connector_id, 110);
     assert_eq!(binding.crtc_id, 42);
-    let geometry = binding.geometry().unwrap();
-    assert_eq!(geometry.output, DesktopRect::new(0, 0, 1920, 1080).unwrap());
-    assert_eq!(geometry.virtual_desktop, geometry.output);
+    assert_eq!(binding.mode.width, 1920);
 }
 
 #[test]
@@ -202,16 +200,44 @@ fn enumeration_metadata_reports_attachment_and_geometry() {
         vec![("card3", Ok(vec![detached, active(9, 41)]))],
     );
     let discovery = discover(&probe).unwrap();
+    let layout = [
+        LayoutOutput {
+            name: "eDP-1".into(),
+            logical_left: 0,
+            logical_top: 0,
+            logical_width: 1210,
+            logical_height: 756,
+            pixel_mode: Some((3024, 1890)),
+        },
+        LayoutOutput {
+            name: "Virtual-9".into(),
+            logical_left: 1210,
+            logical_top: 0,
+            logical_width: 1920,
+            logical_height: 1080,
+            pixel_mode: Some((1920, 1080)),
+        },
+    ];
+    let without_layout = discovery.outputs[0]
+        .0
+        .metadata(discovery.outputs[0].1, None);
+    assert_eq!(without_layout["geometry_supported"], false);
+    assert!(without_layout.get("desktop_geometry").is_none());
     let entries: Vec<_> = discovery
         .outputs
         .iter()
-        .map(|(output, device)| output.metadata(*device))
+        .map(|(output, device)| output.metadata(*device, Some(&layout)))
         .collect();
     assert_eq!(entries[0]["id"], "kwin:Virtual-9");
     assert_eq!(entries[0]["device_name"], "Virtual-9");
     assert_eq!(entries[0]["attached"], true);
     assert_eq!(entries[0]["width"], 1920);
-    assert_eq!(entries[0]["desktop_geometry"]["output"]["width"], 1920);
+    assert_eq!(entries[0]["geometry_supported"], true);
+    assert_eq!(entries[0]["desktop_geometry"]["output"]["left"], 1210);
+    assert_eq!(
+        entries[0]["desktop_geometry"]["virtual_desktop"]["width"],
+        3130
+    );
     assert_eq!(entries[1]["id"], "kwin:Virtual-10");
     assert_eq!(entries[1]["attached"], false);
     assert!(entries[1].get("desktop_geometry").is_none());

@@ -156,9 +156,14 @@ fn geometry_reports_the_owned_output() {
     let geometry = unsafe { geometry.assume_init() };
     assert!(geometry.validate().is_ok());
     assert_eq!(
-        (geometry.output.width, geometry.output.height),
-        (1920, 1080)
+        (
+            geometry.output.left,
+            geometry.output.width,
+            geometry.output.height
+        ),
+        (1210, 1920, 1080)
     );
+    assert_eq!(geometry.virtual_desktop.left, 0);
 
     let other = TestBinding::bind(&factory, b"other.module", 1).unwrap();
     let api = other.api();
@@ -166,6 +171,44 @@ fn geometry_reports_the_owned_output() {
     // SAFETY: as above.
     let status = unsafe { (api.geometry)(api.base.context, id, slot.as_mut_ptr()) };
     assert_eq!(status, MEDIA_CLOSED);
+}
+
+#[test]
+fn geometry_is_busy_while_not_ready_and_unsupported_without_wayland() {
+    for (layout, expected) in [
+        (Some(crate::test_support::appended_layout(1920)), MEDIA_BUSY),
+        (None, MEDIA_UNSUPPORTED),
+    ] {
+        let backend = FakeBackend::new();
+        let handles = backend.handles();
+        if layout.is_none() {
+            *handles.layout.lock().unwrap() = None;
+        }
+        let mut controller = Controller::new(backend, settings());
+        let id = controller
+            .handle(
+                "amaterasu.video",
+                Operation::Open {
+                    output: "kwin:Virtual-9".into(),
+                    operation_id: Some("video".into()),
+                    constant_rate: None,
+                },
+                0,
+            )
+            .unwrap()
+            .created
+            .unwrap();
+        // A scanout mode change the compositor has not announced yet.
+        *handles.connectors.lock().unwrap() = Ok(vec![crate::test_support::connector(9, 41, 2560)]);
+        controller.refresh(crate::controller::RESOLVE_INTERVAL_MS);
+        let factory = Factory::new(Arc::new(Mutex::new(controller)));
+        let binding = TestBinding::bind(&factory, b"amaterasu.video", 1).unwrap();
+        let api = binding.api();
+        let mut slot = std::mem::MaybeUninit::<CaptureGeometry>::uninit();
+        // SAFETY: the binding is live and `slot` is a writable aligned slot.
+        let status = unsafe { (api.geometry)(api.base.context, id, slot.as_mut_ptr()) };
+        assert_eq!(status, expected);
+    }
 }
 
 #[test]

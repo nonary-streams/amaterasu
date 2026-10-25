@@ -3,6 +3,7 @@ use crate::{
     backend::Backend,
     discovery::OutputBinding,
     frames::{StreamFault, StreamFrames},
+    geometry::{self, LayoutOutput},
     model::{
         CaptureError, CaptureResult, MAX_ENUMERATION_LIMIT, MAX_LIFETIME_STREAMS, MAX_STREAMS,
         Operation, Settings, new_id, validate_operation_id,
@@ -16,11 +17,40 @@ use std::{collections::BTreeMap, sync::Arc};
 /// How often an open stream re-resolves its connector's CRTC and mode.
 pub const RESOLVE_INTERVAL_MS: u64 = 1_000;
 
+/// Desktop geometry of one stream, decided at open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamGeometry {
+    /// No Wayland display was reachable at open; never reported.
+    Unsupported,
+    Ready(CaptureGeometry),
+    /// The layout is momentarily unknown or disagrees with the scanout mode.
+    NotReady,
+}
+
+impl StreamGeometry {
+    fn supported(self) -> bool {
+        self != Self::Unsupported
+    }
+
+    /// Recomputes a supported geometry from the latest layout.
+    fn updated(self, layout: Option<&[LayoutOutput]>, binding: &OutputBinding) -> Self {
+        if self == Self::Unsupported {
+            return self;
+        }
+        layout
+            .and_then(|outputs| {
+                geometry::output_geometry(outputs, &binding.output.connector_name(), binding.mode)
+                    .ok()
+            })
+            .map_or(Self::NotReady, Self::Ready)
+    }
+}
+
 struct Stream {
     owner: String,
     operation: String,
     binding: OutputBinding,
-    geometry: CaptureGeometry,
+    geometry: StreamGeometry,
     frames: Arc<StreamFrames>,
     next_resolve_ms: u64,
 }
@@ -44,7 +74,7 @@ impl Reply {
 /// a sink runs.
 pub struct Reader {
     pub frames: Arc<StreamFrames>,
-    pub geometry: CaptureGeometry,
+    pub geometry: StreamGeometry,
 }
 
 #[derive(Clone, Debug)]
@@ -161,7 +191,7 @@ impl<B: Backend> Controller<B> {
         }
         let helper = self.helper_path()?.to_owned();
         let binding = self.backend.resolve(name)?;
-        let geometry = binding.geometry()?;
+        let geometry = self.open_geometry(&binding)?;
         let id = new_id()?;
         if self.streams.contains_key(&id) || self.closed.contains_key(&id) {
             return Err(CaptureError::code("entropy_error"));
@@ -187,6 +217,22 @@ impl<B: Backend> Controller<B> {
             payload,
             created: Some(id),
         })
+    }
+
+    /// Geometry at open: unsupported without a Wayland display, otherwise
+    /// it must be consistent now so the open reply never reports a wrong one.
+    fn open_geometry(&self, binding: &OutputBinding) -> CaptureResult<StreamGeometry> {
+        let Some(layout) = self.backend.desktop_layout() else {
+            return Ok(StreamGeometry::Unsupported);
+        };
+        geometry::output_geometry(&layout, &binding.output.connector_name(), binding.mode)
+            .map(StreamGeometry::Ready)
+            .map_err(|problem| {
+                CaptureError::new(
+                    "output_geometry_unavailable",
+                    format!("{}: {}", binding.output, problem.describe()),
+                )
+            })
     }
 
     fn find_operation(&self, caller: &str, operation: &str) -> Option<(u64, &Stream)> {
@@ -241,22 +287,29 @@ impl<B: Backend> Controller<B> {
     /// Re-resolves each stream's output on its interval, or at once after a
     /// read reported that its CRTC disappeared.
     pub fn refresh(&mut self, now: u64) {
+        let layout_changed = self.backend.poll_layout();
         let due: Vec<u64> = self
             .streams
             .iter()
             .filter(|(_, stream)| {
                 stream.frames.fault().is_none()
-                    && (stream.frames.take_resolve_request() || now >= stream.next_resolve_ms)
+                    && (stream.frames.take_resolve_request()
+                        || layout_changed
+                        || now >= stream.next_resolve_ms)
             })
             .map(|(id, _)| *id)
             .collect();
+        if due.is_empty() {
+            return;
+        }
+        let layout = self.backend.desktop_layout();
         for id in due {
             let output = self.streams[&id].binding.output;
             let resolved = self.backend.resolve(output);
             let stream = self.streams.get_mut(&id).expect("due stream exists");
             stream.next_resolve_ms = now + RESOLVE_INTERVAL_MS;
             match resolved {
-                Ok(binding) => apply_binding(stream, binding),
+                Ok(binding) => apply_binding(stream, binding, layout.as_deref()),
                 Err(error) if error.code == "driver_unavailable" => {}
                 Err(error) => stream.frames.set_fault(StreamFault::OutputLost(error.code)),
             }
@@ -276,13 +329,14 @@ impl<B: Backend> Controller<B> {
             return Err(CaptureError::code("capture_permission_denied"));
         }
         let limit = limit.unwrap_or(MAX_ENUMERATION_LIMIT);
+        let layout = self.backend.desktop_layout();
         let (outputs, driver) = match self.backend.discover() {
             Ok(discovery) => (
                 discovery
                     .outputs
                     .iter()
                     .take(limit)
-                    .map(|(output, device)| output.metadata(*device))
+                    .map(|(output, device)| output.metadata(*device, layout.as_deref()))
                     .collect(),
                 Ok(()),
             ),
@@ -304,7 +358,7 @@ impl<B: Backend> Controller<B> {
                 "frame_helper": check_json(&helper),
                 "driver": check_json(&driver),
             },
-            "geometry_supported": true,
+            "geometry_supported": layout.is_some(),
             "frame_transport": "dmabuf",
         });
         self.last_availability = Some(availability);
@@ -330,7 +384,6 @@ impl<B: Backend> Controller<B> {
             "frame_helper_configured": self.settings.frame_helper.is_some(),
             "availability": self.last_availability.as_ref().map(Availability::json),
             "streams": streams,
-            "geometry_supported": true,
             "opened": self.opened,
             "closed": self.closed.len(),
             "active": self.streams.len(),
@@ -348,7 +401,7 @@ impl<B: Backend> Controller<B> {
 
 /// Follows a CRTC or mode change of the same connector. Moving to another
 /// card or connector object is a different output and ends delivery.
-fn apply_binding(stream: &mut Stream, binding: OutputBinding) {
+fn apply_binding(stream: &mut Stream, binding: OutputBinding, layout: Option<&[LayoutOutput]>) {
     if binding.device != stream.binding.device
         || binding.connector_id != stream.binding.connector_id
     {
@@ -357,13 +410,7 @@ fn apply_binding(stream: &mut Stream, binding: OutputBinding) {
             .set_fault(StreamFault::OutputLost("output_replaced"));
         return;
     }
-    match binding.geometry() {
-        Ok(geometry) => stream.geometry = geometry,
-        Err(error) => {
-            stream.frames.set_fault(StreamFault::OutputLost(error.code));
-            return;
-        }
-    }
+    stream.geometry = stream.geometry.updated(layout, &binding);
     stream.frames.retarget(binding.crtc_id);
     stream.binding = binding;
 }
@@ -376,7 +423,7 @@ fn check_json(result: &CaptureResult<()>) -> Value {
 }
 
 fn stream_reply(id: u64, stream: &Stream) -> Value {
-    json!({
+    let mut reply = json!({
         "ok": true,
         "stream": id,
         "output": stream.binding.output.to_string(),
@@ -388,9 +435,12 @@ fn stream_reply(id: u64, stream: &Stream) -> Value {
         "height": stream.binding.mode.height,
         "refresh_hz": stream.binding.mode.refresh_hz,
         "frame_transport": "dmabuf",
-        "geometry_supported": true,
-        "desktop_geometry": stream.geometry,
-    })
+        "geometry_supported": stream.geometry.supported(),
+    });
+    if let StreamGeometry::Ready(geometry) = stream.geometry {
+        reply["desktop_geometry"] = json!(geometry);
+    }
+    reply
 }
 
 #[cfg(test)]

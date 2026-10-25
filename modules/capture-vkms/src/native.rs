@@ -1,6 +1,9 @@
 //! Native `amaterasu.capture-vkms/1` capture table, v1.4. Only DMA-BUF
 //! delivery is offered; the CPU frame callbacks report MEDIA_UNSUPPORTED.
-use crate::{backend::Backend, controller::Controller};
+use crate::{
+    backend::Backend,
+    controller::{Controller, StreamGeometry},
+};
 use amaterasu_media::{
     CAPTURE_API_V1_4_SIZE, CAPTURE_DMABUF_INTERFACE_MINOR, CaptureApiV1_4, CaptureGeometry,
     DmaBufFrameSink, FrameSink, FreshFrameSinkV1_2, FreshFrameSinkV1_3, INTERFACE_MAJOR,
@@ -178,12 +181,16 @@ unsafe extern "C" fn geometry<B: Backend>(
         // SAFETY: binding context is retained by the broker through this call.
         let binding = unsafe { &*context.cast::<Binding<B>>() };
         match binding.reader(stream) {
-            Ok(reader) => {
-                // SAFETY: the validated aligned output slot is writable for
-                // this synchronous native call and geometry is an owned copy.
-                unsafe { output.write(reader.geometry) };
-                STATUS_OK
-            }
+            Ok(reader) => match reader.geometry {
+                StreamGeometry::Ready(geometry) => {
+                    // SAFETY: the validated aligned output slot is writable for
+                    // this synchronous native call and geometry is an owned copy.
+                    unsafe { output.write(geometry) };
+                    STATUS_OK
+                }
+                StreamGeometry::NotReady => MEDIA_BUSY,
+                StreamGeometry::Unsupported => MEDIA_UNSUPPORTED,
+            },
             Err(status) => status,
         }
     })

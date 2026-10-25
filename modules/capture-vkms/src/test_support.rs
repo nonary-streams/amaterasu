@@ -6,6 +6,7 @@ use crate::{
         OutputBinding,
     },
     frames::FrameSource,
+    geometry::LayoutOutput,
     model::{CaptureError, CaptureResult, Settings},
     output_name::OutputName,
 };
@@ -158,6 +159,39 @@ pub struct FakeBackend {
     pub helper: Arc<Mutex<CaptureResult<()>>>,
     pub script: Arc<SourceScript>,
     pub connects: Arc<Mutex<Vec<(String, u32)>>>,
+    /// `None` models a host without a reachable Wayland display.
+    pub layout: Arc<Mutex<Option<Vec<LayoutOutput>>>>,
+    pub layout_changed: Arc<Mutex<bool>>,
+}
+
+/// A scaled primary with the owned outputs appended to its right.
+pub fn appended_layout(virtual_9_width: u32) -> Vec<LayoutOutput> {
+    let output =
+        |name: &str, left: i32, width: i32, height: i32, pixels: (u32, u32)| LayoutOutput {
+            name: name.into(),
+            logical_left: left,
+            logical_top: 0,
+            logical_width: width,
+            logical_height: height,
+            pixel_mode: Some(pixels),
+        };
+    vec![
+        output("eDP-1", 0, 1210, 756, (3024, 1890)),
+        output(
+            "Virtual-9",
+            1210,
+            virtual_9_width as i32,
+            1080,
+            (virtual_9_width, 1080),
+        ),
+        output(
+            "Virtual-10",
+            1210 + virtual_9_width as i32,
+            1920,
+            1080,
+            (1920, 1080),
+        ),
+    ]
 }
 
 impl FakeBackend {
@@ -170,6 +204,8 @@ impl FakeBackend {
             helper: Arc::new(Mutex::new(Ok(()))),
             script: Arc::new(SourceScript::default()),
             connects: Arc::new(Mutex::new(Vec::new())),
+            layout: Arc::new(Mutex::new(Some(appended_layout(1920)))),
+            layout_changed: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -179,6 +215,8 @@ impl FakeBackend {
             helper: self.helper.clone(),
             script: self.script.clone(),
             connects: self.connects.clone(),
+            layout: self.layout.clone(),
+            layout_changed: self.layout_changed.clone(),
         }
     }
 }
@@ -227,6 +265,14 @@ impl Backend for FakeBackend {
 
     fn monotonic_now_ns(&self) -> u64 {
         1_000_000
+    }
+
+    fn poll_layout(&self) -> bool {
+        std::mem::take(&mut *self.layout_changed.lock().unwrap())
+    }
+
+    fn desktop_layout(&self) -> Option<Vec<LayoutOutput>> {
+        self.layout.lock().unwrap().clone()
     }
 }
 

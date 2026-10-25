@@ -1,5 +1,6 @@
 use super::*;
-use crate::test_support::{FakeBackend, HELPER, Scripted, connector, settings};
+use crate::test_support::{FakeBackend, HELPER, Scripted, appended_layout, connector, settings};
+use amaterasu_media::DesktopRect;
 
 const VIDEO: &str = "amaterasu.video";
 
@@ -26,7 +27,7 @@ fn opened(controller: &mut Controller<FakeBackend>) -> u64 {
 }
 
 #[test]
-fn open_resolves_the_crtc_and_reports_whole_desktop_geometry() {
+fn open_resolves_the_crtc_and_reports_compositor_geometry() {
     let (mut controller, backend) = controller();
     let reply = controller
         .handle(VIDEO, open("kwin:Virtual-9", "video-1"), 0)
@@ -38,12 +39,17 @@ fn open_resolves_the_crtc_and_reports_whole_desktop_geometry() {
     assert_eq!(payload["output"], "kwin:Virtual-9");
     assert_eq!(payload["crtc_id"], 41);
     assert_eq!(payload["geometry_supported"], true);
-    let geometry: CaptureGeometry = serde_json::from_value::<amaterasu_media::DesktopRect>(
-        payload["desktop_geometry"]["output"].clone(),
-    )
-    .map(|output| CaptureGeometry::new(output, output).unwrap())
-    .unwrap();
-    assert_eq!(controller.reader(VIDEO, id).unwrap().geometry, geometry);
+    let output: DesktopRect =
+        serde_json::from_value(payload["desktop_geometry"]["output"].clone()).unwrap();
+    let desktop: DesktopRect =
+        serde_json::from_value(payload["desktop_geometry"]["virtual_desktop"].clone()).unwrap();
+    // Appended right of a 3024x1890 primary at scale 2.5 (1210x756 logical).
+    assert_eq!(output, DesktopRect::new(1210, 0, 1920, 1080).unwrap());
+    assert_eq!(desktop, DesktopRect::new(0, 0, 5050, 1080).unwrap());
+    assert_eq!(
+        controller.reader(VIDEO, id).unwrap().geometry,
+        StreamGeometry::Ready(CaptureGeometry::new(output, desktop).unwrap())
+    );
     assert_eq!(
         *backend.connects.lock().unwrap(),
         vec![(HELPER.to_owned(), 41)]
@@ -266,11 +272,91 @@ fn refresh_follows_a_crtc_change_and_a_mode_change() {
     *backend.connectors.lock().unwrap() = Ok(vec![connector(9, 55, 2560)]);
     controller.refresh(RESOLVE_INTERVAL_MS - 1);
     assert_eq!(controller.reader(VIDEO, id).unwrap().frames.crtc_id(), 41);
+
+    // The scanout changed but the compositor has not announced it yet.
     controller.refresh(RESOLVE_INTERVAL_MS);
     let reader = controller.reader(VIDEO, id).unwrap();
     assert_eq!(reader.frames.crtc_id(), 55);
-    assert_eq!(reader.geometry.output.width, 2560);
+    assert_eq!(reader.geometry, StreamGeometry::NotReady);
     assert_eq!(reader.frames.fault(), None);
+    let status = controller
+        .handle(VIDEO, Operation::Status, 0)
+        .unwrap()
+        .payload;
+    assert!(status["streams"][0].get("desktop_geometry").is_none());
+
+    // The compositor's done event triggers an immediate refresh.
+    *backend.layout.lock().unwrap() = Some(appended_layout(2560));
+    *backend.layout_changed.lock().unwrap() = true;
+    controller.refresh(RESOLVE_INTERVAL_MS + 1);
+    let StreamGeometry::Ready(geometry) = controller.reader(VIDEO, id).unwrap().geometry else {
+        panic!("geometry should be ready again");
+    };
+    assert_eq!(
+        geometry.output,
+        DesktopRect::new(1210, 0, 2560, 1080).unwrap()
+    );
+    assert_eq!(geometry.virtual_desktop.width, 1210 + 2560 + 1920);
+}
+
+#[test]
+fn without_a_wayland_display_geometry_is_unsupported() {
+    let (mut controller, backend) = controller();
+    *backend.layout.lock().unwrap() = None;
+    let reply = controller
+        .handle(VIDEO, open("kwin:Virtual-9", "video-1"), 0)
+        .unwrap();
+    assert_eq!(reply.payload["geometry_supported"], false);
+    assert!(reply.payload.get("desktop_geometry").is_none());
+    let id = reply.created.unwrap();
+    assert_eq!(
+        controller.reader(VIDEO, id).unwrap().geometry,
+        StreamGeometry::Unsupported
+    );
+    // A display that appears later does not change what open reported.
+    *backend.layout.lock().unwrap() = Some(appended_layout(1920));
+    controller.refresh(RESOLVE_INTERVAL_MS);
+    assert_eq!(
+        controller.reader(VIDEO, id).unwrap().geometry,
+        StreamGeometry::Unsupported
+    );
+    let enumeration = controller
+        .handle(
+            VIDEO,
+            Operation::Enumerate {
+                offset: None,
+                limit: None,
+            },
+            0,
+        )
+        .unwrap()
+        .payload;
+    assert_eq!(enumeration["geometry_supported"], true);
+}
+
+#[test]
+fn an_inconsistent_layout_refuses_open_instead_of_guessing() {
+    let (mut controller, backend) = controller();
+    *backend.layout.lock().unwrap() = Some(appended_layout(2560));
+    let error = controller
+        .handle(VIDEO, open("kwin:Virtual-9", "video-1"), 0)
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "output_geometry_unavailable");
+    assert!(error.message.contains("mode differs"));
+
+    let mut missing = appended_layout(1920);
+    missing.retain(|output| output.name != "Virtual-9");
+    *backend.layout.lock().unwrap() = Some(missing);
+    assert_eq!(
+        controller
+            .handle(VIDEO, open("kwin:Virtual-9", "video-1"), 0)
+            .err()
+            .unwrap()
+            .code,
+        "output_geometry_unavailable"
+    );
+    assert!(backend.connects.lock().unwrap().is_empty());
 }
 
 #[test]

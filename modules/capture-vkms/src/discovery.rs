@@ -5,11 +5,11 @@
 pub mod kms;
 pub mod sysfs;
 
+use crate::geometry::{self, LayoutOutput};
 use crate::{
     model::{CaptureError, CaptureResult},
     output_name::OutputName,
 };
-use amaterasu_media::{CaptureGeometry, DesktopRect};
 use amaterasu_vkms_frame_helper::drm_node::DeviceNumber;
 use serde_json::{Value, json};
 
@@ -90,19 +90,6 @@ pub struct OutputBinding {
     pub mode: DisplayMode,
 }
 
-impl OutputBinding {
-    /// No unprivileged source of the compositor's desktop layout is
-    /// available here, so the output is reported as the whole desktop at
-    /// origin 0,0 in mode pixels. Input mapping therefore assumes this output
-    /// is the entire virtual desktop at scale 1.
-    pub fn geometry(&self) -> CaptureResult<CaptureGeometry> {
-        let rectangle = DesktopRect::new(0, 0, self.mode.width, self.mode.height)
-            .map_err(|_| CaptureError::code("invalid_output_mode"))?;
-        CaptureGeometry::new(rectangle, rectangle)
-            .map_err(|_| CaptureError::code("invalid_output_mode"))
-    }
-}
-
 /// One virtual output found during enumeration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredOutput {
@@ -139,8 +126,13 @@ impl DiscoveredOutput {
         })
     }
 
-    pub fn metadata(&self, device: DeviceNumber) -> Value {
+    /// Enumeration entry. Desktop geometry is included only when the
+    /// compositor layout is known and agrees with the scanout mode.
+    pub fn metadata(&self, device: DeviceNumber, layout: Option<&[LayoutOutput]>) -> Value {
         let binding = self.binding(device).ok();
+        let desktop_geometry = binding.as_ref().and_then(|binding| {
+            geometry::output_geometry(layout?, &self.output.connector_name(), binding.mode).ok()
+        });
         let mut entry = json!({
             "id": self.output.to_string(),
             "device_name": self.output.connector_name(),
@@ -150,15 +142,15 @@ impl DiscoveredOutput {
             "connection": self.connector.connection.name(),
             "crtc_id": self.connector.crtc.map(|crtc| crtc.crtc_id),
             "format": "dmabuf",
-            "geometry_supported": binding.is_some(),
+            "geometry_supported": desktop_geometry.is_some(),
         });
         if let Some(binding) = binding {
             entry["width"] = json!(binding.mode.width);
             entry["height"] = json!(binding.mode.height);
             entry["refresh_hz"] = json!(binding.mode.refresh_hz);
-            if let Ok(geometry) = binding.geometry() {
-                entry["desktop_geometry"] = json!(geometry);
-            }
+        }
+        if let Some(geometry) = desktop_geometry {
+            entry["desktop_geometry"] = json!(geometry);
         }
         entry
     }

@@ -145,6 +145,7 @@ dependencies = [
  "amaterasu-media",
  "amaterasu-module-sdk",
  "amaterasu-vkms-frame-helper",
+ "cc",
  "getrandom 0.3.4",
  "libc",
  "serde",

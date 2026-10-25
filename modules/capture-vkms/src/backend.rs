@@ -3,6 +3,7 @@
 use crate::{
     discovery::{self, Discovery, DisplayProbe, OutputBinding, kms::KmsProbe},
     frames::FrameSource,
+    geometry::{DesktopLayout, LayoutOutput, WaylandLayout},
     model::{CaptureError, CaptureResult},
     output_name::OutputName,
 };
@@ -11,7 +12,7 @@ use amaterasu_vkms_frame_helper::{
     process::{self, HelperProcess},
     protocol::Failure,
 };
-use std::path::Path;
+use std::{path::Path, sync::Mutex};
 
 pub trait Backend: Send {
     fn discover(&self) -> CaptureResult<Discovery>;
@@ -24,17 +25,32 @@ pub trait Backend: Send {
     -> CaptureResult<Box<dyn FrameSource>>;
     /// CLOCK_MONOTONIC nanoseconds, the driver's presentation clock.
     fn monotonic_now_ns(&self) -> u64;
+    /// Dispatches compositor events without blocking; true when the output
+    /// layout changed since the previous call.
+    fn poll_layout(&self) -> bool;
+    /// The compositor's live outputs, or `None` without a Wayland display.
+    fn desktop_layout(&self) -> Option<Vec<LayoutOutput>>;
 }
 
 pub struct NativeBackend {
     probe: KmsProbe,
+    layout: Mutex<WaylandLayout>,
 }
 
 impl NativeBackend {
     pub fn new() -> Self {
         Self {
             probe: KmsProbe::new(),
+            layout: Mutex::new(WaylandLayout::new()),
         }
+    }
+
+    fn with_layout<T>(&self, operation: impl FnOnce(&mut WaylandLayout) -> T) -> T {
+        let mut layout = self
+            .layout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        operation(&mut layout)
     }
 }
 
@@ -70,6 +86,14 @@ impl Backend for NativeBackend {
 
     fn monotonic_now_ns(&self) -> u64 {
         monotonic_now_ns()
+    }
+
+    fn poll_layout(&self) -> bool {
+        self.with_layout(|layout| layout.poll())
+    }
+
+    fn desktop_layout(&self) -> Option<Vec<LayoutOutput>> {
+        self.with_layout(|layout| layout.outputs())
     }
 }
 

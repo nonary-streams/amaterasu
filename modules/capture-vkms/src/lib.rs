@@ -12,6 +12,7 @@ mod backend;
 mod controller;
 mod discovery;
 mod frames;
+mod geometry;
 mod model;
 mod native;
 mod output_name;

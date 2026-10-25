@@ -7,6 +7,11 @@ rust-version.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Desktop geometry from the compositor's wl_output/xdg-output layout. Needs
+# wayland-client development files and wayland-scanner at build time.
+linux-kwin-geometry = []
+
 [dependencies]
 amaterasu-module-sdk.workspace = true
 amaterasu-media.workspace = true
@@ -21,6 +26,9 @@ amaterasu-vkms-frame-helper = { path = "../../crates/vkms-frame-helper" }
 # ioctls, fstat and the spawn-time descriptor setup.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[build-dependencies]
+cc = "1"
 
 [lints]
 workspace = true
