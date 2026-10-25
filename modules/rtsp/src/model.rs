@@ -315,11 +315,16 @@ pub enum CaptureProvider {
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
+    /// The only codec the client may negotiate when `codecs` is empty.
     #[serde(
         default,
         skip_serializing_if = "amaterasu_media::VideoCodec::is_default"
     )]
     pub codec: amaterasu_media::VideoCodec,
+    /// Codecs the host's encoders can serve for this launch, as signed by
+    /// NVHTTP. DESCRIBE advertises them and ANNOUNCE must choose one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codecs: Vec<amaterasu_media::VideoCodec>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -347,6 +352,7 @@ impl Default for Profile {
     fn default() -> Self {
         Self {
             codec: amaterasu_media::VideoCodec::H264,
+            codecs: Vec::new(),
             width: 1920,
             height: 1080,
             fps: 60,
@@ -375,6 +381,19 @@ fn audio_channel_mask(channels: u32) -> u32 {
 }
 
 impl Profile {
+    /// The codecs this ticket offers the client.
+    pub fn offered_codecs(&self) -> &[amaterasu_media::VideoCodec] {
+        if self.codecs.is_empty() {
+            std::slice::from_ref(&self.codec)
+        } else {
+            &self.codecs
+        }
+    }
+
+    fn offers(&self, codec: amaterasu_media::VideoCodec) -> bool {
+        self.offered_codecs().contains(&codec)
+    }
+
     pub fn effective_video_max_batch_size_kb(&self) -> u8 {
         match self.video_max_batch_size_kb {
             16 | 32 | 64 => self.video_max_batch_size_kb,
@@ -389,7 +408,7 @@ impl Profile {
     }
 
     fn matches_video(&self, announce: &Announce) -> bool {
-        sdp_codec(announce.video.codec) == self.codec
+        self.offers(sdp_codec(announce.video.codec))
             && announce.video.width == self.width
             && announce.video.height == self.height
             && announce.video.fps == self.fps
@@ -432,11 +451,19 @@ impl Profile {
             return Err("invalid_profile");
         }
 
-        let codec = match self.codec {
+        let unique_codecs = self
+            .codecs
+            .iter()
+            .enumerate()
+            .all(|(index, codec)| !self.codecs[..index].contains(codec));
+        if !self.codecs.is_empty() && (!self.codec.is_default() || !unique_codecs) {
+            return Err("invalid_profile");
+        }
+        // Framing and FEC limits do not depend on the codec.
+        let codec = match self.offered_codecs()[0] {
             amaterasu_media::VideoCodec::H264 => amaterasu_gamestream::video::VideoCodec::H264,
             amaterasu_media::VideoCodec::Hevc => amaterasu_gamestream::video::VideoCodec::Hevc,
-            // AV1 has no GameStream packetizer yet.
-            amaterasu_media::VideoCodec::Av1 => return Err("invalid_profile"),
+            amaterasu_media::VideoCodec::Av1 => amaterasu_gamestream::video::VideoCodec::Av1,
         };
         amaterasu_gamestream::video::VideoPacketizer::new_with_codec(
             amaterasu_gamestream::video::VideoConfig {
@@ -458,6 +485,7 @@ fn sdp_codec(codec: amaterasu_gamestream::sdp::VideoCodec) -> amaterasu_media::V
     match codec {
         amaterasu_gamestream::sdp::VideoCodec::H264 => amaterasu_media::VideoCodec::H264,
         amaterasu_gamestream::sdp::VideoCodec::Hevc => amaterasu_media::VideoCodec::Hevc,
+        amaterasu_gamestream::sdp::VideoCodec::Av1 => amaterasu_media::VideoCodec::Av1,
     }
 }
 
@@ -785,7 +813,7 @@ impl Open {
             max_reference_frames: announce.video.max_reference_frames,
         };
         let video_matches = if let Some(bounds) = self.negotiation_bounds {
-            video.codec == profile.codec
+            profile.offers(video.codec)
                 && video.validate()
                 && video.width <= bounds.max_width
                 && video.height <= bounds.max_height
@@ -926,8 +954,10 @@ impl Open {
             "encrypt_audio": self.profile.encrypt_audio,
             "permit_legacy_audio_iv_wrap": self.profile.permit_legacy_audio_iv_wrap,
         });
-        if self.profile.codec == amaterasu_media::VideoCodec::Hevc {
-            payload["video"]["codec"] = serde_json::json!("hevc");
+        if !self.profile.codecs.is_empty() {
+            payload["video"]["codecs"] = serde_json::json!(self.profile.codecs);
+        } else if !self.profile.codec.is_default() {
+            payload["video"]["codec"] = serde_json::json!(self.profile.codec);
         }
         if let Some(channels @ (6 | 8)) = self.channels {
             payload["audio"]["channels"] = serde_json::json!(channels);

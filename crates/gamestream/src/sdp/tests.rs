@@ -18,6 +18,7 @@ fn changed(name: &str, value: &str) -> String {
 fn all_support() -> TransportSupport {
     TransportSupport {
         hevc: false,
+        av1: false,
         stereo_audio: true,
         enet_control: true,
         encrypted_control: true,
@@ -49,6 +50,37 @@ fn hevc_sdr_announce_is_parsed_but_requires_end_to_end_capability() {
         VideoCodec::H264
     );
     assert!(parse_announce(changed("x-nv-vqos[0].bitStreamFormat", "1").as_bytes()).is_err());
+}
+
+#[test]
+fn bit_stream_format_selects_h264_hevc_and_av1_and_rejects_other_codecs() {
+    let av1 =
+        changed("x-nv-vqos[0].bitStreamFormat", "2").replace("a=x-nv-clientSupportHevc:0 \r\n", "");
+    assert!(!av1.contains("clientSupportHevc"));
+    let announce = parse_announce(av1.as_bytes()).unwrap();
+    assert_eq!(announce.video.codec, VideoCodec::Av1);
+    assert_eq!(
+        announce.check_support(&all_support()),
+        Err(Error::Unsupported("AV1 video"))
+    );
+    let mut enabled = all_support();
+    enabled.av1 = true;
+    announce.check_support(&enabled).unwrap();
+    // HEVC support alone does not admit AV1, nor AV1 support HEVC.
+    enabled.av1 = false;
+    enabled.hevc = true;
+    assert!(announce.check_support(&enabled).is_err());
+
+    assert_eq!(
+        parse_announce(FIXTURE.as_bytes()).unwrap().video.codec,
+        VideoCodec::H264
+    );
+    for unsupported in ["3", "4", "-1"] {
+        assert!(
+            parse_announce(changed("x-nv-vqos[0].bitStreamFormat", unsupported).as_bytes())
+                .is_err()
+        );
+    }
 }
 
 #[test]
@@ -160,7 +192,7 @@ fn encryption_requirements_are_preserved_and_cannot_silently_downgrade() {
 #[test]
 fn unsupported_media_modes_and_invalid_numeric_boundaries_fail() {
     for (name, value) in [
-        ("x-nv-vqos[0].bitStreamFormat", "2"),
+        ("x-nv-vqos[0].bitStreamFormat", "3"),
         ("x-nv-video[0].dynamicRangeMode", "1"),
         ("x-ss-video[0].chromaSamplingType", "1"),
         ("x-nv-video[0].clientViewportWd", "1919"),

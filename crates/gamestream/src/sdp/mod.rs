@@ -38,6 +38,8 @@ pub enum ColorMode {
 pub enum VideoCodec {
     H264,
     Hevc,
+    /// AV1 Main 8-bit, announced by Moonlight as `bitStreamFormat` 2.
+    Av1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +107,8 @@ pub struct Announce {
 pub struct TransportSupport {
     /// HEVC Main SDR encoder, packetizer and session configuration are all ready.
     pub hevc: bool,
+    /// AV1 Main 8-bit SDR encoder, packetizer and session configuration are all ready.
+    pub av1: bool,
     pub stereo_audio: bool,
     pub enet_control: bool,
     pub encrypted_control: bool,
@@ -124,6 +128,11 @@ impl Announce {
                 self.video.codec == VideoCodec::Hevc,
                 support.hevc,
                 "HEVC video",
+            ),
+            (
+                self.video.codec == VideoCodec::Av1,
+                support.av1,
+                "AV1 video",
             ),
             (true, support.stereo_audio, "stereo audio"),
             (true, support.enet_control, "ENet control"),

@@ -46,9 +46,12 @@ pub fn parse_announce(bytes: &[u8]) -> Result<Announce, Error> {
 }
 
 fn video(attributes: &mut Attributes<'_>) -> Result<Video, Error> {
+    // Moonlight's SDP generator: 0 H.264, 1 HEVC, 2 AV1. Other values
+    // (including PyroWave's 3) are not GameStream codecs this host encodes.
     let codec = match attributes.required("x-nv-vqos[0].bitStreamFormat")? {
         0 => VideoCodec::H264,
         1 => VideoCodec::Hevc,
+        2 => VideoCodec::Av1,
         _ => return Err(Error::Unsupported("video codec")),
     };
     let client_hevc = bounded(

@@ -50,7 +50,12 @@ UDP packets.
 
 DESCRIBE advertises H.264 and stereo Opus plus the actual supplied encryption
 capabilities. It requests modern control V2 and optionally required media
-protection. It advertises no HEVC/AV1, reference invalidation, surround audio, or
+protection. HEVC and AV1 are advertised only when the caller enables them in
+`TransportSupport`: HEVC with Moonlight's `sprop-parameter-sets=AAAAAU` marker and
+AV1 with an `a=rtpmap:98 AV1/90000` line. Moonlight prefers AV1, then HEVC, then
+H.264 among the codecs both sides support, and reports its choice in ANNOUNCE as
+`x-nv-vqos[0].bitStreamFormat` 0, 1 or 2. An ANNOUNCE for a codec the ticket did
+not enable fails. It advertises no reference invalidation, surround audio, or
 input-device capability. The caller must supply the actual encoder color mode;
 there is no implicit BT.601/BT.709 or range conversion. Unsupported ANNOUNCE
 features fail rather than being silently downgraded.

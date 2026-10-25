@@ -185,7 +185,15 @@ pub(super) fn description(capabilities: &Capabilities) -> String {
     } else {
         ""
     };
+    // Moonlight selects AV1 when this payload contains "AV1/90000" and both
+    // sides support it, preferring it over HEVC. Like the HEVC marker, it is
+    // emitted only for a ticket whose AV1 path is enabled end to end.
+    let av1_marker = if transport.av1 {
+        "a=rtpmap:98 AV1/90000\r\n"
+    } else {
+        ""
+    };
     format!(
-        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Amaterasu\r\nt=0 0\r\na=x-ss-general.featureFlags:0\r\na=x-ss-general.encryptionSupported:{supported}\r\na=x-ss-general.encryptionRequested:{requested}\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n{hevc_marker}m=audio 0 RTP/AVP 97\r\na=rtpmap:97 opus/48000/2\r\n"
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Amaterasu\r\nt=0 0\r\na=x-ss-general.featureFlags:0\r\na=x-ss-general.encryptionSupported:{supported}\r\na=x-ss-general.encryptionRequested:{requested}\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n{hevc_marker}{av1_marker}m=audio 0 RTP/AVP 97\r\na=rtpmap:97 opus/48000/2\r\n"
     )
 }
