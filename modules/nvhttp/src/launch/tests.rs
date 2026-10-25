@@ -1726,6 +1726,34 @@ fn desktop_launch_and_cancel_only_manage_rtsp_and_history() {
 }
 
 #[test]
+fn pipewire_launch_carries_the_owned_display_request_to_rtsp() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    settings.capture.capture_provider = CaptureProvider::PipeWire;
+    settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let mut desktop_request = request(96);
+    desktop_request.app_id = DESKTOP_APP_ID;
+
+    assert!(controller.launch(96, desktop_request, peer(96), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let rtsp_open = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .expect("RTSP open request");
+    assert_eq!(rtsp_open["capture"]["output"], OWNED_DISPLAY_OUTPUT);
+}
+
+#[test]
 fn desktop_launch_carries_portal_pipewire_source_to_rtsp_without_display_preflight() {
     let now = Instant::now();
     let mut settings = config();

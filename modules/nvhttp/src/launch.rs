@@ -38,6 +38,9 @@ pub(crate) type Send<'a> = dyn FnMut(Command) -> Transport + 'a;
 const MAX_RECORDS: usize = 32;
 pub(crate) const DESKTOP_APP_ID: u32 = i32::MAX as u32;
 pub(crate) const PORTAL_SELECTED_SESSION_SOURCE: &str = "portal-selected-session-source";
+/// Asks the stream session to allocate a per-stream virtual output and
+/// capture it directly, instead of a user-selected portal source.
+pub(crate) const OWNED_DISPLAY_OUTPUT: &str = "amaterasu-owned-display";
 const INITIAL_DEADLINE: Duration = Duration::from_secs(40);
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(20);
 const MONITOR_INTERVAL: Duration = Duration::from_millis(250);
@@ -786,6 +789,11 @@ impl Controller {
             .configured_capture
             .resolve(config.capture.capture_provider);
         let capture_output = match capture_provider {
+            // PipeWire never captures an arbitrary configured name: either the
+            // stream's own virtual output or the user's portal selection.
+            CaptureProvider::PipeWire if config.capture.output == OWNED_DISPLAY_OUTPUT => {
+                OWNED_DISPLAY_OUTPUT.to_owned()
+            }
             CaptureProvider::PipeWire => PORTAL_SELECTED_SESSION_SOURCE.to_owned(),
             CaptureProvider::Dxgi | CaptureProvider::Wgc => self
                 .configured_output_name
