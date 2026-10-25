@@ -53,6 +53,21 @@ impl Broker for FakeBroker {
         Ok(())
     }
 }
+/// Connector names the fake vibeshine card exposes, or a discovery failure.
+#[derive(Clone)]
+struct FakeConnectors(Arc<Mutex<Result<Vec<String>, String>>>);
+impl FakeConnectors {
+    fn named(range: std::ops::RangeInclusive<u32>) -> Self {
+        Self(Arc::new(Mutex::new(Ok(range
+            .map(|index| format!("Virtual-{index}"))
+            .collect()))))
+    }
+}
+impl ConnectorInventory for FakeConnectors {
+    fn connectors(&self) -> Result<Vec<String>, String> {
+        self.0.lock().unwrap().clone()
+    }
+}
 struct FakeCompositor {
     fail: bool,
 }
@@ -73,7 +88,10 @@ impl Compositor for FakeCompositor {
         }
     }
 }
-fn fixture() -> (PathBuf, Controller<FakeBroker, FakeCompositor>) {
+fn fixture() -> (
+    PathBuf,
+    Controller<FakeBroker, FakeCompositor, FakeConnectors>,
+) {
     let root = std::env::temp_dir().join(format!(
         "amaterasu-owned-display-{}",
         amaterasu_storage::random_identifier().unwrap()
@@ -89,6 +107,7 @@ fn fixture() -> (PathBuf, Controller<FakeBroker, FakeCompositor>) {
         journal: Journal::open(&root).unwrap(),
         broker,
         compositor: FakeCompositor { fail: false },
+        connectors: FakeConnectors::named(1..=8),
         stopped: Default::default(),
     };
     (root, controller)
@@ -151,6 +170,7 @@ fn interrupted_cleanup_retains_intent_and_restart_only_recovers_owned_connectors
         journal: Journal::open(&root).unwrap(),
         broker,
         compositor: FakeCompositor { fail: false },
+        connectors: FakeConnectors::named(1..=8),
         stopped: Default::default(),
     };
     assert!(restarted.recover().is_none());
@@ -180,6 +200,81 @@ fn shutdown_never_admits_a_new_connector_effect() {
         controller
             .create("stream-session".into(), specification(FIRST))
             .is_err()
+    );
+    assert!(controller.journal.records.is_empty());
+    assert!(controller.broker.effects.lock().unwrap().is_empty());
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reloaded_pool_allocates_the_connectors_that_exist_past_virtual_8() {
+    let (root, mut controller) = fixture();
+    controller.connectors = FakeConnectors::named(9..=16);
+    controller
+        .broker
+        .outputs
+        .lock()
+        .unwrap()
+        .insert("Virtual-9".into(), true);
+    let first = controller
+        .create("stream-session".into(), specification(FIRST))
+        .unwrap();
+    assert_eq!(first.output, "Virtual-10");
+    assert!(controller.broker.connected("Virtual-10").unwrap());
+    assert!(
+        !controller
+            .broker
+            .effects
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(output, _)| output == "Virtual-1" || output == "Virtual-9")
+    );
+    let broker = controller.broker.clone();
+    let connectors = controller.connectors.clone();
+    drop(controller);
+
+    // The journaled Virtual-10 record remains valid ownership after restart.
+    let mut restarted = Controller {
+        journal: Journal::open(&root).unwrap(),
+        broker,
+        compositor: FakeCompositor { fail: false },
+        connectors,
+        stopped: Default::default(),
+    };
+    assert_eq!(restarted.journal.records[0].output, "Virtual-10");
+    assert!(restarted.recover().is_none());
+    assert!(!restarted.broker.connected("Virtual-10").unwrap());
+    assert!(restarted.broker.connected("Virtual-9").unwrap());
+    drop(restarted);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn connector_discovery_failure_or_exhaustion_admits_no_effect() {
+    let (root, mut controller) = fixture();
+    *controller.connectors.0.lock().unwrap() = Err("DRM sysfs is unavailable".into());
+    assert_eq!(
+        controller
+            .create("stream-session".into(), specification(FIRST))
+            .err()
+            .as_deref(),
+        Some("DRM sysfs is unavailable")
+    );
+    controller.connectors = FakeConnectors::named(9..=9);
+    controller
+        .broker
+        .outputs
+        .lock()
+        .unwrap()
+        .insert("Virtual-9".into(), true);
+    assert_eq!(
+        controller
+            .create("stream-session".into(), specification(FIRST))
+            .err()
+            .as_deref(),
+        Some("no free virtual display connector")
     );
     assert!(controller.journal.records.is_empty());
     assert!(controller.broker.effects.lock().unwrap().is_empty());
