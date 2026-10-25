@@ -1,14 +1,28 @@
-//! H.264 encoding control and native CPU-frame interface.
+//! Video encoding control and the native CPU-frame and DMA-BUF interface.
 #[cfg(any(
     windows,
     test,
     amaterasu_x264,
     amaterasu_ffmpeg_nvenc,
-    amaterasu_ffmpeg_vaapi
+    amaterasu_ffmpeg_vaapi,
+    amaterasu_nvenc_cuda
 ))]
+#[cfg_attr(
+    not(any(
+        windows,
+        test,
+        amaterasu_x264,
+        amaterasu_ffmpeg_nvenc,
+        amaterasu_ffmpeg_vaapi
+    )),
+    allow(dead_code)
+)]
 mod bitstream;
-#[cfg(any(test, amaterasu_x265_hevc))]
+#[cfg(any(test, amaterasu_x265_hevc, amaterasu_nvenc_cuda))]
+#[cfg_attr(not(any(test, amaterasu_x265_hevc)), allow(dead_code))]
 mod hevc;
+#[cfg_attr(not(amaterasu_nvenc_cuda), allow(dead_code))]
+mod input;
 mod layout;
 mod model;
 mod native;

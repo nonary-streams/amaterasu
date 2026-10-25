@@ -8,11 +8,15 @@ mod ffmpeg_nvenc;
 mod ffmpeg_vaapi;
 
 #[cfg(target_os = "linux")]
+mod nvenc_cuda;
+
+#[cfg(target_os = "linux")]
 mod x265_hevc;
 
 #[cfg(windows)]
 mod windows;
 
+use crate::input::{GpuInput, InputSupport};
 use crate::model::{Configuration, EncoderDescription, EncoderIdentity, Packet};
 
 #[derive(Clone, Copy)]
@@ -75,6 +79,11 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
     #[cfg(not(windows))]
     let mut encoders = Vec::new();
 
+    // Native NVENC is listed first so automatic selection prefers it over
+    // the FFmpeg NVENC path on the same GPU.
+    #[cfg(target_os = "linux")]
+    encoders.splice(0..0, nvenc_cuda::descriptions());
+
     #[cfg(target_os = "linux")]
     if let Some(hardware) = ffmpeg_nvenc::description() {
         encoders.push(hardware);
@@ -96,6 +105,8 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
 pub enum Encoder {
     #[cfg(windows)]
     Hardware(windows::Encoder),
+    #[cfg(all(target_os = "linux", amaterasu_nvenc_cuda))]
+    NvencCuda(nvenc_cuda::Encoder),
     #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
     Nvenc(ffmpeg_nvenc::Encoder),
     #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
@@ -110,6 +121,14 @@ impl Encoder {
         identity: &EncoderIdentity,
         configuration: &Configuration,
     ) -> Result<Self, &'static str> {
+        #[cfg(target_os = "linux")]
+        if nvenc_cuda::selected(identity) {
+            #[cfg(amaterasu_nvenc_cuda)]
+            return nvenc_cuda::Encoder::open(identity, configuration).map(Self::NvencCuda);
+            #[cfg(not(amaterasu_nvenc_cuda))]
+            return Err(nvenc_cuda::unavailable_reason());
+        }
+
         #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
         if ffmpeg_nvenc::selected(identity) {
             return ffmpeg_nvenc::open(identity, configuration).map(Self::Nvenc);
@@ -159,6 +178,8 @@ impl Encoder {
         match self {
             #[cfg(windows)]
             Self::Hardware(encoder) => encoder.submit(bytes, timestamp, force),
+            #[cfg(all(target_os = "linux", amaterasu_nvenc_cuda))]
+            Self::NvencCuda(encoder) => encoder.submit(bytes, timestamp, force),
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
             Self::Nvenc(encoder) => encoder.submit(bytes, timestamp, force),
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
@@ -175,6 +196,8 @@ impl Encoder {
         match self {
             #[cfg(windows)]
             Self::Hardware(_) => false,
+            #[cfg(all(target_os = "linux", amaterasu_nvenc_cuda))]
+            Self::NvencCuda(_) => true,
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
             Self::Nvenc(_) => true,
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
@@ -189,6 +212,8 @@ impl Encoder {
         match self {
             #[cfg(windows)]
             Self::Hardware(encoder) => encoder.receive(),
+            #[cfg(all(target_os = "linux", amaterasu_nvenc_cuda))]
+            Self::NvencCuda(encoder) => encoder.receive(),
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
             Self::Nvenc(encoder) => encoder.receive(),
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
@@ -203,6 +228,8 @@ impl Encoder {
         match self {
             #[cfg(windows)]
             Self::Hardware(encoder) => encoder.drain(),
+            #[cfg(all(target_os = "linux", amaterasu_nvenc_cuda))]
+            Self::NvencCuda(encoder) => encoder.drain(),
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
             Self::Nvenc(encoder) => encoder.drain(),
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
@@ -210,6 +237,32 @@ impl Encoder {
             #[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
             Self::Hevc(encoder) => encoder.drain(),
             Self::Software(encoder) => encoder.drain(),
+        }
+    }
+
+    /// Only the native NVENC backend converts on the GPU or imports DMA-BUFs.
+    pub fn input_support(&self) -> InputSupport {
+        match self {
+            #[cfg(all(target_os = "linux", amaterasu_nvenc_cuda))]
+            Self::NvencCuda(encoder) => encoder.input_support(),
+            _ => InputSupport::default(),
+        }
+    }
+
+    pub fn submit_gpu(
+        &mut self,
+        input: GpuInput,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<(), &'static str> {
+        match self {
+            #[cfg(all(target_os = "linux", amaterasu_nvenc_cuda))]
+            Self::NvencCuda(encoder) => encoder.submit_gpu(input, timestamp, force),
+            _ => {
+                drop(input);
+                let _ = (timestamp, force);
+                Err("gpu_input_unsupported")
+            }
         }
     }
 }
@@ -250,6 +303,7 @@ mod tests {
 
         assert!(!ffmpeg_nvenc::selected(&identity));
         assert!(!ffmpeg_vaapi::selected(&identity));
+        assert!(!nvenc_cuda::selected(&identity));
         assert!(matches!(
             Encoder::open(&identity, &configuration),
             Err("hardware_encoder_unavailable")
