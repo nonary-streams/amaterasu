@@ -276,6 +276,37 @@ impl Pipeline {
         );
         match result {
             Ok(Change::Read(response)) => complete(send, request.id, response),
+            Ok(Change::ReadProductSettings) => self.submit(
+                request,
+                Stage::LoadingProductSettings(Operation::SettingsGet {}),
+                CONFIGURATION_SERVICE,
+                "product-get",
+                json!({"action":"product_get"}),
+                send,
+            ),
+            Ok(Change::UpdateProductSettings {
+                session_token_ttl_seconds,
+                remember_me_refresh_token_ttl_seconds,
+                expected_revision,
+            }) => {
+                let lifetimes = TokenLifetimes::new(
+                    session_token_ttl_seconds,
+                    remember_me_refresh_token_ttl_seconds,
+                )
+                .expect("operation validation checked token lifetimes");
+                self.submit(
+                    request,
+                    Stage::SavingProductSettings {
+                        lifetimes,
+                        expected_revision,
+                    },
+                    CONFIGURATION_SERVICE,
+                    "product-update",
+                    lifetimes.update_payload(expected_revision),
+                    send,
+                )
+            }
+
             Ok(Change::WriteDocument {
                 document,
                 response,

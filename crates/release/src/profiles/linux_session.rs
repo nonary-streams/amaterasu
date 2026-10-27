@@ -33,13 +33,16 @@ use std::path::Path;
 /// development policy holds 4 and the installer policy 3. Advance this whenever
 /// the administrator principals or the allowed scopes below
 /// change, including a revert. TTL-only edits do not bump it.
-pub const AUTHORIZATION_POLICY_GENERATION: u64 = 8;
+pub const AUTHORIZATION_POLICY_GENERATION: u64 = 9;
 
-pub const ADMINISTRATOR_PRINCIPALS: [&str; 2] = ["amaterasu.console", "amaterasu.management"];
+pub const ADMINISTRATOR_PRINCIPALS: [&str; 1] = ["amaterasu.console"];
+pub const PAIRING_ADMINISTRATOR_PRINCIPALS: [&str; 2] =
+    ["amaterasu.console", "amaterasu.management"];
 
 /// Management scopes without diagnostics; capture scopes authorize the
 /// current user's explicit XDG Desktop Portal source selection.
-pub const ALLOWED_SCOPES: [&str; 18] = [
+pub const ALLOWED_SCOPES: [&str; 19] = [
+    "account.self",
     "catalog.read",
     "catalog.write",
     "configuration.read",
@@ -408,7 +411,7 @@ fn settings(
     insert(
         "amaterasu.pairing",
         json!({
-            "administrator_principals": ADMINISTRATOR_PRINCIPALS,
+            "administrator_principals": PAIRING_ADMINISTRATOR_PRINCIPALS,
             "transport_principals": ["amaterasu.nvhttp"],
         }),
     );
@@ -495,6 +498,7 @@ fn settings(
 fn authentication_settings() -> Value {
     json!({
         "administrator_principals": ADMINISTRATOR_PRINCIPALS,
+        "legacy_verifier_principals": ["amaterasu.management"],
         "authorization_policy_generation": AUTHORIZATION_POLICY_GENERATION,
         "session_token_ttl_seconds": 7200,
         "remember_me_refresh_token_ttl_seconds": 604800,

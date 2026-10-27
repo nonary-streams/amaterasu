@@ -20,3 +20,7 @@ getrandom.workspace = true
 ureq = { version = "3.4", default-features = false, features = ["rustls", "platform-verifier"] }
 [lints]
 workspace = true
+
+[[bin]]
+name = "amaterasu-web-extension"
+path = "src/bin/amaterasu-web-extension.rs"

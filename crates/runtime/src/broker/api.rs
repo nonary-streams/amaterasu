@@ -19,6 +19,13 @@ pub(super) struct ApiInvocation<'a> {
     pub payload: &'a Value,
 }
 
+pub(super) struct ApiQuery<'a> {
+    pub service: &'a str,
+    pub method: &'a str,
+    pub major: u32,
+    pub min_minor: u32,
+}
+
 pub(super) struct ApiRegistry {
     approved: BTreeMap<MethodKey, ApiMethodApproval>,
     registered: BTreeSet<MethodKey>,
@@ -61,19 +68,24 @@ impl ApiRegistry {
         &self,
         caller: &str,
         grants: &Grants,
-        service: &str,
-        method: &str,
-        major: u32,
-        min_minor: u32,
+        query: ApiQuery<'_>,
+        include_approval: bool,
     ) -> Response {
-        let Some(approval) = self.authorized(caller, grants, service, method, major) else {
+        let Some(approval) =
+            self.authorized(caller, grants, query.service, query.method, query.major)
+        else {
             return permission_denied();
         };
-        if approval.method.interface_minor < min_minor {
+        if approval.method.interface_minor < query.min_minor {
             return Response::error("incompatible_api", "interface minor version is too old");
         }
+        let payload = if include_approval {
+            serde_json::to_value(approval)
+        } else {
+            serde_json::to_value(&approval.method)
+        };
         Response::Result {
-            payload: serde_json::to_value(&approval.method).expect("API method is serializable"),
+            payload: payload.expect("API approval is serializable"),
         }
     }
 

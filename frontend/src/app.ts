@@ -13,6 +13,7 @@ namespace Amaterasu {
     applications: "Applications",
     steam: "Steam",
     diagnostics: "Diagnostics",
+    accounts: "Accounts",
   };
   const pageIcons: Record<Page, string> = {
     updates: "+",
@@ -24,6 +25,20 @@ namespace Amaterasu {
     applications: "□",
     steam: "◇",
     diagnostics: "⌁",
+    accounts: "♙",
+  };
+
+  const corePages = new Map<Page, (context: PageContext) => void>([
+    ["overview", renderOverview], ["host", renderHostManagement], ["catalog", renderCatalog],
+    ["settings", renderSettings], ["updates", renderUpdates], ["sessions", renderSessions],
+    ["applications", renderApplications], ["steam", renderSteam], ["diagnostics", renderDiagnostics],
+    ["accounts", renderAccounts],
+  ]);
+
+  const pageScopes: Partial<Record<Page, string>> = {
+    host: "configuration.read", catalog: "catalog.read", settings: "configuration.read",
+    updates: "configuration.read", sessions: "session.read", applications: "application.read",
+    steam: "steam.read", diagnostics: "diagnostics.read", accounts: "account.self",
   };
 
   class Application {
@@ -31,7 +46,9 @@ namespace Amaterasu {
     private readonly root: HTMLElement;
     private signedIn = false;
     private content = el("main");
-    private navigation = new Map<Page, HTMLButtonElement>();
+    private navigation = new Map<string, HTMLButtonElement>();
+    private extensions: ExtensionPages;
+    private extensionIds = new Set<string>();
     private notification = el("div");
     private notificationTimer = 0;
     private restorationGeneration = 0;
@@ -51,6 +68,7 @@ namespace Amaterasu {
           'meta[name="amaterasu-api-base"]',
         )?.content ?? "",
       );
+      this.extensions = new ExtensionPages(this.api);
       this.api.onAuthenticationLost = () => {
         if (this.signedIn) {
           clearTimeout(this.notificationTimer);
@@ -117,18 +135,26 @@ namespace Amaterasu {
       setLocalizedPageTitle("Restoring session");
     }
 
-    private currentPage(): Page {
+    private currentPage(): string {
       const value = location.hash.slice(1);
-      return Object.hasOwn(pageNames, value) ? (value as Page) : "overview";
+      const core = Object.hasOwn(pageNames, value) && this.pageAvailable(value as Page);
+      return core || (value.startsWith("extension/") && this.extensionIds.has(value.slice(10))) ? value : "overview";
     }
 
-    private navigate(page: Page): void {
+    private pageAvailable(page: Page): boolean {
+      const scope = pageScopes[page];
+      return !scope || this.api.allows(scope) || (page === "accounts" && this.api.allows("configuration.write"));
+    }
+
+    private navigate(page: string): void {
       if (location.hash === `#${page}`) this.renderPage(page);
       else location.hash = page;
     }
 
     private loginScreen(): void {
       this.signedIn = false;
+      this.extensions.reset();
+      this.extensionIds.clear();
       const main = el("main", "login-layout");
       main.id = "main";
       main.tabIndex = -1;
@@ -158,7 +184,7 @@ namespace Amaterasu {
         el(
           "p",
           "muted",
-          "Sign in with the administrator credentials configured on this host.",
+          "Sign in with your host account.",
         ),
       );
       const username = input("username");
@@ -243,21 +269,22 @@ namespace Amaterasu {
           this.shell();
         });
       });
-      const setup = el(
-        "details",
-        "setup-note",
-        el("summary", "", "First time setting up this host?"),
-        el(
-          "p",
-          "",
-          "An administrator must create the initial credentials through the trusted local console. Password setup is not available in this browser.",
-        ),
-        el(
-          "p",
-          "muted",
-          "The management listener must be enabled and this browser origin allowed. Contact the person who configured the host.",
-        ),
-      );
+      const setupCode = input("enrollment_code"); setupCode.required = true; setupCode.autocomplete = "off";
+      const setupUsername = input("enrollment_username"); setupUsername.required = true; setupUsername.autocomplete = "username";
+      const setupPassword = input("enrollment_password", "", "password"); setupPassword.required = true; setupPassword.autocomplete = "new-password";
+      const setupStatus = el("div");
+      const setupSubmit = el("button", "button primary", "Create administrator"); setupSubmit.type = "submit";
+      const setupForm = el("form", "settings-form", field("Code shown on the host", setupCode), field("Username", setupUsername), field("Password", setupPassword), setupSubmit, setupStatus);
+      setupForm.addEventListener("submit", (event) => {
+        event.preventDefault(); if (!setupForm.reportValidity()) return;
+        void runAction(setupSubmit, setupStatus, async () => {
+          await this.api.post("auth/enroll", { code: setupCode.value.trim(), username: setupUsername.value.trim(), password: setupPassword.value }, false);
+          username.value = setupUsername.value.trim(); setupCode.value = ""; setupPassword.value = "";
+          setupStatus.replaceChildren(el("p", "", "Administrator created. Sign in above."));
+        });
+      });
+      const setup = el("details", "setup-note", el("summary", "", "First time setting up this host?"),
+        el("p", "", "Enter the enrollment code displayed locally on the host to create the first administrator."), setupForm);
       card.append(
         form,
         setup,
@@ -287,12 +314,15 @@ namespace Amaterasu {
 
     private shell(): void {
       this.signedIn = true;
+      this.extensions.reset();
+      this.extensionIds.clear();
       this.navigation.clear();
       const shell = el("div", "shell");
       const sidebar = el("aside", "sidebar");
       const nav = el("nav", "navigation");
       setLocalizedAttribute(nav, "aria-label", "Main navigation");
-      for (const page of Object.keys(pageNames) as Page[]) {
+      for (const page of corePages.keys()) {
+        if (!this.pageAvailable(page)) continue;
         const icon = el("span", "nav-icon", pageIcons[page]);
         icon.setAttribute("aria-hidden", "true");
         const item = button(
@@ -308,10 +338,37 @@ namespace Amaterasu {
         nav.append(item);
         this.navigation.set(page, item);
       }
+      const extensionsNav = el("nav", "navigation");
+      setLocalizedAttribute(extensionsNav, "aria-label", "Extensions");
+      const extensionsHeading = el("p", "nav-heading", "EXTENSIONS");
+      extensionsHeading.hidden = true;
+      void this.extensions.discover().then((entries) => {
+        if (!this.signedIn || !shell.isConnected) return;
+        for (const entry of entries) {
+          this.extensionIds.add(entry.id);
+          const page = `extension/${entry.id}`;
+          const item = button(appTextLiteral(entry.name), () => {
+            shell.classList.remove("menu-open");
+            menu.setAttribute("aria-expanded", "false");
+            this.navigate(page);
+          }, "nav-item");
+          extensionsNav.append(item);
+          this.navigation.set(page, item);
+        }
+        extensionsHeading.hidden = entries.length === 0;
+        if (location.hash.startsWith("#extension/")) this.renderPage(this.currentPage());
+      }).catch(() => {
+        if (this.signedIn && shell.isConnected) {
+          extensionsHeading.textContent = "Extensions unavailable";
+          extensionsHeading.hidden = false;
+        }
+      });
       sidebar.append(
         this.brand(),
         el("p", "nav-heading", "WORKSPACE"),
         nav,
+        extensionsHeading,
+        extensionsNav,
         el(
           "div",
           "sidebar-bottom",
@@ -397,7 +454,8 @@ namespace Amaterasu {
       this.renderPage(this.currentPage());
     }
 
-    private renderPage(page: Page): void {
+    private renderPage(page: string): void {
+      this.extensions.dispose();
       const fresh = el("main", "content");
       fresh.id = "main";
       fresh.tabIndex = -1;
@@ -414,19 +472,19 @@ namespace Amaterasu {
         notify: (message) => this.notify(message),
         navigate: (page) => this.navigate(page),
       };
-      const renderers: Record<Page, (context: PageContext) => void> = {
-        overview: renderOverview,
-        host: renderHostManagement,
-        catalog: renderCatalog,
-        settings: renderSettings,
-        updates: renderUpdates,
-        sessions: renderSessions,
-        applications: renderApplications,
-        steam: renderSteam,
-        diagnostics: renderDiagnostics,
-      };
-      renderers[page](context);
-      setLocalizedPageTitle(pageNames[page]);
+      if (page.startsWith("extension/")) {
+        fresh.append(el("p", "muted", "Loading extension…"));
+        void this.extensions.mount(page.slice(10), fresh).catch((error) => {
+          if (fresh.isConnected) fresh.replaceChildren(errorPanel(error));
+        });
+        setLocalizedPageTitle("Extension");
+      } else {
+        const corePage = page as Page;
+        const renderer = corePages.get(corePage);
+        if (!renderer) return;
+        renderer(context);
+        setLocalizedPageTitle(pageNames[corePage]);
+      }
       fresh.focus({ preventScroll: true });
       window.scrollTo(0, 0);
     }

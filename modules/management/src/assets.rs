@@ -187,7 +187,7 @@ pub fn failure(status: u16, message: &str) -> Vec<u8> {
     asset_response(status, "text/plain; charset=utf-8", message.as_bytes())
 }
 
-fn asset_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
+pub(crate) fn asset_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
     let reason = if status == 200 {
         "OK"
     } else if status == 404 {

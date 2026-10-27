@@ -20,12 +20,20 @@ not installed services or a replacement for the remaining product libraries.
 
 The development `serve` command continuously supervises the same managed
 libraries and ticks them between console requests. HTTP ingress is owned by the
-management library, defaults disabled, and currently permits only explicit
-loopback bindings. It authorizes exact route scopes through authentication before
-dispatching product requests. Human-facing bearer identity does not become a
-forged runtime principal: HTTP operations use the management library's namespace.
-Remote TLS, installed service policy and multi-user namespace delegation remain
-separate production requirements.
+management library and defaults disabled. Plain HTTP binds only loopback; optional
+HTTPS can bind a configured address and applies socket-peer admission, origin
+checks, and exact route scopes. Authentication owns human accounts and roles;
+HTTP requests retain the management runtime principal and forward a verified
+session where account administration requires it. The development Linux root
+has local HTTPS setup and first-admin enrollment tools. Installed production
+provisioning, physical network qualification and multi-user namespace delegation
+remain separate requirements.
+
+Web extensions are separately signed and locally approved by ID, publisher key,
+and exact method declarations. The management layer checks selected manifests
+and broker approvals, but extension JavaScript executes with the web UI's
+same-origin authority; this is not a sandbox. Withdrawal requires removing the
+local approval, revoking sessions and closing already-open tabs.
 
 In the code, `Broker` dispatches to `RequestRouter`, `EventBus`, and `HookRegistry`.
 The unsafe runtime boundary lives in `ffi.rs`. Rust feature modules implement

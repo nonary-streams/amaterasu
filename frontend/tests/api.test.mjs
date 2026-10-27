@@ -1662,3 +1662,28 @@ test("session-only login remains in memory when storage methods throw", async ()
   assert.equal(calls.length, 1);
   assert.equal(storage.values.size, 0);
 });
+
+test("role and scope jointly gate dangerous controls while managed launch remains available to operators", async () => {
+  const scopes = ["catalog.read", "configuration.read", "configuration.write", "application.read", "application.launch", "application.terminate", "session.write", "steam.refresh"];
+  for (const role of ["administrator", "operator", "viewer", undefined]) {
+    const { api } = apiHarness(() => Response.json(sessionReply(secret("a"), secret("b"), future(3600), future(7200), { role, scopes })));
+    await api.login("user", "password");
+    assert.equal(api.allows("catalog.read"), true);
+    assert.equal(api.allows("configuration.read"), role === "administrator");
+    assert.equal(api.allows("configuration.write"), role === "administrator");
+    assert.equal(api.allows("application.terminate"), role === "administrator");
+    assert.equal(api.allows("session.write"), role === "administrator");
+    assert.equal(api.allows("steam.refresh"), role === "administrator");
+    assert.equal(api.allowsLaunchAction("start"), role === "administrator" || role === "operator");
+    assert.equal(api.allowsLaunchAction("stop"), role === "administrator" || role === "operator");
+  }
+});
+
+test("browser session role controls actions and missing role fails closed", async () => {
+  for (const role of ["operator", "viewer", undefined]) {
+    const { api } = apiHarness(() => Response.json(browserReply(future(3600), { role, scopes: ["application.launch", "application.terminate", "catalog.read"] })), { origin: "https://example.test" });
+    await api.login("user", "password");
+    assert.equal(api.allowsLaunchAction("start"), role === "operator");
+    assert.equal(api.allows("application.terminate"), false);
+  }
+});

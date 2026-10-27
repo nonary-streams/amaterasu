@@ -803,8 +803,9 @@ fn streaming_profile_defaults_to_portal_and_supports_hardware_modes() {
 /// `AUTHORIZATION_POLICY_GENERATION` together, then update this pin.
 #[test]
 fn authorization_generation_is_bumped_with_principals_and_scopes() {
-    let pinned_principals = ["amaterasu.console", "amaterasu.management"];
+    let pinned_principals = ["amaterasu.console"];
     let pinned_scopes = [
+        "account.self",
         "catalog.read",
         "catalog.write",
         "configuration.read",
@@ -830,8 +831,16 @@ fn authorization_generation_is_bumped_with_principals_and_scopes() {
         authentication["administrator_principals"],
         json!(pinned_principals)
     );
+    assert_eq!(
+        authentication["legacy_verifier_principals"],
+        json!(["amaterasu.management"])
+    );
+    assert_eq!(
+        settings["amaterasu.pairing"]["administrator_principals"],
+        json!(["amaterasu.console", "amaterasu.management"])
+    );
     assert_eq!(authentication["allowed_scopes"], json!(pinned_scopes));
-    assert_eq!(authentication["authorization_policy_generation"], 8);
+    assert_eq!(authentication["authorization_policy_generation"], 9);
 
     // Generations are profile-specific and never reused.
     let development_root = TemporaryRoot::new("generation-development");

@@ -748,6 +748,7 @@ var Amaterasu;
         loggingOut = false;
         onAuthenticationLost = null;
         subject = "";
+        role = null;
         scopes = null;
         constructor(base) {
             const url = new URL(base || location.origin, location.origin);
@@ -824,6 +825,7 @@ var Amaterasu;
             await this.clear();
             this.bearer = token;
             this.subject = "API token";
+            this.role = "token";
             this.scopes = null;
             this.tokenGeneration += 1;
         }
@@ -834,6 +836,7 @@ var Amaterasu;
                 return this.logoutCookieSession();
             this.loggingOut = true;
             this.subject = "";
+            this.role = null;
             this.scopes = null;
             this.abortRequests(true);
             const pendingLogout = this.finishLogout();
@@ -897,7 +900,17 @@ var Amaterasu;
             await this.removeStoredSessionForIdentity(sessionId);
         }
         allows(scope) {
-            return this.scopes === null || this.scopes.includes(scope);
+            if (this.scopes !== null && !this.scopes.includes(scope))
+                return false;
+            if (this.role === "administrator" || this.role === "token")
+                return true;
+            return ["account.self", "application.read", "catalog.read", "display.read",
+                "lutris.read", "session.read", "steam.read"].includes(scope);
+        }
+        allowsLaunchAction(action) {
+            const scope = action === "start" ? "application.launch" : "application.terminate";
+            return (this.role === "administrator" || this.role === "operator" || this.role === "token") &&
+                (this.scopes === null || this.scopes.includes(scope));
         }
         async post(route, payload = {}, protectedRoute = true) {
             if (this.loggingOut) {
@@ -961,6 +974,7 @@ var Amaterasu;
             this.cookieSession = true;
             this.accessExpiresAt = session.expires_at;
             this.subject = session.subject;
+            this.role = session.role ?? null;
             this.scopes = [...session.scopes];
             this.tokenGeneration += 1;
         }
@@ -1370,6 +1384,7 @@ var Amaterasu;
                 bearer: reply.bearer,
                 refresh_token: reply.refresh_token,
                 subject: reply.subject,
+                role: ["administrator", "operator", "viewer"].includes(String(reply.role)) ? reply.role : null,
                 scopes: [...reply.scopes],
                 expires_at: reply.expires_at,
                 refresh_expires_at: reply.refresh_expires_at,
@@ -1381,6 +1396,7 @@ var Amaterasu;
             this.refreshToken = session.refresh_token;
             this.accessExpiresAt = session.expires_at;
             this.subject = this.loggingOut ? "" : session.subject;
+            this.role = this.loggingOut ? null : session.role ?? null;
             this.scopes = this.loggingOut ? null : [...session.scopes];
             this.remembered = remembered;
             this.sessionId = remembered ? sessionId : null;
@@ -1728,6 +1744,7 @@ var Amaterasu;
             this.refreshToken = "";
             this.accessExpiresAt = 0;
             this.subject = "";
+            this.role = null;
             this.scopes = null;
             this.remembered = false;
             this.cookieSession = false;
@@ -4837,7 +4854,14 @@ var Amaterasu;
             edit.disabled = !api.allows("catalog.write") || providerLaunch;
             if (providerLaunch)
                 catalogLocalizedAttribute(edit, "title", "Playnite launch targets are managed by the provider.");
-            const actions = [edit];
+            const launch = Amaterasu.button("Launch", () => void Amaterasu.runAction(launch, status, async () => {
+                const bytes = crypto.getRandomValues(new Uint8Array(16));
+                const operation = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+                await api.post("launch/start", { app_id: row.id, operation_id: `web.${operation}` });
+                notify(catalogTextMessage("Launch requested. Check Applications for its status."));
+            }), "primary");
+            launch.disabled = typeof api.allowsLaunchAction !== "function" || !api.allowsLaunchAction("start");
+            const actions = [launch, edit];
             if (providerLaunch) {
                 const configure = Amaterasu.button("Streaming settings", () => showProviderOverrideEditor(row, capabilities), "secondary");
                 configure.disabled = !api.allows("catalog.write");
@@ -11066,15 +11090,46 @@ var Amaterasu;
         void load();
         void loadHistoryRuntime();
         void loadSaved();
-        Amaterasu.renderHostMetricsDashboard(context, metricsArea, savedHistoryPanel);
+        if (context.api.allows("diagnostics.read"))
+            Amaterasu.renderHostMetricsDashboard(context, metricsArea, savedHistoryPanel);
+        else
+            metricsArea.replaceChildren(Amaterasu.el("p", "muted", "Host metrics are unavailable for this account."));
     }
     Amaterasu.renderSessions = renderSessions;
     function renderApplications(context) {
         const area = Amaterasu.el("div");
         const status = Amaterasu.el("div");
+        const launchesArea = Amaterasu.el("div");
         let offset = 0;
         const history = [0];
-        context.content.append(Amaterasu.sectionHeading("Applications", "Processes launched through this management console.", Amaterasu.button("Refresh", load)), status, area);
+        context.content.append(Amaterasu.sectionHeading("Applications", "Processes launched through this management console.", Amaterasu.button("Refresh", () => { void load(); void loadLaunches(); })), status, Amaterasu.panel("Managed launches", launchesArea), area);
+        async function loadLaunches() {
+            try {
+                const reply = await context.api.post("launch/list", { limit: 16 });
+                if (!context.content.isConnected)
+                    return;
+                if (!Array.isArray(reply.launches))
+                    throw new Error("Invalid launch list.");
+                const rows = reply.launches.map((launch) => {
+                    if (!Number.isSafeInteger(launch.launch_id) || launch.launch_id < 1 || typeof launch.app_id !== "string" || typeof launch.state !== "string")
+                        throw new Error("Invalid launch list.");
+                    const stop = Amaterasu.button("Stop", () => void Amaterasu.runAction(stop, status, async () => {
+                        if (!(await Amaterasu.confirmAction("Stop this launch?", "The managed application and its preparation will be stopped.", "Stop")))
+                            return;
+                        await context.api.post("launch/stop", { launch_id: launch.launch_id });
+                        context.notify("Stop requested. Refresh to check its status.");
+                        await loadLaunches();
+                    }));
+                    stop.disabled = ["stopped", "failed"].includes(launch.state) || typeof context.api.allowsLaunchAction !== "function" || !context.api.allowsLaunchAction("stop");
+                    return [pagesTextLiteral(launch.app_id), pagesTextLiteral(launch.state), stop];
+                });
+                launchesArea.replaceChildren(rows.length ? Amaterasu.table(["Application", "State", "Action"], rows) : Amaterasu.empty("No managed launches", "Applications started from the library appear here."));
+            }
+            catch (error) {
+                if (context.content.isConnected)
+                    launchesArea.replaceChildren(Amaterasu.errorPanel(error, loadLaunches));
+            }
+        }
         async function load() {
             try {
                 const reply = await context.api.post("application/list", {
@@ -11134,6 +11189,7 @@ var Amaterasu;
             }
         }
         void load();
+        void loadLaunches();
     }
     Amaterasu.renderApplications = renderApplications;
     function steamForceSyncOutcome(provider) {
@@ -12140,6 +12196,230 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function roleSelector() {
+        const select = Amaterasu.el("select");
+        for (const role of ["administrator", "operator", "viewer"]) {
+            const option = Amaterasu.el("option", "", role);
+            option.value = role;
+            select.append(option);
+        }
+        return select;
+    }
+    function renderAccounts(context) {
+        const area = Amaterasu.el("div");
+        const current = Amaterasu.input("current_password", "", "password");
+        current.autocomplete = "current-password";
+        current.required = true;
+        const next = Amaterasu.input("new_password", "", "password");
+        next.autocomplete = "new-password";
+        next.required = true;
+        const passwordStatus = Amaterasu.el("div");
+        const change = Amaterasu.el("button", "button primary", "Change password");
+        change.type = "submit";
+        const passwordForm = Amaterasu.el("form", "settings-form", Amaterasu.field("Current password", current), Amaterasu.field("New password", next), change, passwordStatus);
+        passwordForm.addEventListener("submit", (event) => {
+            event.preventDefault();
+            if (!passwordForm.reportValidity())
+                return;
+            void Amaterasu.runAction(change, passwordStatus, async () => { await context.api.post("auth/change_password", { current_password: current.value, new_password: next.value }); current.value = ""; next.value = ""; context.notify("Password changed."); });
+        });
+        context.content.append(Amaterasu.el("h1", "", "Accounts"));
+        if (context.api.allows("account.self"))
+            context.content.append(Amaterasu.panel("Your password", passwordForm));
+        context.content.append(area);
+        async function load() {
+            area.replaceChildren(Amaterasu.el("p", "muted", "Loading accounts…"));
+            try {
+                const reply = await context.api.post("accounts/list");
+                if (!context.content.isConnected)
+                    return;
+                if (!Array.isArray(reply.accounts))
+                    throw new Error("Invalid account list.");
+                const list = Amaterasu.el("div");
+                for (const account of reply.accounts) {
+                    if (typeof account.username !== "string" || !["administrator", "operator", "viewer"].includes(account.role) || typeof account.enabled !== "boolean")
+                        throw new Error("Invalid account list.");
+                    const role = roleSelector();
+                    role.value = account.role;
+                    const enabled = Amaterasu.input("enabled", "", "checkbox");
+                    enabled.checked = account.enabled;
+                    const status = Amaterasu.el("div");
+                    const save = Amaterasu.button("Save", () => void Amaterasu.runAction(save, status, async () => { await context.api.post("accounts/update", { username: account.username, role: role.value, enabled: enabled.checked }); context.notify("Account updated."); await load(); }));
+                    const reset = Amaterasu.input("password", "", "password");
+                    reset.autocomplete = "new-password";
+                    const setPassword = Amaterasu.button("Set password", () => void Amaterasu.runAction(setPassword, status, async () => { if (!reset.value)
+                        throw new Error("Enter a new password."); await context.api.post("accounts/set_password", { username: account.username, password: reset.value }); reset.value = ""; context.notify("Password updated."); }));
+                    const remove = Amaterasu.button("Delete account", () => { if (!window.confirm(`Delete account ${account.username}?`))
+                        return; void Amaterasu.runAction(remove, status, async () => { await context.api.post("accounts/delete", { username: account.username }); await load(); }); });
+                    list.append(Amaterasu.panel(account.username, Amaterasu.field("Role", role), Amaterasu.field("Enabled", enabled), save, Amaterasu.field("New password", reset), setPassword, remove, status));
+                }
+                const username = Amaterasu.input("username");
+                username.required = true;
+                username.autocomplete = "off";
+                const password = Amaterasu.input("password", "", "password");
+                password.required = true;
+                password.autocomplete = "new-password";
+                const role = roleSelector();
+                role.value = "viewer";
+                const status = Amaterasu.el("div");
+                const create = Amaterasu.el("button", "button primary", "Create account");
+                create.type = "submit";
+                const form = Amaterasu.el("form", "settings-form", Amaterasu.field("Username", username), Amaterasu.field("Password", password), Amaterasu.field("Role", role), create, status);
+                form.addEventListener("submit", (event) => { event.preventDefault(); if (!form.reportValidity())
+                    return; void Amaterasu.runAction(create, status, async () => { await context.api.post("accounts/create", { username: username.value.trim(), password: password.value, role: role.value }); password.value = ""; context.notify("Account created."); await load(); }); });
+                area.replaceChildren(Amaterasu.panel("Manage accounts", Amaterasu.el("p", "muted", "Accounts share this host's resources. Permissions are enforced by the host."), list, form));
+            }
+            catch (error) {
+                if (context.content.isConnected) {
+                    if (error instanceof Amaterasu.ApiError && error.status === 403)
+                        area.replaceChildren();
+                    else
+                        area.replaceChildren(Amaterasu.errorPanel(error, load));
+                }
+            }
+        }
+        if (context.api.allows("configuration.write"))
+            void load();
+    }
+    Amaterasu.renderAccounts = renderAccounts;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    const registrations = new Map();
+    const loads = new Map();
+    const pendingScripts = new WeakMap();
+    const registry = {
+        v1: {
+            register(id, page) {
+                const script = document.currentScript;
+                if (!(script instanceof HTMLScriptElement) || pendingScripts.get(script)?.split("@")[0] !== id ||
+                    registrations.has(pendingScripts.get(script)) || typeof page !== "object" || page === null ||
+                    typeof page.title !== "string" || !page.title.trim() || page.title.length > 128 ||
+                    typeof page.mount !== "function")
+                    throw new Error("Invalid extension registration.");
+                registrations.set(pendingScripts.get(script), page);
+            },
+        },
+    };
+    Object.freeze(registry.v1);
+    Object.freeze(registry);
+    window.AmaterasuExtensions = registry;
+    function validExtension(value) {
+        if (!value || typeof value !== "object")
+            return false;
+        const record = value;
+        return typeof record.id === "string" && /^[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?$/.test(record.id) && record.id.length <= 64 &&
+            typeof record.name === "string" && !!record.name.trim() && record.name.length <= 128 &&
+            typeof record.digest === "string" && /^[a-f0-9]{64}$/.test(record.digest) &&
+            record.sdk_version === 1 && typeof record.entrypoint === "string" &&
+            /^[a-zA-Z0-9._/-]+\.js$/.test(record.entrypoint) &&
+            !record.entrypoint.split("/").some((part) => !part || part === "." || part === "..") &&
+            Array.isArray(record.methods) && record.methods.length <= 64 &&
+            record.methods.every((method) => !!method && typeof method === "object" &&
+                typeof method.alias === "string");
+    }
+    class ExtensionPages {
+        api;
+        descriptors = new Map();
+        cleanup = null;
+        controller = null;
+        generation = 0;
+        constructor(api) {
+            this.api = api;
+        }
+        async discover() {
+            const generation = ++this.generation;
+            const reply = await this.api.post("extensions/list");
+            if (generation !== this.generation || !Array.isArray(reply.extensions))
+                return [];
+            const entries = reply.extensions.filter(validExtension);
+            const counts = new Map();
+            for (const entry of entries)
+                counts.set(entry.id, (counts.get(entry.id) ?? 0) + 1);
+            this.descriptors = new Map(entries.filter((entry) => counts.get(entry.id) === 1).map((entry) => [entry.id, entry]));
+            return [...this.descriptors.values()];
+        }
+        dispose() {
+            this.controller?.abort();
+            this.controller = null;
+            const cleanup = this.cleanup;
+            this.cleanup = null;
+            try {
+                cleanup?.();
+            }
+            catch (error) {
+                console.error("Extension cleanup failed", error);
+            }
+        }
+        reset() {
+            this.generation++;
+            this.dispose();
+            this.descriptors.clear();
+        }
+        async mount(id, container) {
+            this.dispose();
+            const descriptor = this.descriptors.get(id);
+            if (!descriptor)
+                throw new Error("Extension is unavailable.");
+            const controller = new AbortController();
+            this.controller = controller;
+            const registrationKey = `${id}@${descriptor.digest}`;
+            let page = registrations.get(registrationKey);
+            if (!page) {
+                let loading = loads.get(registrationKey);
+                if (!loading) {
+                    const script = document.createElement("script");
+                    const base = document.querySelector('meta[name="amaterasu-api-base"]')?.content ?? "";
+                    const path = descriptor.entrypoint.split("/").map(encodeURIComponent).join("/");
+                    script.src = `${base}/v1/extensions/${encodeURIComponent(id)}/${descriptor.digest}/assets/${path}`;
+                    pendingScripts.set(script, registrationKey);
+                    loading = new Promise((resolve, reject) => {
+                        script.onload = () => {
+                            const registered = registrations.get(registrationKey);
+                            if (registered)
+                                resolve(registered);
+                            else
+                                reject(new Error("Extension did not register a page."));
+                        };
+                        script.onerror = () => reject(new Error("Extension could not be loaded."));
+                        document.head.append(script);
+                    }).finally(() => {
+                        pendingScripts.delete(script);
+                        script.remove();
+                        loads.delete(registrationKey);
+                    });
+                    loads.set(registrationKey, loading);
+                }
+                page = await loading;
+            }
+            if (controller.signal.aborted)
+                return;
+            if (!page)
+                throw new Error("Extension did not register a page.");
+            const aliases = new Set(descriptor.methods.map((method) => method.alias));
+            const sdk = Object.freeze({
+                version: 1,
+                signal: controller.signal,
+                call: (method, payload = {}) => {
+                    if (controller.signal.aborted || !aliases.has(method))
+                        return Promise.reject(new Error("Extension method is unavailable."));
+                    return this.api.post("extensions/call", { id, digest: descriptor.digest, method, payload })
+                        .then((reply) => {
+                        if (!Object.hasOwn(reply, "result"))
+                            throw new Error("Invalid extension response.");
+                        return reply.result;
+                    });
+                },
+            });
+            const cleanup = page.mount(container, sdk);
+            if (typeof cleanup === "function")
+                this.cleanup = cleanup;
+        }
+    }
+    Amaterasu.ExtensionPages = ExtensionPages;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function appTextLiteral(value) {
         return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
     }
@@ -12153,6 +12433,7 @@ var Amaterasu;
         applications: "Applications",
         steam: "Steam",
         diagnostics: "Diagnostics",
+        accounts: "Accounts",
     };
     const pageIcons = {
         updates: "+",
@@ -12164,6 +12445,18 @@ var Amaterasu;
         applications: "□",
         steam: "◇",
         diagnostics: "⌁",
+        accounts: "♙",
+    };
+    const corePages = new Map([
+        ["overview", Amaterasu.renderOverview], ["host", Amaterasu.renderHostManagement], ["catalog", Amaterasu.renderCatalog],
+        ["settings", Amaterasu.renderSettings], ["updates", Amaterasu.renderUpdates], ["sessions", Amaterasu.renderSessions],
+        ["applications", Amaterasu.renderApplications], ["steam", Amaterasu.renderSteam], ["diagnostics", Amaterasu.renderDiagnostics],
+        ["accounts", Amaterasu.renderAccounts],
+    ]);
+    const pageScopes = {
+        host: "configuration.read", catalog: "catalog.read", settings: "configuration.read",
+        updates: "configuration.read", sessions: "session.read", applications: "application.read",
+        steam: "steam.read", diagnostics: "diagnostics.read", accounts: "account.self",
     };
     class Application {
         api;
@@ -12171,6 +12464,8 @@ var Amaterasu;
         signedIn = false;
         content = Amaterasu.el("main");
         navigation = new Map();
+        extensions;
+        extensionIds = new Set();
         notification = Amaterasu.el("div");
         notificationTimer = 0;
         restorationGeneration = 0;
@@ -12185,6 +12480,7 @@ var Amaterasu;
                 main?.scrollIntoView();
             });
             this.api = new Amaterasu.Api(document.querySelector('meta[name="amaterasu-api-base"]')?.content ?? "");
+            this.extensions = new Amaterasu.ExtensionPages(this.api);
             this.api.onAuthenticationLost = () => {
                 if (this.signedIn) {
                     clearTimeout(this.notificationTimer);
@@ -12237,7 +12533,12 @@ var Amaterasu;
         }
         currentPage() {
             const value = location.hash.slice(1);
-            return Object.hasOwn(pageNames, value) ? value : "overview";
+            const core = Object.hasOwn(pageNames, value) && this.pageAvailable(value);
+            return core || (value.startsWith("extension/") && this.extensionIds.has(value.slice(10))) ? value : "overview";
+        }
+        pageAvailable(page) {
+            const scope = pageScopes[page];
+            return !scope || this.api.allows(scope) || (page === "accounts" && this.api.allows("configuration.write"));
         }
         navigate(page) {
             if (location.hash === `#${page}`)
@@ -12247,12 +12548,14 @@ var Amaterasu;
         }
         loginScreen() {
             this.signedIn = false;
+            this.extensions.reset();
+            this.extensionIds.clear();
             const main = Amaterasu.el("main", "login-layout");
             main.id = "main";
             main.tabIndex = -1;
             const brand = this.brand();
             const intro = Amaterasu.el("section", "login-intro", brand, Amaterasu.el("div", "", Amaterasu.badge("LOCAL HOST MANAGEMENT", "accent"), Amaterasu.el("h1", "", "Your host.\nWithin reach."), Amaterasu.el("p", "", "A considered place to organize applications, manage sessions, and keep an eye on your host.")), Amaterasu.el("p", "login-footnote", "Independent components. One clear view."));
-            const card = Amaterasu.el("section", "login-card", Amaterasu.el("p", "eyebrow", "WELCOME BACK"), Amaterasu.el("h2", "", "Connect to your host"), Amaterasu.el("p", "muted", "Sign in with the administrator credentials configured on this host."));
+            const card = Amaterasu.el("section", "login-card", Amaterasu.el("p", "eyebrow", "WELCOME BACK"), Amaterasu.el("h2", "", "Connect to your host"), Amaterasu.el("p", "muted", "Sign in with your host account."));
             const username = Amaterasu.input("username");
             username.autocomplete = "username";
             username.required = true;
@@ -12304,7 +12607,32 @@ var Amaterasu;
                     this.shell();
                 });
             });
-            const setup = Amaterasu.el("details", "setup-note", Amaterasu.el("summary", "", "First time setting up this host?"), Amaterasu.el("p", "", "An administrator must create the initial credentials through the trusted local console. Password setup is not available in this browser."), Amaterasu.el("p", "muted", "The management listener must be enabled and this browser origin allowed. Contact the person who configured the host."));
+            const setupCode = Amaterasu.input("enrollment_code");
+            setupCode.required = true;
+            setupCode.autocomplete = "off";
+            const setupUsername = Amaterasu.input("enrollment_username");
+            setupUsername.required = true;
+            setupUsername.autocomplete = "username";
+            const setupPassword = Amaterasu.input("enrollment_password", "", "password");
+            setupPassword.required = true;
+            setupPassword.autocomplete = "new-password";
+            const setupStatus = Amaterasu.el("div");
+            const setupSubmit = Amaterasu.el("button", "button primary", "Create administrator");
+            setupSubmit.type = "submit";
+            const setupForm = Amaterasu.el("form", "settings-form", Amaterasu.field("Code shown on the host", setupCode), Amaterasu.field("Username", setupUsername), Amaterasu.field("Password", setupPassword), setupSubmit, setupStatus);
+            setupForm.addEventListener("submit", (event) => {
+                event.preventDefault();
+                if (!setupForm.reportValidity())
+                    return;
+                void Amaterasu.runAction(setupSubmit, setupStatus, async () => {
+                    await this.api.post("auth/enroll", { code: setupCode.value.trim(), username: setupUsername.value.trim(), password: setupPassword.value }, false);
+                    username.value = setupUsername.value.trim();
+                    setupCode.value = "";
+                    setupPassword.value = "";
+                    setupStatus.replaceChildren(Amaterasu.el("p", "", "Administrator created. Sign in above."));
+                });
+            });
+            const setup = Amaterasu.el("details", "setup-note", Amaterasu.el("summary", "", "First time setting up this host?"), Amaterasu.el("p", "", "Enter the enrollment code displayed locally on the host to create the first administrator."), setupForm);
             card.append(form, setup, Amaterasu.el("div", "login-security", Amaterasu.el("span", "status-dot"), Amaterasu.el("span", "", this.api.usesSecureCookies
                 ? "Your browser sends protected session cookies only to this HTTPS host."
                 : "Same-origin scripts can read remembered tokens; localStorage is not HttpOnly protection or a native-code sandbox.")));
@@ -12318,12 +12646,16 @@ var Amaterasu;
         }
         shell() {
             this.signedIn = true;
+            this.extensions.reset();
+            this.extensionIds.clear();
             this.navigation.clear();
             const shell = Amaterasu.el("div", "shell");
             const sidebar = Amaterasu.el("aside", "sidebar");
             const nav = Amaterasu.el("nav", "navigation");
             Amaterasu.setLocalizedAttribute(nav, "aria-label", "Main navigation");
-            for (const page of Object.keys(pageNames)) {
+            for (const page of corePages.keys()) {
+                if (!this.pageAvailable(page))
+                    continue;
                 const icon = Amaterasu.el("span", "nav-icon", pageIcons[page]);
                 icon.setAttribute("aria-hidden", "true");
                 const item = Amaterasu.button(pageNames[page], () => {
@@ -12335,7 +12667,34 @@ var Amaterasu;
                 nav.append(item);
                 this.navigation.set(page, item);
             }
-            sidebar.append(this.brand(), Amaterasu.el("p", "nav-heading", "WORKSPACE"), nav, Amaterasu.el("div", "sidebar-bottom", Amaterasu.badge("Development preview"), Amaterasu.el("p", "muted", "Local management console"), Amaterasu.el("small", "muted", "Streaming features are in progress.")));
+            const extensionsNav = Amaterasu.el("nav", "navigation");
+            Amaterasu.setLocalizedAttribute(extensionsNav, "aria-label", "Extensions");
+            const extensionsHeading = Amaterasu.el("p", "nav-heading", "EXTENSIONS");
+            extensionsHeading.hidden = true;
+            void this.extensions.discover().then((entries) => {
+                if (!this.signedIn || !shell.isConnected)
+                    return;
+                for (const entry of entries) {
+                    this.extensionIds.add(entry.id);
+                    const page = `extension/${entry.id}`;
+                    const item = Amaterasu.button(appTextLiteral(entry.name), () => {
+                        shell.classList.remove("menu-open");
+                        menu.setAttribute("aria-expanded", "false");
+                        this.navigate(page);
+                    }, "nav-item");
+                    extensionsNav.append(item);
+                    this.navigation.set(page, item);
+                }
+                extensionsHeading.hidden = entries.length === 0;
+                if (location.hash.startsWith("#extension/"))
+                    this.renderPage(this.currentPage());
+            }).catch(() => {
+                if (this.signedIn && shell.isConnected) {
+                    extensionsHeading.textContent = "Extensions unavailable";
+                    extensionsHeading.hidden = false;
+                }
+            });
+            sidebar.append(this.brand(), Amaterasu.el("p", "nav-heading", "WORKSPACE"), nav, extensionsHeading, extensionsNav, Amaterasu.el("div", "sidebar-bottom", Amaterasu.badge("Development preview"), Amaterasu.el("p", "muted", "Local management console"), Amaterasu.el("small", "muted", "Streaming features are in progress.")));
             const menu = Amaterasu.button("☰", () => {
                 const open = shell.classList.toggle("menu-open");
                 menu.setAttribute("aria-expanded", String(open));
@@ -12378,6 +12737,7 @@ var Amaterasu;
             this.renderPage(this.currentPage());
         }
         renderPage(page) {
+            this.extensions.dispose();
             const fresh = Amaterasu.el("main", "content");
             fresh.id = "main";
             fresh.tabIndex = -1;
@@ -12396,19 +12756,22 @@ var Amaterasu;
                 notify: (message) => this.notify(message),
                 navigate: (page) => this.navigate(page),
             };
-            const renderers = {
-                overview: Amaterasu.renderOverview,
-                host: Amaterasu.renderHostManagement,
-                catalog: Amaterasu.renderCatalog,
-                settings: Amaterasu.renderSettings,
-                updates: Amaterasu.renderUpdates,
-                sessions: Amaterasu.renderSessions,
-                applications: Amaterasu.renderApplications,
-                steam: Amaterasu.renderSteam,
-                diagnostics: Amaterasu.renderDiagnostics,
-            };
-            renderers[page](context);
-            Amaterasu.setLocalizedPageTitle(pageNames[page]);
+            if (page.startsWith("extension/")) {
+                fresh.append(Amaterasu.el("p", "muted", "Loading extension…"));
+                void this.extensions.mount(page.slice(10), fresh).catch((error) => {
+                    if (fresh.isConnected)
+                        fresh.replaceChildren(Amaterasu.errorPanel(error));
+                });
+                Amaterasu.setLocalizedPageTitle("Extension");
+            }
+            else {
+                const corePage = page;
+                const renderer = corePages.get(corePage);
+                if (!renderer)
+                    return;
+                renderer(context);
+                Amaterasu.setLocalizedPageTitle(pageNames[corePage]);
+            }
             fresh.focus({ preventScroll: true });
             window.scrollTo(0, 0);
         }

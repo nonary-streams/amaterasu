@@ -1143,3 +1143,21 @@ test("diagnostics resync clears back navigation into evicted records", async () 
   assert.match(content.textContent, /Older records were removed/);
   assert.equal(findButton(content, "← Previous").disabled, true);
 });
+
+test("operator can stop managed launches but cannot terminate raw processes", async () => {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  const api = {
+    allows(scope) { return scope === "application.read"; },
+    allowsLaunchAction(action) { return action === "stop"; },
+    async post(route) {
+      if (route === "launch/list") return { launches: [{ launch_id: 1, app_id: "app-0000000000000001", state: "active" }] };
+      if (route === "application/list") return { processes: [{ process_id: 2, operation_id: "sample", state: "running" }], next_offset: null };
+      throw new Error(`Unexpected route ${route}`);
+    },
+  };
+  pages.renderApplications({ content, api, notify() {}, navigate() {} });
+  await waitFor(() => findButton(content, "Stop") && findButton(content, "Terminate"), "application controls");
+  assert.equal(findButton(content, "Stop").disabled, false);
+  assert.equal(findButton(content, "Terminate").disabled, true);
+});

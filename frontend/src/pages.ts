@@ -582,23 +582,45 @@ namespace Amaterasu {
     void load();
     void loadHistoryRuntime();
     void loadSaved();
-    renderHostMetricsDashboard(context, metricsArea, savedHistoryPanel);
+    if (context.api.allows("diagnostics.read")) renderHostMetricsDashboard(context, metricsArea, savedHistoryPanel);
+    else metricsArea.replaceChildren(el("p", "muted", "Host metrics are unavailable for this account."));
   }
 
   export function renderApplications(context: PageContext): void {
     const area = el("div");
     const status = el("div");
+    const launchesArea = el("div");
     let offset = 0;
     const history = [0];
     context.content.append(
       sectionHeading(
         "Applications",
         "Processes launched through this management console.",
-        button("Refresh", load),
+        button("Refresh", () => { void load(); void loadLaunches(); }),
       ),
       status,
+      panel("Managed launches", launchesArea),
       area,
     );
+    async function loadLaunches(): Promise<void> {
+      try {
+        const reply = await context.api.post<{ launches: { launch_id: number; app_id: string; state: string }[] }>("launch/list", { limit: 16 });
+        if (!context.content.isConnected) return;
+        if (!Array.isArray(reply.launches)) throw new Error("Invalid launch list.");
+        const rows = reply.launches.map((launch) => {
+          if (!Number.isSafeInteger(launch.launch_id) || launch.launch_id < 1 || typeof launch.app_id !== "string" || typeof launch.state !== "string") throw new Error("Invalid launch list.");
+          const stop = button("Stop", () => void runAction(stop, status, async () => {
+            if (!(await confirmAction("Stop this launch?", "The managed application and its preparation will be stopped.", "Stop"))) return;
+            await context.api.post("launch/stop", { launch_id: launch.launch_id });
+            context.notify("Stop requested. Refresh to check its status.");
+            await loadLaunches();
+          }));
+          stop.disabled = ["stopped", "failed"].includes(launch.state) || typeof context.api.allowsLaunchAction !== "function" || !context.api.allowsLaunchAction("stop");
+          return [pagesTextLiteral(launch.app_id), pagesTextLiteral(launch.state), stop];
+        });
+        launchesArea.replaceChildren(rows.length ? table(["Application", "State", "Action"], rows) : empty("No managed launches", "Applications started from the library appear here."));
+      } catch (error) { if (context.content.isConnected) launchesArea.replaceChildren(errorPanel(error, loadLaunches)); }
+    }
     async function load(): Promise<void> {
       try {
         const reply = await context.api.post<ProcessReply>("application/list", {
@@ -679,6 +701,7 @@ namespace Amaterasu {
       }
     }
     void load();
+    void loadLaunches();
   }
 
   interface SteamCatalogSyncStatus {

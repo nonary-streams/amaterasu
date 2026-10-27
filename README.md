@@ -11,7 +11,8 @@ packages, probes their lifecycle in a subprocess, and recovers failed activation
 Persistent state, schema-validated configuration, session/resource coordination,
 a scalable manual application catalog, tick-driven application preparation and
 process-tree cleanup, diagnostics, local Steam discovery, authentication, and a
-protected loopback management API are implemented as separate libraries. The
+protected management API are implemented as separate libraries. Plain HTTP is
+loopback-only; optional HTTPS supports configured private-network access. The
 echo module remains a test fixture.
 Software Opus encoding and UDP media delivery are independently packaged. A
 shared Rust protocol library handles RTSP/SDP parsing, audio/video packetization,
@@ -115,7 +116,7 @@ documented in the module READMEs.
 | `modules/steam` | Incremental local library discovery and bounded snapshot pagination |
 | `modules/authentication` | Durable password credentials, sessions, scoped tokens and revocation |
 | `modules/nvhttp` | Moonlight HTTP/TLS pairing, application lists and certificate-owned application/RTSP launch |
-| `modules/management` | Explicit loopback HTTP routes, origin/framing checks and token authorization |
+| `modules/management` | Loopback HTTP and optional HTTPS routes, origin/framing checks and token authorization |
 | `modules/capture-wgc` | Exact-monitor Windows Graphics Capture with joined worker ownership |
 | `modules/audio` | Windows WASAPI loopback with bounded borrowed PCM delivery |
 | `modules/audio-encode` | Caller-owned software Opus encoding, packet queues and drain |
@@ -170,3 +171,15 @@ and mouse packets through the leased input library; `scripts/test_stream_input.p
 verifies dispatch and release through an in-memory provider. Display optimization,
 broader media negotiation, resume, captured-monitor absolute input and real
 client/hardware playback remain parity gates.
+
+Browser HTTPS for development Linux session roots can be provisioned with the
+[Linux session setup and enrollment tools](docs/linux-session-profile.md#browser-https-on-a-private-network).
+The separate management certificate must be trusted by the browser; this does not
+change Moonlight pairing. Existing roots retain their saved policy and require a
+separate policy upgrade for the new account settings. Installed production
+provisioning and physical network qualification remain release work.
+
+Signed web extensions require explicit local publisher and method approval. They
+run as trusted same-origin JavaScript, not in a sandbox. See the
+[extension example](examples/web-extension/README.md) and
+[withdrawal procedure](docs/linux-session-profile.md#browser-https-on-a-private-network).

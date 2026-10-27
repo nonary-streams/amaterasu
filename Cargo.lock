@@ -285,6 +285,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-extension-example"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-contracts",
+ "amaterasu-module-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-frame-limiter"
 version = "0.1.0"
 dependencies = [

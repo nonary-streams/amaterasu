@@ -1,0 +1,12 @@
+[
+  {
+    "alias": "greet",
+    "provider": "example.extension-provider",
+    "service": "example.extension/1",
+    "method": "greet",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "scope": "catalog.read",
+    "min_role": "operator"
+  }
+]

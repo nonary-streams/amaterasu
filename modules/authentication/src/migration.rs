@@ -73,6 +73,8 @@ pub fn import_legacy_authentication(
                 case_insensitive_username: true,
             }),
             tokens: Vec::new(),
+            accounts: Vec::new(),
+            enrollment: None,
         };
         document
             .validate()
@@ -145,7 +147,7 @@ fn validate_existing_authentication(value: &Value, revision: u64) -> Result<(), 
     document
         .validate()
         .map_err(|_| "legacy_authentication_existing_state_invalid")?;
-    if document.credential.is_none() {
+    if document.credential.is_none() && document.accounts.is_empty() {
         return Err("legacy_authentication_existing_state_invalid");
     }
     Ok(())

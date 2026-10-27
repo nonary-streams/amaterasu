@@ -1,12 +1,20 @@
+use crate::accounts::{self, Account, Role};
 use crate::crypto;
 use crate::legacy_tokens::LegacyApiTokenStore;
 use crate::product_settings::TokenLifetimes;
 use crate::protocol::*;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use subtle::ConstantTimeEq;
 
 pub enum Change {
     Read(Value),
+    ReadProductSettings,
+    UpdateProductSettings {
+        session_token_ttl_seconds: u64,
+        remember_me_refresh_token_ttl_seconds: u64,
+        expected_revision: u64,
+    },
     WriteDocument {
         document: Document,
         response: Value,
@@ -30,6 +38,7 @@ pub enum Change {
 #[derive(Clone)]
 struct Session {
     credential_digest: String,
+    role: Role,
     policy_generation: u64,
     ownership_context_id: String,
     subject: String,
@@ -38,6 +47,38 @@ struct Session {
     refresh_expires_at: u64,
     refresh_token_digest: String,
     remember_me: bool,
+}
+
+struct ManagementBudget {
+    tokens: u32,
+    last_refill: Option<u64>,
+}
+
+impl Default for ManagementBudget {
+    fn default() -> Self {
+        Self {
+            tokens: 20,
+            last_refill: None,
+        }
+    }
+}
+
+impl ManagementBudget {
+    fn admit(&mut self, now: u64) -> Result<(), &'static str> {
+        // This is a process-wide backstop, not a peer limiter. The management
+        // service applies its own limits using the actual socket address. A
+        // short burst cannot impose a full-minute lockout on other clients.
+        if let Some(last) = self.last_refill {
+            let elapsed = now.saturating_sub(last).min(10);
+            self.tokens = self.tokens.saturating_add((elapsed as u32) * 2).min(20);
+        }
+        self.last_refill = Some(now);
+        if self.tokens == 0 {
+            return Err("rate_limited");
+        }
+        self.tokens -= 1;
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -52,6 +93,7 @@ pub struct Engine {
     refresh_index: BTreeMap<String, String>,
     attempts: BTreeMap<String, Attempts>,
     global_attempts: Attempts,
+    management_budget: ManagementBudget,
     latest_time: u64,
 }
 
@@ -63,6 +105,7 @@ impl Engine {
             refresh_index: BTreeMap::new(),
             attempts: BTreeMap::new(),
             global_attempts: Attempts::default(),
+            management_budget: ManagementBudget::default(),
             latest_time: 0,
         }
     }
@@ -84,26 +127,46 @@ impl Engine {
         now: u64,
     ) -> Result<(), &'static str> {
         operation.validate()?;
-        if (operation.requires_administrator()
-            || matches!(
-                operation,
-                Operation::Verify {
-                    legacy_request: Some(_),
-                    ..
-                }
-            ))
+        if matches!(operation, Operation::GenerateEnrollmentCode {})
+            && caller != "amaterasu.console"
+        {
+            return Err("forbidden");
+        }
+        if matches!(operation, Operation::EnrollFirstAdmin { .. })
+            && caller != "amaterasu.management"
+        {
+            return Err("forbidden");
+        }
+        if operation.requires_administrator()
             && !self.settings.administrator_principals.contains(caller)
         {
             return Err("forbidden");
         }
+        if matches!(
+            operation,
+            Operation::Verify {
+                legacy_request: Some(_),
+                ..
+            }
+        ) && !self.settings.administrator_principals.contains(caller)
+            && !self.settings.legacy_verifier_principals.contains(caller)
+        {
+            return Err("forbidden");
+        }
         let now = self.observe_time(now);
-        if matches!(operation, Operation::Login { .. }) {
+        if matches!(
+            operation,
+            Operation::Login { .. } | Operation::EnrollFirstAdmin { .. }
+        ) {
             self.limit_login(caller, now)?;
         }
         Ok(())
     }
 
     fn limit_login(&mut self, caller: &str, now: u64) -> Result<(), &'static str> {
+        if caller == "amaterasu.management" {
+            return self.management_budget.admit(now);
+        }
         self.attempts
             .retain(|_, attempts| now.saturating_sub(attempts.start) < 60);
         if now.saturating_sub(self.global_attempts.start) >= 60 {
@@ -142,23 +205,171 @@ impl Engine {
         session_document.validate()?;
         legacy_api_tokens.validate()?;
         let now = self.observe_time(now);
-        let credential_digest = document
-            .credential
-            .as_ref()
-            .map(|credential| crypto::token_digest(&credential.password_hash));
-        let scope_digest = Self::scope_digest(&self.settings.allowed_scopes);
+        let scope_digest = self.policy_digest();
         // Sidecar bindings must match the current credential, exact scope set,
         // and monotonic policy generation before a session is trusted.
-        self.restore_sessions(
-            &session_document,
-            credential_digest.as_deref(),
-            &scope_digest,
-        );
+        self.restore_sessions(&session_document, &document, &scope_digest);
         match operation {
+            Operation::GenerateEnrollmentCode {} => {
+                if document.credential.is_some() || !document.accounts.is_empty() {
+                    return Err("already_initialized");
+                }
+                let (code, code_digest) = crypto::issue_bearer()?;
+                let expires_at = now.checked_add(600).ok_or("clock_failure")?;
+                let mut document = document;
+                document.enrollment = Some(Enrollment {
+                    code_digest,
+                    expires_at,
+                });
+                Self::write(
+                    document,
+                    json!({"ok":true,"code":code,"expires_at":expires_at}),
+                )
+            }
+            Operation::EnrollFirstAdmin {
+                code,
+                username,
+                password,
+            } => {
+                if document.credential.is_some() || !document.accounts.is_empty() {
+                    return Err("already_initialized");
+                }
+                let enrollment = document.enrollment.as_ref().ok_or("unauthorized")?;
+                if enrollment.expires_at <= now
+                    || !bool::from(
+                        enrollment
+                            .code_digest
+                            .as_bytes()
+                            .ct_eq(crypto::token_digest(&code).as_bytes()),
+                    )
+                {
+                    return Err("unauthorized");
+                }
+                let mut document = document;
+                document.enrollment = None;
+                accounts::add_account(
+                    &mut document.accounts,
+                    None,
+                    Account {
+                        username,
+                        password_hash: crypto::hash_password(&password)?,
+                        authorization_id: String::new(),
+                        role: Role::Administrator,
+                        enabled: true,
+                    },
+                )?;
+                Self::write(document, json!({"ok":true}))
+            }
+            Operation::ListAccounts { bearer } => {
+                self.require_admin_session(&bearer, now)?;
+                let mut accounts = document
+                    .accounts
+                    .iter()
+                    .map(|a| json!({"username":a.username,"role":a.role,"enabled":a.enabled}))
+                    .collect::<Vec<_>>();
+                if let Some(legacy) = &document.credential {
+                    accounts.push(json!({"username":legacy.username,"role":Role::Administrator,"enabled":true}));
+                }
+                Ok(Change::Read(json!({"ok":true,"accounts":accounts})))
+            }
+            Operation::CreateAccount {
+                bearer,
+                username,
+                password,
+                role,
+            } => {
+                self.require_admin_session(&bearer, now)?;
+                let mut document = document;
+                accounts::add_account(
+                    &mut document.accounts,
+                    document.credential.as_ref(),
+                    Account {
+                        username,
+                        password_hash: crypto::hash_password(&password)?,
+                        authorization_id: String::new(),
+                        role,
+                        enabled: true,
+                    },
+                )?;
+                Self::write(document, json!({"ok":true}))
+            }
+            Operation::UpdateAccount {
+                bearer,
+                username,
+                role,
+                enabled,
+            } => {
+                self.require_admin_session(&bearer, now)?;
+                let mut document = document;
+                Self::migrate_legacy(&mut document)?;
+                accounts::update_account(&mut document.accounts, None, &username, role, enabled)?;
+                Self::write(document, json!({"ok":true}))
+            }
+            Operation::DeleteAccount { bearer, username } => {
+                self.require_admin_session(&bearer, now)?;
+                let mut document = document;
+                Self::migrate_legacy(&mut document)?;
+                accounts::delete_account(&mut document.accounts, None, &username)?;
+                Self::write(document, json!({"ok":true}))
+            }
+            Operation::SetAccountPassword {
+                bearer,
+                username,
+                password,
+            } => {
+                self.require_admin_session(&bearer, now)?;
+                let mut document = document;
+                Self::migrate_legacy(&mut document)?;
+                let account = document
+                    .accounts
+                    .iter_mut()
+                    .find(|a| a.username.eq_ignore_ascii_case(&username))
+                    .ok_or("account_not_found")?;
+                accounts::rotate_authorization(account)?;
+                account.password_hash = crypto::hash_password(&password)?;
+                Self::write(document, json!({"ok":true}))
+            }
+            Operation::ChangeOwnPassword {
+                bearer,
+                current_password,
+                new_password,
+            } => {
+                let subject = self.active_session(&bearer, now)?.subject.clone();
+                let mut document = document;
+                Self::migrate_legacy(&mut document)?;
+                let account = document
+                    .accounts
+                    .iter_mut()
+                    .find(|a| a.username == subject)
+                    .ok_or("unauthorized")?;
+                if !crypto::verify_password(&current_password, &account.password_hash) {
+                    return Err("unauthorized");
+                }
+                accounts::rotate_authorization(account)?;
+                account.password_hash = crypto::hash_password(&new_password)?;
+                Self::write(document, json!({"ok":true}))
+            }
             Operation::Status {} => Ok(Change::Read(json!({
                 "ok": true,
-                "verifier_available": document.credential.is_some(),
+                "verifier_available": document.credential.is_some() || !document.accounts.is_empty(),
             }))),
+            Operation::AccountSettingsGet { bearer } => {
+                self.require_admin_session(&bearer, now)?;
+                Ok(Change::ReadProductSettings)
+            }
+            Operation::AccountSettingsUpdate {
+                bearer,
+                session_token_ttl_seconds,
+                remember_me_refresh_token_ttl_seconds,
+                expected_revision,
+            } => {
+                self.require_admin_session(&bearer, now)?;
+                Ok(Change::UpdateProductSettings {
+                    session_token_ttl_seconds,
+                    remember_me_refresh_token_ttl_seconds,
+                    expected_revision,
+                })
+            }
             Operation::SettingsGet {} | Operation::SettingsUpdate { .. } => Err("invalid_request"),
             Operation::Setup { username, password } => Self::setup(document, username, password),
             Operation::ChangePassword { password } => Self::change_password(document, password),
@@ -237,19 +448,12 @@ impl Engine {
         mut session_document: SessionDocument,
         now: u64,
     ) -> (SessionDocument, bool) {
-        let credential_digest = credential_document
-            .credential
-            .as_ref()
-            .map(|credential| crypto::token_digest(&credential.password_hash));
-        let scope_digest = Self::scope_digest(&self.settings.allowed_scopes);
+        let scope_digest = self.policy_digest();
         let original_len = session_document.sessions.len();
         let original_version = session_document.version;
         session_document.sessions.retain_mut(|session| {
-            let eligible = Some(session.credential_digest.as_str()) == credential_digest.as_deref()
-                && credential_document
-                    .credential
-                    .as_ref()
-                    .is_some_and(|credential| session.subject == credential.username)
+            let eligible = Self::identity(credential_document, &session.subject)
+                .is_some_and(|(digest, _)| session.credential_digest == digest)
                 && session.scope_digest == scope_digest
                 && session.policy_generation == Some(self.settings.authorization_policy_generation)
                 && session.refresh_expires_at > now.max(self.latest_time);
@@ -264,14 +468,69 @@ impl Engine {
         (session_document, removed)
     }
 
+    fn identity(document: &Document, subject: &str) -> Option<(String, Role)> {
+        if let Some(credential) = document
+            .credential
+            .as_ref()
+            .filter(|c| c.username == subject)
+        {
+            return Some((
+                crypto::token_digest(&credential.password_hash),
+                Role::Administrator,
+            ));
+        }
+        let account = document
+            .accounts
+            .iter()
+            .find(|a| a.username == subject && a.enabled)?;
+        Some((accounts::credential_digest(account), account.role))
+    }
+
+    fn active_session(&self, bearer: &str, now: u64) -> Result<&Session, &'static str> {
+        self.sessions
+            .get(&crypto::token_digest(bearer))
+            .filter(|s| s.expires_at > now)
+            .ok_or("unauthorized")
+    }
+
+    fn require_admin_session(&self, bearer: &str, now: u64) -> Result<(), &'static str> {
+        if self.active_session(bearer, now)?.role != Role::Administrator {
+            return Err("forbidden");
+        }
+        Ok(())
+    }
+
+    // Migrating the credential is one CAS-protected document write. Session
+    // bindings change, so interrupted sidecar updates cannot preserve access.
+    fn migrate_legacy(document: &mut Document) -> Result<(), &'static str> {
+        if let Some(credential) = document.credential.take() {
+            if credential.legacy_salt.is_some() {
+                return Err("login_required");
+            }
+            accounts::add_account(
+                &mut document.accounts,
+                None,
+                Account {
+                    username: credential.username,
+                    password_hash: credential.password_hash,
+                    authorization_id: String::new(),
+                    role: Role::Administrator,
+                    enabled: true,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn setup(
         mut document: Document,
         username: String,
         password: String,
     ) -> Result<Change, &'static str> {
-        if document.credential.is_some() {
+        if document.credential.is_some() || !document.accounts.is_empty() {
             return Err("already_initialized");
         }
+        document.enrollment = None;
         document.credential = Some(Credential {
             username,
             password_hash: crypto::hash_password(&password)?,
@@ -282,9 +541,21 @@ impl Engine {
     }
 
     fn change_password(mut document: Document, password: String) -> Result<Change, &'static str> {
-        let credential = document.credential.as_mut().ok_or("not_initialized")?;
-        credential.password_hash = crypto::hash_password(&password)?;
-        credential.legacy_salt = None;
+        if let Some(credential) = document.credential.as_mut() {
+            credential.password_hash = crypto::hash_password(&password)?;
+            credential.legacy_salt = None;
+        } else {
+            let mut admins = document
+                .accounts
+                .iter_mut()
+                .filter(|account| account.enabled && account.role == Role::Administrator);
+            let account = admins.next().ok_or("not_initialized")?;
+            if admins.next().is_some() {
+                return Err("ambiguous_account");
+            }
+            accounts::rotate_authorization(account)?;
+            account.password_hash = crypto::hash_password(&password)?;
+        }
         document.validate().map_err(|_| "resource_limit")?;
         Ok(Change::WriteDocument {
             document,
@@ -312,24 +583,37 @@ impl Engine {
         now: u64,
         scope_digest: String,
     ) -> Result<Change, &'static str> {
-        let credential = document.credential.as_ref().ok_or("unauthorized")?;
-        let valid_username = if credential.case_insensitive_username {
-            username.eq_ignore_ascii_case(&credential.username)
-        } else {
-            username == credential.username
-        };
-        let valid_password = match &credential.legacy_salt {
-            Some(salt) => {
-                crypto::verify_legacy_password(&password, salt, &credential.password_hash)
+        let legacy = document.credential.as_ref().filter(|credential| {
+            if credential.case_insensitive_username {
+                username.eq_ignore_ascii_case(&credential.username)
+            } else {
+                username == credential.username
             }
-            None => crypto::verify_password(&password, &credential.password_hash),
+        });
+        let (subject, role, migrate, upgrade_hash) = if let Some(credential) = legacy {
+            let valid = match &credential.legacy_salt {
+                Some(salt) => {
+                    crypto::verify_legacy_password(&password, salt, &credential.password_hash)
+                }
+                None => crypto::verify_password(&password, &credential.password_hash),
+            };
+            if !valid {
+                return Err("unauthorized");
+            }
+            (
+                credential.username.clone(),
+                Role::Administrator,
+                true,
+                credential.legacy_salt.is_some(),
+            )
+        } else {
+            let account =
+                accounts::find_account(&document.accounts, &username).ok_or("unauthorized")?;
+            if !account.enabled || !crypto::verify_password(&password, &account.password_hash) {
+                return Err("unauthorized");
+            }
+            (account.username.clone(), account.role, false, false)
         };
-        if !valid_password || !valid_username {
-            return Err("unauthorized");
-        }
-        // Legacy usernames can be matched without regard to ASCII case, but
-        // the authenticated identity must remain the saved administrator name.
-        let subject = credential.username.clone();
         let (bearer, digest) = crypto::issue_bearer()?;
         let (_, ownership_context_id) = crypto::issue_bearer()?;
         let (refresh_token, refresh_digest) = crypto::issue_bearer()?;
@@ -344,10 +628,9 @@ impl Engine {
             .checked_add(self.settings.session_token_ttl_seconds)
             .ok_or("clock_failure")?
             .min(refresh_expires_at);
-        let scopes = self.settings.allowed_scopes.clone();
-        let response = json!({"ok":true,"bearer":bearer,"refresh_token":refresh_token,"kind":"administrator_session","subject":subject,"scopes":scopes,"expires_at":expires_at,"refresh_expires_at":refresh_expires_at,"remember_me":remember_me});
-        let upgraded = credential.legacy_salt.is_some();
-        if upgraded {
+        let scopes = self.role_scopes(role);
+        let response = json!({"ok":true,"bearer":bearer,"refresh_token":refresh_token,"kind":"administrator_session","subject":subject,"role":role,"scopes":scopes,"expires_at":expires_at,"refresh_expires_at":refresh_expires_at,"remember_me":remember_me});
+        if upgrade_hash {
             let credential = document
                 .credential
                 .as_mut()
@@ -355,16 +638,15 @@ impl Engine {
             credential.password_hash = crypto::hash_password(&password)?;
             credential.legacy_salt = None;
         }
-        let credential = document
-            .credential
-            .as_ref()
-            .expect("credential checked above");
-        let credential_digest = crypto::token_digest(&credential.password_hash);
+        if migrate {
+            Self::migrate_legacy(&mut document)?;
+            self.sessions
+                .retain(|_, session| session.subject != subject);
+            self.refresh_index
+                .retain(|_, id| self.sessions.contains_key(id));
+        }
+        let (credential_digest, _) = Self::identity(&document, &subject).ok_or("unauthorized")?;
         document.validate().map_err(|_| "resource_limit")?;
-        self.sessions
-            .retain(|_, session| session.credential_digest == credential_digest);
-        self.refresh_index
-            .retain(|_, session_id| self.sessions.contains_key(session_id));
         if self.sessions.len() >= MAX_SESSIONS {
             // A client can lose every bearer during a reload while its
             // remembered sessions remain durable. Reclaim the session with
@@ -382,6 +664,7 @@ impl Engine {
             digest.clone(),
             Session {
                 credential_digest,
+                role,
                 policy_generation: self.settings.authorization_policy_generation,
                 ownership_context_id,
                 subject,
@@ -394,7 +677,7 @@ impl Engine {
         );
         self.refresh_index.insert(refresh_digest, digest);
         let sessions = self.build_session_document(&scope_digest)?;
-        if upgraded {
+        if migrate {
             Ok(Change::WriteBoth {
                 document,
                 sessions,
@@ -452,6 +735,7 @@ impl Engine {
             "refresh_token": new_refresh_token,
             "kind": "administrator_session",
             "subject": session.subject,
+            "role": session.role,
             "scopes": session.scopes,
             "expires_at": session.expires_at,
             "refresh_expires_at": session.refresh_expires_at,
@@ -472,13 +756,17 @@ impl Engine {
     fn restore_sessions(
         &mut self,
         document: &SessionDocument,
-        credential_digest: Option<&str>,
+        credentials: &Document,
         scope_digest: &str,
     ) {
         self.sessions.clear();
         self.refresh_index.clear();
         for record in &document.sessions {
-            if Some(record.credential_digest.as_str()) != credential_digest
+            let Some((credential_digest, role)) = Self::identity(credentials, &record.subject)
+            else {
+                continue;
+            };
+            if record.credential_digest != credential_digest
                 || record.scope_digest != scope_digest
                 || record.policy_generation != Some(self.settings.authorization_policy_generation)
                 || record.refresh_expires_at <= self.latest_time
@@ -493,6 +781,7 @@ impl Engine {
                 record.session_id.clone(),
                 Session {
                     credential_digest: record.credential_digest.clone(),
+                    role,
                     policy_generation: record
                         .policy_generation
                         .expect("session generation was validated before restoration"),
@@ -501,7 +790,7 @@ impl Engine {
                         .clone()
                         .unwrap_or_else(|| record.session_id.clone()),
                     subject: record.subject.clone(),
-                    scopes: self.settings.allowed_scopes.clone(),
+                    scopes: self.role_scopes(role),
                     expires_at: record.expires_at,
                     refresh_expires_at: record.refresh_expires_at,
                     refresh_token_digest: record.refresh_token_digest.clone(),
@@ -542,6 +831,31 @@ impl Engine {
         })
     }
 
+    fn role_scopes(&self, role: Role) -> BTreeSet<String> {
+        let mut scopes = accounts::role_scopes(role, &self.settings.allowed_scopes);
+        for (scope, minimum) in &self.settings.scope_minimum_roles {
+            if role == Role::Administrator
+                || *minimum == Role::Viewer
+                || (role == Role::Operator && *minimum == Role::Operator)
+            {
+                scopes.insert(scope.clone());
+            }
+        }
+        scopes
+    }
+
+    fn policy_digest(&self) -> String {
+        if self.settings.scope_minimum_roles.is_empty() {
+            return Self::scope_digest(&self.settings.allowed_scopes);
+        }
+        let canonical = serde_json::to_string(&(
+            &self.settings.allowed_scopes,
+            &self.settings.scope_minimum_roles,
+        ))
+        .expect("serializing authentication policy cannot fail");
+        crypto::token_digest(&canonical)
+    }
+
     fn scope_digest(scopes: &BTreeSet<String>) -> String {
         let canonical_scopes =
             serde_json::to_string(scopes).expect("serializing authentication scopes cannot fail");
@@ -564,7 +878,7 @@ impl Engine {
             }
             self.authorize_scopes(&session.scopes, &required_scopes)?;
             return Ok(Change::Read(
-                json!({"ok":true,"kind":"administrator_session","subject":session.subject,"scopes":session.scopes,"expires_at":session.expires_at,"auth_context_id":session.ownership_context_id}),
+                json!({"ok":true,"kind":"administrator_session","subject":session.subject,"role":session.role,"scopes":session.scopes,"expires_at":session.expires_at,"auth_context_id":session.ownership_context_id}),
             ));
         }
         if let Some(token) = document
@@ -615,7 +929,7 @@ impl Engine {
         ttl_seconds: u64,
         now: u64,
     ) -> Result<Change, &'static str> {
-        if document.credential.is_none() {
+        if document.credential.is_none() && document.accounts.is_empty() {
             return Err("not_initialized");
         }
         self.authorize_scopes(&scopes, &scopes)?;

@@ -1,8 +1,8 @@
 # Authentication authority
 
-`amaterasu-authentication` serves `amaterasu.authentication/1`. It provides one
-administrator password credential, short-lived opaque bearer sessions, and
-scoped API tokens. It is an independently built native module; HTTP routing,
+`amaterasu-authentication` serves `amaterasu.authentication/1`. It provides
+local accounts with administrator, operator and viewer roles, short-lived opaque
+bearer sessions, and scoped API tokens. It is an independently built native module; HTTP routing,
 TLS, cookies, CSRF protection, public network policy, and frontend identity are
 separate responsibilities. Native code is trusted; runtime grants are not a
 native-code sandbox.
@@ -36,7 +36,9 @@ use payload caller, username, token
 subject, or HTTP-supplied role claims as runtime authority.
 
 `authorization_policy_generation` is a deployment-maintained monotonic counter.
-Increase it whenever `allowed_scopes` or `administrator_principals` changes,
+Increase it whenever authentication authorization policy changes, including
+`allowed_scopes`, `scope_minimum_roles`, `legacy_verifier_principals`, or
+`administrator_principals`,
 including when restoring an earlier policy value. Never decrease or reuse a
 generation. This preserves revocation across a policy change and revert that
 occurs while the authentication module is stopped or receives no request. A
@@ -52,7 +54,28 @@ digest remains an additional check when a policy change is observed even
 if the generation was not advanced. This counter is part of module startup
 settings and is separate from the product-document revision for token lifetimes.
 
-The following strict JSON actions are supported:
+Configured administrators can locally generate a short-lived, single-use
+enrollment code for the first administrator. A browser may exchange that code
+for the initial account; enrollment is rejected after initialization. The
+[development Linux procedure](../../docs/linux-session-profile.md#browser-https-on-a-private-network)
+uses a stopped-host probe to issue the code. The local console setup action
+remains available.
+
+Accounts are limited to 32, including an existing legacy credential. Usernames
+are case-insensitively unique. Viewer and operator scopes are fixed allowlists
+intersected with `allowed_scopes`; administrator sessions receive allowed
+scopes. `scope_minimum_roles` can grant explicitly configured additional
+allowed scopes to roles. Auth validates the active administrator session for
+account administration, and self-password changes require the current password.
+Changes to credentials, role or enabled state invalidate the affected account's
+sessions. At least one enabled administrator must remain.
+
+The management runtime principal need not be an authentication administrator.
+Its account and settings requests carry the user's verified bearer, which auth
+checks again. `legacy_verifier_principals` narrowly authorizes legacy request
+verification; it does not authorize setup, token issuance or account management.
+
+The following strict JSON actions include:
 
 ```json
 {"action":"setup","username":"admin","password":"a long administrator password"}
@@ -70,9 +93,11 @@ The following strict JSON actions are supported:
 {"action":"revoke_token","token_id":"<64 lowercase hex digest digits>"}
 ```
 
-Setup, lifetime settings, password rotation, session administration, token
-issuance, listing, and revocation require the immediate runtime caller to appear
-in administrator settings. Lifetime updates are persisted before acknowledgment
+The console setup, privileged lifetime settings, administrator password reset,
+session administration and API token issuance, listing and revocation require
+the immediate runtime caller to appear in administrator settings. Separate
+bearer-checked account and lifetime-setting actions support browser
+administration. Lifetime updates are persisted before acknowledgment
 and use compare-and-swap revisions; login and refresh load the committed values
 before issuing tokens. TTL edits affect subsequently issued tokens but do not
 extend an existing session's absolute refresh expiry; refresh rotation also
@@ -90,7 +115,7 @@ changes the password hash, and invalidates every login session after write
 acknowledgment. Session authorization also checks its credential fingerprint
 against loaded state, covering a committed rotation whose acknowledgment was
 lost to cancellation. A failed uncommitted write leaves existing sessions valid.
-Configured administrator callers can list all administrator-session metadata in
+Configured administrator callers can list all session metadata in
 pages of 1–4 entries (default 4), with `next_offset`, and idempotently revoke a
 session by `session_id`. Session IDs are digest metadata, never reusable bearer
 secrets; listings omit credential fingerprints. Frontends cannot administer
@@ -134,7 +159,7 @@ installer must call `validate` before takeover and call `seed` only on the copie
 `DATA_ROOT/legacy-imports/PRODUCT` source.
 
 Successful login returns `ok`, access `bearer`, `refresh_token`,
-`kind:"administrator_session"`, `subject` (the administrator username), `scopes`,
+`kind:"administrator_session"`, `subject`, `role`, `scopes`,
 `expires_at`, `refresh_expires_at`, and `remember_me`. At login, select the
 configured `remember_me_refresh_token_ttl_seconds` for remembered sessions or
 the fixed 86,400 seconds otherwise. The absolute refresh expiry is login time
@@ -147,7 +172,7 @@ may renew access expiry but keeps the absolute refresh expiry fixed. The refresh
 token is accepted only by `refresh` and `logout`; either it or the access bearer
 can revoke the entire session pair. Logout is idempotent and does not revoke API
 tokens. Session metadata listings include access and refresh expiration plus the
-remember-me flag, but never either secret. Both administrator session
+remember-me flag, but never either secret. Both session
 expirations are strict: access is valid only while `expires_at > now`, and
 refresh is valid only while `refresh_expires_at > now`; equality returns the
 existing `unauthorized` response. Refresh remains possible after access expiry
@@ -158,17 +183,18 @@ This expiry-boundary behavior does not change the success/error response shape,
 session or credential document fields, state keys, schema versions, or service
 version. API-token expiry semantics are unchanged.
 
-Administrator sessions persist in a separate versioned
-`authentication/sessions/v1` state document (schema version 2), apart from
+Account sessions persist in a separate versioned
+`authentication/sessions/v1` state document (schema version 3), apart from
 credential and API-token state at `authentication/v1`. The session document is
 bounded to 16 records and 12,000 serialized bytes. It stores bearer digests,
 credential and scope digests, the policy generation, and session metadata; it
 never stores raw bearer or refresh-token secrets. On module restart, sessions
 restore only when their credential and configured-scope digests and policy
 generation still match and their absolute refresh expiry has not passed. Legacy
-schema version 1 sidecars have no generation and are therefore rejected and
-durably upgraded to an empty schema version 2 document before the request is
-processed. The administrator token lifetime settings remain durable across
+schema version 1 records without a generation fail the current policy check.
+Eligible version 2 sessions are upgraded to version 3 while retaining credential,
+scope, generation and expiry checks; incompatible sessions are pruned. The
+administrator token lifetime settings remain durable across
 module restarts, and lifetime edits alone do not advance the authorization-policy
 generation or invalidate sessions. The packaged runtime profile supplies
 default TTL settings, and the management API and settings editor expose
@@ -189,11 +215,10 @@ verification and refresh. This keeps password login available when earlier
 sessions are no longer accessible to the user, including sessions whose token
 delivery was cancelled.
 
-Backend restart does not itself end a valid administrator session. The current
-browser client holds bearer and refresh tokens only in memory, so reloading or
-closing the page discards those secrets and requires another login, even with
-`remember_me`. A still-open page can continue using its tokens after a worker
-restart, subject to expiry, revocation, and policy checks.
+Backend restart does not itself end a valid account session. The current
+HTTPS browser client uses secure HttpOnly access and refresh cookies. A remembered
+session can refresh after a browser restart until its absolute expiry; logout,
+credential changes and policy changes remain subject to server-side revocation.
 
 Token issuance returns `ok`, the one-time `bearer`, its `token_id`, `scopes`, and
 `expires_at`. The ID is the SHA-256 bearer digest and may be used for revocation;
@@ -232,13 +257,19 @@ separate requests. Cancelled session delivery can occupy a session slot until
 expiry. State failures deny access and do not fall back to cached credentials or
 API-token records.
 
-Login admission permits at most five attempts per runtime caller per 60 seconds
-and 20 attempts globally per window. The bounded in-memory rate ledger is keyed
-by runtime callers, not client-supplied usernames or addresses. A shared frontend
-therefore shares one budget; a public HTTP provider should apply additional
-network-aware admission controls. The ledger resets on restart. Hashing is
-synchronous and bounded by the specified Argon2 cost; it can briefly occupy the
-module's tick. Time is monotonic-clamped within an instance. Persistent token
+For callers other than `amaterasu.management`, login admission permits at most
+five attempts per runtime principal per 60 seconds and 20 attempts across those
+principals per window. Management uses an independent in-memory token bucket
+with a burst capacity of 20 and a refill of two attempts per second. It covers
+login and first-administrator enrollment; a burst can exhaust the bucket, but
+it regains capacity on the next second rather than remaining closed for the
+whole minute. Management also enforces separate per-peer and peer/account
+limits using the actual socket address; authentication never trusts an
+HTTP-supplied peer address. A sufficiently distributed or sustained load can
+still saturate the shared backstop or the serial authentication worker.
+Both in-memory ledgers reset on restart. Hashing is synchronous and bounded by
+the specified Argon2 cost; it can briefly occupy the module's tick. Time is
+monotonic-clamped within an instance. Persistent token
 expiry depends on the host wall clock across restarts; this module does not offer
 an independent trusted clock or rollback-resistant storage.
 
@@ -249,8 +280,8 @@ Errors include `invalid_request`, `forbidden`, `unauthorized`, `rate_limited`,
 `clock_failure`. Unknown fields are rejected; request JSON is bounded to 4096
 serialized bytes. Error replies are `{"ok":false,"code":"..."}`.
 
-Offline password recovery, multiple human users, external identity
-providers, MFA, audit trails, and password breach checks remain unimplemented.
+Offline password recovery, external identity providers, MFA, audit trails, and
+password breach checks remain unimplemented.
 Offline state/host compromise is outside this in-process authority boundary.
 
 Tests exercise the real Argon2 implementation, asynchronous state request/reply

@@ -8,12 +8,14 @@ namespace Amaterasu {
     | "sessions"
     | "applications"
     | "steam"
-    | "diagnostics";
+    | "diagnostics"
+    | "accounts";
   export type Payload = Record<string, unknown>;
   export interface LoginReply {
     ok: boolean;
     bearer: string;
     subject: string;
+    role?: "administrator" | "operator" | "viewer";
     scopes: string[];
     expires_at: number;
   }

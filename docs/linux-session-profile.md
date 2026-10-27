@@ -161,7 +161,7 @@ and control transports accept only the stream session. Only the stream chain,
 the video module and read-only management enumeration can call `capture-kms`;
 only NVHTTP, RTSP and the stream session can call `virtual-display`.
 
-Authentication has its own authorization generation (5). Advance it with any
+Authentication has its own authorization generation (9). Advance it with any
 change to the administrator principals or allowed scopes, including a revert;
 TTL edits do not need it.
 
@@ -221,3 +221,53 @@ device on the LAN; real Moonlight pairing and streaming
 (`qualification-real-client-harness`); mDNS discovery; and any capture, display,
 audio or input effect, which the owning tasks qualify under the native lock with
 a fresh baseline.
+
+## Browser HTTPS on a private network
+
+For an initialized development Linux session root with its component and web packages staged,
+select a concrete RFC 1918, 100.64.0.0/10 VPN, or IPv6 ULA address assigned to this host. Stop the Amaterasu host
+before provisioning; the setup command takes the same root lock as the host and
+fails if it is busy. This does not change the Moonlight listeners or firewall.
+
+```sh
+python3 scripts/setup_linux_management.py /absolute/path/to/ROOT --address 192.168.1.20
+```
+
+The default HTTPS port is 48081; `--port` selects another. The script retains the
+loopback HTTP setting, creates a separate private management certificate and key
+with the selected IP in its subject alternative names, and displays the URL and
+SHA-256 fingerprint. Repeat the command with the same address to reuse the
+identity. To use a certificate trusted by browsers, pass `--certificate` and
+`--private-key` with matching PEM files; the key must be owned by the current
+user and inaccessible to other users. The certificate must currently be valid, permit TLS server authentication, and cover the selected IP.
+Changing the address requires a suitable replacement identity. Existing roots keep their saved authentication policy; setup warns if it predates the account scopes and restricted management verifier. Upgrade that policy separately before using accounts, preserving its other settings and advancing its authorization generation. The generated
+self-signed certificate is not automatically trusted: install or approve its
+certificate in the browser using the browser's trust procedure, after checking
+its fingerprint through a trusted local channel. Keep the private key private.
+
+For a fresh root, issue the short-lived, single-use enrollment code locally while
+the host is stopped, after staging the active components:
+
+```sh
+python3 scripts/enroll_linux_management.py /absolute/path/to/ROOT /absolute/path/to/amaterasu
+```
+
+This runs a temporary local worker under the root lock and exits before the
+normal host starts. It displays the URL, fingerprint, code and expiry; do not
+share the code except with the browser that is enrolling. Start the normal host
+and use that code before it expires. Existing initialized installations do not
+need to enroll again. Neither command starts or restarts a service.
+
+To withdraw an approved web extension from a development root, stop the host and
+run:
+
+```sh
+python3 scripts/withdraw_linux_extension.py /absolute/path/to/ROOT EXTENSION_ID
+```
+
+The command matches the explicit extension ID in the local approval (which the
+server checks against the signed manifest), removes that approval, and advances the authentication
+authorization generation, revoking existing sessions when the host next starts.
+It retains the staged bundle and publisher history. Close every browser tab that
+was open before withdrawal: a script already loaded in a tab can still execute.
+This local action does not revoke the publisher's key elsewhere.

@@ -35,8 +35,9 @@ The Moonlight pairing identity and its certificate are not browser TLS material.
 The installed host additionally requires nonzero TLS ports and content-addressed
 files under its private `management-tls` state directory, selected through the
 worker-state-root token. File digest, ownership, permissions, containment and
-reparse checks remain mandatory. Generated development certificates retain
-loopback SANs; selecting a remote bind alone does not qualify remote TLS identity.
+reparse checks remain mandatory. The development Linux setup tool generates or validates a separate identity for
+the selected assigned private address; selecting a remote bind alone does not
+qualify a certificate. See [setup and enrollment](../../docs/linux-session-profile.md#browser-https-on-a-private-network).
 
 `origin_web_ui_allowed` selects the maximum source tier for HTTPS ingress:
 `pc` permits IPv4 127/8 and IPv6 ::1, `lan` additionally permits RFC1918,
@@ -85,10 +86,16 @@ browser/platform qualification.
 
 ## Authentication and routes
 
-Create the password only through the trusted local authentication console API.
-There is no HTTP password setup, token creation/revocation, arbitrary runtime
-command, or direct state API. The auth library must configure only trusted local
-administrator principals; do not make the management principal an administrator.
+A trusted local console can initialize authentication or generate a short-lived
+one-time first-administrator enrollment code. The browser can exchange that code
+at `/v1/auth/enroll`; enrollment fails after initialization. The development
+Linux enrollment helper issues the code under the stopped host's root lock.
+Account administration forwards the session bearer to authentication, which
+checks the administrator role itself; changing one's own password requires the
+current password. There is no arbitrary runtime command or direct state API.
+Keep management out of authentication `administrator_principals`; its narrowly
+scoped `legacy_verifier_principals` permission supports legacy request checks.
+Pairing has its own separate administrator principal policy.
 
 All business routes are POST and accept `Content-Type: application/json` with an
 object body. The route supplies `action`; including `action` in the body is an
@@ -126,6 +133,10 @@ Plaintext requests cannot use browser cookie routes or cookie authentication.
 
 | Route prefix | Actions | Required scope |
 | --- | --- | --- |
+| `/v1/accounts/` | list, create, update, delete, set_password | `configuration.write` and administrator session |
+| `/v1/auth/` | change_password | `account.self` and current password |
+| `/v1/auth/` | settings, settings_update | `configuration.read`, `configuration.write`; administrator session |
+| `/v1/extensions/` | list, call | `account.self` plus each approved method scope and role |
 | `/v1/catalog/` | get, list, search | `catalog.read` |
 | `/v1/catalog/` | create, update, delete | `catalog.write` |
 | `/v1/configuration/` | get | `configuration.read` |
@@ -286,8 +297,8 @@ process/session coordination. Status/list/stop use its launch ID. An active laun
 means application/session coordination, **not stream readiness**. Initialization,
 cleanup, idempotency and platform support remain the launch module's contract.
 
-Profile additions are scopes `pairing.admin`, `display.read`, `display.write`
-(16 total with the existing 13), management call grants and package dependencies
+Profile additions include scopes `pairing.admin`, `display.read`, `display.write`,
+management call grants and package dependencies
 for pairing/display/launch, and the pairing administrator setting above. The
 launch principal must be permitted by catalog's launch-resolution policy. No new
 cryptographic or platform dependency is introduced into management routing.
@@ -318,6 +329,22 @@ CORS headers, never a wildcard or credential-cookie permission. Strict JSON,
 explicit Bearer headers, Origin checks and numeric Host validation protect the
 browser boundary; ordinary nonbrowser clients may omit Origin. HTTPS browser
 cookie routes retain their separate same-origin CSRF checks.
+
+## Signed web extensions
+
+An extension is a separately signed bundle, locally approved by its explicit ID,
+publisher key and exact API method declarations. The selected signed manifest
+must match the approved ID; broker-provided API metadata and the session's
+role and scope constrain each call. Publisher declarations alone do not grant
+authority. See the [example and policy](../../examples/web-extension/README.md).
+
+Extension JavaScript runs with the web UI's same-origin authority. It is trusted
+code, not a sandbox, and the method allowlist cannot contain all consequences
+of a malicious script. To withdraw an extension from a development Linux root,
+stop the host and use the [local withdrawal command](../../docs/linux-session-profile.md#browser-https-on-a-private-network).
+It removes the approval and advances the authentication generation; close all
+previously open tabs because already-loaded code can continue running. This is
+local withdrawal, not publisher-wide key revocation.
 
 ## Remaining release gates
 

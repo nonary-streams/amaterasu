@@ -28,6 +28,8 @@ pub struct Server {
     maximum_peer: Option<PeerTier>,
     csrf_origins: CsrfOrigins,
     selection_owners: SelectionOwners,
+    authentication_admission: AuthenticationAdmission,
+    extensions: Option<crate::extensions::Extensions>,
 }
 
 impl Server {
@@ -67,6 +69,8 @@ impl Server {
             maximum_peer: None,
             csrf_origins: CsrfOrigins::default(),
             selection_owners: SelectionOwners::default(),
+            authentication_admission: AuthenticationAdmission::default(),
+            extensions: None,
         })
     }
 
@@ -88,6 +92,8 @@ impl Server {
             operation: &mut self.next_operation,
             assets: &mut self.assets,
             selection_owners: &mut self.selection_owners,
+            authentication_admission: &mut self.authentication_admission,
+            extensions: self.extensions.as_ref(),
         };
         for connection in &mut self.connections {
             if !peer_policy::permits(self.maximum_peer, connection.peer, connection.tls.is_some())
@@ -112,6 +118,10 @@ impl Server {
 
     pub(crate) fn set_csrf_policy(&mut self, origins: CsrfOrigins) {
         self.csrf_origins = origins;
+    }
+
+    pub(crate) fn set_extensions(&mut self, extensions: Option<crate::extensions::Extensions>) {
+        self.extensions = extensions;
     }
 
     fn accept(&mut self) -> ModuleResult<()> {
@@ -184,12 +194,6 @@ struct Connection {
     peer: IpAddr,
 }
 
-struct BrowserPolicy<'a> {
-    authority: &'a str,
-    origins: &'a [String],
-    csrf_origins: &'a CsrfOrigins,
-}
-
 struct ConnectionTick<'a> {
     runtime: &'a RuntimeClient,
     authority: &'a str,
@@ -198,6 +202,67 @@ struct ConnectionTick<'a> {
     operation: &'a mut u64,
     assets: &'a mut Option<Assets>,
     selection_owners: &'a mut SelectionOwners,
+    authentication_admission: &'a mut AuthenticationAdmission,
+    extensions: Option<&'a crate::extensions::Extensions>,
+}
+
+#[derive(Default)]
+struct AuthenticationAdmission {
+    attempts: std::collections::VecDeque<(Instant, IpAddr, String)>,
+}
+
+impl AuthenticationAdmission {
+    fn permits(&mut self, peer: IpAddr, request: &http::Request, now: Instant) -> bool {
+        let sensitive = match request.target {
+            RequestTarget::BrowserAuth(BrowserAuth::Login) => true,
+            RequestTarget::Api(route) => {
+                route.service == AUTH_SERVICE
+                    && matches!(route.action, "login" | "enroll_first_admin")
+            }
+            _ => false,
+        };
+        if !sensitive || request.preflight {
+            return true;
+        }
+        while self
+            .attempts
+            .front()
+            .is_some_and(|(time, _, _)| now.duration_since(*time) >= Duration::from_secs(60))
+        {
+            self.attempts.pop_front();
+        }
+        let username = request
+            .payload
+            .get("username")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let username = username.to_ascii_lowercase();
+        let peer = peer.to_canonical();
+        if self
+            .attempts
+            .iter()
+            .filter(|(_, address, _)| *address == peer)
+            .count()
+            >= 10
+            || self
+                .attempts
+                .iter()
+                .filter(|(_, address, account)| *address == peer && *account == username)
+                .count()
+                >= 5
+        {
+            return false;
+        }
+        // A full ledger must not reject every unrelated peer. Eviction keeps
+        // memory bounded, but under distributed pressure it can shorten the
+        // remembered window for the oldest peers. Authentication also applies
+        // a separate global admission budget as a CPU backstop.
+        if self.attempts.len() >= 1024 {
+            self.attempts.pop_front();
+        }
+        self.attempts.push_back((now, peer, username));
+        true
+    }
 }
 
 enum Stage {
@@ -212,6 +277,9 @@ enum Stage {
         operational_health: bool,
         browser_auth: Option<BrowserAuth>,
         capture: Option<CaptureDispatch>,
+    },
+    ExtensionDispatching {
+        request_id: u64,
     },
     Writing {
         bytes: Vec<u8>,
@@ -247,18 +315,7 @@ impl Connection {
             return Ok(());
         }
         match std::mem::replace(&mut self.stage, Stage::Closed) {
-            Stage::Reading(bytes) => self.read_request(
-                runtime,
-                bytes,
-                BrowserPolicy {
-                    authority: context.authority,
-                    origins: context.origins,
-                    csrf_origins: context.csrf_origins,
-                },
-                context.operation,
-                context.assets,
-                context.selection_owners,
-            )?,
+            Stage::Reading(bytes) => self.read_request(bytes, context)?,
             Stage::Verifying {
                 request_id,
                 request,
@@ -268,6 +325,7 @@ impl Connection {
                 *request,
                 context.operation,
                 context.selection_owners,
+                context.extensions,
             )?,
             Stage::Dispatching {
                 request_id,
@@ -286,6 +344,17 @@ impl Connection {
                     selection_owners: context.selection_owners,
                 },
             )?,
+            Stage::ExtensionDispatching { request_id } => {
+                match runtime.send_ephemeral(Command::TakeResult {
+                    request: request_id,
+                })? {
+                    Response::Pending => self.stage = Stage::ExtensionDispatching { request_id },
+                    Response::Result { payload } => {
+                        self.respond(200, json!({"ok":true,"result":payload}))
+                    }
+                    _ => self.fail(503, "service_unavailable"),
+                }
+            }
             Stage::Writing { bytes, offset } => self.write_response(bytes, offset),
             Stage::Closed => {}
         }
@@ -322,8 +391,9 @@ impl Connection {
     }
 
     fn expire(&mut self, runtime: &RuntimeClient) {
-        if let Stage::Verifying { request_id, .. } | Stage::Dispatching { request_id, .. } =
-            self.stage
+        if let Stage::Verifying { request_id, .. }
+        | Stage::Dispatching { request_id, .. }
+        | Stage::ExtensionDispatching { request_id } = self.stage
         {
             let _ = runtime.send(Command::Cancel {
                 request: request_id,
@@ -337,12 +407,8 @@ impl Connection {
 
     fn read_request(
         &mut self,
-        runtime: &RuntimeClient,
         mut bytes: Vec<u8>,
-        policy: BrowserPolicy<'_>,
-        operation: &mut u64,
-        assets: &mut Option<Assets>,
-        selection_owners: &mut SelectionOwners,
+        context: &mut ConnectionTick<'_>,
     ) -> ModuleResult<()> {
         let mut buffer = [0; 4096];
         if self.tls.as_ref().is_some_and(|tls| tls.is_handshaking()) {
@@ -380,17 +446,49 @@ impl Connection {
                 .map_err(|_| "management TLS address unavailable")?
                 .to_string()
         } else {
-            policy.authority.to_owned()
+            context.authority.to_owned()
         };
         match http::parse_policy_transport(
             &bytes,
             &authority,
-            policy.origins,
+            context.origins,
             transport,
-            policy.csrf_origins,
+            context.csrf_origins,
         ) {
             Ok(Some(request)) => {
-                self.authorize(runtime, request, operation, assets, selection_owners)?
+                if context
+                    .authentication_admission
+                    .permits(self.peer, &request, Instant::now())
+                {
+                    if let RequestTarget::Asset(path) = &request.target
+                        && let Some(path) = path.strip_prefix("/v1/extensions/")
+                    {
+                        let parts: Vec<_> = path.splitn(4, '/').collect();
+                        let asset = match parts.as_slice() {
+                            [id, digest, "assets", name] => {
+                                context.extensions.and_then(|e| e.asset(id, digest, name))
+                            }
+                            _ => None,
+                        };
+                        self.stage = Stage::Writing {
+                            bytes: asset.map_or_else(
+                                || crate::assets::failure(404, "Not found"),
+                                |(kind, bytes)| crate::assets::asset_response(200, kind, &bytes),
+                            ),
+                            offset: 0,
+                        };
+                        return Ok(());
+                    }
+                    self.authorize(
+                        context.runtime,
+                        request,
+                        context.operation,
+                        context.assets,
+                        context.selection_owners,
+                    )?
+                } else {
+                    self.fail(429, "rate_limited");
+                }
             }
             Ok(None) => self.stage = Stage::Reading(bytes),
             Err(failure) => self.fail(failure.status, failure.code),
@@ -405,6 +503,7 @@ impl Connection {
         mut request: http::Request,
         operation: &mut u64,
         selection_owners: &mut SelectionOwners,
+        extensions: Option<&crate::extensions::Extensions>,
     ) -> ModuleResult<()> {
         match runtime.send_ephemeral(Command::TakeResult {
             request: request_id,
@@ -415,7 +514,15 @@ impl Connection {
                     request: Box::new(request),
                 }
             }
-            Response::Result { payload } if authorized(&payload, request_scope(&request)) => {
+            Response::Result { payload }
+                if authorized(&payload, request_scope(&request))
+                    && role_permits(&payload, &request) =>
+            {
+                if matches!(request.target, RequestTarget::Api(route) if route.service == crate::SERVICE && matches!(route.action, "extension_list" | "extension_call"))
+                {
+                    self.dispatch_extension(runtime, request, &payload, operation, extensions)?;
+                    return Ok(());
+                }
                 if matches!(request.target, RequestTarget::Api(route) if route.service == "amaterasu.capture-pipewire/1")
                 {
                     request.verified_identity = capture_management::identity(
@@ -643,6 +750,25 @@ impl Connection {
             )?;
             return Ok(());
         }
+        if route.service == crate::AUTH_SERVICE
+            && matches!(
+                route.action,
+                "list_accounts"
+                    | "create_account"
+                    | "update_account"
+                    | "delete_account"
+                    | "set_account_password"
+                    | "change_own_password"
+                    | "account_settings_get"
+                    | "account_settings_update"
+            )
+            && let Some(object) = request.payload.as_object_mut()
+        {
+            object.insert(
+                "bearer".into(),
+                request.bearer.take().map_or(Value::Null, Value::String),
+            );
+        }
         if let Some(request_id) = self.submit(runtime, route.service, request.payload, operation)? {
             self.stage = Stage::Dispatching {
                 request_id,
@@ -651,6 +777,68 @@ impl Connection {
                 browser_auth: None,
                 capture: None,
             };
+        }
+        Ok(())
+    }
+
+    fn dispatch_extension(
+        &mut self,
+        runtime: &RuntimeClient,
+        mut request: http::Request,
+        auth: &Value,
+        operation: &mut u64,
+        extensions: Option<&crate::extensions::Extensions>,
+    ) -> ModuleResult<()> {
+        let RequestTarget::Api(route) = request.target else {
+            unreachable!()
+        };
+        if route.action == "extension_list" {
+            self.respond(
+                200,
+                extensions.map_or_else(|| json!({"ok":true,"extensions":[]}), |e| e.list(auth)),
+            );
+            return Ok(());
+        }
+        let Some(extensions) = extensions else {
+            self.fail(404, "extension_not_found");
+            return Ok(());
+        };
+        if let Some(object) = request.payload.as_object_mut() {
+            object.remove("action");
+        }
+        let call = match extensions.resolve_call(&request.payload, auth) {
+            Ok(call) => call,
+            Err(code) => {
+                self.fail(403, code);
+                return Ok(());
+            }
+        };
+        match runtime.send_ephemeral(call.query())? {
+            Response::Result { payload } if call.accepts_approval(&payload) => {}
+            _ => {
+                self.fail(403, "extension_method_denied");
+                return Ok(());
+            }
+        }
+        let Some(next) = operation.checked_add(1) else {
+            self.fail(503, "operation_ids_exhausted");
+            return Ok(());
+        };
+        let operation_id = format!("management.{}", *operation);
+        *operation = next;
+        let remaining = self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
+        if remaining <= 100 {
+            self.fail(504, "deadline_exceeded");
+            return Ok(());
+        }
+        match runtime.send(call.call(remaining - 100, operation_id))? {
+            Response::Accepted { id } => {
+                self.stage = Stage::ExtensionDispatching { request_id: id }
+            }
+            _ => self.fail(503, "service_unavailable"),
         }
         Ok(())
     }
@@ -898,6 +1086,10 @@ fn unix_seconds() -> u64 {
 
 fn valid_browser_metadata(payload: &Value) -> bool {
     payload.get("kind").and_then(Value::as_str) == Some("administrator_session")
+        && matches!(
+            payload.get("role").and_then(Value::as_str),
+            Some("administrator" | "operator" | "viewer")
+        )
         && payload
             .get("subject")
             .and_then(Value::as_str)
@@ -937,7 +1129,7 @@ fn verification_payload(request: &mut http::Request) -> Value {
         .collect::<Vec<_>>();
     let mut payload = json!({
         "action":"verify",
-        "bearer":request.bearer.take(),
+        "bearer":request.bearer.clone(),
         "required_scopes":required_scopes
     });
     if let Some(context) = legacy_request {
@@ -956,6 +1148,60 @@ fn authorized(payload: &Value, required_scope: Option<&str>) -> bool {
                 scopes.iter().all(|scope| scope.as_str().is_some())
                     && scopes.iter().any(|scope| scope.as_str() == required_scope)
             })
+}
+
+// Browser roles are an additional boundary on top of the token's exact scopes.
+// Legacy and non-browser credentials retain their existing scope policy.
+fn role_permits(payload: &Value, request: &http::Request) -> bool {
+    if !payload
+        .get("subject")
+        .and_then(Value::as_str)
+        .is_some_and(|subject| !subject.is_empty())
+    {
+        return false;
+    }
+    let role = match payload.get("kind").and_then(Value::as_str) {
+        Some("api_token") => return true,
+        Some("administrator_session") => match payload.get("role").and_then(Value::as_str) {
+            Some(role) => role,
+            None => return false,
+        },
+        _ => return false,
+    };
+    let RequestTarget::Api(route) = request.target else {
+        return false;
+    };
+    if role == "administrator" {
+        return true;
+    }
+    if !matches!(role, "operator" | "viewer") {
+        return false;
+    }
+    let read = matches!(
+        (route.service, route.action),
+        ("amaterasu.catalog/1", "get" | "list" | "search")
+            | ("amaterasu.launch/1", "status" | "list")
+            | ("amaterasu.application/1", "status" | "list")
+            | ("amaterasu.session/1", "list" | "snapshot")
+            | ("amaterasu.authentication/1", "change_own_password")
+            | (
+                "amaterasu.management/1",
+                "extension_list" | "extension_call"
+            )
+            | ("amaterasu.steam/1", "list" | "status" | "artwork_read")
+            | ("amaterasu.lutris/1", "status" | "artwork_read")
+            | ("amaterasu.playnite/1", "status")
+            | ("amaterasu.display/1", "status" | "enumerate")
+            | (
+                "amaterasu.session-history/1",
+                "list_sessions" | "session_detail" | "active_sessions" | "history_status"
+            )
+    );
+    read || (role == "operator"
+        && matches!(
+            (route.service, route.action),
+            ("amaterasu.launch/1", "launch" | "stop")
+        ))
 }
 
 fn service_status(payload: &Value, login: bool, operational_health: bool) -> u16 {
@@ -1059,7 +1305,7 @@ mod tests {
         for action in [BrowserAuth::Login, BrowserAuth::Refresh] {
             let reply = browser_reply(
                 action,
-                json!({"ok":true,"bearer":access,"refresh_token":refresh,"kind":"administrator_session","subject":"admin","scopes":["configuration.read"],"expires_at":1_800_000_000,"remember_me":false,"auth_context_id":"internal-session-id"}),
+                json!({"ok":true,"bearer":access,"refresh_token":refresh,"kind":"administrator_session","role":"administrator","subject":"admin","scopes":["configuration.read"],"expires_at":1_800_000_000,"remember_me":false,"auth_context_id":"internal-session-id"}),
             );
             let (headers, body) = reply.split_once("\r\n\r\n").unwrap();
             assert!(headers.contains(&format!("Set-Cookie: __Secure-amaterasu-access={access}; Path=/v1; Secure; HttpOnly; SameSite=Strict")));
@@ -1212,5 +1458,149 @@ mod tests {
             &json!({"ok":true,"scopes":["lutris.read"]}),
             scope
         ));
+    }
+
+    #[test]
+    fn account_roles_limit_routes_even_when_scopes_overlap() {
+        let allowed = |role: &str, path: &str| {
+            let request = http::Request {
+                target: RequestTarget::Api(crate::routes::resolve(path).unwrap()),
+                payload: json!({}),
+                bearer: None,
+                verified_identity: None,
+                origin: None,
+                preflight: false,
+                csrf_exception: false,
+                api_request: None,
+            };
+            role_permits(
+                &json!({"kind":"administrator_session", "role":role, "subject":"person"}),
+                &request,
+            )
+        };
+        for role in ["viewer", "operator"] {
+            assert!(allowed(role, "/v1/launch/status"));
+            assert!(!allowed(role, "/v1/application/launch"));
+            assert!(!allowed(role, "/v1/application/terminate"));
+            assert!(!allowed(role, "/v1/pairing/list_clients"));
+            assert!(!allowed(role, "/v1/auth/settings"));
+            assert!(!allowed(role, "/v1/configuration/get"));
+        }
+        assert!(!allowed("viewer", "/v1/launch/start"));
+        assert!(!allowed("viewer", "/v1/launch/stop"));
+        assert!(allowed("operator", "/v1/launch/start"));
+        assert!(allowed("operator", "/v1/launch/stop"));
+        assert!(allowed("administrator", "/v1/pairing/list_clients"));
+        assert!(!allowed("admin", "/v1/pairing/list_clients"));
+        assert!(!allowed("", "/v1/launch/status"));
+    }
+
+    #[test]
+    fn login_admission_uses_socket_peer_and_case_folded_account_with_expiry() {
+        let mut limiter = AuthenticationAdmission::default();
+        let now = Instant::now();
+        let request = |username: &str| http::Request {
+            target: RequestTarget::BrowserAuth(BrowserAuth::Login),
+            payload: json!({"username": username}),
+            bearer: None,
+            verified_identity: None,
+            origin: None,
+            preflight: false,
+            csrf_exception: false,
+            api_request: None,
+        };
+        let peer = "192.168.1.1".parse().unwrap();
+        for _ in 0..5 {
+            assert!(limiter.permits(peer, &request("Admin"), now));
+        }
+        assert!(!limiter.permits(peer, &request("ADMIN"), now));
+        assert!(!limiter.permits(
+            "::ffff:192.168.1.1".parse().unwrap(),
+            &request("admin"),
+            now
+        ));
+        assert!(limiter.permits("192.168.1.20".parse().unwrap(), &request("ADMIN"), now));
+        assert!(limiter.permits(peer, &request("different"), now));
+        assert!(limiter.permits(peer, &request("admin"), now + Duration::from_secs(60)));
+        for n in 0..9 {
+            assert!(limiter.permits(
+                peer,
+                &request(&format!("user{n}")),
+                now + Duration::from_secs(60)
+            ));
+        }
+        assert!(!limiter.permits(peer, &request("another"), now + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn forwarded_addresses_cannot_change_login_admission_peer() {
+        let mut limiter = AuthenticationAdmission::default();
+        let now = Instant::now();
+        let peer = "192.168.1.5".parse().unwrap();
+        for n in 0..6 {
+            let body = r#"{"username":"Admin","password":"wrong"}"#;
+            let wire = format!(
+                "POST /v1/auth/login HTTP/1.1\r\nHost: 127.0.0.1:1234\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Forwarded-For: 192.168.1.{}\r\n\r\n{body}",
+                body.len(),
+                n + 10
+            );
+            let request = http::parse(wire.as_bytes(), "127.0.0.1:1234", &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(limiter.permits(peer, &request, now), n < 5);
+        }
+    }
+
+    #[test]
+    fn full_login_ledger_evicts_oldest_without_blocking_other_peers() {
+        let mut limiter = AuthenticationAdmission::default();
+        let now = Instant::now();
+        let request = http::Request {
+            target: RequestTarget::BrowserAuth(BrowserAuth::Login),
+            payload: json!({"username":"admin"}),
+            bearer: None,
+            verified_identity: None,
+            origin: None,
+            preflight: false,
+            csrf_exception: false,
+            api_request: None,
+        };
+        for n in 0..1030 {
+            let peer = std::net::Ipv4Addr::new(10, 0, (n / 256) as u8, (n % 256) as u8).into();
+            assert!(limiter.permits(peer, &request, now));
+        }
+        assert_eq!(limiter.attempts.len(), 1024);
+        let limited_peer = "192.168.1.5".parse().unwrap();
+        for _ in 0..5 {
+            assert!(limiter.permits(limited_peer, &request, now));
+        }
+        for n in 0..5 {
+            let other = http::Request {
+                target: RequestTarget::BrowserAuth(BrowserAuth::Login),
+                payload: json!({"username":format!("other{n}")}),
+                bearer: None,
+                verified_identity: None,
+                origin: None,
+                preflight: false,
+                csrf_exception: false,
+                api_request: None,
+            };
+            assert!(limiter.permits(limited_peer, &other, now));
+        }
+        assert_eq!(limiter.attempts.len(), 1024);
+        assert!(limiter.permits("192.168.1.6".parse().unwrap(), &request, now));
+        assert_eq!(limiter.attempts.len(), 1024);
+        assert!(!limiter.permits(limited_peer, &request, now));
+        let other = http::Request {
+            target: RequestTarget::BrowserAuth(BrowserAuth::Login),
+            payload: json!({"username":"unused"}),
+            bearer: None,
+            verified_identity: None,
+            origin: None,
+            preflight: false,
+            csrf_exception: false,
+            api_request: None,
+        };
+        assert!(!limiter.permits(limited_peer, &other, now));
     }
 }

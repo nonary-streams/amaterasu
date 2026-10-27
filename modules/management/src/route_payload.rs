@@ -14,6 +14,14 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         return fields(object, &[], &[]);
     }
     match route.service {
+        "amaterasu.management/1" if route.action == "extension_list" => fields(object, &[], &[]),
+        "amaterasu.management/1" if route.action == "extension_call" => {
+            fields(object, &["id", "digest", "method", "payload"], &[])?;
+            for name in ["id", "digest", "method"] {
+                text(object, name)?;
+            }
+            Ok(())
+        }
         "amaterasu.management/1" if route.action == "repository_list" => {
             fields(object, &[], &["offset"])?;
             if object
@@ -481,8 +489,50 @@ mod lutris_artwork_tests {
 
 fn authentication(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
-        "settings_get" => fields(object, &[], &[]),
-        "settings_update" => {
+        "enroll_first_admin" => {
+            fields(object, &["code", "username", "password"], &[])?;
+            for name in ["code", "username", "password"] {
+                text(object, name)?;
+            }
+            Ok(())
+        }
+        "list_accounts" => fields(object, &[], &[]),
+        "create_account" => {
+            fields(object, &["username", "password", "role"], &[])?;
+            for name in ["username", "password", "role"] {
+                text(object, name)?;
+            }
+            Ok(())
+        }
+        "update_account" => {
+            fields(object, &["username", "role", "enabled"], &[])?;
+            text(object, "username")?;
+            text(object, "role")?;
+            object
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or(INVALID)?;
+            Ok(())
+        }
+        "delete_account" => {
+            fields(object, &["username"], &[])?;
+            text(object, "username")?;
+            Ok(())
+        }
+        "set_account_password" => {
+            fields(object, &["username", "password"], &[])?;
+            text(object, "username")?;
+            text(object, "password")?;
+            Ok(())
+        }
+        "change_own_password" => {
+            fields(object, &["current_password", "new_password"], &[])?;
+            text(object, "current_password")?;
+            text(object, "new_password")?;
+            Ok(())
+        }
+        "settings_get" | "account_settings_get" => fields(object, &[], &[]),
+        "settings_update" | "account_settings_update" => {
             fields(
                 object,
                 &[

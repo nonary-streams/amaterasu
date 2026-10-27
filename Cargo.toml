@@ -19,6 +19,7 @@ members = [
     "crates/release",
     "crates/vkms-frame-helper",
     "fixtures/echo",
+    "fixtures/extension-example",
     "fixtures/media-probe",
     "fixtures/stream-source",
     "fixtures/capture-source",

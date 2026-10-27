@@ -13,6 +13,8 @@ pub const RUNTIME_ID: &str = "amaterasu.runtime";
 pub enum PackageProfile {
     Example,
     Platform,
+    /// Opt-in test package with a third-party registered API provider.
+    ExtensionExample,
     MediaProbe,
     StreamProbe,
     /// Test-only controlled NV12 capture with the real video and encoder modules.
@@ -52,6 +54,17 @@ const EXAMPLE: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.example-echo",
     library: "amaterasu_echo_fixture",
     provides: &["example.echo/1"],
+    calls: &[],
+    publishes: &[],
+    native_provides: &[],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
+};
+
+const EXTENSION_EXAMPLE: ComponentDefinition = ComponentDefinition {
+    id: "example.extension-provider",
+    library: "amaterasu_extension_example",
+    provides: &["example.extension/1"],
     calls: &[],
     publishes: &[],
     native_provides: &[],
@@ -981,6 +994,50 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
     ],
 };
 
+// Only the opt-in fixture package grants management access to the example API.
+const MANAGEMENT_EXTENSION_EXAMPLE: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        // Loopback `/healthz` asks this component's fixed, status-only
+        // operation to drive bounded checks of its imported dependencies.
+        "amaterasu.management/1",
+        "amaterasu.authentication/1",
+        "amaterasu.state/1",
+        "amaterasu.catalog/1",
+        "amaterasu.configuration/1",
+        "amaterasu.session/1",
+        "amaterasu.application/1",
+        "amaterasu.input/1",
+        "amaterasu.steam/1",
+        "amaterasu.playnite/1",
+        "amaterasu.lutris/1",
+        "amaterasu.diagnostics/1",
+        "amaterasu.host-configuration/1",
+        "amaterasu.pairing/1",
+        "amaterasu.display/1",
+        "amaterasu.launch/1",
+        "amaterasu.capture-dxgi/1",
+        "amaterasu.capture-wgc/1",
+        "amaterasu.capture-x11/1",
+        "amaterasu.audio/1",
+        "amaterasu.audio-encode/1",
+        "amaterasu.encode/1",
+        "amaterasu.video/1",
+        "amaterasu.nvhttp/1",
+        // NVHTTP applies base-port changes through RTSP, which preflights
+        // its media and control UDP listeners under the same admin request.
+        "amaterasu.rtsp/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
+        "amaterasu.session-history/1",
+        "amaterasu.host-metrics/1",
+        "amaterasu.updater/1",
+        "amaterasu.system-tray/1",
+        "amaterasu.host-lifecycle/1",
+        "example.extension/1",
+    ],
+    ..MANAGEMENT
+};
+
 // The signed synthetic composition uses the real management authority and API.
 // Its source and input dependencies are fixtures; the call grants remain the
 // same as the platform component's grants.
@@ -1411,6 +1468,44 @@ impl PackageProfile {
                 STREAM_SESSION,
                 RTSP,
             ],
+            Self::ExtensionExample => &[
+                RUNTIME,
+                EXTENSION_EXAMPLE,
+                STATE,
+                SESSION,
+                SESSION_HISTORY,
+                HOST_METRICS,
+                UPDATER,
+                SYSTEM_TRAY,
+                CONFIGURATION,
+                CATALOG,
+                APPLICATION,
+                HOST_CONFIGURATION,
+                DIAGNOSTICS,
+                STEAM,
+                PLAYNITE,
+                LUTRIS,
+                AUTHENTICATION,
+                MANAGEMENT_EXTENSION_EXAMPLE,
+                PLATFORM_PAIRING,
+                NVHTTP,
+                DISPLAY,
+                LAUNCH,
+                INPUT,
+                VIRTUAL_DISPLAY,
+                CAPTURE_DXGI,
+                CAPTURE_WGC,
+                CAPTURE_X11,
+                AUDIO,
+                AUDIO_ENCODE,
+                ENCODE,
+                X11_VIDEO,
+                MEDIA_TRANSPORT,
+                CONTROL_TRANSPORT,
+                FRAME_LIMITER,
+                STREAM_SESSION,
+                RTSP,
+            ],
         }
     }
 }
@@ -1781,3 +1876,45 @@ fn names(values: &[&str]) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod extension_example_tests {
+    use super::*;
+
+    #[test]
+    fn example_provider_and_call_grant_are_opt_in() {
+        let platform = PackageProfile::Platform.components();
+        let example = PackageProfile::ExtensionExample.components();
+        for component in platform {
+            assert!(example.iter().any(|candidate| candidate.id == component.id));
+        }
+        assert_eq!(example.len(), platform.len() + 1);
+        assert!(
+            !platform
+                .iter()
+                .any(|component| component.id == EXTENSION_EXAMPLE.id)
+        );
+        assert!(
+            !PackageProfile::LinuxSession
+                .components()
+                .iter()
+                .any(|component| component.id == EXTENSION_EXAMPLE.id)
+        );
+        let fixture = example
+            .iter()
+            .find(|component| component.id == EXTENSION_EXAMPLE.id)
+            .unwrap();
+        assert_eq!(fixture.provides, &["example.extension/1"]);
+        let management = |components: &[ComponentDefinition]| {
+            components
+                .iter()
+                .find(|component| component.id == MANAGEMENT.id)
+                .unwrap()
+                .calls
+                .contains(&"example.extension/1")
+        };
+        assert!(management(example));
+        assert!(!management(platform));
+        assert!(!management(PackageProfile::LinuxSession.components()));
+    }
+}

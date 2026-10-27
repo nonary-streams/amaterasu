@@ -34,7 +34,7 @@ pub fn prepare_bundle(
     Ok(manifest)
 }
 
-fn collect(
+pub(super) fn collect(
     root: &Path,
     relative: &str,
     files: &mut BTreeMap<String, Asset>,
@@ -85,7 +85,7 @@ fn collect(
     Ok(())
 }
 
-fn write_asset(root: &Path, name: &str, bytes: &[u8]) -> PackageResult<()> {
+pub(super) fn write_asset(root: &Path, name: &str, bytes: &[u8]) -> PackageResult<()> {
     let destination = root.join(name);
     create_private_directory(destination.parent().ok_or("asset parent missing")?)?;
     amaterasu_storage::write_atomically(&destination, bytes)

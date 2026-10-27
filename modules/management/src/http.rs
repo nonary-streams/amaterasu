@@ -228,7 +228,7 @@ fn asset_request(
             api_request: None,
         });
     }
-    if path.starts_with("/v1/") {
+    if path.starts_with("/v1/") && !path.starts_with("/v1/extensions/") {
         return Err(Failure::new(405, "method_not_allowed"));
     }
     if !path.starts_with('/')
@@ -575,6 +575,26 @@ pub fn response_with_cookies(
 mod tests {
     use super::*;
     const HOST: &str = "127.0.0.1:1234";
+
+    #[test]
+    fn extension_asset_get_preserves_nested_path_and_api_gets_stay_closed() {
+        let request = format!(
+            "GET /v1/extensions/example/digest/assets/nested/page.js HTTP/1.1\r\nHost: {HOST}\r\n\r\n"
+        );
+        let parsed = parse(request.as_bytes(), HOST, &[]).unwrap().unwrap();
+        assert!(
+            matches!(parsed.target, RequestTarget::Asset(path) if path == "/v1/extensions/example/digest/assets/nested/page.js")
+        );
+        let api = format!("GET /v1/accounts/list HTTP/1.1\r\nHost: {HOST}\r\n\r\n");
+        assert_eq!(parse(api.as_bytes(), HOST, &[]).err().unwrap().status, 405);
+        let traversal = format!(
+            "GET /v1/extensions/example/digest/assets/../secret HTTP/1.1\r\nHost: {HOST}\r\n\r\n"
+        );
+        assert_eq!(
+            parse(traversal.as_bytes(), HOST, &[]).err().unwrap().status,
+            404
+        );
+    }
 
     fn wire(extra: &str, body: &str) -> Vec<u8> {
         format!("POST /v1/catalog/list HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}", body.len()).into_bytes()

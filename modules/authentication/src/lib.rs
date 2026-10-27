@@ -1,4 +1,5 @@
 //! Credential and bearer-token authority for trusted native modules.
+mod accounts;
 mod crypto;
 mod engine;
 mod legacy_tokens;

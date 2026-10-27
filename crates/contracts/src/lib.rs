@@ -219,6 +219,14 @@ pub enum Command {
         interface_major: u32,
         min_minor: u32,
     },
+    /// Returns the installed approval, including its broker-selected provider.
+    /// Subject to the same registration and caller checks as `QueryApi`.
+    QueryApiApproval {
+        service: String,
+        method: String,
+        interface_major: u32,
+        min_minor: u32,
+    },
     CallApi {
         service: String,
         method: String,

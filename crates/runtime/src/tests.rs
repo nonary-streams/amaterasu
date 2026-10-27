@@ -546,10 +546,21 @@ fn synthetic_api(privilege: ApiPrivilege) -> (RuntimeConfig, ApiMethod) {
 #[test]
 fn installed_user_api_methods_enforce_identity_schema_version_and_raw_route_block() {
     let (config, method) = synthetic_api(ApiPrivilege::User);
+    let approval = config.api_methods[0].clone();
     let mut broker = Broker::new(config).unwrap();
     let provider = "org.example.provider";
     let client = "org.example.client";
     let outsider = "org.example.outsider";
+    let query_approval = || Command::QueryApiApproval {
+        service: method.service.clone(),
+        method: method.method.clone(),
+        interface_major: 1,
+        min_minor: 2,
+    };
+    assert_error_code(
+        broker.dispatch(client, query_approval()),
+        "permission_denied",
+    );
     assert_error_code(
         broker.dispatch(
             outsider,
@@ -611,6 +622,26 @@ fn installed_user_api_methods_enforce_identity_schema_version_and_raw_route_bloc
     assert!(matches!(broker.dispatch(client, Command::QueryApi {
         service: method.service.clone(), method:"render".into(), interface_major:1, min_minor:2,
     }), Response::Result { payload } if payload == serde_json::to_value(&method).unwrap()));
+    assert_error_code(
+        broker.dispatch(outsider, query_approval()),
+        "permission_denied",
+    );
+    assert!(
+        matches!(broker.dispatch(client, query_approval()), Response::Result { payload }
+        if payload == serde_json::to_value(&approval).unwrap())
+    );
+    assert_error_code(
+        broker.dispatch(
+            client,
+            Command::QueryApiApproval {
+                service: method.service.clone(),
+                method: method.method.clone(),
+                interface_major: 1,
+                min_minor: 3,
+            },
+        ),
+        "incompatible_api",
+    );
     assert_error_code(
         broker.dispatch(
             client,

@@ -28,6 +28,8 @@
     "src/system_tray.ts",
     "src/pages.ts",
     "src/management.ts",
+    "src/accounts.ts",
+    "src/extensions.ts",
     "src/app.ts"
   ]
 }

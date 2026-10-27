@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_TOKENS: usize = 32;
 pub const MAX_SESSIONS: usize = 16;
@@ -19,6 +19,8 @@ pub const MAX_TOKEN_SECONDS: u64 = 30 * 24 * 60 * 60;
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub administrator_principals: BTreeSet<String>,
+    pub legacy_verifier_principals: BTreeSet<String>,
+    pub scope_minimum_roles: BTreeMap<String, crate::accounts::Role>,
     pub allowed_scopes: BTreeSet<String>,
     /// Advance for every authentication-policy edit, including restoring old values.
     #[serde(default)]
@@ -31,6 +33,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             administrator_principals: BTreeSet::new(),
+            legacy_verifier_principals: BTreeSet::new(),
+            scope_minimum_roles: BTreeMap::new(),
             allowed_scopes: BTreeSet::new(),
             authorization_policy_generation: 0,
             session_token_ttl_seconds: DEFAULT_SESSION_TOKEN_TTL_SECONDS,
@@ -46,6 +50,15 @@ impl Settings {
                 .administrator_principals
                 .iter()
                 .any(|value| !identifier(value, 128))
+            || self.legacy_verifier_principals.len() > 16
+            || self
+                .legacy_verifier_principals
+                .iter()
+                .any(|value| !identifier(value, 128))
+            || self
+                .scope_minimum_roles
+                .iter()
+                .any(|(scope, _)| !self.allowed_scopes.contains(scope))
             || self.allowed_scopes.len() > MAX_SCOPES
             || self
                 .allowed_scopes
@@ -64,6 +77,41 @@ impl Settings {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    GenerateEnrollmentCode {},
+    EnrollFirstAdmin {
+        code: String,
+        username: String,
+        password: String,
+    },
+    ListAccounts {
+        bearer: String,
+    },
+    CreateAccount {
+        bearer: String,
+        username: String,
+        password: String,
+        role: crate::accounts::Role,
+    },
+    UpdateAccount {
+        bearer: String,
+        username: String,
+        role: crate::accounts::Role,
+        enabled: bool,
+    },
+    DeleteAccount {
+        bearer: String,
+        username: String,
+    },
+    SetAccountPassword {
+        bearer: String,
+        username: String,
+        password: String,
+    },
+    ChangeOwnPassword {
+        bearer: String,
+        current_password: String,
+        new_password: String,
+    },
     /// A non-secret readiness result for the trusted management principal.
     /// It deliberately reveals neither usernames nor credential material.
     Status {},
@@ -81,6 +129,15 @@ pub enum Operation {
         limit: usize,
     },
     SettingsGet {},
+    AccountSettingsGet {
+        bearer: String,
+    },
+    AccountSettingsUpdate {
+        bearer: String,
+        session_token_ttl_seconds: u64,
+        remember_me_refresh_token_ttl_seconds: u64,
+        expected_revision: u64,
+    },
     SettingsUpdate {
         session_token_ttl_seconds: u64,
         remember_me_refresh_token_ttl_seconds: u64,
@@ -123,8 +180,61 @@ pub enum Operation {
 impl Operation {
     pub fn validate(&self) -> Result<(), &'static str> {
         let valid = match self {
+            Self::GenerateEnrollmentCode {} => true,
+            Self::ListAccounts { bearer } => valid_bearer(bearer),
+            Self::CreateAccount {
+                bearer,
+                username,
+                password,
+                ..
+            }
+            | Self::SetAccountPassword {
+                bearer,
+                username,
+                password,
+            } => {
+                valid_bearer(bearer)
+                    && identifier(username, 64)
+                    && (12..=256).contains(&password.len())
+            }
+            Self::UpdateAccount {
+                bearer, username, ..
+            }
+            | Self::DeleteAccount { bearer, username } => {
+                valid_bearer(bearer) && identifier(username, 64)
+            }
+            Self::ChangeOwnPassword {
+                bearer,
+                current_password,
+                new_password,
+            } => {
+                valid_bearer(bearer)
+                    && (1..=256).contains(&current_password.len())
+                    && (12..=256).contains(&new_password.len())
+            }
+            Self::EnrollFirstAdmin {
+                code,
+                username,
+                password,
+            } => {
+                valid_bearer(code)
+                    && identifier(username, 64)
+                    && (12..=256).contains(&password.len())
+            }
             Self::Status {} => true,
             Self::SettingsGet {} => true,
+            Self::AccountSettingsGet { bearer } => valid_bearer(bearer),
+            Self::AccountSettingsUpdate {
+                bearer,
+                session_token_ttl_seconds,
+                remember_me_refresh_token_ttl_seconds,
+                ..
+            } => {
+                valid_bearer(bearer)
+                    && (1..=MAX_CONFIGURED_TTL_SECONDS).contains(session_token_ttl_seconds)
+                    && (1..=MAX_CONFIGURED_TTL_SECONDS)
+                        .contains(remember_me_refresh_token_ttl_seconds)
+            }
             Self::SettingsUpdate {
                 session_token_ttl_seconds,
                 remember_me_refresh_token_ttl_seconds,
@@ -232,6 +342,17 @@ fn http_token_byte(byte: u8) -> bool {
 pub struct Document {
     pub credential: Option<Credential>,
     pub tokens: Vec<ApiToken>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<crate::accounts::Account>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment: Option<Enrollment>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Enrollment {
+    pub code_digest: String,
+    pub expires_at: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -348,7 +469,13 @@ pub struct ApiToken {
 
 impl Document {
     pub fn validate(&self) -> Result<(), &'static str> {
+        crate::accounts::validate_accounts(&self.accounts, self.credential.as_ref())?;
         if self.tokens.len() > MAX_TOKENS
+            || self.enrollment.as_ref().is_some_and(|enrollment| {
+                !valid_digest(&enrollment.code_digest)
+                    || self.credential.is_some()
+                    || !self.accounts.is_empty()
+            })
             || serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > 12_000)
         {
             return Err("invalid_state");
@@ -365,7 +492,7 @@ impl Document {
             {
                 return Err("invalid_state");
             }
-        } else if !self.tokens.is_empty() {
+        } else if self.accounts.is_empty() && !self.tokens.is_empty() {
             return Err("invalid_state");
         }
         let mut ids = BTreeSet::new();

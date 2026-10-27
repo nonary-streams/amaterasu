@@ -12,17 +12,45 @@ pub struct Route {
 pub fn resolve(path: &str) -> Option<Route> {
     let (domain, action) = path.strip_prefix("/v1/")?.split_once('/')?;
     let (service, action, scope) = match (domain, action) {
+        ("extensions", "list") => (
+            "amaterasu.management/1",
+            "extension_list",
+            Some("account.self"),
+        ),
+        ("extensions", "call") => (
+            "amaterasu.management/1",
+            "extension_call",
+            Some("account.self"),
+        ),
+        ("auth", "enroll") => ("amaterasu.authentication/1", "enroll_first_admin", None),
+        ("auth", "change_password") => (
+            "amaterasu.authentication/1",
+            "change_own_password",
+            Some("account.self"),
+        ),
+        ("accounts", action) => (
+            "amaterasu.authentication/1",
+            match action {
+                "list" => "list_accounts",
+                "create" => "create_account",
+                "update" => "update_account",
+                "delete" => "delete_account",
+                "set_password" => "set_account_password",
+                _ => return None,
+            },
+            Some("configuration.write"),
+        ),
         ("auth", "login") => ("amaterasu.authentication/1", "login", None),
         ("auth", "refresh") => ("amaterasu.authentication/1", "refresh", None),
         ("auth", "logout") => ("amaterasu.authentication/1", "logout", None),
         ("auth", "settings") => (
             "amaterasu.authentication/1",
-            "settings_get",
+            "account_settings_get",
             Some("configuration.read"),
         ),
         ("auth", "settings_update") => (
             "amaterasu.authentication/1",
-            "settings_update",
+            "account_settings_update",
             Some("configuration.write"),
         ),
         ("management_settings", "get") => (
@@ -1087,11 +1115,11 @@ mod tests {
 
         let settings = resolve("/v1/auth/settings").unwrap();
         assert_eq!(settings.service, "amaterasu.authentication/1");
-        assert_eq!(settings.action, "settings_get");
+        assert_eq!(settings.action, "account_settings_get");
         assert_eq!(settings.scope, Some("configuration.read"));
         assert_eq!(
             payload(settings, br#"{}"#).unwrap()["action"],
-            "settings_get"
+            "account_settings_get"
         );
         assert!(payload(settings, br#"{"owner":"amaterasu.other"}"#).is_err());
 
@@ -1103,7 +1131,7 @@ mod tests {
                 br#"{"session_token_ttl_seconds":3600,"remember_me_refresh_token_ttl_seconds":259200,"expected_revision":0}"#
             )
             .unwrap()["action"],
-            "settings_update"
+            "account_settings_update"
         );
         for rejected in [
             br#"{"session_token_ttl_seconds":3600,"remember_me_refresh_token_ttl_seconds":259200}"#.as_slice(),

@@ -1,5 +1,6 @@
 //! Independently signed static web bundles. A pointer replacement changes the UI
 //! without changing the native component selection or requiring a host restart.
+pub mod extension;
 mod publication;
 pub use publication::{
     prepare_bundle, restore_previous, restore_version, stage_bundle, stage_repository_bundle,

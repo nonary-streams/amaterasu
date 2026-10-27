@@ -1,0 +1,46 @@
+{
+  "settings": {
+    "amaterasu.management": {
+      "extensions": {
+        "entries": [
+          {
+            "id": "hello",
+            "root": "/absolute/path/to/extensions/hello",
+            "trusted_keys": {"FINGERPRINT": "PUBLIC_KEY_HEX"},
+            "methods": [
+              {
+                "alias": "greet",
+                "provider": "example.extension-provider",
+                "service": "example.extension/1",
+                "method": "greet",
+                "interface_major": 1,
+                "interface_minor": 0,
+                "scope": "catalog.read",
+                "min_role": "operator"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "principals": {
+    "example.extension-provider": {"provide": ["example.extension/1"]},
+    "amaterasu.management": {"call": ["example.extension/1"]}
+  },
+  "api_methods": [
+    {
+      "provider": "example.extension-provider",
+      "callers": ["amaterasu.management"],
+      "method": {
+        "service": "example.extension/1",
+        "method": "greet",
+        "interface_major": 1,
+        "interface_minor": 0,
+        "request": {"required": {"name": "string"}, "optional": {}, "allow_extra": false},
+        "response": {"required": {"message": "string"}, "optional": {}, "allow_extra": false},
+        "privilege": "user"
+      }
+    }
+  ]
+}

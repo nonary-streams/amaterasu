@@ -114,6 +114,7 @@ fn verify_cookie(result: Response, cookie: char) -> (Stage, Vec<Command>) {
             *request,
             &mut operation,
             &mut selection_owners,
+            None,
         )
         .unwrap();
     let commands = recorder.commands.into_inner().unwrap();
@@ -198,7 +199,7 @@ fn valid_cookie_with_insufficient_scope_is_forbidden_without_dispatch() {
 fn valid_cookie_with_exact_route_scope_dispatches_only_the_resolved_action() {
     let (stage, commands) = verify_cookie(
         Response::Result {
-            payload: json!({"ok":true,"kind":"administrator_session","subject":"admin","scopes":["configuration.read"],"expires_at":1_800_000_000}),
+            payload: json!({"ok":true,"kind":"administrator_session","role":"administrator","subject":"admin","scopes":["configuration.read"],"expires_at":1_800_000_000}),
         },
         'd',
     );
@@ -223,6 +224,7 @@ fn pipewire_selection_route_verifies_capture_scope_and_binds_the_handle_to_sessi
             payload: json!({
                 "ok":true,
                 "kind":"administrator_session",
+                "role":"administrator",
                 "subject":"admin",
                 "auth_context_id":auth_context_id,
                 "scopes":["capture.write"],
@@ -289,6 +291,7 @@ fn pipewire_selection_route_verifies_capture_scope_and_binds_the_handle_to_sessi
             *request,
             &mut operation,
             &mut selection_owners,
+            None,
         )
         .unwrap();
     assert!(matches!(

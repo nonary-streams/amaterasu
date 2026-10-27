@@ -2,6 +2,7 @@
 mod assets;
 mod capture_management;
 mod csrf_policy;
+mod extensions;
 mod http;
 mod peer_policy;
 mod product_settings;
@@ -39,6 +40,7 @@ struct Settings {
     #[serde(default)]
     allowed_origins: Vec<String>,
     web: Option<assets::WebSettings>,
+    extensions: Option<extensions::Settings>,
 }
 
 struct ManagementModule {
@@ -88,8 +90,12 @@ impl ManagedModule for ManagementModule {
             }
             _ => None,
         };
+        let extensions = settings
+            .extensions
+            .map(extensions::Extensions::new)
+            .transpose()?;
         let server = if settings.enabled {
-            Some(Server::bind(
+            let mut server = Server::bind(
                 settings
                     .bind
                     .ok_or("enabled management requires an explicit loopback bind")?,
@@ -97,7 +103,9 @@ impl ManagedModule for ManagementModule {
                 settings.web.map(assets::Assets::new).transpose()?,
                 settings.tls_bind,
                 tls_configuration,
-            )?)
+            )?;
+            server.set_extensions(extensions);
+            Some(server)
         } else {
             None
         };

@@ -1137,7 +1137,14 @@ namespace Amaterasu {
       const edit = button("Edit", () => showEditor(row, capabilities));
       edit.disabled = !api.allows("catalog.write") || providerLaunch;
       if (providerLaunch) catalogLocalizedAttribute(edit, "title", "Playnite launch targets are managed by the provider.");
-      const actions = [edit];
+      const launch = button("Launch", () => void runAction(launch, status, async () => {
+        const bytes = crypto.getRandomValues(new Uint8Array(16));
+        const operation = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+        await api.post("launch/start", { app_id: row.id, operation_id: `web.${operation}` });
+        notify(catalogTextMessage("Launch requested. Check Applications for its status."));
+      }), "primary");
+      launch.disabled = typeof api.allowsLaunchAction !== "function" || !api.allowsLaunchAction("start");
+      const actions = [launch, edit];
       if (providerLaunch) {
         const configure = button(
           "Streaming settings",

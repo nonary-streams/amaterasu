@@ -593,7 +593,10 @@ fn verifier_context_is_stable_across_refresh_and_distinct_for_sessions_and_token
         107,
     );
     assert_eq!(token_verified["auth_context_id"], token["token_id"]);
-    assert_eq!(token_verified["kind"], "api_token");
+    assert_eq!(
+        token_verified["kind"], "api_token",
+        "token={token:?} verification={token_verified:?}"
+    );
 
     assert_eq!(
         state.request(
@@ -1195,8 +1198,6 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
     };
     let mut pipeline = Pipeline::new(lutris_settings.clone());
     state.setup(&mut pipeline);
-    let credential_document = state.stored.clone();
-
     let login = state.request(
         &mut pipeline,
         "frontend",
@@ -1205,8 +1206,9 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
     );
     assert_eq!(login["ok"], true);
     assert_eq!(login["scopes"], json!(["lutris.read"]));
-    assert_eq!(state.revision, 2);
-    assert_eq!(state.stored, credential_document);
+    assert_eq!(state.revision, 3);
+    assert!(state.stored.as_ref().unwrap()["credential"].is_null());
+    let credential_document = state.stored.clone();
     assert_eq!(state.session_revision, 1);
     let stored = state.session_stored.as_ref().unwrap();
     assert_eq!(stored["sessions"].as_array().unwrap().len(), 1);
@@ -1260,7 +1262,7 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
     assert_eq!(rotated["ok"], true);
     assert_eq!(rotated["scopes"], json!(["lutris.read"]));
     assert_eq!(rotated["refresh_expires_at"], 500);
-    assert_eq!(state.revision, 3);
+    assert_eq!(state.revision, 4);
     assert_eq!(state.stored, credential_document);
     assert_eq!(state.session_revision, 2);
     assert_eq!(
@@ -2382,7 +2384,8 @@ fn successful_legacy_password_proof_upgrades_the_durable_verifier() {
         100,
     );
     assert_eq!(response["ok"], true);
-    let credential = &state.stored.as_ref().unwrap()["credential"];
+    let credential = &state.stored.as_ref().unwrap()["accounts"][0];
+    assert!(state.stored.as_ref().unwrap()["credential"].is_null());
     assert!(credential.get("legacy_salt").is_none());
     assert!(crate::crypto::valid_password_hash(
         credential["password_hash"].as_str().unwrap()
@@ -2553,7 +2556,7 @@ fn logout_revokes_persistently_and_active_sessions_survive_restart() {
         )["ok"],
         true
     );
-    assert_eq!(state.writes, 4);
+    assert_eq!(state.writes, 5);
 }
 
 #[test]
@@ -2748,5 +2751,308 @@ fn administrator_session_metadata_is_not_a_bearer_and_revocation_works() {
             101,
         )["code"],
         "unauthorized"
+    );
+}
+
+#[test]
+fn enrollment_requires_local_issuance_and_consumes_code_with_credential() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    let generate = json!({"action":"generate_enrollment_code"});
+    assert_eq!(
+        state.request(&mut pipeline, "amaterasu.management", generate.clone(), 100)["code"],
+        "forbidden"
+    );
+    let issued = state.request(&mut pipeline, "amaterasu.console", generate, 100);
+    let code = issued["code"].as_str().unwrap().to_owned();
+    assert_eq!(issued["expires_at"], 700);
+    assert!(!state.stored.as_ref().unwrap().to_string().contains(&code));
+    let enroll = json!({"action":"enroll_first_admin","code":code,"username":"admin","password":"correct horse battery staple"});
+    assert_eq!(
+        state.request(&mut pipeline, "frontend", enroll.clone(), 101)["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        state.request(&mut pipeline, "amaterasu.management", enroll.clone(), 101)["ok"],
+        true
+    );
+    assert!(state.stored.as_ref().unwrap().get("enrollment").is_none());
+    assert!(state.stored.as_ref().unwrap()["credential"].is_null());
+    assert_eq!(
+        state.stored.as_ref().unwrap()["accounts"][0]["role"],
+        "administrator"
+    );
+    assert_eq!(
+        state.request(&mut pipeline, "amaterasu.management", enroll, 102)["code"],
+        "already_initialized"
+    );
+}
+
+#[test]
+fn enrollment_code_expires_and_reissuance_invalidates_previous_code() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    let first = state.request(
+        &mut pipeline,
+        "amaterasu.console",
+        json!({"action":"generate_enrollment_code"}),
+        100,
+    );
+    let second = state.request(
+        &mut pipeline,
+        "amaterasu.console",
+        json!({"action":"generate_enrollment_code"}),
+        101,
+    );
+    let request = |code: &Value| json!({"action":"enroll_first_admin","code":code,"username":"admin","password":"correct horse battery staple"});
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            request(&first["code"]),
+            102
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            request(&second["code"]),
+            701
+        )["code"],
+        "unauthorized"
+    );
+}
+
+#[test]
+fn account_lifecycle_enforces_roles_and_per_user_revocation_across_restart() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.setup(&mut pipeline);
+    let login = |name: &str| json!({"action":"login","username":name,"password":"correct horse battery staple"});
+    let admin = state.request(&mut pipeline, "frontend", login("admin"), 100);
+    let admin_bearer = admin["bearer"].clone();
+    assert_eq!(state.request(&mut pipeline,"frontend",json!({"action":"create_account","bearer":admin_bearer,"username":"operator","password":"correct horse battery staple","role":"operator"}),101)["ok"], true);
+    let operator = state.request(&mut pipeline, "frontend", login("operator"), 101);
+    assert_eq!(operator["role"], "operator");
+    assert_eq!(state.request(&mut pipeline,"frontend",json!({"action":"verify","bearer":operator["bearer"],"required_scopes":["catalog.read"]}),101)["ok"], true);
+    assert_eq!(state.request(&mut pipeline,"frontend",json!({"action":"verify","bearer":operator["bearer"],"required_scopes":["catalog.write"]}),101)["code"], "unauthorized");
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({"action":"list_accounts","bearer":operator["bearer"]}),
+            101
+        )["code"],
+        "forbidden"
+    );
+    assert_eq!(state.request(&mut pipeline,"frontend",json!({"action":"update_account","bearer":admin["bearer"],"username":"operator","role":"viewer","enabled":true}),102)["ok"], true);
+    let mut restarted = Pipeline::new(settings());
+    state.fail_session_write = true;
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":operator["bearer"],"required_scopes":[]}),
+            103
+        )["code"],
+        "state_unavailable"
+    );
+    state.fail_session_write = false;
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"refresh","refresh_token":operator["refresh_token"]}),
+            104
+        )["code"],
+        "unauthorized"
+    );
+    // Updating another user must preserve the administrator session.
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":admin["bearer"],"required_scopes":[]}),
+            104
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"delete_account","bearer":admin["bearer"],"username":"admin"}),
+            104
+        )["code"],
+        "last_administrator"
+    );
+}
+
+#[test]
+fn trusted_scope_policy_grants_only_configured_roles_and_invalidates_sessions() {
+    let mut configured = settings();
+    configured.allowed_scopes.insert("extension.control".into());
+    configured
+        .scope_minimum_roles
+        .insert("extension.control".into(), crate::accounts::Role::Operator);
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(configured.clone());
+    state.setup(&mut pipeline);
+    let login = |username: &str| json!({"action":"login","username":username,"password":"correct horse battery staple"});
+    let admin = state.request(&mut pipeline, "frontend", login("admin"), 100);
+    for role in ["operator", "viewer"] {
+        assert_eq!(state.request(&mut pipeline,"frontend",json!({"action":"create_account","bearer":admin["bearer"],"username":role,"password":"correct horse battery staple","role":role}),100)["ok"],true);
+    }
+    let operator = state.request(&mut pipeline, "frontend", login("operator"), 101);
+    let viewer = state.request(&mut pipeline, "frontend", login("viewer"), 101);
+    let verify = |token: &Value| json!({"action":"verify","bearer":token,"required_scopes":["extension.control"]});
+    assert_eq!(
+        state.request(&mut pipeline, "frontend", verify(&operator["bearer"]), 101)["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(&mut pipeline, "frontend", verify(&viewer["bearer"]), 101)["code"],
+        "unauthorized"
+    );
+    configured.scope_minimum_roles.clear();
+    configured.authorization_policy_generation += 1;
+    let mut restarted = Pipeline::new(configured);
+    assert_eq!(
+        state.request(&mut restarted, "frontend", verify(&operator["bearer"]), 102)["code"],
+        "unauthorized"
+    );
+}
+
+#[test]
+fn account_settings_require_current_administrator_session() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.setup(&mut pipeline);
+    let login = |username: &str| json!({"action":"login","username":username,"password":"correct horse battery staple"});
+    let admin = state.request(&mut pipeline, "frontend", login("admin"), 100);
+    assert_eq!(state.request(&mut pipeline,"frontend",json!({"action":"create_account","bearer":admin["bearer"],"username":"viewer","password":"correct horse battery staple","role":"viewer"}),100)["ok"],true);
+    let viewer = state.request(&mut pipeline, "frontend", login("viewer"), 101);
+    let get = |token: &Value| json!({"action":"account_settings_get","bearer":token});
+    assert_eq!(
+        state.request(&mut pipeline, "frontend", get(&viewer["bearer"]), 101)["code"],
+        "forbidden"
+    );
+    let settings_response = state.request(&mut pipeline, "frontend", get(&admin["bearer"]), 101);
+    assert_eq!(settings_response["ok"], true);
+    let update = |token: &Value| json!({"action":"account_settings_update","bearer":token,"session_token_ttl_seconds":3600,"remember_me_refresh_token_ttl_seconds":604800,"expected_revision":0});
+    assert_eq!(
+        state.request(&mut pipeline, "frontend", update(&viewer["bearer"]), 101)["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        state.request(&mut pipeline, "frontend", update(&admin["bearer"]), 101)["ok"],
+        true
+    );
+}
+
+#[test]
+fn legacy_verifier_principal_has_no_administrator_operations() {
+    let mut policy = settings();
+    policy
+        .legacy_verifier_principals
+        .insert("amaterasu.management".into());
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(policy);
+    state.setup(&mut pipeline);
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({"action":"settings_get"}),
+            100
+        )["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({"action":"change_password","password":"correct horse battery staple"}),
+            100
+        )["code"],
+        "forbidden"
+    );
+    let session = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple"}),
+        100,
+    );
+    assert_eq!(state.request(&mut pipeline,"amaterasu.management",json!({"action":"verify","bearer":session["bearer"],"required_scopes":["catalog.read"],"legacy_request":{"path":"/api/catalog","method":"GET"}}),100)["ok"],true);
+}
+
+#[test]
+fn management_login_backstop_recovers_rapidly_and_preserves_other_caller_limits() {
+    use crate::engine::Engine;
+    use crate::protocol::Operation;
+    let operation = Operation::Login {
+        username: "user".into(),
+        password: "wrong".into(),
+        remember_me: false,
+    };
+    let mut engine = Engine::new(settings());
+    // Management applies its peer/account limits before forwarding these calls;
+    // authentication sees only the trusted module principal, never peer input.
+    for _ in 0..20 {
+        assert_eq!(
+            engine.admit("amaterasu.management", &operation, 100),
+            Ok(())
+        );
+    }
+    assert_eq!(
+        engine.admit("amaterasu.management", &operation, 100),
+        Err("rate_limited")
+    );
+    // Even if two peers consumed the burst, a later client is not locked out
+    // for the rest of the minute. Refill remains bounded at two per second.
+    assert_eq!(
+        engine.admit("amaterasu.management", &operation, 101),
+        Ok(())
+    );
+    assert_eq!(
+        engine.admit("amaterasu.management", &operation, 101),
+        Ok(())
+    );
+    assert_eq!(
+        engine.admit("amaterasu.management", &operation, 101),
+        Err("rate_limited")
+    );
+    for now in 102..112 {
+        for _ in 0..2 {
+            assert_eq!(
+                engine.admit("amaterasu.management", &operation, now),
+                Ok(())
+            );
+        }
+    }
+    // Independent callers retain both the five-per-principal and shared 20
+    // limits, and cannot use the management budget to bypass them.
+    for caller in ["one", "two", "three", "four"] {
+        for _ in 0..5 {
+            assert_eq!(engine.admit(caller, &operation, 112), Ok(()));
+        }
+        assert_eq!(engine.admit(caller, &operation, 112), Err("rate_limited"));
+    }
+    assert_eq!(engine.admit("five", &operation, 112), Err("rate_limited"));
+    assert_eq!(engine.admit("five", &operation, 172), Ok(()));
+    // Restart clears in-memory ledgers; downstream per-peer limits remain
+    // independently enforced by management for its lifetime.
+    let mut restarted = Engine::new(settings());
+    for _ in 0..20 {
+        assert_eq!(
+            restarted.admit("amaterasu.management", &operation, 172),
+            Ok(())
+        );
+    }
+    assert_eq!(
+        restarted.admit("amaterasu.management", &operation, 172),
+        Err("rate_limited")
     );
 }

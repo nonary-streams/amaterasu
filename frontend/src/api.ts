@@ -9,6 +9,7 @@ namespace Amaterasu {
     bearer: string;
     refresh_token: string;
     subject: string;
+    role: AccountRole | null;
     scopes: string[];
     expires_at: number;
     refresh_expires_at: number;
@@ -22,9 +23,12 @@ namespace Amaterasu {
     refreshing: boolean;
   };
 
+  type AccountRole = "administrator" | "operator" | "viewer";
+
   type BrowserSession = {
     ok: true;
     subject: string;
+    role?: AccountRole;
     scopes: string[];
     expires_at: number;
   };
@@ -65,6 +69,7 @@ namespace Amaterasu {
     private loggingOut = false;
     onAuthenticationLost: (() => void) | null = null;
     subject = "";
+    role: AccountRole | "token" | null = null;
     scopes: string[] | null = null;
 
     constructor(base: string) {
@@ -177,6 +182,7 @@ namespace Amaterasu {
       await this.clear();
       this.bearer = token;
       this.subject = "API token";
+      this.role = "token";
       this.scopes = null;
       this.tokenGeneration += 1;
     }
@@ -188,6 +194,7 @@ namespace Amaterasu {
 
       this.loggingOut = true;
       this.subject = "";
+      this.role = null;
       this.scopes = null;
       this.abortRequests(true);
 
@@ -267,7 +274,18 @@ namespace Amaterasu {
     }
 
     allows(scope: string): boolean {
-      return this.scopes === null || this.scopes.includes(scope);
+      if (this.scopes !== null && !this.scopes.includes(scope)) return false;
+      if (this.role === "administrator" || this.role === "token") return true;
+      // The server applies role restrictions in addition to scopes. Treat
+      // missing role metadata as read-only until the session is refreshed.
+      return ["account.self", "application.read", "catalog.read", "display.read",
+        "lutris.read", "session.read", "steam.read"].includes(scope);
+    }
+
+    allowsLaunchAction(action: "start" | "stop"): boolean {
+      const scope = action === "start" ? "application.launch" : "application.terminate";
+      return (this.role === "administrator" || this.role === "operator" || this.role === "token") &&
+        (this.scopes === null || this.scopes.includes(scope));
     }
 
     async post<T>(
@@ -367,6 +385,7 @@ namespace Amaterasu {
       this.cookieSession = true;
       this.accessExpiresAt = session.expires_at;
       this.subject = session.subject;
+      this.role = session.role ?? null;
       this.scopes = [...session.scopes];
       this.tokenGeneration += 1;
     }
@@ -893,6 +912,7 @@ namespace Amaterasu {
         bearer: reply.bearer,
         refresh_token: reply.refresh_token,
         subject: reply.subject,
+        role: ["administrator", "operator", "viewer"].includes(String(reply.role)) ? reply.role! : null,
         scopes: [...reply.scopes],
         expires_at: reply.expires_at,
         refresh_expires_at: reply.refresh_expires_at,
@@ -909,6 +929,7 @@ namespace Amaterasu {
       this.refreshToken = session.refresh_token;
       this.accessExpiresAt = session.expires_at;
       this.subject = this.loggingOut ? "" : session.subject;
+      this.role = this.loggingOut ? null : session.role ?? null;
       this.scopes = this.loggingOut ? null : [...session.scopes];
       this.remembered = remembered;
       this.sessionId = remembered ? sessionId : null;
@@ -1332,6 +1353,7 @@ namespace Amaterasu {
       this.refreshToken = "";
       this.accessExpiresAt = 0;
       this.subject = "";
+      this.role = null;
       this.scopes = null;
       this.remembered = false;
       this.cookieSession = false;

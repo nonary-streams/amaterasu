@@ -12,7 +12,7 @@ use amaterasu_contracts::{
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use api::{ApiInvocation, ApiRegistry};
+use api::{ApiInvocation, ApiQuery, ApiRegistry};
 use events::EventBus;
 use hooks::HookRegistry;
 use requests::{RequestOptions, RequestRouter};
@@ -197,10 +197,29 @@ impl Broker {
             } => self.api.query(
                 caller,
                 grants,
-                &service,
-                &method,
+                ApiQuery {
+                    service: &service,
+                    method: &method,
+                    major: interface_major,
+                    min_minor,
+                },
+                false,
+            ),
+            Command::QueryApiApproval {
+                service,
+                method,
                 interface_major,
                 min_minor,
+            } => self.api.query(
+                caller,
+                grants,
+                ApiQuery {
+                    service: &service,
+                    method: &method,
+                    major: interface_major,
+                    min_minor,
+                },
+                true,
             ),
             Command::CallApi {
                 service,

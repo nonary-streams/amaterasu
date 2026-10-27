@@ -15,6 +15,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import pwd
 import shutil
 import socket
 import ssl
@@ -35,16 +36,46 @@ LAN_ADDRESS = "10.231.0.2"
 WAN_ADDRESS = "203.0.113.2"
 
 
-def configure_private_network(parent_network, parent_user):
-    assert os.readlink("/proc/self/ns/net") != parent_network, "network namespace was not isolated"
-    assert os.readlink("/proc/self/ns/user") != parent_user, "user namespace was not isolated"
-    assert socket.if_nameindex() == [(1, "lo")], "private network has unexpected interfaces"
-    assert os.geteuid() == 0, "private namespace does not own its network configuration"
-    tool = shutil.which("ip")
-    assert tool is not None, "iproute2 is required for this opt-in test"
-    subprocess.run([tool, "link", "set", "lo", "up"], check=True)
-    for address in [SERVER_ADDRESS, LAN_ADDRESS, WAN_ADDRESS]:
-        subprocess.run([tool, "address", "add", address + "/32", "dev", "lo"], check=True)
+def subordinate_id(path, uid):
+    """Find a subordinate ID owned by this user for namespace root only."""
+    names = {str(uid), pwd.getpwuid(uid).pw_name}
+    for line in Path(path).read_text().splitlines():
+        parts = line.split(":")
+        if len(parts) == 3 and parts[0] in names:
+            start, count = int(parts[1]), int(parts[2])
+            if start > 0 and count > 0:
+                return start
+    raise RuntimeError(f"No subordinate ID is configured in {path}")
+
+
+# This bootstrap runs before the private-network test can access the user's
+# home. Namespace root maps to a subordinate host ID, not to the invoking user.
+# After assigning loopback addresses it irrevocably drops to the mapped invoking
+# UID/GID, so the host and its files retain the user's normal ownership.
+NAMESPACE_BOOTSTRAP = r"""
+import os, socket, subprocess, sys
+parent_net, parent_user, uid, gid, ip, script = sys.argv[1:7]
+if os.readlink('/proc/self/ns/net') == parent_net or os.readlink('/proc/self/ns/user') == parent_user:
+    raise RuntimeError('network and user namespaces must both be isolated')
+if socket.if_nameindex() != [(1, 'lo')] or os.geteuid() != 0:
+    raise RuntimeError('network setup requires namespace root and loopback only')
+subprocess.run([ip, 'link', 'set', 'lo', 'up'], check=True)
+for address in sys.argv[7:]:
+    subprocess.run([ip, 'address', 'add', address + '/32', 'dev', 'lo'], check=True)
+os.setgroups([])
+os.setgid(int(gid))
+os.setuid(int(uid))
+if os.getresuid() != (int(uid),) * 3 or int(uid) == 0:
+    raise RuntimeError('failed to drop namespace root UID')
+if os.getresgid() != (int(gid),) * 3 or int(gid) == 0 or os.getgroups():
+    raise RuntimeError('failed to drop namespace root GID or supplementary groups')
+status = dict(line.split(':', 1) for line in open('/proc/self/status') if ':' in line)
+if any(int(status[name].strip(), 16) != 0 for name in ('CapEff', 'CapPrm', 'CapAmb')):
+    raise RuntimeError('namespace capabilities remain after dropping privileges')
+os.execv(sys.executable, [sys.executable, script, '--private-network', '--skip-build',
+                         '--inside-private-network', '--parent-network', parent_net,
+                         '--parent-user', parent_user])
+"""
 
 
 def provision_identity(harness):
@@ -141,12 +172,14 @@ class PeerTlsApi:
             raw.close()
             raise
 
-    def request(self, method, path, payload=None, token=None):
+    def request(self, method, path, payload=None, token=None, extra_headers=None):
         connection = http.client.HTTPSConnection(
             self.host, self.port, timeout=4, context=self.context,
             source_address=(self.source, 0),
         )
         headers = {"Content-Type": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
         if token is not None:
             headers["Authorization"] = "Bearer " + token
         try:
@@ -191,6 +224,27 @@ def assert_identity_checks(api):
             continue
         connection.close()
         raise AssertionError("TLS accepted an untrusted certificate or mismatched identity")
+
+
+def assert_login_throttle_isolated(lan, pc):
+    # The first peer must not exhaust the second peer's quota for the same
+    # existing account. Forwarding headers are untrusted: the actual socket
+    # peer remains the source of the admission decision.
+    for attempt in range(5):
+        status, body = lan.request("POST", "/v1/auth/login", {
+            "username": "ISOLATED-PEER-TEST" if attempt % 2 else "isolated-peer-test",
+            "password": "incorrect-isolated-password",
+        }, extra_headers={"X-Forwarded-For": f"192.0.2.{attempt + 1}"})
+        assert status == 401 and not body.get("ok"), f"failed login {attempt + 1}: HTTP {status}"
+    status, body = lan.request("POST", "/v1/auth/login", {
+        "username": "isolated-peer-test", "password": "isolated-peer-test-password",
+    }, extra_headers={"X-Forwarded-For": "192.0.2.200"})
+    assert status == 429 and body.get("code") == "rate_limited", "peer quota was bypassed"
+    status, body = pc.request("POST", "/v1/auth/login", {
+        "username": "isolated-peer-test", "password": "isolated-peer-test-password",
+    })
+    assert status == 200 and body.get("ok") and body.get("bearer"), \
+        f"other peer could not authenticate: HTTP {status}, code {body.get('code')}"
 
 
 def update_policy(api, token, selection):
@@ -253,6 +307,7 @@ def exercise_private_peers():
                      for source in [PC_ADDRESS, LAN_ADDRESS, WAN_ADDRESS]}
             pc, lan, wan = [peers[source] for source in [PC_ADDRESS, LAN_ADDRESS, WAN_ADDRESS]]
             assert_identity_checks(pc)
+            assert_login_throttle_isolated(lan, pc)
             assert pc.settings(administrator) == lan.settings(administrator)
             assert_peer_denied(wan)
             # The same actual LAN peer can read settings but not operational health.
@@ -293,7 +348,7 @@ def exercise_private_peers():
             raise
         finally:
             console.close()
-    print("Passed: signed native management HTTPS with verified private TLS identity, actual PC/LAN/WAN peers, authorization, narrowing disconnect, restart policy and PC-only health in an isolated Linux network namespace.")
+    print("Passed: signed native management HTTPS with verified private TLS identity, actual PC/LAN/WAN peers, per-peer account throttling, authorization, narrowing disconnect, restart policy and PC-only health in an isolated Linux network namespace.")
     print("Unqualified: physical LAN/WAN reachability, installed TLS/service provisioning, browser editing, Windows/macOS, reference welcome exception and UPnP.")
 
 
@@ -309,7 +364,10 @@ def main():
     assert sys.platform.startswith("linux"), "this opt-in gate requires Linux"
     if options.inside_private_network:
         assert options.parent_network and options.parent_user
-        configure_private_network(options.parent_network, options.parent_user)
+        assert os.readlink("/proc/self/ns/net") != options.parent_network
+        assert os.readlink("/proc/self/ns/user") != options.parent_user
+        assert os.geteuid() != 0 and os.getegid() != 0, "test host must run as a non-root user"
+        assert socket.if_nameindex() == [(1, "lo")], "private network has unexpected interfaces"
         exercise_private_peers()
         return
     assert os.geteuid() != 0, "run this gate as the normal user, without sudo"
@@ -317,11 +375,18 @@ def main():
         run(CARGO, "build", "--workspace", "--locked", "--offline")
     launcher = shutil.which("unshare")
     assert launcher is not None, "util-linux unshare is required for this opt-in gate"
+    ip = shutil.which("ip")
+    assert ip is not None, "iproute2 is required for this opt-in test"
+    uid, gid = os.getuid(), os.getgid()
+    assert uid != 0 and gid != 0
+    subuid = subordinate_id("/etc/subuid", uid)
+    subgid = subordinate_id("/etc/subgid", uid)
     subprocess.run([
-        launcher, "--user", "--map-root-user", "--net", sys.executable, str(Path(__file__).resolve()),
-        "--private-network", "--skip-build", "--inside-private-network",
-        "--parent-network", os.readlink("/proc/self/ns/net"),
-        "--parent-user", os.readlink("/proc/self/ns/user"),
+        launcher, "--user", "--map-current-user", "--map-users", f"0:{subuid}:1",
+        "--map-groups", f"0:{subgid}:1", "--setuid", "0", "--setgid", "0", "--net",
+        sys.executable, "-c", NAMESPACE_BOOTSTRAP,
+        os.readlink("/proc/self/ns/net"), os.readlink("/proc/self/ns/user"), str(uid), str(gid),
+        ip, str(Path(__file__).resolve()), SERVER_ADDRESS, LAN_ADDRESS, WAN_ADDRESS,
     ], check=True, timeout=180)
 
 
