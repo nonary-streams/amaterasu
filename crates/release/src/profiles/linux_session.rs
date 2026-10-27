@@ -582,7 +582,10 @@ fn streaming_settings(options: &LinuxSessionOptions) -> Value {
             "audio_bitrate": 128_000,
             "encrypt_video": true,
             "encrypt_audio": true,
-            "permit_legacy_audio_iv_wrap": false,
+            // Moonlight derives its legacy audio IV from the wrapping RTP
+            // sequence. Continue across that wrap instead of ending normal
+            // sessions after 65536 audio packets.
+            "permit_legacy_audio_iv_wrap": true,
         },
         "desktop": {"enabled": true},
     })

@@ -369,6 +369,55 @@ fn receive(socket: &UdpSocket) -> Vec<u8> {
     bytes
 }
 
+#[test]
+fn encrypted_audio_legacy_compatibility_continues_across_rtp_sequence_wrap() {
+    for packet_ms in [5, 10] {
+        let (video, audio) = receivers();
+        let mut settings = request(&video, &audio, true);
+        settings
+            .encryption
+            .as_mut()
+            .unwrap()
+            .permit_legacy_audio_iv_wrap = true;
+        settings.audio.packet_ms = packet_ms;
+        let mut stream = Stream::open("owner", &settings).unwrap();
+        let opus = [if packet_ms == 5 { 0x8c } else { 0x04 }, 1, 2, 3];
+        let mut first_ciphertext = None;
+
+        // Cross the actual 16-bit wire boundary, including audio encryption, FEC,
+        // admission and UDP delivery: over 327 seconds at 5 ms and 655 at 10 ms.
+        for sequence in 0..65_538 {
+            let expected_datagrams = stream.audio.required_datagrams();
+            let packet = EncodedAudioPacket {
+                frames: packet_ms * 48,
+                timestamp_us: sequence * u64::from(packet_ms) * 1000,
+                ..audio_packet(&opus, sequence)
+            };
+            // SAFETY: the local Opus payload stays live through submission.
+            assert_eq!(
+                unsafe { stream.submit_audio(&packet) },
+                STATUS_OK,
+                "audio packet {sequence}"
+            );
+            stream.delivery.tick();
+            let packet = receive(&audio);
+            assert_eq!(u16::from_be_bytes([packet[2], packet[3]]), sequence as u16);
+            if sequence == 0 {
+                first_ciphertext = Some(packet[12..].to_vec());
+            } else if sequence == 65_536 {
+                assert_eq!(&packet[12..], first_ciphertext.as_ref().unwrap());
+            }
+            for _ in 1..expected_datagrams {
+                receive(&audio);
+            }
+        }
+        assert!(stream.audio_iv_reuse_started());
+        assert_eq!(stream.state(), "sending");
+        assert_eq!(stream.delivery.failure, None);
+        assert_eq!(stream.audio_sequence, Some(65_537));
+    }
+}
+
 fn discovery_ping(token: &str) -> Vec<u8> {
     let mut bytes = token.as_bytes().to_vec();
     bytes.extend_from_slice(&1u32.to_be_bytes());

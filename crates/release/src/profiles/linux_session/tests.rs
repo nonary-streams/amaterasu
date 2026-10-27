@@ -217,6 +217,15 @@ fn linux_profile_allows_hardware_modes_up_to_uhd_at_120_hz() {
 }
 
 #[test]
+fn linux_profile_keeps_encrypted_audio_playing_across_sequence_wrap() {
+    let root = std::env::temp_dir().join("amaterasu-audio-wrap-policy");
+    let policy = linux_session_policy(&root, &LinuxSessionOptions::default()).unwrap();
+    let profile = &policy.settings["amaterasu.nvhttp"]["streaming"]["profile"];
+    assert_eq!(profile["encrypt_audio"], true);
+    assert_eq!(profile["permit_legacy_audio_iv_wrap"], true);
+}
+
+#[test]
 fn explicitly_enabled_virtual_displays_select_a_stream_owned_output() {
     let options = LinuxSessionOptions {
         enable_virtual_display: true,

@@ -225,7 +225,9 @@ and discontinuity skips consume that budget too. Exhaustion fails the stream
 and requires a fresh-key session. Only an explicit
 `permit_legacy_audio_iv_wrap:true` selects long-session legacy compatibility;
 `audio_iv_reuse_started` reports when IV reuse begins. CBC has no authentication
-or replay protection, and this option does not add either. Video GCM's outer
+or replay protection, and this option does not add either. The Linux session
+release profile explicitly enables this compatibility option so normal Moonlight
+sessions continue across the audio counter wrap. Video GCM's outer
 frame-number routing hint is unauthenticated by the client protocol; the full
 RTP/NV plaintext and ciphertext integrity are authenticated.
 
