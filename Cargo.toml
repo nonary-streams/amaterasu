@@ -22,6 +22,7 @@ members = [
     "fixtures/echo",
     "fixtures/extension-example",
     "fixtures/media-probe",
+    "fixtures/autonomous-video-probe",
     "fixtures/stream-source",
     "fixtures/capture-source",
     "fixtures/input-probe",

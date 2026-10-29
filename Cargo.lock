@@ -113,6 +113,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-autonomous-video-probe"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-media",
+ "amaterasu-module-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-capture-authority"
 version = "0.1.0"
 dependencies = [
