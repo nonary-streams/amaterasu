@@ -1,6 +1,11 @@
 #include "amaterasu_media.h"
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(AmaterasuNativeInterface) == 32, "native prefix layout");
+_Static_assert(sizeof(AmaterasuCaptureSwapRequest) == 56, "capture swap request layout");
+_Static_assert(sizeof(AmaterasuCaptureEventSink) == 32, "capture notification sink layout");
+_Static_assert(sizeof(AmaterasuCaptureApiV1_7) == 112, "capture event table layout");
+_Static_assert(offsetof(AmaterasuCaptureApiV1_7, subscribe_events) == 88, "v1.6 prefix preserved");
+_Static_assert(offsetof(AmaterasuCaptureApiV1_7, resolve_swap) == 104, "swap decision offset");
 _Static_assert(sizeof(AmaterasuNativeInterfaceQuery) == 24, "native query layout");
 _Static_assert(sizeof(AmaterasuNativeServiceFactory) == 32, "native factory layout");
 _Static_assert(sizeof(AmaterasuCpuFrame) == 48, "frame layout");

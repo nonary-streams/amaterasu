@@ -4,6 +4,134 @@ This document describes the implemented native capture-to-encoder path. Native
 providers are trusted code loaded into the user worker; runtime grants control
 service routing, not a native-code sandbox. The media ABI is still draft.
 
+## Publish frames and request a capture swap
+
+The Rust SDK's `capture` module provides a capture-only channel. The capture
+worker owns how pixels are acquired; publishing never invokes the encoder.
+Each channel is one capture session, so a producer cannot select another
+session by supplying an ID. The latest frame replaces the previous mailbox
+frame, rather than accumulating a queue of old frames.
+
+```rust,ignore
+use amaterasu_module_sdk::capture::{capture_channel, SwapRequest};
+
+let (publisher, frames) = capture_channel();
+// Move publisher to the capture worker; retain frames in the provider adapter.
+publisher.publish(my_owned_frame)?;
+
+let request_id = publisher.request_capture_swap(SwapRequest {
+    preferred_provider: Some("another_capture".into()), // or None: consumer chooses
+    output: Some("matching-output-id".into()),
+    reason: "source_unavailable".into(),
+})?;
+// Keep capturing if possible. Acceptance itself does not stop this provider.
+let decision = publisher.swap_decision(request_id)?;
+```
+
+`publish` moves an owned frame without copying its pixels. `T` must be `Send +
+Sync`: use `OwnedCpuFrame` for CPU pixels or an immutable GPU-resource owner
+with a real cross-thread ownership contract. A borrowed DMA-BUF descriptor is
+not an owner. Existing `RetainedDmaBufFrame` values remain confined to their
+module thread; this API does not make them transferable between threads.
+Platform-specific GPU resource owners still supply the acquire fence and obey
+the existing leased-frame contract when exposing a frame to consumers.
+
+The reader's `latest_frame()` acquires an `Arc<T>` snapshot; no mailbox lock is
+held while a consumer reads it. The source retains one latest frame for repeated
+reads. Readers must separately bound their in-flight frames and GPU leases.
+For CPU providers, `CaptureFrames<OwnedCpuFrame>::read_cpu_frame(sink)` adapts
+that snapshot to the existing borrowed native CPU callback without another
+pixel copy. Authenticate the caller and stream before invoking the adapter.
+
+`publisher.stop("source_lost")` reports a terminal capture failure and wakes
+consumers even when no further frame can arrive. It is distinct from an advisory
+swap request: video stops the failed stream instead of repeating stale pixels
+indefinitely. Acquired GPU frames still retain their normal completion lifetime.
+
+Publishing to a contended mailbox returns `PublishError { error: Busy, frame }`
+without accepting the frame; the producer can reuse or retry that resource.
+Old resources are released outside the mailbox lock on the publishing thread;
+resource destructors must not wait for GPU completion if capture needs a
+nonblocking publish. `frames.close()` (also performed on reader drop) stops
+future publication and callbacks. It does not revoke already acquired frames
+or claim that their GPU work has completed.
+
+Local consumers call `frames.notifications().wait_timeout(...)` or `take()`.
+Ready flags coalesce, survive notification-before-wait races, and wake waiters
+without transferring pixels. The complete runnable example is
+`crates/module-sdk/examples/capture_notifications.rs`:
+
+```sh
+cargo run --locked --offline -p amaterasu-module-sdk --example capture_notifications
+```
+
+### Native notification boundary
+
+Capture v1.7 appends `subscribe_events`, `unsubscribe_events`, and `resolve_swap`
+to the unchanged v1.6 prefix. Older CPU and GPU frame tables remain usable.
+Native consumers must check both minor version and table size before using the
+tail. Providers can expose v1.7 even when their GPU read callbacks return
+`MEDIA_UNSUPPORTED`; notification support does not promise a GPU transport.
+
+After authorizing its bound caller and stream, a provider delegates subscription
+to `frames.subscribe_events(sink)` and swap replies to
+`frames.resolve_native_swap(id, decision, reason)`. Unsubscribe delegates to
+`frames.unsubscribe_events()`. The provider must track subscriptions owned by
+each native binding and unsubscribe them before releasing that binding. The
+SDK mailbox permits one native subscriber per capture stream. Registration
+announces an already published frame and any pending swap, closing the startup
+race. A failed subscribe must retain no callback/context.
+
+`CaptureEventSink` callbacks may execute on a capture thread. They only record
+bounded metadata and wake the receiver; they must not acquire frames, reenter
+the provider, run encoding, or unwind across the ABI. Unsubscribe and control
+close are synchronous notification lifetime barriers. All admitted callbacks
+must finish before the consumer storage or provider code is retired.
+The `stopped` callback carries terminal source loss independently of swap requests.
+
+The SDK consumer wrapper `CaptureSubscription::subscribe(&binding, stream)`
+pins that binding through unsubscribe. Its notification reader can wait on
+another thread, while native frame acquisition and swap decisions stay on the
+module thread. `CaptureNotifications::native_sink` is the lower-level adapter
+for consumers already managing subscription/binding lifetimes.
+
+Video subscribes to v1.7 streams and reads newly published frames only after a
+ready notification, subject to the stream's existing frame-rate cap. Repeats,
+keyframe requests and encoded-output draining retain their existing behavior.
+Providers without the optional tail retain their existing pacing. The SDK's
+notification wait is directly wakeable; video still consumes notifications on
+the host's existing tick dispatcher. This change does not replace that host
+scheduler or change encoder submission/synchronization.
+
+### Swap request semantics
+
+Requests are advisory and scoped to the current subscription. There is one
+outstanding request, with a monotonically increasing nonzero ID. The provider
+may keep publishing while the coordinator decides. A rejected request leaves
+capture running. An accepted request approves a transition, not successful
+startup of the replacement. Subsequent control close stops the old source.
+The producer can read the decision until the next request or close. A native
+request notification rejected with `MEDIA_BUSY` is retried by subsequent
+publications or explicit `publisher.retry_notifications()`.
+
+The preferred provider is an alias from trusted startup configuration, never a
+service name or arbitrary executable. The consumer chooses if it is absent.
+Output IDs are provider-specific; a coordinator must establish a mapping or
+reject the request. Reasons are bounded identifier codes, not arbitrary logs.
+Swap requests do not grant new service access or elevated permissions.
+
+Video currently accepts transitions between configured CPU providers with an
+explicit destination output and unchanged encoding configuration. It replies
+before retiring the old subscription, confirms the old capture closed, and
+opens the new source under a fresh operation identity. A rejected or failed
+reply never starts a replacement. A replacement open failure uses the normal
+stream cleanup path. GPU capture transitions requiring retirement/reopening
+of encoder or GPU processor sessions return
+`capture_swap_requires_pipeline_restart`; constant-rate mode transitions return
+`capture_swap_requires_mode_restart`. Those downstream restart changes are
+intentionally deferred. Requests with no output mapping return
+`capture_swap_output_required`.
+
 ## Register a provider
 
 A capture component registers a control service and a native capture table

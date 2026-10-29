@@ -281,6 +281,37 @@ typedef struct {
     AmaterasuStatus (*latest_presentation)(void *, uint64_t, AmaterasuPresentationStatus *);
     AmaterasuStatus (*read_dmabuf_frame_leased)(void *, uint64_t, AmaterasuDmaBufLeaseSink);
 } AmaterasuCaptureApiV1_6;
+/* Optional v1.7 notifications. No pixels cross these callbacks. The consumer
+ * context is live from successful subscribe until unsubscribe/control close
+ * finishes. Callbacks may run on capture threads: record bounded metadata and
+ * wake only; never reenter capture or encode inline. Subscribe announces any
+ * already available frame/request. BUSY on request_swap accepts nothing.
+ * Alias/reason: <=64 ASCII letters/digits/_/-/.; reason is nonempty. Empty alias
+ * asks the consumer to choose. Output: optional <=512-byte UTF-8, no controls.
+ * ACCEPTED approves a transition, not successful replacement capture startup. */
+#define AMATERASU_CAPTURE_EVENTS_INTERFACE_MINOR 7u
+#define AMATERASU_CAPTURE_SWAP_ACCEPTED 1u
+#define AMATERASU_CAPTURE_SWAP_REJECTED 2u
+typedef struct {
+    uint64_t id;
+    AmaterasuBorrowedBytes preferred_provider, output, reason;
+} AmaterasuCaptureSwapRequest;
+typedef struct {
+    void *context;
+    void (*frame_ready)(void *);
+    AmaterasuStatus (*request_swap)(void *, const AmaterasuCaptureSwapRequest *);
+    /* Terminal source failure; borrowed nonempty bounded reason code. */
+    void (*stopped)(void *, AmaterasuBorrowedBytes reason);
+} AmaterasuCaptureEventSink;
+typedef struct {
+    AmaterasuCaptureApiV1_6 base;
+    AmaterasuStatus (*subscribe_events)(void *, uint64_t, AmaterasuCaptureEventSink);
+    /* Mandatory, idempotent lifetime barrier, including after control close and
+     * on binding release. No callback may still execute after return. */
+    void (*unsubscribe_events)(void *, uint64_t);
+    AmaterasuStatus (*resolve_swap)(void *, uint64_t, uint64_t, uint32_t, AmaterasuBorrowedBytes);
+} AmaterasuCaptureApiV1_7;
+#define AMATERASU_CAPTURE_API_V1_7_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_7))
 #undef AMATERASU_CAPTURE_V1_4_FIELDS
 #undef AMATERASU_CAPTURE_V1_3_FIELDS
 #undef AMATERASU_CAPTURE_V1_2_FIELDS
