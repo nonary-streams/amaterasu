@@ -33,8 +33,8 @@ cryptographic checks in `test_native_media.py`, `test_control_transport.py` and 
 `cryptography` package in the test environment.
 
 Initialize the capture provider submodule before building it. It has its own
-lockfile and is validated separately from the parent workspace. Its helper-wire
-sources must match the helper used by this repository; run
+lockfile and is validated separately from the parent workspace. Its helper-wire crate also builds the privileged helper; its shared wire
+sources must match the broker library in this repository. Run
 `python3 scripts/check_vkms_wire_sync.py` after changing either copy. Update and
 test both copies together, publish the provider change, then advance the pin.
 
@@ -42,6 +42,10 @@ test both copies together, publish the provider change, then advance the pin.
 git submodule update --init modules/capture-vkms
 python3 scripts/check_vkms_wire_sync.py
 cargo build --workspace --locked
+cargo build --manifest-path modules/capture-vkms/helper-wire/Cargo.toml --locked
+cargo test --manifest-path modules/capture-vkms/helper-wire/Cargo.toml --locked
+cargo clippy --manifest-path modules/capture-vkms/helper-wire/Cargo.toml --all-targets --locked -- -D warnings
+cargo fmt --manifest-path modules/capture-vkms/helper-wire/Cargo.toml --all --check
 cargo build --manifest-path modules/capture-vkms/capture/Cargo.toml --locked
 cargo test --manifest-path modules/capture-vkms/capture/Cargo.toml --locked
 cargo clippy --manifest-path modules/capture-vkms/capture/Cargo.toml --all-targets --locked -- -D warnings

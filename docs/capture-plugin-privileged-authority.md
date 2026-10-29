@@ -94,8 +94,9 @@ other dependencies before building offline:
 
 ```sh
 cargo build --offline --locked \
-  -p amaterasu-vkms-frame-helper -p amaterasu-capture-authority -p amaterasu-release -p amaterasu
+  -p amaterasu-capture-authority -p amaterasu-release -p amaterasu
 git submodule update --init modules/capture-vkms
+cargo build --offline --locked --manifest-path modules/capture-vkms/helper-wire/Cargo.toml
 cargo build --offline --locked --manifest-path modules/capture-vkms/capture/Cargo.toml \
   --features linux-kwin-geometry,linux-gpu-snapshot
 ```

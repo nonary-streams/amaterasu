@@ -1,19 +1,15 @@
 [package]
 name = "amaterasu-vkms-frame-helper"
-description = "Restricted helper that exports vibeshine_drm presentations as DMA-BUF descriptors"
+description = "Unprivileged wire protocol and channel for the VKMS frame helper"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 # The library holds only the unprivileged wire protocol and descriptor channel
-# shared with the capture module. Privileged code lives in the binary.
+# shared with the capture module. The provider builds the privileged binary.
 [lib]
 name = "amaterasu_vkms_frame_helper"
 path = "src/lib.rs"
-
-[[bin]]
-name = "amaterasu-vkms-frame-helper"
-path = "src/main.rs"
 
 # libc is already in the workspace lock and provides the raw Linux syscalls,
 # ioctls and SCM_RIGHTS control-message helpers this crate needs.

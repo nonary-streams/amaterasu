@@ -42,6 +42,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - run: cargo fmt --manifest-path modules/capture-vkms/helper-wire/Cargo.toml --all --check
+      - run: cargo test --manifest-path modules/capture-vkms/helper-wire/Cargo.toml --locked
+      - run: cargo clippy --manifest-path modules/capture-vkms/helper-wire/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo fmt --manifest-path modules/capture-vkms/capture/Cargo.toml --all --check
       - run: cargo test --manifest-path modules/capture-vkms/capture/Cargo.toml --locked
       - run: cargo clippy --manifest-path modules/capture-vkms/capture/Cargo.toml --all-targets --locked -- -D warnings

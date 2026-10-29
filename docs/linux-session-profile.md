@@ -128,7 +128,8 @@ value stops `init-linux-session` before it creates anything.
 
 For the package authority mode, also build `amaterasu-capture-vkms` with
 `linux-kwin-geometry,linux-gpu-snapshot`, plus `amaterasu-vkms-frame-helper` and
-`amaterasu-capture-authority`. The snapshot feature needs the EGL/GBM build
+`amaterasu-capture-authority`. Build the helper separately from
+`modules/capture-vkms/helper-wire/Cargo.toml`. The snapshot feature needs the EGL/GBM build
 prerequisites and a usable GPU render node at runtime. The normal profile build
 must include every component in its composition; the helper and broker are
 separate binaries.
