@@ -547,15 +547,15 @@ mod owned {
         }
     }
     /// KWin names virtual outputs `Virtual-N`. Connector numbers keep counting
-    /// across driver reloads, so any canonical index up to 64 is accepted.
+    /// across driver reloads, so any canonical positive 32-bit signed index is accepted.
     fn is_kwin_virtual_output(output: &str) -> bool {
         output
             .strip_prefix("kwin:Virtual-")
             .filter(|index| {
                 !index.starts_with('0') && index.bytes().all(|byte| byte.is_ascii_digit())
             })
-            .and_then(|index| index.parse::<u8>().ok())
-            .is_some_and(|index| (1..=64).contains(&index))
+            .and_then(|index| index.parse::<i32>().ok())
+            .is_some_and(|index| index > 0)
     }
 
     pub(in super::super) fn absent(record: &Record, payload: &Value) -> bool {
@@ -592,24 +592,26 @@ mod owned {
         use super::is_kwin_virtual_output;
 
         #[test]
-        fn kwin_virtual_outputs_accept_any_canonical_index_up_to_sixty_four() {
+        fn kwin_virtual_outputs_accept_canonical_connector_indices() {
             for accepted in [
                 "kwin:Virtual-1",
                 "kwin:Virtual-8",
                 "kwin:Virtual-9",
                 "kwin:Virtual-16",
                 "kwin:Virtual-64",
+                "kwin:Virtual-65",
+                "kwin:Virtual-256",
+                "kwin:Virtual-2147483647",
             ] {
                 assert!(is_kwin_virtual_output(accepted), "{accepted}");
             }
             for rejected in [
                 "kwin:Virtual-0",
-                "kwin:Virtual-65",
+                "kwin:Virtual-2147483648",
                 "kwin:Virtual-09",
                 "kwin:Virtual-+9",
                 "kwin:Virtual-",
                 "kwin:Virtual-9 ",
-                "kwin:Virtual-256",
                 "kwin:DP-1",
                 "Virtual-9",
             ] {
