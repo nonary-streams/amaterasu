@@ -48,7 +48,6 @@ members = [
     "modules/capture-kms",
     "modules/capture-wgc",
     "modules/capture-x11",
-    "modules/capture-vkms",
     "modules/audio",
     "modules/audio-encode",
     "modules/media-transport",

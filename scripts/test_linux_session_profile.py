@@ -51,6 +51,7 @@ LIBRARY_PACKAGES = [
     "amaterasu-application", "amaterasu-steam", "amaterasu-lutris", "amaterasu-authentication",
     "amaterasu-management", "amaterasu-pairing", "amaterasu-nvhttp", "amaterasu-display",
     "amaterasu-launch", "amaterasu-input", "amaterasu-virtual-display", "amaterasu-capture-kms",
+    "amaterasu-capture-pipewire",
     "amaterasu-audio", "amaterasu-audio-encode", "amaterasu-encode", "amaterasu-video",
     "amaterasu-media-transport", "amaterasu-control-transport", "amaterasu-frame-limiter",
     "amaterasu-stream-session", "amaterasu-rtsp",
@@ -80,6 +81,14 @@ def build() -> None:
     result = subprocess.run(command, cwd=WORKSPACE, text=True, capture_output=True, timeout=3600)
     if result.returncode:
         raise AssertionError(f"build failed:\n{result.stdout}\n{result.stderr}")
+    capture_command = [
+        CARGO, "build", "--offline", "--locked",
+        "--manifest-path", str(WORKSPACE / "modules/capture-vkms/capture/Cargo.toml"),
+        "--target-dir", str(target_directory()),
+    ]
+    result = subprocess.run(capture_command, cwd=WORKSPACE, text=True, capture_output=True, timeout=3600)
+    if result.returncode:
+        raise AssertionError(f"capture build failed:\n{result.stdout}\n{result.stderr}")
 
 
 def isolated_environment(directory: Path) -> dict[str, str]:
@@ -160,6 +169,7 @@ def check_default_policy(root: Path) -> None:
     settings = policy["settings"]
     assert settings["amaterasu.linux-session-video"]["enabled"] is False
     assert settings["amaterasu.capture-kms"]["enabled"] is False
+    assert settings["amaterasu.capture-vkms"]["enabled"] is False
     assert settings["amaterasu.audio"]["enabled"] is False
     assert settings["amaterasu.virtual-display"]["enabled"] is False
     assert settings["amaterasu.input"]["allow_injection"] is False
@@ -167,7 +177,7 @@ def check_default_policy(root: Path) -> None:
     assert settings["amaterasu.stream-session"]["enable_input"] is False
     assert settings["amaterasu.management"]["enabled"] is False
     for forbidden in ("input-probe", "software-probe-audio", "capture-dxgi", "capture-wgc",
-                      "capture-pipewire", "capture-x11", "updater", "system-tray"):
+                      "capture-x11", "updater", "system-tray"):
         assert f"amaterasu.{forbidden}" not in policy["principals"], forbidden
 
 
@@ -275,7 +285,10 @@ def pair_and_list(harness: LinuxSessionHarness, base_port: int) -> tuple[str, di
             }},
         })
         assert created["ok"], created
-        applications = {str(int(created["id"][4:], 16)): CATALOG_NAME}
+        applications = {
+            str(int(created["id"][4:], 16)): CATALOG_NAME,
+            "2147483647": "Desktop",
+        }
         require_private_library(http, https)
         require_untrusted(https, tls_context())
 

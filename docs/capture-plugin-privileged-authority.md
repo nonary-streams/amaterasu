@@ -88,13 +88,16 @@ inherited channel is unavailable.
 
 Build the normal Linux session components and the authority-enabled capture
 provider. The capture snapshot feature requires its EGL/GBM development
-prerequisites and an accessible render node at runtime:
+prerequisites and an accessible render node at runtime. Set an absolute
+`CARGO_TARGET_DIR` shared by both builds and prefetch the provider SDK and its
+other dependencies before building offline:
 
 ```sh
 cargo build --offline --locked \
-  -p amaterasu-capture-vkms -p amaterasu-vkms-frame-helper \
-  -p amaterasu-capture-authority -p amaterasu-release -p amaterasu \
-  --features amaterasu-capture-vkms/linux-kwin-geometry,amaterasu-capture-vkms/linux-gpu-snapshot
+  -p amaterasu-vkms-frame-helper -p amaterasu-capture-authority -p amaterasu-release -p amaterasu
+git submodule update --init modules/capture-vkms
+cargo build --offline --locked --manifest-path modules/capture-vkms/capture/Cargo.toml \
+  --features linux-kwin-geometry,linux-gpu-snapshot
 ```
 
 The following names are placeholders for explicit absolute paths. `ROOT` is a

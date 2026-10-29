@@ -1,3 +1,6 @@
 [submodule "third-party/libvirtualdisplay"]
 	path = third-party/libvirtualdisplay
 	url = https://github.com/Nonary/libvirtualdisplay.git
+[submodule "modules/capture-vkms"]
+	path = modules/capture-vkms
+	url = https://github.com/nonary-streams/amaterasu-capture-vkms.git

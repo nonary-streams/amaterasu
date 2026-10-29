@@ -61,11 +61,17 @@ env CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 nice -n 10 \
     -p amaterasu-authentication -p amaterasu-management -p amaterasu-pairing \
     -p amaterasu-nvhttp -p amaterasu-display -p amaterasu-launch -p amaterasu-input \
     -p amaterasu-virtual-display -p amaterasu-capture-kms -p amaterasu-capture-pipewire \
-    -p amaterasu-capture-vkms -p amaterasu-audio \
+    -p amaterasu-audio \
     -p amaterasu-audio-encode -p amaterasu-encode -p amaterasu-video \
     -p amaterasu-media-transport -p amaterasu-control-transport \
     -p amaterasu-frame-limiter -p amaterasu-stream-session -p amaterasu-rtsp
+git submodule update --init modules/capture-vkms
+env CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 nice -n 10 \
+  cargo build --offline --locked --manifest-path modules/capture-vkms/capture/Cargo.toml
 ```
+
+The provider uses its own lockfile and pinned SDK. Fetch its dependencies before
+using `--offline`. Both builds share the `CARGO_TARGET_DIR` above.
 
 `scripts/test_linux_session_profile.py` runs this same build.
 
