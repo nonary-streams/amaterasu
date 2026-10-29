@@ -8,11 +8,11 @@ use amaterasu_media::{
     CAPTURE_FRAME_FRESH, CaptureApiV1_4, CpuFrame, DmaBufFrame, MEDIA_PENDING,
 };
 
-struct TestBinding(*const CaptureApiV1_5);
+struct TestBinding(*const CaptureApiV1_6);
 
 impl TestBinding {
     fn bind(factory: &Factory<FakeBackend>, caller: &[u8], min_minor: u32) -> Result<Self, Status> {
-        Self::bind_sized(factory, caller, min_minor, CAPTURE_API_V1_5_SIZE)
+        Self::bind_sized(factory, caller, min_minor, CAPTURE_API_V1_6_SIZE)
     }
 
     fn bind_sized(
@@ -45,7 +45,7 @@ impl TestBinding {
         }
     }
 
-    fn api(&self) -> &CaptureApiV1_5 {
+    fn api(&self) -> &CaptureApiV1_6 {
         // SAFETY: this wrapper uniquely owns the live boxed binding until Drop.
         unsafe { &*self.0 }
     }
@@ -136,18 +136,18 @@ fn setup() -> (Box<Factory<FakeBackend>>, Arc<SourceScript>, u64) {
 }
 
 #[test]
-fn the_table_advertises_v1_5_and_rejects_newer_queries() {
+fn the_table_advertises_v1_6_and_rejects_newer_queries() {
     let (factory, _, _) = setup();
     let binding = TestBinding::bind(&factory, b"amaterasu.video", 5).unwrap();
     let header = binding.api().base.header;
-    assert_eq!(header.minor, CAPTURE_PRESENTATION_INTERFACE_MINOR);
-    assert_eq!(header.size, CAPTURE_API_V1_5_SIZE);
+    assert_eq!(header.minor, CAPTURE_LEASE_INTERFACE_MINOR);
+    assert_eq!(header.size, CAPTURE_API_V1_6_SIZE);
     assert_eq!(
-        TestBinding::bind(&factory, b"amaterasu.video", 6).err(),
+        TestBinding::bind(&factory, b"amaterasu.video", 7).err(),
         Some(MEDIA_UNSUPPORTED)
     );
     assert_eq!(
-        TestBinding::bind_sized(&factory, b"amaterasu.video", 5, CAPTURE_API_V1_5_SIZE + 8).err(),
+        TestBinding::bind_sized(&factory, b"amaterasu.video", 5, CAPTURE_API_V1_6_SIZE + 8).err(),
         Some(MEDIA_UNSUPPORTED)
     );
     assert_eq!(
@@ -411,4 +411,65 @@ fn a_busy_controller_is_media_busy() {
     let _held = factory.controller.lock().unwrap();
     assert_eq!(binding.read(id, &mut sink), MEDIA_BUSY);
     assert_eq!(binding.latest(id), Err(MEDIA_BUSY));
+}
+
+#[test]
+fn immutable_native_read_rejects_mutable_scanout_and_retains_private_snapshot() {
+    let _serial = crate::leases::TEST_LEASE_CALLBACKS.lock().unwrap();
+    let (factory, script, id) = setup();
+    let binding = TestBinding::bind(&factory, b"amaterasu.video", 6).unwrap();
+    let frames = factory
+        .controller
+        .lock()
+        .unwrap()
+        .reader("amaterasu.video", id)
+        .unwrap()
+        .frames;
+    frames.store(script.export(1, 0, false), 1);
+    struct Retained(Option<amaterasu_media::DmaBufFrameLease>);
+    unsafe extern "C" fn capture(
+        context: *mut c_void,
+        lease: *const amaterasu_media::DmaBufFrameLease,
+        _: u32,
+    ) -> Status {
+        // SAFETY: provider retains lease during callback, context is this test's sink.
+        let lease = unsafe { &*lease };
+        // SAFETY: successful retain grants exactly one reference consumed below.
+        let status = unsafe { lease.retain.unwrap()(lease.context) };
+        if status == STATUS_OK {
+            // SAFETY: context is the exclusively borrowed test sink.
+            unsafe { (*context.cast::<Retained>()).0 = Some(*lease) };
+        }
+        status
+    }
+    let mut retained = Retained(None);
+    let api = binding.api();
+    let sink = amaterasu_media::DmaBufLeaseSink {
+        context: (&mut retained as *mut Retained).cast(),
+        write: capture,
+    };
+    // SAFETY: live native binding and sink during this synchronous callback.
+    assert_eq!(
+        unsafe { (api.read_dmabuf_frame_leased)(api.base.context, id, sink) },
+        MEDIA_UNSUPPORTED
+    );
+    assert!(retained.0.is_none());
+    frames.store_snapshot(script.export(2, 0, false), 2);
+    // SAFETY: same live binding and sink; this frame is independently owned.
+    assert_eq!(
+        unsafe { (api.read_dmabuf_frame_leased)(api.base.context, id, sink) },
+        STATUS_OK
+    );
+    let lease = retained.0.take().unwrap();
+    factory
+        .controller
+        .lock()
+        .unwrap()
+        .handle("amaterasu.video", Operation::Close { stream: id }, 0)
+        .unwrap();
+    drop(frames);
+    assert_eq!(script.open_descriptors(), 1);
+    // SAFETY: consumes the one retained reference while binding remains live.
+    unsafe { lease.release.unwrap()(lease.context, -1) };
+    assert!(script.all_lent_descriptors_closed());
 }

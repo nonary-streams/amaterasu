@@ -11,15 +11,20 @@ use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 
 const CAPTURE_SERVICE: &str = "amaterasu.capture-dxgi/1";
+const CUSTOM_CAPTURE_SERVICE: &str = "test.custom-capture/1";
 const METRICS_SERVICE: &str = "test.capture-source/1";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Settings {}
+struct Settings {
+    #[serde(default)]
+    custom_service: bool,
+}
 
 struct CaptureSource {
     runtime: RuntimeClient,
     controller: native::SharedController,
+    capture_service: &'static str,
     _factory: Box<native::Factory>,
 }
 
@@ -28,22 +33,28 @@ impl ManagedModule for CaptureSource {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
             return Err("capture fixture settings unavailable".into());
         };
-        serde_json::from_value::<Settings>(payload)
+        let settings = serde_json::from_value::<Settings>(payload)
             .map_err(|error| format!("invalid capture fixture settings: {error}"))?;
+        let capture_service = if settings.custom_service {
+            CUSTOM_CAPTURE_SERVICE
+        } else {
+            CAPTURE_SERVICE
+        };
         let controller = Arc::new(Mutex::new(Controller::default()));
         let factory = native::Factory::new(controller.clone());
         runtime.require_success(Command::Register {
-            service: CAPTURE_SERVICE.into(),
+            service: capture_service.into(),
         })?;
         // SAFETY: the stable boxed factory lives through module destruction;
         // consumers own independent shared references through their bindings.
-        unsafe { runtime.register_native(CAPTURE_SERVICE, &factory.api) }?;
+        unsafe { runtime.register_native(capture_service, &factory.api) }?;
         runtime.require_success(Command::Register {
             service: METRICS_SERVICE.into(),
         })?;
         Ok(Self {
             runtime,
             controller,
+            capture_service,
             _factory: factory,
         })
     }
@@ -73,7 +84,7 @@ impl ManagedModule for CaptureSource {
                     .lock()
                     .map_err(|_| "capture fixture controller poisoned")?;
                 let reply = match serde_json::from_value::<Operation>(payload) {
-                    Ok(operation) if service == CAPTURE_SERVICE => {
+                    Ok(operation) if service == self.capture_service => {
                         controller.handle(&caller, operation)
                     }
                     Ok(Operation::Status) if service == METRICS_SERVICE => {

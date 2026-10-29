@@ -1,5 +1,6 @@
 //! Safe module-facing API. ABI ownership and panic containment live in `exports`.
 pub mod exports;
+pub mod media;
 mod native;
 pub use native::NativeBinding;
 
@@ -11,6 +12,7 @@ pub use amaterasu_contracts::encoder::{
     validate_software_options,
 };
 pub use amaterasu_contracts::{Command, HostLifecycleAction, Response, RuntimeHostContext};
+pub use amaterasu_media as media_abi;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 
 const LOG_EMITTER_CAPACITY: usize = 128;

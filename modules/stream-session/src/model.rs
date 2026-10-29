@@ -709,17 +709,55 @@ fn invalid_peer(address: IpAddr) -> bool {
         || mapped(address)
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub enum CaptureProvider {
     #[default]
     Dxgi,
     Wgc,
-    /// An explicitly selected current-user portal source.
-    #[serde(rename = "pipewire")]
     PipeWire,
     X11,
     Kms,
+    /// A configured external capture alias, resolved by the video service.
+    External(String),
+}
+
+impl Serialize for CaptureProvider {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let name = match self {
+            Self::Dxgi => "dxgi",
+            Self::Wgc => "wgc",
+            Self::PipeWire => "pipewire",
+            Self::X11 => "x11",
+            Self::Kms => "kms",
+            Self::External(name) => name,
+        };
+        serializer.serialize_str(name)
+    }
+}
+
+impl<'de> Deserialize<'de> for CaptureProvider {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        match name.as_str() {
+            "dxgi" => Ok(Self::Dxgi),
+            "wgc" => Ok(Self::Wgc),
+            "pipewire" => Ok(Self::PipeWire),
+            "x11" => Ok(Self::X11),
+            "kms" => Ok(Self::Kms),
+            _ if !name.is_empty()
+                && name.len() <= 64
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'
+                        || byte == b'-'
+                }) =>
+            {
+                Ok(Self::External(name))
+            }
+            _ => Err(serde::de::Error::custom("invalid capture provider alias")),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -961,7 +999,10 @@ impl StartConfig {
             return Err("invalid_start_configuration");
         }
         if self.output == "amaterasu-owned-display"
-            && self.capture_provider != CaptureProvider::PipeWire
+            && !matches!(
+                self.capture_provider,
+                CaptureProvider::PipeWire | CaptureProvider::External(_)
+            )
         {
             return Err("owned_display_requires_pipewire");
         }
@@ -1157,6 +1198,39 @@ mod tests {
     fn start_json() -> Value {
         json!({"output":"display-1","encoder":0,"audio_endpoint":"default",
             "configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}})
+    }
+
+    #[test]
+    fn external_capture_alias_is_bounded_and_forwarded() {
+        let mut value = start_json();
+        value["capture_provider"] = json!("acme_capture-1");
+        let start: StartConfig = serde_json::from_value(value).unwrap();
+        assert!(start.validate(true).is_ok());
+        assert_eq!(
+            serde_json::to_value(start).unwrap()["capture_provider"],
+            "acme_capture-1"
+        );
+        for alias in ["", "acme.capture", "Acme", "acme/service", &"a".repeat(65)] {
+            assert!(serde_json::from_value::<CaptureProvider>(json!(alias)).is_err());
+        }
+    }
+
+    #[test]
+    fn owned_output_accepts_pipewire_and_external_aliases_only() {
+        for (provider, expected) in [
+            ("pipewire", Ok(())),
+            ("vkms", Ok(())),
+            ("dxgi", Err("owned_display_requires_pipewire")),
+            ("wgc", Err("owned_display_requires_pipewire")),
+            ("kms", Err("owned_display_requires_pipewire")),
+            ("x11", Err("owned_display_requires_pipewire")),
+        ] {
+            let mut value = start_json();
+            value["capture_provider"] = json!(provider);
+            value["output"] = json!("amaterasu-owned-display");
+            let start: StartConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(start.validate(true), expected, "provider {provider}");
+        }
     }
 
     #[test]

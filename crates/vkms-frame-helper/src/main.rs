@@ -3,8 +3,10 @@
 //!
 //! The operator grants exactly `cap_sys_admin+p`. The helper keeps that
 //! capability permitted but not effective, raises it only around the two
-//! private driver ioctls, and drops every other capability at startup. It
-//! takes no arguments and never reads its environment.
+//! private driver ioctls, and drops every other capability at startup. The
+//! separate `--approved-service` mode accepts only a root broker peer and is
+//! installed root-only; it does not turn a user helper into a public service.
+//! Neither mode reads configuration from its environment.
 #[cfg(target_os = "linux")]
 mod capabilities;
 #[cfg(target_os = "linux")]
@@ -33,15 +35,13 @@ fn main() -> ExitCode {
 fn run() -> Result<(), u8> {
     use amaterasu_vkms_frame_helper::exit_status;
 
-    if std::env::args_os().len() != 1 {
-        return Err(exit_status::USAGE);
-    }
+    let mode = startup::StartupMode::parse(std::env::args_os().skip(1))?;
     startup::close_inherited_descriptors().map_err(|_| exit_status::HARDENING)?;
     startup::harden_process()?;
-    startup::refuse_root_identity()?;
+    mode.validate_process_identity()?;
     let privilege = capabilities::AdminPrivilege::reduce(capabilities::ProcessCapabilities)
         .map_err(|_| exit_status::CAPABILITIES)?;
-    let channel = startup::adopt_control_socket()?;
+    let channel = startup::adopt_control_socket(mode)?;
     serve(
         &channel,
         service::Service::new(device::DeviceOpener, privilege),

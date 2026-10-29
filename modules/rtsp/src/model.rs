@@ -292,16 +292,54 @@ pub struct Capture {
     pub host_audio_enabled: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CaptureProvider {
     Dxgi,
     Wgc,
-    /// An explicitly selected current-user portal source.
-    #[serde(rename = "pipewire")]
     PipeWire,
     X11,
     Kms,
+    /// A configured external capture alias, resolved by the video service.
+    External(String),
+}
+
+impl Serialize for CaptureProvider {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let name = match self {
+            Self::Dxgi => "dxgi",
+            Self::Wgc => "wgc",
+            Self::PipeWire => "pipewire",
+            Self::X11 => "x11",
+            Self::Kms => "kms",
+            Self::External(name) => name,
+        };
+        serializer.serialize_str(name)
+    }
+}
+
+impl<'de> Deserialize<'de> for CaptureProvider {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        match name.as_str() {
+            "dxgi" => Ok(Self::Dxgi),
+            "wgc" => Ok(Self::Wgc),
+            "pipewire" => Ok(Self::PipeWire),
+            "x11" => Ok(Self::X11),
+            "kms" => Ok(Self::Kms),
+            _ if !name.is_empty()
+                && name.len() <= 64
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'
+                        || byte == b'-'
+                }) =>
+            {
+                Ok(Self::External(name))
+            }
+            _ => Err(serde::de::Error::custom("invalid capture provider alias")),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -3359,6 +3397,21 @@ mod tests {
         let request: Open = serde_json::from_value(value).unwrap();
 
         assert_eq!(request.validate(false), Err("invalid_max_bitrate"));
+    }
+
+    #[test]
+    fn external_capture_alias_is_bounded_and_forwarded() {
+        let mut value = open_json();
+        value["capture"]["capture_provider"] = json!("acme_capture-1");
+        let request: Open = serde_json::from_value(value).unwrap();
+        assert!(request.validate(false).is_ok());
+        assert_eq!(
+            request.arm(41)["configuration"]["capture_provider"],
+            "acme_capture-1"
+        );
+        for alias in ["", "acme.capture", "Acme", "acme/service", &"a".repeat(65)] {
+            assert!(serde_json::from_value::<CaptureProvider>(json!(alias)).is_err());
+        }
     }
 
     #[test]

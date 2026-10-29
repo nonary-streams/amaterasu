@@ -145,6 +145,7 @@ mod tests {
         write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
         let artifact = b"synthetic runtime bytes, never loaded";
         let manifest = ReleaseManifest {
+            privileged_requests: Vec::new(),
             schema: 1,
             host_context_schema: 1,
             project: "amaterasu".into(),

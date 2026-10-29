@@ -259,6 +259,18 @@ fn initialize_profile(root: &Path, profile: DevelopmentProfile<'_>) -> PackageRe
         tls.apply_settings(&mut bootstrap, &state_root)?;
     }
 
+    if let DevelopmentProfile::LinuxSession(options) = &profile
+        && let Some(helper) = &options.capture_authority_helper
+    {
+        write_json_atomically(
+            &root.join(crate::capture_authority_package::SPEC_FILE),
+            &crate::capture_authority_package::PackageSpec {
+                schema: 1,
+                helper_source: helper.into(),
+                drm_card: options.capture_authority_card,
+            },
+        )?;
+    }
     write_json_atomically(&root.join("development-key.json"), &encode_hex(&secret))?;
     write_json_atomically(&root.join("bootstrap.json"), &bootstrap)?;
     write_json_atomically(&root.join("selection.json"), &ActivationState::default())
@@ -277,13 +289,27 @@ pub fn build_package(
     }
     let secret: String = read_json(&root.join("development-key.json"))?;
     let signing_key = SigningKey::from_bytes(&decode_hex::<32>(&secret)?);
-    build_signed_package(
+    let authority = if matches!(profile, PackageProfile::LinuxSession)
+        && root
+            .join(crate::capture_authority_package::SPEC_FILE)
+            .try_exists()
+            .map_err(|error| error.to_string())?
+    {
+        Some(read_json::<crate::capture_authority_package::PackageSpec>(
+            &root.join(crate::capture_authority_package::SPEC_FILE),
+        )?)
+    } else {
+        None
+    };
+    build_signed_package_with_runtime_probe_and_authority(
         artifacts,
         output,
         sequence,
         profile,
         &signing_key,
         DEVELOPMENT_KEY_ID,
+        x264_runtime_available,
+        authority.as_ref(),
     )
 }
 
@@ -2272,6 +2298,32 @@ fn build_signed_package_with_runtime_probe(
     key_id: &str,
     runtime_available: impl FnOnce(u32) -> bool,
 ) -> PackageResult<()> {
+    build_signed_package_with_runtime_probe_and_authority(
+        artifacts,
+        output,
+        sequence,
+        profile,
+        signing_key,
+        key_id,
+        runtime_available,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_signed_package_with_runtime_probe_and_authority(
+    artifacts: &Path,
+    output: &Path,
+    sequence: u64,
+    profile: PackageProfile,
+    signing_key: &SigningKey,
+    key_id: &str,
+    runtime_available: impl FnOnce(u32) -> bool,
+    authority: Option<&crate::capture_authority_package::PackageSpec>,
+) -> PackageResult<()> {
+    if authority.is_some() && !matches!(profile, PackageProfile::LinuxSession) {
+        return Err("capture authority is only supported by the Linux session package".into());
+    }
     if output.try_exists().map_err(|error| error.to_string())? {
         return Err("package output already exists; use a new directory for each release".into());
     }
@@ -2299,7 +2351,13 @@ fn build_signed_package_with_runtime_probe(
         components.push(component);
     }
 
+    let privileged_requests = authority
+        .map(|spec| crate::capture_authority_package::prepare(spec, output))
+        .transpose()?
+        .into_iter()
+        .collect();
     let manifest = ReleaseManifest {
+        privileged_requests,
         schema: 1,
         host_context_schema: 1,
         project: "amaterasu".into(),

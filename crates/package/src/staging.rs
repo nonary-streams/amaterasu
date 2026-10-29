@@ -116,7 +116,12 @@ fn copy_package_files(
         .iter()
         .map(|component| component.file.as_str());
 
-    for filename in metadata_files.chain(artifacts) {
+    let helpers = package
+        .manifest
+        .privileged_requests
+        .iter()
+        .map(|request| request.helper.file.as_str());
+    for filename in metadata_files.chain(artifacts).chain(helpers) {
         let bytes = read_bounded(&source.join(filename), MAX_ARTIFACT_BYTES)?;
         let mut output = OpenOptions::new()
             .write(true)

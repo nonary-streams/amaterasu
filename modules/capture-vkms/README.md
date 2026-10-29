@@ -4,7 +4,8 @@ This independently built trusted native library provides control and native
 `amaterasu.capture-vkms/1` for the owned virtual outputs that the
 `vibeshine_drm` kernel driver exposes as `Virtual-N` connectors. Frames are the
 driver's latest completed primary-plane scanout of the output's CRTC, delivered
-as borrowed DMA-BUF descriptors without any CPU copy. Native API grants do not
+as DMA-BUF descriptors. Optional private GPU snapshots supply immutable frame
+leases without a CPU copy. Native API grants do not
 sandbox native code. The provider exists only on Linux; other targets build an
 empty library.
 
@@ -13,7 +14,34 @@ process never receives that capability. A small dedicated helper,
 `amaterasu-vkms-frame-helper` (crate `crates/vkms-frame-helper`), holds it and
 does nothing else.
 
-## Installing the helper
+## Package-approved authority
+
+New capture packages select `authority_channel:true` instead of `frame_helper`.
+The protected launcher supplies `authority_channel_fd` to the approved component
+only after verifying the package and machine-protected approval. This descriptor
+is a private control channel, not an executable path or caller-provided identity.
+Each stream obtains an independent broker-proxied helper session. Both control
+and session sockets must have a root peer. The broker checks the exact package
+approval and resource scope on every helper request and owns revocation.
+
+The helper's `--approved-service` mode requires all real, effective and saved
+UID/GID values to be root and a root peer at fd 3. It is executed only by the
+protected broker from its root-only installed artifact. The user-process module
+is never elevated. Missing, denied or revoked authority fails without trying a
+legacy helper. Approvals, protected installation and active deployment are
+separate states; selecting this setting does not install the broker or approve
+a request. In-process native modules remain trusted code.
+
+```json
+{"enabled":true,"capture_principals":["amaterasu.video"],"authority_channel":true,"gpu_snapshot":true}
+```
+
+`authority_channel_fd` is reserved for host injection and must not be placed in
+package-controlled policy. Simultaneous authority mode and a legacy helper path
+are rejected. No injected channel yields `authority_unavailable`; an explicit
+broker denial yields `authority_denied`.
+
+## Installing the legacy helper
 
 Install the helper as a root-owned file that group and others cannot write,
 for example `/usr/libexec/amaterasu/amaterasu-vkms-frame-helper` with mode
@@ -143,8 +171,8 @@ A lost compositor connection is retried at most once per second.
 
 ## Native frames
 
-The native table is `CaptureApiV1_5` (major 1, minor 5), a strict superset of
-`CaptureApiV1_4`, so v1.4 consumers bind and read it unchanged.
+The native table is `CaptureApiV1_6` (major 1, minor 6), a strict superset of
+`CaptureApiV1_5`; older DMA-BUF consumers bind and read the same prefix.
 `read_frame`, `read_frame_with_freshness` and
 `read_frame_with_capture_timestamp` return `MEDIA_UNSUPPORTED`.
 
@@ -191,6 +219,42 @@ concurrent read of the same stream is `MEDIA_BUSY`; a closed or faulted-output
 stream is `MEDIA_CLOSED`; a failed helper or permission refusal is
 `MEDIA_BACKEND_ERROR` for both reads and presentation queries.
 
+### Immutable GPU frame leases
+
+Build with `--features linux-kwin-geometry,linux-gpu-snapshot` and set
+`gpu_snapshot:true`. Snapshot support requires GBM, EGL, GLES and libdrm
+development libraries, plus access to a compatible render node at runtime.
+The presentation thread waits for all input acquire fences, then renders into
+a fresh private GBM allocation and calls `glFinish` before exporting it. This
+provider never writes that allocation again. RGB8 input uses XR24 storage;
+XR30, AR30, XB30 and AB30 input uses XR30 storage, a high-precision sampler and
+a framebuffer with at least ten bits per RGB component. Unsupported import or
+render targets fail without reducing precision. No CPU readback occurs.
+
+`read_dmabuf_frame_leased` supports only these completed private snapshots.
+Ordinary mutable scanout exports return `MEDIA_UNSUPPORTED` from the leased
+read. Retaining pins immutable pixels and descriptors even after frame
+replacement or stream close. The consumer must retain the native binding until
+it releases every frame. A global limit of eight retained references applies
+across frames, streams and stream restarts; a full limit returns `MEDIA_BUSY`
+and acquires nothing.
+
+Release consumes exactly one retained reference and its completion fence.
+`-1` means consumer GPU work has finished. Other completion fences must be real
+Linux sync_file descriptors and are waited for up to one second. An invalid,
+failed or stalled completion fence permanently quarantines its allocation and
+capacity slot until the process ends, preventing premature reuse. This bounded
+failure behavior can make later retains busy; the usual synchronous encoder
+path completes its read before release and uses `-1`.
+
+The context initializes on its presentation thread before open succeeds; missing
+snapshot support reports `gpu_snapshot_unavailable`. A failed copy during a
+stream faults it as `gpu_snapshot_failed`. Fresh allocation and synchronous GPU
+completion favor ownership correctness; sustained cost and multi-GPU import need
+hardware measurement. Ten-bit storage is not an HDR qualification: the current
+KMS frame metadata remains sRGB, and HDR colorimetry, encoder support and client
+playback remain separate unfinished gates.
+
 ### Threading, latency and lifetimes
 
 - Reads and queries take the controller lock with `try_lock` (busy rather
@@ -198,16 +262,20 @@ stream is `MEDIA_CLOSED`; a failed helper or permission refusal is
   reference to the stored frame. No lock is held while the presentation thread
   waits on the helper, and the presentation thread never waits for a sink:
   a read holds only that stream's read gate while the sink runs.
-- A presentation is readable one FRAME round trip (a helper exchange and the
-  driver export, bounded to 100 ms) after WAIT returns, which is itself
+- Without snapshots, a presentation is readable one FRAME round trip (a
+  helper exchange and the driver export, bounded to 100 ms) after WAIT returns, which is itself
   immediate on completion. The consumer then sees it on its next
   `latest_presentation` poll.
+- Snapshot mode additionally waits for input fences and GPU copy completion;
+  a stalled graphics driver can delay teardown. No bounded GPU execution time
+  is claimed from the helper's socket timeout.
 - The thread stops on close, on module shutdown, and on its own when the
   stream faults. Close sets a stop flag, shuts down the stream's helper socket,
   which makes a pending WAIT or FRAME fail at once, and joins the thread; the
   thread then ends the helper (it exits on end of stream, or is killed after
   50 ms if it is still in the driver). Close therefore blocks the tick for
-  about 50 ms at most, well under one WAIT timeout.
+  about 50 ms for the legacy helper outside a GPU-copy operation. Approved
+  sessions are terminated by their broker when the module closes its endpoint.
 - `busy` and `interrupted` driver refusals are retried after 5 ms; other
   driver refusals after 20 ms, faulting the stream as `frame_helper_failed`
   after 10 in a row. `crtc_not_found` asks the controller to re-resolve the

@@ -6,7 +6,7 @@ use crate::{
         OutputBinding,
     },
     geometry::LayoutOutput,
-    model::{CaptureError, CaptureResult, Settings},
+    model::{CaptureError, CaptureResult, HelperEndpoint, Settings},
     output_name::OutputName,
     presenter::{FrameSource, SourceInterrupt},
 };
@@ -418,20 +418,20 @@ impl Backend for FakeBackend {
         crate::discovery::resolve(&probe, output)
     }
 
-    fn probe_helper(&self, _helper: &str) -> CaptureResult<()> {
+    fn probe_helper(&self, _helper: HelperEndpoint<'_>) -> CaptureResult<()> {
         self.helper.lock().unwrap().clone()
     }
 
     fn connect(
         &self,
-        helper: &str,
+        helper: HelperEndpoint<'_>,
         binding: &OutputBinding,
     ) -> CaptureResult<Box<dyn FrameSource>> {
         self.helper.lock().unwrap().clone()?;
         self.connects
             .lock()
             .unwrap()
-            .push((helper.to_owned(), binding.crtc_id));
+            .push((helper.label(), binding.crtc_id));
         Ok(Box::new(FakeSource::new(self.script.clone())))
     }
 
@@ -476,5 +476,6 @@ pub fn settings() -> Settings {
         enabled: true,
         capture_principals: ["amaterasu.video".into()].into(),
         frame_helper: Some(HELPER.into()),
+        ..Settings::default()
     }
 }

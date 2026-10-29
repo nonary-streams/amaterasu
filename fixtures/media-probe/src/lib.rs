@@ -1,5 +1,6 @@
 //! Integration fixture: binds media tables and exercises software Opus without hardware.
 mod control;
+mod custom_video;
 mod hardware;
 mod opus;
 mod pipewire;
@@ -17,6 +18,7 @@ struct Probe {
     runtime: RuntimeClient,
     opus: Option<opus::OpusProbe>,
     control: Option<control::ControlProbe>,
+    custom_video: Option<custom_video::CustomVideoProbe>,
     hardware: Option<hardware::HardwareVideoProbe>,
     pipewire: Option<pipewire::CaptureProbe>,
     pipewire_control: Option<pipewire::ControlStatusProbe>,
@@ -32,6 +34,7 @@ impl ManagedModule for Probe {
             runtime,
             opus: None,
             control: None,
+            custom_video: None,
             hardware: None,
             pipewire: None,
             pipewire_control: None,
@@ -39,6 +42,12 @@ impl ManagedModule for Probe {
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
+        if let Some(probe) = &mut self.custom_video {
+            if probe.tick(&self.runtime)? {
+                self.custom_video = None;
+            }
+            return Ok(());
+        }
         if let Some(probe) = &mut self.control {
             if probe.tick(&self.runtime)? {
                 self.control = None;
@@ -89,6 +98,11 @@ impl ManagedModule for Probe {
                     Some("control_open" | "control_close")
                 ) {
                     self.control = Some(control::ControlProbe::start(&self.runtime, id, payload)?);
+                    return Ok(());
+                }
+                if payload["action"] == "custom_video" {
+                    self.custom_video =
+                        Some(custom_video::CustomVideoProbe::start(&self.runtime, id)?);
                     return Ok(());
                 }
                 if payload["action"] == "control_echo" {

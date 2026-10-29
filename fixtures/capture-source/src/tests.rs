@@ -11,6 +11,7 @@ struct MockRuntime {
     valid_request: bool,
     registrations: Vec<String>,
     native_registrations: Vec<String>,
+    settings: Value,
 }
 
 impl Default for MockRuntime {
@@ -22,6 +23,7 @@ impl Default for MockRuntime {
             valid_request: true,
             registrations: Vec::new(),
             native_registrations: Vec::new(),
+            settings: json!({}),
         }
     }
 }
@@ -55,7 +57,9 @@ unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, sink: Re
     // SAFETY: the SDK borrows initialized command bytes for this callback.
     let command: Command = serde_json::from_slice(unsafe { input.read() }.unwrap()).unwrap();
     let response = match command {
-        Command::GetSettings {} => Response::Result { payload: json!({}) },
+        Command::GetSettings {} => Response::Result {
+            payload: runtime.settings.clone(),
+        },
         Command::Register { service } => {
             runtime.registrations.push(service);
             Response::Ok
@@ -96,6 +100,26 @@ fn module_registers_only_capture_and_metrics_without_encoder_capabilities() {
         module.controller.lock().unwrap().metrics()["native_capture_qualified"],
         false
     );
+}
+
+#[test]
+fn custom_fixture_registers_only_its_own_control_and_native_identity() {
+    let mut runtime = MockRuntime {
+        settings: json!({"custom_service": true}),
+        ..Default::default()
+    };
+    let mut module = CaptureSource::start(runtime.client()).unwrap();
+    assert_eq!(
+        runtime.registrations,
+        [CUSTOM_CAPTURE_SERVICE, METRICS_SERVICE]
+    );
+    assert_eq!(runtime.native_registrations, [CUSTOM_CAPTURE_SERVICE]);
+    runtime.queue(open_payload("custom"));
+    if let Some(Response::Request { service, .. }) = runtime.requests.back_mut() {
+        *service = CUSTOM_CAPTURE_SERVICE.into();
+    }
+    module.tick().unwrap();
+    assert_eq!(runtime.completions[0]["ok"], true);
 }
 
 #[test]

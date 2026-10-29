@@ -125,7 +125,10 @@ mod tests {
         production_bootstrap.development = false;
         write_json_atomically(&root.join("bootstrap.json"), &production_bootstrap).unwrap();
         let verified = VerifiedPackage {
+            signer_fingerprint: None,
+            privileged_requests: Vec::new(),
             manifest: ReleaseManifest {
+                privileged_requests: Vec::new(),
                 schema: 1,
                 host_context_schema: 1,
                 project: "amaterasu".into(),

@@ -1,0 +1,22 @@
+[package]
+name = "amaterasu-capture-authority"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+amaterasu-package.workspace = true
+amaterasu-contracts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+amaterasu-vkms-frame-helper = { path = "../vkms-frame-helper" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true

@@ -388,3 +388,311 @@ fn portal_selection_authorizes_direct_management_and_video_ensure_routes() {
         json!([VIDEO_COMPONENT_ID])
     );
 }
+
+#[test]
+fn opt_in_virtual_screen_alias_matches_bootstrap_and_retains_provider_grants() {
+    let parse = |arguments: &[&str]| {
+        LinuxSessionOptions::from_arguments(
+            &arguments
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>(),
+        )
+    };
+    let helper = "/usr/libexec/amaterasu/amaterasu-vkms-frame-helper";
+    let options = parse(&[
+        "--enable-capture",
+        "--enable-virtual-display",
+        "--frame-helper",
+        helper,
+        "--enable-virtual-screen-capture",
+    ])
+    .unwrap();
+    let root = local_parity::TemporaryRoot::new("virtual-screen-alias");
+    let policy = linux_session_policy(root.path(), &options).unwrap();
+    let video = &policy.settings[VIDEO_COMPONENT_ID];
+    assert_eq!(video["capture_providers"], json!(["kms", "pipewire"]));
+    assert_eq!(
+        video["external_capture_providers"]["virtual_screen"],
+        json!({
+            "service":"amaterasu.capture-vkms/1", "frame_transport":"dmabuf"
+        })
+    );
+    let bootstrap = &policy.settings["amaterasu.nvhttp"]["streaming"]["capture"];
+    assert_eq!(bootstrap["capture_provider"], "virtual_screen");
+    assert_eq!(bootstrap["output"], "amaterasu-owned-display");
+    assert_eq!(
+        policy.settings["amaterasu.capture-vkms"]["frame_helper"],
+        helper
+    );
+    let video_component = COMPONENTS
+        .iter()
+        .find(|component| component.id == VIDEO_COMPONENT_ID)
+        .unwrap();
+    assert!(video_component.calls.contains(&"amaterasu.capture-vkms/1"));
+    assert!(
+        video_component
+            .native_uses
+            .contains(&"amaterasu.capture-vkms/1")
+    );
+    assert!(
+        video_component
+            .dependencies
+            .contains(&"amaterasu.capture-vkms")
+    );
+    for id in [NVHTTP.id, RTSP.id, STREAM_SESSION.id] {
+        assert!(
+            COMPONENTS
+                .iter()
+                .find(|component| component.id == id)
+                .unwrap()
+                .calls
+                .contains(&"amaterasu.capture-vkms/1")
+        );
+    }
+    assert_eq!(
+        streaming_settings(&LinuxSessionOptions::default())["capture"]["capture_provider"],
+        "pipewire"
+    );
+
+    for arguments in [
+        vec!["--enable-virtual-screen-capture"],
+        vec![
+            "--enable-capture",
+            "--enable-virtual-display",
+            "--enable-virtual-screen-capture",
+        ],
+        vec![
+            "--enable-capture",
+            "--frame-helper",
+            helper,
+            "--enable-virtual-screen-capture",
+        ],
+        vec![
+            "--enable-virtual-display",
+            "--frame-helper",
+            helper,
+            "--enable-virtual-screen-capture",
+        ],
+        vec![
+            "--enable-capture",
+            "--enable-virtual-display",
+            "--frame-helper",
+            helper,
+            "--capture-output",
+            "kms:card0",
+            "--enable-virtual-screen-capture",
+        ],
+        vec![
+            "--enable-capture",
+            "--enable-virtual-display",
+            "--frame-helper",
+            helper,
+            "--enable-virtual-screen-capture",
+            "--enable-virtual-screen-capture",
+        ],
+    ] {
+        assert!(parse(&arguments).is_err(), "{arguments:?}");
+    }
+    let invalid = LinuxSessionOptions {
+        enable_virtual_screen_capture: true,
+        ..Default::default()
+    };
+    assert!(linux_session_policy(root.path(), &invalid).is_err());
+}
+
+#[test]
+fn package_capture_authority_requires_explicit_scoped_virtual_screen_options() {
+    let parse = |values: &[&str]| LinuxSessionOptions::from_arguments(&arguments(values));
+    let helper = "/opt/amaterasu/artifacts/amaterasu-vkms-frame-helper";
+    let base = [
+        "--enable-capture",
+        "--enable-virtual-display",
+        "--enable-virtual-screen-capture",
+        "--capture-authority-helper",
+        helper,
+    ];
+    let options = parse(&base).unwrap();
+    assert_eq!(options.capture_authority_helper.as_deref(), Some(helper));
+    assert_eq!(options.capture_authority_card, 0);
+    assert!(options.frame_helper.is_none());
+
+    let mut scoped = base.to_vec();
+    scoped.extend(["--capture-authority-card", "63"]);
+    assert_eq!(parse(&scoped).unwrap().capture_authority_card, 63);
+
+    for values in [
+        vec!["--capture-authority-helper", helper],
+        vec!["--capture-authority-card", "0"],
+        vec!["--capture-authority-card", "1"],
+        vec!["--frame-helper", helper, "--capture-authority-card", "0"],
+        vec![
+            "--enable-virtual-screen-capture",
+            "--capture-authority-helper",
+            helper,
+        ],
+        vec![
+            "--enable-capture",
+            "--enable-virtual-screen-capture",
+            "--capture-authority-helper",
+            helper,
+        ],
+        vec![
+            "--enable-virtual-display",
+            "--enable-virtual-screen-capture",
+            "--capture-authority-helper",
+            helper,
+        ],
+    ] {
+        assert!(parse(&values).is_err(), "accepted {values:?}");
+    }
+
+    for extra in [
+        vec!["--frame-helper", helper],
+        vec!["--capture-output", "kms:card0"],
+        vec!["--capture-authority-helper", helper],
+        vec![
+            "--capture-authority-card",
+            "1",
+            "--capture-authority-card",
+            "2",
+        ],
+    ] {
+        let mut values = base.to_vec();
+        values.extend(extra);
+        assert!(parse(&values).is_err(), "accepted {values:?}");
+    }
+}
+
+#[test]
+fn package_capture_authority_rejects_invalid_paths_and_card_scope() {
+    let parse = |values: &[&str]| LinuxSessionOptions::from_arguments(&arguments(values));
+    let base = [
+        "--enable-capture",
+        "--enable-virtual-display",
+        "--enable-virtual-screen-capture",
+    ];
+    for path in [
+        "",
+        "relative/helper",
+        "/opt/../tmp/helper",
+        "/opt/helpers/",
+        "/",
+    ] {
+        let mut values = base.to_vec();
+        values.extend(["--capture-authority-helper", path]);
+        assert!(
+            matches!(
+                parse(&values),
+                Err(options::OptionError::InvalidCaptureAuthorityHelper(_))
+            ),
+            "accepted {path:?}"
+        );
+    }
+    let mut with_helper = base.to_vec();
+    with_helper.extend(["--capture-authority-helper", "/opt/amaterasu/helper"]);
+    for card in ["64", "4294967296", "-1", "", "one", "1.0"] {
+        let mut values = with_helper.clone();
+        values.extend(["--capture-authority-card", card]);
+        assert!(
+            matches!(
+                parse(&values),
+                Err(options::OptionError::InvalidCaptureAuthorityCard(_))
+            ),
+            "accepted {card:?}"
+        );
+    }
+    for option in ["--capture-authority-helper", "--capture-authority-card"] {
+        let mut values = base.to_vec();
+        values.push(option);
+        assert!(matches!(
+            parse(&values),
+            Err(options::OptionError::MissingValue(_))
+        ));
+    }
+}
+
+#[test]
+fn programmatic_capture_authority_options_preserve_validation() {
+    let valid = LinuxSessionOptions {
+        enable_capture: true,
+        enable_virtual_display: true,
+        enable_virtual_screen_capture: true,
+        capture_authority_helper: Some("/opt/amaterasu/helper".into()),
+        capture_authority_card: 3,
+        ..Default::default()
+    };
+    assert!(valid.validate().is_ok());
+    assert!(
+        LinuxSessionOptions {
+            capture_authority_card: 64,
+            ..valid.clone()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        LinuxSessionOptions {
+            capture_authority_helper: None,
+            ..valid.clone()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        LinuxSessionOptions {
+            frame_helper: Some("/opt/legacy/helper".into()),
+            ..valid.clone()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        LinuxSessionOptions {
+            enable_virtual_screen_capture: false,
+            ..valid.clone()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        LinuxSessionOptions {
+            capture_authority_helper: Some("relative/helper".into()),
+            ..valid
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[test]
+fn package_authority_profile_uses_only_the_inherited_channel() {
+    let options = LinuxSessionOptions {
+        enable_capture: true,
+        enable_virtual_display: true,
+        enable_virtual_screen_capture: true,
+        capture_authority_helper: Some("/build/artifacts/amaterasu-vkms-frame-helper".into()),
+        capture_authority_card: 3,
+        ..LinuxSessionOptions::default()
+    };
+    options.validate().unwrap();
+    assert_eq!(
+        vkms_capture_settings(&options),
+        json!({
+            "enabled": true,
+            "capture_principals": [VIDEO_COMPONENT_ID],
+            "authority_channel": true,
+            "gpu_snapshot": true,
+        })
+    );
+    assert!(
+        vkms_capture_settings(&options)
+            .get("authority_channel_fd")
+            .is_none()
+    );
+    assert!(
+        vkms_capture_settings(&options)
+            .get("frame_helper")
+            .is_none()
+    );
+}

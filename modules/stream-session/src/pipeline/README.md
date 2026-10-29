@@ -33,7 +33,7 @@ The action does not implement a network RTSP listener or claim that a PLAY respo
 
 ## Owned Linux displays
 
-A PipeWire start targeting `amaterasu-owned-display` allocates a unique monitor
+A PipeWire or external-provider start targeting `amaterasu-owned-display` allocates a unique monitor
 through `amaterasu.virtual-display/1` after transport authentication and before
 video capture. Its caller/UUID identity derives from the stable journaled stream
 record. Monitor readiness must match requested timing, active state and the

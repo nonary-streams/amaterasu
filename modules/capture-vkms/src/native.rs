@@ -1,4 +1,4 @@
-//! Native `amaterasu.capture-vkms/1` capture table, v1.5. Only DMA-BUF
+//! Native `amaterasu.capture-vkms/1` capture table, v1.6. Only DMA-BUF
 //! delivery is offered; the CPU frame callbacks report MEDIA_UNSUPPORTED.
 //! Reads and presentation queries use the frame the stream's presentation
 //! thread stored and never wait for the helper.
@@ -7,9 +7,10 @@ use crate::{
     controller::{Controller, StreamGeometry},
 };
 use amaterasu_media::{
-    CAPTURE_API_V1_5_SIZE, CAPTURE_PRESENTATION_INTERFACE_MINOR, CaptureApiV1_5, CaptureGeometry,
-    DmaBufFrameSink, FrameSink, FreshFrameSinkV1_2, FreshFrameSinkV1_3, INTERFACE_MAJOR,
-    MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_UNSUPPORTED, PresentationStatus,
+    CAPTURE_API_V1_6_SIZE, CAPTURE_LEASE_INTERFACE_MINOR, CaptureApiV1_6, CaptureGeometry,
+    DmaBufFrameSink, DmaBufLeaseSink, FrameSink, FreshFrameSinkV1_2, FreshFrameSinkV1_3,
+    INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_UNSUPPORTED,
+    PresentationStatus,
 };
 use amaterasu_module_sdk::abi::{
     AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery, NativeServiceFactory,
@@ -44,7 +45,7 @@ impl<B: Backend + 'static> Factory<B> {
 }
 
 struct Binding<B: Backend> {
-    api: CaptureApiV1_5,
+    api: CaptureApiV1_6,
     controller: Shared<B>,
     caller: String,
 }
@@ -52,12 +53,12 @@ struct Binding<B: Backend> {
 impl<B: Backend> Binding<B> {
     fn new(controller: Shared<B>, caller: String) -> Box<Self> {
         let mut binding = Box::new(Self {
-            api: CaptureApiV1_5 {
+            api: CaptureApiV1_6 {
                 base: NativeInterface {
                     header: AbiHeader {
-                        size: CAPTURE_API_V1_5_SIZE,
+                        size: CAPTURE_API_V1_6_SIZE,
                         major: INTERFACE_MAJOR,
-                        minor: CAPTURE_PRESENTATION_INTERFACE_MINOR,
+                        minor: CAPTURE_LEASE_INTERFACE_MINOR,
                     },
                     context: std::ptr::null_mut(),
                     release: Some(release::<B>),
@@ -68,6 +69,7 @@ impl<B: Backend> Binding<B> {
                 read_frame_with_capture_timestamp,
                 read_dmabuf_frame: read_dmabuf_frame::<B>,
                 latest_presentation: latest_presentation::<B>,
+                read_dmabuf_frame_leased: read_dmabuf_frame_leased::<B>,
             },
             controller,
             caller,
@@ -91,8 +93,8 @@ impl<B: Backend> Binding<B> {
 fn supports_query(query: &NativeInterfaceQuery) -> bool {
     query.header.supports::<NativeInterfaceQuery>()
         && query.interface_major == INTERFACE_MAJOR
-        && query.min_minor <= CAPTURE_PRESENTATION_INTERFACE_MINOR
-        && query.min_size <= CAPTURE_API_V1_5_SIZE
+        && query.min_minor <= CAPTURE_LEASE_INTERFACE_MINOR
+        && query.min_size <= CAPTURE_API_V1_6_SIZE
 }
 
 unsafe extern "C" fn bind<B: Backend + 'static>(
@@ -229,6 +231,39 @@ unsafe extern "C" fn read_dmabuf_frame<B: Backend>(
         // frame meanwhile. Only this stream's read gate is held while
         // foreign code runs; the sink must duplicate any descriptor it keeps.
         let status = unsafe { sink.send(lent.frame(), lent.freshness) };
+        frames.finish(lent, status)
+    })
+}
+
+unsafe extern "C" fn read_dmabuf_frame_leased<B: Backend>(
+    context: *mut c_void,
+    stream: u64,
+    sink: DmaBufLeaseSink,
+) -> Status {
+    guarded(|| {
+        if context.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: broker retains this binding through the synchronous call.
+        let binding = unsafe { &*context.cast::<Binding<B>>() };
+        let frames = match binding.reader(stream) {
+            Ok(reader) => reader.frames,
+            Err(status) => return status,
+        };
+        let Some(_admission) = frames.admission.enter() else {
+            return MEDIA_CLOSED;
+        };
+        let lent = match frames.lend() {
+            Ok(lent) => lent,
+            Err(status) => return status,
+        };
+        let lease = match lent.lease() {
+            Ok(lease) => lease,
+            Err(status) => return status,
+        };
+        // SAFETY: the lent Arc pins immutable private storage through callback.
+        // A consumer retaining it must keep this native binding live until release.
+        let status = unsafe { sink.send(&lease, lent.freshness) };
         frames.finish(lent, status)
     })
 }

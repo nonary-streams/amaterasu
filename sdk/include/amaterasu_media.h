@@ -84,6 +84,20 @@ typedef struct {
     AmaterasuStatus (*write)(void *context, const AmaterasuCpuFrame *frame);
 } AmaterasuFrameSink;
 
+/* Optional synchronous CPU transform v1.0. Input and sink are borrowed until
+ * process returns; output and bytes are borrowed only until write returns.
+ * On OK invoke write exactly once; a processor failure before delivery invokes
+ * it zero times. Return a rejected write status unchanged. BUSY consumes nothing and
+ * may be retried. Preserve sequence and timestamp; shape and pixels may change.
+ * Callbacks must be serialized and no pointer may be retained. */
+#define AMATERASU_CPU_PROCESSOR_INTERFACE_MAJOR 1u
+#define AMATERASU_CPU_PROCESSOR_INTERFACE_MINOR 0u
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*process)(void *context, uint64_t stream, const AmaterasuCpuFrame *frame, AmaterasuFrameSink sink);
+} AmaterasuCpuProcessorApi;
+#define AMATERASU_CPU_PROCESSOR_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuCpuProcessorApi))
+
 /* Freshness is source provenance, not encoder acceptance: FRESH identifies a
  * newly acquired source frame; CACHED_REUSE identifies reused pixels. */
 #define AMATERASU_CAPTURE_FRAME_CACHED_REUSE 0u
@@ -118,6 +132,49 @@ typedef struct {
     void *context;
     AmaterasuStatus (*write)(void *context, const AmaterasuDmaBufFrame *frame, uint32_t freshness);
 } AmaterasuDmaBufFrameSink;
+
+/* Borrowed lease over IMMUTABLE pixels. retain adds one reference on OK;
+ * any error adds none. Providers impose finite outstanding-reference limits.
+ * Every successful retain requires one release. A duplicated scanout fd alone
+ * cannot implement this contract. Plane/acquire-fence fds stay provider-owned
+ * and live until release; wait for acquire fences before reading.
+ * release consumes one reference and, when >= 0, completion_fence_fd ownership.
+ * The provider waits for the fence, closes it, and only then may reuse pixels.
+ * -1 asserts all consumer GPU access completed. Invalid/failed fences must
+ * quarantine storage. Callbacks/binding remain live through references AND
+ * pending fences; callbacks run on the owning module thread and cannot unwind.
+ * Returning from a sink does not implicitly retain or transfer a reference. */
+typedef struct {
+    AmaterasuDmaBufFrame frame;
+    void *context;
+    AmaterasuStatus (*retain)(void *context);
+    void (*release)(void *context, int32_t completion_fence_fd);
+} AmaterasuDmaBufFrameLease;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *context, const AmaterasuDmaBufFrameLease *lease, uint32_t freshness);
+} AmaterasuDmaBufLeaseSink;
+
+/* Optional synchronous GPU transform. Input/output leases are borrowed;
+ * retain explicitly for later use. On OK call the sink exactly once preserving
+ * timestamp, sequence, and the supplied freshness. Propagate sink rejection unchanged. BUSY before
+ * delivery consumes nothing. No callback may happen after process returns.
+ * Processing cannot mutate input pixels and must honor all GPU fences. Finish
+ * borrowed input reads before return or retain a separate reference and release
+ * it after GPU completion/with a completion fence. Pending output writes require
+ * acquire fences. The caller releasing its reference does not retire processor
+ * work; the processor owns that independently retained reference. */
+#define AMATERASU_GPU_PROCESSOR_INTERFACE_MAJOR 1u
+#define AMATERASU_GPU_PROCESSOR_INTERFACE_MINOR 0u
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*process)(void *context, uint64_t stream, const AmaterasuDmaBufFrameLease *lease, uint32_t freshness, AmaterasuDmaBufLeaseSink sink);
+    /* Stop stream permanently; synchronously retire all retained input/output
+     * references and completion fences before return. May block on vendor/GPU
+     * work. Source bindings must remain live throughout cancellation. */
+    void (*cancel_dmabuf_leases)(void *context, uint64_t stream);
+} AmaterasuGpuProcessorApi;
+#define AMATERASU_GPU_PROCESSOR_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApi))
 
 /* H264/HEVC bytes are Annex B; AV1 bytes are one OBU temporal unit. EOS has flags=2, len=0, no payload.
  * When open selects packet_boundaries=true, flag 4 marks the last fragment of
@@ -155,6 +212,10 @@ typedef struct {
 
 #define AMATERASU_CAPTURE_INTERFACE_MINOR 1u
 #define AMATERASU_CAPTURE_FRESHNESS_INTERFACE_MINOR 2u
+#define AMATERASU_CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR 3u
+#define AMATERASU_CAPTURE_DMABUF_INTERFACE_MINOR 4u
+#define AMATERASU_CAPTURE_PRESENTATION_INTERFACE_MINOR 5u
+#define AMATERASU_CAPTURE_LEASE_INTERFACE_MINOR 6u
 #define AMATERASU_CAPTURE_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiPrefix))
 
 typedef struct {
@@ -179,6 +240,55 @@ typedef struct {
 #define AMATERASU_CAPTURE_API_V1_1_SIZE ((uint32_t)sizeof(AmaterasuCaptureApi))
 #define AMATERASU_CAPTURE_API_V1_2_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_2))
 
+/* Source pacing time has the capture stream's microsecond epoch; frame time
+ * may instead be rewritten for encoder submission. Both are borrowed during
+ * the synchronous callback. */
+typedef struct {
+    AmaterasuCpuFrame frame;
+    uint64_t capture_pacing_timestamp_us;
+} AmaterasuCaptureFrameV1_3;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *context, const AmaterasuCaptureFrameV1_3 *frame, uint32_t freshness);
+} AmaterasuFreshFrameSinkV1_3;
+
+/* Each tail is available only when both the advertised minor and table size
+ * cover that version. The older prefixes remain valid. */
+#define AMATERASU_CAPTURE_V1_2_FIELDS \
+    AmaterasuNativeInterface base; \
+    AmaterasuStatus (*read_frame)(void *, uint64_t, AmaterasuFrameSink); \
+    AmaterasuStatus (*geometry)(void *, uint64_t, AmaterasuCaptureGeometry *); \
+    AmaterasuStatus (*read_frame_with_freshness)(void *, uint64_t, AmaterasuFreshFrameSinkV1_2)
+#define AMATERASU_CAPTURE_V1_3_FIELDS \
+    AMATERASU_CAPTURE_V1_2_FIELDS; \
+    AmaterasuStatus (*read_frame_with_capture_timestamp)(void *, uint64_t, AmaterasuFreshFrameSinkV1_3)
+#define AMATERASU_CAPTURE_V1_4_FIELDS \
+    AMATERASU_CAPTURE_V1_3_FIELDS; \
+    AmaterasuStatus (*read_dmabuf_frame)(void *, uint64_t, AmaterasuDmaBufFrameSink)
+typedef struct { AMATERASU_CAPTURE_V1_3_FIELDS; } AmaterasuCaptureApiV1_3;
+/* UNSUPPORTED means this stream has no DMA-BUF frames; use the CPU path. */
+typedef struct { AMATERASU_CAPTURE_V1_4_FIELDS; } AmaterasuCaptureApiV1_4;
+/* Sequence zero means no completed presentation. Timestamp uses stream epoch. */
+typedef struct { uint64_t sequence, timestamp_us; } AmaterasuPresentationStatus;
+typedef struct {
+    AMATERASU_CAPTURE_V1_4_FIELDS;
+    AmaterasuStatus (*latest_presentation)(void *, uint64_t, AmaterasuPresentationStatus *);
+} AmaterasuCaptureApiV1_5;
+/* The v1.5 prefix is unchanged. Only providers able to pin immutable contents
+ * may expose leased capture. UNSUPPORTED permits the legacy borrowed path. */
+typedef struct {
+    AMATERASU_CAPTURE_V1_4_FIELDS;
+    AmaterasuStatus (*latest_presentation)(void *, uint64_t, AmaterasuPresentationStatus *);
+    AmaterasuStatus (*read_dmabuf_frame_leased)(void *, uint64_t, AmaterasuDmaBufLeaseSink);
+} AmaterasuCaptureApiV1_6;
+#undef AMATERASU_CAPTURE_V1_4_FIELDS
+#undef AMATERASU_CAPTURE_V1_3_FIELDS
+#undef AMATERASU_CAPTURE_V1_2_FIELDS
+#define AMATERASU_CAPTURE_API_V1_3_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_3))
+#define AMATERASU_CAPTURE_API_V1_4_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_4))
+#define AMATERASU_CAPTURE_API_V1_5_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_5))
+#define AMATERASU_CAPTURE_API_V1_6_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_6))
+
 typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*submit)(void *context, uint64_t stream, const AmaterasuCpuFrame *frame, uint32_t force_idr);
@@ -198,10 +308,38 @@ typedef struct {
     AmaterasuStatus (*drain)(void *context, uint64_t stream);
     AmaterasuStatus (*submit_dmabuf)(void *context, uint64_t stream, const AmaterasuDmaBufFrame *frame, uint32_t force_idr);
 } AmaterasuEncoderApiV1_1;
+/* Leased encoder v1.2: asynchronous work must retain before returning OK
+ * and release only after safe GPU access completes (or with completion fence).
+ * Every non-OK return retains nothing and retires all GPU access started by the
+ * rejected submission before returning. Drain completion retires all accepted
+ * references. Provider code/binding must outlive pending completion fences. */
+#define AMATERASU_ENCODER_LEASE_INTERFACE_MINOR 2u
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuCpuFrame *, uint32_t);
+    AmaterasuStatus (*receive)(void *, uint64_t, AmaterasuPacketSink);
+    AmaterasuStatus (*drain)(void *, uint64_t);
+    AmaterasuStatus (*submit_dmabuf)(void *, uint64_t, const AmaterasuDmaBufFrame *, uint32_t);
+    AmaterasuStatus (*submit_dmabuf_leased)(void *, uint64_t, const AmaterasuDmaBufFrameLease *, uint32_t);
+    /* Permanently stop this stream; synchronously retire all accepted input
+     * references AND completion fences before returning. May block on vendor
+     * work. Capture/processor bindings stay live during cancellation. Failure
+     * safely quarantines storage; no pending access/reference may remain. */
+    void (*cancel_dmabuf_leases)(void *, uint64_t);
+} AmaterasuEncoderApiV1_2;
+#define AMATERASU_ENCODER_API_V1_2_SIZE ((uint32_t)sizeof(AmaterasuEncoderApiV1_2))
+#define AMATERASU_ENCODER_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuEncoderApi))
+#define AMATERASU_ENCODER_API_V1_1_SIZE ((uint32_t)sizeof(AmaterasuEncoderApiV1_1))
 typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuPacketSink sink);
 } AmaterasuVideoApi;
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuPacketSink sink);
+    /* OK initializes geometry; UNSUPPORTED means unavailable. */
+    AmaterasuStatus (*geometry)(void *context, uint64_t stream, AmaterasuCaptureGeometry *geometry);
+} AmaterasuVideoApiV1_1;
 
 /* The trusted control caller must authorize the peer and negotiate the profile.
  * The provider enforces ownership; it does not authenticate peers. Submit one

@@ -527,7 +527,7 @@ impl Controller {
                         .or(application_overrides.capture)
                         .unwrap_or(record.global_capture_mode);
                     (record.capture_provider, record.constant_rate) =
-                        selected_capture_mode.resolve(record.bootstrap_capture_provider);
+                        selected_capture_mode.resolve(record.bootstrap_capture_provider.clone());
                     if record.capture_provider == super::CaptureProvider::PipeWire
                         && record.capture_output != super::OWNED_DISPLAY_OUTPUT
                     {
@@ -1423,13 +1423,13 @@ fn display_admission_response(record: &Record, payload: &Value) -> Result<String
 }
 
 fn capture_source(record: &Record) -> Result<&str, &'static str> {
-    capture_source_for(record.capture_provider, &record.capture_output)
+    capture_source_for(&record.capture_provider, &record.capture_output)
 }
 
-fn capture_source_for(
-    provider: super::CaptureProvider,
-    output: &str,
-) -> Result<&str, &'static str> {
+fn capture_source_for<'a>(
+    provider: &super::CaptureProvider,
+    output: &'a str,
+) -> Result<&'a str, &'static str> {
     let source = match provider {
         super::CaptureProvider::Wgc => output,
         super::CaptureProvider::X11 => {
@@ -1453,7 +1453,9 @@ fn capture_source_for(
         // Windows-oriented display management contract.
         super::CaptureProvider::Kms => return Err("capture_display_mapping_unsupported"),
         // Portal source IDs cannot identify physical Windows display topology.
-        super::CaptureProvider::PipeWire => return Err("capture_display_mapping_unsupported"),
+        super::CaptureProvider::PipeWire | super::CaptureProvider::External(_) => {
+            return Err("capture_display_mapping_unsupported");
+        }
         super::CaptureProvider::Dxgi => {
             let (luid, source) = output.split_once('/').ok_or("invalid_capture_output")?;
             let Some((high, low)) = luid.split_once(':') else {
@@ -1616,7 +1618,7 @@ mod capture_source_tests {
     #[test]
     fn x11_source_uses_validated_connector_name_without_exposing_xid() {
         assert_eq!(
-            capture_source_for(super::super::CaptureProvider::X11, "x11:DP-1/0000002a"),
+            capture_source_for(&super::super::CaptureProvider::X11, "x11:DP-1/0000002a"),
             Ok("DP-1")
         );
     }
@@ -1630,7 +1632,7 @@ mod capture_source_tests {
             "x11:DP-1/0000002a/extra",
         ] {
             assert_eq!(
-                capture_source_for(super::super::CaptureProvider::X11, output),
+                capture_source_for(&super::super::CaptureProvider::X11, output),
                 Err("invalid_capture_output")
             );
         }
@@ -1640,7 +1642,7 @@ mod capture_source_tests {
     fn kms_source_does_not_claim_a_windows_display_mapping() {
         assert_eq!(
             capture_source_for(
-                super::super::CaptureProvider::Kms,
+                &super::super::CaptureProvider::Kms,
                 "kms:card1/conn=34/crtc=56/plane=78"
             ),
             Err("capture_display_mapping_unsupported")

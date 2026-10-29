@@ -6,7 +6,10 @@
 //! newest frame. Native reads and presentation queries never talk to the
 //! helper, so frames become available at the compositor's presentation rate,
 //! including variable refresh, instead of being sampled on a fixed timer.
-use crate::frames::{StreamFault, StreamFrames};
+use crate::{
+    frames::{StreamFault, StreamFrames},
+    snapshot::Snapshotter,
+};
 use amaterasu_vkms_frame_helper::{
     client::{ClientError, ExportedFrame, FrameExport, Presentation},
     protocol::{Failure, PRESENT_CHANGED},
@@ -66,17 +69,46 @@ pub struct PresentationThread {
 }
 
 impl PresentationThread {
+    #[cfg(test)]
     pub fn spawn(source: Box<dyn FrameSource>, frames: Arc<StreamFrames>) -> io::Result<Self> {
+        Self::spawn_with_snapshot(source, frames, false)
+    }
+
+    pub fn spawn_with_snapshot(
+        source: Box<dyn FrameSource>,
+        frames: Arc<StreamFrames>,
+        gpu_snapshot: bool,
+    ) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let interrupt = source.interrupter();
-        let presenter = Presenter::new(source, frames.clone(), stop.clone());
+        let child_stop = stop.clone();
+        let (ready, initialized) = std::sync::mpsc::sync_channel(1);
         let handle = thread::Builder::new()
             .name("vkms-presentation".into())
             .spawn(move || {
+                let snapshotter = if gpu_snapshot {
+                    match Snapshotter::new() {
+                        Ok(snapshotter) => Some(snapshotter),
+                        Err(_) => {
+                            let _ = ready.send(false);
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let presenter = Presenter::new(source, frames.clone(), child_stop, snapshotter);
+                let _ = ready.send(true);
                 if catch_unwind(AssertUnwindSafe(|| presenter.run())).is_err() {
                     frames.set_fault(StreamFault::HelperFailed);
                 }
             })?;
+        if initialized.recv() != Ok(true) {
+            let _ = handle.join();
+            return Err(io::Error::other(
+                "immutable GPU snapshot backend unavailable",
+            ));
+        }
         Ok(Self {
             stop,
             interrupt,
@@ -137,10 +169,16 @@ struct Presenter {
     /// the output moves to another CRTC with its own counter.
     sequence_base: u64,
     consecutive_driver_errors: u32,
+    snapshotter: Option<Snapshotter>,
 }
 
 impl Presenter {
-    fn new(source: Box<dyn FrameSource>, frames: Arc<StreamFrames>, stop: Arc<AtomicBool>) -> Self {
+    fn new(
+        source: Box<dyn FrameSource>,
+        frames: Arc<StreamFrames>,
+        stop: Arc<AtomicBool>,
+        snapshotter: Option<Snapshotter>,
+    ) -> Self {
         Self {
             crtc_id: frames.crtc_id(),
             source,
@@ -149,6 +187,7 @@ impl Presenter {
             driver_sequence: 0,
             sequence_base: 0,
             consecutive_driver_errors: 0,
+            snapshotter,
         }
     }
 
@@ -225,7 +264,14 @@ impl Presenter {
         self.driver_sequence = previous.max(exported_sequence).max(waited_sequence);
         if exported_sequence > previous {
             let stream_sequence = self.sequence_base.saturating_add(exported_sequence);
-            self.frames.store(exported, stream_sequence);
+            if let Some(snapshotter) = &mut self.snapshotter {
+                match snapshotter.snapshot(exported) {
+                    Ok(snapshot) => self.frames.store_snapshot(snapshot, stream_sequence),
+                    Err(_) => self.frames.set_fault(StreamFault::GpuSnapshotFailed),
+                }
+            } else {
+                self.frames.store(exported, stream_sequence);
+            }
         }
     }
 

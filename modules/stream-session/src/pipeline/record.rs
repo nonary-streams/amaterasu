@@ -269,7 +269,7 @@ impl Record {
                 .as_bytes()
                 .to_vec()
         } else {
-            serde_json::to_vec(&(start.capture_provider, start.constant_rate, &start.output))
+            serde_json::to_vec(&(&start.capture_provider, start.constant_rate, &start.output))
                 .expect("bounded configuration")
         };
         let digest = Sha256::digest(identity);

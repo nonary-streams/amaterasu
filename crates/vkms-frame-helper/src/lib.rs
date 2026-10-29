@@ -3,9 +3,13 @@
 //! `amaterasu-vkms-frame-helper` binary holds CAP_SYS_ADMIN, and its privileged
 //! code is not part of this library.
 //!
-//! The helper inherits exactly one connected AF_UNIX SOCK_SEQPACKET socket at
-//! descriptor [`HELPER_SOCKET_FD`], takes no arguments, and ignores its
-//! environment. It exits when the peer closes the socket.
+//! The legacy helper inherits one connected AF_UNIX SOCK_SEQPACKET socket
+//! at descriptor [`HELPER_SOCKET_FD`], takes no arguments, and ignores its
+//! environment. The protected broker instead uses `--approved-service`, whose
+//! root-only entry point requires a root peer and is never executed by a module.
+//! Both modes exit when the peer closes the socket.
+#[cfg(target_os = "linux")]
+pub mod authority;
 #[cfg(target_os = "linux")]
 pub mod channel;
 #[cfg(target_os = "linux")]
@@ -25,13 +29,13 @@ pub const HELPER_PROGRAM_NAME: &str = "amaterasu-vkms-frame-helper";
 /// the peer closes exits with zero.
 pub mod exit_status {
     pub const UNSUPPORTED_PLATFORM: u8 = 64;
-    /// Arguments were supplied; the helper accepts none.
+    /// Arguments do not select exactly one supported startup mode.
     pub const USAGE: u8 = 65;
-    /// Descriptor 3 is not a connected AF_UNIX SOCK_SEQPACKET socket of the same user.
+    /// Descriptor 3 is not a valid socket with the peer required by this mode.
     pub const SOCKET: u8 = 66;
     /// Capability sets could not be reduced to at most CAP_SYS_ADMIN permitted.
     pub const CAPABILITIES: u8 = 67;
-    /// A real, effective or saved user or group id is root.
+    /// Process identities do not match the selected startup mode.
     pub const ROOT_IDENTITY: u8 = 68;
     /// PR_SET_NO_NEW_PRIVS or another process hardening step failed.
     pub const HARDENING: u8 = 69;
@@ -45,7 +49,7 @@ pub mod exit_status {
             CAPABILITIES => {
                 "the frame helper holds capabilities other than CAP_SYS_ADMIN; grant only cap_sys_admin+p"
             }
-            ROOT_IDENTITY => "the frame helper refuses to run as root",
+            ROOT_IDENTITY => "the frame helper identities do not match its startup mode",
             HARDENING => "the frame helper could not harden its process",
             _ => "the frame helper exited during startup",
         }

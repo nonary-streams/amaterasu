@@ -3,7 +3,10 @@
 `amaterasu-capture-source` is a trusted native test fixture. Load it only in a
 test profile under a separate module identity, providing control and native
 `amaterasu.capture-dxgi/1` plus control `test.capture-source/1`, with empty settings
-`{}`. Do not also load the genuine DXGI provider for the same service.
+`{}`. Do not also load the genuine DXGI provider for the same service. With
+`{"custom_service":true}` it instead registers control and native
+`test.custom-capture/1`, allowing integration tests to exercise an independently
+named capture service without registering the DXGI identity.
 
 The sole output, `nv12-fixture-display`, is 64×48 with matching output and virtual
 desktop geometry at (0, 0). Each stream produces exactly 12 accepted frames,

@@ -59,6 +59,12 @@ pub struct Settings {
     /// Absolute path of `amaterasu-vkms-frame-helper`. Capture is unavailable
     /// without it; the file is verified each time it is used.
     pub frame_helper: Option<String>,
+    /// Explicitly selects package-approved authority. Only the host injects
+    /// the inherited descriptor after the protected launcher authenticated it.
+    pub authority_channel: bool,
+    pub authority_channel_fd: Option<i32>,
+    /// Copies scanout into independent GPU storage before advertising leases.
+    pub gpu_snapshot: bool,
 }
 
 impl Settings {
@@ -67,10 +73,49 @@ impl Settings {
             .frame_helper
             .as_ref()
             .is_none_or(|path| !path.is_empty() && path.len() <= 4096 && !path.contains('\0'));
-        if !helper_valid || !valid_principals(&self.capture_principals) {
+        if !helper_valid
+            || !valid_principals(&self.capture_principals)
+            || (self.authority_channel && self.frame_helper.is_some())
+            || self
+                .authority_channel_fd
+                .is_some_and(|fd| !self.authority_channel || fd < 3)
+        {
             return Err(CaptureError::code("invalid_settings"));
         }
         Ok(())
+    }
+}
+
+/// A selected authority path. Approved channels never fall back to spawning
+/// a capability-bearing executable, including after revocation or failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperEndpoint<'a> {
+    Executable(&'a str),
+    ApprovedChannel(i32),
+}
+
+impl HelperEndpoint<'_> {
+    pub fn label(self) -> String {
+        match self {
+            Self::Executable(path) => path.to_owned(),
+            Self::ApprovedChannel(_) => "package-approved capture authority".into(),
+        }
+    }
+}
+
+impl Settings {
+    pub fn helper_endpoint(&self) -> CaptureResult<HelperEndpoint<'_>> {
+        if self.authority_channel {
+            return self.authority_channel_fd.map(HelperEndpoint::ApprovedChannel).ok_or_else(|| {
+                CaptureError::new("authority_unavailable", "package-approved capture authority was not supplied by the protected launcher")
+            });
+        }
+        self.frame_helper
+            .as_deref()
+            .map(HelperEndpoint::Executable)
+            .ok_or_else(|| {
+                CaptureError::frame_helper_unavailable("the frame_helper setting is not configured")
+            })
     }
 }
 
@@ -147,6 +192,38 @@ mod tests {
         let mut empty_path = settings;
         empty_path.frame_helper = Some(String::new());
         assert!(empty_path.validate().is_err());
+    }
+
+    #[test]
+    fn approved_authority_requires_explicit_mode_and_never_uses_a_legacy_fallback() {
+        let mut settings = Settings {
+            authority_channel: true,
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_ok());
+        assert_eq!(
+            settings.helper_endpoint().err().unwrap().code,
+            "authority_unavailable"
+        );
+        settings.frame_helper = Some("/opt/legacy-helper".into());
+        assert!(settings.validate().is_err());
+        // Even malformed mixed settings retain approved-channel selection.
+        assert_eq!(
+            settings.helper_endpoint().err().unwrap().code,
+            "authority_unavailable"
+        );
+        settings.frame_helper = None;
+        settings.authority_channel_fd = Some(198);
+        assert!(settings.validate().is_ok());
+        assert_eq!(
+            settings.helper_endpoint(),
+            Ok(HelperEndpoint::ApprovedChannel(198))
+        );
+        settings.authority_channel = false;
+        assert!(settings.validate().is_err());
+        settings.authority_channel = true;
+        settings.authority_channel_fd = Some(2);
+        assert!(settings.validate().is_err());
     }
 
     #[test]

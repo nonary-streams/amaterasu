@@ -1,8 +1,9 @@
-//! Zero-copy capture of owned `kwin:Virtual-N` outputs on vibeshine_drm.
+//! DMA-BUF capture of owned `kwin:Virtual-N` outputs on vibeshine_drm.
 //!
 //! Frames are the driver's completed primary-plane scanouts, exported as
 //! DMA-BUFs by the separately installed `amaterasu-vkms-frame-helper`, which
-//! alone holds CAP_SYS_ADMIN. This module never holds that capability.
+//! alone holds CAP_SYS_ADMIN. Optional private GPU copies support immutable
+//! frame leases. This module never holds that capability.
 //! Native modules are trusted code; runtime API grants are not a native-code
 //! sandbox. The provider exists only on Linux.
 #![cfg(target_os = "linux")]
@@ -13,10 +14,12 @@ mod controller;
 mod discovery;
 mod frames;
 mod geometry;
+mod leases;
 mod model;
 mod native;
 mod output_name;
 mod presenter;
+mod snapshot;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use backend::NativeBackend;

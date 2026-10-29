@@ -60,7 +60,8 @@ env CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 nice -n 10 \
     -p amaterasu-catalog -p amaterasu-application -p amaterasu-steam -p amaterasu-lutris \
     -p amaterasu-authentication -p amaterasu-management -p amaterasu-pairing \
     -p amaterasu-nvhttp -p amaterasu-display -p amaterasu-launch -p amaterasu-input \
-    -p amaterasu-virtual-display -p amaterasu-capture-kms -p amaterasu-audio \
+    -p amaterasu-virtual-display -p amaterasu-capture-kms -p amaterasu-capture-pipewire \
+    -p amaterasu-capture-vkms -p amaterasu-audio \
     -p amaterasu-audio-encode -p amaterasu-encode -p amaterasu-video \
     -p amaterasu-media-transport -p amaterasu-control-transport \
     -p amaterasu-frame-limiter -p amaterasu-stream-session -p amaterasu-rtsp
@@ -107,11 +108,47 @@ imported again with the console `import_identity` call, or created by `initializ
 | `--enable-capture` | Enables the video module and KMS capture (`capture_providers=["kms"]`). |
 | `--enable-audio` | Enables host audio capture. |
 | `--enable-virtual-display` | Enables the owned virtual display provider. |
+| `--enable-virtual-screen-capture` | Selects the VKMS capture plugin for owned virtual screens. Requires `--enable-capture`, `--enable-virtual-display`, the default capture output, and one helper mode below. |
+| `--capture-authority-helper ABSOLUTE_SOURCE` | Packages helper bytes and requests broker-mediated authority for the capture plugin. Requires `--enable-virtual-screen-capture`; enables immutable GPU snapshots in the generated provider settings. This declares a request, not an approval or installation. |
+| `--capture-authority-card CARD` | Exact DRM card scope for the packaged request, from 0 through 63; default 0. Requires `--capture-authority-helper`, including when CARD is explicitly 0. |
+| `--frame-helper ABSOLUTE_PATH` | Legacy direct-helper mode, mutually exclusive with `--capture-authority-helper`. The root-owned capability-bearing executable must already be installed and authorized separately; it is independent of package approval. |
 | `--enable-input` | Sets `amaterasu.input` `allow_injection=true` and stream-session `enable_input=true`. A relative pointer can leave an owned screen and move the live cursor; keep this off on a shared desktop. |
 | `--enable-display-mutation` | Sets `amaterasu.display` `allow_mutation=true`. |
 
 Each option may appear once. Unknown options, a missing value, or an out-of-range
 value stops `init-linux-session` before it creates anything.
+
+### Package-approved virtual-screen capture
+
+For the package authority mode, also build `amaterasu-capture-vkms` with
+`linux-kwin-geometry,linux-gpu-snapshot`, plus `amaterasu-vkms-frame-helper` and
+`amaterasu-capture-authority`. The snapshot feature needs the EGL/GBM build
+prerequisites and a usable GPU render node at runtime. The normal profile build
+must include every component in its composition; the helper and broker are
+separate binaries.
+
+`init-linux-session` records the local helper source in
+`capture-authority-package.json`. `pack-linux-session` copies those bytes into
+the signed package and records the exact helper digest, component and card
+scope. The new mode sets `authority_channel:true` and `gpu_snapshot:true`; a
+missing approved channel or snapshot implementation is an explicit availability
+failure and does not fall back to the legacy helper.
+
+Run `capture-authority-review` to inspect the verified publisher, package,
+component, helper, worker and scope. A later explicit administrator invocation of
+`capture-authority-approve` checks the confirmed approval ID, installs a protected
+snapshot and records the decision. It seals the copied bootstrap as a signed
+production policy without modifying the local publisher root. The protected
+broker then starts a new unprivileged worker with a private inherited authority
+channel. It requires Yama `ptrace_scope` 1, 2 or 3; at scope 1, launch it through
+the root system service manager rather than beneath a user shell. For KWin
+geometry, explicitly configure the approved user's `WAYLAND_DISPLAY` socket
+basename in that root service; the broker validates its owner and forwards it
+without inheriting arbitrary environment values. The workflow does not change
+kernel settings. See the [complete approval and revocation commands](capture-plugin-privileged-authority.md#prepare-review-and-deploy-for-a-later-test).
+No profile-generation command installs a privileged helper, starts a service or
+proves a real frame export.
+
 
 ## LAN option
 

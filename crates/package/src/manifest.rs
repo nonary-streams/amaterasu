@@ -31,6 +31,9 @@ pub struct ReleaseManifest {
     pub expires_unix: u64,
     pub target: String,
     pub components: Vec<ComponentManifest>,
+    /// Requests only; machine-protected approval is required separately.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub privileged_requests: Vec<crate::PrivilegedRequest>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,5 +88,8 @@ pub struct VerifiedPackage {
     pub manifest: ReleaseManifest,
     pub digest: String,
     pub signed: bool,
+    /// SHA-256 of the actual verified Ed25519 key bytes, never a display key ID.
+    pub signer_fingerprint: Option<String>,
+    pub privileged_requests: Vec<crate::VerifiedPrivilegedRequest>,
     pub runtime_config: RuntimeConfig,
 }

@@ -1230,18 +1230,12 @@ impl ProductSettings {
         })
     }
 
-    pub fn capture_provider(&self) -> Option<&'static str> {
+    pub fn capture_provider(&self) -> Option<String> {
         self.bootstrap_settings.streaming.as_ref().map(|streaming| {
             let (provider, _) = self
                 .configured_capture
-                .resolve(streaming.capture.capture_provider);
-            match provider {
-                crate::launch::CaptureProvider::Dxgi => "dxgi",
-                crate::launch::CaptureProvider::Wgc => "wgc",
-                crate::launch::CaptureProvider::PipeWire => "pipewire",
-                crate::launch::CaptureProvider::X11 => "x11",
-                crate::launch::CaptureProvider::Kms => "kms",
-            }
+                .resolve(streaming.capture.capture_provider.clone());
+            provider.as_str().to_owned()
         })
     }
 
@@ -5723,14 +5717,14 @@ mod tests {
             ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
         first_start.apply_document(parse_document(&selected_document).unwrap());
         assert_eq!(first_start.configured_capture(), CaptureMode::Wgcc);
-        assert_eq!(first_start.capture_provider(), Some("wgc"));
+        assert_eq!(first_start.capture_provider().as_deref(), Some("wgc"));
         assert_eq!(first_start.settings_payload()["configured_capture"], "wgcc");
 
         let mut restarted =
             ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
         restarted.apply_document(parse_document(&selected_document).unwrap());
         assert_eq!(restarted.configured_capture(), CaptureMode::Wgcc);
-        assert_eq!(restarted.capture_provider(), Some("wgc"));
+        assert_eq!(restarted.capture_provider().as_deref(), Some("wgc"));
     }
 
     #[test]
@@ -5753,7 +5747,11 @@ mod tests {
             let mut settings =
                 ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
             settings.apply_document(parse_document(&document).unwrap());
-            assert_eq!(settings.capture_provider(), Some(provider), "{mode:?}");
+            assert_eq!(
+                settings.capture_provider().as_deref(),
+                Some(provider),
+                "{mode:?}"
+            );
         }
     }
 
@@ -5768,7 +5766,7 @@ mod tests {
             .capture_provider = crate::launch::CaptureProvider::PipeWire;
         let settings = ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
 
-        assert_eq!(settings.capture_provider(), Some("pipewire"));
+        assert_eq!(settings.capture_provider().as_deref(), Some("pipewire"));
     }
 
     #[test]

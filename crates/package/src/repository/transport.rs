@@ -157,26 +157,103 @@ fn payload_files(kind: CandidateKind, raw: &[u8]) -> PackageResult<Vec<(String, 
         CandidateKind::NativeSet => {
             let manifest: ReleaseManifest =
                 serde_json::from_slice(raw).map_err(|error| error.to_string())?;
-            if manifest.components.len() > 64 {
+            if manifest.components.len() > 64
+                || manifest.privileged_requests.len() > crate::MAX_PRIVILEGED_REQUESTS
+            {
                 return Err("too many native artifacts".into());
             }
-            let mut total = 0u64;
-            manifest
+            let artifacts = manifest
                 .components
                 .into_iter()
-                .map(|component| {
-                    if !valid_segment(&component.file)
-                        || matches!(component.file.as_str(), "manifest.json" | "manifest.sig")
+                .map(|component| Ok((component.file, component.size, MAX_NATIVE_ARTIFACT_BYTES)));
+            let helpers = manifest.privileged_requests.into_iter().map(|request| {
+                crate::privileged::validate_helper(&request.helper)?;
+                Ok((
+                    request.helper.file,
+                    request.helper.size,
+                    crate::MAX_PRIVILEGED_HELPER_BYTES,
+                ))
+            });
+            let mut total = 0u64;
+            let mut names = std::collections::BTreeSet::new();
+            artifacts
+                .chain(helpers)
+                .map(|artifact: PackageResult<(String, u64, u64)>| {
+                    let (name, size, maximum) = artifact?;
+                    if !valid_segment(&name)
+                        || matches!(name.as_str(), "manifest.json" | "manifest.sig")
+                        || !names.insert(name.clone())
                     {
-                        return Err("invalid native artifact filename".into());
+                        return Err("invalid or duplicate native artifact filename".into());
                     }
-                    total = total.saturating_add(component.size);
-                    if component.size > MAX_NATIVE_ARTIFACT_BYTES || total > MAX_NATIVE_SET_BYTES {
+                    total = total.saturating_add(size);
+                    if size > maximum || total > MAX_NATIVE_SET_BYTES {
                         return Err("native download exceeds byte limit".into());
                     }
-                    Ok((component.file, component.size))
+                    Ok((name, size))
                 })
                 .collect()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn manifest() -> serde_json::Value {
+        json!({
+            "schema": 1, "host_context_schema": 1, "project": "amaterasu",
+            "sequence": 1, "expires_unix": 9999999999u64, "target": "linux-x86_64",
+            "components": [],
+            "privileged_requests": [{
+                "schema": 1, "component": "example.capture", "operation": "vkms_frame_export_v1",
+                "target": "linux-x86_64", "resource": {"drm_card": 0},
+                "helper": {"file": "capture-helper", "size": 42, "sha256": "a".repeat(64)}
+            }]
+        })
+    }
+
+    #[test]
+    fn native_download_includes_signed_privileged_helper_payload() {
+        let files = payload_files(
+            CandidateKind::NativeSet,
+            &serde_json::to_vec(&manifest()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(files, vec![("capture-helper".into(), 42)]);
+    }
+
+    #[test]
+    fn native_helper_downloads_preserve_bounds_and_unique_safe_names() {
+        for (field, value) in [
+            ("file", json!("../helper")),
+            ("file", json!("manifest.json")),
+            ("size", json!(crate::MAX_PRIVILEGED_HELPER_BYTES + 1)),
+        ] {
+            let mut input = manifest();
+            input["privileged_requests"][0]["helper"][field] = value;
+            assert!(
+                payload_files(
+                    CandidateKind::NativeSet,
+                    &serde_json::to_vec(&input).unwrap()
+                )
+                .is_err()
+            );
+        }
+        let mut input = manifest();
+        let duplicate = input["privileged_requests"][0].clone();
+        input["privileged_requests"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(
+            payload_files(
+                CandidateKind::NativeSet,
+                &serde_json::to_vec(&input).unwrap()
+            )
+            .is_err()
+        );
     }
 }

@@ -11,6 +11,8 @@ crate-type = ["cdylib", "rlib"]
 # Desktop geometry from the compositor's wl_output/xdg-output layout. Needs
 # wayland-client development files and wayland-scanner at build time.
 linux-kwin-geometry = []
+# Copies mutable compositor frames into immutable render-node allocations.
+linux-gpu-snapshot = []
 
 [dependencies]
 amaterasu-module-sdk.workspace = true

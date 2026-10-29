@@ -20,10 +20,13 @@ Moonlight's bounded session label; it is passed separately from capture `output`
 Fixed mode requires both ports.
 Discovery mode requires them to be omitted or zero so caller-supplied ports cannot
 silently override discovery.
-Capture contains `capture_provider` (`dxgi` or `wgc`), optional `constant_rate`
+Capture contains `capture_provider` (`dxgi`, `wgc`, `pipewire`, `x11`, `kms`,
+or a configured external alias), optional `constant_rate`
 (default false), `output`, `encoder`, `audio_endpoint` and optional
 `host_audio_enabled` (default false). That flag snapshots Moonlight's
 `localAudioPlayMode` choice and is forwarded through stream-session to AudioCapture.
+External aliases are 1–64 lowercase ASCII letters, digits, underscores or hyphens;
+Video resolves them against its configured providers and rejects unknown aliases.
 Constant-rate capture is accepted only with WGC and is forwarded to stream-session
 and Video as part of the per-open selection. The profile supplies dimensions, frame rate, bitrate in kbps,
 reference-frame limit, video packet/FEC settings, Opus packet duration/bitrate and

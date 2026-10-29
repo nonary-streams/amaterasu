@@ -1,3 +1,6 @@
+#[cfg(target_os = "linux")]
+mod capture_authority;
+mod capture_authority_package;
 mod development;
 mod linux_owned_display;
 #[cfg(target_os = "linux")]
@@ -25,6 +28,41 @@ fn run() -> PackageResult<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     match arguments.as_slice() {
         [command, root] if command == "init" => development::initialize(Path::new(root)),
+        #[cfg(target_os = "linux")]
+        [command, bootstrap, package, worker, uid, gid]
+            if command == "capture-authority-review" =>
+        {
+            capture_authority::review(
+                Path::new(bootstrap),
+                Path::new(package),
+                Path::new(worker),
+                uid,
+                gid,
+            )
+        }
+        #[cfg(target_os = "linux")]
+        [
+            command,
+            bootstrap,
+            package,
+            worker,
+            uid,
+            gid,
+            installation,
+            confirmed,
+        ] if command == "capture-authority-approve" => capture_authority::approve(
+            Path::new(bootstrap),
+            Path::new(package),
+            Path::new(worker),
+            uid,
+            gid,
+            Path::new(installation),
+            confirmed,
+        ),
+        #[cfg(target_os = "linux")]
+        [command, installation, id] if command == "capture-authority-revoke" => {
+            capture_authority::revoke(Path::new(installation), id)
+        }
         [command, root, options @ ..] if command == "init-linux-session" => {
             let options =
                 profiles::linux_session::options::LinuxSessionOptions::from_arguments(options)
@@ -276,5 +314,5 @@ fn verify(root: &str, source: &str) -> PackageResult<()> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release init-linux-session ROOT [--lan ADDRESS:PORT [--allow-remote]] [--catalog-owner management|console] [--management-port PORT] [--capture-output ID] [--audio-endpoint NAME] [--enable-capture] [--enable-audio] [--enable-virtual-display] [--enable-input] [--enable-display-mutation] [--frame-helper ABSOLUTE_PATH]\n  amaterasu-release prepare-linux-user-service ROOT HOST_EXECUTABLE OUTPUT_DIRECTORY (Linux only; emits a reviewable bundle)\n  amaterasu-release preflight-linux-user-service ROOT HOST_EXECUTABLE BUNDLE_DIRECTORY (Linux only; read-only deployment checks)\n  amaterasu-release pack-linux-session ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release init-desktop-stream-smoke ROOT [--allow-remote]\n  amaterasu-release preflight-desktop-stream-smoke ROOT [VHF_INSTALL_ROOT]\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-extension-example ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-desktop-stream-smoke ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-software-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-linux-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release repository-approve ROOT ID HTTPS_URL PUBLIC_KEY_HEX CONFIRMED_SHA256\n  amaterasu-release repository-revoke ROOT ID\n  amaterasu-release repository-refresh ROOT ID\n  amaterasu-release repository-list ROOT\n  amaterasu-release repository-download ROOT ID SLOT IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-install-ui ROOT ID IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-stage-native ROOT ID SLOT IMPLEMENTATION VERSION SOURCE\n  amaterasu-release repository-activate-native ROOT DIGEST\n  amaterasu-release repository-restore-ui ROOT [DIGEST]\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT\n  amaterasu-release seal-vhf-package PACKAGE CONFIRMED_FINGERPRINT SIGNTOOL\n  amaterasu-release verify-vhf-package PACKAGE CONFIRMED_FINGERPRINT SIGNTOOL\n  amaterasu-release install-vhf-package PACKAGE INSTALL_ROOT RUNTIME_ROOT CONFIRMED_FINGERPRINT SIGNTOOL DEVCON\n  amaterasu-release rollback-vhf-package INSTALL_ROOT RUNTIME_ROOT DEVCON\n  amaterasu-release grant-vhf-input INSTALL_ROOT RUNTIME_ROOT ACTIVE_SET_DIGEST KEYBOARD_0_OR_1 MOUSE_0_OR_1\n  amaterasu-release revoke-vhf-input INSTALL_ROOT RUNTIME_ROOT\n  Desktop smoke requires replacing SELECT_OUTPUT_ID with a current DXGI output ID in bootstrap.json.\n  --allow-remote selects wildcard stream listeners only; it does not alter firewall or machine network settings."
+    "usage:\n  amaterasu-release init ROOT\n  amaterasu-release init-linux-session ROOT [--lan ADDRESS:PORT [--allow-remote]] [--catalog-owner management|console] [--management-port PORT] [--capture-output ID] [--audio-endpoint NAME] [--enable-capture] [--enable-audio] [--enable-virtual-display] [--enable-virtual-screen-capture] [--enable-input] [--enable-display-mutation] [--frame-helper ABSOLUTE_PATH | --capture-authority-helper ABSOLUTE_PATH [--capture-authority-card CARD]]\n  amaterasu-release capture-authority-review BOOTSTRAP PACKAGE HOST UID GID (read-only)\n  amaterasu-release capture-authority-approve BOOTSTRAP PACKAGE HOST UID GID INSTALL_ROOT CONFIRMED_ID (explicit administrator action)\n  amaterasu-release capture-authority-revoke INSTALL_ROOT APPROVAL_ID (explicit administrator action)\n  amaterasu-release prepare-linux-user-service ROOT HOST_EXECUTABLE OUTPUT_DIRECTORY (Linux only; emits a reviewable bundle)\n  amaterasu-release preflight-linux-user-service ROOT HOST_EXECUTABLE BUNDLE_DIRECTORY (Linux only; read-only deployment checks)\n  amaterasu-release pack-linux-session ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release init-desktop-stream-smoke ROOT [--allow-remote]\n  amaterasu-release preflight-desktop-stream-smoke ROOT [VHF_INSTALL_ROOT]\n  amaterasu-release pack ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-platform ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-extension-example ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-media-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-stream-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-desktop-stream-smoke ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-software-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release pack-linux-probe ROOT ARTIFACTS OUTPUT SEQUENCE\n  amaterasu-release verify ROOT PACKAGE\n  amaterasu-release stage ROOT PACKAGE [--historical]\n  amaterasu-release pack-web ROOT DIST OUTPUT SEQUENCE\n  amaterasu-release stage-web ROOT PACKAGE\n  amaterasu-release repository-approve ROOT ID HTTPS_URL PUBLIC_KEY_HEX CONFIRMED_SHA256\n  amaterasu-release repository-revoke ROOT ID\n  amaterasu-release repository-refresh ROOT ID\n  amaterasu-release repository-list ROOT\n  amaterasu-release repository-download ROOT ID SLOT IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-install-ui ROOT ID IMPLEMENTATION VERSION OUTPUT\n  amaterasu-release repository-stage-native ROOT ID SLOT IMPLEMENTATION VERSION SOURCE\n  amaterasu-release repository-activate-native ROOT DIGEST\n  amaterasu-release repository-restore-ui ROOT [DIGEST]\n  amaterasu-release prepare-installer ARTIFACTS WEB_DIST OUTPUT\n  amaterasu-release seal-vhf-package PACKAGE CONFIRMED_FINGERPRINT SIGNTOOL\n  amaterasu-release verify-vhf-package PACKAGE CONFIRMED_FINGERPRINT SIGNTOOL\n  amaterasu-release install-vhf-package PACKAGE INSTALL_ROOT RUNTIME_ROOT CONFIRMED_FINGERPRINT SIGNTOOL DEVCON\n  amaterasu-release rollback-vhf-package INSTALL_ROOT RUNTIME_ROOT DEVCON\n  amaterasu-release grant-vhf-input INSTALL_ROOT RUNTIME_ROOT ACTIVE_SET_DIGEST KEYBOARD_0_OR_1 MOUSE_0_OR_1\n  amaterasu-release revoke-vhf-input INSTALL_ROOT RUNTIME_ROOT\n  Desktop smoke requires replacing SELECT_OUTPUT_ID with a current DXGI output ID in bootstrap.json.\n  --allow-remote selects wildcard stream listeners only; it does not alter firewall or machine network settings."
 }

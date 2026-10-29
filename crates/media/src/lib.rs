@@ -1,4 +1,4 @@
-//! Draft media interfaces. Buffers are borrowed for one synchronous callback.
+//! Draft media interfaces with synchronous borrows and optional explicit GPU leases.
 //! No Rust allocator, collection, or reference crosses a module boundary.
 use amaterasu_abi::{NativeInterface, STATUS_INVALID_ARGUMENT, Status};
 use std::{ffi::c_void, mem::size_of};
@@ -15,6 +15,8 @@ mod color;
 pub use color::*;
 mod dmabuf;
 pub use dmabuf::*;
+mod dmabuf_lease;
+pub use dmabuf_lease::*;
 mod codec;
 pub use codec::*;
 mod geometry;
@@ -34,8 +36,12 @@ pub const CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR: u32 = 3;
 pub const CAPTURE_DMABUF_INTERFACE_MINOR: u32 = 4;
 /// Capture API v1.5 adds a cheap query of the newest completed presentation.
 pub const CAPTURE_PRESENTATION_INTERFACE_MINOR: u32 = 5;
+/// Capture API v1.6 adds retained immutable DMA-BUF frame leases.
+pub const CAPTURE_LEASE_INTERFACE_MINOR: u32 = 6;
 /// Encoder API v1.1 adds DMA-BUF frame submission.
 pub const ENCODER_DMABUF_INTERFACE_MINOR: u32 = 1;
+/// Encoder API v1.2 accepts explicit immutable DMA-BUF leases.
+pub const ENCODER_LEASE_INTERFACE_MINOR: u32 = 2;
 pub const CAPTURE_FRAME_CACHED_REUSE: u32 = 0;
 pub const CAPTURE_FRAME_FRESH: u32 = 1;
 pub const PIXEL_BGRA8: u32 = 1;
@@ -55,6 +61,25 @@ pub const MEDIA_UNSUPPORTED: Status = 13;
 pub const MEDIA_BACKEND_ERROR: Status = 14;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_PACKET_BYTES: usize = 16 * 1024 * 1024;
+
+/// Optional synchronous CPU processing interface, version 1.0.
+pub const CPU_PROCESSOR_INTERFACE_MAJOR: u32 = 1;
+pub const CPU_PROCESSOR_INTERFACE_MINOR: u32 = 0;
+
+/// Transforms one borrowed CPU frame. The input and sink are valid only until
+/// `process` returns; output is valid only until its sink callback returns.
+/// Exactly one callback is required on success. A processor failure before
+/// delivery invokes no callback; a rejected callback status is returned unchanged.
+/// BUSY consumes nothing and may be retried. Sequence and timestamp are
+/// preserved; dimensions, stride, format and pixels may change. Providers must
+/// serialize callbacks, never retain pointers, and never unwind across the ABI.
+#[repr(C)]
+pub struct CpuProcessorApi {
+    pub base: NativeInterface,
+    pub process: unsafe extern "C" fn(*mut c_void, u64, *const CpuFrame, FrameSink) -> Status,
+}
+
+pub const CPU_PROCESSOR_API_V1_0_SIZE: u32 = size_of::<CpuProcessorApi>() as u32;
 
 /// BGRA uses one plane; NV12 uses contiguous Y then interleaved UV planes with
 /// the same stride. Timestamps are microseconds from the producer's stream epoch.
@@ -269,6 +294,25 @@ pub struct CaptureApiV1_5 {
         unsafe extern "C" fn(*mut c_void, u64, *mut PresentationStatus) -> Status,
 }
 
+/// Additive v1.6 table: the entire v1.5 prefix is preserved. A provider only
+/// advertises this version when it can retain immutable pixels until all lease
+/// references and completion fences are released. Unsupported streams may
+/// return MEDIA_UNSUPPORTED and continue using synchronous borrowed frames.
+#[repr(C)]
+pub struct CaptureApiV1_6 {
+    pub base: NativeInterface,
+    pub read_frame: unsafe extern "C" fn(*mut c_void, u64, FrameSink) -> Status,
+    pub geometry: unsafe extern "C" fn(*mut c_void, u64, *mut CaptureGeometry) -> Status,
+    pub read_frame_with_freshness:
+        unsafe extern "C" fn(*mut c_void, u64, FreshFrameSinkV1_2) -> Status,
+    pub read_frame_with_capture_timestamp:
+        unsafe extern "C" fn(*mut c_void, u64, FreshFrameSinkV1_3) -> Status,
+    pub read_dmabuf_frame: unsafe extern "C" fn(*mut c_void, u64, DmaBufFrameSink) -> Status,
+    pub latest_presentation:
+        unsafe extern "C" fn(*mut c_void, u64, *mut PresentationStatus) -> Status,
+    pub read_dmabuf_frame_leased: unsafe extern "C" fn(*mut c_void, u64, DmaBufLeaseSink) -> Status,
+}
+
 /// Newest completed presentation of one capture stream. `sequence` is the
 /// value a later `DmaBufFrame` for that presentation carries; zero means no
 /// presentation has completed yet. `timestamp_us` uses the stream epoch.
@@ -293,6 +337,7 @@ pub const CAPTURE_API_V1_2_SIZE: u32 = size_of::<CaptureApiV1_2>() as u32;
 pub const CAPTURE_API_V1_3_SIZE: u32 = size_of::<CaptureApiV1_3>() as u32;
 pub const CAPTURE_API_V1_4_SIZE: u32 = size_of::<CaptureApiV1_4>() as u32;
 pub const CAPTURE_API_V1_5_SIZE: u32 = size_of::<CaptureApiV1_5>() as u32;
+pub const CAPTURE_API_V1_6_SIZE: u32 = size_of::<CaptureApiV1_6>() as u32;
 
 /// Receives one borrowed frame and its source freshness in a single callback.
 #[repr(C)]
@@ -378,8 +423,35 @@ pub struct EncoderApiV1_1 {
     pub submit_dmabuf: unsafe extern "C" fn(*mut c_void, u64, *const DmaBufFrame, u32) -> Status,
 }
 
+/// Additive v1.2 encoder table accepting explicit immutable frame leases.
+/// `submit_dmabuf_leased` borrows the lease during the call. An asynchronous
+/// encoder must retain it before returning STATUS_OK and release it only after
+/// the safe GPU read/copy completion (or with a valid completion fence). BUSY
+/// and every other non-OK status retain no references: all GPU access started
+/// by a rejected submission is retired before it returns. The encoder reports
+/// all accepted work retired before drain completes; cancellation must likewise
+/// retire its references/fences. Provider code and binding also outlive pending
+/// completion fences.
+#[repr(C)]
+pub struct EncoderApiV1_2 {
+    pub base: NativeInterface,
+    pub submit: unsafe extern "C" fn(*mut c_void, u64, *const CpuFrame, u32) -> Status,
+    pub receive: unsafe extern "C" fn(*mut c_void, u64, PacketSink) -> Status,
+    pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
+    pub submit_dmabuf: unsafe extern "C" fn(*mut c_void, u64, *const DmaBufFrame, u32) -> Status,
+    pub submit_dmabuf_leased:
+        unsafe extern "C" fn(*mut c_void, u64, *const DmaBufFrameLease, u32) -> Status,
+    /// Permanently stops this stream and synchronously retires every accepted
+    /// lease reference and completion fence before returning. May block while
+    /// vendor work completes. Capture and processor bindings remain live during
+    /// this call. Failed GPU work must safely quarantine storage; returning with
+    /// pending GPU access or a retained input reference is forbidden.
+    pub cancel_dmabuf_leases: unsafe extern "C" fn(*mut c_void, u64),
+}
+
 pub const ENCODER_API_V1_0_SIZE: u32 = size_of::<EncoderApi>() as u32;
 pub const ENCODER_API_V1_1_SIZE: u32 = size_of::<EncoderApiV1_1>() as u32;
+pub const ENCODER_API_V1_2_SIZE: u32 = size_of::<EncoderApiV1_2>() as u32;
 
 /// Encoded output from an owned capture-to-encode stream. Configuration and
 /// lifecycle remain on the control service; consumers only receive packets here.

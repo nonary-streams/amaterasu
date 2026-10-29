@@ -102,6 +102,8 @@ impl LoadedComponents {
         );
         inject_package_root(&mut runtime_config, root)?;
         inject_running_package_digest(&mut runtime_config, &package.digest)?;
+        #[cfg(target_os = "linux")]
+        crate::capture_authority::inject(package, &mut runtime_config.settings)?;
         if package
             .manifest
             .components

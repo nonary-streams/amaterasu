@@ -34,19 +34,29 @@ pub fn verify_package_with_progress(
     progress: &mut dyn FnMut(usize, usize) -> PackageResult<()>,
 ) -> PackageResult<VerifiedPackage> {
     let raw_manifest = read_bounded(&directory.join("manifest.json"), MAX_MANIFEST_BYTES)?;
-    let signed = verify_signature(directory, bootstrap, &raw_manifest)?;
+    let signer_fingerprint = verify_signature(directory, bootstrap, &raw_manifest)?;
+    let signed = signer_fingerprint.is_some();
     let manifest: ReleaseManifest =
         serde_json::from_slice(&raw_manifest).map_err(|error| error.to_string())?;
 
     validate_release(&manifest, policy)?;
     progress(0, manifest.components.len())?;
     validate_component_set(directory, &manifest.components, signed, progress)?;
+    let digest = sha256(&raw_manifest);
+    let privileged_requests = crate::privileged::verify_privileged_requests(
+        directory,
+        &manifest,
+        &digest,
+        signer_fingerprint.as_deref(),
+    )?;
     let runtime_config = resolve_runtime_grants(bootstrap, &manifest.components);
 
     Ok(VerifiedPackage {
         manifest,
-        digest: sha256(&raw_manifest),
+        digest,
         signed,
+        signer_fingerprint,
+        privileged_requests,
         runtime_config,
     })
 }
@@ -55,21 +65,25 @@ fn verify_signature(
     directory: &Path,
     bootstrap: &BootstrapConfig,
     raw_manifest: &[u8],
-) -> PackageResult<bool> {
+) -> PackageResult<Option<String>> {
     let signature_path = directory.join("manifest.sig");
     if !signature_path
         .try_exists()
         .map_err(|error| error.to_string())?
     {
         if bootstrap.allow_unsigned && bootstrap.development {
-            return Ok(false);
+            return Ok(None);
         }
         return Err("unsigned component set rejected".into());
     }
 
     let signature: ReleaseSignature = read_json(&signature_path)?;
     verify_detached_signature(&bootstrap.trusted_keys, raw_manifest, &signature)?;
-    Ok(true)
+    let key = bootstrap
+        .trusted_keys
+        .get(&signature.key_id)
+        .ok_or("unknown release signer")?;
+    Ok(Some(sha256(&decode_hex::<32>(key)?)))
 }
 
 pub fn verify_detached_signature(

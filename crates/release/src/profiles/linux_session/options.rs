@@ -37,6 +37,12 @@ pub enum OptionError {
     InvalidManagementPort(String),
     InvalidCatalogOwner(String),
     InvalidFrameHelper(String),
+    InvalidCaptureAuthorityHelper(String),
+    InvalidCaptureAuthorityCard(String),
+    CaptureAuthorityRequirements,
+    CaptureAuthorityCardWithoutHelper,
+    ConflictingCaptureHelpers,
+    VirtualScreenCaptureRequirements,
     InvalidLabel(&'static str),
 }
 
@@ -71,9 +77,29 @@ impl fmt::Display for OptionError {
                 formatter,
                 "--management-port expects a loopback TCP port from 1024 through 65535, got {value:?}"
             ),
+            Self::VirtualScreenCaptureRequirements => formatter.write_str(
+                "--enable-virtual-screen-capture requires --enable-capture, --enable-virtual-display, a --capture-authority-helper or already configured --frame-helper, and the default capture output"
+            ),
             Self::InvalidFrameHelper(value) => write!(
                 formatter,
                 "--frame-helper expects an absolute path to amaterasu-vkms-frame-helper, got {value:?}"
+            ),
+            Self::InvalidCaptureAuthorityHelper(value) => write!(
+                formatter,
+                "--capture-authority-helper expects an absolute normal path to the packaged helper artifact, got {value:?}"
+            ),
+            Self::InvalidCaptureAuthorityCard(value) => write!(
+                formatter,
+                "--capture-authority-card expects a DRM card number from 0 through 63, got {value:?}"
+            ),
+            Self::CaptureAuthorityRequirements => formatter.write_str(
+                "--capture-authority-helper requires --enable-virtual-screen-capture"
+            ),
+            Self::CaptureAuthorityCardWithoutHelper => formatter.write_str(
+                "--capture-authority-card requires --capture-authority-helper"
+            ),
+            Self::ConflictingCaptureHelpers => formatter.write_str(
+                "--capture-authority-helper and --frame-helper are mutually exclusive"
             ),
             Self::InvalidCatalogOwner(value) => write!(
                 formatter,
@@ -278,6 +304,9 @@ pub struct LinuxSessionOptions {
     pub enable_audio: bool,
     /// Enables the owned virtual display provider.
     pub enable_virtual_display: bool,
+    /// Pins owned virtual display capture to the registered VKMS DMA-BUF provider.
+    /// Package-authorized capture needs approval; a legacy helper must already be installed.
+    pub enable_virtual_screen_capture: bool,
     /// Allows stream sessions to create virtual input devices.
     pub enable_input: bool,
     /// Allows the display module to change the physical display layout.
@@ -285,6 +314,11 @@ pub struct LinuxSessionOptions {
     /// Absolute path of the root-owned `amaterasu-vkms-frame-helper` that the
     /// operator granted `cap_sys_admin+p`. Enables direct scanout capture.
     pub frame_helper: Option<String>,
+    /// Source artifact for the signed package's narrowly scoped capture authority.
+    /// Packaging and approval are separate from installing any OS authority.
+    pub capture_authority_helper: Option<String>,
+    /// Exact DRM card included in the package's requested authority.
+    pub capture_authority_card: u32,
 }
 
 impl Default for LinuxSessionOptions {
@@ -298,9 +332,12 @@ impl Default for LinuxSessionOptions {
             enable_capture: false,
             enable_audio: false,
             enable_virtual_display: false,
+            enable_virtual_screen_capture: false,
             enable_input: false,
             enable_display_mutation: false,
             frame_helper: None,
+            capture_authority_helper: None,
+            capture_authority_card: 0,
         }
     }
 }
@@ -366,9 +403,24 @@ impl LinuxSessionOptions {
                         "--frame-helper",
                     )?)?);
                 }
+                "--capture-authority-helper" => {
+                    seen.once("--capture-authority-helper")?;
+                    let helper = required_value(&mut arguments, "--capture-authority-helper")?;
+                    options.capture_authority_helper =
+                        Some(parse_capture_authority_helper(&helper)?);
+                }
+                "--capture-authority-card" => {
+                    seen.once("--capture-authority-card")?;
+                    let card = required_value(&mut arguments, "--capture-authority-card")?;
+                    options.capture_authority_card = parse_capture_authority_card(&card)?;
+                }
                 "--enable-virtual-display" => {
                     seen.once("--enable-virtual-display")?;
                     options.enable_virtual_display = true;
+                }
+                "--enable-virtual-screen-capture" => {
+                    seen.once("--enable-virtual-screen-capture")?;
+                    options.enable_virtual_screen_capture = true;
                 }
                 "--enable-input" => {
                     seen.once("--enable-input")?;
@@ -386,7 +438,46 @@ impl LinuxSessionOptions {
             None if allow_remote => return Err(OptionError::AllowRemoteWithoutWildcard),
             None => {}
         }
+        if seen.0.contains(&"--capture-authority-card")
+            && options.capture_authority_helper.is_none()
+        {
+            return Err(OptionError::CaptureAuthorityCardWithoutHelper);
+        }
+        options.validate()?;
         Ok(options)
+    }
+
+    /// Reject inconsistent opt-in settings for both parsed and programmatic profiles.
+    pub fn validate(&self) -> Result<(), OptionError> {
+        if self.capture_authority_helper.is_some() && self.frame_helper.is_some() {
+            return Err(OptionError::ConflictingCaptureHelpers);
+        }
+        if self.capture_authority_helper.is_some() && !self.enable_virtual_screen_capture {
+            return Err(OptionError::CaptureAuthorityRequirements);
+        }
+        if self.capture_authority_helper.is_none() && self.capture_authority_card != 0 {
+            return Err(OptionError::CaptureAuthorityCardWithoutHelper);
+        }
+        if self.capture_authority_card > 63 {
+            return Err(OptionError::InvalidCaptureAuthorityCard(
+                self.capture_authority_card.to_string(),
+            ));
+        }
+        if self.enable_virtual_screen_capture
+            && (!self.enable_capture
+                || !self.enable_virtual_display
+                || (self.frame_helper.is_none() && self.capture_authority_helper.is_none())
+                || self.capture_output != DEFAULT_CAPTURE_OUTPUT)
+        {
+            return Err(OptionError::VirtualScreenCaptureRequirements);
+        }
+        if let Some(helper) = &self.frame_helper {
+            parse_frame_helper(helper)?;
+        }
+        if let Some(helper) = &self.capture_authority_helper {
+            parse_capture_authority_helper(helper)?;
+        }
+        Ok(())
     }
 }
 
@@ -411,6 +502,18 @@ fn required_value<'a>(
         .next()
         .cloned()
         .ok_or(OptionError::MissingValue(option))
+}
+
+fn parse_capture_authority_helper(value: &str) -> Result<String, OptionError> {
+    parse_frame_helper(value).map_err(|_| OptionError::InvalidCaptureAuthorityHelper(value.into()))
+}
+
+fn parse_capture_authority_card(value: &str) -> Result<u32, OptionError> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|card| *card <= 63)
+        .ok_or_else(|| OptionError::InvalidCaptureAuthorityCard(value.into()))
 }
 
 fn parse_frame_helper(value: &str) -> Result<String, OptionError> {

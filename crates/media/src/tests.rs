@@ -1,4 +1,16 @@
 use super::*;
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn cpu_processor_table_matches_c_layout() {
+    assert_eq!(std::mem::size_of::<CpuProcessorApi>(), 40);
+    assert_eq!(std::mem::offset_of!(CpuProcessorApi, process), 32);
+    assert_eq!(CPU_PROCESSOR_API_V1_0_SIZE, 40);
+    assert_eq!(
+        (CPU_PROCESSOR_INTERFACE_MAJOR, CPU_PROCESSOR_INTERFACE_MINOR),
+        (1, 0)
+    );
+}
 use amaterasu_abi::STATUS_OK;
 
 #[test]
@@ -470,4 +482,60 @@ fn dmabuf_and_gpu_table_layouts_are_stable() {
     assert_eq!(ENCODER_API_V1_0_SIZE, 56);
     assert_eq!(ENCODER_API_V1_1_SIZE, 64);
     assert_eq!(offset_of!(EncoderApiV1_1, submit_dmabuf), 56);
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn leased_media_tables_preserve_prefixes_and_match_c() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(size_of::<DmaBufFrameLease>(), 136);
+    assert_eq!(offset_of!(DmaBufFrameLease, context), 112);
+    assert_eq!(offset_of!(DmaBufFrameLease, retain), 120);
+    assert_eq!(offset_of!(DmaBufFrameLease, release), 128);
+    assert_eq!(size_of::<DmaBufLeaseSink>(), 16);
+    assert_eq!(GPU_PROCESSOR_API_V1_0_SIZE, 48);
+    assert_eq!(offset_of!(GpuProcessorApi, cancel_dmabuf_leases), 40);
+    assert_eq!(CAPTURE_API_V1_6_SIZE, 88);
+    assert_eq!(
+        offset_of!(CaptureApiV1_6, read_dmabuf_frame_leased),
+        size_of::<CaptureApiV1_5>()
+    );
+    assert_eq!(
+        offset_of!(CaptureApiV1_6, latest_presentation),
+        offset_of!(CaptureApiV1_5, latest_presentation)
+    );
+    assert_eq!(ENCODER_API_V1_2_SIZE, 80);
+    assert_eq!(
+        offset_of!(EncoderApiV1_2, submit_dmabuf_leased),
+        size_of::<EncoderApiV1_1>()
+    );
+    assert_eq!(offset_of!(EncoderApiV1_2, cancel_dmabuf_leases), 72);
+    assert_eq!(
+        offset_of!(EncoderApiV1_2, submit_dmabuf),
+        offset_of!(EncoderApiV1_1, submit_dmabuf)
+    );
+}
+
+#[test]
+fn leased_frame_requires_an_owner_and_both_callbacks() {
+    unsafe extern "C" fn retain(_: *mut c_void) -> Status {
+        STATUS_OK
+    }
+    unsafe extern "C" fn release(_: *mut c_void, _: i32) {}
+    let mut context = 0u8;
+    let mut lease = DmaBufFrameLease {
+        frame: dmabuf_frame(),
+        context: std::ptr::from_mut(&mut context).cast(),
+        retain: Some(retain),
+        release: Some(release),
+    };
+    assert_eq!(lease.validate(), Ok(()));
+    lease.retain = None;
+    assert_eq!(lease.validate(), Err(STATUS_INVALID_ARGUMENT));
+    lease.retain = Some(retain);
+    lease.release = None;
+    assert_eq!(lease.validate(), Err(STATUS_INVALID_ARGUMENT));
+    lease.release = Some(release);
+    lease.context = std::ptr::null_mut();
+    assert_eq!(lease.validate(), Err(STATUS_INVALID_ARGUMENT));
 }

@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+mod capture_authority;
 #[cfg(windows)]
 mod input_companion;
 #[cfg(target_os = "linux")]
@@ -60,6 +62,11 @@ fn run() -> PackageResult<()> {
         }
         [command, root, digest] if command == "native-recover" => {
             native_recovery::restore(Path::new(root), Some(digest))?;
+        }
+        #[cfg(target_os = "linux")]
+        [command, root, digest, state_root, component] if command == "worker-authorized-serve" => {
+            capture_authority::adopt(component, digest)?;
+            worker::serve_interactive(Path::new(root), digest, Path::new(state_root), None)?;
         }
         [command, root, digest] if command == "worker-serve" => {
             worker::serve(Path::new(root), digest)?;

@@ -483,7 +483,8 @@ pub struct CaptureConfig {
 
 impl CaptureConfig {
     fn validate(&self) -> Result<(), &'static str> {
-        if self.encoder.validate().is_err()
+        if matches!(&self.capture_provider, CaptureProvider::External(alias) if !valid_capture_provider_alias(alias))
+            || self.encoder.validate().is_err()
             || !valid_label(&self.output, 512)
             || !valid_label(&self.audio_endpoint, 4096)
         {
@@ -533,16 +534,58 @@ impl CaptureMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CaptureProvider {
     Dxgi,
     Wgc,
     /// An explicitly selected current-user portal source.
-    #[serde(rename = "pipewire")]
     PipeWire,
     X11,
     Kms,
+    /// An alias selected in signed startup configuration. Video authorizes it.
+    External(String),
+}
+
+impl CaptureProvider {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Dxgi => "dxgi",
+            Self::Wgc => "wgc",
+            Self::PipeWire => "pipewire",
+            Self::X11 => "x11",
+            Self::Kms => "kms",
+            Self::External(alias) => alias,
+        }
+    }
+}
+
+fn valid_capture_provider_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 64
+        && alias
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte))
+}
+
+impl Serialize for CaptureProvider {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CaptureProvider {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "dxgi" => Ok(Self::Dxgi),
+            "wgc" => Ok(Self::Wgc),
+            "pipewire" => Ok(Self::PipeWire),
+            "x11" => Ok(Self::X11),
+            "kms" => Ok(Self::Kms),
+            alias if valid_capture_provider_alias(alias) => Ok(Self::External(value)),
+            _ => Err(serde::de::Error::custom("invalid capture provider alias")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -905,11 +948,11 @@ impl Controller {
             .unwrap_or(&config.capture.audio_endpoint)
             .to_owned();
         let bootstrap_audio_endpoint = config.capture.audio_endpoint.clone();
-        let bootstrap_capture_provider = config.capture.capture_provider;
+        let bootstrap_capture_provider = config.capture.capture_provider.clone();
         let global_capture_mode = self.configured_capture;
         let selected_capture_mode = peer.client_capture.unwrap_or(global_capture_mode);
         let (capture_provider, constant_rate) =
-            selected_capture_mode.resolve(bootstrap_capture_provider);
+            selected_capture_mode.resolve(bootstrap_capture_provider.clone());
         let capture_output = if capture_provider == CaptureProvider::PipeWire {
             if config.capture.output == OWNED_DISPLAY_OUTPUT {
                 OWNED_DISPLAY_OUTPUT.to_owned()

@@ -160,12 +160,6 @@ impl<B: Backend> Controller<B> {
         Ok(())
     }
 
-    fn helper_path(&self) -> CaptureResult<&str> {
-        self.settings.frame_helper.as_deref().ok_or_else(|| {
-            CaptureError::frame_helper_unavailable("the frame_helper setting is not configured")
-        })
-    }
-
     fn open(
         &mut self,
         caller: &str,
@@ -191,21 +185,30 @@ impl<B: Backend> Controller<B> {
         if self.streams.len() >= MAX_STREAMS || self.opened >= MAX_LIFETIME_STREAMS {
             return Err(CaptureError::code("resource_exhausted"));
         }
-        let helper = self.helper_path()?.to_owned();
+        let helper = self.settings.helper_endpoint()?;
         let binding = self.backend.resolve(name)?;
         let geometry = self.open_geometry(&binding)?;
         let id = new_id()?;
         if self.streams.contains_key(&id) || self.closed.contains_key(&id) {
             return Err(CaptureError::code("entropy_error"));
         }
-        let source = self.backend.connect(&helper, &binding)?;
+        let source = self.backend.connect(helper, &binding)?;
         let frames = Arc::new(StreamFrames::new(
             binding.crtc_id,
             self.backend.monotonic_now_ns(),
         ));
-        let presenter = PresentationThread::spawn(source, frames.clone()).map_err(|error| {
+        let presenter = PresentationThread::spawn_with_snapshot(
+            source,
+            frames.clone(),
+            self.settings.gpu_snapshot,
+        )
+        .map_err(|error| {
             CaptureError::new(
-                "resource_exhausted",
+                if self.settings.gpu_snapshot {
+                    "gpu_snapshot_unavailable"
+                } else {
+                    "resource_exhausted"
+                },
                 format!("cannot start the presentation thread: {error}"),
             )
         })?;
@@ -356,9 +359,22 @@ impl<B: Backend> Controller<B> {
             Err(error) => (Vec::new(), Err(error)),
         };
         let helper = self
-            .helper_path()
+            .settings
+            .helper_endpoint()
             .and_then(|helper| self.backend.probe_helper(helper));
-        let reason = helper.clone().err().or_else(|| driver.clone().err());
+        let snapshot = if self.settings.gpu_snapshot && !cfg!(amaterasu_vkms_gpu_snapshot) {
+            Err(CaptureError::new(
+                "gpu_snapshot_unavailable",
+                "the capture provider was built without linux-gpu-snapshot",
+            ))
+        } else {
+            Ok(())
+        };
+        let reason = helper
+            .clone()
+            .err()
+            .or_else(|| driver.clone().err())
+            .or_else(|| snapshot.clone().err());
         let availability = Availability {
             available: reason.is_none(),
             reason,
@@ -370,6 +386,7 @@ impl<B: Backend> Controller<B> {
             "checks": {
                 "frame_helper": check_json(&helper),
                 "driver": check_json(&driver),
+                "gpu_snapshot_build": check_json(&snapshot),
             },
             "geometry_supported": layout.is_some(),
             "frame_transport": "dmabuf",
@@ -394,7 +411,9 @@ impl<B: Backend> Controller<B> {
             "ok": true,
             "enabled": self.settings.enabled,
             "native_supported": true,
-            "frame_helper_configured": self.settings.frame_helper.is_some(),
+            "frame_helper_configured": self.settings.frame_helper.is_some() || self.settings.authority_channel,
+            "authority_mode": if self.settings.authority_channel { "package_approved" } else { "legacy_helper" },
+            "gpu_snapshot": self.settings.gpu_snapshot,
             "availability": self.last_availability.as_ref().map(Availability::json),
             "streams": streams,
             "opened": self.opened,

@@ -13,6 +13,7 @@ members = [
     "crates/input-companion",
     "crates/runtime",
     "crates/package",
+    "crates/capture-authority",
     "crates/storage",
     "crates/module-sdk",
     "crates/host",

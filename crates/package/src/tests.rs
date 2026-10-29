@@ -31,6 +31,7 @@ impl TestPackage {
             policy: RuntimeConfig::default(),
         };
         let manifest = ReleaseManifest {
+            privileged_requests: Vec::new(),
             schema: 1,
             host_context_schema: 1,
             project: "amaterasu".into(),
@@ -361,3 +362,6 @@ fn root_lock_prevents_concurrent_mutation_and_releases_on_drop() {
     drop(first);
     assert!(RootLock::acquire(&package.directory).is_ok());
 }
+
+#[path = "privileged_tests.rs"]
+mod privileged_tests;

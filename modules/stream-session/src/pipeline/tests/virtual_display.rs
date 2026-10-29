@@ -671,6 +671,83 @@ fn display_is_owned_before_capture_and_removed_only_after_video_closes() {
 }
 
 #[test]
+fn external_capture_uses_the_owned_output_and_closes_before_removal() {
+    let mut host = Harness::new();
+    let session = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut request = own_display_start(session);
+    request["configuration"]["capture_provider"] = json!("virtual_screen");
+    assert_eq!(host.response(2, request)["state"], "active");
+    let create = host
+        .broker
+        .calls
+        .iter()
+        .position(|call| {
+            call.service == "amaterasu.virtual-display/1" && call.payload["action"] == "create"
+        })
+        .unwrap();
+    let opens: Vec<_> = host
+        .broker
+        .calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| {
+            call.service == Resource::Video.service() && call.payload["action"] == "open"
+        })
+        .collect();
+    assert_eq!(opens.len(), 1);
+    assert!(create < opens[0].0);
+    assert_eq!(opens[0].1.payload["capture_provider"], "virtual_screen");
+    assert_eq!(opens[0].1.payload["output"], "kwin:Virtual-2");
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":session}))["state"],
+        "stopped"
+    );
+    assert!(host.broker.virtual_displays.is_empty());
+    let close = host
+        .broker
+        .calls
+        .iter()
+        .position(|call| {
+            call.service == Resource::Video.service() && call.payload["action"] == "close"
+        })
+        .unwrap();
+    let remove = host
+        .broker
+        .calls
+        .iter()
+        .position(|call| {
+            call.service == "amaterasu.virtual-display/1" && call.payload["action"] == "remove"
+        })
+        .unwrap();
+    assert!(close < remove);
+}
+
+#[test]
+fn external_capture_failure_removes_owned_output_without_fallback() {
+    let mut host = Harness::new();
+    let session = host.response(1, prepare())["session"].as_u64().unwrap();
+    host.broker.fail_open = Some(Resource::Video.service());
+    let mut request = own_display_start(session);
+    request["configuration"]["capture_provider"] = json!("unknown_alias");
+    assert_eq!(host.response(2, request)["state"], "failed");
+    assert!(host.broker.virtual_displays.is_empty());
+    let opens: Vec<_> = host
+        .broker
+        .calls
+        .iter()
+        .filter(|call| {
+            call.service == Resource::Video.service() && call.payload["action"] == "open"
+        })
+        .collect();
+    assert_eq!(opens.len(), 1);
+    assert_eq!(opens[0].payload["capture_provider"], "unknown_alias");
+    assert_eq!(opens[0].payload["output"], "kwin:Virtual-2");
+    assert!(host.broker.calls.iter().any(|call| {
+        call.service == "amaterasu.virtual-display/1" && call.payload["action"] == "remove"
+    }));
+}
+
+#[test]
 fn failed_connector_cleanup_retains_the_write_ahead_record() {
     let mut host = Harness::new();
     let session = host.response(1, prepare())["session"].as_u64().unwrap();

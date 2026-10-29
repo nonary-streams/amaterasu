@@ -3,8 +3,8 @@
 //!
 //! The presentation thread stores each completed presentation as the
 //! stream's newest frame. Reads lend that stored frame to one sink callback
-//! without asking the helper; the stored frame is the buffer currently
-//! scanned out, so lending it again for a repeat is valid.
+//! without asking the helper. Ordinary exports retain the scanout allocation;
+//! immutable leases instead retain a completed private GPU snapshot.
 use crate::admission::Admission;
 use amaterasu_media::{
     CAPTURE_FRAME_CACHED_REUSE, CAPTURE_FRAME_FRESH, DMABUF_COLOR_SRGB, DMABUF_MAX_DIMENSION,
@@ -28,6 +28,8 @@ pub enum StreamFault {
     HelperFailed,
     /// The driver refused CAP_SYS_ADMIN.
     PermissionDenied,
+    /// Import, synchronization, allocation or private GPU copy failed.
+    GpuSnapshotFailed,
     /// The output disappeared or lost its CRTC.
     OutputLost(&'static str),
 }
@@ -37,6 +39,7 @@ impl StreamFault {
         match self {
             Self::HelperFailed => "frame_helper_failed",
             Self::PermissionDenied => "permission_denied",
+            Self::GpuSnapshotFailed => "gpu_snapshot_failed",
             Self::OutputLost(code) => code,
         }
     }
@@ -45,7 +48,9 @@ impl StreamFault {
     pub fn status(self) -> Status {
         match self {
             Self::OutputLost(_) => MEDIA_CLOSED,
-            Self::HelperFailed | Self::PermissionDenied => MEDIA_BACKEND_ERROR,
+            Self::HelperFailed | Self::PermissionDenied | Self::GpuSnapshotFailed => {
+                MEDIA_BACKEND_ERROR
+            }
         }
     }
 }
@@ -55,6 +60,16 @@ impl StreamFault {
 pub struct StoredFrame {
     frame: DmaBufFrame,
     _descriptors: ExportedFrame,
+    immutable: bool,
+}
+
+impl StoredFrame {
+    pub fn frame(&self) -> &DmaBufFrame {
+        &self.frame
+    }
+    pub fn immutable(&self) -> bool {
+        self.immutable
+    }
 }
 
 /// The newest presentation the presentation thread stored.
@@ -92,6 +107,10 @@ pub struct Lent<'a> {
 impl Lent<'_> {
     pub fn frame(&self) -> &DmaBufFrame {
         &self.stored.frame
+    }
+
+    pub fn lease(&self) -> Result<amaterasu_media::DmaBufFrameLease, Status> {
+        crate::leases::descriptor(&self.stored)
     }
 }
 
@@ -158,8 +177,17 @@ impl StreamFrames {
     /// The previous frame's descriptors close at once unless a read still
     /// borrows them, in which case they close when that read ends.
     pub fn store(&self, exported: ExportedFrame, sequence: u64) {
+        self.store_frame(exported, sequence, false);
+    }
+
+    /// Only the completed private GPU-copy path may mark storage immutable.
+    pub fn store_snapshot(&self, exported: ExportedFrame, sequence: u64) {
+        self.store_frame(exported, sequence, true);
+    }
+
+    fn store_frame(&self, exported: ExportedFrame, sequence: u64, immutable: bool) {
         let timestamp_us = self.stream_timestamp_us(exported.descriptor.timestamp_ns);
-        let frame = describe(exported, sequence, timestamp_us).map(Arc::new);
+        let frame = describe(exported, sequence, timestamp_us, immutable).map(Arc::new);
         let replaced = {
             let mut newest = self.lock_newest();
             newest.presentation = PresentationStatus {
@@ -230,6 +258,7 @@ fn describe(
     exported: ExportedFrame,
     sequence: u64,
     timestamp_us: u64,
+    immutable: bool,
 ) -> Result<StoredFrame, Status> {
     let descriptor = exported.descriptor;
     if descriptor.width > DMABUF_MAX_DIMENSION || descriptor.height > DMABUF_MAX_DIMENSION {
@@ -261,6 +290,7 @@ fn describe(
     Ok(StoredFrame {
         frame,
         _descriptors: exported,
+        immutable,
     })
 }
 

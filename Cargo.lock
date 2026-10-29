@@ -113,6 +113,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-capture-authority"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-contracts",
+ "amaterasu-package",
+ "amaterasu-vkms-frame-helper",
+ "ed25519-dalek",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "amaterasu-capture-dxgi"
 version = "0.1.0"
 dependencies = [
@@ -473,6 +487,7 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
+ "amaterasu-media",
  "serde_json",
 ]
 
@@ -560,6 +575,7 @@ name = "amaterasu-release"
 version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
+ "amaterasu-capture-authority",
  "amaterasu-contracts",
  "amaterasu-nvhttp",
  "amaterasu-package",

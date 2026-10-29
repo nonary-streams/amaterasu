@@ -5710,3 +5710,34 @@ fn scoped_software_selection_uses_the_frozen_snapshot_to_constrain_codec_negotia
     assert_eq!(open["negotiation_bounds"]["max_width"], 1920);
     assert_eq!(open["negotiation_bounds"]["max_fps"], 60);
 }
+
+#[test]
+fn external_capture_alias_flows_from_startup_to_rtsp() {
+    let mut value = serde_json::to_value(config()).unwrap();
+    value["capture"]["capture_provider"] = json!("acme_capture-1");
+    let streaming: StreamingConfig = serde_json::from_value(value).unwrap();
+    assert!(streaming.validate().is_ok());
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(streaming)).unwrap();
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    let open = broker.commands.iter().find_map(|command| match command {
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+        _ => None,
+    }).expect("RTSP open request");
+    assert_eq!(open["capture"]["capture_provider"], "acme_capture-1");
+    assert_eq!(open["capture"]["output"], "display-one");
+    assert_eq!(open["capture"]["constant_rate"], false);
+}
+
+#[test]
+fn external_capture_alias_rejects_invalid_names_and_builtin_override_works() {
+    for alias in ["", "Upper", "raw.service/1", "space name", &"a".repeat(65)] {
+        assert!(serde_json::from_value::<CaptureProvider>(json!(alias)).is_err(), "{alias}");
+    }
+    let external = CaptureProvider::External("acme".into());
+    assert_eq!(CaptureMode::Auto.resolve(external.clone()), (external.clone(), false));
+    assert_eq!(CaptureMode::Wgcc.resolve(external), (CaptureProvider::Wgc, true));
+}

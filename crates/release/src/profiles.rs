@@ -656,10 +656,14 @@ const STREAM_SOURCE: ComponentDefinition = ComponentDefinition {
 const CAPTURE_SOURCE: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.capture-source",
     library: "amaterasu_capture_source",
-    provides: &["amaterasu.capture-dxgi/1", "test.capture-source/1"],
+    provides: &[
+        "amaterasu.capture-dxgi/1",
+        "test.custom-capture/1",
+        "test.capture-source/1",
+    ],
     calls: &[],
     publishes: &[],
-    native_provides: &["amaterasu.capture-dxgi/1"],
+    native_provides: &["amaterasu.capture-dxgi/1", "test.custom-capture/1"],
     native_uses: &[],
     dependencies: &[RUNTIME_ID],
 };
@@ -672,8 +676,16 @@ const SOFTWARE_AUDIO_SOURCE: ComponentDefinition = ComponentDefinition {
 };
 
 const SOFTWARE_VIDEO: ComponentDefinition = ComponentDefinition {
-    calls: &["amaterasu.capture-dxgi/1", "amaterasu.encode/1"],
-    native_uses: &["amaterasu.capture-dxgi/1", "amaterasu.encode/1"],
+    calls: &[
+        "amaterasu.capture-dxgi/1",
+        "test.custom-capture/1",
+        "amaterasu.encode/1",
+    ],
+    native_uses: &[
+        "amaterasu.capture-dxgi/1",
+        "test.custom-capture/1",
+        "amaterasu.encode/1",
+    ],
     dependencies: &[RUNTIME_ID, "amaterasu.capture-source", "amaterasu.encode"],
     ..VIDEO
 };
@@ -855,6 +867,26 @@ const STREAM_SESSION_PROBE: ComponentDefinition = ComponentDefinition {
 };
 
 const STREAM_SESSION_SOFTWARE_PROBE: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.input/1",
+        "amaterasu.session/1",
+        "amaterasu.display/1",
+        "amaterasu.state/1",
+        "amaterasu.video/1",
+        "amaterasu.audio/1",
+        "amaterasu.audio-encode/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
+        "test.custom-capture/1",
+        "amaterasu.capture-dxgi/1",
+        "amaterasu.capture-wgc/1",
+        "amaterasu.encode/1",
+        "amaterasu.session-history/1",
+        "amaterasu.host-metrics/1",
+        "amaterasu.updater/1",
+        "amaterasu.system-tray/1",
+        "amaterasu.frame-limiter/1",
+    ],
     dependencies: &[
         "amaterasu.input-probe",
         RUNTIME_ID,
@@ -915,6 +947,67 @@ const MEDIA_PROBE: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport",
         "amaterasu.control-transport",
     ],
+};
+
+const SOFTWARE_NVHTTP: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.configuration/1",
+        "amaterasu.input/1",
+        "amaterasu.pairing/1",
+        "amaterasu.state/1",
+        "amaterasu.catalog/1",
+        "amaterasu.launch/1",
+        "amaterasu.display/1",
+        "amaterasu.playnite/1",
+        "amaterasu.lutris/1",
+        "amaterasu.application/1",
+        "amaterasu.rtsp/1",
+        "amaterasu.stream-session/1",
+        "amaterasu.session/1",
+        "amaterasu.video/1",
+        "amaterasu.audio/1",
+        "amaterasu.audio-encode/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
+        "test.custom-capture/1",
+        "amaterasu.capture-dxgi/1",
+        "amaterasu.capture-wgc/1",
+        "amaterasu.encode/1",
+        "amaterasu.management/1",
+    ],
+    ..NVHTTP
+};
+
+const SOFTWARE_RTSP: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.input/1",
+        "amaterasu.stream-session/1",
+        "amaterasu.session/1",
+        "amaterasu.display/1",
+        "amaterasu.state/1",
+        "amaterasu.launch/1",
+        "amaterasu.video/1",
+        "amaterasu.audio/1",
+        "amaterasu.audio-encode/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
+        "test.custom-capture/1",
+        "amaterasu.capture-dxgi/1",
+        "amaterasu.capture-wgc/1",
+        "amaterasu.encode/1",
+    ],
+    ..RTSP
+};
+
+const SOFTWARE_MEDIA_PROBE: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.video/1",
+        "amaterasu.encode/1",
+        "test.custom-capture/1",
+    ],
+    native_uses: &["amaterasu.video/1"],
+    dependencies: &[RUNTIME_ID, "amaterasu.video"],
+    ..MEDIA_PROBE
 };
 
 const MANAGEMENT: ComponentDefinition = ComponentDefinition {
@@ -1353,7 +1446,7 @@ impl PackageProfile {
                 AUTHENTICATION,
                 MANAGEMENT_SOFTWARE_PROBE,
                 PAIRING,
-                NVHTTP,
+                SOFTWARE_NVHTTP,
                 SESSION,
                 SESSION_HISTORY,
                 HOST_METRICS,
@@ -1365,11 +1458,12 @@ impl PackageProfile {
                 AUDIO_ENCODE,
                 ENCODE,
                 SOFTWARE_VIDEO,
+                SOFTWARE_MEDIA_PROBE,
                 MEDIA_TRANSPORT,
                 CONTROL_TRANSPORT,
                 FRAME_LIMITER,
                 STREAM_SESSION_SOFTWARE_PROBE,
-                RTSP,
+                SOFTWARE_RTSP,
             ],
             Self::LinuxProbe => &[
                 RUNTIME,

@@ -16,6 +16,9 @@ getrandom.workspace = true
 sha2.workspace = true
 libloading.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+amaterasu-capture-authority = { path = "../capture-authority" }
+
 [dev-dependencies]
 amaterasu-runtime = { path = "../runtime" }
 # Generated NVHTTP settings are parsed and resolved by the module's own rules.

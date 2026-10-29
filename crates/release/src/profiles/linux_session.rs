@@ -344,6 +344,7 @@ pub fn linux_session_policy(
     root: &Path,
     options: &LinuxSessionOptions,
 ) -> PackageResult<RuntimeConfig> {
+    options.validate().map_err(|error| error.to_string())?;
     let mut policy = RuntimeConfig::default();
     for component in COMPONENTS {
         if component.id != RUNTIME_ID {
@@ -458,10 +459,18 @@ fn settings(
     // The portal owns the explicit user-consent prompt. Capture remains
     // disabled until selected in the portal; video processing is separately
     // enabled through the profile option.
-    insert(
-        VIDEO_COMPONENT_ID,
-        json!({"enabled": options.enable_capture, "capture_providers": ["kms", "pipewire", "vkms"]}),
-    );
+    let video_settings = if options.enable_virtual_screen_capture {
+        json!({
+            "enabled": options.enable_capture,
+            "capture_providers": ["kms", "pipewire"],
+            "external_capture_providers": {"virtual_screen": {
+                "service": "amaterasu.capture-vkms/1", "frame_transport": "dmabuf"
+            }}
+        })
+    } else {
+        json!({"enabled": options.enable_capture, "capture_providers": ["kms", "pipewire", "vkms"]})
+    };
+    insert(VIDEO_COMPONENT_ID, video_settings);
     let mut capture_settings = portal_capture_settings();
     if options.enable_virtual_display {
         capture_settings["allow_named_outputs"] = json!(true);
@@ -514,10 +523,18 @@ fn portal_capture_settings() -> Value {
     })
 }
 
-/// Direct scanout capture needs the operator-installed privileged helper.
-/// Without `--frame-helper` the provider stays disabled and video keeps
-/// capturing owned outputs through PipeWire.
+/// Package authority selects the broker-inherited channel; it never names a
+/// descriptor or executable in user-controlled settings. The older helper
+/// remains a separate explicit compatibility mode.
 fn vkms_capture_settings(options: &LinuxSessionOptions) -> Value {
+    if options.capture_authority_helper.is_some() {
+        return json!({
+            "enabled": options.enable_capture,
+            "capture_principals": [VIDEO_COMPONENT_ID],
+            "authority_channel": true,
+            "gpu_snapshot": true,
+        });
+    }
     match &options.frame_helper {
         Some(helper) => json!({
             "enabled": options.enable_capture,
@@ -562,7 +579,7 @@ fn nvhttp_settings(options: &LinuxSessionOptions) -> Value {
 fn streaming_settings(options: &LinuxSessionOptions) -> Value {
     json!({
         "capture": {
-            "capture_provider": if options.capture_output == options::DEFAULT_CAPTURE_OUTPUT { "pipewire" } else { "kms" },
+            "capture_provider": if options.enable_virtual_screen_capture { "virtual_screen" } else if options.capture_output == options::DEFAULT_CAPTURE_OUTPUT { "pipewire" } else { "kms" },
             "output": if options.capture_output != options::DEFAULT_CAPTURE_OUTPUT { options.capture_output.as_str() } else if options.enable_virtual_display { "amaterasu-owned-display" } else { "portal-selected-session-source" },
             // Automatic selection lets the video module open a hardware
             // encoder for whichever codec the client negotiates, then the

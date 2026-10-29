@@ -21,6 +21,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -35,8 +36,17 @@ from test_rtsp import PeerDiscovery, RtspClient, announcement
 from test_stream_session import collect, stop_client, verify_audio
 
 CAPTURE = "test.capture-source/1"
+CUSTOM_CAPTURE = "test.custom-capture/1"
 AUDIO = "test.stream-source/1"
 WIDTH, HEIGHT, SOURCE_FRAMES = 64, 48, 12
+
+
+def wait_ready(console):
+    deadline = time.monotonic() + 120
+    while not any("Development worker ready: pid=" in line for line in console.errors):
+        assert console.process.poll() is None, "".join(console.errors)
+        assert time.monotonic() < deadline, "worker did not become ready within 120 seconds"
+        time.sleep(0.05)
 
 
 def checked(api, path, payload=None, bearer=None):
@@ -45,7 +55,7 @@ def checked(api, path, payload=None, bearer=None):
     return result
 
 
-def configure(harness):
+def configure(harness, custom_capture=False, direct=False):
     path = harness.root / "bootstrap.json"
     bootstrap = json.loads(path.read_text())
     settings = bootstrap["policy"]["settings"]
@@ -63,7 +73,7 @@ def configure(harness):
         "https_bind": f"127.0.0.1:{base_port - 5}",
         "streaming": {
             "capture": {
-                "capture_provider": "dxgi", "output": "nv12-fixture-display",
+                "capture_provider": "custom" if custom_capture else "dxgi", "output": "nv12-fixture-display",
                 "encoder": 0, "audio_endpoint": "default",
             },
             "profile": {
@@ -85,11 +95,27 @@ def configure(harness):
         "enabled": True, "enable_input": False,
         "allowed_principals": ["amaterasu.rtsp"],
     }
-    settings["amaterasu.capture-source"] = {}
+    settings["amaterasu.capture-source"] = {"custom_service": True} if custom_capture else {}
     settings["amaterasu.software-probe-audio"] = {"enable_video": False}
-    settings["amaterasu.video"] = {"enabled": True, "capture_providers": ["dxgi"]}
+    settings["amaterasu.video"] = {"enabled": True, "capture_providers": [] if custom_capture else ["dxgi"]}
+    if custom_capture:
+        settings["amaterasu.video"]["external_capture_providers"] = {"custom": CUSTOM_CAPTURE}
+        # The development policy composes several profiles, with the later
+        # platform video entry replacing the software-probe entry. Explicitly
+        # authorize this test-only provider for this isolated host.
+        video_policy = bootstrap["policy"]["principals"]["amaterasu.video"]
+        video_policy["call"].append(CUSTOM_CAPTURE)
+        video_policy["native_use"].append(CUSTOM_CAPTURE)
+        assert CUSTOM_CAPTURE in bootstrap["policy"]["principals"]["amaterasu.console"]["call"]
+        for principal in ("amaterasu.nvhttp", "amaterasu.rtsp", "amaterasu.stream-session"):
+            bootstrap["policy"]["principals"][principal]["call"].append(CUSTOM_CAPTURE)
+        if direct:
+            bootstrap["policy"]["principals"]["amaterasu.media-probe"]["call"].append(CUSTOM_CAPTURE)
     settings["amaterasu.encode"] = {"enabled": True}
     settings["amaterasu.audio-encode"] = {"enabled": True}
+    if direct:
+        settings["amaterasu.nvhttp"]["enabled"] = False
+        settings["amaterasu.rtsp"]["enabled"] = False
     for component in ("media-transport", "control-transport"):
         settings[f"amaterasu.{component}"] = {
             "enabled": True, "allowed_principals": ["amaterasu.stream-session"],
@@ -104,6 +130,14 @@ def configure(harness):
     assert "amaterasu_video" in libraries["amaterasu.video"]
     assert "amaterasu_encode" in libraries["amaterasu.encode"]
     assert "amaterasu.capture-dxgi" not in libraries
+    if custom_capture:
+        components = {entry["id"]: entry for entry in manifest["components"]}
+        provider = components["amaterasu.capture-source"]["requested"]
+        video_grants = components["amaterasu.video"]["requested"]
+        assert CUSTOM_CAPTURE in provider["provide"] and CUSTOM_CAPTURE in provider["native_provide"], provider
+        assert CUSTOM_CAPTURE in video_grants["call"] and CUSTOM_CAPTURE in video_grants["native_use"], video_grants
+        for principal in ("amaterasu.nvhttp", "amaterasu.rtsp", "amaterasu.stream-session"):
+            assert CUSTOM_CAPTURE in components[principal]["requested"]["call"], components[principal]
     harness.stage(package)
 
 
@@ -211,7 +245,8 @@ def reassemble_video(datagrams, key):
             assert packet[24:27] == parity[24:27]
             assert packet[32:] == parity[32:]
         payload = b"".join(parts[index][32:] for index in range(count))
-        assert payload[:3] == b"\x01\x00\x00" and payload[6:8] == bytes(2)
+        # Bytes 1 and 2 carry the measured host processing latency.
+        assert payload[0] == 1 and payload[6:8] == bytes(2), payload[:8].hex()
         final_size = int.from_bytes(payload[4:6], "little")
         assert 0 < final_size <= 1008
         actual_size = (count - 1) * 1008 + final_size
@@ -254,7 +289,7 @@ def independently_decode(units, directory):
     assert all(left * right < 0 for left, right in zip(contrasts, contrasts[1:])), contrasts
 
 
-def exercise(console, https, context, oracle, directory):
+def exercise(console, https, context, oracle, directory, custom_capture=False):
     marker = directory / "software-application.pid"
     app_id = create_application(console, marker, 0, 60)
     key = secrets.token_bytes(16)
@@ -292,6 +327,9 @@ def exercise(console, https, context, oracle, directory):
             wait_until(lambda: not child_running(pid), "public teardown retained its application")
             capture = console.request(CAPTURE, {"action": "status"})
             assert capture["opened"] == capture["closed"] == 1 and capture["frames"] == SOURCE_FRAMES, capture
+            assert capture["callers"]["amaterasu.video"] == {
+                "opened": 1, "closed": 1, "frames": SOURCE_FRAMES, "active": 0,
+            }, capture
             source = console.request(AUDIO, {"action": "status"})
             assert source["video"]["opened"] == source["video"]["frames"] == 0, source
             assert source["audio"]["opened"] == source["audio"]["closed"] == 1, source
@@ -310,6 +348,7 @@ def exercise(console, https, context, oracle, directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--encoder", choices=("auto", "software"), default="auto")
+    parser.add_argument("--custom-capture", action="store_true", help="route through the independent test capture service")
     arguments = parser.parse_args()
     oracle = Path(os.environ["AMATERASU_ENET_CLIENT_ORACLE"]).resolve(strict=True)
     # Use a dedicated target directory: enabling x264 must not overwrite default artifacts.
@@ -320,11 +359,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix="amaterasu-public-software-stream-") as temporary:
         directory = Path(temporary)
         harness = ComponentHarness(directory)
-        configure(harness)
+        configure(harness, arguments.custom_capture)
         console = Console(harness)
         try:
+            wait_ready(console)
             https, context = initialize(console, arguments.encoder)
-            evidence = exercise(console, https, context, oracle, directory)
+            evidence = exercise(console, https, context, oracle, directory, arguments.custom_capture)
             console.eof()
         except BaseException:
             print("".join(console.errors), file=sys.stderr)
