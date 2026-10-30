@@ -19,6 +19,8 @@ mod dmabuf_lease;
 pub use dmabuf_lease::*;
 mod capture_events;
 pub use capture_events::*;
+mod frame_resource;
+pub use frame_resource::*;
 mod codec;
 pub use codec::*;
 mod geometry;

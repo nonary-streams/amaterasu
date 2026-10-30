@@ -1,8 +1,17 @@
 //! Capture-only publishing and notifications. No encoding or provider selection
 //! runs on a capture thread. Each channel represents one capture session.
+mod connection;
+mod negotiation;
 mod publisher;
 mod subscription;
 
+pub use connection::{ConnectionError, ResourceConnection};
+pub use negotiation::{
+    Accessibility, DeliveryFormat, DeliveryRequirement, DeliverySelection,
+    MAX_DELIVERY_CAPABILITY_BYTES, MAX_DELIVERY_OFFERS, MAX_DELIVERY_REQUIREMENTS,
+    NegotiationError, Ownership, ProviderOffer, Schema, select_delivery,
+    select_delivery_with_compatibility,
+};
 pub use publisher::{CaptureFrames, CapturePublisher, PublishError, capture_channel};
 pub use subscription::{CaptureNotice, CaptureNotifications, CaptureSubscription};
 

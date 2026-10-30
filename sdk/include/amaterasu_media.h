@@ -312,6 +312,155 @@ typedef struct {
     AmaterasuStatus (*resolve_swap)(void *, uint64_t, uint64_t, uint32_t, AmaterasuBorrowedBytes);
 } AmaterasuCaptureApiV1_7;
 #define AMATERASU_CAPTURE_API_V1_7_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_7))
+/* Generic negotiated resources are additive to the legacy capture APIs. Native
+ * modules are trusted; these grants do not sandbox native code. Kinds at or
+ * above VENDOR_BASE require a separately agreed schema. Unknown kinds/versions
+ * must be rejected. All descriptors and embedded handles are borrowed. */
+#define AMATERASU_CAPTURE_RESOURCE_INTERFACE_MINOR 8u
+#define AMATERASU_FRAME_RESOURCE_CONSUMER_INTERFACE_MAJOR 1u
+#define AMATERASU_FRAME_RESOURCE_CONSUMER_INTERFACE_MINOR 0u
+#define AMATERASU_FRAME_RESOURCE_PROCESSOR_INTERFACE_MAJOR 1u
+#define AMATERASU_FRAME_RESOURCE_PROCESSOR_INTERFACE_MINOR 0u
+#define AMATERASU_FRAME_RESOURCE_CPU 1u
+#define AMATERASU_FRAME_RESOURCE_DMABUF 2u
+#define AMATERASU_FRAME_RESOURCE_VENDOR_BASE 0x80000000u
+#define AMATERASU_FRAME_SYNC_NONE 0u
+#define AMATERASU_FRAME_SYNC_SYNC_FILE 1u
+#define AMATERASU_FRAME_SYNC_VENDOR_BASE 0x80000000u
+typedef struct {
+    uint32_t kind, version, size, reserved;
+    uint8_t namespace_id[16]; /* zero for standard kinds; nonzero UUID for vendor */
+    const void *data;
+} AmaterasuFrameDescriptor;
+/* SYNC_FILE v1 points to this borrowed Linux sync_file descriptor. */
+typedef struct { int32_t fd; } AmaterasuFrameSyncFile;
+typedef struct {
+    uint32_t format, min_width, max_width, min_height, max_height;
+} AmaterasuCpuResourceCapabilities;
+typedef struct {
+    uint32_t fourcc, color;
+    uint64_t modifier;
+    uint32_t min_width, max_width, min_height, max_height;
+    uint8_t device_id[16]; /* agreed UUID; zero means unknown */
+} AmaterasuDmaBufResourceCapabilities;
+#define AMATERASU_FRAME_OWNERSHIP_BORROWED 1u
+#define AMATERASU_FRAME_OWNERSHIP_RETAINABLE 2u
+#define AMATERASU_FRAME_ACCESS_CPU 1u
+#define AMATERASU_FRAME_ACCESS_GPU 2u
+/* IDs are nonzero and unique per stream/generation. Offer descriptors and
+ * capability data are borrowed for the callback. CPU and DMA-BUF v1 offer
+ * payloads are AmaterasuCpuResourceCapabilities and
+ * AmaterasuDmaBufResourceCapabilities, distinct from frame payloads. Borrowed
+ * ownership requires retain to return UNSUPPORTED. NONE has zero version/size
+ * and NULL data. Schema-specific capability data must be checked for actual
+ * device, format, and synchronization compatibility. */
+typedef struct {
+    uint64_t id;
+    uint32_t ownership, accessibility, reserved;
+    /* accessibility is a bitset. Zero is unspecified. CPU/GPU mean the schema
+     * exposes a direct access/import mechanism, not physical residency, zero
+     * copy, or absence of staging. Device/format/sync constraints still apply. */
+    AmaterasuFrameDescriptor resource, acquire_sync, completion_sync;
+} AmaterasuCaptureResourceOffer;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *, const AmaterasuCaptureResourceOffer *);
+} AmaterasuCaptureResourceOfferSink;
+/* Zero means unknown; never infer SDR or HDR from an unknown value. */
+#define AMATERASU_FRAME_COLOR_UNKNOWN 0u
+#define AMATERASU_FRAME_PRIMARIES_BT709 1u
+#define AMATERASU_FRAME_PRIMARIES_BT2020 2u
+#define AMATERASU_FRAME_TRANSFER_SRGB 1u
+#define AMATERASU_FRAME_TRANSFER_BT709 2u
+#define AMATERASU_FRAME_TRANSFER_PQ 3u
+#define AMATERASU_FRAME_TRANSFER_HLG 4u
+#define AMATERASU_FRAME_MATRIX_RGB 1u
+#define AMATERASU_FRAME_MATRIX_BT709 2u
+#define AMATERASU_FRAME_MATRIX_BT2020_NCL 3u
+#define AMATERASU_FRAME_RANGE_FULL 1u
+#define AMATERASU_FRAME_RANGE_LIMITED 2u
+#define AMATERASU_FRAME_CLOCK_UNKNOWN 0u
+#define AMATERASU_FRAME_CLOCK_STREAM_RELATIVE 1u
+#define AMATERASU_FRAME_CLOCK_HOST_MONOTONIC 2u
+/* All zero means absent. In v1 size is sizeof the record. Each zero color
+ * component remains independently unknown. Unknown versions/values must not
+ * be interpreted as known color. Timestamps are in microseconds in their
+ * respective clocks; only compare understood domains with matching nonzero epoch
+ * IDs. A zero epoch is unknown and does not establish comparability. */
+typedef struct {
+    uint32_t version, size, primaries, transfer, matrix, range;
+} AmaterasuFrameColorMetadata;
+typedef struct {
+    uint32_t version, size, domain, reserved;
+    uint8_t epoch_id[16];
+} AmaterasuFrameClockMetadata;
+/* CPU resource v1 points to AmaterasuCpuFrame; DMA-BUF v1 points to
+ * AmaterasuDmaBufFrame. Descriptor size must cover that struct. CPU uses
+ * SYNC_NONE; DMA-BUF acquire fences remain in its planes and must be waited.
+ * Copy frame and descriptors during callback. Successful retain pins immutable
+ * pixels, descriptor data and handles through release; failed retain acquires
+ * nothing. Providers impose finite reference limits. Each release consumes one
+ * retained reference; NONE asserts all work completed. Otherwise completion
+ * covers all work and is borrowed only until release returns: provider must
+ * duplicate/retain handles synchronously and quarantine on failure. Keep provider
+ * and binding live through all references and pending work. Selection changes
+ * and stream close do not invalidate retained frames; destruction waits for
+ * references and completion fences. Callbacks run on
+ * the owning module thread and must not unwind across the ABI. */
+typedef struct {
+    uint64_t offer_generation, offer_id, timestamp_us, capture_pacing_timestamp_us, sequence;
+    uint32_t width, height, freshness, reserved;
+    AmaterasuFrameColorMetadata color;
+    AmaterasuFrameClockMetadata clock, pacing_clock;
+    AmaterasuFrameDescriptor resource, acquire_sync;
+    void *context;
+    AmaterasuStatus (*retain)(void *);
+    void (*release)(void *, const AmaterasuFrameDescriptor *completion);
+} AmaterasuCaptureResourceFrame;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *, const AmaterasuCaptureResourceFrame *);
+} AmaterasuCaptureResourceFrameSink;
+/* Enumeration is synchronous and returns a nonzero generation even for an
+ * empty list. Selection uses that exact generation/ID; stale or unavailable
+ * returns UNSUPPORTED without changing the prior selection. Capability changes
+ * invalidate it. Reads deliver at most one frame, PENDING none; sink errors
+ * propagate. Legacy read operations remain available. Calls require the same
+ * authenticated stream ownership as legacy operations. The provider keeps an
+ * initial frame reference during the sink callback; sink return transfers none. */
+typedef struct {
+    AmaterasuCaptureApiV1_7 base;
+    AmaterasuStatus (*enumerate_resources)(void *, uint64_t, AmaterasuCaptureResourceOfferSink, uint64_t *generation);
+    AmaterasuStatus (*select_resource)(void *, uint64_t, uint64_t generation, uint64_t offer_id);
+    AmaterasuStatus (*read_resource_frame)(void *, uint64_t, AmaterasuCaptureResourceFrameSink);
+} AmaterasuCaptureApiV1_8;
+#define AMATERASU_CAPTURE_API_V1_8_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_8))
+/* An independently bound consumer (e.g. encoder). Its offer IDs and generation
+ * belong to its own stream. Configure verifies the producer offer and both
+ * schemas; incompatible/stale returns UNSUPPORTED with configuration unchanged.
+ * Producer generation and offer are borrowed during configure; copy needed
+ * data before returning. Configure first, then select the producer; if select
+ * fails, do not submit and re-enumerate/reconfigure. Submit's final
+ * argument is nonzero to request an IDR when applicable. Submit finishes access
+ * before returning or retains for asynchronous work; failed submit retains no
+ * work. Cancel stops admission and retires retained references and work. */
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*enumerate_resources)(void *, uint64_t, AmaterasuCaptureResourceOfferSink, uint64_t *generation);
+    AmaterasuStatus (*configure)(void *, uint64_t, uint64_t consumer_generation, uint64_t consumer_id, uint64_t producer_generation, const AmaterasuCaptureResourceOffer *producer_offer);
+    AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuCaptureResourceFrame *, uint32_t flags);
+    void (*cancel)(void *, uint64_t);
+} AmaterasuFrameResourceConsumerApi;
+/* The processor follows the same lifetime rules; process delivers at most one
+ * output synchronously, preserving sequence, timestamps and freshness. */
+typedef struct {
+    AmaterasuFrameResourceConsumerApi base;
+    AmaterasuStatus (*enumerate_outputs)(void *, uint64_t, AmaterasuCaptureResourceOfferSink, uint64_t *generation);
+    AmaterasuStatus (*select_output)(void *, uint64_t, uint64_t generation, uint64_t offer_id);
+    AmaterasuStatus (*process)(void *, uint64_t, const AmaterasuCaptureResourceFrame *, AmaterasuCaptureResourceFrameSink);
+} AmaterasuFrameResourceProcessorApi;
+#define AMATERASU_FRAME_RESOURCE_CONSUMER_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuFrameResourceConsumerApi))
+#define AMATERASU_FRAME_RESOURCE_PROCESSOR_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuFrameResourceProcessorApi))
 #undef AMATERASU_CAPTURE_V1_4_FIELDS
 #undef AMATERASU_CAPTURE_V1_3_FIELDS
 #undef AMATERASU_CAPTURE_V1_2_FIELDS

@@ -1,7 +1,9 @@
 //! Helpers for borrowed CPU frames and explicitly retained GPU presentations.
+mod generic;
 mod lease;
 use amaterasu_abi::{STATUS_INVALID_ARGUMENT, Status};
 use amaterasu_media::{CpuFrame, frame_size};
+pub use generic::{BorrowedResourceFrame, OwnedResourceCpuFrame, RetainedResourceFrame};
 pub use lease::RetainedDmaBufFrame;
 
 /// A validated CPU frame whose pixels remain borrowed for its lifetime.

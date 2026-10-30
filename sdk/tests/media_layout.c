@@ -6,6 +6,16 @@ _Static_assert(sizeof(AmaterasuCaptureEventSink) == 32, "capture notification si
 _Static_assert(sizeof(AmaterasuCaptureApiV1_7) == 112, "capture event table layout");
 _Static_assert(offsetof(AmaterasuCaptureApiV1_7, subscribe_events) == 88, "v1.6 prefix preserved");
 _Static_assert(offsetof(AmaterasuCaptureApiV1_7, resolve_swap) == 104, "swap decision offset");
+_Static_assert(offsetof(AmaterasuCaptureApiV1_8, base) == 0, "capture v1.8 prefix");
+_Static_assert(offsetof(AmaterasuCaptureApiV1_8, enumerate_resources) == sizeof(AmaterasuCaptureApiV1_7), "capture v1.7 prefix preserved");
+_Static_assert(AMATERASU_CAPTURE_API_V1_8_SIZE == sizeof(AmaterasuCaptureApiV1_8), "capture resource table size");
+_Static_assert(offsetof(AmaterasuFrameResourceProcessorApi, base) == 0, "resource consumer prefix");
+_Static_assert(offsetof(AmaterasuFrameResourceProcessorApi, enumerate_outputs) == sizeof(AmaterasuFrameResourceConsumerApi), "resource processor extension");
+_Static_assert(sizeof(AmaterasuFrameDescriptor) == 40, "resource descriptor layout");
+_Static_assert(sizeof(AmaterasuCaptureResourceOffer) == 144, "resource offer layout");
+_Static_assert(sizeof(AmaterasuCaptureResourceFrame) == 248, "resource frame layout");
+_Static_assert(sizeof(AmaterasuFrameColorMetadata) == 24, "frame color metadata layout");
+_Static_assert(sizeof(AmaterasuFrameClockMetadata) == 32, "frame clock metadata layout");
 _Static_assert(sizeof(AmaterasuNativeInterfaceQuery) == 24, "native query layout");
 _Static_assert(sizeof(AmaterasuNativeServiceFactory) == 32, "native factory layout");
 _Static_assert(sizeof(AmaterasuCpuFrame) == 48, "frame layout");

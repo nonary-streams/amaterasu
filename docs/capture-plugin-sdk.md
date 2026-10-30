@@ -170,6 +170,78 @@ DMA-BUF input and implement encoder v1.1. Capture v1.5 optionally supplies
 presentation-driven pacing. A pinned external DMA-BUF provider fails when the
 required path is unavailable; it does not silently substitute another source.
 
+## Negotiated resource delivery
+
+Capture v1.8 adds an optional resource interface after the v1.7 table. Check
+both the minor version and table size before using it. It does not change the
+legacy CPU or DMA-BUF reads. Once the control service has opened and authorized
+the stream, enumerate its resource offers, choose a compatible offer, and select
+its ID with the enumeration generation. A stale or unsupported selection fails;
+a capability change invalidates the selection and requires renegotiation.
+Providers authenticate ownership on every operation. Descriptors returned during
+enumeration are borrowed only for that callback: copy any data needed later.
+
+Offers describe the resource and synchronization schemas and whether a frame is
+borrowed only or retainable. Explicit CPU/GPU accessibility flags let callers
+enforce their requirements even for a vendor schema; unspecified accessibility
+is not proof of either. These flags describe access under that schema, not
+physical residency or a no-copy promise. Standard CPU and DMA-BUF capability payloads specify
+formats and size ranges; DMA-BUF adds modifier, color and device identity. A
+zero device identity is unknown and does not establish compatibility. Custom
+schemas use a nonzero vendor UUID, kind and version. Only components that agree
+on a custom schema can interpret its payload. The SDK's `capture::select_delivery`
+helpers select among bounded lists with ordered preferences and explicit
+requirements; use schema-aware matching when capability equality alone does not
+establish compatibility. Consumer configuration must still verify actual import
+support.
+
+`CaptureResourceFrame` carries common frame metadata plus a typed resource and
+acquire synchronization descriptor. Optional color metadata is separate from
+the resource. Frame and pacing timestamps have independent optional clock-domain
+and epoch metadata; absent information means unknown, not an implied color space
+or shared clock. CPU and DMA-BUF v1 frame payloads use the
+existing `CpuFrame` and `DmaBufFrame` layouts, not the offer capability layouts.
+Frame descriptors are borrowed for the callback. A successful retain pins the
+resource, its immutable pixels and descriptor data until release. Borrowed-only
+providers return unsupported from retain. The consumer waits for acquisition
+and releases after all accesses complete, or supplies a supported completion
+object covering pending work. The provider duplicates or retains completion
+handles synchronously and quarantines storage if that fails. Bindings and
+providers must remain alive until retained frames and pending fences retire;
+closing a stream or changing its selection cannot invalidate a retained frame.
+Retain/release are module-thread operations unless a schema explicitly provides
+a stronger contract.
+
+Rust consumers can use `BorrowedResourceFrame::copy_cpu` for an explicit
+independent copy of a standard CPU frame. The returned `OwnedResourceCpuFrame`
+retains its presentation, color and clock metadata as well as the copied pixels.
+
+`FrameResourceConsumerApi` and `FrameResourceProcessorApi` define independent
+consumer and processor tables for implementers. Configure the consumer against
+the chosen producer offer before selecting the producer. If either step fails,
+do not submit; re-enumerate and configure again. These ABI definitions alone do
+not make every existing encoder or processor accept every resource. GPU-backed
+delivery does not imply dedicated VRAM residency or an end-to-end zero-copy
+path. CPU copies and GPU readback are explicit operations, not implied by a
+resource offer.
+
+The optional `capture::ResourceConnection` helper forwards resources to a
+compatible native consumer without interpreting their payload. It can require
+CPU and/or GPU accessibility and checks offer generations before selecting a
+producer. Its consumer cancellation is a lifetime barrier: a stale configured
+connection is retired, so reopen the consumer stream before creating another
+connection. The helper does not open services or stream owners; its unsafe
+constructor requires those bindings and owners to remain live.
+
+For an external provider that implements v1.8, video can select a standard CPU
+resource explicitly using `"frame_transport":"generic_cpu"` in its provider
+registration. Video submits that frame synchronously through the existing CPU
+encoder path. The bridge currently requires unknown color metadata and does not
+use generic source timestamps for pacing. This setting does not provide generic GPU or custom-resource
+forwarding to encoders; those require a compatible resource consumer and its
+own binding and lifecycle integration. Existing `cpu` and `dmabuf` settings
+continue to use their existing interfaces.
+
 ## Frame and processor contracts
 
 The C declarations live in `sdk/include/amaterasu_media.h`; the Rust equivalents

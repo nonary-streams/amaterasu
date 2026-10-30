@@ -1,5 +1,6 @@
 use super::*;
 use crate::model::{FRAME_COUNT, OUTPUT, Operation, frame_bytes};
+use amaterasu_media::{CAPTURE_INTERFACE_MINOR, CaptureApi};
 
 struct TestBinding(*const CaptureApi);
 
@@ -114,8 +115,8 @@ fn native_query_rejects_unknown_version_oversized_table_and_invalid_caller() {
     let size = size_of::<CaptureApi>() as u32;
     for query in [
         query(INTERFACE_MAJOR + 1, 0, size),
-        query(INTERFACE_MAJOR, 2, size),
-        query(INTERFACE_MAJOR, 1, size + 1),
+        query(INTERFACE_MAJOR, 9, size),
+        query(INTERFACE_MAJOR, 1, size_of::<CaptureApiV1_8>() as u32 + 1),
         NativeInterfaceQuery {
             header: AbiHeader {
                 size: 0,
@@ -330,4 +331,147 @@ fn binding_copies_borrowed_caller_and_rejected_sink_errors_do_not_advance() {
     assert_eq!(binding.read(id, &mut sink), STATUS_OK);
     assert_eq!(sink.frames[0], sink.frames[1]);
     assert_eq!(controller.lock().unwrap().metrics()["frames"], 1);
+}
+
+#[derive(Default)]
+struct ResourceProbe {
+    offer: Option<(u64, u32, u32, u32, u32)>,
+    retained: Option<CaptureResourceFrame>,
+    status: Status,
+    sequences: Vec<u64>,
+}
+
+unsafe extern "C" fn inspect_offer(
+    context: *mut c_void,
+    offer: *const CaptureResourceOffer,
+) -> Status {
+    // SAFETY: the test passes a live probe and the provider supplies a borrowed offer.
+    let probe = unsafe { &mut *context.cast::<ResourceProbe>() };
+    let offer = unsafe { &*offer };
+    assert_eq!(offer.resource.kind, FRAME_RESOURCE_CPU);
+    assert_eq!(offer.resource.version, 1);
+    assert_eq!(offer.resource.namespace, [0; 16]);
+    assert_eq!(
+        offer.resource.size as usize,
+        size_of::<CpuResourceCapabilities>()
+    );
+    assert_eq!(offer.ownership, FRAME_OWNERSHIP_RETAINABLE);
+    assert_eq!(offer.accessibility, FRAME_ACCESS_CPU);
+    assert_eq!(offer.acquire_sync.kind, FRAME_SYNC_NONE);
+    assert_eq!(offer.completion_sync.kind, FRAME_SYNC_NONE);
+    // SAFETY: the standard CPU offer provides this exact capability payload during the call.
+    let capabilities = unsafe { &*offer.resource.data.cast::<CpuResourceCapabilities>() };
+    probe.offer = Some((
+        offer.id,
+        capabilities.format,
+        capabilities.min_width,
+        capabilities.max_width,
+        capabilities.max_height,
+    ));
+    probe.status
+}
+
+unsafe extern "C" fn inspect_resource(
+    context: *mut c_void,
+    frame: *const CaptureResourceFrame,
+) -> Status {
+    // SAFETY: probe and borrowed frame are valid for the synchronous callback.
+    let probe = unsafe { &mut *context.cast::<ResourceProbe>() };
+    let frame = unsafe { &*frame };
+    assert_eq!((frame.offer_generation, frame.offer_id), (1, 1));
+    assert_eq!(
+        (frame.resource.kind, frame.resource.version),
+        (FRAME_RESOURCE_CPU, 1)
+    );
+    assert_eq!(frame.acquire_sync.kind, FRAME_SYNC_NONE);
+    assert_eq!((frame.color.version, frame.color.size), (0, 0));
+    assert_eq!((frame.clock.version, frame.clock.size), (0, 0));
+    assert_eq!(
+        (frame.pacing_clock.version, frame.pacing_clock.size),
+        (0, 0)
+    );
+    // SAFETY: the CPU frame descriptor is valid and immutable during this call.
+    let cpu = unsafe { &*frame.resource.data.cast::<CpuFrame>() };
+    assert_eq!(cpu.validate(), Ok(()));
+    assert_eq!(cpu.sequence, frame.sequence);
+    probe.sequences.push(frame.sequence);
+    if probe.status == STATUS_OK && probe.retained.is_none() {
+        // SAFETY: the provider holds its reference during this callback.
+        assert_eq!(unsafe { (frame.retain)(frame.context) }, STATUS_OK);
+        probe.retained = Some(*frame);
+    }
+    probe.status
+}
+
+#[test]
+fn resource_negotiation_is_owned_and_leases_keep_accepted_pixels_immutable() {
+    let (controller, factory, id) = setup();
+    let owner = TestBinding::new(&factory, b"amaterasu.video");
+    let wrong = TestBinding::new(&factory, b"amaterasu.nvhttp");
+    // SAFETY: the provider advertises v1.8 and the binding is live throughout this test.
+    let api = unsafe { &*owner.0.cast::<CaptureApiV1_8>() };
+    let wrong_api = unsafe { &*wrong.0.cast::<CaptureApiV1_8>() };
+    let context = api.base.base.base.context;
+    let mut probe = ResourceProbe::default();
+    let sink = CaptureResourceFrameSink {
+        context: (&mut probe as *mut ResourceProbe).cast(),
+        write: inspect_resource,
+    };
+    let offers = CaptureResourceOfferSink {
+        context: (&mut probe as *mut ResourceProbe).cast(),
+        write: inspect_offer,
+    };
+    let mut generation = 0;
+    // SAFETY: all bindings, sinks and outputs are live for each synchronous call.
+    unsafe {
+        assert_eq!(
+            (api.read_resource_frame)(context, id, sink),
+            MEDIA_UNSUPPORTED
+        );
+        assert_eq!(
+            (wrong_api.enumerate_resources)(
+                wrong_api.base.base.base.context,
+                id,
+                offers,
+                &mut generation
+            ),
+            MEDIA_CLOSED
+        );
+        assert_eq!(
+            (wrong_api.select_resource)(wrong_api.base.base.base.context, id, 1, 1),
+            MEDIA_CLOSED
+        );
+        assert_eq!(
+            (api.enumerate_resources)(context, id, offers, &mut generation),
+            STATUS_OK
+        );
+        assert_eq!(generation, 1);
+        assert_eq!(probe.offer, Some((1, PIXEL_NV12, WIDTH, WIDTH, HEIGHT)));
+        assert_eq!((api.select_resource)(context, id, 2, 1), MEDIA_UNSUPPORTED);
+        assert_eq!((api.select_resource)(context, id, 1, 1), STATUS_OK);
+        assert_eq!((api.select_resource)(context, id, 1, 99), MEDIA_UNSUPPORTED);
+        probe.status = MEDIA_BUSY;
+        assert_eq!((api.read_resource_frame)(context, id, sink), MEDIA_BUSY);
+        probe.status = STATUS_OK;
+        assert_eq!((api.read_resource_frame)(context, id, sink), STATUS_OK);
+        assert_eq!((api.read_resource_frame)(context, id, sink), STATUS_OK);
+    }
+    assert_eq!(probe.sequences, [0, 0, 1]);
+    let retained = probe.retained.take().unwrap();
+    controller
+        .lock()
+        .unwrap()
+        .close("amaterasu.video", id)
+        .unwrap();
+    // SAFETY: retained reference pins both the descriptor and immutable frame storage.
+    let cpu = unsafe { &*retained.resource.data.cast::<CpuFrame>() };
+    assert_eq!(unsafe { cpu.bytes() }.unwrap(), frame_bytes(0));
+    // SAFETY: this consumes the successful retain after all reads have completed.
+    unsafe { (retained.release)(retained.context, &none_descriptor()) };
+    // SAFETY: binding and sink remain live; closed stream cannot deliver another frame.
+    assert_eq!(
+        unsafe { (api.read_resource_frame)(context, id, sink) },
+        MEDIA_CLOSED
+    );
+    assert_eq!(controller.lock().unwrap().metrics()["frames"], 2);
 }

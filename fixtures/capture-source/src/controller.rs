@@ -29,6 +29,7 @@ struct Stream {
     owner: String,
     operation_id: Option<String>,
     delivery: Arc<DeliveryState>,
+    resource_selected: bool,
 }
 
 /// One exclusively reserved frame. Dropping a rejected delivery permits an
@@ -123,6 +124,7 @@ impl Controller {
                 owner: caller.into(),
                 operation_id,
                 delivery: Arc::new(DeliveryState::default()),
+                resource_selected: false,
             },
         );
         self.callers.entry(caller.into()).or_default().opened += 1;
@@ -152,6 +154,33 @@ impl Controller {
 
     pub fn authorize(&self, caller: &str, id: u64) -> FixtureResult<()> {
         self.owned(caller, id).map(|_| ())
+    }
+
+    pub fn select_resource(
+        &mut self,
+        caller: &str,
+        id: u64,
+        generation: u64,
+        offer: u64,
+    ) -> Status {
+        let Some(stream) = self
+            .streams
+            .get_mut(&id)
+            .filter(|stream| stream.owner == caller)
+        else {
+            return MEDIA_CLOSED;
+        };
+        if generation != 1 || offer != 1 {
+            return amaterasu_media::MEDIA_UNSUPPORTED;
+        }
+        stream.resource_selected = true;
+        STATUS_OK
+    }
+
+    pub fn resource_selected(&self, caller: &str, id: u64) -> Result<bool, Status> {
+        self.owned(caller, id)
+            .map(|stream| stream.resource_selected)
+            .map_err(|_| MEDIA_CLOSED)
     }
 
     pub fn close(&mut self, caller: &str, id: u64) -> FixtureResult<()> {

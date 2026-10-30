@@ -55,7 +55,9 @@ def checked(api, path, payload=None, bearer=None):
     return result
 
 
-def configure(harness, custom_capture=False, direct=False):
+def configure(harness, custom_capture=False, direct=False, generic_cpu=False):
+    if generic_cpu:
+        custom_capture = True
     path = harness.root / "bootstrap.json"
     bootstrap = json.loads(path.read_text())
     settings = bootstrap["policy"]["settings"]
@@ -99,7 +101,10 @@ def configure(harness, custom_capture=False, direct=False):
     settings["amaterasu.software-probe-audio"] = {"enable_video": False}
     settings["amaterasu.video"] = {"enabled": True, "capture_providers": [] if custom_capture else ["dxgi"]}
     if custom_capture:
-        settings["amaterasu.video"]["external_capture_providers"] = {"custom": CUSTOM_CAPTURE}
+        settings["amaterasu.video"]["external_capture_providers"] = {
+            "custom": {"service": CUSTOM_CAPTURE, "frame_transport": "generic_cpu"}
+            if generic_cpu else CUSTOM_CAPTURE
+        }
         # The development policy composes several profiles, with the later
         # platform video entry replacing the software-probe entry. Explicitly
         # authorize this test-only provider for this isolated host.
@@ -349,7 +354,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--encoder", choices=("auto", "software"), default="auto")
     parser.add_argument("--custom-capture", action="store_true", help="route through the independent test capture service")
+    parser.add_argument("--generic-cpu", action="store_true",
+                        help="use the generic CPU resource API with the independent capture service")
     arguments = parser.parse_args()
+    custom_capture = arguments.custom_capture or arguments.generic_cpu
     oracle = Path(os.environ["AMATERASU_ENET_CLIENT_ORACLE"]).resolve(strict=True)
     # Use a dedicated target directory: enabling x264 must not overwrite default artifacts.
     target = Path(os.environ["CARGO_TARGET_DIR"])
@@ -359,12 +367,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix="amaterasu-public-software-stream-") as temporary:
         directory = Path(temporary)
         harness = ComponentHarness(directory)
-        configure(harness, arguments.custom_capture)
+        configure(harness, custom_capture, generic_cpu=arguments.generic_cpu)
         console = Console(harness)
         try:
             wait_ready(console)
             https, context = initialize(console, arguments.encoder)
-            evidence = exercise(console, https, context, oracle, directory, arguments.custom_capture)
+            evidence = exercise(console, https, context, oracle, directory, custom_capture)
             console.eof()
         except BaseException:
             print("".join(console.errors), file=sys.stderr)
@@ -372,6 +380,8 @@ def main():
         finally:
             console.close()
     print(f"Passed: public {arguments.encoder} selection, signed settings with min_threads=3, paired HTTPS launch, encrypted RTSP/ENet/video, real NV12 video/x264, independent FFmpeg decode, post-activation IDR, FEC, graceful drain and owned-source cleanup.")
+    if arguments.generic_cpu:
+        print("Capture transport: negotiated generic CPU resource.")
     print(json.dumps(evidence, sort_keys=True))
     print("Not qualified: desktop capture, game/client playback, performance, Windows runtime or production x264 distribution; configuration parity IDs remain pending.")
 
