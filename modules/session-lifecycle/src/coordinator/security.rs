@@ -121,7 +121,18 @@ impl Coordinator {
             {
                 continue;
             }
+            let Ok(metadata) = super::provider_observations::metadata(journal, session, caller)
+            else {
+                return rejection("provider_metadata_unavailable");
+            };
             let mut result = payload.clone();
+            if let (Some(destination), Some(fields)) =
+                (result.as_object_mut(), metadata.as_object())
+            {
+                destination.extend(fields.clone());
+            } else {
+                return rejection("invalid_provider_request");
+            }
             result["status"] = json!("succeeded");
             result["session_target"] = json!({"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation});
             result["consumers_retired"] = json!(session.streams.iter().all(|(id, stream)| {
@@ -130,6 +141,9 @@ impl Coordinator {
                     || (stream.phase == StreamPhase::Quiescing
                         && stream.retirements == stream.required)
             }));
+            if serde_json::to_vec(&result).map_or(true, |bytes| bytes.len() > 16 * 1024) {
+                return rejection("provider_metadata_too_large");
+            }
             return result;
         }
         rejection("unknown_provider_admission")

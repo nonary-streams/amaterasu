@@ -133,6 +133,13 @@ impl Coordinator {
         let streams: Vec<_> = session.streams.iter().filter(|(_, stream)| stream.binding_owner == caller).map(|(stream_id, stream)| {
             json!({"target":{"kind":"stream","host_epoch":session.host_epoch,"session_id":session.id,"stream_id":stream_id,"expected_generation":stream.generation},"lifecycle_target":{"kind":"stream","host_epoch":session.host_epoch,"session_id":session.id,"stream_id":stream_id,"generation":stream.generation},"phase":stream.phase,"candidate":stream.candidate,"consumers_retired":stream.phase==StreamPhase::Retired || (stream.phase==StreamPhase::Quiescing && stream.retirements==stream.required)})
         }).collect();
-        json!({"status":"succeeded","provider":caller,"target":target,"session_target":{"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation},"execution_domain":execution_domain,"settings_revision":snapshot.revision,"settings":snapshot.settings,"streams":streams,"obligations":obligations,"plans":plans,"mutation_domains":mutation_domains})
+        let Ok(metadata) = super::provider_observations::metadata(journal, session, caller) else {
+            return rejection("provider_metadata_unavailable");
+        };
+        let result = json!({"status":"succeeded","provider":caller,"target":target,"session_target":{"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation},"execution_domain":execution_domain,"settings_revision":snapshot.revision,"settings":snapshot.settings,"streams":streams,"obligations":obligations,"plans":plans,"mutation_domains":mutation_domains,"admitted_plans":metadata["admitted_plans"],"resource_targets":metadata["resource_targets"],"stale_mutation_domains":metadata["stale_mutation_domains"]});
+        if serde_json::to_vec(&result).map_or(true, |bytes| bytes.len() > 16 * 1024) {
+            return rejection("provider_metadata_too_large");
+        }
+        result
     }
 }

@@ -3,6 +3,7 @@ mod action_endpoints;
 mod action_target;
 mod application;
 mod operations;
+mod provider_observations;
 mod providers;
 mod recovery;
 mod retention;
@@ -425,6 +426,8 @@ impl Coordinator {
         }
         let result = if operation == "recover_session" {
             self.recover_session(caller, initiator, payload, key)
+        } else if operation == "refresh_provider_observations" {
+            self.refresh_provider_observations(caller, initiator, payload, key)
         } else {
             self.admit(caller, initiator, payload, key)
         };
