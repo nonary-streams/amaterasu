@@ -3,6 +3,75 @@
 use super::*;
 use amaterasu_extension_api::{ResourceControlRequest, ResourceControlResponse, ResourceOutput};
 
+// A closed graph records the Work before the action advances to replan.
+// Only that independently verifiable action transition may differ; every
+// cleanup callback, control, target, graph and other Work field remains exact.
+fn matching_release_work(journal: &Journal, live: &Work, closed: &Work) -> bool {
+    if serde_json::to_value(live).ok() == serde_json::to_value(closed).ok() {
+        return true;
+    }
+    let (Some(current), Some(original)) = (&live.action_transfer, &closed.action_transfer) else {
+        return false;
+    };
+    let rebound_authorized = current.stage == ActionTransferStage::Rebound
+        && journal
+            .actions
+            .binding_for_rebind(&original.service, &original.permit)
+            .ok()
+            .as_ref()
+            == Some(&original.binding)
+        && journal
+            .actions
+            .binding_for_permit(&current.service, &current.permit)
+            .ok()
+            .as_ref()
+            == Some(&current.binding);
+    let expected_proof = action_release_proof::proof_from_composed_release(journal, live);
+    if !release_transfer_matches(
+        current,
+        original,
+        expected_proof.as_ref(),
+        rebound_authorized,
+    ) {
+        return false;
+    }
+    let mut normalized = live.clone();
+    normalized.action_transfer = closed.action_transfer.clone();
+    serde_json::to_value(normalized).ok() == serde_json::to_value(closed).ok()
+}
+
+fn release_transfer_matches(
+    current: &ActionTransfer,
+    original: &ActionTransfer,
+    expected: Option<&action_release_proof::ActionReleaseProof>,
+    rebound_authorized: bool,
+) -> bool {
+    if original.stage != ActionTransferStage::CleanupPending
+        || original.release_proof.is_some()
+        || current.service != original.service
+        || current.input_reservation_id != original.input_reservation_id
+        || current.snapshot != original.snapshot
+        || current.binding.operation_id != original.binding.operation_id
+        || current.binding.action_id != original.binding.action_id
+        || current.binding.target != original.binding.target
+        || current.binding.source != original.binding.source
+    {
+        return false;
+    }
+    let exact_binding = match current.stage {
+        ActionTransferStage::ReplanRequired => {
+            current.binding == original.binding
+                && current.permit == original.permit
+                && current.admission_id == original.admission_id
+        }
+        ActionTransferStage::Rebound => rebound_authorized,
+        ActionTransferStage::CleanupPending => false,
+    };
+    expected.is_some()
+        && exact_binding
+        && serde_json::to_value(&current.release_proof).ok() == serde_json::to_value(expected).ok()
+}
+
 pub(super) fn authenticated_input(
     journal: &Journal,
     request: &ResourceControlRequest,
@@ -40,7 +109,7 @@ pub(super) fn authenticated_input(
         &request.transition_id,
     );
     if let (Some(live), Some(closed)) = (live, closed_release)
-        && serde_json::to_value(live).ok() != serde_json::to_value(closed).ok()
+        && !matching_release_work(journal, live, closed)
     {
         return None;
     }
@@ -395,6 +464,88 @@ pub(super) fn authenticated_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_release_transition_requires_exact_binding_and_verified_proof() {
+        let target = amaterasu_extension_api::LifecycleTarget::Stream {
+            host_epoch: "epoch".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 1,
+        };
+        let binding = crate::action_authority::ActionBinding {
+            operation_id: "operation".into(),
+            action_id: "owner/remove".into(),
+            target: crate::action_authority::ActionTarget::Stream {
+                host_epoch: "epoch".into(),
+                session_id: "session".into(),
+                stream_id: "stream".into(),
+                expected_generation: 1,
+            },
+            plan_digest: "a".repeat(64),
+            source: crate::action_authority::Principal {
+                caller: "caller".into(),
+                initiator: "initiator".into(),
+            },
+        };
+        let original = ActionTransfer {
+            service: "actions".into(),
+            permit: "permit".into(),
+            binding,
+            input_reservation_id: Some("input".into()),
+            admission_id: None,
+            snapshot: None,
+            stage: ActionTransferStage::CleanupPending,
+            release_proof: None,
+        };
+        let proof = action_release_proof::ActionReleaseProof {
+            target,
+            transition_id: "transition".into(),
+            original_admissions: Default::default(),
+            callbacks: vec![],
+        };
+        let mut current = original.clone();
+        current.stage = ActionTransferStage::ReplanRequired;
+        current.release_proof = Some(proof.clone());
+        assert!(release_transfer_matches(
+            &current,
+            &original,
+            Some(&proof),
+            false
+        ));
+        assert!(!release_transfer_matches(&current, &original, None, false));
+        current.binding.action_id = "foreign".into();
+        assert!(!release_transfer_matches(
+            &current,
+            &original,
+            Some(&proof),
+            false
+        ));
+        current.binding = original.binding.clone();
+        current.release_proof.as_mut().unwrap().transition_id = "forged".into();
+        assert!(!release_transfer_matches(
+            &current,
+            &original,
+            Some(&proof),
+            false
+        ));
+        current.release_proof = Some(proof.clone());
+        current.stage = ActionTransferStage::Rebound;
+        current.permit = "new".into();
+        assert!(!release_transfer_matches(
+            &current,
+            &original,
+            Some(&proof),
+            false
+        ));
+        assert!(release_transfer_matches(
+            &current,
+            &original,
+            Some(&proof),
+            true
+        ));
+    }
+
     use serde_json::json;
 
     #[test]
