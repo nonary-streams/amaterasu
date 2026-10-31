@@ -271,10 +271,32 @@ revocation do not prove that effects from an old worker stopped. Follow the
 host's existing lifecycle and recovery procedures and retain any unconfirmed
 cleanup state.
 
-The SDK replacement fixture answers only static `list` and `resolve` requests and
-requires immediate caller and initiator to match; it rejects delegated access
-and does not implement launch, discovery, artwork, or persistence. Its sample
-settings and signed-set packaging are useful for testing selection, not a claim
-of behavioral equivalence or end-to-end streaming compatibility. A production
-replacement must implement and be qualified for every operation its selected
-consumers use, including their actual delegation identities and failure paths.
+The SDK replacement fixture supports a static `list` and `resolve` mode by
+default. Its optional `catalog_backed` mode forwards those reads to Catalog as
+parent-linked requests and projects only public ID and name fields. In both
+modes it admits only configured callers whose broker-attested immediate caller
+and initiator match; it rejects incoming delegated calls. It handles one pending
+request and does not implement launch, discovery, artwork, or catalog import.
+It is a demonstration, not a production-hardened or behaviorally complete
+replacement.
+
+For catalog-backed mode, the earlier minimal template and policy fragments are
+not sufficient. Add `"amaterasu.catalog": "0.1.0"` and `"amaterasu.state":
+"0.1.0"` to the replacement template's `requires`, and add
+`"amaterasu.catalog/1"` and `"amaterasu.state/1"` to both its requested
+`call` grants and its bootstrap principal approvals. Configure the fixture with
+`"catalog_backed": true`; keep its `allowed_callers` explicit. Catalog's
+`export_principals` must map each permitted initiating caller to the intended
+catalog owner. The initiating caller also needs the catalog and State call
+grants for the parented chain. These requirements are separate from the
+mandatory catalog `library_principal` binding above.
+
+A signed temporary-development-host test selected this fixture in one complete
+set, verified and staged it, then used `amaterasu.console` to create a catalog
+entry and directly list and resolve it through the replacement. The replacement
+called real Catalog and State through the broker; the test also rejected a
+forged payload initiator and a direct unauthorized catalog export. This qualifies
+that local fixture path only. It does not test NVHTTP, artwork, actual game
+launch, system installation, or end-to-end streaming. A production replacement
+must implement and be qualified for every operation its selected consumers use,
+including their actual delegation identities and failure paths.
