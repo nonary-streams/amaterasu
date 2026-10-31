@@ -514,7 +514,38 @@ impl Coordinator {
                     _ => true,
                 };
                 if fully_released && let Some(admission) = &state.admission_id {
-                    authority.finish_admission(provider, admission)?;
+                    let resource = match &state.response {
+                        Some(ProviderResponse::Prepared {
+                            candidate: Some(candidate),
+                            ..
+                        }) => {
+                            let plan = state.plan.as_ref().ok_or("candidate_plan_missing")?;
+                            let (_, _, _, generation) =
+                                super::operations::target_parts(&work.target)?;
+                            crate::plan_validation::validate_candidate(
+                                plan,
+                                candidate,
+                                generation,
+                                candidate.geometry_revision,
+                            )?;
+                            Some(crate::planning::ResourceRef {
+                                provider: candidate.resource.provider.clone(),
+                                resource_id: candidate.resource.resource_id.clone(),
+                                incarnation: candidate.resource.incarnation.clone(),
+                                revision: candidate.resource.revision,
+                                execution_domain: candidate.resource.execution_domain.clone(),
+                                mutation_domains: candidate
+                                    .resource
+                                    .mutation_domains
+                                    .iter()
+                                    .cloned()
+                                    .chain(candidate.resource.mutation_domain.iter().cloned())
+                                    .collect(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    authority.finish_admission_with_resource(provider, admission, resource)?;
                 }
                 if let Some(ProviderResponse::Cleanup { outcomes }) = &state.response {
                     let settled = self.shared.borrow().value.authority.settled.clone();

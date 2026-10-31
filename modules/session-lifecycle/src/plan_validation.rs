@@ -242,9 +242,13 @@ pub fn validate_candidate(
             .incarnation
             .as_ref()
             .is_some_and(|incarnation| incarnation != &resource.incarnation)
-        || planned
-            .expected_revision
-            .is_some_and(|revision| revision != resource.revision)
+        || planned.expected_revision.is_some_and(|revision| {
+            if planned.access == ResourceAccess::Read {
+                resource.revision != revision
+            } else {
+                resource.revision < revision
+            }
+        })
         || resource
             .mutation_domain
             .as_ref()
@@ -336,6 +340,17 @@ mod tests {
         let (plan, _, _) = fixture();
         let mut candidate: api::CaptureBinding = serde_json::from_value(json!({"capture_provider":"capture", "selector_schema":"selector/1", "selector":{}, "resource":{"provider":"display", "resource_id":"output", "incarnation":"native", "revision":4, "execution_domain":"seat", "mutation_domain":"topology", "mutation_domains":["topology"]}, "mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}, "plan_revision":2, "geometry_revision":3, "generation":4})).unwrap();
         assert!(validate_candidate(&plan, &candidate, 4, 3).is_ok());
+        candidate.resource.revision = 5;
+        assert!(validate_candidate(&plan, &candidate, 4, 3).is_ok());
+        let mut read_only = plan.clone();
+        read_only.resources[0].access = ResourceAccess::Read;
+        assert!(validate_candidate(&read_only, &candidate, 4, 3).is_err());
+        candidate.resource.revision = 3;
+        assert!(validate_candidate(&plan, &candidate, 4, 3).is_err());
+        candidate.resource.revision = 4;
+        candidate.resource.execution_domain = "other-seat".into();
+        assert!(validate_candidate(&plan, &candidate, 4, 3).is_err());
+        candidate.resource.execution_domain = "seat".into();
         candidate.resource.incarnation = "replacement".into();
         assert!(validate_candidate(&plan, &candidate, 4, 3).is_err());
         candidate.resource.incarnation = "native".into();

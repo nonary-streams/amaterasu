@@ -163,6 +163,87 @@ fn validate_domain_advance(old: &DomainState, current: &DomainState) -> ModuleRe
     Ok(())
 }
 
+/// Reap only orphaned resources whose complete domain observations prove they
+/// are idle. Stale or borrowed domains conservatively retain their resources.
+fn prune_idle_orphan_resources(state: &mut AuthorityState) {
+    let referenced: BTreeSet<(String, String)> = state
+        .admissions
+        .values()
+        .chain(state.settled.values())
+        .flat_map(|admission| {
+            admission
+                .plan
+                .resources
+                .iter()
+                .map(|resource| (resource.provider.clone(), resource.resource_id.clone()))
+        })
+        .collect();
+    for (provider, resources) in &mut state.snapshot.resources {
+        resources.retain(|id, resource| {
+            referenced.contains(&(provider.clone(), id.clone()))
+                || resource.mutation_domains.is_empty()
+                || resource.mutation_domains.iter().any(|domain| {
+                    state.domain_locks.contains_key(domain)
+                        || state.refresh_required.contains(domain)
+                        || state
+                            .snapshot
+                            .domains
+                            .get(domain)
+                            .is_none_or(|observation| !observation.borrowers.is_empty())
+                })
+        });
+    }
+    state
+        .snapshot
+        .resources
+        .retain(|_, resources| !resources.is_empty());
+}
+
+fn validate_materialized_resource(
+    admission: &Admission,
+    resource: &ResourceRef,
+) -> ModuleResult<()> {
+    if resource.provider != admission.provider
+        || !valid_id(&resource.resource_id)
+        || !valid_id(&resource.incarnation)
+        || !valid_id(&resource.execution_domain)
+        || resource.revision == 0
+    {
+        return Err("invalid materialized resource".into());
+    }
+    let mut matches = admission.plan.resources.iter().filter(|planned| {
+        planned.provider == resource.provider && planned.resource_id == resource.resource_id
+    });
+    let planned = matches.next().ok_or("resource was not admitted")?;
+    if matches.next().is_some()
+        || planned.execution_domain != resource.execution_domain
+        || planned
+            .mutation_domains
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != resource.mutation_domains
+        || planned
+            .incarnation
+            .as_ref()
+            .is_some_and(|incarnation| incarnation != &resource.incarnation)
+        || planned.expected_revision.is_some_and(|revision| {
+            if planned.access == amaterasu_extension_api::ResourceAccess::Read {
+                resource.revision != revision
+            } else {
+                resource.revision < revision
+            }
+        })
+        || resource
+            .mutation_domains
+            .iter()
+            .any(|domain| !admission.rights.iter().any(|(owned, _)| owned == domain))
+    {
+        return Err("materialized resource exceeds admission".into());
+    }
+    Ok(())
+}
+
 impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
     /// `selections` and all recovered coordinator state must originate from
     /// verified installed metadata and the private durable journal respectively.
@@ -260,15 +341,38 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
     /// callback. Cleanup obligations remain outstanding in settled history.
     /// Unknown callback outcomes must retain the admission and its locks.
     pub fn finish_admission(&mut self, provider: &str, admission_id: &str) -> ModuleResult<()> {
+        self.finish_admission_with_resource(provider, admission_id, None)
+    }
+
+    /// Materialize only the exact resource reserved by the admitted plan and
+    /// persist it together with the terminal admission transition.
+    pub fn finish_admission_with_resource(
+        &mut self,
+        provider: &str,
+        admission_id: &str,
+        resource: Option<ResourceRef>,
+    ) -> ModuleResult<()> {
         if self.poisoned || !self.selections.contains_key(provider) {
             return Err("provider is not approved".into());
         }
         if let Some(settled) = self.state.settled.get(admission_id) {
-            return if settled.provider == provider {
-                Ok(())
-            } else {
-                Err("admission provider mismatch".into())
-            };
+            if settled.provider != provider {
+                return Err("admission provider mismatch".into());
+            }
+            if let Some(resource) = resource {
+                validate_materialized_resource(settled, &resource)?;
+                if self
+                    .state
+                    .snapshot
+                    .resources
+                    .get(provider)
+                    .and_then(|items| items.get(&resource.resource_id))
+                    != Some(&resource)
+                {
+                    return Err("settled resource mismatch".into());
+                }
+            }
+            return Ok(());
         }
         let admission = self
             .state
@@ -284,6 +388,26 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             return Err("admission provider or rights mismatch".into());
         }
         let mut next = self.state.clone();
+        if let Some(resource) = resource {
+            validate_materialized_resource(&admission, &resource)?;
+            if let Some(old) = next
+                .snapshot
+                .resources
+                .get(provider)
+                .and_then(|resources| resources.get(&resource.resource_id))
+                && (old.execution_domain != resource.execution_domain
+                    || old.mutation_domains != resource.mutation_domains
+                    || resource.revision < old.revision
+                    || (resource != *old && resource.revision == old.revision))
+            {
+                return Err("materialized resource conflicts with prior observation".into());
+            }
+            next.snapshot
+                .resources
+                .entry(provider.to_owned())
+                .or_default()
+                .insert(resource.resource_id.clone(), resource);
+        }
         for (domain, _) in &admission.rights {
             next.domain_locks.remove(domain);
             next.refresh_required.insert(domain.clone());
@@ -329,6 +453,7 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         }
         let mut next = self.state.clone();
         next.settled.remove(admission_id);
+        prune_idle_orphan_resources(&mut next);
         self.persist(next)
     }
 
@@ -471,21 +596,43 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
                 .snapshot
                 .resources
                 .get(provider)
-                .and_then(|resources| resources.get(&observation.resource_id))
-                .ok_or("unknown resource")?;
-            if old.mutation_domains != observation.mutation_domains
-                || old.execution_domain != observation.execution_domain
-                || observation.revision < old.revision
-                || (observation != old && observation.revision == old.revision)
-            {
-                return Err("stale or substituted resource observation".into());
+                .and_then(|resources| resources.get(&observation.resource_id));
+            if let Some(old) = old {
+                if old.mutation_domains != observation.mutation_domains
+                    || old.execution_domain != observation.execution_domain
+                    || observation.revision < old.revision
+                    || (observation != old && observation.revision == old.revision)
+                {
+                    return Err("stale or substituted resource observation".into());
+                }
+            } else {
+                let reserved = self.state.settled.values().any(|admission| {
+                    admission.provider == provider
+                        && admission.plan.resources.iter().any(|planned| {
+                            planned.provider == provider
+                                && planned.resource_id == observation.resource_id
+                                && planned.incarnation.is_none()
+                                && planned.expected_revision.is_none()
+                                && planned.execution_domain == observation.execution_domain
+                                && planned
+                                    .mutation_domains
+                                    .iter()
+                                    .cloned()
+                                    .collect::<BTreeSet<_>>()
+                                    == observation.mutation_domains
+                        })
+                });
+                if !reserved {
+                    return Err("unknown resource".into());
+                }
             }
             next.snapshot
                 .resources
-                .get_mut(provider)
-                .expect("validated resource owner")
+                .entry(provider.to_owned())
+                .or_default()
                 .insert(observation.resource_id.clone(), observation.clone());
         }
+        prune_idle_orphan_resources(&mut next);
         self.persist(next)
     }
 
@@ -1262,3 +1409,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "prepare_materialization_tests.rs"]
+mod materialization_tests;
