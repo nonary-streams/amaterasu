@@ -8,6 +8,7 @@ mod action_endpoints;
 mod action_release_proof;
 mod action_target;
 mod application;
+mod checkpoint_queries;
 #[allow(dead_code)] // Checkpoint integration is not yet enabled.
 mod closed_stream;
 mod composed_release_proof;
