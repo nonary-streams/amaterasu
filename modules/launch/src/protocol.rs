@@ -438,6 +438,16 @@ pub enum CatalogLaunch {
         #[serde(default)]
         preparation: Vec<PreparationStep>,
     },
+    Provider {
+        provider: String,
+        application_id: String,
+        #[serde(default = "default_playnite_exit_timeout_seconds")]
+        exit_timeout_seconds: u64,
+        #[serde(default)]
+        working_directory: Option<String>,
+        #[serde(default)]
+        preparation: Vec<PreparationStep>,
+    },
     /// A process-less session that owns only the prepare lease. It carries no
     /// program, path, or provider identity.
     Desktop {
@@ -594,6 +604,13 @@ pub enum LaunchTarget {
         working_directory: Option<String>,
         preparation: Vec<PlannedPreparationStep>,
     },
+    Provider {
+        provider: String,
+        application_id: String,
+        exit_timeout_seconds: u64,
+        working_directory: Option<String>,
+        preparation: Vec<PlannedPreparationStep>,
+    },
     /// A Desktop session has no process and no provider ticket. The application
     /// provider's prepare lease is the only effect-bearing dependency.
     Desktop {
@@ -671,6 +688,10 @@ impl LaunchTarget {
             }
             Self::Playnite { .. } if elevated => Err("invalid_catalog_response"),
             Self::PlayniteFullscreen { .. } if elevated => Err("invalid_catalog_response"),
+            Self::Provider { .. } if elevated => Err("invalid_catalog_response"),
+            Self::Provider { .. } if steam_id.is_some() || steam_install_dir.is_some() => {
+                Err("invalid_catalog_response")
+            }
             Self::Desktop { .. } if elevated => Err("invalid_catalog_response"),
             Self::Desktop { .. } if steam_id.is_some() || steam_install_dir.is_some() => {
                 Err("invalid_catalog_response")
@@ -718,6 +739,29 @@ impl LaunchTarget {
                     working_directory.as_deref(),
                 )?;
                 Ok(Self::PlayniteFullscreen {
+                    exit_timeout_seconds,
+                    working_directory,
+                    preparation,
+                })
+            }
+            Self::Provider {
+                provider,
+                application_id,
+                exit_timeout_seconds,
+                working_directory,
+                preparation,
+            } => {
+                let preparation = merge_preparation_plan(
+                    global_preparation,
+                    legacy_global_preparation,
+                    preparation,
+                    legacy_application_preparation,
+                    !exclude_global_preparation,
+                    working_directory.as_deref(),
+                )?;
+                Ok(Self::Provider {
+                    provider,
+                    application_id,
                     exit_timeout_seconds,
                     working_directory,
                     preparation,
@@ -809,6 +853,38 @@ impl LaunchTarget {
                     return Err("invalid_catalog_response");
                 }
                 Ok(Self::PlayniteFullscreen {
+                    exit_timeout_seconds,
+                    working_directory,
+                    preparation: preparation
+                        .into_iter()
+                        .map(PlannedPreparationStep::Structured)
+                        .collect(),
+                })
+            }
+            CatalogLaunch::Provider {
+                provider,
+                application_id,
+                exit_timeout_seconds,
+                working_directory,
+                preparation,
+            } => {
+                let working_directory = working_directory
+                    .as_deref()
+                    .map(|directory| resolve_working_directory(directory, environment))
+                    .transpose()?
+                    .flatten();
+                if !valid_catalog_principal(&provider)
+                    || application_id.trim().is_empty()
+                    || application_id.len() > 96
+                    || application_id.chars().any(char::is_control)
+                    || !(1..=MAX_EXIT_TIMEOUT_SECONDS).contains(&exit_timeout_seconds)
+                    || !valid_preparation(&preparation)
+                {
+                    return Err("invalid_catalog_response");
+                }
+                Ok(Self::Provider {
+                    provider,
+                    application_id,
                     exit_timeout_seconds,
                     working_directory,
                     preparation: preparation
@@ -1364,7 +1440,9 @@ impl Executable {
                 let _ = path;
                 Err("unsupported_launch_kind")
             }
-            CatalogLaunch::Playnite { .. } => Err("unsupported_launch_kind"),
+            CatalogLaunch::Playnite { .. } | CatalogLaunch::Provider { .. } => {
+                Err("unsupported_launch_kind")
+            }
             CatalogLaunch::PlayniteFullscreen { .. } | CatalogLaunch::Desktop { .. } => {
                 Err("unsupported_launch_kind")
             }
@@ -2038,11 +2116,19 @@ pub fn error(code: &str) -> Value {
     json!({"ok":false,"code":code})
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRoute {
+    pub importer: String,
+    pub service: String,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub environment: BTreeMap<String, String>,
     pub retirement_observers: BTreeSet<String>,
+    pub provider_routes: BTreeMap<String, ProviderRoute>,
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -2051,6 +2137,27 @@ impl Settings {
                 .retirement_observers
                 .iter()
                 .any(|observer| !valid_catalog_principal(observer))
+        {
+            return Err("invalid_launch_settings");
+        }
+        if self.provider_routes.len() > 32
+            || self.provider_routes.iter().any(|(key, route)| {
+                !valid_catalog_principal(key)
+                    || !valid_catalog_principal(&route.importer)
+                    || route
+                        .service
+                        .strip_suffix("/1")
+                        .is_none_or(|name| !valid_catalog_principal(name))
+            })
+        {
+            return Err("invalid_launch_settings");
+        }
+        let mut importers = BTreeSet::new();
+        let mut services = BTreeSet::new();
+        if self
+            .provider_routes
+            .values()
+            .any(|route| !importers.insert(&route.importer) || !services.insert(&route.service))
         {
             return Err("invalid_launch_settings");
         }
@@ -4053,5 +4160,28 @@ mod keybindings_override_tests {
             );
         }
         assert!(serde_json::from_value::<ApplicationConfigOverrides>(Value::Null).is_err());
+    }
+    #[test]
+    fn generic_provider_routes_require_unique_trusted_importers_and_services() {
+        let valid = json!({"provider_routes":{"example":{"importer":"example.importer","service":"example.provider/1"}}});
+        let settings: crate::protocol::Settings = serde_json::from_value(valid.clone()).unwrap();
+        assert!(settings.validate().is_ok());
+        let mut duplicate = valid.clone();
+        duplicate["provider_routes"]["other"] =
+            json!({"importer":"example.importer","service":"other.provider/1"});
+        assert!(
+            serde_json::from_value::<crate::protocol::Settings>(duplicate)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        let mut malformed = valid;
+        malformed["provider_routes"]["example"]["service"] = json!("example.provider/2");
+        assert!(
+            serde_json::from_value::<crate::protocol::Settings>(malformed)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 }

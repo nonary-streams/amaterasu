@@ -221,7 +221,10 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
             entry
                 .validate()
                 .map_err(|message| error("invalid_entry", message))?;
-            if matches!(&entry.launch, Launch::Playnite { .. }) {
+            if matches!(
+                &entry.launch,
+                Launch::Playnite { .. } | Launch::Provider { .. }
+            ) {
                 return Err(error(
                     "provider_launch_required",
                     "Playnite launch targets can only be written by the trusted provider",
@@ -247,7 +250,10 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
             check_revision(&document, expected_revision)?;
             reject_provider_artwork(&entry)?;
             let existing = find_entry(&document, &id)?;
-            if matches!(&existing.launch, Launch::Playnite { .. }) {
+            if matches!(
+                &existing.launch,
+                Launch::Playnite { .. } | Launch::Provider { .. }
+            ) {
                 return Err(error(
                     "provider_entry_managed",
                     "Playnite launch identity can only be changed by its provider",
@@ -265,7 +271,10 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
             entry
                 .validate()
                 .map_err(|message| error("invalid_entry", message))?;
-            if matches!(&entry.launch, Launch::Playnite { .. }) {
+            if matches!(
+                &entry.launch,
+                Launch::Playnite { .. } | Launch::Provider { .. }
+            ) {
                 return Err(error(
                     "provider_launch_required",
                     "Playnite launch targets can only be written by the trusted provider",
@@ -526,6 +535,16 @@ pub fn matches_query(entry: &Entry, query: &str) -> bool {
         } => {
             contains(program)
                 || contains(&format!("{} {}", program, arguments.join(" ")))
+                || working_directory.as_deref().is_some_and(contains)
+        }
+        Launch::Provider {
+            provider,
+            application_id,
+            working_directory,
+            ..
+        } => {
+            contains(provider)
+                || contains(application_id)
                 || working_directory.as_deref().is_some_and(contains)
         }
         Launch::Playnite {

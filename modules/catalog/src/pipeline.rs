@@ -91,6 +91,8 @@ struct LaunchMarkerScan {
     state_revision: u64,
     entry_id: String,
     fingerprint: String,
+    importer: String,
+    expected_source_id: Option<String>,
     after: Option<String>,
     scanned: usize,
     source_id: Option<String>,
@@ -151,6 +153,7 @@ struct ProviderInventoryRequest {
 #[derive(Clone)]
 struct ProviderSession {
     caller: String,
+    provider_key: Option<String>,
     key: String,
     state_present: bool,
     collection_revision: u64,
@@ -227,6 +230,7 @@ pub struct Pipeline {
     export_principals: BTreeMap<String, String>,
     steam_id_export_principals: BTreeMap<String, String>,
     import_principals: BTreeMap<String, String>,
+    provider_launch_principals: BTreeMap<String, String>,
     provider_sessions: BTreeMap<String, ProviderSession>,
     queued: VecDeque<Incoming>,
     pending: Option<Pending>,
@@ -247,6 +251,11 @@ impl Pipeline {
             import_principals,
             ..Self::default()
         }
+    }
+
+    pub fn with_provider_launch_principals(mut self, principals: BTreeMap<String, String>) -> Self {
+        self.provider_launch_principals = principals;
+        self
     }
 
     /// Seed the Desktop entry once into each owner's catalog before ordinary
@@ -620,6 +629,7 @@ impl Pipeline {
             .map(|marker| marker.source_id.clone())
             .collect();
         let mut session = ProviderSession {
+            provider_key: self.provider_launch_principals.get(&caller).cloned(),
             caller,
             key: context.key.clone(),
             state_present,
@@ -641,11 +651,15 @@ impl Pipeline {
                 Ok(intents) => intents,
                 Err(failure) => return complete(send, context.request_id, failure),
             };
-            session.seen_source_ids =
-                match validate_staged_intents(&session.caller, &BTreeSet::new(), &intents) {
-                    Ok(ids) => ids,
-                    Err(failure) => return complete(send, context.request_id, failure),
-                };
+            session.seen_source_ids = match validate_staged_intents(
+                &session.caller,
+                session.provider_key.as_deref(),
+                &BTreeSet::new(),
+                &intents,
+            ) {
+                Ok(ids) => ids,
+                Err(failure) => return complete(send, context.request_id, failure),
+            };
         }
         self.apply_provider_operation(context, scan.operation, session, send)
     }
@@ -1845,11 +1859,15 @@ impl Pipeline {
             expire_source_ids: batch.expire_source_ids,
             selection_remove_source_ids: batch.selection_remove_source_ids,
         };
-        let source_ids =
-            match validate_staged_intents(&session.caller, &session.seen_source_ids, &row) {
-                Ok(ids) => ids,
-                Err(failure) => return complete(send, context.request_id, failure),
-            };
+        let source_ids = match validate_staged_intents(
+            &session.caller,
+            session.provider_key.as_deref(),
+            &session.seen_source_ids,
+            &row,
+        ) {
+            Ok(ids) => ids,
+            Err(failure) => return complete(send, context.request_id, failure),
+        };
         session.seen_source_ids.extend(source_ids);
         let Some(next_sequence) = sequence.checked_add(1) else {
             return complete(
@@ -2815,10 +2833,49 @@ impl Pipeline {
                     Ok(entry) if entry.validate().is_ok() => entry,
                     _ => return complete(send, context.request_id, malformed()),
                 };
+                let (importer, expected_source_id) =
+                    match &entry.launch {
+                        Launch::Provider {
+                            provider,
+                            application_id,
+                            ..
+                        } => {
+                            let Some(importer) = self.provider_launch_principals.iter().find_map(
+                                |(importer, key)| (key == provider).then_some(importer.clone()),
+                            ) else {
+                                return complete(
+                                    send,
+                                    context.request_id,
+                                    error(
+                                        "provider_identity_required",
+                                        "provider target has no configured importer",
+                                    ),
+                                );
+                            };
+                            if self
+                                .import_principals
+                                .get(&importer)
+                                .is_none_or(|owner| context.key != format!("principal/{owner}"))
+                            {
+                                return complete(
+                                    send,
+                                    context.request_id,
+                                    error(
+                                        "provider_identity_required",
+                                        "provider importer is not authorized for this catalog",
+                                    ),
+                                );
+                            }
+                            (importer, Some(application_id.clone()))
+                        }
+                        _ => (LUTRIS_IMPORTER.to_owned(), None),
+                    };
                 let scan = LaunchMarkerScan {
                     state_revision,
                     entry_id: entry_id.to_owned(),
-                    fingerprint: provider_entry_fingerprint(LUTRIS_IMPORTER, &entry),
+                    fingerprint: provider_entry_fingerprint(&importer, &entry),
+                    importer,
+                    expected_source_id,
                     // State cursors name existing keys. Start at the beginning
                     // and resume only from keys returned by this revision.
                     after: None,
@@ -2909,7 +2966,7 @@ impl Pipeline {
         let Some(rows) = payload["entries"].as_array() else {
             return complete(send, context.request_id, malformed());
         };
-        let prefix = format!("{ENTRY_PREFIX}{LUTRIS_IMPORTER}:");
+        let prefix = format!("{ENTRY_PREFIX}{}:", scan.importer);
         let mut past_prefix = false;
         for row in rows {
             let Some(key) = row["key"].as_str() else {
@@ -2932,7 +2989,7 @@ impl Pipeline {
             }
             let source_id = &key[prefix.len()..];
             let marker: Marker = match serde_json::from_value(row["value"].clone()) {
-                Ok(marker) if validate_marker(&marker, LUTRIS_IMPORTER, source_id) => marker,
+                Ok(marker) if validate_marker(&marker, &scan.importer, source_id) => marker,
                 _ => return complete(send, context.request_id, malformed()),
             };
             if marker.entry_id == scan.entry_id {
@@ -2940,13 +2997,19 @@ impl Pipeline {
                     return complete(send, context.request_id, malformed());
                 }
                 scan.matched = true;
-                let numeric_id = source_id
-                    .parse::<i64>()
-                    .ok()
-                    .filter(|id| *id > 0 && id.to_string() == source_id);
-                let Some(_) = numeric_id else {
-                    return complete(send, context.request_id, malformed());
-                };
+                if let Some(expected_source_id) = &scan.expected_source_id {
+                    if source_id != expected_source_id {
+                        return complete(send, context.request_id, malformed());
+                    }
+                } else {
+                    let numeric_id = source_id
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|id| *id > 0 && id.to_string() == source_id);
+                    if numeric_id.is_none() {
+                        return complete(send, context.request_id, malformed());
+                    }
+                }
                 if !marker.detached && marker.fingerprint == scan.fingerprint {
                     scan.source_id = Some(source_id.to_owned());
                 }
@@ -2973,7 +3036,16 @@ impl Pipeline {
         }
         if let Some(source_id) = scan.source_id {
             scan.reply["provider_provenance"] =
-                json!({"provider":LUTRIS_IMPORTER,"source_id":source_id});
+                json!({"provider":scan.importer,"source_id":source_id});
+        } else if scan.expected_source_id.is_some() {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "provider_identity_required",
+                    "provider target has no attached importer marker",
+                ),
+            );
         }
         complete_selected(send, context, scan.reply)
     }
@@ -3207,6 +3279,7 @@ fn collect_staged(session: &ProviderSession) -> Result<StagedIntents, Value> {
 
 fn validate_staged_intents(
     caller: &str,
+    provider_key: Option<&str>,
     seen: &BTreeSet<String>,
     intents: &StagedIntents,
 ) -> Result<BTreeSet<String>, Value> {
@@ -3236,7 +3309,13 @@ fn validate_staged_intents(
         }
     }
     for item in &intents.entries {
-        validate_provider_entry(caller, &item.source_id, &item.entry, item.preserve_artwork)?;
+        validate_provider_entry(
+            caller,
+            provider_key,
+            &item.source_id,
+            &item.entry,
+            item.preserve_artwork,
+        )?;
     }
     Ok(ids)
 }
@@ -3256,10 +3335,19 @@ fn staged_batch(intents: &StagedIntents, revision: u64) -> ProviderBatch {
 /// Validate and plan a provider batch without publishing the collection edits.
 fn validate_provider_entry(
     caller: &str,
+    provider_key: Option<&str>,
     source_id: &str,
     entry: &Entry,
     preserve_artwork: bool,
 ) -> Result<(), Value> {
+    let invalid_generic_provider = match &entry.launch {
+        Launch::Provider {
+            provider,
+            application_id,
+            ..
+        } => provider_key != Some(provider.as_str()) || application_id != source_id,
+        _ => false,
+    };
     let invalid_launch_owner = matches!(
         &entry.launch,
         Launch::Playnite { .. } | Launch::PlayniteFullscreen { .. }
@@ -3305,7 +3393,11 @@ fn validate_provider_entry(
             "Steam metadata requires the authenticated Steam importer and matching source ID",
         ));
     }
-    if entry.validate().is_err() || invalid_launch_owner || invalid_fullscreen_import {
+    if entry.validate().is_err()
+        || invalid_launch_owner
+        || invalid_fullscreen_import
+        || invalid_generic_provider
+    {
         return Err(error(
             "invalid_entry",
             "provider entry identity or value is invalid",
@@ -3363,7 +3455,13 @@ fn plan_provider_batch(
             source_flags,
             preserve_artwork,
         } = provider_entry;
-        validate_provider_entry(&session.caller, &source_id, &entry, preserve_artwork)?;
+        validate_provider_entry(
+            &session.caller,
+            session.provider_key.as_deref(),
+            &source_id,
+            &entry,
+            preserve_artwork,
+        )?;
         let key = entry_key(&session.caller, &source_id);
         let existing = session.markers.get(&key).cloned();
         let source_flags = source_flags

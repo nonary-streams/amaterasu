@@ -5,14 +5,13 @@
 //! fixed at startup; no identity or service selector is taken from the payload.
 //! Grants route trusted native code and are not a sandbox. An adapter cannot
 //! prove effects, persistence, lifecycle retirement, or host-side selection.
-use super::provider::{
-    ArtworkChunk, ArtworkReference, DiscoveryPage, LifecycleRequest, LifecycleState,
-};
+use super::provider::{ArtworkChunk, ArtworkReference, DiscoveryPage};
+use super::provider_lifecycle::{self, Action, Observation, Request as LifecycleRequest};
 use crate::requests::IncomingRequest;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_RESPONSE_BYTES: usize = 12_000;
 
@@ -27,15 +26,27 @@ enum Request {
         reference: ArtworkReference,
         offset: u64,
     },
+    Identity {},
     Launch {
         operation_id: String,
         application_id: String,
+        provider_incarnation: String,
     },
     Lookup {
         operation_id: String,
+        application_id: String,
+        provider_incarnation: String,
+    },
+    RecoverStop {
+        operation_id: String,
+        application_id: String,
+        provider_incarnation: String,
     },
     Stop {
         operation_id: String,
+        application_id: String,
+        provider_incarnation: String,
+        ticket: String,
     },
 }
 
@@ -66,19 +77,31 @@ pub trait Provider {
         reference: &ArtworkReference,
         offset: u64,
     ) -> Result<ArtworkChunk, &'static str>;
+    /// Must be unique to this provider incarnation and stable while dispatching.
+    fn incarnation(&self) -> &str;
     fn lifecycle(
         &mut self,
         identity: &Identity<'_>,
         request: LifecycleRequest,
-    ) -> Result<LifecycleState, &'static str>;
+    ) -> Result<Observation, &'static str>;
 }
 
 /// Fixed provider policy. An empty initiator set denies all requests.
 pub struct ProviderAdapter<P> {
     provider: P,
     service: String,
-    caller: String,
-    initiators: BTreeSet<String>,
+    callers: BTreeMap<String, CallerPolicy>,
+}
+
+/// Startup authorization for a single immediate caller. Grants are independent;
+/// a discovery caller should not automatically gain lifecycle authority.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CallerPolicy {
+    pub initiators: BTreeSet<String>,
+    pub discovery: bool,
+    pub artwork: bool,
+    pub lifecycle: bool,
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -92,28 +115,54 @@ fn valid_identifier(value: &str) -> bool {
 impl<P: Provider> ProviderAdapter<P> {
     /// Validates a fixed, startup-provided service and identity policy. Service
     /// routing authorization still belongs to the host's registration grants.
+    /// This convenience constructor grants all adapter capabilities to the
+    /// caller. Prefer `with_policies` when callers have different roles.
     pub fn new(
         provider: P,
         service: String,
         caller: String,
         initiators: BTreeSet<String>,
     ) -> Result<Self, &'static str> {
+        Self::with_policies(
+            provider,
+            service,
+            BTreeMap::from([(
+                caller,
+                CallerPolicy {
+                    initiators,
+                    discovery: true,
+                    artwork: true,
+                    lifecycle: true,
+                },
+            )]),
+        )
+    }
+
+    /// Bind each broker-attested immediate caller to its permitted initiators and
+    /// capabilities. Empty maps and empty sets deny access. Policy is fixed at startup.
+    pub fn with_policies(
+        provider: P,
+        service: String,
+        callers: BTreeMap<String, CallerPolicy>,
+    ) -> Result<Self, &'static str> {
         let Some((namespace, version)) = service.rsplit_once('/') else {
             return Err("invalid service");
         };
         if !valid_identifier(namespace)
             || version != "1"
-            || !valid_identifier(&caller)
-            || initiators.len() > 16
-            || initiators.iter().any(|id| !valid_identifier(id))
+            || callers.len() > 16
+            || callers.iter().any(|(caller, policy)| {
+                !valid_identifier(caller)
+                    || policy.initiators.len() > 16
+                    || policy.initiators.iter().any(|id| !valid_identifier(id))
+            })
         {
             return Err("invalid provider policy");
         }
         Ok(Self {
             provider,
             service,
-            caller,
-            initiators,
+            callers,
         })
     }
 
@@ -121,8 +170,10 @@ impl<P: Provider> ProviderAdapter<P> {
     /// suitable for `RuntimeClient::complete_serialized`.
     pub fn dispatch(&mut self, incoming: &IncomingRequest<Value>) -> Value {
         if incoming.service != self.service
-            || incoming.caller != self.caller
-            || !self.initiators.contains(&incoming.initiator)
+            || !self
+                .callers
+                .get(&incoming.caller)
+                .is_some_and(|policy| policy.initiators.contains(&incoming.initiator))
         {
             return failure("unauthorized");
         }
@@ -132,6 +183,19 @@ impl<P: Provider> ProviderAdapter<P> {
         let Ok(request) = incoming.decode::<Request>() else {
             return failure("invalid_request");
         };
+        let policy = &self.callers[&incoming.caller];
+        let authorized = match &request {
+            Request::Discover { .. } => policy.discovery,
+            Request::Artwork { .. } => policy.artwork,
+            Request::Identity { .. }
+            | Request::Launch { .. }
+            | Request::Lookup { .. }
+            | Request::RecoverStop { .. }
+            | Request::Stop { .. } => policy.lifecycle,
+        };
+        if !authorized {
+            return failure("unauthorized");
+        }
         let identity = Identity {
             caller: &incoming.caller,
             initiator: &incoming.initiator,
@@ -178,22 +242,69 @@ impl<P: Provider> ProviderAdapter<P> {
                         }))
                     })
             }
+            Request::Identity {} => {
+                if !provider_lifecycle::valid_incarnation(self.provider.incarnation()) {
+                    return failure("invalid_provider_response");
+                }
+                Ok(json!({"provider_incarnation":self.provider.incarnation()}))
+            }
             Request::Launch {
                 operation_id,
                 application_id,
+                provider_incarnation,
             } => self.lifecycle(
                 &identity,
-                LifecycleRequest::Launch {
+                LifecycleRequest {
+                    action: Action::Launch,
                     operation_id,
                     application_id,
+                    provider_incarnation,
+                    ticket: None,
                 },
             ),
-            Request::Lookup { operation_id } => {
-                self.lifecycle(&identity, LifecycleRequest::Lookup { operation_id })
-            }
-            Request::Stop { operation_id } => {
-                self.lifecycle(&identity, LifecycleRequest::Stop { operation_id })
-            }
+            Request::Lookup {
+                operation_id,
+                application_id,
+                provider_incarnation,
+            } => self.lifecycle(
+                &identity,
+                LifecycleRequest {
+                    action: Action::Lookup,
+                    operation_id,
+                    application_id,
+                    provider_incarnation,
+                    ticket: None,
+                },
+            ),
+            Request::RecoverStop {
+                operation_id,
+                application_id,
+                provider_incarnation,
+            } => self.lifecycle(
+                &identity,
+                LifecycleRequest {
+                    action: Action::RecoverStop,
+                    operation_id,
+                    application_id,
+                    provider_incarnation,
+                    ticket: None,
+                },
+            ),
+            Request::Stop {
+                operation_id,
+                application_id,
+                provider_incarnation,
+                ticket,
+            } => self.lifecycle(
+                &identity,
+                LifecycleRequest {
+                    action: Action::Stop,
+                    operation_id,
+                    application_id,
+                    provider_incarnation,
+                    ticket: Some(ticket),
+                },
+            ),
         };
         match result {
             Ok(Value::Object(mut value)) => {
@@ -215,13 +326,12 @@ impl<P: Provider> ProviderAdapter<P> {
         request: LifecycleRequest,
     ) -> Result<Value, &'static str> {
         request.validate()?;
-        let state = self.provider.lifecycle(identity, request)?;
-        if let LifecycleState::Failed { message } = &state
-            && (message.len() > 512 || message.chars().any(char::is_control))
-        {
-            return Err("invalid_provider_response");
+        if self.provider.incarnation() != request.provider_incarnation {
+            return Err("stale_provider_incarnation");
         }
-        serde_json::to_value(state).map_err(|_| "invalid_provider_response")
+        let observation = self.provider.lifecycle(identity, request.clone())?;
+        observation.validate_for(&request)?;
+        serde_json::to_value(observation).map_err(|_| "invalid_provider_response")
     }
 }
 

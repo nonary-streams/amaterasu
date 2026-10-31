@@ -2,15 +2,15 @@
 use amaterasu_module_sdk::{
     Command, ManagedModule, ModuleResult, Response, RuntimeClient,
     application_library::{
-        provider::{
-            Application, ArtworkChunk, ArtworkReference, DiscoveryPage, LifecycleRequest,
-            LifecycleState,
+        provider::{Application, ArtworkChunk, ArtworkReference, DiscoveryPage},
+        provider_adapter::{CallerPolicy, Identity, Provider, ProviderAdapter},
+        provider_lifecycle::{
+            Action, Observation, ProofKind, Request as LifecycleRequest, RetirementProof, State,
         },
-        provider_adapter::{Identity, Provider, ProviderAdapter},
     },
 };
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 const SERVICE: &str = "example.library.provider/1";
 const COVER: &[u8] = &[
@@ -22,13 +22,27 @@ const COVER: &[u8] = &[
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Settings {
-    library_caller: String,
-    allowed_initiators: BTreeSet<String>,
+    callers: BTreeMap<String, CallerPolicy>,
 }
 
-#[derive(Default)]
 struct Fixture {
-    operations: BTreeMap<(String, String), (String, LifecycleState)>,
+    incarnation: String,
+    operations: BTreeMap<(String, String), (String, Option<String>, State)>,
+}
+
+fn random_token() -> Result<String, &'static str> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| "entropy_unavailable")?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+impl Fixture {
+    fn new() -> Result<Self, &'static str> {
+        Ok(Self {
+            incarnation: random_token()?,
+            operations: BTreeMap::new(),
+        })
+    }
 }
 
 impl Provider for Fixture {
@@ -73,44 +87,83 @@ impl Provider for Fixture {
         })
     }
 
+    fn incarnation(&self) -> &str {
+        &self.incarnation
+    }
+
     fn lifecycle(
         &mut self,
         identity: &Identity<'_>,
         request: LifecycleRequest,
-    ) -> Result<LifecycleState, &'static str> {
-        match request {
-            LifecycleRequest::Launch {
-                operation_id,
-                application_id,
-            } => {
-                if application_id != "fixture-game" {
+    ) -> Result<Observation, &'static str> {
+        let key = (identity.caller.to_owned(), request.operation_id.clone());
+        if self
+            .operations
+            .get(&key)
+            .is_some_and(|entry| entry.0 != request.application_id)
+        {
+            return Err("operation_conflict");
+        }
+        if !self.operations.contains_key(&key)
+            && matches!(request.action, Action::Launch | Action::RecoverStop)
+            && self.operations.len() >= 4096
+        {
+            return Err("capacity_exhausted");
+        }
+        match request.action {
+            Action::Launch => {
+                if request.application_id != "fixture-game" {
                     return Err("not_found");
                 }
-                let key = (identity.initiator.to_owned(), operation_id);
+                if !self.operations.contains_key(&key) {
+                    self.operations.insert(
+                        key.clone(),
+                        (
+                            request.application_id.clone(),
+                            Some(random_token()?),
+                            State::Running,
+                        ),
+                    );
+                }
+            }
+            Action::RecoverStop => {
                 let entry = self
                     .operations
-                    .entry(key)
-                    .or_insert_with(|| (application_id.clone(), LifecycleState::Running));
-                if entry.0 != application_id {
-                    return Err("operation_conflict");
+                    .entry(key.clone())
+                    .or_insert_with(|| (request.application_id.clone(), None, State::Stopped));
+                entry.2 = State::Stopped;
+            }
+            Action::Stop => {
+                if let Some(entry) = self.operations.get_mut(&key) {
+                    if entry.1 != request.ticket {
+                        return Err("ticket_mismatch");
+                    }
+                    entry.2 = State::Stopped;
                 }
-                Ok(entry.1.clone())
             }
-            LifecycleRequest::Lookup { operation_id } => Ok(self
-                .operations
-                .get(&(identity.initiator.to_owned(), operation_id))
-                .map_or(LifecycleState::Unknown, |entry| entry.1.clone())),
-            LifecycleRequest::Stop { operation_id } => {
-                let Some(entry) = self
-                    .operations
-                    .get_mut(&(identity.initiator.to_owned(), operation_id))
-                else {
-                    return Ok(LifecycleState::Unknown);
-                };
-                entry.1 = LifecycleState::Stopped;
-                Ok(entry.1.clone())
-            }
+            Action::Lookup => {}
         }
+        let (ticket, state) = self
+            .operations
+            .get(&key)
+            .map_or((None, State::Unknown), |entry| {
+                (entry.1.clone(), entry.2.clone())
+            });
+        let retirement_proof = (state == State::Stopped).then(|| RetirementProof {
+            kind: ProofKind::FencedStopped,
+            operation_id: request.operation_id.clone(),
+            application_id: request.application_id.clone(),
+            provider_incarnation: request.provider_incarnation.clone(),
+            ticket: ticket.clone(),
+        });
+        Ok(Observation {
+            operation_id: request.operation_id,
+            application_id: request.application_id,
+            provider_incarnation: request.provider_incarnation,
+            ticket,
+            state,
+            retirement_proof,
+        })
     }
 }
 
@@ -125,11 +178,10 @@ impl ManagedModule for Module {
         };
         let settings: Settings =
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
-        let adapter = ProviderAdapter::new(
-            Fixture::default(),
+        let adapter = ProviderAdapter::with_policies(
+            Fixture::new().map_err(str::to_owned)?,
             SERVICE.into(),
-            settings.library_caller,
-            settings.allowed_initiators,
+            settings.callers,
         )
         .map_err(str::to_owned)?;
         runtime.require_success(Command::Register {
@@ -145,13 +197,18 @@ impl ManagedModule for Module {
         Ok(())
     }
 }
+#[cfg(not(test))]
 amaterasu_module_sdk::export_module!(Module);
+
+#[cfg(test)]
+mod launch_composition;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use amaterasu_module_sdk::requests::IncomingRequest;
     use serde_json::{Value, json};
+    use std::collections::BTreeSet;
 
     fn request(payload: Value) -> IncomingRequest<Value> {
         IncomingRequest {
@@ -192,7 +249,7 @@ mod tests {
         let host = Host {
             commands: RefCell::new(vec![]),
             replies: RefCell::new(VecDeque::from([
-                json!({"kind":"result","payload":{"library_caller":"library","allowed_initiators":["consumer"]}}),
+                json!({"kind":"result","payload":{"callers":{"library":{"initiators":["consumer"],"discovery":true}}}}),
                 json!({"kind":"ok"}),
                 json!({"kind":"request","id":9,"caller":"library","initiator":"consumer","service":SERVICE,"payload":{"action":"discover","cursor":null,"limit":1},"remaining_ms":100}),
                 json!({"kind":"ok"}),
@@ -297,7 +354,7 @@ mod tests {
             ("library", "consumer", SERVICE)
         );
         let mut adapter = ProviderAdapter::new(
-            Fixture::default(),
+            Fixture::new().unwrap(),
             SERVICE.into(),
             "library".into(),
             BTreeSet::from(["consumer".into()]),
@@ -331,12 +388,37 @@ mod tests {
     }
 
     #[test]
+    fn capability_policy_separates_discovery_and_lifecycle() {
+        let mut adapter = ProviderAdapter::with_policies(
+            Fixture::new().unwrap(),
+            SERVICE.into(),
+            BTreeMap::from([(
+                "library".into(),
+                CallerPolicy {
+                    initiators: BTreeSet::from(["consumer".into()]),
+                    discovery: true,
+                    ..Default::default()
+                },
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter.dispatch(&request(json!({"action":"discover","limit":1})))["ok"],
+            true
+        );
+        assert_eq!(
+            adapter.dispatch(&request(json!({"action":"identity"})))["error"]["code"],
+            "unauthorized"
+        );
+    }
+
+    #[test]
     fn provider_routes_discovery_artwork_and_synthetic_lifecycle() {
         let mut adapter = ProviderAdapter::new(
-            Fixture::default(),
+            Fixture::new().unwrap(),
             SERVICE.into(),
             "library".into(),
-            BTreeSet::from(["consumer".into()]),
+            BTreeSet::from(["consumer".into(), "library".into()]),
         )
         .unwrap();
         let discover = adapter.dispatch(&request(
@@ -346,27 +428,49 @@ mod tests {
         let cover = adapter.dispatch(&request(json!({"action":"artwork","reference":{"id":"fixture-cover","revision":"fixture-v1"},"offset":0})));
         assert_eq!(cover["mime"], "image/png");
         assert!(cover["data_base64"].as_str().unwrap().starts_with("iVBOR"));
-        let launch =
-            json!({"action":"launch","operation_id":"op1","application_id":"fixture-game"});
+        let identity = adapter.dispatch(&request(json!({"action":"identity"})));
+        let incarnation = identity["provider_incarnation"].as_str().unwrap();
+        let launch = json!({"action":"launch","operation_id":"op1","application_id":"fixture-game","provider_incarnation":incarnation});
+        let launched = adapter.dispatch(&request(launch.clone()));
+        assert_eq!(launched["state"], "running");
         assert_eq!(
-            adapter.dispatch(&request(launch.clone()))["state"],
-            "running"
+            adapter.dispatch(&request(launch))["ticket"],
+            launched["ticket"]
         );
-        assert_eq!(adapter.dispatch(&request(launch))["state"], "running");
-        assert_eq!(
-            adapter.dispatch(&request(json!({"action":"stop","operation_id":"op1"})))["state"],
-            "stopped"
+        let mut monitor = request(
+            json!({"action":"lookup","operation_id":"op1","application_id":"fixture-game","provider_incarnation":incarnation}),
         );
-        assert_eq!(
-            adapter.dispatch(&request(json!({"action":"lookup","operation_id":"op1"})))["state"],
-            "stopped"
+        monitor.initiator = "library".into();
+        assert_eq!(adapter.dispatch(&monitor)["ticket"], launched["ticket"]);
+        let ticket = launched["ticket"].as_str().unwrap();
+        let stop = json!({"action":"stop","operation_id":"op1","application_id":"fixture-game","provider_incarnation":incarnation,"ticket":ticket});
+        let stopped = adapter.dispatch(&request(stop));
+        assert_eq!(stopped["state"], "stopped");
+        assert_eq!(stopped["retirement_proof"]["kind"], "fenced_stopped");
+        let lookup = json!({"action":"lookup","operation_id":"missing","application_id":"fixture-game","provider_incarnation":incarnation});
+        assert_eq!(adapter.dispatch(&request(lookup))["state"], "unknown");
+        let recover = json!({"action":"recover_stop","operation_id":"missing","application_id":"fixture-game","provider_incarnation":incarnation});
+        let fenced = adapter.dispatch(&request(recover));
+        assert_eq!(fenced["state"], "stopped");
+        assert!(fenced["ticket"].is_null());
+        let delayed = json!({"action":"launch","operation_id":"missing","application_id":"fixture-game","provider_incarnation":incarnation});
+        assert_eq!(adapter.dispatch(&request(delayed))["state"], "stopped");
+        let mut restarted = ProviderAdapter::new(
+            Fixture::new().unwrap(),
+            SERVICE.into(),
+            "library".into(),
+            BTreeSet::from(["consumer".into()]),
+        )
+        .unwrap();
+        let after_restart = adapter.dispatch(&request(json!({"action":"identity"})));
+        let new_identity = restarted.dispatch(&request(json!({"action":"identity"})));
+        assert_ne!(
+            after_restart["provider_incarnation"],
+            new_identity["provider_incarnation"]
         );
-        assert_eq!(
-            adapter.dispatch(&request(
-                json!({"action":"lookup","operation_id":"missing"})
-            ))["state"],
-            "unknown"
-        );
+        assert_eq!(restarted.dispatch(&request(json!({"action":"recover_stop","operation_id":"op1","application_id":"fixture-game","provider_incarnation":incarnation})))["ok"], false);
+        let stale = json!({"action":"launch","operation_id":"op2","application_id":"fixture-game","provider_incarnation":"old"});
+        assert_eq!(adapter.dispatch(&request(stale))["ok"], false);
         let mut spoofed = request(json!({"action":"discover","limit":1}));
         spoofed.initiator = "other".into();
         assert_eq!(adapter.dispatch(&spoofed)["error"]["code"], "unauthorized");

@@ -168,6 +168,24 @@ Startup settings are optional and default to an empty environment:
 {"environment":{"SystemRoot":"C:\\Windows"}}
 ```
 
+Imported generic provider targets additionally require an operator-configured
+`provider_routes` map. For example, `{"provider_routes":{"games":{"importer":"example.importer","service":"example.provider/1"}}}`
+binds the catalog's `games` key to one authenticated importer and one fixed
+service. The catalog must independently bind that importer to the same key.
+Launch checks catalog provenance and the source/application ID before using the
+route; absent or mismatched bindings fail before creating a session. Configure
+signed broker call grants for launch and its parent callers, and configure the
+provider to accept launch as immediate caller with both the initial initiator and
+`amaterasu.launch` as permitted initiators for parentless cleanup and monitoring.
+
+Launch owns preparation and the session lease. Before starting a generic target
+it pins the provider incarnation, and it recovers an ambiguous start using the
+same operation ID without replaying the start. A matching provider assertion that
+the operation has been fenced and stopped is required before releasing the lease;
+unknown state, a changed incarnation, or an invalid fence leaves cleanup
+unconfirmed for retry. The assertion relies on trusted provider code; it is not a
+cryptographic or operating-system verification of the provider's effects.
+
 An optional `retirement_observers` array grants named broker callers read-only
 retirement verification. `verify_retirement` requires the original owner and
 application operation ID; a known launch ID can additionally be supplied. It

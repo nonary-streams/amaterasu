@@ -6201,6 +6201,7 @@ fn cleanup_planner_preserves_manually_changed_entries_and_selects_only_owned_mar
         .collect();
     let mut session = ProviderSession {
         caller: owner.into(),
+        provider_key: None,
         key: "catalog".into(),
         state_present: true,
         collection_revision: 5,
@@ -7199,6 +7200,295 @@ fn real_state_changed_finish_policy_discards_incompatible_partial_draft() {
         json!({"action":"collection_get","collection":"principal/management","key":null}),
     );
     assert_eq!(header["count"], 67); // 33 entries, 33 markers and the provider state
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn generic_provider_launch_is_bound_to_importer_and_source_id() {
+    let mut backend = Backend::default();
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::from(["launcher".into()]),
+        BTreeMap::from([("consumer".into(), "owner".into())]),
+        BTreeMap::new(),
+        BTreeMap::from([("importer".into(), "owner".into())]),
+    )
+    .with_provider_launch_principals(BTreeMap::from([("importer".into(), "provider-key".into())]));
+    let begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("sync", 1),
+        "importer",
+        "owner",
+        "owner",
+    );
+    assert_eq!(begin["ok"], true, "{begin}");
+    let generation = begin["generation"].as_u64().unwrap();
+    let revision = begin["revision"].as_u64().unwrap();
+    let target = |provider: &str, id: &str| json!({"name":"Game","launch":{"kind":"provider","provider":provider,"application_id":id}});
+    for bad in [target("other", "game"), target("provider-key", "different")] {
+        let reply = backend.run_for(
+            &mut pipeline,
+            snapshot_batch("sync", generation, 1, 0, revision, vec![("game", bad)]),
+            "importer",
+            "owner",
+            "owner",
+        );
+        assert_eq!(reply["error"]["code"], "invalid_entry", "{reply}");
+    }
+    let good = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "sync",
+            generation,
+            1,
+            0,
+            revision,
+            vec![("game", target("provider-key", "game"))],
+        ),
+        "importer",
+        "owner",
+        "owner",
+    );
+    assert_eq!(good["ok"], true, "{good}");
+    let id = backend.entries["~provider.entry:importer:game"]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let resolved = backend.run_for(
+        &mut pipeline,
+        json!({"action":"resolve_launch","id":id}),
+        "launcher",
+        "owner",
+        "owner",
+    );
+    assert_eq!(
+        resolved["provider_provenance"],
+        json!({"provider":"importer","source_id":"game"}),
+        "{resolved}"
+    );
+    pipeline
+        .import_principals
+        .insert("importer".into(), "new-owner".into());
+    for (action, initiator) in [
+        ("resolve_launch", "owner"),
+        ("resolve_exported_launch", "consumer"),
+    ] {
+        let rejected = backend.run_for(
+            &mut pipeline,
+            json!({"action":action,"id":id}),
+            "launcher",
+            initiator,
+            "owner",
+        );
+        assert_eq!(
+            rejected["error"]["code"], "provider_identity_required",
+            "{rejected}"
+        );
+    }
+    pipeline
+        .import_principals
+        .insert("importer".into(), "owner".into());
+    let saved = backend.entries[&id].clone();
+    backend.entries.get_mut(&id).unwrap()["name"] = json!("tampered");
+    let detached = backend.run_for(
+        &mut pipeline,
+        json!({"action":"resolve_launch","id":id}),
+        "launcher",
+        "owner",
+        "owner",
+    );
+    assert_eq!(
+        detached["error"]["code"], "provider_identity_required",
+        "{detached}"
+    );
+    backend.entries.insert(id.clone(), saved);
+    pipeline.provider_launch_principals = BTreeMap::from([("other".into(), "provider-key".into())]);
+    let remapped = backend.run_for(
+        &mut pipeline,
+        json!({"action":"resolve_launch","id":id}),
+        "launcher",
+        "owner",
+        "owner",
+    );
+    assert_eq!(
+        remapped["error"]["code"], "provider_identity_required",
+        "{remapped}"
+    );
+
+    let manual = backend.run_for(&mut Pipeline::default(), json!({"action":"create","expected_revision":good["revision"],"entry":target("provider-key","game")}), "owner", "owner", "owner");
+    assert_eq!(
+        manual["error"]["code"], "provider_launch_required",
+        "{manual}"
+    );
+}
+
+#[test]
+fn staged_generic_launch_validates_importer_before_and_after_restart() {
+    let mut backend = Backend::default();
+    let make_pipeline = || {
+        Pipeline::new_with_steam_id_export_principals(
+            BTreeSet::from(["launcher".into()]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::from([("importer".into(), "owner".into())]),
+        )
+        .with_provider_launch_principals(BTreeMap::from([(
+            "importer".into(),
+            "provider-key".into(),
+        )]))
+    };
+    let mut pipeline = make_pipeline();
+    let mut request = snapshot_begin("staged-generic", 1);
+    request["staged"] = json!(true);
+    let begin = backend.run_for(&mut pipeline, request, "importer", "owner", "owner");
+    assert_eq!(begin["staged"], true);
+    let generation = begin["generation"].as_u64().unwrap();
+    let target = |provider: &str, id: &str| json!({"name":"Game","launch":{"kind":"provider","provider":provider,"application_id":id}});
+    for bad in [target("other", "game"), target("provider-key", "other")] {
+        let rejected = backend.run_for(
+            &mut pipeline,
+            snapshot_batch("staged-generic", generation, 1, 0, 0, vec![("game", bad)]),
+            "importer",
+            "owner",
+            "owner",
+        );
+        assert_eq!(rejected["error"]["code"], "invalid_entry", "{rejected}");
+    }
+    let accepted = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "staged-generic",
+            generation,
+            1,
+            0,
+            0,
+            vec![("game", target("provider-key", "game"))],
+        ),
+        "importer",
+        "owner",
+        "owner",
+    );
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    assert!(!backend.entries.contains_key("app-0000000000000001"));
+    let mut restarted = make_pipeline();
+    let finish = backend.run_for(
+        &mut restarted,
+        snapshot_finish("staged-generic", generation, 1, 0, 1, true),
+        "importer",
+        "owner",
+        "owner",
+    );
+    assert_eq!(finish["ok"], true, "{finish}");
+    let resolved = backend.run_for(
+        &mut restarted,
+        json!({"action":"resolve_launch","id":"app-0000000000000001"}),
+        "launcher",
+        "owner",
+        "owner",
+    );
+    assert_eq!(
+        resolved["provider_provenance"],
+        json!({"provider":"importer","source_id":"game"})
+    );
+}
+
+#[test]
+fn real_state_generic_staging_rejects_artwork_spoof_and_preserves_concurrent_edits() {
+    let (mut backend, directory) = real_state_backend();
+    let make_pipeline = || {
+        Pipeline::new_with_steam_id_export_principals(
+            BTreeSet::from(["launcher".into()]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::from([("importer".into(), "owner".into())]),
+        )
+        .with_provider_launch_principals(BTreeMap::from([(
+            "importer".into(),
+            "provider-key".into(),
+        )]))
+    };
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(pipeline, payload, "importer", "owner", "owner")
+    };
+    let target = |name: &str| json!({"name":name,"launch":{"kind":"provider","provider":"provider-key","application_id":"game"}});
+    let mut pipeline = make_pipeline();
+    let begin = run(&mut backend, &mut pipeline, snapshot_begin("prior", 1));
+    let generation = begin["generation"].as_u64().unwrap();
+    let batch = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "prior",
+            generation,
+            1,
+            0,
+            0,
+            vec![("game", target("Original"))],
+        ),
+    );
+    assert_eq!(batch["ok"], true, "{batch}");
+    let revision = batch["revision"].as_u64().unwrap();
+    assert_eq!(
+        run(
+            &mut backend,
+            &mut pipeline,
+            snapshot_finish("prior", generation, 1, revision, 1, true)
+        )["ok"],
+        true
+    );
+
+    let mut begin = snapshot_begin("staged", 2);
+    begin["staged"] = json!(true);
+    let begin = run(&mut backend, &mut pipeline, begin);
+    let generation = begin["generation"].as_u64().unwrap();
+    let mut forged = target("Forged");
+    forged["artwork"] = json!({"provider":"steam","app_id":42,"revision":"1"});
+    let rejected = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch("staged", generation, 2, 0, revision, vec![("game", forged)]),
+    );
+    assert_eq!(rejected["error"]["code"], "provider_artwork_required");
+    let accepted = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "staged",
+            generation,
+            2,
+            0,
+            revision,
+            vec![("game", target("Provider edit"))],
+        ),
+    );
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    let store = backend.live.as_ref().unwrap();
+    let header = store.handle("amaterasu.catalog", json!({"action":"collection_get","collection":"principal/owner","key":"app-0000000000000001"}));
+    let mut edited = header["value"].clone();
+    edited["name"] = json!("Manual edit");
+    let mut metadata = header["metadata"].clone();
+    metadata["revision"] = json!(revision + 1);
+    backend.before_draft_publish = Some(
+        json!({"action":"collection_commit","collection":"principal/owner","expected_revision":header["revision"],"metadata":metadata,"edits":[{"key":"app-0000000000000001","value":edited}]}),
+    );
+    let conflict = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_finish("staged", generation, 2, revision, 1, true),
+    );
+    assert_eq!(conflict["error"]["code"], "revision_conflict", "{conflict}");
+    let mut restarted = make_pipeline();
+    let finished = run(
+        &mut backend,
+        &mut restarted,
+        snapshot_finish("staged", generation, 2, revision + 1, 1, true),
+    );
+    assert_eq!(finished["ok"], true, "{finished}");
+    let store = backend.live.take().unwrap();
+    let row = store.handle("amaterasu.catalog", json!({"action":"collection_get","collection":"principal/owner","key":"app-0000000000000001"}));
+    assert_eq!(row["value"]["name"], "Manual edit");
+    let marker = store.handle("amaterasu.catalog", json!({"action":"collection_get","collection":"principal/owner","key":entry_key("importer", "game")}));
+    assert_eq!(marker["value"]["detached"], true);
     drop(store);
     std::fs::remove_dir_all(directory).unwrap();
 }

@@ -64,6 +64,10 @@ pub struct Record {
     pub legacy_global_preparation: Vec<LegacyPreparationCommand>,
     #[serde(skip)]
     pub provider_ticket: Option<String>,
+    #[serde(skip)]
+    pub generic_provider_service: Option<String>,
+    #[serde(skip)]
+    pub generic_provider_incarnation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_overrides: Option<ApplicationConfigOverrides>,
     /// Sparse per-application output/virtual-screen controls frozen from the
@@ -283,6 +287,8 @@ impl Records {
                 global_preparation,
                 legacy_global_preparation,
                 provider_ticket: None,
+                generic_provider_service: None,
+                generic_provider_incarnation: None,
                 config_overrides: None,
                 application_display_settings: None,
                 executable_path: None,

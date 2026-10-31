@@ -181,7 +181,9 @@ pub fn provider_launch(payload: &Value, record: &Record) -> Result<ProviderLaunc
             (payload["started"] == true && payload.get("found").is_none())
                 || (payload["found"] == true && payload.get("started").is_none())
         }
-        LaunchTarget::Executable(_) | LaunchTarget::Desktop { .. } => false,
+        LaunchTarget::Executable(_)
+        | LaunchTarget::Desktop { .. }
+        | LaunchTarget::Provider { .. } => false,
     };
     if !identity_matches
         || record
@@ -207,7 +209,9 @@ pub fn provider_launch(payload: &Value, record: &Record) -> Result<ProviderLaunc
             &["ok", "started", "ticket", "state"]
         }
         LaunchTarget::PlayniteFullscreen { .. } => &["ok", "found", "ticket", "state"],
-        LaunchTarget::Executable(_) | LaunchTarget::Desktop { .. } => {
+        LaunchTarget::Executable(_)
+        | LaunchTarget::Desktop { .. }
+        | LaunchTarget::Provider { .. } => {
             return Err("invalid_provider_response");
         }
     };
@@ -222,6 +226,28 @@ pub fn provider_launch(payload: &Value, record: &Record) -> Result<ProviderLaunc
         ticket: ticket.into(),
         state,
     })
+}
+
+pub fn generic_provider(
+    payload: &Value,
+    record: &Record,
+) -> Result<crate::provider_evidence::Evidence, &'static str> {
+    let Some(LaunchTarget::Provider { application_id, .. }) = record.target.as_ref() else {
+        return Err("invalid_provider_response");
+    };
+    let incarnation = record
+        .generic_provider_incarnation
+        .as_deref()
+        .ok_or("invalid_provider_response")?;
+    crate::provider_evidence::validate(
+        payload,
+        &crate::provider_evidence::Expected {
+            operation_id: &record.process_operation,
+            application_id,
+            provider_incarnation: incarnation,
+            ticket: record.provider_ticket.as_deref(),
+        },
+    )
 }
 
 #[cfg(test)]

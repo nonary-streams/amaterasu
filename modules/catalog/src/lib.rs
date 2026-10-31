@@ -18,6 +18,8 @@ struct Settings {
     export_principals: std::collections::BTreeMap<String, String>,
     steam_id_export_principals: std::collections::BTreeMap<String, String>,
     import_principals: std::collections::BTreeMap<String, String>,
+    /// Authenticated importer principal -> configured provider key.
+    provider_launch_principals: std::collections::BTreeMap<String, String>,
     /// Create one `Desktop` entry, once, in each catalog that
     /// `export_principals` serves to streaming clients.
     seed_desktop_entry: bool,
@@ -45,6 +47,21 @@ impl Settings {
                 .import_principals
                 .iter()
                 .any(|(consumer, owner)| !valid_principal(consumer) || !valid_principal(owner))
+            || self.provider_launch_principals.len() > 16
+            || self
+                .provider_launch_principals
+                .iter()
+                .any(|(principal, provider)| {
+                    !valid_principal(principal)
+                        || !model::valid_provider_key(provider)
+                        || !self.import_principals.contains_key(principal)
+                })
+            || self
+                .provider_launch_principals
+                .values()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.provider_launch_principals.len()
         {
             return Err("catalog principal settings require 1..128 character identifiers and at most 16 entries each".into());
         }
@@ -89,6 +106,7 @@ impl ManagedModule for CatalogModule {
                 settings.steam_id_export_principals,
                 settings.import_principals,
             )
+            .with_provider_launch_principals(settings.provider_launch_principals)
             .with_desktop_seed(seeded_owners),
         })
     }
@@ -104,6 +122,24 @@ amaterasu_module_sdk::export_module!(CatalogModule);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_launch_mapping_requires_unique_authorized_importers() {
+        let valid: Settings = serde_json::from_value(serde_json::json!({
+            "import_principals":{"importer":"owner"},
+            "provider_launch_principals":{"importer":"provider-key"}
+        }))
+        .unwrap();
+        assert!(valid.validate().is_ok());
+        for value in [
+            serde_json::json!({"provider_launch_principals":{"missing":"provider-key"}}),
+            serde_json::json!({"import_principals":{"a":"owner","b":"owner"},"provider_launch_principals":{"a":"same","b":"same"}}),
+            serde_json::json!({"import_principals":{"a":"owner"},"provider_launch_principals":{"a":"bad/key"}}),
+        ] {
+            let settings: Settings = serde_json::from_value(value).unwrap();
+            assert!(settings.validate().is_err());
+        }
+    }
 
     #[test]
     fn desktop_seed_is_off_by_default_and_strictly_typed() {

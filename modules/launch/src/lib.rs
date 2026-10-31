@@ -1,6 +1,7 @@
 //! Catalog-backed application launch and session ownership.
 mod pipeline;
 mod protocol;
+pub mod provider_evidence;
 mod records;
 mod responses;
 mod workflow;
@@ -23,6 +24,7 @@ impl ManagedModule for LaunchModule {
         settings.validate().map_err(str::to_owned)?;
         let mut pipeline = Pipeline::new(settings.environment).map_err(str::to_owned)?;
         pipeline.set_retirement_observers(settings.retirement_observers);
+        pipeline.set_provider_routes(settings.provider_routes);
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;

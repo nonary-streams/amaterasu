@@ -418,6 +418,7 @@ pub struct Pipeline {
     ingress_since_monitor: u8,
     environment: BTreeMap<String, String>,
     retirement_observers: BTreeSet<String>,
+    provider_routes: BTreeMap<String, ProviderRoute>,
 }
 impl Pipeline {
     pub fn new(environment: BTreeMap<String, String>) -> Result<Self, &'static str> {
@@ -429,10 +430,15 @@ impl Pipeline {
             ingress_since_monitor: 0,
             environment,
             retirement_observers: BTreeSet::new(),
+            provider_routes: BTreeMap::new(),
         })
     }
     pub fn set_retirement_observers(&mut self, observers: BTreeSet<String>) {
         self.retirement_observers = observers;
+    }
+
+    pub fn set_provider_routes(&mut self, routes: BTreeMap<String, ProviderRoute>) {
+        self.provider_routes = routes;
     }
 
     fn verify_retirement(
@@ -1343,7 +1349,11 @@ impl Pipeline {
                 record.target,
                 Some(LaunchTarget::Playnite { .. } | LaunchTarget::PlayniteFullscreen { .. })
             );
-            self.job = Some(Workflow::monitor(record.launch_id, playnite));
+            let mut workflow = Workflow::monitor(record.launch_id, playnite);
+            if matches!(record.target, Some(LaunchTarget::Provider { .. })) {
+                workflow.step = Step::MonitorProvider;
+            }
+            self.job = Some(workflow);
         }
     }
     fn dispatch(
@@ -1385,6 +1395,7 @@ impl Pipeline {
         let (service, payload) = job
             .command(record, &self.environment)
             .map_err(str::to_owned)?;
+        let service = service.to_owned();
         // Mark possibly committed mutations before submission. A transport or
         // cancellation error then reconciles by owned lookup, never by respawn.
         if job.step == Step::CreateSession {
@@ -1396,7 +1407,7 @@ impl Pipeline {
         if job.step == Step::PrepareApplication {
             record.preparation_requested = true;
         }
-        if job.step == Step::StartPlaynite {
+        if matches!(job.step, Step::StartPlaynite | Step::StartProvider) {
             record.provider_launch_requested = true;
         }
         self.sequence = self
@@ -1412,7 +1423,7 @@ impl Pipeline {
                 .clamp(1, 5_000) as u64
         };
         let response = send(Command::Request {
-            service: service.into(),
+            service,
             payload,
             timeout_ms,
             operation_id: format!("{}.{}", record.session_key, self.sequence),
@@ -1523,27 +1534,62 @@ impl Pipeline {
                     }
                     Err(code) => return self.dependency_failed(job, code, send),
                 }
-                record.lutris_source_id = match payload.get("provider_provenance") {
-                    None => None,
-                    Some(provenance) => {
-                        let valid_object = provenance.as_object().is_some_and(|fields| {
-                            fields.len() == 2 && provenance["provider"] == "amaterasu.lutris"
+                if let Some(LaunchTarget::Provider {
+                    provider,
+                    application_id,
+                    ..
+                }) = record.target.as_ref()
+                {
+                    let Some(route) = self.provider_routes.get(provider) else {
+                        return self.dependency_failed(job, "provider_not_configured", send);
+                    };
+                    let valid = payload
+                        .get("provider_provenance")
+                        .and_then(Value::as_object)
+                        .is_some_and(|proof| {
+                            proof.len() == 2
+                                && proof.get("provider").and_then(Value::as_str)
+                                    == Some(route.importer.as_str())
+                                && proof.get("source_id").and_then(Value::as_str)
+                                    == Some(application_id.as_str())
                         });
-                        let source_id = provenance["source_id"].as_str().and_then(|source| {
-                            source
-                                .parse::<i64>()
-                                .ok()
-                                .filter(|id| *id > 0 && id.to_string() == source)
-                        });
-                        if !valid_object
-                            || source_id.is_none()
-                            || !matches!(record.target, Some(LaunchTarget::Executable(_)))
-                        {
-                            return self.dependency_failed(job, "invalid_catalog_response", send);
-                        }
-                        source_id
+                    if !valid {
+                        return self.dependency_failed(job, "invalid_catalog_response", send);
                     }
-                };
+                    record.generic_provider_service = Some(route.service.clone());
+                }
+                record.lutris_source_id =
+                    if matches!(record.target, Some(LaunchTarget::Provider { .. })) {
+                        None
+                    } else {
+                        match payload.get("provider_provenance") {
+                            None => None,
+                            Some(provenance) => {
+                                let valid_object = provenance.as_object().is_some_and(|fields| {
+                                    fields.len() == 2
+                                        && provenance["provider"] == "amaterasu.lutris"
+                                });
+                                let source_id =
+                                    provenance["source_id"].as_str().and_then(|source| {
+                                        source
+                                            .parse::<i64>()
+                                            .ok()
+                                            .filter(|id| *id > 0 && id.to_string() == source)
+                                    });
+                                if !valid_object
+                                    || source_id.is_none()
+                                    || !matches!(record.target, Some(LaunchTarget::Executable(_)))
+                                {
+                                    return self.dependency_failed(
+                                        job,
+                                        "invalid_catalog_response",
+                                        send,
+                                    );
+                                }
+                                source_id
+                            }
+                        }
+                    };
                 let config_overrides = match payload["entry"].get("config_overrides") {
                     Some(value) => match serde_json::from_value::<
                         crate::protocol::ApplicationConfigOverrides,
@@ -1621,7 +1667,8 @@ impl Pipeline {
                         Step::LutrisPreSpawn
                     }
                     Some(LaunchTarget::Executable(_)) => Step::Spawn,
-                    Some(LaunchTarget::Playnite { preparation, .. })
+                    Some(LaunchTarget::Provider { preparation, .. })
+                    | Some(LaunchTarget::Playnite { preparation, .. })
                     | Some(LaunchTarget::PlayniteFullscreen { preparation, .. })
                     | Some(LaunchTarget::Desktop { preparation, .. })
                         if !preparation.is_empty() || record.output.is_some() =>
@@ -1631,6 +1678,7 @@ impl Pipeline {
                     Some(
                         LaunchTarget::Playnite { .. } | LaunchTarget::PlayniteFullscreen { .. },
                     ) => Step::StartPlaynite,
+                    Some(LaunchTarget::Provider { .. }) => Step::IdentifyProvider,
                     // Nothing to prepare and no process: the session is ready.
                     Some(LaunchTarget::Desktop { .. }) => Step::Activate,
                     None => return self.dependency_failed(job, "invalid_catalog_response", send),
@@ -1649,6 +1697,8 @@ impl Pipeline {
                     responses::PreparationState::Ready => {
                         job.step = if matches!(record.target, Some(LaunchTarget::Desktop { .. })) {
                             Step::Activate
+                        } else if matches!(record.target, Some(LaunchTarget::Provider { .. })) {
+                            Step::IdentifyProvider
                         } else {
                             Step::StartPlaynite
                         };
@@ -1707,6 +1757,57 @@ impl Pipeline {
                         apply_application_outcome(record, outcome);
                         return self.cleanup_failed(job, "application_cleanup_failed", send);
                     }
+                }
+            }
+            Step::IdentifyProvider => {
+                record.generic_provider_incarnation = Some(
+                    match crate::provider_evidence::provider_incarnation(&payload) {
+                        Ok(incarnation) => incarnation,
+                        Err(code) => return self.dependency_failed(job, code, send),
+                    },
+                );
+                job.step = Step::StartProvider;
+            }
+            Step::StartProvider | Step::MonitorProvider => {
+                let evidence = match responses::generic_provider(&payload, record) {
+                    Ok(evidence) => evidence,
+                    Err(code) => return self.dependency_failed(job, code, send),
+                };
+                record.provider_ticket = evidence.ticket;
+                use crate::provider_evidence::State as ProviderState;
+                match evidence.state {
+                    ProviderState::Starting if job.step == Step::StartProvider => {
+                        job.step = Step::MonitorProvider;
+                    }
+                    ProviderState::Starting => {}
+                    ProviderState::Running
+                        if job.step == Step::StartProvider || record.state == State::Starting =>
+                    {
+                        if record.return_on_admission
+                            && let Some(request) = job.request.take()
+                        {
+                            complete(send, request, record.response())?;
+                        }
+                        job.step = Step::Activate;
+                    }
+                    ProviderState::Running => return Ok(()),
+                    ProviderState::Stopped | ProviderState::LaunchFailed if evidence.retired => {
+                        record.provider_stopped = true;
+                        job.begin_cleanup(
+                            record,
+                            if evidence.state == ProviderState::Stopped {
+                                Outcome::Completed
+                            } else {
+                                Outcome::Failed
+                            },
+                            None,
+                        );
+                    }
+                    _ => job.begin_cleanup(
+                        record,
+                        Outcome::Failed,
+                        Some("provider_launch_unconfirmed"),
+                    ),
                 }
             }
             Step::StartPlaynite => {
@@ -1850,6 +1951,19 @@ impl Pipeline {
                     return self.cleanup_failed(job, "process_lookup_failed", send);
                 }
                 job.step = first_cleanup_step(record);
+            }
+            Step::RecoverProviderStop => {
+                let evidence = match responses::generic_provider(&payload, record) {
+                    Ok(evidence) => evidence,
+                    Err(code) => return self.cleanup_failed(job, code, send),
+                };
+                record.provider_ticket = evidence.ticket;
+                if evidence.retired {
+                    record.provider_stopped = true;
+                    job.step = first_cleanup_step(record);
+                } else if evidence.state != crate::provider_evidence::State::Stopping {
+                    return self.cleanup_failed(job, "provider_stop_unconfirmed", send);
+                }
             }
             Step::FindPlaynite => {
                 if responses::provider_lookup_not_found(&payload, record) {

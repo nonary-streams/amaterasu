@@ -135,6 +135,10 @@ pub enum SnapshotRequest {
         source_revision: u64,
         provider_epoch: u64,
         expected_collection_revision: Option<u64>,
+        /// Request staged publication. Require `staged:true` in the begin
+        /// response; older catalogs may not implement this mode.
+        #[serde(skip_serializing_if = "is_false")]
+        staged: bool,
     },
     ProviderSnapshotBatch {
         sync_id: String,
@@ -159,6 +163,10 @@ pub enum SnapshotRequest {
         remove_expired: bool,
         remove_selection: bool,
     },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[cfg(test)]
@@ -188,6 +196,24 @@ mod tests {
         batch.remove_source_ids.clear();
         batch.entries[0].entry = json!({"name":"x".repeat(MAX_BATCH_BYTES)});
         assert!(batch.validate().is_err());
+    }
+
+    #[test]
+    fn staged_mode_is_explicit_and_legacy_mode_omits_the_field() {
+        let begin = |staged| SnapshotRequest::ProviderSnapshotBegin {
+            sync_id: "sync".into(),
+            source_revision: 1,
+            provider_epoch: 0,
+            expected_collection_revision: None,
+            staged,
+        };
+        assert!(
+            serde_json::to_value(begin(false))
+                .unwrap()
+                .get("staged")
+                .is_none()
+        );
+        assert_eq!(serde_json::to_value(begin(true)).unwrap()["staged"], true);
     }
 
     #[test]
@@ -344,59 +370,6 @@ pub mod provider {
             Ok(())
         }
     }
-
-    /// Stable operation ID is chosen by the lifecycle owner and must be reused
-    /// with identical arguments for a retry. Caller identity is taken only from
-    /// the broker envelope, never these payload fields.
-    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-    #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-    pub enum LifecycleRequest {
-        Launch {
-            operation_id: String,
-            application_id: String,
-        },
-        Lookup {
-            operation_id: String,
-        },
-        Stop {
-            operation_id: String,
-        },
-    }
-
-    impl LifecycleRequest {
-        pub fn validate(&self) -> Result<(), &'static str> {
-            let valid_operation = |value: &str| {
-                !value.is_empty()
-                    && value.len() <= 128
-                    && value.bytes().all(|byte| byte.is_ascii_graphic())
-            };
-            match self {
-                Self::Launch {
-                    operation_id,
-                    application_id,
-                } if valid_operation(operation_id) && token(application_id) => Ok(()),
-                Self::Lookup { operation_id } | Self::Stop { operation_id }
-                    if valid_operation(operation_id) =>
-                {
-                    Ok(())
-                }
-                _ => Err("invalid lifecycle identity"),
-            }
-        }
-    }
-
-    /// Unknown requires reconciliation; it is neither a failed launch nor
-    /// evidence that resources were stopped. No automatic retry is safe for a
-    /// new operation identity after an uncertain side effect.
-    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-    #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-    pub enum LifecycleState {
-        Pending,
-        Running,
-        Stopped,
-        Failed { message: String },
-        Unknown,
-    }
 }
 
 #[cfg(test)]
@@ -439,28 +412,13 @@ mod provider_tests {
         };
         page.entries = vec![app.clone(), app];
         assert!(page.validate().is_err());
-        assert!(
-            LifecycleRequest::Launch {
-                operation_id: "launch-1".into(),
-                application_id: "game".into()
-            }
-            .validate()
-            .is_ok()
-        );
-        assert!(
-            LifecycleRequest::Lookup {
-                operation_id: " ".into()
-            }
-            .validate()
-            .is_err()
-        );
-        assert_eq!(
-            serde_json::to_value(LifecycleState::Unknown).unwrap()["state"],
-            "unknown"
-        );
+        assert_eq!(page.entries.len(), 2);
     }
 }
 
 /// Adapter for a broker-registered provider service. Host-side routing and
 /// lifecycle ownership remain separate responsibilities.
 pub mod provider_adapter;
+
+/// Incarnation-bound lifecycle requests and retirement assertions.
+pub mod provider_lifecycle;

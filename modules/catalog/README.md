@@ -554,3 +554,20 @@ first ordinary access migrates it and seeding first would fork it. No Desktop
 entry is created without the marker commit, so a lost commit acknowledgement
 reconciles by reading the marker. Real Moonlight client acceptance of a Desktop
 launch is pending; see the launch README.
+
+### Generic provider-owned launch targets
+
+A snapshot importer may write `{"kind":"provider","provider":"key",
+"application_id":"source-id"}` only when startup settings contain both
+`import_principals` for the authenticated importer and a unique
+`provider_launch_principals` mapping from that importer to `key`. The application
+ID must equal the snapshot row's source ID. Provider keys are 1–128 ASCII letters,
+digits, dots, underscores or hyphens; source IDs are 1–96 printable bytes.
+Optional `exit_timeout_seconds` is 1–300 (default 10), `working_directory` and
+`preparation` follow existing target validation. Manual create and update cannot
+introduce or replace these targets. At launch resolution, the current mapping and
+attached provider marker must still match the target, source ID and entry
+fingerprint; otherwise resolution fails closed. Removing or changing a mapping
+can therefore make existing entries unavailable. Launch must separately bind the
+key to an approved service and verify the provider lifecycle; catalog storage
+does not start an application or prove cleanup.

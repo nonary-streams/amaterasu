@@ -101,6 +101,10 @@ struct Harness {
     fail_global_preparation: bool,
     fail_global_preparation_cleanup_once: bool,
     catalog_desktop: bool,
+    catalog_generic: bool,
+    generic_started: bool,
+    generic_lost_start: bool,
+    generic_bad_proof: bool,
     drop_prepare_result: bool,
 }
 impl Harness {
@@ -173,6 +177,10 @@ impl Harness {
             fail_global_preparation: false,
             fail_global_preparation_cleanup_once: false,
             catalog_desktop: false,
+            catalog_generic: false,
+            generic_started: false,
+            generic_lost_start: false,
+            generic_bad_proof: false,
             drop_prepare_result: false,
         }
     }
@@ -588,7 +596,9 @@ impl Harness {
                         } else {
                             "pipeline::tests::controlled_process"
                         };
-                        let launch = if self.catalog_desktop {
+                        let launch = if self.catalog_generic {
+                            json!({"kind":"provider","provider":"example","application_id":"42"})
+                        } else if self.catalog_desktop {
                             json!({"kind":"desktop","exit_timeout_seconds":10})
                         } else {
                             self.catalog_playnite_game_id.as_ref().map_or_else(
@@ -702,6 +712,24 @@ impl Harness {
                         }
                         reply
                     }
+                    "example.provider/1" => {
+                        if action == "identity" { json!({"ok":true,"provider_incarnation":"epoch"}) } else {
+                            assert_eq!(payload["provider_incarnation"], "epoch");
+                            let state = match action.as_str() {
+                                "launch" => { self.generic_started = true; "running" },
+                                "lookup" => "running",
+                                "recover_stop" => "stopped",
+                                _ => panic!("unexpected provider action"),
+                            };
+                            let ticket = json!("ticket");
+                            let mut proof = json!(null);
+                            if state == "stopped" {
+                                proof = json!({"kind":"fenced_stopped","operation_id":payload["operation_id"],"application_id":payload["application_id"],"provider_incarnation":"epoch","ticket":ticket});
+                                if self.generic_bad_proof { proof["provider_incarnation"] = json!("changed"); }
+                            }
+                            json!({"ok":true,"operation_id":payload["operation_id"],"application_id":payload["application_id"],"provider_incarnation":"epoch","ticket":ticket,"state":state,"retirement_proof":proof})
+                        }
+                    },
                     crate::workflow::SESSION => self.session(&payload),
                     crate::workflow::APPLICATION => self.application(&payload),
                     crate::workflow::PLAYNITE => self.playnite(&payload),
@@ -738,6 +766,15 @@ impl Harness {
                 Response::Ok
             }
             Command::TakeResult { request: 50 } => {
+                if self.generic_lost_start
+                    && self.commands.last().is_some_and(|(service, payload, _)| {
+                        service == "example.provider/1" && payload["action"] == "launch"
+                    })
+                {
+                    self.generic_lost_start = false;
+                    self.reply = None;
+                    return Err("simulated provider start acknowledgement loss".into());
+                }
                 if self.drop_spawn_result
                     && self
                         .commands
@@ -4972,4 +5009,104 @@ fn resumed_limiter_lossless_target_only_tracks_fps_when_not_explicit() {
         harness.request(&mut pipeline, "amaterasu.nvhttp", authorize)["ok"],
         true
     );
+}
+
+#[test]
+fn generic_provider_ambiguous_start_recovers_with_fenced_stop_before_session_release() {
+    let mut harness = Harness::new();
+    harness.catalog_generic = true;
+    harness.catalog_provenance = Some(json!({"provider":"example.importer","source_id":"42"}));
+    harness.generic_lost_start = true;
+    let mut pipeline = pipeline();
+    pipeline.set_provider_routes(
+        [(
+            "example".into(),
+            ProviderRoute {
+                importer: "example.importer".into(),
+                service: "example.provider/1".into(),
+            },
+        )]
+        .into(),
+    );
+    let result = harness.request(&mut pipeline, "alice", launch("generic-lost"));
+    assert_eq!(result["launch"]["state"], "failed", "{result}");
+    let actions: Vec<_> = harness
+        .commands
+        .iter()
+        .filter(|(service, _, _)| service == "example.provider/1")
+        .map(|(_, payload, _)| payload["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(actions, ["identity", "launch", "recover_stop"]);
+    assert!(harness.generic_started);
+    assert!(
+        harness
+            .sessions
+            .iter()
+            .all(|session| session.state == "stopped")
+    );
+}
+
+#[test]
+fn generic_provider_rejects_forged_provenance_before_effect() {
+    let mut harness = Harness::new();
+    harness.catalog_generic = true;
+    harness.catalog_provenance = Some(json!({"provider":"evil.importer","source_id":"42"}));
+    let mut pipeline = pipeline();
+    pipeline.set_provider_routes(
+        [(
+            "example".into(),
+            ProviderRoute {
+                importer: "example.importer".into(),
+                service: "example.provider/1".into(),
+            },
+        )]
+        .into(),
+    );
+    let result = harness.request(&mut pipeline, "alice", launch("generic-bad-owner"));
+    assert_eq!(result["launch"]["failure"], "invalid_catalog_response");
+    assert!(harness.sessions.is_empty());
+    assert!(!harness.generic_started);
+}
+
+#[test]
+fn generic_provider_invalid_stop_fence_retains_lease_and_allows_owner_retry() {
+    let mut harness = Harness::new();
+    harness.catalog_generic = true;
+    harness.catalog_provenance = Some(json!({"provider":"example.importer","source_id":"42"}));
+    let mut pipeline = pipeline();
+    pipeline.set_provider_routes(
+        [(
+            "example".into(),
+            ProviderRoute {
+                importer: "example.importer".into(),
+                service: "example.provider/1".into(),
+            },
+        )]
+        .into(),
+    );
+    let started = harness.request(&mut pipeline, "alice", launch("generic-stop"));
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let id = started["launch"]["launch_id"].clone();
+    let denied = harness.request(
+        &mut pipeline,
+        "bob",
+        json!({"action":"stop","launch_id":id}),
+    );
+    assert_eq!(denied["ok"], false);
+    harness.generic_bad_proof = true;
+    let failed = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":id}),
+    );
+    assert_eq!(failed["launch"]["state"], "cleanup_failed", "{failed}");
+    assert!(harness.sessions[0].lease.is_some());
+    harness.generic_bad_proof = false;
+    let stopped = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":id}),
+    );
+    assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
+    assert!(harness.sessions[0].lease.is_none());
 }

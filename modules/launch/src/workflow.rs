@@ -19,6 +19,10 @@ pub enum Step {
     AwaitApplication,
     PrepareApplication,
     AwaitPreparation,
+    IdentifyProvider,
+    StartProvider,
+    MonitorProvider,
+    RecoverProviderStop,
     StartPlaynite,
     AwaitPlayniteStart,
     MonitorPlaynite,
@@ -91,11 +95,11 @@ impl Workflow {
     pub fn parent(&self) -> Option<u64> {
         if self.cleanup { None } else { self.request }
     }
-    pub fn command(
+    pub fn command<'a>(
         &self,
-        record: &Record,
+        record: &'a Record,
         environment: &std::collections::BTreeMap<String, String>,
-    ) -> Result<(&'static str, Value), &'static str> {
+    ) -> Result<(&'a str, Value), &'static str> {
         let session = record.session_id;
         Ok(match self.step {
             Step::Catalog => {
@@ -140,6 +144,37 @@ impl Workflow {
                 }
                 (APPLICATION, payload)
             }
+            Step::IdentifyProvider => (
+                record
+                    .generic_provider_service
+                    .as_deref()
+                    .ok_or("invalid_workflow")?,
+                json!({"action":"identity"}),
+            ),
+            Step::StartProvider | Step::MonitorProvider | Step::RecoverProviderStop => {
+                let Some(LaunchTarget::Provider { application_id, .. }) = record.target.as_ref()
+                else {
+                    return Err("invalid_workflow");
+                };
+                let service = record
+                    .generic_provider_service
+                    .as_deref()
+                    .ok_or("invalid_workflow")?;
+                let incarnation = record
+                    .generic_provider_incarnation
+                    .as_deref()
+                    .ok_or("invalid_workflow")?;
+                let action = match self.step {
+                    Step::StartProvider => "launch",
+                    Step::MonitorProvider => "lookup",
+                    Step::RecoverProviderStop => "recover_stop",
+                    _ => unreachable!(),
+                };
+                (
+                    service,
+                    json!({"action":action,"operation_id":record.process_operation,"application_id":application_id,"provider_incarnation":incarnation}),
+                )
+            }
             Step::StartPlaynite => match record.target.as_ref() {
                 Some(LaunchTarget::Playnite { game_id, .. }) => (
                     PLAYNITE,
@@ -164,6 +199,12 @@ impl Workflow {
                             preparation,
                             working_directory,
                             exit_timeout_seconds,
+                        })
+                        | Some(LaunchTarget::Provider {
+                            preparation,
+                            working_directory,
+                            exit_timeout_seconds,
+                            ..
                         })
                         | Some(LaunchTarget::Desktop {
                             preparation,
@@ -321,6 +362,14 @@ pub(crate) fn cleanup_budget(target: Option<&LaunchTarget>) -> Duration {
             // Two bounded authenticated pipe connections, stop, and polling.
             ((timeout + 21) * 1_000, timeout, preparation.as_slice())
         }
+        Some(LaunchTarget::Provider {
+            exit_timeout_seconds,
+            preparation,
+            ..
+        }) => {
+            let timeout = (*exit_timeout_seconds).min(300);
+            ((timeout + 21) * 1_000, timeout, preparation.as_slice())
+        }
         Some(LaunchTarget::Desktop {
             exit_timeout_seconds,
             preparation,
@@ -358,6 +407,11 @@ pub(crate) fn cleanup_budget(target: Option<&LaunchTarget>) -> Duration {
 pub fn first_cleanup_step(record: &Record) -> Step {
     if record.session_requested && record.session_id.is_none() {
         Step::FindSession
+    } else if record.provider_launch_requested
+        && !record.provider_stopped
+        && matches!(record.target, Some(LaunchTarget::Provider { .. }))
+    {
+        Step::RecoverProviderStop
     } else if record.provider_launch_requested && record.provider_ticket.is_none() {
         Step::FindPlaynite
     } else if record.provider_ticket.is_some() && !record.provider_stopped {

@@ -964,6 +964,22 @@ pub enum Launch {
     Application {
         path: String,
     },
+    /// Opaque target owned by a startup-authorized importer and provider.
+    Provider {
+        provider: String,
+        application_id: String,
+        #[serde(default = "default_playnite_exit_timeout_seconds")]
+        exit_timeout_seconds: u64,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            alias = "working-dir",
+            deserialize_with = "empty_working_directory_as_none"
+        )]
+        working_directory: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preparation: Vec<PreparationStep>,
+    },
     /// A launch target owned by the trusted Playnite provider. The game ID is
     /// resolved by Playnite's authenticated extension IPC, never by a shell.
     Playnite {
@@ -1238,6 +1254,27 @@ impl Entry {
                 validate_combined_preparation_count(preparation.len(), self.prep_cmd.len())?;
             }
             Launch::Application { path } => validate_path(path)?,
+            Launch::Provider {
+                provider,
+                application_id,
+                exit_timeout_seconds,
+                working_directory,
+                preparation,
+            } => {
+                if !valid_provider_key(provider)
+                    || application_id.trim().is_empty()
+                    || !bounded_text(application_id, 96)
+                    || *exit_timeout_seconds == 0
+                    || *exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS
+                {
+                    return Err("invalid provider launch identity or timeout");
+                }
+                if let Some(directory) = working_directory {
+                    validate_working_directory(directory)?;
+                }
+                validate_preparation(preparation)?;
+                validate_combined_preparation_count(preparation.len(), self.prep_cmd.len())?;
+            }
             Launch::Playnite {
                 game_id,
                 exit_timeout_seconds,
@@ -1290,6 +1327,14 @@ impl Entry {
         }
         Ok(())
     }
+}
+
+pub(crate) fn valid_provider_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 pub fn valid_steam_id(value: &str) -> bool {

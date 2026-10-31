@@ -21,9 +21,12 @@ collection revisions; forward the returned values and sequences exactly. The
 batch validator checks unique source IDs, at most eight total entry/removal
 intents, and at most 12,000 encoded bytes for the four batch arrays. Catalog entry normalization can increase the encoded size, so a locally valid
 batch may still be rejected. The catalog also validates entry data, authorization
-and concurrency. Batches are committed
-incrementally, so failure or an incomplete finish does not roll them back.
-Cleanup is requested only by a complete finish and its explicit removal flags.
+and concurrency. By default batches are committed incrementally, so failure or
+an incomplete finish does not roll them back. An opt-in staged begin requests
+atomic publication; require an explicit `staged:true` acknowledgement and
+respect the selected catalog's storage and publication bounds. Incomplete staged
+finish does not publish. Cleanup is requested only by a complete finish and its
+explicit removal flags.
 Never report an incomplete scan as complete.
 
 Broker admission is not proof that a lifecycle effect occurred. On an uncertain
