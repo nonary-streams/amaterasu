@@ -319,6 +319,22 @@ fn pending_reconfiguration_keeps_old_borrow_fenced_until_worker_settles() {
             revision: 1,
         },
     );
+    let unknown =
+        manager.reconfigure_status("other", "resize-1", FIRST, "ref-1", &borrow_id, "domain", 1);
+    assert_eq!(unknown["code"], "recovery_required");
+    let unknown =
+        manager.reconfigure_status("owner", "missing", FIRST, "ref-1", &borrow_id, "domain", 1);
+    assert_eq!(unknown["code"], "recovery_required");
+    assert_eq!(manager.reconfigurations.len(), 1);
+    assert!(
+        manager.sender.is_none(),
+        "lookup must not enqueue native work"
+    );
+    manager.domain_id = "domain".into();
+    assert_eq!(
+        manager.reconfigure_status("owner", "resize-1", FIRST, "ref-1", &borrow_id, "domain", 1)["state"],
+        "pending"
+    );
     assert_eq!(
         manager.release_borrow("owner", FIRST, "ref-1", &borrow_id)["code"],
         "reconfigure_pending"

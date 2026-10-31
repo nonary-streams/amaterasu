@@ -319,6 +319,25 @@ impl Manager {
     pub fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Admission>) {
         self.tick();
         match operation {
+            Operation::ReconfigureStatus {
+                operation_id,
+                identity,
+                reference_id,
+                borrow_id,
+                expected_topology_domain_id,
+                expected_topology_revision,
+            } => (
+                self.reconfigure_status(
+                    caller,
+                    &operation_id,
+                    &identity,
+                    &reference_id,
+                    &borrow_id,
+                    &expected_topology_domain_id,
+                    expected_topology_revision,
+                ),
+                None,
+            ),
             Operation::Reconfigure {
                 operation_id,
                 identity,
@@ -632,6 +651,51 @@ impl Manager {
             self.monitors.get_mut(&key).unwrap().state = "removing";
         }
         json!({"ok":true,"removed":false,"monitor":self.monitors[&key].response(reference_id),"reference_owned":false})
+    }
+    /// Lookup only: never enqueue work or admit an unknown operation. The
+    /// observing phase may finish the already completed operation's borrow.
+    #[allow(clippy::too_many_arguments)]
+    fn reconfigure_status(
+        &mut self,
+        caller: &str,
+        operation_id: &str,
+        identity: &str,
+        reference_id: &str,
+        borrow_id: &str,
+        domain_id: &str,
+        revision: u64,
+    ) -> Value {
+        let key = (caller.to_owned(), identity.to_owned());
+        let Some(change) = self.reconfigurations.get(&key) else {
+            return failure("recovery_required");
+        };
+        if self.domain_id != domain_id
+            || change.domain_id != domain_id
+            || change.revision != revision
+            || change.transition.operation_id != operation_id
+            || change.transition.reference_id != reference_id
+            || change.transition.borrow_id != borrow_id
+        {
+            return failure("recovery_required");
+        }
+        if let Some(result) = change.result.clone() {
+            let Some(new_borrow) = result["borrow_id"].as_str() else {
+                return failure("recovery_required");
+            };
+            let verified = self.validate_borrow(caller, identity, reference_id, new_borrow);
+            return if verified["ok"] == true
+                && verified["mutation_domain"] == result["mutation_domain"]
+            {
+                result
+            } else {
+                failure("recovery_required")
+            };
+        }
+        match change.state {
+            "pending" => json!({"ok":true,"state":"pending","operation_id":operation_id}),
+            "observing" => self.finish_reconfigure(&key),
+            _ => failure("recovery_required"),
+        }
     }
     #[allow(clippy::too_many_arguments)]
     fn reconfigure(

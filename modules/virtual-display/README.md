@@ -72,6 +72,11 @@ reconciliation; startup recovery may remove the journaled connector. The caller
 must hold its cooperative mutation reservation and retire capture consumers
 before admission, and persist the replacement borrow before publishing capture.
 External desktop applications are outside that cooperative fence.
+`reconfigure_status` is a recovery-only lookup for the exact caller, operation,
+reference, original borrow and domain pair. It never admits an unknown
+operation or queues KScreen work. A matching operation can report pending or
+its revalidated result; an unknown operation, restart or uncertain effect
+returns `recovery_required`.
 
 `$XDG_STATE_HOME/amaterasu/virtual-display-linux` (default
 `~/.local/state/amaterasu/virtual-display-linux`) is locked against other
