@@ -38,7 +38,7 @@ unsafe extern "C" fn invoke(
     let Ok(bytes) = (unsafe { input.read() }) else {
         return abi::STATUS_INVALID_ARGUMENT;
     };
-    let Ok(command) = serde_json::from_slice(bytes) else {
+    let Ok(command) = serde_json::from_slice::<Command>(bytes) else {
         return abi::STATUS_INVALID_ARGUMENT;
     };
     let response = endpoint
@@ -91,6 +91,9 @@ impl Drop for RunningModule {
         }
     }
 }
+fn domain(revision: u64, borrowers: usize) -> Value {
+    json!({"id":"provider_session:abc","revision":revision,"borrowers":borrowers,"pending_mutations":0,"scope":"provider_session"})
+}
 struct Fixture {
     broker: Rc<RefCell<Broker>>,
     lifecycle: RunningModule,
@@ -104,15 +107,20 @@ struct Fixture {
     entries: BTreeMap<String, Value>,
     metadata: Value,
     native_calls: Vec<Value>,
+    references: BTreeMap<String, String>,
+    borrows: BTreeMap<String, String>,
+    domain_revision: u64,
+    borrow_sequence: u32,
 }
 impl Fixture {
     fn new() -> Self {
         let examples =
             PathBuf::from(std::env::var_os("AMATERASU_DISPLAY_EXAMPLES").expect("examples path"));
-        let approvals: Value = serde_json::from_slice(
-            &std::fs::read(examples.join("lifecycle-api-approvals.json")).unwrap(),
-        )
-        .unwrap();
+        let approvals_path = std::env::var_os("AMATERASU_DISPLAY_APPROVALS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| examples.join("lifecycle-api-approvals.json"));
+        let approvals: Value =
+            serde_json::from_slice(&std::fs::read(approvals_path).unwrap()).unwrap();
         let descriptor: Value = serde_json::from_slice(
             &std::fs::read(examples.join("settings-descriptor.json")).unwrap(),
         )
@@ -142,7 +150,7 @@ impl Fixture {
         }
         let method = |name| json!({"service":DISPLAY_SERVICE,"method":name,"interface_major":1,"interface_minor":0,"schema_revision":1});
         let configuration = json!({"principals":{
-            COORDINATOR:{"provide":[LIFECYCLE],"call":[DISPLAY_SERVICE,"amaterasu.virtual-display/1","amaterasu.state/1"]},
+            COORDINATOR:{"provide":[LIFECYCLE],"call":[LIFECYCLE,DISPLAY_SERVICE,"amaterasu.virtual-display/1","amaterasu.state/1"]},
             DISPLAY:{"provide":[DISPLAY_SERVICE],"call":[LIFECYCLE,"amaterasu.virtual-display/1","amaterasu.state/1"]},
             "transport":{"call":[LIFECYCLE]}, "capture":{"call":[LIFECYCLE]}, "amaterasu.extension-registry":{"call":[DISPLAY_SERVICE]},
             "amaterasu.management":{"call":[DISPLAY_SERVICE]},
@@ -150,7 +158,7 @@ impl Fixture {
         },"api_methods":approvals["api_methods"],"settings":{COORDINATOR:{
             "journal_path":root.join("journal.json"), "trusted_callers":["transport","capture",DISPLAY],
             "session_delegates":["capture"], "consumers":{"capture":["capture"]},
-            "operation_grants":{"transport":["prepare","lookup","prepare_stream","snapshot","start_stream"],"capture":["ack_binding","lookup"],DISPLAY:["verify_provider_epoch"]},
+            "operation_grants":{"transport":["prepare","lookup","prepare_stream","resume_stream","snapshot","start_stream","pause_stream","end_session","application_retired"],"capture":["ack_binding","retire_stream","lookup"],DISPLAY:["verify_provider_epoch","refresh_provider_observations"]},
             "consumer_requirements":{"execution_domain":"desktop","capture_providers":["amaterasu.capture-pipewire/1"],"selector_schemas":["amaterasu.kwin-wl-output/1"]},
             "participants":[{"provider":DISPLAY,"plan_method":method("resource_plan"),"callback_method":method("lifecycle_callback"),"status_method":method("lifecycle_status"),"binding_validate_method":method("binding_validate"),"settings_revision":"one","settings":settings,"capabilities":[],"cleanup_methods":[method("lifecycle_callback")]}]
         }}});
@@ -197,6 +205,10 @@ impl Fixture {
             entries: BTreeMap::new(),
             metadata: Value::Null,
             native_calls: Vec::new(),
+            references: BTreeMap::new(),
+            borrows: BTreeMap::new(),
+            domain_revision: 1,
+            borrow_sequence: 0,
         }
     }
     fn tick(&mut self) {
@@ -261,28 +273,24 @@ impl Fixture {
     }
     fn native(&mut self, p: &Value) -> Value {
         self.native_calls.push(p.clone());
-        let borrowers = self
-            .native_calls
-            .iter()
-            .filter(|call| call["action"] == "borrow")
-            .count();
-        let domain = json!({"id":"provider_session:abc","revision":1+borrowers,"borrowers":borrowers,"pending_mutations":0,"scope":"provider_session"});
         match p["action"].as_str().unwrap() {
             "status" => {
-                let previous = self
-                    .native_calls
-                    .iter()
-                    .find(|call| call["action"] == "create" && call["identity"] == p["identity"]);
-                let reference_owned = self.native_calls.iter().any(|call| {
+                let identity = p["identity"].as_str();
+                let previous = self.native_calls.iter().find(|call| {
                     call["action"] == "create"
-                        && call["identity"] == p["identity"]
-                        && call["reference_id"] == p["reference_id"]
+                        && identity.is_none_or(|wanted| call["identity"] == wanted)
+                        && self.references.values().any(|id| call["identity"] == *id)
+                });
+                let reference_owned = p["reference_id"].as_str().map(|reference| {
+                    self.references
+                        .get(reference)
+                        .is_some_and(|id| identity == Some(id.as_str()))
                 });
                 let monitors = previous.map_or_else(
                     || json!([]),
-                    |call| json!([{"reference_owned":reference_owned,"specification":{"identity":call["identity"],"width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false},"state":"ready","output":"Virtual-1","error":null,"virtual_display_layout":"extended","dd_virtual_display_scale":0,"capture_output":"kwin:Virtual-1","ready":{"device_path":"Virtual-1","active":true}}]),
+                    |call| json!([{"reference_owned":reference_owned.unwrap_or(false),"specification":{"identity":call["identity"],"width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false},"state":"ready","output":"Virtual-1","error":null,"virtual_display_layout":"extended","dd_virtual_display_scale":0,"capture_output":"kwin:Virtual-1","ready":{"device_path":"Virtual-1","active":true}}]),
                 );
-                json!({"ok":true,"enabled":true,"native_supported":true,"driver":"libvirtualdisplay","ownership_authority":"unix_uid_broker","recovery_ready":true,"reference_owned":reference_owned,"monitors":monitors,"mutation_domain":domain,"settings":{"virtual_display_layout":"extended","dd_virtual_display_scale":0}})
+                json!({"ok":true,"enabled":true,"native_supported":true,"driver":"libvirtualdisplay","ownership_authority":"unix_uid_broker","recovery_ready":true,"reference_owned":reference_owned,"monitors":monitors,"mutation_domain":domain(self.domain_revision,self.borrows.len()),"settings":{"virtual_display_layout":"extended","dd_virtual_display_scale":0}})
             }
             "create" => {
                 assert_eq!(
@@ -293,17 +301,47 @@ impl Fixture {
                     !self.values.is_empty(),
                     "effect must follow durable resource record"
                 );
+                self.references.insert(
+                    p["reference_id"].as_str().unwrap().into(),
+                    p["identity"].as_str().unwrap().into(),
+                );
                 json!({"ok":true,"reference_owned":true,"monitor":{"specification":{"identity":p["identity"],"width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false},"virtual_display_layout":"extended","dd_virtual_display_scale":0,"state":"ready","error":null,"ready":{"device_path":"Virtual-1","active":true},"capture_output":"kwin:Virtual-1"}})
             }
-            "borrow" | "validate_borrow" => {
-                let borrow_id = if p["action"] == "validate_borrow" {
-                    p["borrow_id"].as_str().unwrap().to_owned()
-                } else if borrowers == 1 {
-                    "a".repeat(64)
-                } else {
-                    "c".repeat(64)
-                };
-                json!({"ok":true,"borrow_id":borrow_id,"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000},"mutation_domain":domain})
+            "borrow" => {
+                let reference = p["reference_id"].as_str().unwrap().to_owned();
+                assert!(self.references.contains_key(&reference));
+                self.borrow_sequence += 1;
+                let borrow_id = format!("{:064x}", self.borrow_sequence);
+                self.borrows.insert(reference, borrow_id.clone());
+                self.domain_revision += 1;
+                json!({"ok":true,"borrow_id":borrow_id,"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000},"mutation_domain":domain(self.domain_revision,self.borrows.len())})
+            }
+            "validate_borrow" => {
+                assert_eq!(
+                    self.borrows.get(p["reference_id"].as_str().unwrap()),
+                    p["borrow_id"].as_str().map(str::to_owned).as_ref()
+                );
+                json!({"ok":true,"borrow_id":p["borrow_id"],"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000},"mutation_domain":domain(self.domain_revision,self.borrows.len())})
+            }
+            "release_borrow" => {
+                let reference = p["reference_id"].as_str().unwrap();
+                assert_eq!(
+                    self.borrows.get(reference),
+                    p["borrow_id"].as_str().map(str::to_owned).as_ref()
+                );
+                self.borrows.remove(reference);
+                self.domain_revision += 1;
+                json!({"ok":true,"released":true,"mutation_domain":domain(self.domain_revision,self.borrows.len())})
+            }
+            "remove" => {
+                let reference = p["reference_id"].as_str().unwrap();
+                assert!(!self.borrows.contains_key(reference));
+                assert!(self.references.remove(reference).is_some());
+                let still_present = self
+                    .references
+                    .values()
+                    .any(|id| id == p["identity"].as_str().unwrap());
+                json!({"ok":true,"removed":!still_present,"identity":p["identity"],"reference_released":true,"reference_owned":false})
             }
             action => panic!("unexpected virtual action {action}: {p}"),
         }
@@ -358,7 +396,10 @@ impl Drop for Fixture {
         // SAFETY: the plugin instance has been destroyed and no callbacks remain.
         unsafe { dlclose(self.library) };
         self.library = std::ptr::null_mut();
-        std::fs::remove_dir_all(&self.root).unwrap();
+        eprintln!(
+            "cross-ABI test evidence retained at {}",
+            self.root.display()
+        );
     }
 }
 #[test]
@@ -367,7 +408,7 @@ fn real_display_and_lifecycle_round_trip_with_simulated_backends() {
     let mut f = Fixture::new();
     let video = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
     let prepared =
-        f.call(json!({"operation":"prepare","operation_id":"prepare","requested_video":video}));
+        f.call(json!({"operation":"prepare","operation_id":"prepare","requested_video":video,"application_ref":{"kind":"desktop"}}));
     assert_eq!(prepared["status"], "pending", "{prepared}");
     let ready = f.settled("prepare");
     assert_eq!(
@@ -375,7 +416,7 @@ fn real_display_and_lifecycle_round_trip_with_simulated_backends() {
         "{ready}; virtual calls: {:?}",
         f.native_calls
     );
-    let stream=f.call(json!({"operation":"prepare_stream","operation_id":"stream","target":ready["target"],"intent":"initial","requested_video":video}));
+    let stream=f.call(json!({"operation":"prepare_stream","operation_id":"stream","target":ready["target"],"intent":"initial","requested_video":video,"consumer_requirements":["capture"]}));
     assert_eq!(stream["status"], "pending", "{stream}");
     let result = f.settled("stream");
     assert_eq!(
@@ -415,4 +456,89 @@ fn real_display_and_lifecycle_round_trip_with_simulated_backends() {
             .count(),
         2
     );
+    let started =
+        f.call(json!({"operation":"start_stream","operation_id":"start","target":target}));
+    assert_eq!(started["status"], "succeeded", "{started}");
+    let pause = f.call(json!({"operation":"pause_stream","operation_id":"pause","target":target}));
+    assert_eq!(pause["status"], "pending", "{pause}");
+    assert_eq!(pause["fenced"], true);
+    let retired=f.call_as("capture",json!({"operation":"retire_stream","operation_id":"retire","target":target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}));
+    assert_eq!(retired["status"], "pending", "{retired}");
+    let paused = f.settled("pause");
+    assert_eq!(
+        paused["status"], "succeeded",
+        "{paused}; native calls: {:?}",
+        f.native_calls
+    );
+    assert_eq!(f.references.len(), 1, "pause retains the session reference");
+    assert_eq!(f.borrows.len(), 1, "pause retires only the stream borrow");
+    let resume=f.call(json!({"operation":"resume_stream","operation_id":"resume","target":ready["target"],"intent":"resume","requested_video":video,"consumer_requirements":["capture"]}));
+    assert_eq!(resume["status"], "pending", "{resume}");
+    let resumed = f.settled("resume");
+    assert_eq!(
+        resumed["status"], "succeeded",
+        "{resumed}; native calls: {:?}",
+        f.native_calls
+    );
+    let resumed_target = resumed["target"].clone();
+    assert_ne!(resumed_target["stream_id"], target["stream_id"]);
+    let resumed_candidate = resumed["candidate"].clone();
+    let resumed_ack=f.call_as("capture",json!({"operation":"ack_binding","operation_id":"resume-ack","target":resumed_target,"consumer":"capture","plan_revision":resumed_candidate["plan_revision"],"candidate":resumed_candidate,"observed_capture":observed}));
+    assert_eq!(resumed_ack["status"], "pending", "{resumed_ack}");
+    let mut result = Value::Null;
+    for _ in 0..500 {
+        result = f.call_as(
+            "capture",
+            json!({"operation":"lookup","operation_id":"resume-ack"}),
+        );
+        if result["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(result["status"], "succeeded", "{result}");
+    let restarted = f.call(
+        json!({"operation":"start_stream","operation_id":"resume-start","target":resumed_target}),
+    );
+    assert_eq!(restarted["status"], "succeeded", "{restarted}");
+    let end =
+        f.call(json!({"operation":"end_session","operation_id":"end","target":ready["target"]}));
+    assert_eq!(end["status"], "pending", "{end}");
+    let retired=f.call_as("capture",json!({"operation":"retire_stream","operation_id":"resume-retire","target":resumed_target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}));
+    assert_eq!(retired["status"], "pending", "{retired}");
+    let app=f.call(json!({"operation":"application_retired","operation_id":"desktop-retired","target":ready["target"]}));
+    assert_eq!(app["status"], "succeeded", "{app}");
+    let ended = f.settled("end");
+    assert_eq!(
+        ended["status"], "succeeded",
+        "{ended}; native calls: {:?}",
+        f.native_calls
+    );
+    assert!(f.references.is_empty());
+    assert!(f.borrows.is_empty());
+}
+
+#[test]
+#[ignore = "requires an independently built display module and its example approvals"]
+fn real_display_releases_session_before_any_stream() {
+    let mut f = Fixture::new();
+    let video = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
+    let prepared = f.call(json!({"operation":"prepare","operation_id":"prepare","requested_video":video,"application_ref":{"kind":"desktop"}}));
+    assert_eq!(prepared["status"], "pending", "{prepared}");
+    let ready = f.settled("prepare");
+    assert_eq!(ready["status"], "succeeded", "{ready}");
+    assert_eq!(f.references.len(), 1);
+    assert_eq!(f.borrows.len(), 1);
+    let end =
+        f.call(json!({"operation":"end_session","operation_id":"end","target":ready["target"]}));
+    assert_eq!(end["status"], "pending", "{end}");
+    let app=f.call(json!({"operation":"application_retired","operation_id":"desktop-retired","target":ready["target"]}));
+    assert_eq!(app["status"], "succeeded", "{app}");
+    let ended = f.settled("end");
+    assert_eq!(
+        ended["status"], "succeeded",
+        "{ended}; native calls: {:?}",
+        f.native_calls
+    );
+    assert!(f.references.is_empty());
+    assert!(f.borrows.is_empty());
 }
