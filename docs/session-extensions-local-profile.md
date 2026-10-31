@@ -30,9 +30,13 @@ It creates an operator bootstrap policy with exact methods and callers, pins the
 descriptor digest, configures lifecycle participants and consumer identities,
 and signs then verifies the whole set. The plugin's default `enabled` setting
 must be false. The action grant list and lifecycle input-action list start empty, so buttons
-and shortcuts are not authorized. The current provider descriptor declares no
-actions. Add exact action IDs, scopes, and caller/initiator approvals only after
-the provider advertises implemented actions and the authority path is qualified.
+and shortcuts are not authorized. When the selected provider advertises the
+exact supported `nonary.display-settings/remove-owned` action, passing
+`--enable-display-actions` before the positional arguments authorizes that
+action for session and stream targets through management and input. The
+preparer rejects this flag if the matching descriptor and API methods are absent
+or incompatible. The provider's current published descriptor may still omit
+the action; source and hardware qualification remain separate.
 The command never stages,
 activates, installs, starts, or restarts the host, and it does not change desktop
 or network configuration. Both root and package paths must be new.

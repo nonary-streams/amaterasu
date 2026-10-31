@@ -53,12 +53,28 @@ def method_ref(name: str) -> dict:
             "interface_minor": 0, "schema_revision": 1}
 
 
-def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: str, approvals: list[dict], component: dict) -> dict:
+def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: str, approvals: list[dict], component: dict, enable_display_actions: bool = False) -> dict:
     if descriptor.get("provider") != PROVIDER or component.get("id") != PROVIDER:
         raise ValueError("unexpected display provider identity")
     if any(approval.get("provider") != PROVIDER or approval.get("method", {}).get("service") != PROVIDER_SERVICE for approval in approvals):
         raise ValueError("provider API approvals do not match the selected provider")
     expected = {"settings_validate", "resource_plan", "lifecycle_callback", "lifecycle_status", "binding_validate"}
+    action_id = PROVIDER + "/remove-owned"
+    actions = descriptor.get("actions", [])
+    if actions:
+        if len(actions) != 1:
+            raise ValueError("unsupported display action descriptor")
+        action = actions[0]
+        if (action.get("id") != action_id or action.get("execution") != "session_mutation"
+                or set(action.get("allowed_targets", [])) != {"session", "stream"}
+                or action.get("arguments") != {}
+                or action.get("plan") != method_ref("action_plan")
+                or action.get("execute") != method_ref("action_execute")
+                or action.get("status") != method_ref("action_status")):
+            raise ValueError("unsupported display action contract")
+        expected.update({"action_plan", "action_execute", "action_status"})
+    elif enable_display_actions:
+        raise ValueError("selected provider does not advertise a supported remove-owned action")
     if len(approvals) != len(expected) or {item["method"]["method"] for item in approvals} != expected:
         raise ValueError("provider API approvals are incomplete or duplicated")
     policy = bootstrap["policy"]
@@ -87,6 +103,8 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
     for approval in approvals:
         if approval["method"]["method"] == "settings_validate":
             approval["callers"] = validation_callers
+        elif approval["method"]["method"] in {"action_plan", "action_execute", "action_status"}:
+            approval["callers"] = [ACTIONS, MANAGEMENT, INPUT, STREAM]
     installed = policy.get("api_methods", [])
     def method_identity(approval: dict) -> tuple:
         method = approval["method"]
@@ -108,7 +126,7 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
     settings[LIFECYCLE] = {
         "journal_path": str(journal / "journal.json"),
         "trusted_callers": sorted(OPERATIONS), "session_delegates": [RTSP, STREAM],
-        "input_actions": [], "action_service": ACTIONS, "settings_registry_caller": REGISTRY,
+        "input_actions": [action_id] if enable_display_actions else [], "action_service": ACTIONS, "settings_registry_caller": REGISTRY,
         "settings_registry_service": REGISTRY_SERVICE,
         "operation_grants": OPERATIONS,
         "consumers": {"capture": [STREAM], "input": [STREAM, INPUT]},
@@ -119,7 +137,10 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
             "binding_validate_method": method_ref("binding_validate"), "settings_revision": "bootstrap-v1",
             "settings": defaults, "capabilities": [], "cleanup_methods": []}],
     }
-    settings[ACTIONS] = {"input_service": INPUT, "grants": []}
+    action_grants = [{"principal": identity, "action_ids": [action_id],
+                      "target_kinds": ["session", "stream"], "execution_classes": ["session_mutation"]}
+                     for identity in (MANAGEMENT, INPUT, STREAM)] if enable_display_actions else []
+    settings[ACTIONS] = {"input_service": INPUT, "grants": action_grants}
     settings.setdefault("amaterasu.launch", {})["retirement_observers"] = [LIFECYCLE]
     settings[NVHTTP]["session_lifecycle_required"] = True
     # The implemented binding adapter supports PipeWire/KWin SDR only.
@@ -129,6 +150,8 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--enable-display-actions", action="store_true",
+                        help="authorize the selected provider remove-owned action for managed sessions")
     parser.add_argument("publisher", type=Path)
     parser.add_argument("root", type=Path)
     parser.add_argument("artifacts", type=Path)
@@ -153,7 +176,7 @@ def main() -> None:
     bootstrap_path = args.root / "bootstrap.json"
     bootstrap = json.loads(bootstrap_path.read_text())
     descriptor_digest = run(args.publisher, "extension-descriptor-digest", examples / "settings-descriptor.json")
-    calls = prepare(bootstrap, args.root.resolve(), descriptor, descriptor_digest, approvals, component)
+    calls = prepare(bootstrap, args.root.resolve(), descriptor, descriptor_digest, approvals, component, args.enable_display_actions)
     bootstrap_path.write_text(json.dumps(bootstrap, indent=2) + "\n")
     with tempfile.TemporaryDirectory(prefix="amaterasu-extension-grants-") as temporary:
         call_path = Path(temporary) / "calls.json"
@@ -163,6 +186,8 @@ def main() -> None:
         run(args.publisher, "verify", args.root, args.package)
     print("Prepared and verified the opt-in signed set; it has not been staged or activated.")
     print("Provider effects start disabled; lifecycle, platform and live streaming require qualification.")
+    if args.enable_display_actions:
+        print("The remove-owned action is authorized for managed session and stream targets.")
 
 
 if __name__ == "__main__":
