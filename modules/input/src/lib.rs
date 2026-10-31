@@ -7,6 +7,8 @@ mod feedback;
 mod gamepad;
 mod gamepad_profile;
 mod model;
+pub mod shortcut;
+pub use model::{Key as ShortcutKey, KeyState as ShortcutKeyState};
 mod product_settings;
 
 use amaterasu_input_policy::KeyBindings;
