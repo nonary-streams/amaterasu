@@ -2154,6 +2154,17 @@ mod tests {
         )
         .unwrap();
         assert!(constructed == cert);
+        let mut retired = journal.clone();
+        super::session_closure::retire_ended_session(&mut retired, &work.target).unwrap();
+        assert!(retired.sessions.is_empty());
+        assert!(retention::session_expired(&retired, &work.target));
+        assert!(retired.composition.records().next().is_none());
+        assert!(validate_journal(&retired).is_ok());
+        let mut rejected = journal.clone();
+        rejected.sessions.get_mut("session").unwrap().phase = SessionPhase::RecoveryRequired;
+        let before = serde_json::to_value(&rejected).unwrap();
+        assert!(super::session_closure::retire_ended_session(&mut rejected, &work.target).is_err());
+        assert_eq!(serde_json::to_value(&rejected).unwrap(), before);
         let mut substituted = journal.clone();
         let mut value = serde_json::to_value(&substituted.composition).unwrap();
         value["outputs"][0]["callback_proof"]["request"]["operation_id"] =
@@ -2232,6 +2243,38 @@ mod tests {
             )
             .unwrap();
         assert!(actual_child_cert == child_cert);
+        let mut transferred = source_with_child.clone();
+        super::session_closure::retire_ended_session(&mut transferred, &work.target).unwrap();
+        assert!(!transferred.closed_streams.contains_target(&stream));
+        let (history, _) = transferred
+            .ended_session_history
+            .historical_children(&transferred, &stream, "owner")
+            .unwrap();
+        assert!(history.contains_closure_query(
+            "owner",
+            &stream,
+            1,
+            ("display", "incarnation"),
+            "control",
+            &"b".repeat(64)
+        ));
+        assert!(!history.contains_closure_query(
+            "owner",
+            &stream,
+            2,
+            ("display", "incarnation"),
+            "control",
+            &"b".repeat(64)
+        ));
+        assert!(
+            transferred
+                .ended_session_history
+                .historical_children(&transferred, &stream, "foreign")
+                .is_none()
+        );
+        let reopened: Journal =
+            serde_json::from_slice(&serde_json::to_vec(&transferred).unwrap()).unwrap();
+        assert!(validate_journal(&reopened).is_ok());
         let key = serde_json::to_string(&("epoch", "session")).unwrap();
         let mut encoded_book = json!({"certificates":{}});
         encoded_book["certificates"][&key] = serde_json::to_value(&child_cert).unwrap();

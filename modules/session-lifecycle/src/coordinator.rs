@@ -64,6 +64,8 @@ mod stage_backend;
 mod stream_closure_lookup;
 #[allow(dead_code)]
 mod stream_release;
+#[allow(dead_code, reason = "awaits the atomic ended-session transaction")]
+mod terminal_root;
 
 use crate::adapter::LifecycleSettings;
 use crate::prepare_authority::{AuthorityState, ProviderSelection};

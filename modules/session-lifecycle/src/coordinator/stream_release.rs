@@ -27,6 +27,10 @@ pub(super) struct StreamReleaseBook {
     proofs: Vec<StreamReleaseProof>,
 }
 impl StreamReleaseBook {
+    pub(super) fn targets(&self) -> impl Iterator<Item = &LifecycleTarget> {
+        self.proofs.iter().map(|proof| &proof.target)
+    }
+
     pub fn proofs(&self) -> impl Iterator<Item = &StreamReleaseProof> {
         self.proofs.iter()
     }

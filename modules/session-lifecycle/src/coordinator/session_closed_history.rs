@@ -583,6 +583,25 @@ pub(super) struct EndedSessionBook {
 }
 
 impl EndedSessionBook {
+    pub(super) fn matches_children(
+        &self,
+        journal: &Journal,
+        target: &LifecycleTarget,
+        expected: &closed_stream::SessionChildrenSnapshot,
+    ) -> bool {
+        let Some(cert) = Self::key(target).and_then(|key| self.certificates.get(&key)) else {
+            return false;
+        };
+        cert.target == *target
+            && Self::valid_entry(journal, cert)
+            && cert.closed_children as usize == expected.len()
+            && if expected.len() == 0 {
+                cert.children.is_none()
+            } else {
+                cert.children.as_ref() == Some(expected)
+            }
+    }
+
     /// Resolve compact historical evidence only; this does not grant control.
     pub(super) fn historical_children<'a>(
         &'a self,

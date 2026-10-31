@@ -13,6 +13,67 @@ pub(super) struct SessionClosurePreflight {
     pub prepares: Vec<session_prepare_evidence::ClosedPrepareEvidence>,
 }
 
+/// Atomically replace a fully proven terminal session with compact historical
+/// evidence. The caller must fence in-memory drivers and durably save the
+/// resulting private journal before admitting further work.
+#[allow(dead_code, reason = "awaits scheduler integration")]
+pub(super) fn retire_ended_session(
+    journal: &mut Journal,
+    target: &LifecycleTarget,
+) -> ModuleResult<()> {
+    let source = preflight(journal, target)?;
+    let certificate =
+        session_closed_history::EndedSessionCertificate::from_verified(journal, target)?;
+    let (_, session_id, None, _) = operations::target_parts(target)? else {
+        return Err("session_target_required".into());
+    };
+    let admissions = journal
+        .sessions
+        .get(session_id)
+        .ok_or("unknown_session")?
+        .admission_ids
+        .clone();
+    let root = terminal_root::preflight(journal, target, &certificate.root, &admissions)?;
+    let children = journal
+        .closed_streams
+        .session_children_snapshot(
+            journal,
+            target,
+            &certificate.root,
+            certificate.resource_generation,
+        )
+        .ok_or("stream_checkpoint_snapshot_invalid")?;
+    if certificate.closed_children as usize != children.len()
+        || (children.len() != 0 && certificate.children.as_ref() != Some(&children))
+        || (children.len() == 0 && certificate.children.is_some())
+    {
+        return Err("session_child_snapshot_changed".into());
+    }
+
+    let mut draft = journal.clone();
+    session_release::retire_closed_release(&mut draft, target, &source.release)?;
+    session_prepare_evidence::retire_closed_prepares(&mut draft, target, &source.prepares)?;
+    let mut child_book = draft.closed_streams.clone();
+    child_book.retire_session_children_exact(
+        journal,
+        target,
+        &certificate.root,
+        certificate.resource_generation,
+        &children,
+    )?;
+    draft.closed_streams = child_book;
+    retention::fence_exact_receipts(&mut draft, target, root.receipt_keys())?;
+    retention::fence_closed_session(&mut draft, target)?;
+    let mut certificates = draft.ended_session_history.clone();
+    certificates.stage_verified(journal, target)?;
+    draft.ended_session_history = certificates;
+    draft.sessions.remove(session_id).ok_or("unknown_session")?;
+    terminal_root::retire_after_transfer(&mut draft, target, &root)?;
+    validate_journal(&draft).map_err(|_| "ended_session_retirement_invalid")?;
+    *journal = draft;
+    Ok(())
+}
+
 fn target_in_session(target: &LifecycleTarget, session_id: &str) -> bool {
     match target {
         LifecycleTarget::Session { session_id: id, .. }

@@ -479,6 +479,24 @@ impl InputAuthority {
             .count()
     }
 
+    /// Terminal reservations remain historical references even after their
+    /// effects finish; root retirement must wait for separate replay-safe GC.
+    #[allow(dead_code, reason = "awaits the atomic ended-session transaction")]
+    pub(crate) fn has_any_session_reference(&self, session_id: &str) -> bool {
+        self.bindings
+            .values()
+            .any(|binding| binding.session_id == session_id)
+            || self.reservations.values().any(|entry| {
+                entry.binding.session_id == session_id
+                    || match &entry.target {
+                        Some(ActionTarget::Session { session_id: id, .. })
+                        | Some(ActionTarget::Stream { session_id: id, .. }) => id == session_id,
+                        Some(ActionTarget::Host { .. }) => true,
+                        None => false,
+                    }
+            })
+    }
+
     pub fn has_unresolved_session(&self, _host_epoch: &str, session_id: &str) -> bool {
         self.bindings
             .values()
@@ -558,6 +576,37 @@ mod tests {
             allowed_actions: BTreeSet::from(["display".into()]),
         }
     }
+    #[test]
+    fn terminal_reservation_remains_a_session_reference() {
+        let mut authority = InputAuthority::default();
+        let active = binding();
+        let token = authority.issue_input_binding(&active).unwrap();
+        let target = ActionTarget::Stream {
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            expected_generation: 1,
+        };
+        let ReservationResult::Admitted(reservation) = authority
+            .reserve_input_action_for_target(
+                "input", "client", "op", &token, "display", &active, &target,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        authority
+            .reservations
+            .values_mut()
+            .find(|item| item.reservation_id == reservation.reservation_id)
+            .unwrap()
+            .outcome = Outcome::Completed;
+        authority.fence(&active);
+        assert!(authority.has_any_session_reference("session"));
+        assert!(!authority.has_unresolved_session("host", "session"));
+        assert!(!authority.has_any_session_reference("other"));
+    }
+
     #[test]
     fn target_is_durable_exact_and_cannot_change_on_retry() {
         let mut authority = InputAuthority::default();

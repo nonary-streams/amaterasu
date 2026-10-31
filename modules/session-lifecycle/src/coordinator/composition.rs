@@ -222,6 +222,22 @@ pub struct CompositionBook {
     stage_anchors: Vec<StageAnchor>,
 }
 
+/// Exact composition-owned records that a validated terminal-session
+/// transaction may replace. This is structural evidence, never authority.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct TerminalRootSnapshot {
+    root: StoredOutput,
+    anchors: Vec<StageAnchor>,
+}
+
+fn target_uses_session(target: &LifecycleTarget, session_id: &str) -> bool {
+    match target {
+        LifecycleTarget::Session { session_id: id, .. }
+        | LifecycleTarget::Stream { session_id: id, .. } => id == session_id,
+        LifecycleTarget::Validation { .. } => false,
+    }
+}
+
 /// A policy-selected direct dependency. Schema is immutable and pinned by digest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputSelection {
@@ -392,6 +408,89 @@ impl CompositionBook {
             .retain(|selection| &selection.target != target);
         self.refinements
             .retain(|item| &item.request.target != target);
+    }
+
+    /// Capture only the exact released root and its checkpoint anchors. The
+    /// caller must independently prove graph closure and all other books' pins.
+    pub(super) fn terminal_root_snapshot(
+        &self,
+        target: &LifecycleTarget,
+        expected: &StoredOutput,
+    ) -> Result<TerminalRootSnapshot, &'static str> {
+        let LifecycleTarget::Session { session_id, .. } = target else {
+            return Err("terminal_session_required");
+        };
+        if expected.output.origin != *target || expected.state != OutputState::Released {
+            return Err("terminal_root_mismatch");
+        }
+        let mut roots = self
+            .outputs
+            .iter()
+            .filter(|item| item.output.origin == *target);
+        if roots.next() != Some(expected) || roots.next().is_some() {
+            return Err("terminal_root_ambiguous");
+        }
+        let same_resource = |output: &ResourceOutput| {
+            output.resource.provider == expected.output.resource.provider
+                && output.resource.resource_id == expected.output.resource.resource_id
+        };
+        if self
+            .outputs
+            .iter()
+            .any(|item| item != expected && same_resource(&item.output))
+            || self.selections.iter().any(|item| {
+                target_uses_session(&item.target, session_id) || same_resource(&item.input.output)
+            })
+            || self.finalize_selections.iter().any(|item| {
+                target_uses_session(&item.target, session_id) || same_resource(&item.input.output)
+            })
+            || self.staged_outputs.iter().any(|item| {
+                target_uses_session(&item.target, session_id)
+                    || same_resource(&item.before)
+                    || same_resource(&item.after)
+            })
+            || self.refinements.iter().any(|item| {
+                target_uses_session(&item.request.target, session_id)
+                    || same_resource(&item.confirmed.output)
+            })
+        {
+            return Err("terminal_root_has_composition_references");
+        }
+        let mut anchors = Vec::new();
+        for anchor in &self.stage_anchors {
+            if target_uses_session(&anchor.target, session_id)
+                || same_resource(&anchor.staged)
+                || same_resource(&anchor.released)
+            {
+                if !target_uses_session(&anchor.target, session_id)
+                    || !same_key(&anchor.staged, &expected.output)
+                    || !same_key(&anchor.released, &expected.output)
+                {
+                    return Err("terminal_root_anchor_mismatch");
+                }
+                anchors.push(anchor.clone());
+            }
+        }
+        Ok(TerminalRootSnapshot {
+            root: expected.clone(),
+            anchors,
+        })
+    }
+
+    /// Mutate a private book clone only after the enclosing transaction has
+    /// validated the full graph, all inbound references and replacement proof.
+    pub(super) fn retire_terminal_root_exact(
+        &mut self,
+        target: &LifecycleTarget,
+        expected: &TerminalRootSnapshot,
+    ) -> Result<(), &'static str> {
+        if self.terminal_root_snapshot(target, &expected.root)? != *expected {
+            return Err("terminal_root_snapshot_changed");
+        }
+        self.outputs.retain(|item| item != &expected.root);
+        self.stage_anchors
+            .retain(|item| !expected.anchors.contains(item));
+        Ok(())
     }
 
     /// A target may use only its one exact staged result, and only while the
@@ -1479,6 +1578,46 @@ mod tests {
             capability: output.capability,
             schema: output.schema,
         }
+    }
+
+    #[test]
+    fn terminal_root_snapshot_rejects_changed_or_foreign_references() {
+        let mut root = record();
+        root.state = OutputState::Released;
+        let anchor = StageAnchor {
+            target: serde_json::from_value(json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1})).unwrap(),
+            release_admission: "release".into(),
+            staged: root.output.clone(),
+            released: root.output.clone(),
+        };
+        let mut book = CompositionBook {
+            outputs: vec![root.clone()],
+            stage_anchors: vec![anchor],
+            ..Default::default()
+        };
+        let snapshot = book.terminal_root_snapshot(&target(), &root).unwrap();
+        let mut changed = book.clone();
+        changed.stage_anchors[0].release_admission = "changed".into();
+        let before = serde_json::to_value(&changed).unwrap();
+        assert!(
+            changed
+                .retire_terminal_root_exact(&target(), &snapshot)
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&changed).unwrap(), before);
+        let mut foreign = record();
+        foreign.output.origin = LifecycleTarget::Session {
+            host_epoch: "epoch".into(),
+            session_id: "foreign".into(),
+            generation: 1,
+        };
+        book.outputs.push(foreign);
+        assert!(book.terminal_root_snapshot(&target(), &root).is_err());
+        book.outputs.pop();
+        book.retire_terminal_root_exact(&target(), &snapshot)
+            .unwrap();
+        assert!(book.outputs.is_empty());
+        assert!(book.stage_anchors.is_empty());
     }
 
     #[test]
