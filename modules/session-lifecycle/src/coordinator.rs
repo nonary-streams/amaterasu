@@ -155,6 +155,9 @@ struct SessionRecord {
     /// journals may lack provenance; operations requiring it must fail closed.
     #[serde(default)]
     admission_targets: BTreeMap<String, LifecycleTarget>,
+    /// Original lifecycle phase; missing legacy entries cannot establish ownership.
+    #[serde(default)]
+    admission_phases: BTreeMap<String, LifecyclePhase>,
     #[serde(default)]
     provider_settings: BTreeMap<String, settings_snapshot::FrozenSettings>,
 }

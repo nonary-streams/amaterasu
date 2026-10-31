@@ -179,6 +179,7 @@ impl Coordinator {
                     application_operation_id,
                     admission_ids: BTreeSet::new(),
                     admission_targets: BTreeMap::new(),
+                    admission_phases: BTreeMap::new(),
                     provider_settings: BTreeMap::new(),
                 },
             );
