@@ -229,6 +229,7 @@ pub struct BindingConstraint {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderStatusRequest {
+    pub provider_sequence: u64,
     pub operation_id: String,
     pub transition_id: String,
     pub receipt_id: String,
@@ -265,6 +266,8 @@ pub struct ConsumerRequirements {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderRequest {
+    /// Persisted monotonic sequence per provider and authenticated coordinator.
+    pub provider_sequence: u64,
     pub operation: ProviderOperation,
     pub version: u32,
     pub transition_id: String,
@@ -474,7 +477,8 @@ pub struct ExtensionDescriptor {
 /// Check a provider request's shape before processing it. The broker caller,
 /// admitted plan and installed grants must still be checked by the coordinator.
 pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String> {
-    if request.version != CONTRACT_VERSION
+    if request.provider_sequence == 0
+        || request.version != CONTRACT_VERSION
         || !valid_opaque_id(&request.transition_id)
         || !valid_opaque_id(&request.operation_id)
         || !valid_opaque_id(&request.settings_revision)
@@ -952,6 +956,7 @@ mod tests {
         plan.obligations[1].depends_on.clear();
         assert!(validate_resource_plan(&plan).is_ok());
         let mut request = ProviderRequest {
+            provider_sequence: 1,
             operation: ProviderOperation::LifecycleCallback,
             version: 1,
             transition_id: "transition".into(),
@@ -980,6 +985,9 @@ mod tests {
         assert!(validate_provider_request(&request).is_err());
         request.admission_id = Some("admitted".into());
         assert!(validate_provider_request(&request).is_ok());
+        request.provider_sequence = 0;
+        assert!(validate_provider_request(&request).is_err());
+        request.provider_sequence = 1;
         let response = ProviderResponse::Cleanup {
             outcomes: vec![CleanupOutcome {
                 obligation_id: "foreign".into(),
