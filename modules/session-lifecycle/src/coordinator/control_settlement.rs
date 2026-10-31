@@ -158,6 +158,12 @@ impl ControlSettlementBook {
             .filter(|item| ids.contains(&item.settlement.settlement_id))
             .collect();
         if selected.len() != ids.len()
+            || selected
+                .iter()
+                .map(|item| &item.settlement.settlement_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != ids.len()
             || selected.iter().any(|item| {
                 item.owner_ack.is_none()
                     || item.owner_dispatch.is_none()
@@ -474,8 +480,15 @@ mod tests {
                 .collect(),
         };
         assert!(full.retire_exact(&ids, &|_| true).is_err());
-        assert_eq!(full.records, vec![first, second]);
+        assert_eq!(full.records, vec![first.clone(), second]);
         assert_eq!(full.replay_fences.len(), MAX_REPLAY_FENCES);
+
+        let mut duplicate = ControlSettlementBook {
+            records: vec![first.clone(), first],
+            ..Default::default()
+        };
+        assert!(duplicate.retire_exact(&ids, &|_| true).is_err());
+        assert_eq!(duplicate.records.len(), 2);
     }
     #[test]
     fn retained_raw_owner_response_accepts_omitted_default_field() {
