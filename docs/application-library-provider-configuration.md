@@ -295,8 +295,15 @@ A signed temporary-development-host test selected this fixture in one complete
 set, verified and staged it, then used `amaterasu.console` to create a catalog
 entry and directly list and resolve it through the replacement. The replacement
 called real Catalog and State through the broker; the test also rejected a
-forged payload initiator and a direct unauthorized catalog export. This qualifies
-that local fixture path only. It does not test NVHTTP, artwork, actual game
-launch, system installation, or end-to-end streaming. A production replacement
-must implement and be qualified for every operation its selected consumers use,
-including their actual delegation identities and failure paths.
+forged payload initiator and a direct unauthorized catalog export. A separate
+signed temporary-host test paired a client using a PIN and requested `/applist`
+over loopback mutual TLS with the generated certificate pinned. That request
+returned a real catalog entry through NVHTTP and the selected catalog-backed
+replacement. The test used source base `150744d0` with the fixture changes;
+production commit `7ccc0d56` was added afterward and was not part of that run.
+
+These tests qualify the local fixture paths only. They do not verify artwork,
+actual game launch or effects, media playback, system installation, or end-to-end
+gameplay. A production replacement must implement and be qualified for every
+operation its selected consumers use, including their actual delegation
+identities and failure paths.
