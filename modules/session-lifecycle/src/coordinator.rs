@@ -451,6 +451,8 @@ struct Journal {
     #[serde(default)]
     composition: composition::CompositionBook,
     #[serde(default)]
+    closed_streams: closed_stream::ClosedStreamBook,
+    #[serde(default)]
     control_settlements: control_settlement::ControlSettlementBook,
     #[serde(default)]
     finalize_results: finalize_result::FinalizeResultBook,
@@ -622,6 +624,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                     || (!journal.authority.admissions.contains_key(id)
                         && !journal.authority.settled.contains_key(id))
             })
+        || !journal.closed_streams.validate(journal)
         || !journal.composition.validate_structure()
         || !composition::validate_finalize_selections(journal)
         || journal.composition.records().any(|record| {
@@ -1050,6 +1053,7 @@ impl Coordinator {
             input_boot_epochs: BTreeMap::new(),
             retention: Default::default(),
             composition: Default::default(),
+            closed_streams: Default::default(),
             control_settlements: Default::default(),
             finalize_results: Default::default(),
             stream_releases: Default::default(),

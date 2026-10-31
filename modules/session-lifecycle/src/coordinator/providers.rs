@@ -2726,6 +2726,7 @@ mod admission_target_tests {
             input_boot_epochs: Default::default(),
             retention: Default::default(),
             composition: Default::default(),
+            closed_streams: Default::default(),
             control_settlements: Default::default(),
             finalize_results: Default::default(),
             stream_releases: Default::default(),

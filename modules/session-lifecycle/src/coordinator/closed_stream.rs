@@ -25,7 +25,12 @@ pub(super) struct HistoricalProof<'a> {
 }
 
 impl ClosedStreamBook {
-    fn validate(&self, journal: &Journal) -> bool {
+    /// Raw presence only; callers must reject ambiguous mixed source records.
+    pub(super) fn contains_target(&self, target: &LifecycleTarget) -> bool {
+        self.records.iter().any(|record| &record.target == target)
+    }
+
+    pub(super) fn validate(&self, journal: &Journal) -> bool {
         self.records.len() <= MAX_CHECKPOINTS
             && self.expired_scopes.len() <= MAX_SCOPE_FENCES
             && self.expired_scopes.iter().all(|item| valid_digest(item))
