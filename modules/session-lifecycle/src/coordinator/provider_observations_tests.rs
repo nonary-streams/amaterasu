@@ -900,3 +900,48 @@ fn refresh_compaction_requires_terminal_unreferenced_verified_authority() {
         .revision -= 1;
     assert!(super::super::refresh_receipt::compact(&mut journal, &key));
 }
+
+#[test]
+fn released_root_domains_require_exact_resource_and_owner() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.coordinator.shared.borrow().value.clone();
+    let root: super::super::composition::StoredOutput = serde_json::from_value(json!({
+        "output": {"output_id":"output","capability":"screen","schema":{"id":"screen/2","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"provider-a","producer_service":"provider-a/2","origin":{"kind":"session","host_epoch":"epoch","session_id":"session-a","generation":1},"resource":{"provider":"provider-a","resource_id":"screen","incarnation":"native","revision":2,"execution_domain":"seat","mutation_domain":"shared","mutation_domains":[]},"data":{}},
+        "admission_id":"root","transition_id":"prepare","state":"released",
+        "plan":{"plan_id":"root-plan","revision":1,"resources":[{"provider":"provider-a","resource_id":"screen","incarnation":"native","expected_revision":2,"execution_domain":"seat","mutation_domains":["shared"],"access":"exclusive"}],"mutation_domains":[{"domain":"shared","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}
+    })).unwrap();
+    assert!(
+        scoped_root_domains(&journal, &root, "provider-a")
+            .unwrap()
+            .contains_key("shared")
+    );
+    assert!(scoped_root_domains(&journal, &root, "provider-b").is_err());
+    let mut forged = root.clone();
+    forged.plan.mutation_domains[0].domain = "foreign".into();
+    assert!(scoped_root_domains(&journal, &forged, "provider-a").is_err());
+    forged = root.clone();
+    forged.plan.resources[0].resource_id = "other".into();
+    assert!(scoped_root_domains(&journal, &forged, "provider-a").is_err());
+    journal
+        .authority
+        .domain_owners
+        .insert("shared".into(), "provider-b".into());
+    assert!(scoped_root_domains(&journal, &root, "provider-a").is_err());
+}
+
+#[test]
+fn forged_reprepare_cannot_expose_closed_root_domain() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.coordinator.shared.borrow().value.clone();
+    let epoch = journal.host_epoch.clone();
+    let next = json!({"phase":"stream.prepare","target":{"kind":"stream","host_epoch":epoch,"session_id":"session-a","stream_id":"new-stream","generation":1},"intent":"initial","reason":null,"video":null,"transition_id":"next","providers":[],"index":0,"states":{},"candidate":null,"waiting_retirement":false});
+    let work: Work = serde_json::from_value(json!({"phase":"session.prepare","target":{"kind":"session","host_epoch":epoch,"session_id":"session-a","generation":1},"intent":null,"reason":null,"video":null,"transition_id":"replacement","providers":["provider-a"],"index":0,"states":{},"candidate":null,"waiting_retirement":false,"reprepare":{"owner":"provider-a","old_generation":1,"old_incarnation":"native","next":next}})).unwrap();
+    let receipt: Receipt = serde_json::from_value(json!({"caller":"transport","initiator":"client","request":{},"response":{"status":"pending"},"work":work,"wait_target":null})).unwrap();
+    journal.receipts.insert("forged".into(), receipt);
+    assert!(reprepare_domains(&journal, &journal.sessions["session-a"], "provider-a").is_err());
+    assert!(
+        reprepare_domains(&journal, &journal.sessions["session-a"], "provider-b")
+            .unwrap()
+            .is_empty()
+    );
+}

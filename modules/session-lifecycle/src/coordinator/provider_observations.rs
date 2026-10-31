@@ -256,6 +256,115 @@ fn closed_admissions(journal: &Journal, session: &SessionRecord) -> ModuleResult
     Ok(closed)
 }
 
+// The released root remains evidence for observing its domain, never authority
+// to recover its resource, obligations, or effect rights. Restrict this exception
+// to the one persisted, proof-authorized replacement prepare.
+fn reprepare_domains(
+    journal: &Journal,
+    session: &SessionRecord,
+    provider: &str,
+) -> ModuleResult<BTreeMap<String, ResourceAccess>> {
+    let mut works = journal.receipts.values().filter_map(|receipt| {
+        let work = receipt.work.as_ref()?;
+        let continuation = work.reprepare.as_ref()?;
+        (receipt.response["status"] == "pending"
+            && continuation.owner == provider
+            && work.phase == LifecyclePhase::SessionPrepare
+            && work.target
+                == (LifecycleTarget::Session {
+                    host_epoch: session.host_epoch.clone(),
+                    session_id: session.id.clone(),
+                    generation: session.generation,
+                }))
+        .then_some(work)
+    });
+    let Some(work) = works.next() else {
+        return Ok(BTreeMap::new());
+    };
+    if works.next().is_some() || !work.reprepare_authorized(journal) {
+        return Err("reprepare_observation_unproven".into());
+    }
+    let state = work
+        .states
+        .get(provider)
+        .ok_or("reprepare_observation_unproven")?;
+    if state.provider != provider
+        || state.request.target != work.target
+        || state.request.transition_id != work.transition_id
+        || state.request.phase != LifecyclePhase::SessionPrepare
+        || state.request.operation != amaterasu_extension_api::ProviderOperation::ResourcePlan
+        || state.request.version != amaterasu_extension_api::COMPOSITION_VERSION
+        || state.request.resource_generation != session.resource_generations.get(provider).copied()
+        || !matches!(
+            state.phase,
+            crate::prepare_driver::PreparePhase::Plan
+                | crate::prepare_driver::PreparePhase::PlanStatus
+        )
+        || !state.dispatch.as_ref().is_some_and(|dispatch| {
+            matches!(
+                dispatch.state,
+                crate::provider_dispatch::DispatchState::OutcomeUnknown
+            )
+        })
+    {
+        return Err("reprepare_observation_unproven".into());
+    }
+    let continuation = work
+        .reprepare
+        .as_ref()
+        .ok_or("reprepare_observation_unproven")?;
+    let marker = super::action_disposition::resolved_at(
+        journal,
+        &session.id,
+        provider,
+        continuation.old_generation,
+    )
+    .ok_or("reprepare_observation_unproven")?;
+    let mut roots = journal.composition.records().filter(|root| {
+        root.admission_id == marker.root_admission_id
+            && root.output.origin == work.target
+            && root.output.producer == provider
+            && root.output.resource == marker.resource
+            && root.state == super::composition::OutputState::Released
+    });
+    let root = roots.next().ok_or("reprepare_observation_unproven")?;
+    if roots.next().is_some() {
+        return Err("reprepare_observation_unproven".into());
+    }
+    scoped_root_domains(journal, root, provider)
+}
+
+fn scoped_root_domains(
+    journal: &Journal,
+    root: &super::composition::StoredOutput,
+    provider: &str,
+) -> ModuleResult<BTreeMap<String, ResourceAccess>> {
+    if !root_plan_is_scoped_to_released_resource(root) {
+        return Err("reprepare_observation_unproven".into());
+    }
+    let mut domains = BTreeMap::new();
+    for domain in &root.plan.mutation_domains {
+        if journal
+            .authority
+            .domain_owners
+            .get(&domain.domain)
+            .map(String::as_str)
+            != Some(provider)
+            || !journal
+                .authority
+                .snapshot
+                .domains
+                .contains_key(&domain.domain)
+            || domains
+                .insert(domain.domain.clone(), domain.access.clone())
+                .is_some()
+        {
+            return Err("reprepare_observation_unproven".into());
+        }
+    }
+    Ok(domains)
+}
+
 /// This is called only after exact broker caller/request/admission verification.
 /// Domain entries are the last authenticated observations; entries in
 /// `stale_mutation_domains` must be refreshed before they are used as current.
@@ -523,6 +632,22 @@ fn metadata_with_scope(
             );
         }
     }
+    if scoped_domains.is_none() {
+        for (domain, access) in reprepare_domains(journal, session, provider)? {
+            let observed = journal
+                .authority
+                .snapshot
+                .domains
+                .get(&domain)
+                .ok_or("domain_observation_missing")?;
+            domains.entry(domain.clone()).or_insert(MutationDomainPlan {
+                domain,
+                expected_revision: observed.revision,
+                borrowers: observed.borrowers.clone(),
+                access,
+            });
+        }
+    }
     let targets: Vec<Value> = target_values
         .into_iter()
         .map(|target| serde_json::from_str(&target).expect("serialized target is valid"))
@@ -731,6 +856,11 @@ impl Coordinator {
                     allowed_resources.insert(resource.resource_id.clone());
                 }
             }
+        }
+        // Nested provider-request verification above authenticates this exact
+        // persisted replacement plan before the released-root exception applies.
+        if nested.is_some() {
+            allowed_domains.extend(reprepare_domains(&next, session, caller)?.into_keys());
         }
         if allowed_domains.is_empty() && allowed_resources.is_empty() {
             return Err("provider_session_not_owned".into());
