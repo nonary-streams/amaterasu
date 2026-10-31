@@ -1,4 +1,5 @@
 use super::*;
+mod display_plugin_smoke;
 use amaterasu_contracts::Grants;
 use amaterasu_module_sdk::RuntimeClient;
 use std::sync::atomic::{AtomicUsize, Ordering};

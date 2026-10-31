@@ -14,3 +14,4 @@ workspace = true
 
 [dev-dependencies]
 amaterasu-module-sdk.workspace = true
+libloading.workspace = true
