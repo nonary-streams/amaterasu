@@ -287,7 +287,7 @@ impl Harness {
                         self.stage_refresh_done = false;
                         self.stage_refresh_request = None;
                         self.refresh_round += 1;
-                        self.deferred_finalize_plan = Some((id, plan, args["target"].clone()));
+                        self.deferred_finalize_plan = Some((id, plan, args.clone()));
                     } else {
                         assert!(matches!(
                             self.broker.borrow_mut().dispatch(
@@ -447,8 +447,8 @@ impl Harness {
                     }
                     other => panic!("stage refresh failed: {other:?}"),
                 }
-            } else if let Some((owner_request, _, target)) = &self.deferred_finalize_plan {
-                let payload = json!({"operation":"refresh_provider_observations","operation_id":format!("stage-observe-{}",self.refresh_round),"target":target,"domains":[{"domain":"topology","revision":1,"borrowers":{}}],"resources":[{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domains":["topology"]}]});
+            } else if let Some((owner_request, _, provider_request)) = &self.deferred_finalize_plan {
+                let payload = json!({"operation":"refresh_provider_observations","operation_id":format!("stage-observe-{}",self.refresh_round),"target":provider_request["target"],"provider_request":provider_request,"domains":[{"domain":"topology","revision":1,"borrowers":{}}],"resources":[{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domains":["topology"]}]});
                 let response = self.broker.borrow_mut().dispatch(
                     "display",
                     Command::Request {
