@@ -174,6 +174,9 @@ pub struct AuthorityState {
     pub refresh_required: BTreeSet<String>,
     /// Retains the full plan and cleanup obligations after lock release.
     pub settled: BTreeMap<String, Admission>,
+    /// Settled producer plans still referenced by canonical output records.
+    #[serde(default)]
+    pub output_admissions: BTreeSet<String>,
     #[serde(default)]
     pub control_permits: BTreeMap<String, ControlPermit>,
     #[serde(default)]
@@ -738,6 +741,13 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             validate_selection(&admission.selection)?;
             amaterasu_extension_api::validate_resource_plan(&admission.plan)?;
         }
+        if state
+            .output_admissions
+            .iter()
+            .any(|id| !state.settled.contains_key(id))
+        {
+            return Err("orphaned output admission".into());
+        }
         let mut control_operations = BTreeSet::new();
         let mut control_sequences = BTreeSet::new();
         for (id, permit) in &state.control_permits {
@@ -842,6 +852,27 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         admission_id: &str,
         resource: Option<ResourceRef>,
     ) -> ModuleResult<()> {
+        self.finish_admission_inner(provider, admission_id, resource, false)
+    }
+
+    /// The writer must atomically persist the authenticated output and work
+    /// progress with this retained producer admission and resource observation.
+    pub fn finish_admission_with_output(
+        &mut self,
+        provider: &str,
+        admission_id: &str,
+        resource: ResourceRef,
+    ) -> ModuleResult<()> {
+        self.finish_admission_inner(provider, admission_id, Some(resource), true)
+    }
+
+    fn finish_admission_inner(
+        &mut self,
+        provider: &str,
+        admission_id: &str,
+        resource: Option<ResourceRef>,
+        retain_output: bool,
+    ) -> ModuleResult<()> {
         if self.poisoned || !self.selections.contains_key(provider) {
             return Err("provider is not approved".into());
         }
@@ -864,6 +895,9 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         if let Some(settled) = self.state.settled.get(admission_id) {
             if settled.provider != provider {
                 return Err("admission provider mismatch".into());
+            }
+            if retain_output && !self.state.output_admissions.contains(admission_id) {
+                return Err("output was not retained with admission".into());
             }
             if let Some(resource) = resource {
                 validate_materialized_resource(settled, &resource)?;
@@ -923,9 +957,39 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             .retain(|_, permit| permit.request.admission_id != admission_id);
         next.finalize_permits
             .retain(|_, permit| permit.request.admission_id != admission_id);
-        if !admission.plan.obligations.is_empty() {
+        if retain_output {
+            next.output_admissions.insert(admission_id.to_owned());
+        }
+        if retain_output || !admission.plan.obligations.is_empty() {
             next.settled.insert(admission_id.to_owned(), admission);
         }
+        self.persist(next)
+    }
+
+    /// The coordinator calls this only after it has durably confirmed the
+    /// canonical output retired and no dependent still references the plan.
+    /// Its writer must persist those facts atomically with this transition.
+    pub fn release_output_admission(
+        &mut self,
+        provider: &str,
+        admission_id: &str,
+    ) -> ModuleResult<()> {
+        if self.poisoned || !self.selections.contains_key(provider) {
+            return Err("provider is not approved".into());
+        }
+        let admission = self
+            .state
+            .settled
+            .get(admission_id)
+            .ok_or("unknown settled admission")?;
+        if admission.provider != provider {
+            return Err("admission provider mismatch".into());
+        }
+        if !self.state.output_admissions.contains(admission_id) {
+            return Ok(());
+        }
+        let mut next = self.state.clone();
+        next.output_admissions.remove(admission_id);
         self.persist(next)
     }
 
@@ -940,6 +1004,9 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
     ) -> ModuleResult<()> {
         if self.poisoned || !self.selections.contains_key(provider) {
             return Err("provider is not approved".into());
+        }
+        if self.state.output_admissions.contains(admission_id) {
+            return Err("admission still referenced by output".into());
         }
         let admission = self
             .state
@@ -1913,6 +1980,46 @@ mod tests {
             &domain,
             false
         ));
+    }
+
+    #[test]
+    fn output_retains_producer_admission_without_cleanup_obligations() {
+        let selected = selection();
+        let mut plan = plan();
+        plan.resources[0].access = ResourceAccess::Read;
+        plan.mutation_domains[0].access = ResourceAccess::Read;
+        plan.obligations.clear();
+        let resource = ResourceRef {
+            provider: "display".into(),
+            resource_id: "output".into(),
+            incarnation: "native".into(),
+            revision: 2,
+            execution_domain: "seat".into(),
+            mutation_domains: ["topology".into()].into(),
+        };
+        let mut authority = CoordinatorPrepareAuthority::new(
+            AuthorityState::default(),
+            vec![selected.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        let id = authority.admit_plan(&selected.participant, &plan).unwrap();
+        authority
+            .finish_admission_with_output("display", &id, resource)
+            .unwrap();
+        assert!(authority.state.output_admissions.contains(&id));
+        assert!(authority.state.settled.contains_key(&id));
+        assert!(authority.retire_settled("display", &id, &[]).is_err());
+        let mut recovered = CoordinatorPrepareAuthority::new(
+            authority.state.clone(),
+            vec![selected],
+            Journal::default(),
+        )
+        .unwrap();
+        assert!(recovered.release_output_admission("foreign", &id).is_err());
+        recovered.release_output_admission("display", &id).unwrap();
+        recovered.retire_settled("display", &id, &[]).unwrap();
+        assert!(!recovered.state.settled.contains_key(&id));
     }
 
     #[test]
