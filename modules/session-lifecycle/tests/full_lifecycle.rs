@@ -53,10 +53,15 @@ struct Harness {
     request_sequence: u64,
     provider_calls: Vec<Value>,
     provider: bool,
+    registry_settings: Option<(u64, Value)>,
 }
 
 impl Harness {
     fn with_provider(provider: bool) -> Self {
+        Self::with_registry(provider, None)
+    }
+
+    fn with_registry(provider: bool, registry_settings: Option<(u64, Value)>) -> Self {
         let root = std::env::temp_dir().join(format!(
             "amaterasu-lifecycle-broker-{}-{}",
             std::process::id(),
@@ -118,6 +123,16 @@ impl Harness {
             }
             configuration["api_methods"]=json!(methods.iter().map(|method|json!({"provider":"display","callers":[COORDINATOR],"method":method})).collect::<Vec<_>>());
         }
+        if registry_settings.is_some() {
+            configuration["principals"][COORDINATOR]["call"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("amaterasu.extension-registry/1"));
+            configuration["principals"]["registry"] =
+                json!({"provide":["amaterasu.extension-registry/1"]});
+            configuration["settings"][COORDINATOR]["settings_registry_service"] =
+                json!("amaterasu.extension-registry/1");
+        }
         let configuration = serde_json::from_value(configuration).unwrap();
         let broker = Rc::new(RefCell::new(Broker::new(configuration).unwrap()));
         for method in methods {
@@ -143,6 +158,17 @@ impl Harness {
                 Response::Ok
             ));
         }
+        if registry_settings.is_some() {
+            assert!(matches!(
+                broker.borrow_mut().dispatch(
+                    "registry",
+                    Command::Register {
+                        service: "amaterasu.extension-registry/1".into()
+                    }
+                ),
+                Response::Ok
+            ));
+        }
         let endpoint = Box::new(Endpoint {
             broker: broker.clone(),
             principal: COORDINATOR,
@@ -159,6 +185,7 @@ impl Harness {
             request_sequence: 0,
             provider_calls: Vec::new(),
             provider,
+            registry_settings,
         };
         harness.start();
         harness
@@ -255,6 +282,33 @@ impl Harness {
                 } else {
                     panic!("unexpected provider method: {payload}");
                 }
+            }
+        }
+        if let Some((revision, settings)) = &self.registry_settings {
+            let request = self
+                .broker
+                .borrow_mut()
+                .dispatch("registry", Command::Poll {});
+            if let Response::Request {
+                id,
+                caller,
+                payload,
+                ..
+            } = request
+            {
+                assert_eq!(caller, COORDINATOR);
+                assert_eq!(payload["operation"], "settings_get");
+                assert_eq!(payload["provider"], "display");
+                assert_eq!(payload["scope"], json!({"kind":"host"}));
+                let effective: serde_json::Map<String, Value> = settings
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| {
+                        (key.clone(), json!({"value":value,"source":{"kind":"host"}}))
+                    })
+                    .collect();
+                assert!(matches!(self.broker.borrow_mut().dispatch("registry", Command::Complete { request: id, payload: json!({"ok":true,"status":"ok","revision":revision,"effective":effective}) }), Response::Ok));
             }
         }
         for principal in ["amaterasu.input", "launch"] {
@@ -504,4 +558,59 @@ fn completed_sessions_roll_over_without_replaying_creation() {
     assert_eq!(replay["reason"], "receipt_expired", "{replay}");
     let snapshot = harness.call("transport", json!({"operation":"snapshot"}));
     assert!(snapshot["sessions"].as_array().unwrap().len() < 128);
+}
+
+#[test]
+fn registry_settings_are_frozen_per_session_and_stream_lifecycle() {
+    let mut harness = Harness::with_registry(true, Some((1, json!({"mode":"session"}))));
+    let prepared = harness.call("transport", json!({"operation":"prepare","operation_id":"snapshot.prepare","application_ref":{"kind":"application","app_id":"app"}}));
+    assert_eq!(prepared["status"], "pending", "{prepared}");
+    let ready = harness.settled("transport", "snapshot.prepare");
+    assert_eq!(ready["status"], "succeeded", "{ready}");
+    let session = ready["target"].clone();
+    let bound = harness.call("transport", json!({"operation":"bind_application","operation_id":"snapshot.bind","target":session,"launch_id":42,"application_operation_id":"snapshot.launch"}));
+    assert_eq!(bound["status"], "succeeded", "{bound}");
+    harness.registry_settings = Some((2, json!({"mode":"stream"})));
+    let stream = harness.prepare_and_start_stream(&session, "snapshot.stream", false);
+    harness.registry_settings = Some((3, json!({"mode":"later"})));
+    harness.pause(&stream, "snapshot.stream");
+    let end = harness.call(
+        "transport",
+        json!({"operation":"end_session","operation_id":"snapshot.end","target":session}),
+    );
+    assert_eq!(end["status"], "pending", "{end}");
+    let retired = harness.call("transport", json!({"operation":"application_retired","operation_id":"snapshot.retire-app","target":session}));
+    assert_eq!(retired["status"], "pending", "{retired}");
+    assert_eq!(
+        harness.settled("transport", "snapshot.retire-app")["status"],
+        "succeeded"
+    );
+    assert_eq!(
+        harness.settled("transport", "snapshot.end")["status"],
+        "succeeded"
+    );
+    for (phase, revision, value) in [
+        ("session.prepare", "registry-1", "session"),
+        ("stream.prepare", "registry-2", "stream"),
+        ("stream.release", "registry-2", "stream"),
+        ("session.release", "registry-1", "session"),
+    ] {
+        let matching: Vec<_> = harness
+            .provider_calls
+            .iter()
+            .filter(|call| {
+                call["method"] == "lifecycle_callback" && call["arguments"]["phase"] == phase
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "{phase}: {matching:?}");
+        assert_eq!(
+            matching[0]["arguments"]["settings_revision"], revision,
+            "{phase}"
+        );
+        assert_eq!(
+            matching[0]["arguments"]["settings"],
+            json!({"mode":value}),
+            "{phase}"
+        );
+    }
 }
