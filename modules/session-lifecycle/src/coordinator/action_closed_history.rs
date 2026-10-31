@@ -51,6 +51,31 @@ impl ClosedActionBook {
         records.next().is_none().then_some(&record.retired_root)
     }
 
+    /// Exact admission IDs covered by fully verified action cleanup.
+    pub(super) fn closed_admissions(&self, target: &LifecycleTarget) -> Option<BTreeSet<String>> {
+        if !self.validate() {
+            return None;
+        }
+        Some(
+            self.records
+                .iter()
+                .filter(|record| &record.session_target == target)
+                .flat_map(|record| record.closed_admissions.iter().cloned())
+                .collect(),
+        )
+    }
+
+    /// A retired root may be used only as historical evidence, never as a live effect grant.
+    pub(super) fn certifies_root(&self, root: &composition::StoredOutput, generation: u64) -> bool {
+        self.historical_root(
+            &root.admission_id,
+            &root.transition_id,
+            &root.output.producer,
+            generation,
+        ) == Some(&root.output)
+            && root.state == composition::OutputState::Released
+    }
+
     /// Read-only lookup; this never recovers permission to execute an effect.
     pub(super) fn matching_retry(
         &self,
@@ -104,6 +129,7 @@ pub(super) struct ClosedActionCertificate {
     resource_generation: u64,
     retired_admission: String,
     retired_transition: String,
+    closed_admissions: BTreeSet<String>,
     retired_root: amaterasu_extension_api::ResourceOutput,
     replacement_generation: u64,
     replacement_admission: String,
@@ -166,6 +192,9 @@ impl ClosedActionCertificate {
             && valid_id(&self.replacement_admission)
             && valid_id(&self.retired_admission)
             && valid_id(&self.retired_transition)
+            && self.closed_admissions.len() <= 128
+            && self.closed_admissions.contains(&self.retired_admission)
+            && self.closed_admissions.iter().all(|id| valid_id(id))
             && self.retired_root.producer == self.owner
             && self.retired_root.origin == self.session_target
             && amaterasu_extension_api::validate_resource_output(&self.retired_root).is_ok()
@@ -231,6 +260,36 @@ impl ClosedActionCertificate {
             .action_transfer
             .as_ref()
             .ok_or("action_closure_transfer_missing")?;
+        let snapshot = transfer
+            .snapshot
+            .as_ref()
+            .ok_or("action_closure_snapshot_missing")?;
+        let proof = transfer
+            .release_proof
+            .as_ref()
+            .ok_or("action_closure_proof_missing")?;
+        let mut closed_admissions = BTreeSet::from([marker.root_admission_id.clone()]);
+        closed_admissions.extend(snapshot.stream_admissions.keys().cloned());
+        closed_admissions.extend(
+            proof
+                .callbacks
+                .iter()
+                .filter_map(|callback| callback.request.admission_id.clone()),
+        );
+        closed_admissions.insert(
+            transfer
+                .admission_id
+                .clone()
+                .ok_or("action_closure_admission_missing")?,
+        );
+        if closed_admissions.len() > 128
+            || closed_admissions.iter().any(|id| {
+                !journal.authority.settled.contains_key(id)
+                    || journal.authority.admissions.contains_key(id)
+            })
+        {
+            return Err("action_closure_admission_unsettled".into());
+        }
         Ok(Self {
             version: 1,
             session_target: marker.session_target.clone(),
@@ -238,6 +297,7 @@ impl ClosedActionCertificate {
             resource_generation: generation,
             retired_admission: old_root.admission_id.clone(),
             retired_transition: old_root.transition_id.clone(),
+            closed_admissions,
             retired_root: old_root.output.clone(),
             replacement_generation: current,
             replacement_admission: replacement.admission_id.clone(),
@@ -285,6 +345,7 @@ mod tests {
             resource_generation: 1,
             retired_admission: "retired".into(),
             retired_transition: "prepare".into(),
+            closed_admissions: BTreeSet::from(["retired".into()]),
             retired_root: serde_json::from_value(json!({"output_id":"output","capability":"screen","schema":{"id":"screen","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"owner","producer_service":"owner/2","origin":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":1},"resource":{"provider":"owner","resource_id":"display","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":{}})).unwrap(),
             replacement_generation: 2,
             replacement_admission: "replacement".into(),

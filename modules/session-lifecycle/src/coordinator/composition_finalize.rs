@@ -51,6 +51,9 @@ pub(super) fn resolve_historical_control_chain(
             &root.output.origin,
             &root.output.producer,
         )
+        && !super::resource_generation::historical_generation(journal, root)
+            .ok()
+            .is_some_and(|generation| journal.closed_actions.certifies_root(root, generation))
     {
         return Err("historical_root_release_unproven".into());
     }

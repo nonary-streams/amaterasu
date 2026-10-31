@@ -164,6 +164,12 @@ fn closed_admissions(journal: &Journal, session: &SessionRecord) -> ModuleResult
         generation: session.generation,
     };
     let mut closed = closed_stream_admissions(journal, session)?;
+    closed.extend(
+        journal
+            .closed_actions
+            .closed_admissions(&target)
+            .ok_or("closed_action_invalid")?,
+    );
     for root in journal.composition.records().filter(|root| {
         root.output.origin == target && root.state == super::composition::OutputState::Released
     }) {
@@ -182,7 +188,9 @@ fn closed_admissions(journal: &Journal, session: &SessionRecord) -> ModuleResult
             &root.output.producer,
             generation,
         );
-        if marker.is_none_or(|marker| marker.root_admission_id != root.admission_id) {
+        if marker.is_none_or(|marker| marker.root_admission_id != root.admission_id)
+            && !journal.closed_actions.certifies_root(root, generation)
+        {
             return Err("historical_release_unproven".into());
         }
         if !root_plan_is_scoped_to_released_resource(root) {

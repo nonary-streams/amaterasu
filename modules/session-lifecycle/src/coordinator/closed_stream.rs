@@ -1293,16 +1293,18 @@ fn closed_source_generation(journal: &Journal, source: &composition::StoredOutpu
                 return None;
             };
             let session = journal.sessions.get(session_id)?;
-            if session.phase != SessionPhase::Ended
-                || !journal.session_releases.has_valid_released(
+            let generation = resource_generation::historical_generation(journal, root).ok()?;
+            if !(session.phase == SessionPhase::Ended
+                && journal.session_releases.has_valid_released(
                     journal,
                     &root.output.origin,
                     &root.output.producer,
-                )
+                ))
+                && !journal.closed_actions.certifies_root(root, generation)
             {
                 return None;
             }
-            resource_generation::historical_generation(journal, root).ok()
+            Some(generation)
         }
         _ => None,
     }
