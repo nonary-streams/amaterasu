@@ -19,7 +19,10 @@ const MAX_STATUS_POLLS: u32 = 32;
 pub enum ControlPhase {
     Effect,
     Status { receipt_id: String },
-    Confirmed { result: Box<ConfirmedControl> },
+    /// The owner reported Applied; this is provisional until settlement is
+    /// durably recorded and the owner acknowledges its independent CAS.
+    #[serde(alias = "confirmed")]
+    Applied { result: Box<ConfirmedControl> },
     Rejected { reason: String },
     RecoveryRequired { reason: String },
 }
@@ -177,7 +180,7 @@ impl ControlDispatch {
         }
         if matches!(
             self.state.phase,
-            ControlPhase::Confirmed { .. }
+            ControlPhase::Applied { .. }
                 | ControlPhase::Rejected { .. }
                 | ControlPhase::RecoveryRequired { .. }
         ) {
@@ -315,7 +318,7 @@ impl ControlDispatch {
                     candidate: candidate.map(|binding| *binding),
                 };
                 validate_applied(&next.request, &next.dependency, &result)?;
-                ControlPhase::Confirmed {
+                ControlPhase::Applied {
                     result: Box::new(result),
                 }
             }
