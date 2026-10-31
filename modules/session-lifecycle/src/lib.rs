@@ -41,3 +41,6 @@ impl LifecycleHandler for Coordinator {
 
 type SessionLifecycleModule = LifecycleAdapter<Coordinator>;
 amaterasu_module_sdk::export_module!(SessionLifecycleModule);
+
+#[cfg(test)]
+mod coordinator_regression_tests;

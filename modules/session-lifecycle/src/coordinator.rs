@@ -1137,6 +1137,13 @@ impl Coordinator {
         })
     }
 
+    // The composed graph is exercised directly while its production profile remains gated.
+    #[cfg(test)]
+    pub(crate) fn configure_for_test(&mut self, settings: LifecycleSettings) {
+        self.settings = settings;
+        self.configured = true;
+    }
+
     pub fn configured(settings: &LifecycleSettings) -> ModuleResult<Self> {
         settings.validate()?;
         let mut coordinator =
