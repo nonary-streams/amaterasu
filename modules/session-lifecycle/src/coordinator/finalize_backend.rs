@@ -123,7 +123,8 @@ impl FinalizeEndpointBackend for Backend<'_> {
             return Err("finalize_approval_changed".into());
         }
         let mut controls = Vec::new();
-        let mut current_output = input.output.clone();
+        let mut current_output =
+            authenticated_current_output(&journal.composition, selection)?.clone();
         if !journal.control_settlements.validate_structure() {
             return Err("invalid_control_settlement_journal".into());
         }
@@ -311,6 +312,31 @@ impl FinalizeEndpointBackend for Backend<'_> {
             request,
         )
     }
+}
+/// Resolve only the stage recorded by the coordinator, never a caller-provided output.
+pub(super) fn authenticated_current_output<'a>(
+    book: &super::composition::CompositionBook,
+    selection: &'a super::finalize_selection::FinalizeSelectionSnapshot,
+) -> ModuleResult<&'a ResourceOutput> {
+    if let Some(stage) = &selection.stage {
+        if book.staged_for(
+            &selection.target,
+            &selection.input.output.producer,
+            &selection.input.output.output_id,
+        )? != stage
+        {
+            return Err("finalize_stage_mismatch".into());
+        }
+    } else if matches!(
+        (&selection.input.output.origin, &selection.target),
+        (
+            LifecycleTarget::Session { .. },
+            LifecycleTarget::Stream { .. }
+        )
+    ) {
+        return Err("finalize_stage_missing".into());
+    }
+    Ok(selection.current_output())
 }
 impl Coordinator {
     pub(super) fn finalize_operation(&mut self, caller: &str, payload: Value) -> Value {

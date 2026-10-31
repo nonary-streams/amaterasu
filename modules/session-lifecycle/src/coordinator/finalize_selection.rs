@@ -287,10 +287,18 @@ pub(super) mod tests {
         selection.stage = Some(stage);
         book.record_finalize_selection(selection.clone(), &|_| true)
             .unwrap();
+        assert_eq!(
+            super::super::finalize_backend::authenticated_current_output(&book, &selection)
+                .unwrap(),
+            &staged_output
+        );
         assert_eq!(selection.current_output(), &staged_output);
         assert_ne!(selection.current_output(), &root.output);
         let mut tampered = selection;
         tampered.stage.as_mut().unwrap().after.data = json!({"mode":"other"});
+        assert!(
+            super::super::finalize_backend::authenticated_current_output(&book, &tampered).is_err()
+        );
         assert!(book.record_finalize_selection(tampered, &|_| true).is_err());
     }
 
