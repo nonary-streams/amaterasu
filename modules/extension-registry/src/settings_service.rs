@@ -17,6 +17,7 @@ use std::{
 
 const MAX_PENDING: usize = 32;
 const MAX_VALIDATIONS: usize = 64;
+const MAX_RESPONSE_BYTES: usize = 12_000;
 
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
@@ -350,6 +351,16 @@ impl SettingsService {
                                 continue;
                             }
                         };
+                        if !settings::responses_fit(&pending.fields, &updated, MAX_RESPONSE_BYTES) {
+                            completed.push((
+                                id,
+                                discovery::failure(
+                                    "resource_exhausted",
+                                    "settings response exceeds size limit",
+                                ),
+                            ));
+                            continue;
+                        }
                         let snapshots = match settings::validation_snapshots(
                             &pending.fields,
                             &pending.allowed,
@@ -429,6 +440,22 @@ impl SettingsService {
                                 scope.clone(),
                                 values.clone(),
                             ) {
+                                Ok(updated)
+                                    if !settings::responses_fit(
+                                        &pending.fields,
+                                        &updated,
+                                        MAX_RESPONSE_BYTES,
+                                    ) =>
+                                {
+                                    completed.push((
+                                        id,
+                                        discovery::failure(
+                                            "resource_exhausted",
+                                            "settings response exceeds size limit",
+                                        ),
+                                    ));
+                                    continue;
+                                }
                                 Ok(updated) => match settings::validation_snapshots(
                                     &pending.fields,
                                     &pending.allowed,

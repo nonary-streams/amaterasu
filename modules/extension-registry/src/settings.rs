@@ -154,6 +154,46 @@ pub fn resolve(
     Ok(result)
 }
 
+/// A conservative response bound, covering any authorized selection of layers.
+/// Each value and provenance uses the longest candidate independently, so the
+/// constructed response is at least as large as every actual response.
+pub fn responses_fit(fields: &Fields, document: &Document, limit: usize) -> bool {
+    let Ok(defaults) = defaults(fields) else {
+        return false;
+    };
+    let largest_scope = document
+        .layers
+        .iter()
+        .map(|layer| serde_json::to_value(&layer.scope).unwrap_or(Value::Null))
+        .max_by_key(|scope| serde_json::to_vec(scope).map_or(usize::MAX, |v| v.len()))
+        .unwrap_or(Value::Null);
+    let mut effective = BTreeMap::new();
+    for (name, default) in defaults {
+        let mut value = default;
+        let mut size = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
+        for layer in &document.layers {
+            if let Some(candidate) = layer.values.get(&name) {
+                let candidate_size = serde_json::to_vec(candidate).map_or(usize::MAX, |v| v.len());
+                if candidate_size > size {
+                    size = candidate_size;
+                    value = candidate.clone();
+                }
+            }
+        }
+        effective.insert(
+            name,
+            serde_json::json!({"value":value,"source":largest_scope}),
+        );
+    }
+    let values = document
+        .layers
+        .iter()
+        .map(|layer| &layer.values)
+        .max_by_key(|values| serde_json::to_vec(values).map_or(usize::MAX, |v| v.len()));
+    let response = serde_json::json!({"ok":true,"status":"ok","revision":u64::MAX,"values":values.cloned().unwrap_or_default(),"effective":effective});
+    serde_json::to_vec(&response).is_ok_and(|bytes| bytes.len() <= limit)
+}
+
 /// Enumerate every effective combination represented by persisted layers. A
 /// caller must run provider cross-field validation on each before committing.
 /// Refuse growth beyond a fixed budget before making any validation calls.
@@ -382,6 +422,36 @@ mod tests {
             resolve(&fields, &allowed, &cleared, Some("app"), None, None).unwrap()["enabled"].value,
             json!(false)
         );
+    }
+
+    #[test]
+    fn response_budget_rejects_values_that_would_duplicate_past_limit() {
+        let fields: Fields = serde_json::from_value(json!({
+            "first":{"type":"string","default":"","max_length":4096},
+            "second":{"type":"string","default":"","max_length":4096}
+        }))
+        .unwrap();
+        let allowed = ["first", "second"]
+            .into_iter()
+            .map(|name| (name.into(), ["host".into()].into_iter().collect()))
+            .collect();
+        let current = Document {
+            revision: 0,
+            schema_revision: 1,
+            layers: vec![],
+        };
+        let updated = update(
+            &fields,
+            &allowed,
+            &current,
+            0,
+            Scope::Host,
+            serde_json::from_value(json!({"first":"x".repeat(4096),"second":"x".repeat(4096)}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(serde_json::to_vec(&updated).unwrap().len() < 12_000);
+        assert!(!responses_fit(&fields, &updated, 12_000));
     }
 
     #[test]
