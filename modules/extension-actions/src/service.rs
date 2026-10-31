@@ -21,6 +21,8 @@ pub(crate) struct Epoch {
     pub(crate) initiator: String,
     pub(crate) open_index: String,
     pub(crate) closed: bool,
+    #[serde(default)]
+    pub(crate) retired: u64,
     pub(crate) receipts: BTreeMap<u64, Record>,
 }
 #[derive(Serialize, Deserialize)]
@@ -155,6 +157,7 @@ struct ActiveWork {
     polls: u64,
     cancel_parent: Option<u64>,
     cancel_sent: bool,
+    effect_started: bool,
 }
 struct Pending {
     request: u64,
@@ -377,7 +380,7 @@ impl ActionsModule {
                         }
                     }
                     Stage::DispatchReply { key } => self.dispatch_reply(key, payload),
-                    Stage::CancelReply { key } => self.drive(key),
+                    Stage::CancelReply { key } => self.cancel_reply(key, payload),
                     Stage::RecoveryHead => self.recovery_head(payload),
                     Stage::RecoveryPage { revision } => self.recovery_page(revision, payload),
                 }
@@ -393,7 +396,7 @@ impl ActionsModule {
                         return Ok(());
                     }
                     Stage::CancelReply { key } => {
-                        self.drive(key)?;
+                        self.cancel_reply(key, Value::Null)?;
                         return Ok(());
                     }
                     Stage::RecoveryHead | Stage::RecoveryPage { .. } => {
@@ -455,6 +458,7 @@ impl ActionsModule {
                 initiator: incoming.initiator,
                 open_index: index.clone(),
                 closed: false,
+                retired: 0,
                 receipts: BTreeMap::new(),
             };
             let metadata = json!({"active":active + 1});
@@ -518,8 +522,11 @@ impl ActionsModule {
             .get("sequence")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        if sequence == 0 || sequence > 64 {
+        if sequence == 0 {
             return self.complete(incoming.id, failure("sequence_window"));
+        }
+        if sequence <= epoch.retired {
+            return self.complete(incoming.id, failure("receipt_expired"));
         }
         if operation == "cancel" {
             let Some(record) = epoch.receipts.get(&sequence) else {
@@ -604,6 +611,9 @@ impl ActionsModule {
         if epoch.closed {
             return self.complete(incoming.id, failure("epoch_closed"));
         }
+        if advance_watermark(&mut epoch, sequence).is_err() {
+            return self.complete(incoming.id, failure("sequence_window"));
+        }
         let payload = json!({"operation":"describe_action","action_id":invoke.action_id});
         self.submit(
             payload,
@@ -634,6 +644,9 @@ impl ActionsModule {
             || crate::validation::validate_request(&action, &invoke).is_err()
         {
             return self.complete(incoming.id, failure("invalid_action"));
+        }
+        if !action.required_capabilities.is_empty() {
+            return self.complete(incoming.id, failure("capability_unavailable"));
         }
         let Some(provider) = response
             .get("provider")
@@ -788,6 +801,11 @@ impl ActionsModule {
                 dispatch: Some(dispatch.clone()),
             },
         );
+        while serde_json::to_vec(&epoch).map_or(true, |bytes| bytes.len() > MAX_EPOCH_BYTES) {
+            if retire_one(&mut epoch).is_err() {
+                return self.complete(incoming.id, failure("capacity"));
+            }
+        }
         self.write_start(
             incoming.id,
             (revision, metadata),
@@ -989,6 +1007,7 @@ impl ActionsModule {
                 polls: 0,
                 cancel_parent: None,
                 cancel_sent: false,
+                effect_started: false,
             },
         );
         self.drive(key)
@@ -1027,6 +1046,12 @@ impl ActionsModule {
                 }
             }
         }
+        if active.receipt.get("cancellation_requested") == Some(&Value::Bool(true))
+            && matches!(active.dispatch.stage, DispatchStage::Running { .. })
+            && !active.effect_started
+        {
+            return self.dispatch_unknown(key);
+        }
         if matches!(active.dispatch.stage, DispatchStage::ReadyToExecute { .. }) {
             let expected = active.dispatch.clone();
             let mut replacement = expected.clone();
@@ -1062,6 +1087,9 @@ impl ActionsModule {
                 operation_id.push_str(&format!("-{}", active.polls));
             }
         }
+        if matches!(active.dispatch.stage, DispatchStage::Running { .. }) {
+            active.effect_started = true;
+        }
         match self.runtime.send(command) {
             Ok(Response::Accepted { id }) => {
                 self.pending.push_back(Pending {
@@ -1072,6 +1100,40 @@ impl ActionsModule {
             }
             _ => self.dispatch_unknown(key),
         }
+    }
+    fn cancel_reply(&mut self, key: (String, u64), payload: Value) -> ModuleResult<()> {
+        let Some(active) = self.active.get_mut(&key) else {
+            return Ok(());
+        };
+        if matches!(active.dispatch.stage, DispatchStage::Running { .. }) && !active.effect_started
+        {
+            if payload.get("status").and_then(Value::as_str) != Some("cancelled")
+                || payload.get("operation_id").and_then(Value::as_str)
+                    != Some(active.dispatch.request.operation_id.as_str())
+            {
+                return self.dispatch_unknown(key);
+            }
+            let expected = active.dispatch.clone();
+            let mut replacement = expected.clone();
+            if replacement.confirm_cancelled_before_effect().is_err() {
+                return self.dispatch_unknown(key);
+            }
+            let mut receipt = action_receipt(&replacement, "cancelled", None);
+            receipt["cancellation_requested"] = json!(true);
+            match self.worker.persist(
+                key.0.clone(),
+                expected,
+                replacement.clone(),
+                active.receipt.clone(),
+                receipt.clone(),
+                Instant::now() + Duration::from_secs(30),
+            ) {
+                Ok(()) => active.replacement = Some((replacement, receipt)),
+                Err(_) => active.recovery_unconfirmed = true,
+            }
+            return Ok(());
+        }
+        self.drive(key)
     }
     fn dispatch_reply(&mut self, key: (String, u64), payload: Value) -> ModuleResult<()> {
         let Some(active) = self.active.get_mut(&key) else {
@@ -1248,6 +1310,37 @@ impl ActionsModule {
         }
     }
 }
+fn terminal_receipt(record: &Record) -> bool {
+    matches!(
+        record.receipt.get("status").and_then(Value::as_str),
+        Some("rejected" | "succeeded" | "failed" | "cancelled")
+    )
+}
+fn retire_one(epoch: &mut Epoch) -> Result<(), ()> {
+    let next = epoch.retired.checked_add(1).ok_or(())?;
+    if !epoch.receipts.get(&next).is_some_and(terminal_receipt) {
+        return Err(());
+    }
+    epoch.receipts.remove(&next);
+    epoch.retired = next;
+    Ok(())
+}
+fn advance_watermark(epoch: &mut Epoch, sequence: u64) -> Result<(), ()> {
+    let required = sequence.saturating_sub(64);
+    if required <= epoch.retired {
+        return Ok(());
+    }
+    if required - epoch.retired > epoch.receipts.len() as u64
+        || (epoch.retired + 1..=required)
+            .any(|index| !epoch.receipts.get(&index).is_some_and(terminal_receipt))
+    {
+        return Err(());
+    }
+    while epoch.retired < required {
+        retire_one(epoch)?;
+    }
+    Ok(())
+}
 fn same_session(
     left: &amaterasu_extension_api::ActionTarget,
     right: &amaterasu_extension_api::ActionTarget,
@@ -1331,6 +1424,7 @@ mod tests {
         provider_pending: bool,
         cancellation_requests: usize,
         mutation_descriptor: bool,
+        required_capability: bool,
     }
     impl Host {
         fn dispatch(&mut self, command: Command) -> Response {
@@ -1356,12 +1450,17 @@ mod tests {
                         let method = json!({"service":"example.provider/1","method":"action_execute","interface_major":1,"interface_minor":0,"schema_revision":1});
                         let plan = json!({"service":"example.provider/1","method":"action_plan","interface_major":1,"interface_minor":0,"schema_revision":1});
                         let status = json!({"service":"example.provider/1","method":"action_status","interface_major":1,"interface_minor":0,"schema_revision":1});
+                        let capabilities = if self.required_capability {
+                            vec!["example/capability"]
+                        } else {
+                            vec![]
+                        };
                         let execution = if self.mutation_descriptor {
                             "session_mutation"
                         } else {
                             "read_only"
                         };
-                        json!({"ok":true,"provider":"example.provider","revision":1,"action":{"id":"example/action","label":"Example","description":"Example","execution":execution,"arguments":{},"allowed_targets":["session"],"required_capabilities":[],"plan":plan,"execute":method,"status":status}})
+                        json!({"ok":true,"provider":"example.provider","revision":1,"action":{"id":"example/action","label":"Example","description":"Example","execution":execution,"arguments":{},"allowed_targets":["session"],"required_capabilities":capabilities,"plan":plan,"execute":method,"status":status}})
                     } else if service == amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE {
                         match payload["operation"].as_str() {
                             Some("authorize_action") if self.allow_permit => {
@@ -1437,13 +1536,12 @@ mod tests {
                         json!({"status":"pending","receipt":{"id":"pending"}})
                     } else {
                         assert!(parent.is_none());
-                        let epoch = payload["operation_id"]
+                        let (epoch, sequence) = payload["operation_id"]
                             .as_str()
                             .unwrap()
-                            .split(':')
-                            .next()
+                            .split_once(':')
                             .unwrap();
-                        let record = &self.state[&format!("epoch/{epoch}")]["receipts"]["1"];
+                        let record = &self.state[&format!("epoch/{epoch}")]["receipts"][sequence];
                         assert_eq!(record["dispatch"]["stage"]["phase"], "running");
                         assert_eq!(record["receipt"]["status"], "running");
                         self.effects += 1;
@@ -1710,5 +1808,59 @@ mod tests {
         host.run();
         assert_eq!(host.replies[1]["code"], "mutation_unavailable");
         assert_eq!(host.effects, 0);
+    }
+    #[test]
+    fn unavailable_required_capability_rejects_before_planning() {
+        let mut host = Host {
+            allow_permit: true,
+            required_capability: true,
+            ..Host::default()
+        };
+        host.request(
+            1,
+            "alice",
+            json!({"operation":"open_epoch","operation_id":"open"}),
+        );
+        host.run();
+        let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+        host.request(2, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}));
+        host.run();
+        assert_eq!(host.replies[1]["code"], "capability_unavailable");
+        assert_eq!(host.effects, 0);
+    }
+    #[test]
+    fn rolling_watermark_expires_old_receipts_without_reexecution() {
+        let mut host = Host {
+            allow_permit: true,
+            ..Host::default()
+        };
+        host.request(
+            1,
+            "alice",
+            json!({"operation":"open_epoch","operation_id":"open"}),
+        );
+        host.run();
+        let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+        for sequence in 1..=65 {
+            host.request(sequence + 1, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":sequence,"operation_id":format!("{epoch}:{sequence}"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}));
+            host.run();
+            assert_eq!(
+                host.replies.last().unwrap()["status"],
+                "queued",
+                "sequence {sequence}: {:?}",
+                host.replies.last()
+            );
+        }
+        assert_eq!(host.effects, 65);
+        host.request(
+            100,
+            "alice",
+            json!({"operation":"status","epoch":epoch,"sequence":1}),
+        );
+        host.request(101, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}));
+        host.run();
+        assert_eq!(host.replies[66]["code"], "receipt_expired");
+        assert_eq!(host.replies[67]["code"], "receipt_expired");
+        assert_eq!(host.effects, 65);
     }
 }
