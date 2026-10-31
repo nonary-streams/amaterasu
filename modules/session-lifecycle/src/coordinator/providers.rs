@@ -3,6 +3,45 @@ use crate::prepare_authority::{AuthorityJournal, CoordinatorPrepareAuthority, Me
 use crate::prepare_driver::{PrepareAuthority, PrepareJournal, PreparePhase};
 use amaterasu_extension_api::{ProviderOperation, ProviderRequest, ProviderResponse};
 
+/// Grant only canonical borrows attested by the selected owner output.
+fn authorize_output_borrowers(
+    borrowers: &mut BTreeSet<String>,
+    session: &SessionRecord,
+    work: &Work,
+    owner: &str,
+    output: &amaterasu_extension_api::ResourceOutput,
+) {
+    if session.streams.values().all(|stream| {
+        stream.binding_owner != owner
+            || stream.phase == StreamPhase::Retired
+            || (stream.phase == StreamPhase::Quiescing && stream.retirements == stream.required)
+    }) {
+        if matches!(&output.origin, LifecycleTarget::Session { host_epoch, session_id, generation }
+        if host_epoch == &session.host_epoch && session_id == &session.id && *generation == session.generation)
+            && output.domain_observations.iter().any(|observation| {
+                observation.complete
+                    && observation.borrowers.get(&session.id) == Some(&session.generation)
+            })
+        {
+            borrowers.insert(session.id.clone());
+        }
+        if let LifecycleTarget::Stream {
+            stream_id,
+            generation,
+            ..
+        } = &work.target
+            && session.streams.get(stream_id).is_some_and(|stream| {
+                stream.generation == *generation && stream.phase == StreamPhase::Preparing
+            })
+            && output.domain_observations.iter().any(|observation| {
+                observation.complete && observation.borrowers.get(stream_id) == Some(generation)
+            })
+        {
+            borrowers.insert(stream_id.clone());
+        }
+    }
+}
+
 pub(super) struct AuthorityWriter(pub(super) Shared);
 impl AuthorityJournal for AuthorityWriter {
     fn persist(&mut self, state: &AuthorityState) -> ModuleResult<()> {
@@ -731,42 +770,13 @@ impl Coordinator {
                     {
                         return Err("control_input_changed".into());
                     }
-                    // A delegated control may retire only the canonical parent
-                    // borrow and the stream currently being prepared. Other
-                    // owner streams must already be retired before mutation.
-                    if session.streams.values().all(|stream| {
-                        stream.binding_owner != *owner
-                            || stream.phase == StreamPhase::Retired
-                            || (stream.phase == StreamPhase::Quiescing
-                                && stream.retirements == stream.required)
-                    }) {
-                        if matches!(&output.origin, LifecycleTarget::Session { host_epoch, session_id, generation }
-                            if host_epoch == &session.host_epoch && session_id == &session.id && *generation == session.generation)
-                            && output.domain_observations.iter().any(|observation| {
-                                observation.complete
-                                    && observation.borrowers.get(&session.id)
-                                        == Some(&session.generation)
-                            })
-                        {
-                            selected.authorized_borrowers.insert(session.id.clone());
-                        }
-                        if let LifecycleTarget::Stream {
-                            stream_id,
-                            generation,
-                            ..
-                        } = &work.target
-                            && session.streams.get(stream_id).is_some_and(|stream| {
-                                stream.generation == *generation
-                                    && stream.phase == StreamPhase::Preparing
-                            })
-                            && output.domain_observations.iter().any(|observation| {
-                                observation.complete
-                                    && observation.borrowers.get(stream_id) == Some(generation)
-                            })
-                        {
-                            selected.authorized_borrowers.insert(stream_id.clone());
-                        }
-                    }
+                    authorize_output_borrowers(
+                        &mut selected.authorized_borrowers,
+                        session,
+                        work,
+                        owner,
+                        &output,
+                    );
                     selected.approved_control_bindings.push(
                         crate::plan_validation::ApprovedControlBinding {
                             policy: policy.clone(),
@@ -775,6 +785,37 @@ impl Coordinator {
                         },
                     );
                 }
+            }
+            if let Some(finalize) = work
+                .composition_progress
+                .as_ref()
+                .and_then(|progress| progress.finalize.as_ref())
+                && finalize.selection.policy.owner_provider == *provider
+            {
+                let frozen = &finalize.selection;
+                if !self.settings.finalize_policies.contains(&frozen.policy)
+                    || !selected.approvals.contains(&frozen.finalize_approval)
+                    || !selected
+                        .approvals
+                        .contains(&frozen.finalize_status_approval)
+                    || journal.composition.finalize_selection(
+                        &work.target,
+                        &work.transition_id,
+                        provider,
+                        &frozen.input.output.output_id,
+                    ) != Some(frozen)
+                {
+                    return Err("finalize_selection_changed".into());
+                }
+                let (output, _) =
+                    super::composition_finalize::resolve_control_chain(journal, work, frozen)?;
+                authorize_output_borrowers(
+                    &mut selected.authorized_borrowers,
+                    session,
+                    work,
+                    provider,
+                    &output,
+                );
             }
             let consumers_retired = session.streams.values().all(|stream| {
                 stream.binding_owner != *provider
