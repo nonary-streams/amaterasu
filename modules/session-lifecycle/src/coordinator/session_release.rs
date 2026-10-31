@@ -379,6 +379,70 @@ fn valid_noop_proof(journal: &Journal, proof: &NoopReleaseProof) -> bool {
         && composition::valid_callback_proof(&proof.callback, &response)
 }
 
+/// Match an exact original stream obligation to its authenticated owner cleanup.
+/// This never infers a release from an obligation ID or a different target.
+pub(super) fn proven_stream_obligation_released(
+    journal: &Journal,
+    session_target: &LifecycleTarget,
+    obligation: &amaterasu_extension_api::ResourceObligation,
+) -> bool {
+    proven_stream_obligation_with(journal, session_target, obligation, |target| {
+        journal
+            .verified_released_output(target)
+            .map(|(id, _)| id.to_owned())
+    })
+}
+
+fn proven_stream_obligation_with(
+    journal: &Journal,
+    session_target: &LifecycleTarget,
+    obligation: &amaterasu_extension_api::ResourceObligation,
+    verified_release: impl Fn(&LifecycleTarget) -> Option<String>,
+) -> bool {
+    let Ok((epoch, session_id, None, generation)) = operations::target_parts(session_target) else {
+        return false;
+    };
+    let Some(session) = journal.sessions.get(session_id) else {
+        return false;
+    };
+    if session.host_epoch != epoch || session.generation != generation {
+        return false;
+    }
+    let mut matches = 0;
+    for (stream_id, stream) in &session.streams {
+        if stream.phase != StreamPhase::Retired || stream.binding_owner != obligation.provider {
+            continue;
+        }
+        let target = LifecycleTarget::Stream {
+            host_epoch: epoch.into(),
+            session_id: session_id.into(),
+            stream_id: stream_id.clone(),
+            generation: stream.generation,
+        };
+        let original = session.admission_ids.iter().any(|id| {
+            session.admission_targets.get(id) == Some(&target)
+                && session.admission_phases.get(id) == Some(&LifecyclePhase::StreamPrepare)
+                && journal.authority.settled.get(id).is_some_and(|admission| {
+                    admission.provider == obligation.provider
+                        && admission.plan.obligations.contains(obligation)
+                })
+        });
+        let released = verified_release(&target).is_some_and(|id| {
+            session.admission_ids.contains(&id)
+                && session.admission_targets.get(&id) == Some(&target)
+                && session.admission_phases.get(&id) == Some(&LifecyclePhase::StreamRelease)
+                && journal.authority.settled.get(&id).is_some_and(|admission| {
+                    admission.provider == obligation.provider
+                        && admission.plan.obligations.contains(obligation)
+                })
+        });
+        if original && released {
+            matches += 1;
+        }
+    }
+    matches == 1
+}
+
 fn valid_root_provenance(journal: &Journal, root: &composition::StoredOutput) -> bool {
     let Ok((_, session_id, None, _)) = operations::target_parts(&root.output.origin) else {
         return false;
@@ -1751,6 +1815,75 @@ mod tests {
         let restored: Journal =
             serde_json::from_value(serde_json::to_value(journal).unwrap()).unwrap();
         assert!(restored.session_releases.validate(&restored));
+    }
+
+    #[test]
+    fn prior_stream_obligation_requires_exact_target_admissions_and_verified_release() {
+        let (mut journal, work, _) = complete_fixture();
+        let target: LifecycleTarget = serde_json::from_value(json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":3})).unwrap();
+        let stream: StreamRecord = serde_json::from_value(json!({"generation":3,"phase":"retired","candidate":null,"required":[],"acknowledgements":[],"retirements":[],"binding_owner":"owner"})).unwrap();
+        journal
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .streams
+            .insert("stream".into(), stream);
+        let admission = journal.authority.settled["root"].clone();
+        let obligation = admission.plan.obligations[0].clone();
+        for (id, phase) in [
+            ("stream-prepare", LifecyclePhase::StreamPrepare),
+            ("stream-release", LifecyclePhase::StreamRelease),
+        ] {
+            journal
+                .authority
+                .settled
+                .insert(id.into(), admission.clone());
+            let session = journal.sessions.get_mut("session").unwrap();
+            session.admission_ids.insert(id.into());
+            session.admission_targets.insert(id.into(), target.clone());
+            session.admission_phases.insert(id.into(), phase);
+        }
+        let verified = |requested: &LifecycleTarget| {
+            (requested == &target).then(|| "stream-release".to_string())
+        };
+        assert!(proven_stream_obligation_with(
+            &journal,
+            &work.target,
+            &obligation,
+            verified
+        ));
+        // The production accessor does not accept an unverified synthetic match.
+        assert!(!proven_stream_obligation_released(
+            &journal,
+            &work.target,
+            &obligation
+        ));
+        let mut substituted = obligation.clone();
+        substituted.payload = json!({"different":true});
+        assert!(!proven_stream_obligation_with(
+            &journal,
+            &work.target,
+            &substituted,
+            verified
+        ));
+        assert!(!proven_stream_obligation_with(
+            &journal,
+            &work.target,
+            &obligation,
+            |_| None
+        ));
+        journal
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .admission_targets
+            .insert("stream-release".into(), work.target.clone());
+        assert!(!proven_stream_obligation_with(
+            &journal,
+            &work.target,
+            &obligation,
+            verified
+        ));
     }
 
     #[test]
