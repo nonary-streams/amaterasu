@@ -100,6 +100,16 @@ impl Dispatch {
         if bytes.len() > 4_000 || !plan.is_object() {
             return Err("invalid_plan");
         }
+        let typed: amaterasu_extension_api::ResourcePlan =
+            serde_json::from_value(plan.clone()).map_err(|_| "invalid_plan")?;
+        amaterasu_extension_api::validate_resource_plan(&typed).map_err(|_| "invalid_plan")?;
+        if typed
+            .required_capabilities
+            .iter()
+            .any(|capability| !self.descriptor.required_capabilities.contains(capability))
+        {
+            return Err("capability_expansion");
+        }
         let digest = Sha256::digest(&bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -445,6 +455,9 @@ mod tests {
     use super::*;
     use amaterasu_extension_api::{ActionTarget, ExecutionClass, MethodRef, TargetKind};
     use serde_json::json;
+    fn sample_plan() -> Value {
+        json!({"plan_id":"p1","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})
+    }
     fn fixture() -> Dispatch {
         let method = MethodRef {
             service: "example/1".into(),
@@ -493,9 +506,7 @@ mod tests {
     fn effect_requires_matching_authorization_and_consume() {
         let mut operation = fixture();
         assert!(operation.begin_effect().is_err());
-        operation
-            .accept_plan(json!({"mutation_domains":["desktop"]}))
-            .unwrap();
+        operation.accept_plan(sample_plan()).unwrap();
         let Stage::AwaitingPermit { digest, .. } = &operation.stage else {
             panic!()
         };
@@ -516,10 +527,7 @@ mod tests {
         operation
             .confirm_consume("e:1", &target, &digest, "permit")
             .unwrap();
-        assert_eq!(
-            operation.begin_effect().unwrap(),
-            json!({"mutation_domains":["desktop"]})
-        );
+        assert_eq!(operation.begin_effect().unwrap(), sample_plan());
         assert!(operation.cancel_before_effect().is_err());
         operation
             .provider_result(Outcome::Succeeded, json!({"receipt":"ok"}))
@@ -536,7 +544,7 @@ mod tests {
     #[test]
     fn restart_fences_an_effect_with_unknown_outcome() {
         let mut operation = fixture();
-        operation.accept_plan(json!({})).unwrap();
+        operation.accept_plan(sample_plan()).unwrap();
         let Stage::AwaitingPermit { digest, .. } = &operation.stage else {
             panic!()
         };
@@ -561,7 +569,7 @@ mod tests {
             operation.broker_call().unwrap(),
             Some(amaterasu_module_sdk::Command::CallApi { .. })
         ));
-        operation.accept_reply(json!({"status":"planned","operation_id":"e:1","action_id":"example/action","target":target,"plan":{"mutation_domains":[]}})).unwrap();
+        operation.accept_reply(json!({"status":"planned","operation_id":"e:1","action_id":"example/action","target":target,"plan":sample_plan()})).unwrap();
         let Stage::AwaitingPermit { digest, .. } = &operation.stage else {
             panic!()
         };
@@ -592,5 +600,13 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn plan_cannot_expand_approved_capabilities() {
+        let mut operation = fixture();
+        let mut plan = sample_plan();
+        plan["required_capabilities"] = json!(["example/capability"]);
+        assert_eq!(operation.accept_plan(plan), Err("capability_expansion"));
+        assert_eq!(operation.stage, Stage::Planning);
     }
 }

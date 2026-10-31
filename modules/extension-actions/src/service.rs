@@ -1,4 +1,4 @@
-//! Serialized state-backed action admission and lifecycle-fenced dispatch.
+//! Serialized state-backed action admission and lifecycle-fenced read-only dispatch.
 use crate::dispatch::{Dispatch, Outcome, Stage as DispatchStage};
 use crate::worker::Worker;
 use amaterasu_extension_api::{ActionInvoke, EXTENSION_ACTIONS_SERVICE};
@@ -723,6 +723,32 @@ impl ActionsModule {
         {
             return self.complete(incoming.id, failure("invalid_plan"));
         }
+        if action.execution != amaterasu_extension_api::ExecutionClass::ReadOnly {
+            return self.complete(incoming.id, failure("mutation_unavailable"));
+        }
+        let Ok(plan) = serde_json::from_value::<amaterasu_extension_api::ResourcePlan>(
+            response.get("plan").cloned().unwrap_or(Value::Null),
+        ) else {
+            return self.complete(incoming.id, failure("invalid_plan"));
+        };
+        use amaterasu_extension_api::{ConsumerChange, ResourceAccess};
+        if amaterasu_extension_api::validate_resource_plan(&plan).is_err()
+            || plan
+                .resources
+                .iter()
+                .any(|resource| resource.access != ResourceAccess::Read)
+            || plan
+                .mutation_domains
+                .iter()
+                .any(|domain| domain.access != ResourceAccess::Read)
+            || plan.consumer_change != ConsumerChange::Live
+            || !plan.affected_consumers.is_empty()
+            || !plan.obligations.is_empty()
+            || !plan.allowed_degradation.is_empty()
+            || plan.candidate_constraint.is_some()
+        {
+            return self.complete(incoming.id, failure("mutation_unavailable"));
+        }
         let Ok(mut dispatch) = crate::dispatch::Dispatch::new(
             invoke.clone(),
             action.clone(),
@@ -889,15 +915,16 @@ impl ActionsModule {
                 return Ok(());
             };
             for (sequence, record) in epoch.receipts {
-                let Some(dispatch) = record.dispatch else {
-                    continue;
-                };
                 if !matches!(
                     record.receipt.get("status").and_then(Value::as_str),
                     Some("queued" | "running")
                 ) {
                     continue;
                 }
+                let Some(dispatch) = record.dispatch else {
+                    self.recovery = Recovery::Blocked;
+                    return Ok(());
+                };
                 let mut replacement = dispatch.clone();
                 replacement.fence_after_restart();
                 if replacement == dispatch {
@@ -1303,13 +1330,14 @@ mod tests {
         effects: usize,
         provider_pending: bool,
         cancellation_requests: usize,
+        mutation_descriptor: bool,
     }
     impl Host {
         fn dispatch(&mut self, command: Command) -> Response {
             match command {
                 Command::Register { .. } | Command::ReleaseResult { .. } => Response::Ok,
                 Command::GetSettings {} => Response::Result {
-                    payload: json!({"grants":[{"principal":"management","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["session_mutation"]},{"principal":"alice","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["session_mutation"]},{"principal":"bob","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["session_mutation"]}]}),
+                    payload: json!({"grants":[{"principal":"management","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]},{"principal":"alice","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]},{"principal":"bob","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]}]}),
                 },
                 Command::Poll {} => self.incoming.pop_front().unwrap_or(Response::Pending),
                 Command::Complete { payload, .. } => {
@@ -1328,7 +1356,12 @@ mod tests {
                         let method = json!({"service":"example.provider/1","method":"action_execute","interface_major":1,"interface_minor":0,"schema_revision":1});
                         let plan = json!({"service":"example.provider/1","method":"action_plan","interface_major":1,"interface_minor":0,"schema_revision":1});
                         let status = json!({"service":"example.provider/1","method":"action_status","interface_major":1,"interface_minor":0,"schema_revision":1});
-                        json!({"ok":true,"provider":"example.provider","revision":1,"action":{"id":"example/action","label":"Example","description":"Example","execution":"session_mutation","arguments":{},"allowed_targets":["session"],"required_capabilities":[],"plan":plan,"execute":method,"status":status}})
+                        let execution = if self.mutation_descriptor {
+                            "session_mutation"
+                        } else {
+                            "read_only"
+                        };
+                        json!({"ok":true,"provider":"example.provider","revision":1,"action":{"id":"example/action","label":"Example","description":"Example","execution":execution,"arguments":{},"allowed_targets":["session"],"required_capabilities":[],"plan":plan,"execute":method,"status":status}})
                     } else if service == amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE {
                         match payload["operation"].as_str() {
                             Some("authorize_action") if self.allow_permit => {
@@ -1399,7 +1432,7 @@ mod tests {
                     self.next += 1;
                     let result = if method == "action_plan" {
                         assert!(parent.is_some());
-                        json!({"status":"planned","operation_id":payload["operation_id"],"action_id":payload["action_id"],"target":payload["target"],"plan":{"mutation_domains":[]}})
+                        json!({"status":"planned","operation_id":payload["operation_id"],"action_id":payload["action_id"],"target":payload["target"],"plan":{"plan_id":"p1","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}})
                     } else if method == "action_status" {
                         json!({"status":"pending","receipt":{"id":"pending"}})
                     } else {
@@ -1658,5 +1691,24 @@ mod tests {
             host.state[&format!("epoch/{epoch}")]["receipts"]["1"]["receipt"]["cancellation_requested"],
             true
         );
+    }
+    #[test]
+    fn mutation_descriptor_is_rejected_before_lifecycle_or_execution() {
+        let mut host = Host {
+            allow_permit: true,
+            mutation_descriptor: true,
+            ..Host::default()
+        };
+        host.request(
+            1,
+            "alice",
+            json!({"operation":"open_epoch","operation_id":"open"}),
+        );
+        host.run();
+        let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+        host.request(2, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}));
+        host.run();
+        assert_eq!(host.replies[1]["code"], "mutation_unavailable");
+        assert_eq!(host.effects, 0);
     }
 }
