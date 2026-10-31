@@ -2,6 +2,8 @@
 //!
 //! The catalog remains the source of truth and the launch service retains
 //! ownership of launch operations and their retirement proofs.
+mod discovery;
+
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,6 +22,11 @@ enum Action {
     },
     Resolve {
         id: String,
+    },
+    Discover {
+        provider: String,
+        cursor: Option<String>,
+        limit: usize,
     },
 }
 
@@ -51,6 +58,7 @@ impl Action {
                 Ok((json!({"action":"resolve_exported","id":id}), true))
             }
             Self::Resolve { .. } => Err("invalid catalog ID"),
+            Self::Discover { .. } => Err("discovery is not a catalog request"),
         }
     }
 }
@@ -131,24 +139,35 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 512 && !name.chars().any(char::is_control)
 }
 
+enum Projection {
+    Catalog(bool),
+    Discovery(usize),
+}
+
 struct Pending {
     parent: u64,
-    resolve: bool,
+    projection: Projection,
     result: Option<Value>,
     released: bool,
 }
 struct Library {
     runtime: RuntimeClient,
     pending: BTreeMap<u64, Pending>,
+    discovery: discovery::Settings,
 }
 impl ManagedModule for Library {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
+        let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
+            return Err("library settings unavailable".into());
+        };
+        let discovery = discovery::Settings::from_module_settings(&payload)?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
         Ok(Self {
             runtime,
             pending: BTreeMap::new(),
+            discovery,
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
@@ -157,12 +176,21 @@ impl ManagedModule for Library {
             if pending.result.is_none() {
                 match self.runtime.send(Command::TakeResult { request: child }) {
                     Ok(Response::Result { payload }) => {
-                        pending.result = Some(project(payload, pending.resolve))
+                        pending.result = Some(match pending.projection {
+                            Projection::Catalog(resolve) => project(payload, resolve),
+                            Projection::Discovery(limit) => discovery::project(payload, limit),
+                        })
                     }
                     Ok(Response::Pending) | Err(_) => continue,
                     _ => {
-                        pending.result =
-                            Some(error("catalog_unavailable", "catalog request failed"))
+                        pending.result = Some(match pending.projection {
+                            Projection::Catalog(_) => {
+                                error("catalog_unavailable", "catalog request failed")
+                            }
+                            Projection::Discovery(_) => {
+                                error("provider_unavailable", "discovery provider request failed")
+                            }
+                        })
                     }
                 }
             }
@@ -216,21 +244,49 @@ impl ManagedModule for Library {
             });
             return Ok(());
         }
-        let (payload, resolve) = match serde_json::from_value::<Action>(payload)
-            .map_err(|_| "invalid request")
-            .and_then(Action::catalog_request)
-        {
+        let route = serde_json::from_value::<Action>(payload)
+            .map_err(|_| ("invalid_request", "invalid request"))
+            .and_then(|action| match action {
+                Action::Discover {
+                    provider,
+                    cursor,
+                    limit,
+                } => self
+                    .discovery
+                    .route(discovery::Request::new(provider, cursor, limit), &initiator)
+                    .map(|(service, payload, limit)| {
+                        (service, payload, Projection::Discovery(limit))
+                    })
+                    .map_err(|code| (code, "discovery request rejected")),
+                action => action
+                    .catalog_request()
+                    .map(|(payload, resolve)| {
+                        (CATALOG.into(), payload, Projection::Catalog(resolve))
+                    })
+                    .map_err(|message| ("invalid_request", message)),
+            });
+        let (service, payload, projection) = match route {
             Ok(value) => value,
-            Err(message) => {
+            Err((code, message)) => {
                 let _ = self.runtime.send_ephemeral(Command::Complete {
                     request: id,
-                    payload: error("invalid_request", message),
+                    payload: error(code, message),
                 });
                 return Ok(());
             }
         };
+        let unavailable = match projection {
+            Projection::Catalog(_) => (
+                "catalog_unavailable",
+                "catalog request could not be admitted",
+            ),
+            Projection::Discovery(_) => (
+                "provider_unavailable",
+                "discovery provider request could not be admitted",
+            ),
+        };
         match self.runtime.send_ephemeral(Command::Request {
-            service: CATALOG.into(),
+            service,
             payload,
             timeout_ms: remaining_ms.min(30_000),
             operation_id: format!("library.catalog.{id}"),
@@ -241,7 +297,7 @@ impl ManagedModule for Library {
                     child,
                     Pending {
                         parent: id,
-                        resolve,
+                        projection,
                         result: None,
                         released: false,
                     },
@@ -250,10 +306,7 @@ impl ManagedModule for Library {
             _ => {
                 let _ = self.runtime.send_ephemeral(Command::Complete {
                     request: id,
-                    payload: error(
-                        "catalog_unavailable",
-                        "catalog request could not be admitted",
-                    ),
+                    payload: error(unavailable.0, unavailable.1),
                 });
             }
         }
