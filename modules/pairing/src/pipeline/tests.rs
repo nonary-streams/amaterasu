@@ -4069,10 +4069,16 @@ fn trust_mutation_waits_for_stream_lease_retirement_and_owner_drain() {
         effect_owner_epoch: "owner".into(),
     };
     let scope = crate::effect_gate::StreamScope {
-        capabilities: ["speaker.pcm/1".into()].into(),
+        capabilities: [amaterasu_module_sdk::effect_authority::FeedbackCapability {
+            schema: "speaker.pcm".into(),
+            version: 1,
+            direction: amaterasu_module_sdk::effect_authority::FeedbackDirection::ToClient,
+        }]
+        .into(),
+        controller_slot: 3,
         transport_service: "amaterasu.control-transport/1".into(),
         transport_stream: 7,
-        transport_epoch: "transport".into(),
+        transport_epoch: "c".repeat(32),
     };
     gate.bind_scoped(source.clone(), Some(scope.clone()))
         .unwrap();
@@ -4155,8 +4161,8 @@ fn stream_binding_cannot_rebind_source_to_another_certificate_or_capability_scop
     let source = json!({"version":1,"id":"ab".repeat(16),"generation":1,"host_epoch":"host",
         "session_id":"session","stream_id":"stream","stream_generation":1,"device":"device",
         "device_generation":1,"effect_owner_epoch":"owner"});
-    let scope = json!({"capabilities":["speaker.pcm/1"],"transport_service":"amaterasu.control-transport/1",
-        "transport_stream":7,"transport_epoch":"transport"});
+    let scope = json!({"capabilities":[{"schema":"speaker.pcm","version":1,"direction":"to_client"}],"controller_slot":3,"transport_service":"amaterasu.control-transport/1",
+        "transport_stream":7,"transport_epoch":"c".repeat(32)});
     let request = json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source,"scope":scope});
     assert_eq!(
         pipeline
@@ -4171,9 +4177,48 @@ fn stream_binding_cannot_rebind_source_to_another_certificate_or_capability_scop
         Err("source_owner_conflict")
     );
     let mut altered = request;
-    altered["scope"]["capabilities"] = json!(["foreign/1"]);
+    altered["scope"]["capabilities"] =
+        json!([{"schema":"foreign.schema","version":1,"direction":"to_client"}]);
     assert_eq!(
         pipeline.apply_effect_request("nvhttp", "nvhttp", altered, now()),
         Err("source_scope_conflict")
     );
+}
+
+#[test]
+fn real_broker_stream_lease_returns_exact_selected_source_and_scope() {
+    let (mut pipeline, _harness, _) = paired_native_client();
+    pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+    });
+    let initial = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let recovered = pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"recover","epoch":initial,"owner_epoch":"owner"}),
+            now(),
+        )
+        .unwrap();
+    let epoch = recovered["epoch"].as_str().unwrap();
+    let source = json!({"version":1,"id":"ab".repeat(16),"generation":1,"host_epoch":"host", "session_id":"session","stream_id":"stream","stream_generation":1,"device":"device","device_generation":1,"effect_owner_epoch":"owner"});
+    let scope = json!({"capabilities":[{"schema":"speaker.pcm","version":1,"direction":"to_client"}],"controller_slot":3,"transport_service":"amaterasu.control-transport/1","transport_stream":7,"transport_epoch":"c".repeat(32)});
+    pipeline.apply_effect_request("nvhttp", "nvhttp", json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source,"scope":scope}), now()).unwrap();
+    let mut broker = authority_broker();
+    let Response::Accepted {id} = broker.dispatch("input", Command::Request { service:EFFECT_SERVICE.into(),
+        payload:json!({"action":"admit_stream_lease","epoch":epoch,"source":source,"scope":scope,"operation_id":"lease","sequence":1}),
+        timeout_ms:30_000, operation_id:"admit-stream-real".into(), parent:None }) else { panic!("request rejected") };
+    pipeline
+        .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+        .unwrap();
+    let Response::Result { payload } =
+        broker.dispatch("input", Command::TakeResult { request: id })
+    else {
+        panic!("missing receipt")
+    };
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["source"], source);
+    assert_eq!(payload["scope"], scope);
+    assert_eq!(payload["kind"], "stream_lease");
 }

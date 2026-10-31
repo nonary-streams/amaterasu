@@ -1063,10 +1063,10 @@ impl Pipeline {
                     return Err("source_denied");
                 }
                 let ticket = gate
-                    .admit_stream_lease(&source, &operation_id, sequence, scope)?
+                    .admit_stream_lease(&source, &operation_id, sequence, scope.clone())?
                     .to_owned();
                 Ok(
-                    json!({"ok":true,"epoch":gate.epoch(),"operation_id":operation_id,"ticket":ticket,"kind":"stream_lease"}),
+                    json!({"ok":true,"epoch":gate.epoch(),"operation_id":operation_id,"ticket":ticket,"kind":"stream_lease","source":source,"scope":scope}),
                 )
             }
             EffectRequest::LookupStreamLease {

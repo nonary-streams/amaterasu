@@ -49,12 +49,40 @@ fn token(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
 
+/// Wire-compatible with input extension capability identities; feedback leases
+/// accept only the client-bound direction.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd)]
+#[serde(deny_unknown_fields)]
+pub struct FeedbackCapability {
+    pub schema: String,
+    pub version: u16,
+    pub direction: FeedbackDirection,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackDirection {
+    ToClient,
+}
+impl FeedbackCapability {
+    pub fn valid(&self) -> bool {
+        !self.schema.is_empty()
+            && self.schema.len() <= 128
+            && self.schema.contains('.')
+            && self
+                .schema
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
+            && self.version != 0
+    }
+}
+
 /// Transport and negotiated capabilities selected by the authenticated protocol.
 /// No caller-supplied field proves that the client negotiated a capability.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StreamScope {
-    pub capabilities: BTreeSet<String>,
+    pub capabilities: BTreeSet<FeedbackCapability>,
+    pub controller_slot: u16,
     pub transport_service: String,
     pub transport_stream: u64,
     pub transport_epoch: String,
@@ -63,10 +91,10 @@ impl StreamScope {
     pub fn valid(&self) -> bool {
         !self.capabilities.is_empty()
             && self.capabilities.len() <= 32
-            && self.capabilities.iter().all(|v| token(v))
+            && self.capabilities.iter().all(FeedbackCapability::valid)
             && self.transport_service.strip_suffix("/1").is_some_and(token)
             && self.transport_stream != 0
-            && token(&self.transport_epoch)
+            && hex(&self.transport_epoch, 32)
     }
 }
 
@@ -164,3 +192,34 @@ pub enum Request {
 
 /// Owner-side ticket lifecycle; does not authenticate a source or activate routes.
 pub mod consumer;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stream_scope_requires_exact_client_bound_capability_and_provider_epoch() {
+        let value = json!({"controller_slot":7,"capabilities":[{"schema":"org.example.feedback","version":1,"direction":"to_client"}],
+            "transport_service":"amaterasu.control-transport/1","transport_stream":4,"transport_epoch":"a".repeat(32)});
+        let scope: StreamScope = serde_json::from_value(value.clone()).unwrap();
+        assert!(scope.valid());
+        let mut wrong_direction = value.clone();
+        wrong_direction["capabilities"][0]["direction"] = json!("to_device");
+        assert!(serde_json::from_value::<StreamScope>(wrong_direction).is_err());
+        let mut wrong_epoch = value.clone();
+        wrong_epoch["transport_epoch"] = json!("a".repeat(31));
+        assert!(
+            !serde_json::from_value::<StreamScope>(wrong_epoch)
+                .unwrap()
+                .valid()
+        );
+        let mut wrong_version = value;
+        wrong_version["capabilities"][0]["version"] = json!(0);
+        assert!(
+            !serde_json::from_value::<StreamScope>(wrong_version)
+                .unwrap()
+                .valid()
+        );
+    }
+}

@@ -430,10 +430,16 @@ mod tests {
 
     fn stream_scope() -> StreamScope {
         StreamScope {
-            capabilities: ["controller.speaker.pcm/1".into()].into(),
+            capabilities: [amaterasu_module_sdk::effect_authority::FeedbackCapability {
+                schema: "controller.speaker.pcm".into(),
+                version: 1,
+                direction: amaterasu_module_sdk::effect_authority::FeedbackDirection::ToClient,
+            }]
+            .into(),
+            controller_slot: 3,
             transport_service: "amaterasu.control-transport/1".into(),
             transport_stream: 7,
-            transport_epoch: "transport-epoch".into(),
+            transport_epoch: "c".repeat(32),
         }
     }
 
@@ -485,7 +491,7 @@ mod tests {
             Err("stream_scope_denied")
         );
         let mut wrong_scope = scope.clone();
-        wrong_scope.capabilities.insert("foreign/1".into());
+        wrong_scope.controller_slot += 1;
         assert_eq!(
             gate.admit_stream_lease(&source, "lease", 1, wrong_scope),
             Err("stream_scope_denied")
