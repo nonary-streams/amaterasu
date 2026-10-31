@@ -1,4 +1,4 @@
-//! Opt-in session preparation against a real virtual-screen provider.
+//! Opt-in session and stream preparation against a real virtual-screen provider.
 //!
 //! Supply matching trusted `AMATERASU_LIFECYCLE_PLUGIN` and
 //! `AMATERASU_SCREEN_PLUGIN` cdylibs, `AMATERASU_OWNER_EXAMPLES`, and
@@ -168,7 +168,8 @@ fn owner_configuration() -> Value {
         "virtual":{"provide":["amaterasu.virtual-display/1"]}, "state":{"provide":["amaterasu.state/1"]}
     },"api_methods":approvals["api_methods"],"settings":{COORDINATOR:{
         "journal_path":"/replaced","trusted_callers":["transport","capture",SCREEN],
-        "operation_grants":{"transport":["prepare","lookup"],SCREEN:["verify_provider_epoch"]},
+        "session_delegates":["capture"],"consumers":{"capture":["capture"]},
+        "operation_grants":{"transport":["prepare","prepare_stream","lookup","start_stream"],"capture":["ack_binding","lookup"],SCREEN:["verify_provider_epoch","describe_resource_finalize","verify_resource_finalize","validate_resource_finalize","verify_finalize_stage","verify_finalize_result","refresh_provider_observations"]},
         "consumer_requirements":{"execution_domain":"desktop","capture_providers":["amaterasu.capture-pipewire/1"],"selector_schemas":["amaterasu.kwin-wl-output/1"]},
         "participants":[{"provider":SCREEN,"contract_version":2,"plan_method":method("resource_plan"),"callback_method":method("lifecycle_callback"),"status_method":method("lifecycle_status"),"settings_revision":"one","settings":settings,"capabilities":[],"cleanup_methods":[method("lifecycle_callback")]}]
     }}});
@@ -179,6 +180,14 @@ fn owner_configuration() -> Value {
     let digest = format!("{:x}", Sha256::digest(document.as_bytes()));
     let schema = json!({"id":"amaterasu.display-target/1","major":1,"minor":0,"digest":digest});
     let lifecycle = &mut configuration["settings"][COORDINATOR];
+    if approvals["api_methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["method"]["method"] == "binding_validate")
+    {
+        lifecycle["participants"][0]["binding_validate_method"] = method("binding_validate");
+    }
     lifecycle["schema_documents"] = json!([{"reference":schema,"document":document}]);
     lifecycle["finalize_policies"] = json!([{"owner_provider":SCREEN,"owner_service":"nonary.virtual-screen/2","method":method("resource_finalize"),"status_method":method("lifecycle_status"),"output_capability":"amaterasu.display-target","output_schema":schema,"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","required_access":"exclusive","domain_scope":"resource","mutation_domains":[]}]);
     configuration
@@ -522,4 +531,66 @@ fn real_owner_prepares_session_with_simulated_native_and_state() {
                 .as_array()
                 .is_some_and(|outputs| !outputs.is_empty())
     }));
+}
+
+#[test]
+#[ignore = "requires a stream-capable owner and lifecycle with finalize stage support"]
+fn real_owner_finalizes_stream_and_validates_capture_binding() {
+    let mut f = Fixture::new();
+    let video = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
+    let pending = f.call(json!({"operation":"prepare","operation_id":"owner-session","requested_video":video,"application_ref":{"kind":"desktop"}}));
+    assert_eq!(pending["status"], "pending", "{pending}");
+    let session = f.settled("owner-session");
+    assert_eq!(session["status"], "succeeded", "{session}");
+    let requested = f.call(json!({"operation":"prepare_stream","operation_id":"owner-stream","target":session["target"],"intent":"initial","requested_video":video,"consumer_requirements":["capture"]}));
+    assert_eq!(requested["status"], "pending", "{requested}");
+    let stream = f.settled("owner-stream");
+    assert_eq!(
+        stream["status"],
+        "succeeded",
+        "{stream}; native={:?}; trace={:?}",
+        f.native_calls,
+        f.trace.borrow()
+    );
+    let target = stream["target"].clone();
+    let candidate = stream["candidate"].clone();
+    assert_eq!(candidate["resource"]["provider"], SCREEN);
+    assert_eq!(candidate["mode"], video);
+    let trace = f.trace.borrow();
+    assert!(
+        trace.iter().any(|event| event["principal"] == COORDINATOR
+            && event["command"]["method"] == "resource_finalize"),
+        "finalize not dispatched"
+    );
+    drop(trace);
+    let observed = json!({"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000});
+    let ack = f.call_as("capture", json!({"operation":"ack_binding","operation_id":"capture-ack","target":target,"consumer":"capture","plan_revision":candidate["plan_revision"],"candidate":candidate,"observed_capture":observed}));
+    assert_eq!(ack["status"], "pending", "{ack}");
+    let mut outcome = Value::Null;
+    for _ in 0..500 {
+        outcome = f.call_as(
+            "capture",
+            json!({"operation":"lookup","operation_id":"capture-ack"}),
+        );
+        if outcome["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(
+        outcome["status"],
+        "succeeded",
+        "{outcome}; trace={:?}",
+        f.trace.borrow()
+    );
+    assert!(
+        f.trace
+            .borrow()
+            .iter()
+            .any(|event| event["principal"] == COORDINATOR
+                && event["command"]["method"] == "binding_validate"),
+        "binding validator not dispatched"
+    );
+    let started =
+        f.call(json!({"operation":"start_stream","operation_id":"start","target":target}));
+    assert_eq!(started["status"], "succeeded", "{started}");
 }
