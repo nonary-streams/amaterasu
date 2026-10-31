@@ -404,6 +404,91 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         self.persist(next)
     }
 
+    /// Publish one complete native readback without exposing a partially
+    /// refreshed snapshot. The selected owner supplies the observations; this
+    /// method does not independently inspect the operating system. No locked
+    /// domain, new resource, or changed execution domain can enter through it.
+    pub fn refresh_observations(
+        &mut self,
+        provider: &str,
+        domains: &[(String, DomainState)],
+        resources: &[ResourceRef],
+    ) -> ModuleResult<()> {
+        if self.poisoned
+            || !self.selections.contains_key(provider)
+            || (domains.is_empty() && resources.is_empty())
+            || domains.len() > MAX_ADMISSIONS
+            || resources.len() > MAX_ADMISSIONS
+        {
+            return Err("invalid provider observation batch".into());
+        }
+        let mut next = self.state.clone();
+        let mut seen_domains = BTreeSet::new();
+        for (domain, observation) in domains {
+            if !valid_id(domain)
+                || !seen_domains.insert(domain)
+                || observation.revision == 0
+                || observation
+                    .borrowers
+                    .values()
+                    .any(|generation| *generation == 0)
+                || self.state.domain_owners.get(domain).map(String::as_str) != Some(provider)
+                || self.state.domain_locks.contains_key(domain)
+            {
+                return Err("domain refresh not authorized or locked".into());
+            }
+            let old = self
+                .state
+                .snapshot
+                .domains
+                .get(domain)
+                .ok_or("unknown domain")?;
+            validate_domain_advance(old, observation)?;
+            next.snapshot
+                .domains
+                .insert(domain.clone(), observation.clone());
+            next.refresh_required.remove(domain);
+        }
+        let mut seen_resources = BTreeSet::new();
+        for observation in resources {
+            if observation.provider != provider
+                || !valid_id(&observation.resource_id)
+                || !valid_id(&observation.incarnation)
+                || !valid_id(&observation.execution_domain)
+                || observation.revision == 0
+                || !seen_resources.insert(&observation.resource_id)
+                || observation.mutation_domains.is_empty()
+                || observation.mutation_domains.iter().any(|domain| {
+                    self.state.domain_locks.contains_key(domain)
+                        || self.state.domain_owners.get(domain).map(String::as_str)
+                            != Some(provider)
+                })
+            {
+                return Err("invalid resource observation".into());
+            }
+            let old = self
+                .state
+                .snapshot
+                .resources
+                .get(provider)
+                .and_then(|resources| resources.get(&observation.resource_id))
+                .ok_or("unknown resource")?;
+            if old.mutation_domains != observation.mutation_domains
+                || old.execution_domain != observation.execution_domain
+                || observation.revision < old.revision
+                || (observation != old && observation.revision == old.revision)
+            {
+                return Err("stale or substituted resource observation".into());
+            }
+            next.snapshot
+                .resources
+                .get_mut(provider)
+                .expect("validated resource owner")
+                .insert(observation.resource_id.clone(), observation.clone());
+        }
+        self.persist(next)
+    }
+
     fn persist(&mut self, next: AuthorityState) -> ModuleResult<()> {
         if self.poisoned {
             return Err("authority journal requires recovery".into());
@@ -1043,5 +1128,137 @@ mod tests {
         );
         assert!(authority.state.admissions.contains_key(&next));
         assert!(authority.state.settled.contains_key(&id));
+    }
+
+    #[test]
+    fn observation_batch_publishes_complete_readback_in_one_write() {
+        let selection = selection();
+        let mut authority = CoordinatorPrepareAuthority::new(
+            AuthorityState::default(),
+            vec![selection.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        let admission = authority
+            .admit_plan(&selection.participant, &plan())
+            .unwrap();
+        authority.finish_admission("display", &admission).unwrap();
+        let writes = authority.journal.snapshots.len();
+        let mut domain = authority.state.snapshot.domains["topology"].clone();
+        domain.revision += 1;
+        domain.borrowers.insert("retained".into(), 3);
+        let mut resource = authority.state.snapshot.resources["display"]["output"].clone();
+        resource.revision += 1;
+        resource.incarnation = "new-native-borrow".into();
+        authority
+            .refresh_observations(
+                "display",
+                &[("topology".into(), domain.clone())],
+                std::slice::from_ref(&resource),
+            )
+            .unwrap();
+        assert_eq!(authority.journal.snapshots.len(), writes + 1);
+        assert_eq!(authority.state.snapshot.domains["topology"], domain);
+        assert_eq!(
+            authority.state.snapshot.resources["display"]["output"],
+            resource
+        );
+        assert!(!authority.state.refresh_required.contains("topology"));
+        assert!(authority.state.settled.contains_key(&admission));
+    }
+
+    #[test]
+    fn observation_batch_rejects_invalid_tail_without_partial_publication() {
+        let selection = selection();
+        let mut authority = CoordinatorPrepareAuthority::new(
+            AuthorityState::default(),
+            vec![selection.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        let admission = authority
+            .admit_plan(&selection.participant, &plan())
+            .unwrap();
+        let old = authority.state.snapshot.domains["topology"].clone();
+        assert!(
+            authority
+                .refresh_observations("display", &[("topology".into(), old.clone())], &[],)
+                .is_err()
+        );
+        authority.finish_admission("display", &admission).unwrap();
+        let writes = authority.journal.snapshots.len();
+        let before = serde_json::to_value(&authority.state).unwrap();
+        let mut domain = old.clone();
+        domain.revision += 1;
+        domain.borrowers.clear();
+        let mut substituted = authority.state.snapshot.resources["display"]["output"].clone();
+        substituted.revision += 1;
+        substituted.execution_domain = "other-seat".into();
+        assert!(
+            authority
+                .refresh_observations(
+                    "display",
+                    &[("topology".into(), domain.clone())],
+                    &[substituted],
+                )
+                .is_err()
+        );
+        assert!(
+            authority
+                .refresh_observations("other", &[("topology".into(), domain.clone())], &[],)
+                .is_err()
+        );
+        assert!(
+            authority
+                .refresh_observations(
+                    "display",
+                    &[
+                        ("topology".into(), domain.clone()),
+                        ("topology".into(), domain)
+                    ],
+                    &[],
+                )
+                .is_err()
+        );
+        let mut stale = old;
+        stale.borrowers.clear();
+        assert!(
+            authority
+                .refresh_observations("display", &[("topology".into(), stale)], &[],)
+                .is_err()
+        );
+        assert_eq!(authority.journal.snapshots.len(), writes);
+        assert_eq!(serde_json::to_value(&authority.state).unwrap(), before);
+    }
+
+    #[test]
+    fn observation_batch_write_failure_retains_old_state_and_poison_fence() {
+        let selection = selection();
+        let mut authority = CoordinatorPrepareAuthority::new(
+            AuthorityState::default(),
+            vec![selection.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        let admission = authority
+            .admit_plan(&selection.participant, &plan())
+            .unwrap();
+        authority.finish_admission("display", &admission).unwrap();
+        let before = serde_json::to_value(&authority.state).unwrap();
+        let mut domain = authority.state.snapshot.domains["topology"].clone();
+        domain.revision += 1;
+        authority.journal.fail = true;
+        assert!(
+            authority
+                .refresh_observations("display", &[("topology".into(), domain.clone())], &[],)
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&authority.state).unwrap(), before);
+        authority.journal.fail = false;
+        assert!(
+            authority
+                .refresh_observations("display", &[("topology".into(), domain)], &[],)
+                .is_err()
+        );
     }
 }
