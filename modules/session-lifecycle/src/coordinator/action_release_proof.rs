@@ -55,6 +55,7 @@ fn session_dependents_noop(
     session: &SessionRecord,
     snapshot: &ActionReleaseSnapshot,
     owner: &str,
+    historical: bool,
 ) -> bool {
     let graph = &snapshot.session_graph;
     let reverse: Vec<_> = graph.order.iter().rev().cloned().collect();
@@ -92,15 +93,52 @@ fn session_dependents_noop(
         if frozen.admission.provider != provider
             || frozen.transition_id != transition
             || journal.authority.settled.get(id) != Some(&frozen.admission)
-            || session
-                .obligations
-                .iter()
-                .any(|obligation| obligation.provider == provider)
+            || session.obligations.iter().any(|obligation| {
+                obligation.provider == provider
+                    && !dependent_stream_obligation_is_attributed(
+                        journal, session, snapshot, obligation, historical,
+                    )
+            })
         {
             return false;
         }
     }
     true
+}
+
+fn dependent_stream_obligation_is_attributed(
+    journal: &Journal,
+    session: &SessionRecord,
+    snapshot: &ActionReleaseSnapshot,
+    obligation: &amaterasu_extension_api::ResourceObligation,
+    historical: bool,
+) -> bool {
+    let frozen_stream = snapshot.stream_admissions.values().any(|entry| {
+        entry.admission.provider == obligation.provider
+            && entry.admission.plan.obligations.contains(obligation)
+    });
+    frozen_stream
+        || session.admission_ids.iter().any(|admission_id| {
+            let Some(target @ LifecycleTarget::Stream { session_id, .. }) =
+                session.admission_targets.get(admission_id)
+            else {
+                return false;
+            };
+            session_id == &session.id
+                && target != &snapshot.stream_target
+                && session.admission_phases.get(admission_id)
+                    == Some(&LifecyclePhase::StreamPrepare)
+                && journal
+                    .authority
+                    .admissions
+                    .get(admission_id)
+                    .or_else(|| journal.authority.settled.get(admission_id))
+                    .is_some_and(|admission| {
+                        admission.provider == obligation.provider
+                            && admission.plan.obligations.contains(obligation)
+                    })
+                && (historical || journal.verified_released_output(target).is_some())
+        })
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -239,7 +277,7 @@ fn validate_graph_callbacks_inner(
         || !target_matches
         // Stream cleanup does not prove session-scoped dependent restoration;
         // each selected dependent must have authentic frozen no-op evidence.
-        || !session_dependents_noop(journal, session, snapshot, &owner)
+        || !session_dependents_noop(journal, session, snapshot, &owner, historical)
     {
         return false;
     }
@@ -551,7 +589,8 @@ mod tests {
             &journal,
             &journal.sessions["session"],
             &snapshot,
-            "owner"
+            "owner",
+            false
         ));
         graph.order.push("settings".into());
         graph
@@ -563,7 +602,66 @@ mod tests {
             &journal,
             &journal.sessions["session"],
             &snapshot,
-            "owner"
+            "owner",
+            false
+        ));
+        let obligation = json!({"obligation_id":"stream-restore","provider":"settings","resource_id":"display","mutation_domain":null,"depends_on":[],"cleanup_method":{"service":"settings/2","method":"cleanup","interface_major":2,"interface_minor":0,"schema_revision":1},"payload":{}});
+        let method = json!({"service":"settings/2","method":"callback","interface_major":2,"interface_minor":0,"schema_revision":1});
+        let admission: crate::prepare_authority::Admission = serde_json::from_value(json!({"provider":"settings","selection":{"participant":{"provider":"settings","contract_version":2,"depends_on":["owner"],"plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"rev","settings":{}},"approvals":[],"capabilities":[],"cleanup_methods":[],"authorized_borrowers":[],"approved_control_bindings":[]},"plan":{"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[obligation],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]},"rights":[]})).unwrap();
+        let obligation: amaterasu_extension_api::ResourceObligation =
+            serde_json::from_value(obligation).unwrap();
+        snapshot.stream_admissions.insert(
+            "old".into(),
+            ActionSnapshotAdmission {
+                admission: admission.clone(),
+                transition_id: "stream-transition".into(),
+            },
+        );
+        assert!(dependent_stream_obligation_is_attributed(
+            &journal,
+            &journal.sessions["session"],
+            &snapshot,
+            &obligation,
+            false
+        ));
+        let mut unknown = obligation.clone();
+        unknown.obligation_id = "unknown".into();
+        assert!(!dependent_stream_obligation_is_attributed(
+            &journal,
+            &journal.sessions["session"],
+            &snapshot,
+            &unknown,
+            false
+        ));
+        snapshot.stream_admissions.clear();
+        let session = journal.sessions.get_mut("session").unwrap();
+        session.admission_ids.insert("later".into());
+        session.admission_targets.insert(
+            "later".into(),
+            LifecycleTarget::Stream {
+                host_epoch: session.host_epoch.clone(),
+                session_id: "session".into(),
+                stream_id: "later".into(),
+                generation: 1,
+            },
+        );
+        session
+            .admission_phases
+            .insert("later".into(), LifecyclePhase::StreamPrepare);
+        journal.authority.settled.insert("later".into(), admission);
+        assert!(!dependent_stream_obligation_is_attributed(
+            &journal,
+            &journal.sessions["session"],
+            &snapshot,
+            &obligation,
+            false
+        ));
+        assert!(dependent_stream_obligation_is_attributed(
+            &journal,
+            &journal.sessions["session"],
+            &snapshot,
+            &obligation,
+            true
         ));
         drop(coordinator);
         std::fs::remove_dir_all(root).unwrap();
