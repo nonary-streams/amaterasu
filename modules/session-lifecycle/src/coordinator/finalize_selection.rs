@@ -240,14 +240,17 @@ pub(super) mod tests {
         let mut book = CompositionBook::default();
         book.record(root.clone(), &selected, &root.output.origin, &|_| true)
             .unwrap();
+        let mut staged_output = root.output.clone();
+        staged_output.resource.revision += 1;
+        staged_output.data = json!({"mode":"staged"});
         let mut plan = root.plan.clone();
         plan.resources[0].incarnation = Some(root.output.resource.incarnation.clone());
-        plan.resources[0].expected_revision = Some(root.output.resource.revision);
+        plan.resources[0].expected_revision = Some(staged_output.resource.revision);
         let method = json!({"service":"owner/2","method":"callback","interface_major":2,"interface_minor":0,"schema_revision":1});
         let participant = serde_json::from_value(json!({"provider":"owner","plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"revision","settings":{}})).unwrap();
         let request: api::ProviderRequest = serde_json::from_value(json!({"provider_sequence":1,"operation":"lifecycle_callback","version":2,"transition_id":selection.transition_id,"operation_id":"stage-call","target":selection.target,"phase":"stream.prepare","settings_revision":"revision","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":1000,"plan_revision":plan.revision,"admission_id":"stage-admission","approved_plan":plan})).unwrap();
         let response: api::ProviderResponse = serde_json::from_value(
-            json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[root.output]}),
+            json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[staged_output]}),
         )
         .unwrap();
         let terminal = DispatchRecord {
@@ -272,7 +275,7 @@ pub(super) mod tests {
             transition_id: selection.transition_id.clone(),
             plan,
             before: root.output.clone(),
-            after: root.output.clone(),
+            after: staged_output.clone(),
             callback_proof: ProducerCallbackProof {
                 participant,
                 request,
@@ -284,7 +287,8 @@ pub(super) mod tests {
         selection.stage = Some(stage);
         book.record_finalize_selection(selection.clone(), &|_| true)
             .unwrap();
-        assert_eq!(selection.current_output(), &root.output);
+        assert_eq!(selection.current_output(), &staged_output);
+        assert_ne!(selection.current_output(), &root.output);
         let mut tampered = selection;
         tampered.stage.as_mut().unwrap().after.data = json!({"mode":"other"});
         assert!(book.record_finalize_selection(tampered, &|_| true).is_err());
