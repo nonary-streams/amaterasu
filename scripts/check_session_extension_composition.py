@@ -25,9 +25,11 @@ OWNER_METHODS = {"settings_validate", "resource_plan", "lifecycle_callback", "li
                  "binding_validate", "resource_control", "resource_control_settle",
                  "resource_finalize", "resource_status"}
 ACTION_METHODS = {"action_plan", "action_execute", "action_status"}
+HOST_STATE_CONTEXT_SERVICE = "amaterasu.host-state-context/1"
 PROVIDER_CALLS = {
     DISPLAY: {"amaterasu.session-lifecycle/1"},
-    OWNER: {"amaterasu.state/1", "amaterasu.session-lifecycle/1", "amaterasu.virtual-display/1"},
+    OWNER: {"amaterasu.state/1", "amaterasu.session-lifecycle/1", "amaterasu.virtual-display/1",
+            HOST_STATE_CONTEXT_SERVICE},
 }
 FIELD_KINDS = {"any", "null", "boolean", "integer", "number", "string", "array", "object"}
 

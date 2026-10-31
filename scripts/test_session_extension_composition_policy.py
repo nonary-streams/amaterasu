@@ -152,6 +152,10 @@ class CompositionPolicyTest(unittest.TestCase):
         self.owner["component"]["requested"]["provide"] = [check.OWNER + "/1"]
         with self.assertRaisesRegex(ValueError, "selected v2"):
             policy.provider_entries(self.selected)
+        self.owner["component"]["requested"]["provide"] = [check.OWNER + "/2"]
+        self.display["component"]["requested"]["call"].append(check.HOST_STATE_CONTEXT_SERVICE)
+        with self.assertRaisesRegex(ValueError, "unexpected service calls"):
+            policy.provider_entries(self.selected)
 
     def test_bootstrap_assembly_preserves_existing_base_and_refuses_old_extension(self):
         identities = [legacy.NVHTTP, legacy.RTSP, legacy.STREAM, legacy.INPUT,
@@ -190,6 +194,10 @@ class CompositionPolicyTest(unittest.TestCase):
         self.assertEqual(settings["amaterasu.launch"]["retirement_observers"], ["other.observer", legacy.LIFECYCLE])
         self.assertIn(check.OWNER + "/2", calls[legacy.LIFECYCLE])
         self.assertIn(check.DISPLAY + "/2", calls[legacy.REGISTRY])
+        principals = assembled["policy"]["principals"]
+        self.assertIn(check.HOST_STATE_CONTEXT_SERVICE, principals[check.OWNER]["call"])
+        self.assertTrue(all(check.HOST_STATE_CONTEXT_SERVICE not in grants.get("call", [])
+                            for identity, grants in principals.items() if identity != check.OWNER))
         base["policy"]["settings"][legacy.REGISTRY] = {"descriptors": [{"old": True}]}
         with self.assertRaisesRegex(ValueError, "explicit migration"):
             policy.build_bootstrap(base, self.selected, entries, lifecycle)

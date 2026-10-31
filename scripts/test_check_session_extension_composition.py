@@ -45,6 +45,11 @@ class CompositionPreflightTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unexpected service calls"):
             self.check()
 
+    def test_owner_requires_host_state_context(self):
+        self.component["requested"]["call"].remove(check.HOST_STATE_CONTEXT_SERVICE)
+        with self.assertRaisesRegex(ValueError, "unexpected service calls"):
+            self.check()
+
     def test_extra_native_or_unknown_grants_fail(self):
         self.component["requested"]["native_use"] = ["unexpected.native/1"]
         with self.assertRaisesRegex(ValueError, "non-service grants"):
