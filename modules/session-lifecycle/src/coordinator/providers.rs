@@ -201,6 +201,41 @@ impl AuthorityJournal for StreamReleaseWriter {
     }
 }
 
+struct SessionReleaseWriter {
+    shared: Shared,
+    key: String,
+    provider: String,
+    state: PrepareState,
+}
+impl AuthorityJournal for SessionReleaseWriter {
+    fn persist(&mut self, authority: &AuthorityState) -> ModuleResult<()> {
+        let mut next = self.shared.borrow().value.clone();
+        let work = next
+            .receipts
+            .get(&self.key)
+            .and_then(|receipt| receipt.work.clone())
+            .ok_or("unknown_transition")?;
+        super::session_release::record_session_release_proof(
+            &mut next,
+            &work,
+            &self.provider,
+            &self.state,
+        )?;
+        let admission = self
+            .state
+            .admission_id
+            .as_deref()
+            .ok_or("admission_missing")?;
+        if !authority.settled.contains_key(admission) {
+            return Err("release_admission_not_retained".into());
+        }
+        next.authority = authority.clone();
+        apply_participant(&mut next, &self.key, &self.provider, &self.state, false)?;
+        validate_journal(&next).map_err(|_| "invalid_session_release_journal")?;
+        save(&self.shared, next)
+    }
+}
+
 fn apply_participant(
     next: &mut Journal,
     key: &str,
@@ -1029,14 +1064,29 @@ impl Coordinator {
             if self.settings.participants.iter().any(|participant| {
                 &participant.provider == provider
                     && participant.contract_version == amaterasu_extension_api::COMPOSITION_VERSION
-            }) && !matches!(
-                work.phase,
-                LifecyclePhase::SessionPrepare
-                    | LifecyclePhase::StreamPrepare
-                    | LifecyclePhase::StreamRelease
-            ) {
-                self.fail_work(&key, "composition_path_not_supported")?;
-                continue;
+            }) {
+                if work.phase == LifecyclePhase::SessionRelease {
+                    let preflight = {
+                        let shared = self.shared.borrow();
+                        super::session_release::validate_session_release_preflight(
+                            &shared.value,
+                            &work,
+                            provider,
+                        )
+                    };
+                    if let Err(reason) = preflight {
+                        self.cleanup_failure(&key, &reason)?;
+                        continue;
+                    }
+                } else if !matches!(
+                    work.phase,
+                    LifecyclePhase::SessionPrepare
+                        | LifecyclePhase::StreamPrepare
+                        | LifecyclePhase::StreamRelease
+                ) {
+                    self.fail_work(&key, "composition_path_not_supported")?;
+                    continue;
+                }
             }
             match self.ensure_settings(&work, send) {
                 Ok(true) => {}
@@ -1073,6 +1123,7 @@ impl Coordinator {
                     LifecyclePhase::SessionPrepare
                         | LifecyclePhase::StreamPrepare
                         | LifecyclePhase::StreamRelease
+                        | LifecyclePhase::SessionRelease
                 )
                 && work.provider_graph.as_ref().is_some_and(|graph| {
                     graph.order == [participant.provider.clone()]
@@ -1105,6 +1156,20 @@ impl Coordinator {
             if participant.contract_version != 1 && !standalone_v2 && !composed_v2 {
                 self.fail_work(&key, "composition_path_not_supported")?;
                 continue;
+            }
+            if standalone_v2 && work.phase == LifecyclePhase::SessionRelease {
+                let preflight = {
+                    let shared = self.shared.borrow();
+                    super::session_release::validate_session_release_preflight(
+                        &shared.value,
+                        &work,
+                        provider,
+                    )
+                };
+                if let Err(reason) = preflight {
+                    self.cleanup_failure(&key, &reason)?;
+                    continue;
+                }
             }
             if standalone_v2 && work.phase == LifecyclePhase::StreamRelease {
                 let preflight = {
@@ -1186,6 +1251,18 @@ impl Coordinator {
                             continue;
                         }
                     }
+                } else if standalone_v2 && work.phase == LifecyclePhase::SessionRelease {
+                    let shared = self.shared.borrow();
+                    let mut roots = shared.value.composition.records().filter(|record| {
+                        record.output.origin == work.target
+                            && record.output.producer == *provider
+                            && record.state == composition::OutputState::Retained
+                    });
+                    let root = roots.next().ok_or("session_root_missing")?;
+                    if roots.next().is_some() {
+                        return Err("session_root_ambiguous".into());
+                    }
+                    vec![root.output.clone()]
                 } else if standalone_v2 && work.phase == LifecyclePhase::StreamRelease {
                     let shared = self.shared.borrow();
                     let mut results = shared.value.finalize_results.records().filter(|record| {
@@ -1315,7 +1392,12 @@ impl Coordinator {
             if !self.drivers.contains_key(&runtime_key) {
                 let driver = if composed_v2 {
                     PrepareDriver::new_composed(work.states[provider].clone(), &effective_settings)?
-                } else if standalone_v2 && work.phase == LifecyclePhase::StreamRelease {
+                } else if standalone_v2
+                    && matches!(
+                        work.phase,
+                        LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
+                    )
+                {
                     PrepareDriver::new_standalone_release(
                         work.states[provider].clone(),
                         &effective_settings,
@@ -1451,6 +1533,25 @@ impl Coordinator {
                     )?;
                     if let Err(reason) = finish.finish_admission_retained(provider, admission) {
                         self.fail_work(&key, &reason)?;
+                    }
+                    self.drivers.remove(&runtime_key);
+                    continue;
+                }
+                if standalone_v2 && work.phase == LifecyclePhase::SessionRelease {
+                    let admission = state.admission_id.as_deref().ok_or("admission_missing")?;
+                    let writer = SessionReleaseWriter {
+                        shared: self.shared.clone(),
+                        key: key.clone(),
+                        provider: provider.clone(),
+                        state: state.clone(),
+                    };
+                    let mut finish = CoordinatorPrepareAuthority::new(
+                        self.shared.borrow().value.authority.clone(),
+                        self.work_selections(&work)?,
+                        writer,
+                    )?;
+                    if let Err(reason) = finish.finish_admission_retained(provider, admission) {
+                        self.cleanup_failure(&key, &reason)?;
                     }
                     self.drivers.remove(&runtime_key);
                     continue;
@@ -1822,6 +1923,21 @@ impl Coordinator {
             return Err("capture_owner_ambiguous".into());
         }
         drop(finalize_owners);
+        let session_release_proven = work.phase == LifecyclePhase::SessionRelease
+            && work.providers.len() == 1
+            && next.session_releases.has_valid_released(&next, &work.target, &work.providers[0])
+            && next.sessions.get(id).is_some_and(|session| {
+                session.admission_ids.iter().all(|admission| {
+                    !next.authority.admissions.contains_key(admission)
+                        && next.authority.settled.contains_key(admission)
+                        && next.references_admission(admission)
+                }) && session.obligations.iter().all(|obligation| {
+                    work.states.values().any(|state| matches!(&state.response,
+                        Some(ProviderResponse::Cleanup { outcomes, .. }) if outcomes.iter().any(|outcome|
+                            outcome.obligation_id == obligation.obligation_id
+                                && outcome.state == amaterasu_extension_api::CleanupState::Released)))
+                })
+            });
         let session = next.sessions.get_mut(id).ok_or("unknown_session")?;
         let mut response = json!({"status":"succeeded","target":work.target,"transition_id":work.transition_id,"host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation});
         if let Some(stream) = stream_id.and_then(|id| session.streams.get(id)) {
@@ -1896,6 +2012,7 @@ impl Coordinator {
             }
             LifecyclePhase::SessionRelease => {
                 if !deferred
+                    && !session_release_proven
                     && session.admission_ids.iter().any(|admission| {
                         next.authority.admissions.contains_key(admission)
                             || next.authority.settled.contains_key(admission)
