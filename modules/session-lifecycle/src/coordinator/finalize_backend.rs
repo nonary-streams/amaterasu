@@ -53,6 +53,10 @@ impl Backend<'_> {
 }
 impl FinalizeEndpointBackend for Backend<'_> {
     fn resolve(&mut self, request: &ResourceFinalizeRequest) -> ModuleResult<ResolvedFinalize> {
+        super::checkpoint_queries::ensure_effect_scope_open(
+            &self.coordinator.shared.borrow().value,
+            &request.target,
+        )?;
         let shared = self.coordinator.shared.borrow();
         let journal = &shared.value;
         let admission = journal

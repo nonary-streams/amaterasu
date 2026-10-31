@@ -694,6 +694,10 @@ fn ensure_control_operation_unfenced(
 
 impl ControlEndpointBackend for Backend<'_> {
     fn resolve(&mut self, request: &ResourceControlRequest) -> ModuleResult<ResolvedControl> {
+        super::checkpoint_queries::ensure_effect_scope_open(
+            &self.coordinator.shared.borrow().value,
+            &request.target,
+        )?;
         self.resolve_control(request, None, false)
     }
     fn validate_arguments(&mut self, schema: &SchemaRef, arguments: &Value) -> ModuleResult<()> {

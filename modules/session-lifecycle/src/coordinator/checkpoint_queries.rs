@@ -2,7 +2,7 @@
 //!
 //! These adapters grant no effect authority. An absent, ambiguous or invalid
 //! certificate returns `None`, allowing the caller to reject the query.
-use super::{Journal, closed_stream::ClosedStreamBook};
+use super::{Journal, closed_stream::ClosedStreamBook, retention};
 use crate::adapter::LifecycleSettings;
 use amaterasu_extension_api::{
     LifecycleTarget, ResourceControlResponse, ResourceControlSettlementRequest,
@@ -15,6 +15,9 @@ pub(super) fn ensure_effect_scope_open(
     journal: &Journal,
     target: &LifecycleTarget,
 ) -> amaterasu_module_sdk::ModuleResult<()> {
+    if retention::session_expired(journal, target) {
+        return Err("session_expired".into());
+    }
     if !journal.closed_streams.validate(journal) || journal.closed_streams.scope_fenced(target) {
         return Err("closed_stream_effect_fenced".into());
     }
@@ -90,6 +93,35 @@ mod tests {
         let journal: Journal = serde_json::from_value(json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{},"closed_streams":{"records":[],"expired_scopes":[digest]}})).unwrap();
         assert!(ensure_effect_scope_open(&journal, &target).is_err());
         assert!(ensure_effect_scope_open(&journal, &other).is_ok());
+    }
+
+    #[test]
+    fn ended_session_fence_covers_all_children_after_stream_fences_are_removed() {
+        let session: LifecycleTarget = serde_json::from_value(
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}),
+        )
+        .unwrap();
+        let child: LifecycleTarget = serde_json::from_value(json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":3})).unwrap();
+        let another_child: LifecycleTarget = serde_json::from_value(json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"other","generation":9})).unwrap();
+        let other_session: LifecycleTarget = serde_json::from_value(json!({"kind":"stream","host_epoch":"epoch","session_id":"other","stream_id":"stream","generation":3})).unwrap();
+        let other_epoch: LifecycleTarget = serde_json::from_value(json!({"kind":"stream","host_epoch":"other","session_id":"session","stream_id":"stream","generation":3})).unwrap();
+        let mut journal: Journal = serde_json::from_value(
+            json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{}}),
+        )
+        .unwrap();
+        retention::fence_closed_session(&mut journal, &session).unwrap();
+        let restored: Journal =
+            serde_json::from_value(serde_json::to_value(journal).unwrap()).unwrap();
+        assert!(!restored.closed_streams.scope_fenced(&child));
+        for target in [&session, &child, &another_child] {
+            assert_eq!(
+                ensure_effect_scope_open(&restored, target).unwrap_err(),
+                "session_expired"
+            );
+        }
+        for target in [&other_session, &other_epoch] {
+            assert!(ensure_effect_scope_open(&restored, target).is_ok());
+        }
     }
 
     #[test]
