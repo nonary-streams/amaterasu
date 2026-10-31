@@ -142,6 +142,13 @@ impl Coordinator {
                 state
             };
             let request = &state.request;
+            if state.provider != caller
+                || request.target != work.target
+                || request.transition_id != work.transition_id
+                || request.phase != work.phase
+            {
+                continue;
+            }
             let Ok((target_epoch, session_id, stream_id, generation)) =
                 super::operations::target_parts(&request.target)
             else {
@@ -153,6 +160,17 @@ impl Coordinator {
             let Some(session) = journal.sessions.get(session_id) else {
                 continue;
             };
+            if session.host_epoch != target_epoch
+                || match stream_id {
+                    Some(id) => session
+                        .streams
+                        .get(id)
+                        .is_none_or(|stream| stream.generation != generation),
+                    None => session.generation != generation,
+                }
+            {
+                continue;
+            }
             if nested.is_some()
                 && (session.host_epoch != target_epoch
                     || stream_id
@@ -186,6 +204,30 @@ impl Coordinator {
             if !phase_allowed {
                 continue;
             }
+            // The cursor is coordinator-owned and frozen into the exact
+            // persisted provider request. It exists before the first output;
+            // subsequent work must match its current session value.
+            let resource_owner = state.participant.contract_version
+                == amaterasu_extension_api::COMPOSITION_VERSION
+                && self
+                    .settings
+                    .finalize_policies
+                    .iter()
+                    .any(|policy| policy.owner_provider == caller);
+            let resource_generation = if resource_owner {
+                match session.resource_generations.get(caller).copied() {
+                    Some(generation)
+                        if generation > 0 && request.resource_generation == Some(generation) =>
+                    {
+                        Some(generation)
+                    }
+                    _ => continue,
+                }
+            } else if request.resource_generation.is_some() {
+                continue;
+            } else {
+                None
+            };
             if payload["provider_sequence"] != request.provider_sequence
                 || payload["operation_id"] != request.operation_id
                 || payload["transition_id"] != request.transition_id
@@ -210,11 +252,15 @@ impl Coordinator {
             if let (Some(destination), Some(fields)) =
                 (result.as_object_mut(), metadata.as_object())
             {
+                destination.remove("resource_generation");
                 destination.extend(fields.clone());
             } else {
                 return rejection("invalid_provider_request");
             }
             result["status"] = json!("succeeded");
+            if let Some(generation) = resource_generation {
+                result["resource_generation"] = json!(generation);
+            }
             result["session_target"] = json!({"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation});
             result["consumers_retired"] = json!(session.streams.iter().all(|(id, stream)| {
                 (stream_id == Some(id.as_str()) && stream.phase == StreamPhase::Preparing)
@@ -907,5 +953,104 @@ impl Coordinator {
         };
         save(&self.shared, next)?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod resource_generation_tests {
+    use super::*;
+
+    #[test]
+    fn provider_epoch_uses_durable_owner_cursor_before_any_output() {
+        let path = std::env::temp_dir().join(format!(
+            "amaterasu-cursor-{}-{}",
+            std::process::id(),
+            identifier().unwrap()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut coordinator = Coordinator::open(&path.join("journal.json")).unwrap();
+        let epoch = coordinator.shared.borrow().value.host_epoch.clone();
+        let target =
+            json!({"kind":"session","host_epoch":epoch,"session_id":"session","generation":3});
+        let method = json!({"service":"owner/2","method":"plan","interface_major":2,"interface_minor":0,"schema_revision":1});
+        let schema = json!({"id":"schema","major":1,"minor":0,"digest":"a".repeat(64)});
+        coordinator.settings.finalize_policies.push(serde_json::from_value(json!({"owner_provider":"owner","owner_service":"owner/2","method":method,"status_method":method,"output_capability":"output","output_schema":schema,"capture_provider":"capture","selector_schema":"selector","required_access":"exclusive","mutation_domains":["domain"]})).unwrap());
+        let participant = json!({"provider":"owner","contract_version":2,"depends_on":[],"plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"rev","settings":{}});
+        let request = json!({"version":2,"provider_sequence":1,"operation":"resource_plan","transition_id":"transition","operation_id":"owner-plan","target":target,"resource_generation":1,"phase":"session.prepare","settings_revision":"rev","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector"]},"remaining_ms":5000,"plan_revision":null,"admission_id":null,"approved_plan":null});
+        let state = json!({"provider":"owner","participant":participant,"request":request,"phase":"plan","plan":null,"admission_id":null,"pending_receipt":null,"status_polls":0,"last_sequence":1,"dispatch":null,"response":null});
+        let work = json!({"phase":"session.prepare","target":target,"intent":null,"reason":null,"video":null,"transition_id":"transition","providers":["owner"],"index":0,"states":{"owner":state},"candidate":null,"waiting_retirement":false});
+        let session = json!({"host_epoch":epoch,"id":"session","generation":3,"phase":"preparing","owner":{"caller":"transport","initiator":"user"},"delegates":[],"application_ref":{},"settings_revision":"rev","application_retired":false,"streams":{},"resource_generations":{"owner":1}});
+        let mut journal = coordinator.shared.borrow().value.clone();
+        journal
+            .sessions
+            .insert("session".into(), serde_json::from_value(session).unwrap());
+        journal.receipts.insert("work".into(), serde_json::from_value(json!({"caller":"transport","initiator":"user","request":{},"response":{"status":"pending"},"work":work})).unwrap());
+        save(&coordinator.shared, journal).unwrap();
+        let typed: amaterasu_extension_api::ProviderRequest =
+            serde_json::from_value(request).unwrap();
+        let verification = json!({"host_epoch":epoch,"provider_sequence":1,"operation_id":"owner-plan","transition_id":"transition","target":target,"fingerprint":fingerprint(&typed).unwrap(),"resource_generation":99});
+        let response = coordinator.verify_provider("owner", &verification);
+        assert_eq!(response["status"], "succeeded");
+        assert_eq!(response["resource_generation"], 1);
+        assert_eq!(
+            coordinator.verify_provider("foreign", &verification)["status"],
+            "rejected"
+        );
+        let original = coordinator.shared.borrow().value.clone();
+        let mut stream_journal = original.clone();
+        let stream_target: LifecycleTarget = serde_json::from_value(json!({"kind":"stream","host_epoch":epoch,"session_id":"session","stream_id":"stream","generation":4})).unwrap();
+        stream_journal.sessions.get_mut("session").unwrap().streams.insert("stream".into(), serde_json::from_value(json!({"generation":4,"phase":"preparing","candidate":null,"required":[],"acknowledgements":[],"retirements":[]})).unwrap());
+        let work = stream_journal
+            .receipts
+            .get_mut("work")
+            .unwrap()
+            .work
+            .as_mut()
+            .unwrap();
+        work.phase = LifecyclePhase::StreamPrepare;
+        work.target = stream_target.clone();
+        let stream_request = &mut work.states.get_mut("owner").unwrap().request;
+        stream_request.phase = LifecyclePhase::StreamPrepare;
+        stream_request.target = stream_target.clone();
+        let stream_verification = json!({"host_epoch":epoch,"provider_sequence":1,"operation_id":"owner-plan","transition_id":"transition","target":stream_target,"fingerprint":fingerprint(stream_request).unwrap()});
+        save(&coordinator.shared, stream_journal).unwrap();
+        assert_eq!(
+            coordinator.verify_provider("owner", &stream_verification)["resource_generation"],
+            1
+        );
+        let mut wrong_stream = coordinator.shared.borrow().value.clone();
+        wrong_stream
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .streams
+            .get_mut("stream")
+            .unwrap()
+            .generation += 1;
+        save(&coordinator.shared, wrong_stream).unwrap();
+        assert_eq!(
+            coordinator.verify_provider("owner", &stream_verification)["status"],
+            "rejected"
+        );
+        save(&coordinator.shared, original).unwrap();
+        let mut changed = coordinator.shared.borrow().value.clone();
+        changed
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .insert("owner".into(), 2);
+        save(&coordinator.shared, changed).unwrap();
+        assert_eq!(
+            coordinator.verify_provider("owner", &verification)["status"],
+            "rejected"
+        );
+        drop(coordinator);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }
