@@ -2379,6 +2379,7 @@ mod admission_target_tests {
             application_ref: json!({}),
             settings_revision: "revision".into(),
             application_retired: false,
+            application_retirement_proof: None,
             streams: Default::default(),
             obligations: vec![],
             required_consumers: None,

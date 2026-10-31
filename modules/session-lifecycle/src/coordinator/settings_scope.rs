@@ -180,6 +180,7 @@ mod tests {
                 application_ref: json!({"kind":"application","app_id":"app"}),
                 settings_revision: "revision".into(),
                 application_retired: false,
+                application_retirement_proof: None,
                 streams: BTreeMap::new(),
                 obligations: vec![],
                 required_consumers: None,

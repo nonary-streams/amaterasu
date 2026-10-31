@@ -10,6 +10,82 @@ pub(super) struct ApplicationBinding {
     pub owner: String,
 }
 
+/// Evidence is saved in the same transaction as the retirement flag. It is
+/// historical only and does not authorize a new launch or a native effect.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ApplicationRetirementProof {
+    Desktop {
+        target: LifecycleTarget,
+    },
+    Launch {
+        target: LifecycleTarget,
+        binding: ApplicationBinding,
+        no_launch: bool,
+        service: String,
+        request_operation_id: String,
+        request_payload: Value,
+        response: Value,
+    },
+}
+
+fn retirement_payload(binding: &ApplicationBinding, no_launch: bool) -> Value {
+    json!({"action":"verify_retirement","owner":binding.owner,"launch_id":if no_launch {None} else {Some(binding.launch_id)},"operation_id":binding.operation_id})
+}
+
+pub(super) fn valid_retirement_proof(session: &SessionRecord, target: &LifecycleTarget) -> bool {
+    if !session.application_retired
+        || !matches!(target, LifecycleTarget::Session { host_epoch, session_id, generation }
+            if host_epoch == &session.host_epoch && session_id == &session.id && *generation == session.generation)
+    {
+        return false;
+    }
+    match &session.application_retirement_proof {
+        Some(ApplicationRetirementProof::Desktop {
+            target: proof_target,
+        }) => {
+            proof_target == target
+                && session.application.is_none()
+                && session.application_operation_id.is_none()
+                && session.application_ref.get("kind").and_then(Value::as_str) == Some("desktop")
+        }
+        Some(ApplicationRetirementProof::Launch {
+            target: proof_target,
+            binding,
+            no_launch,
+            service,
+            request_operation_id,
+            request_payload,
+            response,
+        }) => {
+            proof_target == target
+                && service == "amaterasu.launch/1"
+                && valid_id(request_operation_id)
+                && request_operation_id.starts_with("retirement-")
+                && *request_payload == retirement_payload(binding, *no_launch)
+                && serde_json::to_vec(response).is_ok_and(|bytes| bytes.len() <= 4096)
+                && response["ok"] == true
+                && response["retired"] == true
+                && response["owner"] == binding.owner
+                && response["operation_id"] == binding.operation_id
+                && if *no_launch {
+                    binding.launch_id == 0
+                        && session.application.is_none()
+                        && session.application_operation_id.as_deref()
+                            == Some(binding.operation_id.as_str())
+                        && session.owner.caller == binding.owner
+                        && response["launch_id"].is_null()
+                        && response["never_admitted"] == true
+                } else {
+                    binding.launch_id > 0
+                        && session.application.as_ref() == Some(binding)
+                        && response["launch_id"] == binding.launch_id
+                }
+        }
+        None => false,
+    }
+}
+
 pub(super) struct ApplicationJob {
     key: String,
     target: LifecycleTarget,
@@ -128,10 +204,11 @@ impl Coordinator {
             if session.application_ref.get("kind").and_then(Value::as_str) != Some("desktop") {
                 return Err("application_retirement_unconfirmed".into());
             }
-            next.sessions
-                .get_mut(&session_id)
-                .unwrap()
-                .application_retired = true;
+            let session = next.sessions.get_mut(&session_id).unwrap();
+            session.application_retired = true;
+            session.application_retirement_proof = Some(ApplicationRetirementProof::Desktop {
+                target: target.clone(),
+            });
             json!({"status":"succeeded","operation_id":operation_id,"target":target})
         } else {
             return Err("unsupported_operation".into());
@@ -198,7 +275,7 @@ impl Coordinator {
                 let binding = &job.binding;
                 let request = Command::Request {
                     service: "amaterasu.launch/1".into(),
-                    payload: json!({"action":"verify_retirement","owner":binding.owner,"launch_id":if job.no_launch {None} else {Some(binding.launch_id)},"operation_id":binding.operation_id}),
+                    payload: retirement_payload(binding, job.no_launch),
                     timeout_ms: 5000,
                     operation_id: format!("retirement-{}", job.query_id),
                     parent: None,
@@ -246,6 +323,18 @@ impl Coordinator {
             };
         if valid {
             session.application_retired = true;
+            session.application_retirement_proof = Some(ApplicationRetirementProof::Launch {
+                target: job.target.clone(),
+                binding: job.binding.clone(),
+                no_launch: job.no_launch,
+                service: "amaterasu.launch/1".into(),
+                request_operation_id: format!("retirement-{}", job.query_id),
+                request_payload: retirement_payload(&job.binding, job.no_launch),
+                response: result.clone().expect("validated response"),
+            });
+            if !valid_retirement_proof(session, &job.target) {
+                return Err("invalid_application_retirement_proof".into());
+            }
         }
         let receipt = next
             .receipts
@@ -297,6 +386,7 @@ mod tests {
                 application_ref: json!({"kind":"application"}),
                 settings_revision: "1".into(),
                 application_retired: false,
+                application_retirement_proof: None,
                 application: None,
                 application_operation_id: None,
                 admission_ids: Default::default(),
@@ -371,6 +461,60 @@ mod tests {
             "recovery_required"
         );
         drop(journal);
+        let request = json!({"operation":"application_retired","operation_id":"retry"});
+        coordinator
+            .application_operation(
+                "nvhttp",
+                "nvhttp",
+                request,
+                receipt_key("nvhttp", "nvhttp", "retry"),
+                target.clone(),
+            )
+            .unwrap();
+        let mut send = |command| match command {
+            Command::Request { .. } => Ok(Response::Accepted { id: 9 }),
+            Command::TakeResult { .. } => Ok(Response::Result {
+                payload: json!({"ok":true,"retired":true,"owner":"nvhttp","launch_id":42,"operation_id":"launch"}),
+            }),
+            Command::ReleaseResult { .. } => Ok(Response::Ok),
+            _ => panic!("unexpected command"),
+        };
+        for _ in 0..3 {
+            coordinator.advance_applications(&mut send).unwrap();
+        }
+        let stored = coordinator.shared.borrow().value.clone();
+        assert!(valid_retirement_proof(&stored.sessions["session"], &target));
+        let mut altered = stored.clone();
+        if let Some(ApplicationRetirementProof::Launch { response, .. }) = &mut altered
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .application_retirement_proof
+        {
+            response["launch_id"] = json!(43);
+        } else {
+            panic!("missing launch proof");
+        }
+        assert!(validate_journal(&altered).is_err());
+        let restored: Journal =
+            serde_json::from_slice(&serde_json::to_vec(&stored).unwrap()).unwrap();
+        assert!(validate_journal(&restored).is_ok());
+        assert!(valid_retirement_proof(
+            &restored.sessions["session"],
+            &target
+        ));
+        let mut desktop = restored.sessions["session"].clone();
+        desktop.application = None;
+        desktop.application_operation_id = None;
+        desktop.application_ref = json!({"kind":"desktop"});
+        desktop.application_retirement_proof = Some(ApplicationRetirementProof::Desktop {
+            target: target.clone(),
+        });
+        assert!(valid_retirement_proof(&desktop, &target));
+        desktop.application_operation_id = Some("unsettled-launch".into());
+        assert!(!valid_retirement_proof(&desktop, &target));
+        desktop.application_retirement_proof = None;
+        assert!(!valid_retirement_proof(&desktop, &target));
         drop(coordinator);
         std::fs::remove_dir_all(dir).unwrap();
     }

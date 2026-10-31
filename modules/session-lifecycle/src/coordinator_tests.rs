@@ -499,6 +499,7 @@ fn frozen_action_lineage_survives_restart_and_rejects_tampering() {
         application_ref: json!({}),
         settings_revision: "revision".into(),
         application_retired: false,
+        application_retirement_proof: None,
         streams: [("stream".into(), stream)].into(),
         obligations: vec![],
         required_consumers: None,

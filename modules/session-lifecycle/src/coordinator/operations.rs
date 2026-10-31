@@ -249,6 +249,7 @@ impl Coordinator {
                         .unwrap_or("initial")
                         .into(),
                     application_retired: false,
+                    application_retirement_proof: None,
                     streams: BTreeMap::new(),
                     obligations: vec![],
                     required_consumers: None,

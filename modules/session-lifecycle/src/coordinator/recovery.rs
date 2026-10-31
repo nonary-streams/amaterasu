@@ -210,6 +210,7 @@ mod tests {
             application_ref: json!({"kind":"desktop"}),
             settings_revision: "1".into(),
             application_retired: false,
+            application_retirement_proof: None,
             application: None,
             application_operation_id: None,
             admission_ids: Default::default(),

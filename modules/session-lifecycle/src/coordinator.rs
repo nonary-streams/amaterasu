@@ -16,9 +16,9 @@ mod composition_control;
 #[allow(dead_code)] // Composed finalization is still gated.
 mod composition_finalize;
 mod composition_prepare;
+mod composition_progress;
 #[allow(dead_code)] // Release remains gated until provider and proof hooks are wired.
 mod composition_release;
-mod composition_progress;
 mod control_backend;
 #[allow(dead_code)] // Control dispatch remains gated until coordinator sequencing is wired.
 mod control_dispatch;
@@ -393,6 +393,8 @@ struct SessionRecord {
     application_ref: Value,
     settings_revision: String,
     application_retired: bool,
+    #[serde(default)]
+    application_retirement_proof: Option<application::ApplicationRetirementProof>,
     streams: BTreeMap<String, StreamRecord>,
     #[serde(default)]
     obligations: Vec<amaterasu_extension_api::ResourceObligation>,
@@ -571,7 +573,18 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
             })
         })
         || journal.sessions.values().any(|session| {
-            session.resource_generations.len() > 32
+            session
+                .application_retirement_proof
+                .as_ref()
+                .is_some_and(|_| {
+                    let target = LifecycleTarget::Session {
+                        host_epoch: session.host_epoch.clone(),
+                        session_id: session.id.clone(),
+                        generation: session.generation,
+                    };
+                    !application::valid_retirement_proof(session, &target)
+                })
+                || session.resource_generations.len() > 32
                 || session
                     .resource_generations
                     .iter()
