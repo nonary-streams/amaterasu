@@ -73,9 +73,6 @@ def main() -> None:
         for entry in selected:
             assert "amaterasu.library" not in entry.get("requires", {}), entry
         run(publisher, "stage", root, package)
-        if args.paired_nvhttp:
-            from test_nvhttp import install_fixture_identity
-            install_fixture_identity(SimpleNamespace(root=root))
         console = PatientConsole(SimpleNamespace(host=host, root=root), environment=environment)
         try:
             created = console.request(CATALOG, {"action": "create", "expected_revision": 0,
@@ -95,11 +92,14 @@ def main() -> None:
             assert not denied["ok"] and denied["error"]["code"] == "permission_denied", denied
             if args.paired_nvhttp:
                 from test_nvhttp import check_library, initialize_host_identity, pair, tls_context, wait_for
-                initialize_host_identity(console)
+                identity = initialize_host_identity(console)
+                host_certificate = identity["certificate_pem"].encode("ascii")
                 status = wait_for(console, "amaterasu.nvhttp/1", {"action":"status"}, lambda value: value.get("tls_ready"))
                 http, https = "http://" + status["http_address"], "https://" + status["https_address"]
-                pair(console, http)
-                check_library(https, {str(int(app_id[4:], 16)): "Catalog-backed game"}, tls_context())
+                pair(console, http, host_certificate_pem=host_certificate)
+                check_library(https, {str(int(app_id[4:], 16)): "Catalog-backed game"},
+                              tls_context(host_certificate_pem=host_certificate),
+                              expected_server_pem=host_certificate)
             console.eof()
         finally:
             console.close()
