@@ -15859,6 +15859,34 @@ var Amaterasu;
                     control.value = value;
                 return { node: control, value: () => control.value };
             }
+            case "tagged_union": {
+                if (!definition.tag || !definition.variants || !value || typeof value !== "object" || Array.isArray(value))
+                    throw new Error("Invalid tagged setting.");
+                const tag = definition.tag;
+                const variants = definition.variants;
+                const initial = value;
+                if (typeof initial[tag] !== "string" || !Object.hasOwn(variants, initial[tag]))
+                    throw new Error("Unsupported setting variant.");
+                const select = Amaterasu.el("select");
+                for (const name of Object.keys(variants)) {
+                    const option = Amaterasu.el("option", "", name);
+                    option.value = name;
+                    select.append(option);
+                }
+                select.value = initial[tag];
+                const container = Amaterasu.el("div");
+                let fields = [];
+                const render = (existing) => {
+                    const selected = variants[select.value];
+                    if (!selected)
+                        throw new Error("Unsupported setting variant.");
+                    fields = Object.entries(selected).map(([name, child]) => [name, extensionFieldEditor(child, existing && Object.hasOwn(existing, name) ? existing[name] : structuredClone(child.default))]);
+                    container.replaceChildren(...fields.map(([name, editor]) => Amaterasu.el("label", "field", Amaterasu.el("span", "field-label", name), editor.node)));
+                };
+                select.addEventListener("change", () => render());
+                render(initial);
+                return { node: Amaterasu.el("div", "extension-tagged-union", select, container), value: () => ({ [tag]: select.value, ...Object.fromEntries(fields.map(([name, editor]) => [name, editor.value()])) }) };
+            }
             case "object": {
                 if (!definition.fields || !value || typeof value !== "object" || Array.isArray(value))
                     throw new Error("Invalid object setting.");
@@ -15902,6 +15930,104 @@ var Amaterasu;
     }
     Amaterasu.extensionFieldEditor = extensionFieldEditor;
 })(Amaterasu || (Amaterasu = {}));
+(function (Amaterasu) {
+    function bindingChoice(label, value, choices) {
+        const select = Amaterasu.el("select");
+        select.setAttribute("aria-label", label);
+        for (const [id, name] of choices) {
+            const option = Amaterasu.el("option", "", name);
+            option.value = id;
+            select.append(option);
+        }
+        select.value = value;
+        return select;
+    }
+    function bindingKeyEditor(key, label) {
+        if (!key || !["linux_evdev", "windows_scan", "moonlight_vk"].includes(key.platform))
+            throw new Error("Unsupported key identity.");
+        const group = Amaterasu.el("fieldset", "extension-key", Amaterasu.el("legend", "", label));
+        const platform = bindingChoice("Key encoding", key.platform, [
+            ["linux_evdev", "Linux evdev (physical)"], ["windows_scan", "Windows scan code (physical)"],
+            ["moonlight_vk", "Moonlight virtual key"],
+        ]);
+        const code = Amaterasu.input("", String(key.code), "number");
+        code.min = "1";
+        code.max = "65535";
+        code.step = "1";
+        const flag = Amaterasu.input("", "", "checkbox");
+        flag.checked = key.platform === "windows_scan" ? key.extended === true : key.normalized === true;
+        const flagLabel = Amaterasu.el("label", "", flag, Amaterasu.el("span"));
+        const updateFlag = () => {
+            flagLabel.hidden = platform.value === "linux_evdev";
+            flagLabel.lastElementChild.textContent = platform.value === "windows_scan" ? " Extended scan code" : " Normalized Moonlight key";
+            code.max = platform.value === "moonlight_vk" ? "255" : "65535";
+        };
+        platform.addEventListener("change", updateFlag);
+        updateFlag();
+        group.append(Amaterasu.el("label", "field", Amaterasu.el("span", "field-label", "Encoding"), platform), Amaterasu.el("label", "field", Amaterasu.el("span", "field-label", "Key code"), code), flagLabel, Amaterasu.el("small", "muted", "Use the key code for this input provider. Left and right modifiers have separate codes."));
+        return { node: group, value: () => {
+                const number = Number(code.value);
+                if (!code.value || !Number.isInteger(number) || number < 1 || number > Number(code.max))
+                    throw new Error("Enter a supported key code.");
+                if (platform.value === "linux_evdev")
+                    return { platform: platform.value, code: number };
+                if (platform.value === "windows_scan")
+                    return { platform: platform.value, code: number, extended: flag.checked };
+                if (platform.value === "moonlight_vk")
+                    return { platform: platform.value, code: number, normalized: flag.checked };
+                throw new Error("Unsupported key encoding.");
+            } };
+    }
+    function extensionKeybindingEditor(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Invalid keybinding.");
+        const binding = value;
+        if (!Array.isArray(binding.modifiers) || binding.modifiers.length > 8 || !binding.arguments || typeof binding.arguments !== "object" || Array.isArray(binding.arguments))
+            throw new Error("Invalid keybinding.");
+        const group = Amaterasu.el("fieldset", "extension-keybinding");
+        const id = Amaterasu.input("", binding.id);
+        const context = Amaterasu.input("", binding.context);
+        const enabled = Amaterasu.input("", "", "checkbox");
+        enabled.checked = binding.enabled;
+        const source = bindingChoice("Source", binding.source, [["session_input", "Session input"], ["host_local", "Host local"]]);
+        const target = bindingChoice("Target", binding.target, [["current_session", "Current session"], ["host", "Host"]]);
+        const propagation = bindingChoice("Propagation", binding.propagation, [["forward", "Forward trigger"], ["consume_trigger", "Consume trigger"]]);
+        const action = Amaterasu.input("", binding.action_id);
+        const args = Amaterasu.el("textarea");
+        args.value = JSON.stringify(binding.arguments, null, 2);
+        const trigger = bindingKeyEditor(binding.trigger, "Trigger key");
+        const modifierContainer = Amaterasu.el("div");
+        const modifiers = [];
+        const addModifier = (key) => {
+            if (modifiers.length >= 8)
+                return;
+            const editor = bindingKeyEditor(key, "Modifier");
+            const row = Amaterasu.el("div", "extension-modifier", editor.node);
+            row.append(Amaterasu.button("Remove modifier", () => { const index = modifiers.indexOf(editor); if (index >= 0)
+                modifiers.splice(index, 1); row.remove(); }));
+            modifiers.push(editor);
+            modifierContainer.append(row);
+        };
+        for (const modifier of binding.modifiers)
+            addModifier(modifier);
+        group.append(Amaterasu.field("Binding ID", id), Amaterasu.el("label", "field", enabled, " Enabled"), Amaterasu.field("Context", context), Amaterasu.field("Source", source), Amaterasu.field("Target", target), Amaterasu.field("Propagation", propagation), Amaterasu.field("Action ID", action), Amaterasu.field("Action arguments (JSON object)", args), trigger.node, modifierContainer, Amaterasu.button("Add modifier", () => addModifier({ platform: "linux_evdev", code: 29 })));
+        return { node: group, value: () => {
+                let parsed;
+                try {
+                    parsed = JSON.parse(args.value);
+                }
+                catch {
+                    throw new Error("Enter valid action arguments as a JSON object.");
+                }
+                if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+                    throw new Error("Action arguments must be a JSON object.");
+                return { id: id.value, enabled: enabled.checked, source: source.value, context: context.value,
+                    trigger: trigger.value(), modifiers: modifiers.map((item) => item.value()), propagation: propagation.value,
+                    action_id: action.value, arguments: parsed, target: target.value };
+            } };
+    }
+    Amaterasu.extensionKeybindingEditor = extensionKeybindingEditor;
+})(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
     function renderSessionExtensionSettings(context, area) {
@@ -15943,7 +16069,12 @@ var Amaterasu;
                         if (!effective)
                             throw new Error("Missing effective extension setting.");
                         const isOverride = Object.hasOwn(document.values, option.id);
-                        const editor = Amaterasu.extensionFieldEditor(option.definition, isOverride ? document.values[option.id] : effective.value);
+                        const editorValue = isOverride ? document.values[option.id] : effective.value;
+                        if (option.presentation != null && option.presentation !== "keybinding")
+                            throw new Error("Unsupported extension setting presentation.");
+                        const editor = option.presentation === "keybinding"
+                            ? Amaterasu.extensionKeybindingEditor(editorValue)
+                            : Amaterasu.extensionFieldEditor(option.definition, editorValue);
                         const inherit = Amaterasu.input("", "", "checkbox");
                         inherit.checked = !isOverride;
                         form.append(Amaterasu.el("div", "field", Amaterasu.el("span", "field-label", option.label), editor.node, Amaterasu.el("label", "", inherit, " Inherit default"), Amaterasu.el("small", "muted", `${option.help} · Applies: ${option.apply_policy} · Source: ${effective.source === null ? "default" : JSON.stringify(effective.source)}`)));

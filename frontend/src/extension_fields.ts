@@ -13,6 +13,8 @@ namespace Amaterasu {
     options?: string[];
     item?: ExtensionFieldDefinition;
     fields?: Record<string, ExtensionFieldDefinition>;
+    tag?: string;
+    variants?: Record<string, Record<string, ExtensionFieldDefinition>>;
   };
   export interface ExtensionFieldEditor {
     node: HTMLElement;
@@ -55,6 +57,28 @@ namespace Amaterasu {
         if (typeof value === "string") control.value = value;
         return { node: control, value: () => control.value };
       }
+      case "tagged_union": {
+        if (!definition.tag || !definition.variants || !value || typeof value !== "object" || Array.isArray(value))
+          throw new Error("Invalid tagged setting.");
+        const tag = definition.tag;
+        const variants = definition.variants;
+        const initial = value as Record<string, unknown>;
+        if (typeof initial[tag] !== "string" || !Object.hasOwn(variants, initial[tag])) throw new Error("Unsupported setting variant.");
+        const select = el("select");
+        for (const name of Object.keys(variants)) { const option = el("option", "", name); option.value = name; select.append(option); }
+        select.value = initial[tag] as string;
+        const container = el("div");
+        let fields: Array<readonly [string, ExtensionFieldEditor]> = [];
+        const render = (existing?: Record<string, unknown>) => {
+          const selected = variants[select.value];
+          if (!selected) throw new Error("Unsupported setting variant.");
+          fields = Object.entries(selected).map(([name, child]) => [name, extensionFieldEditor(child, existing && Object.hasOwn(existing, name) ? existing[name] : structuredClone(child.default))] as const);
+          container.replaceChildren(...fields.map(([name, editor]) => el("label", "field", el("span", "field-label", name), editor.node)));
+        };
+        select.addEventListener("change", () => render());
+        render(initial);
+        return { node: el("div", "extension-tagged-union", select, container), value: () => ({ [tag]: select.value, ...Object.fromEntries(fields.map(([name, editor]) => [name, editor.value()])) }) };
+      }
       case "object": {
         if (!definition.fields || !value || typeof value !== "object" || Array.isArray(value))
           throw new Error("Invalid object setting.");
@@ -92,5 +116,100 @@ namespace Amaterasu {
       default:
         throw new Error(`Unsupported setting type: ${definition.type}`);
     }
+  }
+}
+
+namespace Amaterasu {
+  interface BindingKey { platform: string; code: number; extended?: boolean; normalized?: boolean }
+  interface BindingValue {
+    id: string; enabled: boolean; source: string; context: string; trigger: BindingKey;
+    modifiers: BindingKey[]; propagation: string; action_id: string;
+    arguments: Record<string, unknown>; target: string;
+  }
+
+  function bindingChoice(label: string, value: string, choices: Array<[string, string]>): HTMLSelectElement {
+    const select = el("select");
+    select.setAttribute("aria-label", label);
+    for (const [id, name] of choices) {
+      const option = el("option", "", name);
+      option.value = id;
+      select.append(option);
+    }
+    select.value = value;
+    return select;
+  }
+
+  function bindingKeyEditor(key: BindingKey, label: string): ExtensionFieldEditor {
+    if (!key || !["linux_evdev", "windows_scan", "moonlight_vk"].includes(key.platform))
+      throw new Error("Unsupported key identity.");
+    const group = el("fieldset", "extension-key", el("legend", "", label));
+    const platform = bindingChoice("Key encoding", key.platform, [
+      ["linux_evdev", "Linux evdev (physical)"], ["windows_scan", "Windows scan code (physical)"],
+      ["moonlight_vk", "Moonlight virtual key"],
+    ]);
+    const code = input("", String(key.code), "number");
+    code.min = "1";
+    code.max = "65535";
+    code.step = "1";
+    const flag = input("", "", "checkbox");
+    flag.checked = key.platform === "windows_scan" ? key.extended === true : key.normalized === true;
+    const flagLabel = el("label", "", flag, el("span"));
+    const updateFlag = () => {
+      flagLabel.hidden = platform.value === "linux_evdev";
+      flagLabel.lastElementChild!.textContent = platform.value === "windows_scan" ? " Extended scan code" : " Normalized Moonlight key";
+      code.max = platform.value === "moonlight_vk" ? "255" : "65535";
+    };
+    platform.addEventListener("change", updateFlag);
+    updateFlag();
+    group.append(el("label", "field", el("span", "field-label", "Encoding"), platform),
+      el("label", "field", el("span", "field-label", "Key code"), code), flagLabel,
+      el("small", "muted", "Use the key code for this input provider. Left and right modifiers have separate codes."));
+    return { node: group, value: () => {
+      const number = Number(code.value);
+      if (!code.value || !Number.isInteger(number) || number < 1 || number > Number(code.max)) throw new Error("Enter a supported key code.");
+      if (platform.value === "linux_evdev") return { platform: platform.value, code: number };
+      if (platform.value === "windows_scan") return { platform: platform.value, code: number, extended: flag.checked };
+      if (platform.value === "moonlight_vk") return { platform: platform.value, code: number, normalized: flag.checked };
+      throw new Error("Unsupported key encoding.");
+    } };
+  }
+
+  export function extensionKeybindingEditor(value: unknown): ExtensionFieldEditor {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid keybinding.");
+    const binding = value as BindingValue;
+    if (!Array.isArray(binding.modifiers) || binding.modifiers.length > 8 || !binding.arguments || typeof binding.arguments !== "object" || Array.isArray(binding.arguments))
+      throw new Error("Invalid keybinding.");
+    const group = el("fieldset", "extension-keybinding");
+    const id = input("", binding.id);
+    const context = input("", binding.context);
+    const enabled = input("", "", "checkbox"); enabled.checked = binding.enabled;
+    const source = bindingChoice("Source", binding.source, [["session_input", "Session input"], ["host_local", "Host local"]]);
+    const target = bindingChoice("Target", binding.target, [["current_session", "Current session"], ["host", "Host"]]);
+    const propagation = bindingChoice("Propagation", binding.propagation, [["forward", "Forward trigger"], ["consume_trigger", "Consume trigger"]]);
+    const action = input("", binding.action_id);
+    const args = el("textarea"); args.value = JSON.stringify(binding.arguments, null, 2);
+    const trigger = bindingKeyEditor(binding.trigger, "Trigger key");
+    const modifierContainer = el("div");
+    const modifiers: ExtensionFieldEditor[] = [];
+    const addModifier = (key: BindingKey) => {
+      if (modifiers.length >= 8) return;
+      const editor = bindingKeyEditor(key, "Modifier");
+      const row = el("div", "extension-modifier", editor.node);
+      row.append(button("Remove modifier", () => { const index = modifiers.indexOf(editor); if (index >= 0) modifiers.splice(index, 1); row.remove(); }));
+      modifiers.push(editor); modifierContainer.append(row);
+    };
+    for (const modifier of binding.modifiers) addModifier(modifier);
+    group.append(field("Binding ID", id), el("label", "field", enabled, " Enabled"), field("Context", context),
+      field("Source", source), field("Target", target), field("Propagation", propagation), field("Action ID", action),
+      field("Action arguments (JSON object)", args), trigger.node, modifierContainer,
+      button("Add modifier", () => addModifier({ platform: "linux_evdev", code: 29 })));
+    return { node: group, value: () => {
+      let parsed: unknown;
+      try { parsed = JSON.parse(args.value); } catch { throw new Error("Enter valid action arguments as a JSON object."); }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Action arguments must be a JSON object.");
+      return { id: id.value, enabled: enabled.checked, source: source.value, context: context.value,
+        trigger: trigger.value(), modifiers: modifiers.map((item) => item.value()), propagation: propagation.value,
+        action_id: action.value, arguments: parsed, target: target.value };
+    } };
   }
 }

@@ -4,6 +4,7 @@ namespace Amaterasu {
     label: string;
     help: string;
     definition: ExtensionFieldDefinition;
+    presentation?: string | null;
     allowed_scopes: string[];
     apply_policy: string;
   }
@@ -48,7 +49,12 @@ namespace Amaterasu {
             const effective = document.effective[option.id];
             if (!effective) throw new Error("Missing effective extension setting.");
             const isOverride = Object.hasOwn(document.values, option.id);
-            const editor = extensionFieldEditor(option.definition, isOverride ? document.values[option.id] : effective.value);
+            const editorValue = isOverride ? document.values[option.id] : effective.value;
+            if (option.presentation != null && option.presentation !== "keybinding")
+              throw new Error("Unsupported extension setting presentation.");
+            const editor = option.presentation === "keybinding"
+              ? extensionKeybindingEditor(editorValue)
+              : extensionFieldEditor(option.definition, editorValue);
             const inherit = input("", "", "checkbox");
             inherit.checked = !isOverride;
             form.append(el("div", "field", el("span", "field-label", option.label), editor.node,
