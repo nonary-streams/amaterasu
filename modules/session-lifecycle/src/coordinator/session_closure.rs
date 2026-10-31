@@ -318,9 +318,8 @@ mod tests {
 }
 
 impl Coordinator {
-    /// Retire at most one eligible session per scheduler turn. This hook is
-    /// intentionally not scheduled until all terminal fences are integrated.
-    #[allow(dead_code, reason = "scheduler activation awaits terminal fences")]
+    /// Retire at most one eligible session per scheduler turn after all work
+    /// and broker-facing drivers have drained.
     pub(crate) fn retire_ended_sessions_if_idle(&mut self) -> ModuleResult<bool> {
         if !self.drivers.is_empty()
             || !self.finalize_drivers.is_empty()

@@ -25,7 +25,6 @@ fn session_borrowers(target: &Value, foreign: bool) -> Value {
 struct Harness {
     broker: Rc<RefCell<Broker>>,
     coordinator: Option<Coordinator>,
-    retire_automatically: bool,
     fresh_domain: bool,
     settings: LifecycleSettings,
     root: PathBuf,
@@ -212,7 +211,6 @@ impl Harness {
         let mut harness = Self {
             broker,
             coordinator: None,
-            retire_automatically: false,
             fresh_domain: false,
             settings,
             root,
@@ -264,9 +262,6 @@ impl Harness {
         coordinator
             .advance(&mut |command| Ok(self.broker.borrow_mut().dispatch(COORDINATOR, command)))
             .unwrap();
-        if self.retire_automatically {
-            coordinator.retire_ended_sessions_if_idle().unwrap();
-        }
         let polled = self
             .broker
             .borrow_mut()
@@ -1155,18 +1150,9 @@ fn composed_restore_and_close(last_cycle: usize) {
     assert!(harness.staged_output.is_none());
     let journal: Value =
         serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap()).unwrap();
-    assert_eq!(
-        journal["closed_streams"]["records"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
+    assert!(journal["sessions"].as_object().unwrap().is_empty());
     check_settlement_history(&mut harness, &historical_tuples);
     check_closed_effects_rejected(&mut harness, &historical_tuples);
-    // Exercise the candidate scheduler hook after Coordinator::advance without
-    // activating it in the production module.
-    harness.retire_automatically = true;
     let lookup = harness.call(
         "transport",
         json!({"operation":"lookup","operation_id":"session.end"}),

@@ -1333,7 +1333,9 @@ impl Coordinator {
         }
         self.refresh_approvals(send)?;
         self.advance_applications(send)?;
-        self.advance_work(send)
+        self.advance_work(send)?;
+        self.retire_ended_sessions_if_idle()?;
+        Ok(())
     }
 }
 
