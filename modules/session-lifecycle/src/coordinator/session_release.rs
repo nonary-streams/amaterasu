@@ -1131,8 +1131,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dependent_noop_proof_precedes_owner_release() {
+    fn dependent_fixture() -> (Journal, Work, PrepareState, PrepareState) {
         let (mut journal, mut work, root_state) = complete_fixture();
         let graph = ProviderGraph {
             order: vec!["owner".into(), "settings".into()],
@@ -1238,6 +1237,179 @@ mod tests {
             payload: serde_json::to_value(state.response.as_ref().unwrap()).unwrap(),
         };
         journal.receipts.get_mut("receipt").unwrap().work = Some(work.clone());
+        (journal, work, root_state, state)
+    }
+
+    #[test]
+    fn scheduler_releases_noop_dependent_before_session_owner() {
+        let (mut journal, mut work, mut owner, mut dependent) = dependent_fixture();
+        let directory = std::env::temp_dir().join(format!(
+            "amaterasu-session-reverse-{}",
+            amaterasu_storage::random_identifier().unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut coordinator = Coordinator::open(&directory.join("journal")).unwrap();
+        coordinator.configured = true;
+        coordinator.settings.participants =
+            vec![owner.participant.clone(), dependent.participant.clone()];
+        coordinator.settings.consumer_requirements = owner.request.consumer_requirements.clone();
+        coordinator
+            .settings
+            .finalize_policies
+            .push(super::super::finalize_selection::tests::fixture().policy);
+        let mut owner_admission = journal
+            .authority
+            .settled
+            .remove("release-admission")
+            .unwrap();
+        owner_admission.plan.resources[0].incarnation = Some("native".into());
+        owner_admission
+            .selection
+            .cleanup_methods
+            .push(owner_admission.plan.obligations[0].cleanup_method.clone());
+        owner.request.approved_plan = Some(owner_admission.plan.clone());
+        owner.request.dependency_inputs =
+            vec![journal.composition.records().next().unwrap().output.clone()];
+        owner.request.resource_generation = Some(1);
+        owner.plan = Some(owner_admission.plan.clone());
+        owner.phase = PreparePhase::Callback;
+        owner.response = None;
+        owner.terminal_dispatch = None;
+        let dependent_admission = journal
+            .authority
+            .settled
+            .remove("settings-release")
+            .unwrap();
+        dependent.phase = PreparePhase::Callback;
+        dependent.response = None;
+        dependent.terminal_dispatch = None;
+        work.states = BTreeMap::from([
+            ("settings".into(), dependent.clone()),
+            ("owner".into(), owner.clone()),
+        ]);
+        journal
+            .authority
+            .snapshot
+            .resources
+            .entry("owner".into())
+            .or_default()
+            .insert(
+                "display".into(),
+                crate::planning::ResourceRef {
+                    provider: "owner".into(),
+                    resource_id: "display".into(),
+                    incarnation: "native".into(),
+                    revision: 2,
+                    execution_domain: "seat".into(),
+                    mutation_domains: Default::default(),
+                },
+            );
+        coordinator
+            .selections
+            .insert("owner".into(), owner_admission.selection.clone());
+        coordinator
+            .selections
+            .insert("settings".into(), dependent_admission.selection.clone());
+        journal
+            .authority
+            .admissions
+            .insert("release-admission".into(), owner_admission);
+        journal
+            .authority
+            .admissions
+            .insert("settings-release".into(), dependent_admission);
+        journal.authority.sequences.insert("owner".into(), 1);
+        journal.authority.sequences.insert("settings".into(), 1);
+        let session = journal.sessions.get_mut("session").unwrap();
+        session.resource_generations.insert("owner".into(), 1);
+        for provider in ["owner", "settings"] {
+            session.provider_settings.insert(
+                provider.into(),
+                settings_snapshot::FrozenSettings {
+                    settings: json!({}),
+                    revision: "revision".into(),
+                },
+            );
+        }
+        let key = receipt_key("transport", "client", "end");
+        journal.receipts.clear();
+        journal.receipts.insert(
+            key.clone(),
+            Receipt {
+                caller: "transport".into(),
+                initiator: "client".into(),
+                request: json!({"operation_id":"end"}),
+                response: json!({"status":"pending","operation_id":"end"}),
+                work: Some(work),
+                wait_target: None,
+            },
+        );
+        coordinator.shared.borrow_mut().value = journal;
+        let mut calls = Vec::new();
+        let mut provider = String::new();
+        let mut send = |command| -> ModuleResult<Response> {
+            match command {
+                Command::QueryApiApproval {
+                    service,
+                    method,
+                    interface_major,
+                    min_minor,
+                } => Ok(Response::Result {
+                    payload: json!({"provider":if service == "owner/2" {"owner"} else {"settings"},"method":{"service":service,"method":method,"interface_major":interface_major,"interface_minor":min_minor}}),
+                }),
+                Command::CallApi {
+                    service, payload, ..
+                } => {
+                    assert_eq!(payload["phase"], "session.release");
+                    provider = if service == "owner/2" {
+                        "owner"
+                    } else {
+                        "settings"
+                    }
+                    .into();
+                    calls.push(provider.clone());
+                    Ok(Response::Accepted { id: 1 })
+                }
+                Command::TakeResult { .. } => Ok(Response::Result {
+                    payload: if provider == "owner" {
+                        json!({"status":"cleanup","outcomes":[{"obligation_id":"cleanup","state":"released","reason":null}],"outputs":[]})
+                    } else {
+                        json!({"status":"cleanup","outcomes":[],"outputs":[]})
+                    },
+                }),
+                Command::ReleaseResult { .. } => Ok(Response::Ok),
+                other => panic!("unexpected broker command: {other:?}"),
+            }
+        };
+        for _ in 0..24 {
+            coordinator.advance_work(&mut send).unwrap();
+        }
+        let shared = coordinator.shared.borrow();
+        assert_eq!(
+            calls,
+            ["settings", "owner"],
+            "receipt: {}",
+            shared.value.receipts[&key].response
+        );
+        assert_eq!(shared.value.receipts[&key].response["status"], "succeeded");
+        assert!(shared.value.session_releases.validate(&shared.value));
+        drop(shared);
+        drop(coordinator);
+        let restored: Journal =
+            serde_json::from_slice(&std::fs::read(directory.join("journal")).unwrap()).unwrap();
+        assert!(restored.session_releases.validate(&restored));
+        validate_journal(&restored).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dependent_noop_proof_precedes_owner_release() {
+        let (mut journal, work, root_state, state) = dependent_fixture();
         assert!(validate_session_release_preflight(&journal, &work, "settings").is_ok());
         let mut owner_work = work.clone();
         owner_work.index = 1;
