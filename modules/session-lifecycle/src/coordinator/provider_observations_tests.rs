@@ -420,3 +420,127 @@ fn v2_plan_refresh_requires_exact_active_request_before_native_observation_is_sa
         2
     );
 }
+
+#[test]
+fn nested_finalize_plan_refresh_checks_exact_owner_and_request() {
+    use sha2::{Digest, Sha256};
+    let path = std::env::temp_dir().join(format!(
+        "amaterasu-finalize-positive-{}-{}",
+        std::process::id(),
+        identifier().unwrap()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut coordinator = Coordinator::open(&path.join("journal.json")).unwrap();
+    let epoch = coordinator.shared.borrow().value.host_epoch.clone();
+    let session =
+        json!({"kind":"session","host_epoch":epoch,"session_id":"session","generation":1});
+    let stream = json!({"kind":"stream","host_epoch":epoch,"session_id":"session","stream_id":"stream","generation":1});
+    let document = r#"{"$id":"example.schema/1","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false}"#;
+    let schema = json!({"id":"example.schema/1","major":1,"minor":0,"digest":format!("{:x}", Sha256::digest(document.as_bytes()))});
+    let resource = json!({"provider":"owner","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":"domain","mutation_domains":["domain"]});
+    let output = json!({"output_id":"out","capability":"display","schema":schema,"producer":"owner","producer_service":"owner/2","origin":session,"resource":resource,"domain_observations":[{"domain":"domain","revision":1,"borrowers":{},"complete":true}],"data":{}});
+    let method = |name: &str| json!({"service":"owner/2","method":name,"interface_major":2,"interface_minor":0,"schema_revision":1});
+    let approval = |name: &str| json!({"method":method(name),"broker_approval":{"provider":"owner","method":{"service":"owner/2","method":name,"interface_major":2,"interface_minor":0}}});
+    let participant = json!({"provider":"owner","contract_version":2,"plan_method":method("plan"),"callback_method":method("callback"),"status_method":method("status"),"capabilities":[],"cleanup_methods":[method("callback")],"settings_revision":"one","settings":{}});
+    let selection = json!({"participant":participant,"approvals":[approval("plan"),approval("callback"),approval("status"),approval("finalize")],"capabilities":[],"cleanup_methods":[method("callback")],"authorized_borrowers":[]});
+    let obligation = json!({"obligation_id":"restore","provider":"owner","resource_id":"output","mutation_domain":"domain","depends_on":[],"cleanup_method":method("callback"),"payload":{}});
+    let source_plan = json!({"plan_id":"source","revision":1,"resources":[{"provider":"owner","resource_id":"output","incarnation":"native","expected_revision":1,"execution_domain":"seat","mutation_domains":["domain"],"access":"exclusive"}],"mutation_domains":[{"domain":"domain","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{},"obligations":[obligation],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
+    let mut final_plan = source_plan.clone();
+    final_plan["plan_id"] = json!("final");
+    final_plan["candidate_constraint"] = json!({"capture_provider":"capture","selector_schema":"selector","resource_provider":"owner","resource_id":"output","incarnation":"native","execution_domain":"seat","mode":null,"plan_revision":1});
+    let requirements = json!({"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector"]});
+    let callback = json!({"version":2,"provider_sequence":1,"operation":"lifecycle_callback","transition_id":"source-transition","operation_id":"source-op","target":session,"phase":"session.prepare","settings_revision":"one","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":1,"admission_id":"source","approved_plan":source_plan});
+    let prepared =
+        json!({"status":"prepared","candidate":null,"obligations":[obligation],"outputs":[output]});
+    let call = |name: &str, args: Value, operation: &str| json!({"service":"owner/2","method":name,"interface_major":2,"interface_minor":0,"approval":approval(name)["broker_approval"],"arguments":args,"timeout_ms":5000,"operation_id":operation});
+    let proof = json!({"participant":participant,"request":callback,"terminal":{"call":call("callback",callback.clone(),"source-op"),"state":{"state":"completed","payload":prepared}},"pending_receipt":null});
+    let stored = json!({"output":output,"admission_id":"source","transition_id":"source-transition","plan":source_plan,"state":"retained","callback_proof":proof});
+    let policy = json!({"owner_provider":"owner","owner_service":"owner/2","method":method("finalize"),"status_method":method("status"),"output_capability":"display","output_schema":schema,"capture_provider":"capture","selector_schema":"selector","required_access":"exclusive","domain_scope":"resource","mutation_domains":[]});
+    let frozen = json!({"target":stream,"parent_generation":1,"transition_id":"transition","input":stored,"policy":policy,"finalize_approval":approval("finalize"),"finalize_status_approval":approval("status"),"schema_documents":[{"reference":schema,"document":document}]});
+    let plan_request = json!({"version":2,"provider_sequence":2,"operation":"resource_finalize_plan","transition_id":"transition","operation_id":"plan-op","target":stream,"phase":"stream.prepare","settings_revision":"one","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":null,"admission_id":null,"approved_plan":null,"dependency_inputs":[output],"control_results":[]});
+    let request: amaterasu_extension_api::ResourceFinalizeRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":"effect","provider_sequence":3,"target":stream,"output":output,"control_results":[],"admission_id":"fresh","permit_id":"permit","remaining_ms":5000})).unwrap();
+    let context = json!({"policy":policy,"output":output,"control_results":[],"target":stream,"transition_id":"transition","parent_generation":1});
+    let effect_call = call(
+        "finalize",
+        serde_json::to_value(&request).unwrap(),
+        "effect",
+    );
+    let status_call = call("status", json!({}), "status-op");
+    let dispatch = json!({"request":request,"context":context,"effect_call":effect_call,"status_selection":status_call,"phase":{"effect":{}},"status_polls":0,"dispatch":null});
+    // Serialize the enum using its actual wire tag instead of assuming a unit representation.
+    let mut dispatch = dispatch;
+    dispatch["phase"] = json!("effect");
+    let owner_plan = json!({"provider":"owner","participant":participant,"request":plan_request,"phase":"plan","plan":final_plan,"admission_id":"fresh","pending_receipt":null,"status_polls":0,"last_sequence":2,"dispatch":null,"terminal_dispatch":null,"response":null});
+    let progress = json!({"inputs":[stored],"selections":[],"controls":[],"finalize":{"selection":frozen,"owner_plan":owner_plan,"dispatch":dispatch}});
+    let work = json!({"composition_progress":progress,"phase":"stream.prepare","target":stream,"intent":"initial","reason":null,"video":null,"transition_id":"transition","providers":[],"index":0,"states":{},"candidate":null,"waiting_retirement":false});
+    let session_record = json!({"host_epoch":epoch,"id":"session","generation":1,"phase":"ready","owner":{"caller":"transport","initiator":"transport"},"delegates":[],"application_ref":{},"settings_revision":"one","application_retired":false,"streams":{"stream":{"generation":1,"phase":"preparing","candidate":null,"required":[],"acknowledgements":[],"retirements":[]}},"admission_ids":["source","fresh"],"admission_targets":{"source":session,"fresh":stream},"admission_phases":{"source":"session.prepare","fresh":"stream.prepare"}});
+    let admission = |plan: Value| json!({"provider":"owner","selection":selection,"plan":plan,"rights":[["domain","Exclusive"]]});
+    let mut journal = coordinator.shared.borrow().value.clone();
+    journal.sessions.insert(
+        "session".into(),
+        serde_json::from_value(session_record).unwrap(),
+    );
+    journal.receipts.insert("work".into(), serde_json::from_value(json!({"caller":"transport","initiator":"transport","request":{},"response":{"status":"pending"},"work":work})).unwrap());
+    journal.composition = serde_json::from_value(
+        json!({"outputs":[stored],"selections":[],"finalize_selections":[frozen],"refinements":[]}),
+    )
+    .unwrap();
+    journal
+        .admission_transitions
+        .insert("source".into(), "source-transition".into());
+    journal
+        .admission_transitions
+        .insert("fresh".into(), "transition".into());
+    journal.authority = serde_json::from_value(json!({"sequences":{"owner":3},"snapshot":{"resources":{"owner":{"output":{"provider":"owner","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domains":["domain"]}}},"domains":{"domain":{"revision":1,"borrowers":{}}}},"admissions":{"fresh":admission(final_plan)},"domain_locks":{"domain":"fresh"},"domain_owners":{"domain":"owner"},"refresh_required":[],"settled":{"source":admission(source_plan)},"finalize_permits":{"permit":{"context":context,"request":request,"consumed":false,"settled":false}}})).unwrap();
+    coordinator
+        .settings
+        .finalize_policies
+        .push(serde_json::from_value(policy).unwrap());
+    coordinator
+        .settings
+        .schema_documents
+        .push(serde_json::from_value(json!({"reference":schema,"document":document})).unwrap());
+    coordinator
+        .settings
+        .participants
+        .push(serde_json::from_value(participant).unwrap());
+    coordinator
+        .selections
+        .insert("owner".into(), serde_json::from_value(selection).unwrap());
+    journal.authority.admissions.remove("fresh");
+    journal.authority.finalize_permits.clear();
+    journal.authority.domain_locks.clear();
+    journal.authority.refresh_required.insert("domain".into());
+    save(&coordinator.shared, journal).unwrap();
+    let mut payload = json!({"operation_id":"refresh", "target":stream, "provider_request":plan_request, "domains":[{"domain":"domain","revision":2,"borrowers":{}}],"resources":[]});
+    payload["provider_request"]["provider_sequence"] = json!(99);
+    assert_eq!(
+        coordinator
+            .refresh_provider_observations("owner", "owner", payload.clone(), "forged".into())
+            .unwrap_err(),
+        "finalize_refresh_mismatch"
+    );
+    payload["provider_request"]["provider_sequence"] = json!(2);
+    assert_eq!(
+        coordinator
+            .refresh_provider_observations("other", "other", payload.clone(), "foreign".into())
+            .unwrap_err(),
+        "provider_not_selected"
+    );
+    assert_eq!(
+        coordinator
+            .refresh_provider_observations("owner", "owner", payload, "exact".into())
+            .unwrap()["status"],
+        "succeeded"
+    );
+    assert_eq!(
+        coordinator.shared.borrow().value.authority.snapshot.domains["domain"].revision,
+        2
+    );
+    let _ = std::fs::remove_dir_all(path);
+}
