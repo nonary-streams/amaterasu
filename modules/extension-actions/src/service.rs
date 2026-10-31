@@ -4,7 +4,7 @@ use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, Runti
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 const STATE: &str = "amaterasu.state/1";
 const COLLECTION: &str = "extension-actions-v1";
@@ -111,7 +111,7 @@ struct Pending {
 
 pub struct ActionsModule {
     runtime: RuntimeClient,
-    pending: Option<Pending>,
+    pending: VecDeque<Pending>,
     policy: Policy,
 }
 impl ManagedModule for ActionsModule {
@@ -128,13 +128,18 @@ impl ManagedModule for ActionsModule {
         })?;
         Ok(Self {
             runtime,
-            pending: None,
+            pending: VecDeque::new(),
             policy,
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
-        if let Some(pending) = self.pending.take() {
-            return self.advance(pending);
+        if let Some(pending) = self.pending.pop_front() {
+            self.advance(pending)?;
+        }
+        // Keep status and cancellation responsive while other requests wait on
+        // broker calls. The broker retains backpressure when this bound is full.
+        if self.pending.len() >= 32 {
+            return Ok(());
         }
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
@@ -229,7 +234,7 @@ impl ActionsModule {
             parent: if descriptor { Some(parent) } else { None },
         })? {
             Response::Accepted { id } => {
-                self.pending = Some(Pending { request: id, stage });
+                self.pending.push_back(Pending { request: id, stage });
                 Ok(())
             }
             _ => self.complete(parent, failure("state_unavailable")),
@@ -240,7 +245,7 @@ impl ActionsModule {
             request: pending.request,
         })? {
             Response::Pending => {
-                self.pending = Some(pending);
+                self.pending.push_back(pending);
                 Ok(())
             }
             Response::Result { payload } => {
@@ -719,11 +724,13 @@ mod tests {
         host.run();
         let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
         host.request(2, "alice", json!({"operation":"close_epoch","epoch":epoch}));
+        host.run();
         host.request(
             3,
             "alice",
             json!({"operation":"retire_epoch","epoch":epoch}),
         );
+        host.run();
         host.request(4, "alice", open);
         host.request(
             5,
