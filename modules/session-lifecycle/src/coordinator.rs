@@ -31,6 +31,7 @@ mod settings_scope;
 mod settings_snapshot;
 #[allow(dead_code)] // Settlement dispatch is gated until composition sequencing is wired.
 mod settlement_dispatch;
+mod stage_backend;
 
 use crate::adapter::LifecycleSettings;
 use crate::prepare_authority::{AuthorityState, ProviderSelection};
@@ -810,6 +811,9 @@ impl Coordinator {
         }
         if operation == "verify_provider_epoch" {
             return self.verify_provider(caller, &payload);
+        }
+        if operation == "verify_finalize_stage" {
+            return self.verify_finalize_stage_operation(caller, &payload);
         }
         if matches!(
             operation,
