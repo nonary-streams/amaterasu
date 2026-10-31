@@ -150,3 +150,85 @@ impl AudioPacket {
         }
     }
 }
+
+/// Exact video-unit selection supplied by trusted session composition.
+#[derive(Clone, Copy)]
+pub(super) struct VideoUnitSelection {
+    pub stream: u64,
+    pub generation: u64,
+    pub offer_id: u64,
+    pub codec: EncoderFormatId,
+    pub framing: EncoderFormatId,
+    pub source_id: u64,
+    pub config_generation: u64,
+    pub clock_epoch: [u8; 16],
+    /// V1 units cannot carry required frame metadata.
+    pub metadata_required: bool,
+}
+
+impl VideoUnitSelection {
+    pub(super) fn valid(&self) -> bool {
+        let valid_id =
+            |id: EncoderFormatId| id.namespace_id != 0 && id.value != 0 && id.schema != 0;
+        self.stream != 0
+            && self.generation != 0
+            && self.offer_id != 0
+            && self.source_id != 0
+            && self.config_generation != 0
+            && self.clock_epoch != [0; 16]
+            && valid_id(self.codec)
+            && valid_id(self.framing)
+            && !self.metadata_required
+    }
+    pub(super) fn accepts(&self, unit: &NegotiatedVideoUnit) -> bool {
+        self.valid()
+            && unit
+                .validate_for(
+                    self.stream,
+                    self.generation,
+                    self.offer_id,
+                    self.codec,
+                    self.framing,
+                )
+                .is_ok()
+            && unit.source_id == self.source_id
+            && unit.config_generation == self.config_generation
+            && unit.clock.epoch_id == self.clock_epoch
+    }
+}
+
+/// Owns the copied unit until transport admission succeeds.
+pub(super) struct VideoUnitPacket {
+    metadata: NegotiatedVideoUnit,
+    bytes: Vec<u8>,
+}
+
+impl VideoUnitPacket {
+    /// # Safety
+    /// The unit and any nonempty byte allocation remain initialized and
+    /// immutable throughout this synchronous copy.
+    pub(super) unsafe fn copy(
+        unit: &NegotiatedVideoUnit,
+        selection: &VideoUnitSelection,
+    ) -> PlaneResult<Self> {
+        if !selection.accepts(unit) {
+            return Err("invalid_negotiated_video_unit");
+        }
+        let bytes = if unit.data.len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: caller guarantees the validated byte allocation lifetime.
+            unsafe { std::slice::from_raw_parts(unit.data.ptr, unit.data.len) }.to_vec()
+        };
+        let mut metadata = *unit;
+        metadata.data = amaterasu_module_sdk::abi::BorrowedBytes::new(&[]);
+        Ok(Self { metadata, bytes })
+    }
+
+    pub(super) fn header(&self) -> NegotiatedVideoUnit {
+        NegotiatedVideoUnit {
+            data: amaterasu_module_sdk::abi::BorrowedBytes::new(&self.bytes),
+            ..self.metadata
+        }
+    }
+}

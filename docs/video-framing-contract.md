@@ -40,9 +40,12 @@ not silently drop required metadata or insert it twice.
 
 These contracts and the runtime provider tests are a foundation only. Two
 runtime-selected synthetic encoder and framer pairs exercise the same internal
-media-transport packetizer and loopback sender; the stream-session pump and production transport service
-are not wired to these tables. No
-extension profile is admitted to a production stream, and there is no claim of
+media-transport packetizer and loopback sender. A separate test drives the
+stream-session pump and native bindings with synthetic unit and transport
+providers after an RTSP offer and acceptance, including a backpressure retry.
+The negotiated pump constructor is private and has no production caller; the
+production video and transport services do not yet register these unit tables.
+No extension profile is admitted to a production stream, and there is no claim of
 PyroWave or Dolby interoperability, GPU support, or actual HDR decoding. A
 production path requires exact negotiated client/profile matching and independent
 encoder, framing and transport support, then an unchanged-consumer provider
