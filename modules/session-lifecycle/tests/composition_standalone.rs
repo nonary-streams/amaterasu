@@ -447,7 +447,8 @@ impl Harness {
                     }
                     other => panic!("stage refresh failed: {other:?}"),
                 }
-            } else if let Some((owner_request, _, provider_request)) = &self.deferred_finalize_plan {
+            } else if let Some((owner_request, _, provider_request)) = &self.deferred_finalize_plan
+            {
                 let payload = json!({"operation":"refresh_provider_observations","operation_id":format!("stage-observe-{}",self.refresh_round),"target":provider_request["target"],"provider_request":provider_request,"domains":[{"domain":"topology","revision":1,"borrowers":{}}],"resources":[{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domains":["topology"]}]});
                 let response = self.broker.borrow_mut().dispatch(
                     "display",
