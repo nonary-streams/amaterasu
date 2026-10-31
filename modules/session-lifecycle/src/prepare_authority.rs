@@ -774,6 +774,12 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             let admission = state
                 .admissions
                 .get(&permit.request.admission_id)
+                .or_else(|| {
+                    permit
+                        .settled
+                        .then(|| state.settled.get(&permit.request.admission_id))
+                        .flatten()
+                })
                 .ok_or("orphaned finalize permit")?;
             if !valid_id(id)
                 || state.control_permits.contains_key(id)
@@ -792,12 +798,26 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
                 return Err("invalid recovered finalize permit".into());
             }
             amaterasu_extension_api::validate_resource_finalize_request(&permit.request)?;
-            validate_finalize_binding(
-                admission,
-                &permit.context,
-                &permit.request,
-                &state.snapshot,
-            )?;
+            if permit.settled {
+                if !state
+                    .output_admissions
+                    .contains(&permit.request.admission_id)
+                    || admission.provider != permit.context.policy.owner_provider
+                    || permit.context.target != permit.request.target
+                    || permit.context.transition_id != permit.request.transition_id
+                    || permit.context.output != permit.request.output
+                    || permit.context.control_results != permit.request.control_results
+                {
+                    return Err("invalid settled finalize permit".into());
+                }
+            } else {
+                validate_finalize_binding(
+                    admission,
+                    &permit.context,
+                    &permit.request,
+                    &state.snapshot,
+                )?;
+            }
         }
         if state.refresh_required.iter().any(|domain| {
             !state.domain_owners.contains_key(domain) || state.domain_locks.contains_key(domain)
@@ -1666,7 +1686,19 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             poisoned: false,
         };
         staged.settle_finalize_permit(request)?;
+        // The result journal and future owner verification require the exact
+        // settled permit even after the active admission has been released.
+        let permit = staged
+            .state
+            .finalize_permits
+            .get(&request.permit_id)
+            .cloned()
+            .ok_or("unknown finalize permit")?;
         staged.finish_admission_with_output(provider, &request.admission_id, resource)?;
+        staged
+            .state
+            .finalize_permits
+            .insert(request.permit_id.clone(), permit);
         self.persist(staged.state)
     }
 
@@ -2425,10 +2457,27 @@ mod tests {
         assert!(
             recovered
                 .state
+                .finalize_permits
+                .get(&request.permit_id)
+                .is_some_and(|permit| permit.consumed
+                    && permit.settled
+                    && permit.request == request)
+        );
+        assert!(
+            recovered
+                .state
                 .output_admissions
                 .contains(&request.admission_id)
         );
         assert!(recovered.state.settled.contains_key(&request.admission_id));
+        assert!(
+            CoordinatorPrepareAuthority::new(
+                recovered.state.clone(),
+                vec![selected],
+                Journal::default()
+            )
+            .is_ok()
+        );
         assert!(
             !recovered
                 .state
