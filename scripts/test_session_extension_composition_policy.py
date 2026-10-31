@@ -39,6 +39,8 @@ class CompositionPolicyTest(unittest.TestCase):
         self.assertEqual([entry["provider"] for entry in result["participants"]], [check.OWNER, check.DISPLAY])
         self.assertEqual(result["participants"][1]["depends_on"], [check.OWNER])
         self.assertTrue(all(entry["contract_version"] == 2 for entry in result["participants"]))
+        for participant in result["participants"]:
+            self.assertEqual(participant["cleanup_methods"], [policy.method_ref(participant["provider"], "lifecycle_callback")])
         self.assertEqual(result["participants"][0]["binding_validate_method"], policy.method_ref(check.OWNER, "binding_validate"))
         self.assertEqual(result["input_actions"], [])
         self.assertEqual(result["action_grants"], [])
