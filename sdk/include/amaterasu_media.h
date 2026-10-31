@@ -644,7 +644,7 @@ typedef struct {
  * invalid. Buffers are borrowed synchronously and BUSY consumes nothing. */
 #define AMATERASU_NEGOTIATED_VIDEO_CONTRACT "amaterasu.video-unit.native/1"
 #define AMATERASU_NEGOTIATED_VIDEO_TRANSPORT_CONTRACT "amaterasu.video-unit-transport.native/1"
-#define AMATERASU_VIDEO_FRAMING_CONTRACT "amaterasu.video-framing.native/1"
+#define AMATERASU_VIDEO_FRAMING_CONTRACT "amaterasu.video-framing.native/2"
 #define AMATERASU_VIDEO_UNIT_VERSION 1u
 #define AMATERASU_VIDEO_UNIT_KEYFRAME 1u
 #define AMATERASU_VIDEO_UNIT_DISCONTINUITY 2u
@@ -653,6 +653,10 @@ typedef struct {
 #define AMATERASU_VIDEO_FRAME_MAX_DATAGRAMS 2048u
 #define AMATERASU_VIDEO_FRAME_RECORD_START 1u
 #define AMATERASU_VIDEO_FRAME_CRITICAL_PREFIX 2u
+#define AMATERASU_VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED 1u
+#define AMATERASU_VIDEO_FRAMING_LIMITS_VERSION 2u
+#define AMATERASU_VIDEO_FRAMING_INTERFACE_MAJOR 2u
+#define AMATERASU_VIDEO_FRAMING_INTERFACE_MINOR 0u
 typedef struct { uint64_t namespace_id, value, schema; } AmaterasuVideoFormatId;
 typedef struct {
     uint32_t size, version;
@@ -684,6 +688,8 @@ typedef struct {
     uint32_t allowed_extensions, max_datagrams, max_queue_bytes;
     uint32_t min_parity_shards, max_fec_percentage;
     uint64_t max_wire_bytes;
+    /* V2 tail; the distinct framing v2 contract is required. */
+    uint32_t min_fec_percentage, max_fec_blocks, fec_policy_flags, reserved;
 } AmaterasuVideoFramingLimits;
 typedef struct {
     uint32_t size, version;

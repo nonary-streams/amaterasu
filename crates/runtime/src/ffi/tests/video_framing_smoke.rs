@@ -124,6 +124,19 @@ fn exercise<P: FramingProvider>(provider_impl: P, marker: u8) {
         let factory = video_framing::Factory::new(provider_impl);
         unsafe { video_framing::register(&provider, SERVICE, &factory) }.unwrap();
         assert!(unsafe { video_framing::bind(&intruder, SERVICE) }.is_err());
+        // A v1 caller cannot bind the distinct v2 framing contract.
+        assert!(
+            unsafe {
+                consumer.bind_native_typed(
+                    SERVICE,
+                    "amaterasu.video-framing.native/1",
+                    1,
+                    0,
+                    size_of::<VideoFramingApi>() as u32,
+                )
+            }
+            .is_err()
+        );
         let binding = unsafe { video_framing::bind(&consumer, SERVICE) }.unwrap();
         let api = unsafe { binding.table::<VideoFramingApi>() }.unwrap();
         let bytes = [10, 20, 30];
@@ -158,7 +171,7 @@ fn exercise<P: FramingProvider>(provider_impl: P, marker: u8) {
         };
         let limits = VideoFramingLimits {
             size: size_of::<VideoFramingLimits>() as u32,
-            version: 1,
+            version: VIDEO_FRAMING_LIMITS_VERSION,
             packet_size: 1024,
             crypto_overhead: 0,
             network_overhead: 28,
@@ -166,7 +179,11 @@ fn exercise<P: FramingProvider>(provider_impl: P, marker: u8) {
             max_datagrams: 8,
             max_queue_bytes: 8192,
             min_parity_shards: 0,
+            min_fec_percentage: 0,
             max_fec_percentage: 0,
+            max_fec_blocks: 1,
+            fec_policy_flags: 0,
+            reserved: 0,
             max_wire_bytes: 8192,
         };
         let mut output = Output {

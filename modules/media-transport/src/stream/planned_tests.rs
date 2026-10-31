@@ -310,7 +310,7 @@ fn exercise<E: EncoderProvider + Default, P: FramingProvider>(
         };
         let limits = VideoFramingLimits {
             size: size_of::<VideoFramingLimits>() as u32,
-            version: 1,
+            version: VIDEO_FRAMING_LIMITS_VERSION,
             packet_size: 1024,
             crypto_overhead: 0,
             network_overhead: 28,
@@ -318,7 +318,11 @@ fn exercise<E: EncoderProvider + Default, P: FramingProvider>(
             max_datagrams: 8,
             max_queue_bytes: 8192,
             min_parity_shards: 0,
+            min_fec_percentage: 0,
             max_fec_percentage: 0,
+            max_fec_blocks: 1,
+            fec_policy_flags: 0,
+            reserved: 0,
             max_wire_bytes: 8192,
         };
         stream
@@ -332,6 +336,7 @@ fn exercise<E: EncoderProvider + Default, P: FramingProvider>(
                 config_generation: 8,
                 clock_epoch: [1; 16],
                 clock_origin_us: host_monotonic_micros().max(1),
+                allow_unprotected_fallback: false,
                 limits,
             })
             .unwrap();

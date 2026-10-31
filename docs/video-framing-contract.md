@@ -2,7 +2,7 @@
 
 The additive `amaterasu.video-unit.native/1`,
 `amaterasu.video-unit-transport.native/1`, and
-`amaterasu.video-framing.native/1` interfaces use full encoder codec and framing
+`amaterasu.video-framing.native/2` interfaces use full encoder codec and framing
 namespace/value/schema triples. They do not change legacy `EncodedPacket`,
 `VideoApi`, or `MediaTransportApi`. A unit carries a selected stream, offer and
 generation, source and configuration generations, access-unit/submission IDs,
@@ -18,8 +18,16 @@ The consumer must independently validate it against trusted negotiated limits;
 structural validity and a signed capability are not proof of compatibility.
 `VideoFramePlan::validate` checks packet/crypto/network overhead, data-shard
 coverage, parity math and 255-shard protected blocks, 1023-shard unprotected
-blocks, FEC work and configured queue/wire caps. It computes a conservative
-reservation before the owner mutates frame index, packet sequence or nonce.
+blocks, FEC work and configured queue/wire caps. Every protected block must
+meet the trusted host's selected minimum FEC percentage and shard count. Zero
+parity is rejected unless the host separately authorizes fallback and the
+whole frame is too large for protected blocks within the negotiated block limit;
+then all blocks must be unprotected. The packetizer and transport independently
+match the supplied minimum percentage, minimum shard count and block limit to
+the host's configured values. The validator computes a conservative reservation
+before the owner mutates frame index, packet sequence or nonce. Framing v2 is
+a separate typed interface: its limits v2 tail preserves the v1 prefix offsets,
+but a v1 provider cannot be bound as v2 or bypass the policy checks.
 The framer owns neither sockets nor encryption; the transport remains responsible
 for packetization, security, delivery, fairness, cancellation and retirement.
 

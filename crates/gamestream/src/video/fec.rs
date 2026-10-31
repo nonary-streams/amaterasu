@@ -127,8 +127,10 @@ impl VideoPacketizer {
         latency: u16,
     ) -> Result<Vec<Vec<u8>>, VideoError> {
         if limits.packet_size as usize != self.config.packet_size
-            || limits.min_parity_shards < u32::from(self.config.min_parity_shards)
-            || plan.block_count > u32::from(self.config.max_fec_blocks)
+            || limits.min_parity_shards != u32::from(self.config.min_parity_shards)
+            || limits.min_fec_percentage != u32::from(self.config.fec_percentage)
+            || limits.max_fec_blocks != u32::from(self.config.max_fec_blocks)
+            || plan.block_count > limits.max_fec_blocks
         {
             return Err(VideoError::InvalidPlan);
         }

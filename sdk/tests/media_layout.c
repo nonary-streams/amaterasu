@@ -109,6 +109,8 @@ _Static_assert(sizeof(AmaterasuNegotiatedVideoApi) == 40, "video unit table layo
 _Static_assert(sizeof(AmaterasuNegotiatedVideoTransportApi) == 48, "video transport table layout");
 _Static_assert(sizeof(AmaterasuVideoFramingApi) == 40, "video framing table layout");
 _Static_assert(sizeof(AmaterasuVideoFecBlock) == 16, "video FEC plan block layout");
-_Static_assert(sizeof(AmaterasuVideoFramingLimits) == 48, "video framing limits layout");
+_Static_assert(sizeof(AmaterasuVideoFramingLimits) == 64, "video framing limits layout");
+_Static_assert(offsetof(AmaterasuVideoFramingLimits, max_wire_bytes) == 40, "video limits v1 prefix");
+_Static_assert(offsetof(AmaterasuVideoFramingLimits, min_fec_percentage) == 48, "video limits v2 tail");
 _Static_assert(sizeof(AmaterasuVideoFramePlan) == 112, "video frame plan layout");
 #endif

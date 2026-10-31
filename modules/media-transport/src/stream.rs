@@ -59,6 +59,8 @@ pub struct PlannedVideoSelection {
     pub config_generation: u64,
     pub clock_epoch: [u8; 16],
     pub clock_origin_us: u64,
+    /// Independently authorized by trusted host policy, not a provider claim.
+    pub allow_unprotected_fallback: bool,
     pub limits: VideoFramingLimits,
 }
 
@@ -440,13 +442,17 @@ impl Stream {
             || selection.clock_epoch == [0; 16]
             || selection.clock_origin_us == 0
             || limits.size as usize != size_of::<VideoFramingLimits>()
-            || limits.version != 1
+            || limits.version != VIDEO_FRAMING_LIMITS_VERSION
             || limits.packet_size as usize != self.video_settings.packet_size
             || limits.crypto_overhead != expected_crypto
             || limits.network_overhead < min_network
             || limits.max_datagrams as usize > MAX_DATAGRAMS
             || limits.max_queue_bytes as usize > MAX_QUEUE_BYTES
-            || limits.min_parity_shards < u32::from(self.video_settings.min_parity_shards)
+            || limits.min_parity_shards != u32::from(self.video_settings.min_parity_shards)
+            || limits.min_fec_percentage != u32::from(self.video_settings.fec_percentage)
+            || limits.max_fec_blocks != u32::from(self.video_settings.max_fec_blocks)
+            || (limits.fec_policy_flags & VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED != 0
+                && !selection.allow_unprotected_fallback)
         {
             return Err("invalid_planned_video_selection");
         }

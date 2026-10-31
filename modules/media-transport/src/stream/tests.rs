@@ -964,7 +964,7 @@ fn planned_video_is_checked_before_actual_udp_delivery() {
     };
     let limits = VideoFramingLimits {
         size: size_of::<VideoFramingLimits>() as u32,
-        version: 1,
+        version: VIDEO_FRAMING_LIMITS_VERSION,
         packet_size: 1024,
         crypto_overhead: 0,
         network_overhead: 28,
@@ -972,7 +972,11 @@ fn planned_video_is_checked_before_actual_udp_delivery() {
         max_datagrams: 64,
         max_queue_bytes: 64 * 1024,
         min_parity_shards: 0,
+        min_fec_percentage: 0,
         max_fec_percentage: 0,
+        max_fec_blocks: 4,
+        fec_policy_flags: 0,
+        reserved: 0,
         max_wire_bytes: 64 * 1024,
     };
     let selection = PlannedVideoSelection {
@@ -985,6 +989,7 @@ fn planned_video_is_checked_before_actual_udp_delivery() {
         config_generation: 8,
         clock_epoch: [1; 16],
         clock_origin_us: host_monotonic_micros().max(1),
+        allow_unprotected_fallback: false,
         limits,
     };
     stream.configure_planned_video(selection).unwrap();
@@ -1072,4 +1077,62 @@ fn planned_video_is_checked_before_actual_udp_delivery() {
     );
     assert_eq!(stream.next_frame_index, Some(2));
     assert_eq!(stream.video_sequence, Some(1));
+}
+
+#[test]
+fn planned_selection_cannot_override_host_fec_or_authorize_fallback() {
+    let (video, audio) = receivers();
+    let mut request = request(&video, &audio, false);
+    request.video.fec_percentage = 20;
+    request.video.min_parity_shards = 2;
+    request.video.max_fec_blocks = 4;
+    let mut stream = Stream::open("owner", &request).unwrap();
+    let id = EncoderFormatId {
+        namespace_id: 42,
+        value: 3,
+        schema: 1,
+    };
+    let limits = VideoFramingLimits {
+        size: size_of::<VideoFramingLimits>() as u32,
+        version: VIDEO_FRAMING_LIMITS_VERSION,
+        packet_size: 1024,
+        crypto_overhead: 0,
+        network_overhead: 28,
+        allowed_extensions: 0,
+        max_datagrams: 64,
+        max_queue_bytes: 64 * 1024,
+        min_parity_shards: 2,
+        min_fec_percentage: 20,
+        max_fec_percentage: 255,
+        max_fec_blocks: 4,
+        fec_policy_flags: 0,
+        reserved: 0,
+        max_wire_bytes: 64 * 1024,
+    };
+    let selection = PlannedVideoSelection {
+        stream: 5,
+        generation: 7,
+        offer_id: 9,
+        codec: id,
+        framing: id,
+        source_id: 6,
+        config_generation: 8,
+        clock_epoch: [1; 16],
+        clock_origin_us: host_monotonic_micros().max(1),
+        allow_unprotected_fallback: false,
+        limits,
+    };
+    let mut wrong = selection;
+    wrong.limits.min_fec_percentage = 0;
+    wrong.limits.min_parity_shards = 0;
+    assert!(stream.configure_planned_video(wrong).is_err());
+    wrong = selection;
+    wrong.limits.max_fec_blocks = 1;
+    assert!(stream.configure_planned_video(wrong).is_err());
+    wrong = selection;
+    wrong.limits.fec_policy_flags = VIDEO_FRAME_ALLOW_LARGE_UNPROTECTED;
+    assert!(stream.configure_planned_video(wrong).is_err());
+    stream.configure_planned_video(selection).unwrap();
+    assert_eq!(stream.next_frame_index, Some(1));
+    assert_eq!(stream.delivery.queued(), 0);
 }

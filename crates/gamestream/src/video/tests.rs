@@ -545,13 +545,13 @@ fn host_processing_latency_fills_frame_header_bytes_one_and_two() {
 fn external_plan_generates_bounded_fec_and_preserves_indices_on_rejection() {
     use amaterasu_abi::BorrowedBytes;
     use amaterasu_media::{
-        VIDEO_FRAME_CRITICAL_PREFIX, VIDEO_FRAME_RECORD_START, VideoFecBlock, VideoFramePlan,
-        VideoFramingLimits,
+        VIDEO_FRAME_CRITICAL_PREFIX, VIDEO_FRAME_RECORD_START, VIDEO_FRAMING_LIMITS_VERSION,
+        VideoFecBlock, VideoFramePlan, VideoFramingLimits,
     };
     let mut packetizer = VideoPacketizer::new(VideoConfig {
         packet_size: 1024,
-        fec_percentage: 0,
-        min_parity_shards: 0,
+        fec_percentage: 50,
+        min_parity_shards: 1,
         max_fec_blocks: 4,
         encrypted: false,
     })
@@ -576,7 +576,7 @@ fn external_plan_generates_bounded_fec_and_preserves_indices_on_rejection() {
     };
     let mut limits = VideoFramingLimits {
         size: size_of::<VideoFramingLimits>() as u32,
-        version: 1,
+        version: VIDEO_FRAMING_LIMITS_VERSION,
         packet_size: 1024,
         crypto_overhead: 32,
         network_overhead: 28,
@@ -584,7 +584,11 @@ fn external_plan_generates_bounded_fec_and_preserves_indices_on_rejection() {
         max_datagrams: 16,
         max_queue_bytes: 10_000,
         min_parity_shards: 1,
+        min_fec_percentage: 50,
         max_fec_percentage: 100,
+        max_fec_blocks: 4,
+        fec_policy_flags: 0,
+        reserved: 0,
         max_wire_bytes: 10_000,
     };
     limits.max_datagrams = 2;
@@ -612,4 +616,75 @@ fn external_plan_generates_bounded_fec_and_preserves_indices_on_rejection() {
     let next =
         unsafe { packetizer.packetize_external_plan(&plan, &limits, true, 2, 180000, 0) }.unwrap();
     assert_eq!(&next[0][2..4], &[0, 3]);
+}
+
+#[test]
+fn external_provider_cannot_downgrade_negotiated_fec_policy() {
+    use amaterasu_abi::BorrowedBytes;
+    use amaterasu_media::{
+        VIDEO_FRAMING_LIMITS_VERSION, VideoFecBlock, VideoFramePlan, VideoFramingLimits,
+    };
+    let mut packetizer = VideoPacketizer::new(VideoConfig {
+        packet_size: 1024,
+        fec_percentage: 20,
+        min_parity_shards: 2,
+        max_fec_blocks: 4,
+        encrypted: false,
+    })
+    .unwrap();
+    let bytes = vec![1; 9 * 1008 - 7];
+    let mut blocks = [VideoFecBlock::default(); 4];
+    blocks[0] = VideoFecBlock {
+        first_data_shard: 0,
+        data_shards: 10,
+        parity_shards: 0,
+        percentage: 0,
+    };
+    let mut plan = VideoFramePlan {
+        size: size_of::<VideoFramePlan>() as u32,
+        version: 1,
+        framed_bytes: BorrowedBytes::new(&bytes),
+        record_starts: BorrowedBytes::new(&[]),
+        critical_prefix_shards: 0,
+        block_count: 1,
+        blocks,
+    };
+    let mut limits = VideoFramingLimits {
+        size: size_of::<VideoFramingLimits>() as u32,
+        version: VIDEO_FRAMING_LIMITS_VERSION,
+        packet_size: 1024,
+        crypto_overhead: 0,
+        network_overhead: 28,
+        allowed_extensions: 0,
+        max_datagrams: 128,
+        max_queue_bytes: 256 * 1024,
+        min_parity_shards: 0,
+        min_fec_percentage: 0,
+        max_fec_percentage: 255,
+        max_fec_blocks: 4,
+        fec_policy_flags: 0,
+        reserved: 0,
+        max_wire_bytes: 256 * 1024,
+    };
+    assert!(matches!(
+        unsafe { packetizer.packetize_external_plan(&plan, &limits, true, 1, 0, 0) },
+        Err(VideoError::InvalidPlan)
+    ));
+    limits.min_parity_shards = 2;
+    limits.min_fec_percentage = 20;
+    assert!(matches!(
+        unsafe { packetizer.packetize_external_plan(&plan, &limits, true, 1, 0, 0) },
+        Err(VideoError::InvalidPlan)
+    ));
+    plan.blocks[0].percentage = 15;
+    plan.blocks[0].parity_shards = 2;
+    assert!(matches!(
+        unsafe { packetizer.packetize_external_plan(&plan, &limits, true, 1, 0, 0) },
+        Err(VideoError::InvalidPlan)
+    ));
+    plan.blocks[0].percentage = 20;
+    let packets =
+        unsafe { packetizer.packetize_external_plan(&plan, &limits, true, 1, 0, 0) }.unwrap();
+    assert_eq!(&packets[0][2..4], &[0, 0]);
+    assert_eq!(packets.len(), 12);
 }

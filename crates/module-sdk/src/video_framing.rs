@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-pub const FRAMING_CONTRACT: &str = "amaterasu.video-framing.native/1";
+pub const FRAMING_CONTRACT: &str = "amaterasu.video-framing.native/2";
 pub const VIDEO_UNIT_CONTRACT: &str = "amaterasu.video-unit.native/1";
 pub const VIDEO_TRANSPORT_CONTRACT: &str = "amaterasu.video-unit-transport.native/1";
 
@@ -81,8 +81,8 @@ unsafe extern "C" fn bind_factory<P: FramingProvider>(
             None => return STATUS_INVALID_ARGUMENT,
         };
         if !query.header.supports::<NativeInterfaceQuery>()
-            || query.interface_major != 1
-            || query.min_minor > 0
+            || query.interface_major != VIDEO_FRAMING_INTERFACE_MAJOR
+            || query.min_minor > VIDEO_FRAMING_INTERFACE_MINOR
             || query.min_size as usize > size_of::<VideoFramingApi>()
         {
             return STATUS_INVALID_ARGUMENT;
@@ -92,7 +92,11 @@ unsafe extern "C" fn bind_factory<P: FramingProvider>(
         let mut binding = Box::new(Binding {
             api: VideoFramingApi {
                 base: NativeInterface {
-                    header: AbiHeader::of::<VideoFramingApi>(),
+                    header: AbiHeader {
+                        size: size_of::<VideoFramingApi>() as u32,
+                        major: VIDEO_FRAMING_INTERFACE_MAJOR,
+                        minor: VIDEO_FRAMING_INTERFACE_MINOR,
+                    },
                     context: std::ptr::null_mut(),
                     release: Some(release::<P>),
                 },
@@ -191,8 +195,8 @@ pub unsafe fn bind(runtime: &RuntimeClient, service: &str) -> ModuleResult<Nativ
         runtime.bind_native_typed(
             service,
             FRAMING_CONTRACT,
-            1,
-            0,
+            VIDEO_FRAMING_INTERFACE_MAJOR,
+            VIDEO_FRAMING_INTERFACE_MINOR,
             size_of::<VideoFramingApi>() as u32,
         )
     }
