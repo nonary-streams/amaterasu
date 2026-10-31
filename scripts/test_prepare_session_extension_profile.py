@@ -49,6 +49,8 @@ class ProfileActionPolicyTest(unittest.TestCase):
                         copy.deepcopy(self.approvals), self.component)
         self.assertEqual(default_bootstrap["policy"]["settings"][profile.ACTIONS]["grants"], [])
         self.assertEqual(default_bootstrap["policy"]["settings"][profile.LIFECYCLE]["input_actions"], [])
+        self.assertNotIn("amaterasu.virtual-display/1",
+                         default_bootstrap["policy"]["principals"][profile.ACTIONS]["call"])
         bootstrap = copy.deepcopy(self.bootstrap)
         profile.prepare(bootstrap, self.root, self.descriptor, "digest", copy.deepcopy(self.approvals),
                         self.component, True)
@@ -56,6 +58,9 @@ class ProfileActionPolicyTest(unittest.TestCase):
         self.assertEqual(settings[profile.LIFECYCLE]["input_actions"], [action_id])
         self.assertIn(profile.LIFECYCLE_SERVICE,
                       bootstrap["policy"]["principals"][profile.LIFECYCLE]["call"])
+        for identity in (profile.ACTIONS, profile.MANAGEMENT, profile.INPUT, profile.STREAM):
+            self.assertIn("amaterasu.virtual-display/1",
+                          bootstrap["policy"]["principals"][identity]["call"])
         descriptor_policy = settings[profile.REGISTRY]["descriptors"][0]
         self.assertTrue(any(grant["caller"] == profile.ACTIONS and grant["read"]
                             for grant in descriptor_policy["grants"]))

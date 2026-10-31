@@ -100,6 +100,10 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
         REGISTRY: [LIFECYCLE_SERVICE, STATE, PROVIDER_SERVICE],
         ACTIONS: [LIFECYCLE_SERVICE, REGISTRY_SERVICE, STATE, PROVIDER_SERVICE],
     })
+    if enable_display_actions:
+        # Action planning and execution may delegate to the selected display provider.
+        for identity in (ACTIONS, MANAGEMENT, INPUT, STREAM):
+            calls[identity].append("amaterasu.virtual-display/1")
     for identity, services in calls.items():
         principal = principals[identity]
         principal["call"] = sorted(set(principal.get("call", [])) | set(services))
