@@ -492,6 +492,7 @@ impl Dispatch {
                 transition_id,
                 plan,
                 digest,
+                old_permit,
                 ..
             } => {
                 if status != "succeeded"
@@ -508,7 +509,7 @@ impl Dispatch {
                 let permit = reply
                     .get("permit_id")
                     .and_then(Value::as_str)
-                    .filter(|p| !p.is_empty() && p.len() <= 256)
+                    .filter(|p| !p.is_empty() && p.len() <= 256 && *p != old_permit)
                     .ok_or("invalid_reply")?
                     .to_owned();
                 self.stage = Stage::ReadyToExecute {
@@ -866,6 +867,7 @@ mod tests {
         let serialized = serde_json::to_vec(&operation).unwrap();
         operation = serde_json::from_slice(&serialized).unwrap();
         assert!(operation.accept_reply(json!({"status":"succeeded","operation_id":"e:1","transition_id":"wrong","target":target_json,"plan_digest":digest,"permit_id":"new-permit"})).is_err());
+        assert!(operation.accept_reply(json!({"status":"succeeded","operation_id":"e:1","transition_id":"transition","target":target_json,"plan_digest":digest,"permit_id":"old-permit"})).is_err());
         assert!(operation.begin_effect().is_err());
         operation.accept_reply(json!({"status":"succeeded","operation_id":"e:1","transition_id":"transition","target":target_json,"plan_digest":digest,"permit_id":"new-permit"})).unwrap();
         assert!(
