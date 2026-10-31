@@ -864,6 +864,14 @@ mod tests {
     fn dependent_cleanup_requires_persisted_replan_and_exact_rebind() {
         let mut operation = fixture();
         operation.descriptor.execution = ExecutionClass::SessionMutation;
+        operation.descriptor.allowed_targets = vec![TargetKind::Stream];
+        operation.request.target = ActionTarget::Stream {
+            host_epoch: "h".into(),
+            session_id: "s".into(),
+            stream_id: "stream".into(),
+            expected_generation: 7,
+        };
+        operation.request.input_reservation_id = Some("keyboard-reservation".into());
         operation.accept_plan(sample_plan()).unwrap();
         let Stage::AwaitingPermit { digest, .. } = &operation.stage else {
             panic!()
@@ -877,8 +885,23 @@ mod tests {
         operation
             .confirm_consume("e:1", &target, &old_digest, "old-permit")
             .unwrap();
+        let Some(amaterasu_module_sdk::Command::Request { payload, .. }) =
+            operation.broker_call().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(payload["target"], target_json);
+        assert_eq!(payload["input_reservation_id"], "keyboard-reservation");
         operation.accept_reply(json!({"status":"replan_required","operation_id":"e:1","target":target_json,"plan_digest":old_digest,"transition_id":"transition"})).unwrap();
         assert!(operation.begin_effect().is_err());
+        let Some(amaterasu_module_sdk::Command::CallApi { payload, .. }) =
+            operation.broker_call().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(payload["target"], target_json);
+        assert_eq!(payload["operation_id"], "e:1");
+        assert_eq!(payload["action_id"], "example/action");
         let mut new_plan = sample_plan();
         new_plan["revision"] = json!(2);
         new_plan["control_proposals"] = json!([]);
