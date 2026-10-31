@@ -93,6 +93,48 @@ fn record_admission(
     Ok(())
 }
 
+fn cleanup_admission_matches(
+    journal: &Journal,
+    session: &SessionRecord,
+    admission_id: &str,
+    target: &LifecycleTarget,
+    phase: &LifecyclePhase,
+) -> ModuleResult<bool> {
+    let old_target = session
+        .admission_targets
+        .get(admission_id)
+        .ok_or("admission_target_missing")?;
+    let old_phase = session
+        .admission_phases
+        .get(admission_id)
+        .ok_or("admission_phase_missing")?;
+    if !journal
+        .admission_transitions
+        .get(admission_id)
+        .is_some_and(|id| valid_id(id))
+    {
+        return Err("admission_transition_missing".into());
+    }
+    if old_target != target {
+        return Ok(false);
+    }
+    let expected = match phase {
+        LifecyclePhase::StreamRelease => matches!(
+            old_phase,
+            LifecyclePhase::StreamPrepare | LifecyclePhase::StreamRelease
+        ),
+        LifecyclePhase::SessionRelease => matches!(
+            old_phase,
+            LifecyclePhase::SessionPrepare | LifecyclePhase::SessionRelease
+        ),
+        _ => false,
+    };
+    if !expected {
+        return Err("admission_phase_mismatch".into());
+    }
+    Ok(true)
+}
+
 struct ActionAdmissionWriter {
     shared: Shared,
     key: String,
@@ -638,6 +680,26 @@ impl Coordinator {
                         if admission.provider != *provider || !owned.contains(&id) {
                             continue;
                         }
+                        let eligible = {
+                            let journal = self.shared.borrow();
+                            let (_, session_id, _, _) =
+                                super::operations::target_parts(&work.target)?;
+                            cleanup_admission_matches(
+                                &journal.value,
+                                &journal.value.sessions[session_id],
+                                &id,
+                                &work.target,
+                                &work.phase,
+                            )
+                        };
+                        match eligible {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(_) => {
+                                composition_cleanup_blocked = true;
+                                continue;
+                            }
+                        }
                         let matched: Vec<_> = outcomes
                             .iter()
                             .filter(|outcome| {
@@ -1022,6 +1084,15 @@ impl Coordinator {
                 }
             }
             LifecyclePhase::SessionRelease => {
+                if !deferred
+                    && session.admission_ids.iter().any(|admission| {
+                        next.authority.admissions.contains_key(admission)
+                            || next.authority.settled.contains_key(admission)
+                            || next.composition.references_admission(admission)
+                    })
+                {
+                    return Err("session_cleanup_obligations_unresolved".into());
+                }
                 session.phase = if deferred {
                     SessionPhase::Retired
                 } else {
@@ -1341,6 +1412,36 @@ mod admission_target_tests {
             stream_id: "stream".into(),
             generation: 8,
         };
+        assert!(
+            cleanup_admission_matches(
+                &journal,
+                &journal.sessions["first"],
+                "admission",
+                &target,
+                &LifecyclePhase::StreamRelease
+            )
+            .unwrap()
+        );
+        assert!(
+            !cleanup_admission_matches(
+                &journal,
+                &journal.sessions["first"],
+                "admission",
+                &changed,
+                &LifecyclePhase::StreamRelease
+            )
+            .unwrap()
+        );
+        assert!(
+            cleanup_admission_matches(
+                &legacy,
+                &legacy.sessions["first"],
+                "admission",
+                &target,
+                &LifecyclePhase::StreamRelease
+            )
+            .is_err()
+        );
         assert!(
             record_admission(
                 &mut journal,
