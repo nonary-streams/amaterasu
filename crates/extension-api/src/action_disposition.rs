@@ -1,6 +1,6 @@
 //! Typed action resource disposition. Serialized references identify resources;
 //! they are not authority and never replace authenticated dispatch evidence.
-use crate::{LifecycleTarget, ResourceRef};
+use crate::{CleanupOutcome, CleanupState, LifecycleTarget, ResourceRef};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -18,6 +18,9 @@ pub struct ActionResourceDispositionPlan {
     pub resource: ResourceRef,
     pub origin: LifecycleTarget,
     pub intent: ActionResourceDispositionIntent,
+    /// IDs nominated from the coordinator-authenticated original owner plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cleanup_obligation_ids: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +37,9 @@ pub struct ActionResourceDispositionResult {
     pub resource: ResourceRef,
     pub origin: LifecycleTarget,
     pub state: ActionResourceDispositionState,
+    /// Only explicit Released outcomes can establish completed cleanup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cleanup_outcomes: Vec<CleanupOutcome>,
 }
 /// Exact completed owner payload. The receipt is opaque recovery data, not proof.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -109,6 +115,15 @@ pub fn validate_action_disposition_plan(
         || plan.resource_generation == 0
         || !valid_resource(&plan.resource)
         || !valid_origin(&plan.origin)
+        || plan.cleanup_obligation_ids.len() > 128
+        || plan
+            .cleanup_obligation_ids
+            .iter()
+            .any(|id| !crate::valid_opaque_id(id))
+        || plan
+            .cleanup_obligation_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
     {
         return Err("invalid action disposition plan".into());
     }
@@ -136,6 +151,24 @@ pub fn validate_action_disposition_result(
     {
         return Err("action disposition changed selected resource".into());
     }
+    let mut seen = BTreeSet::new();
+    if result.cleanup_outcomes.len() > 128
+        || result.cleanup_outcomes.iter().any(|outcome| {
+            (outcome.state == CleanupState::Released
+                && result.state != ActionResourceDispositionState::Released)
+                || !seen.insert(&outcome.obligation_id)
+                || plan
+                    .cleanup_obligation_ids
+                    .binary_search(&outcome.obligation_id)
+                    .is_err()
+                || outcome
+                    .reason
+                    .as_ref()
+                    .is_some_and(|reason| reason.len() > 4096)
+        })
+    {
+        return Err("invalid action cleanup outcomes".into());
+    }
     Ok(())
 }
 
@@ -155,7 +188,11 @@ pub fn validate_action_provider_completed(
     match (plan, completed.resource_disposition.as_ref()) {
         (Some(plan), Some(result)) => {
             validate_action_disposition_result(plan, result)?;
-            if result.state == ActionResourceDispositionState::Released
+            if (result.state == ActionResourceDispositionState::Released
+                || result
+                    .cleanup_outcomes
+                    .iter()
+                    .any(|outcome| outcome.state == CleanupState::Released))
                 && completed.status != ActionProviderCompletionStatus::Succeeded
             {
                 return Err("released disposition requires successful completion".into());
@@ -224,6 +261,67 @@ mod tests {
         assert_eq!(
             serde_json::to_value(completed).unwrap()["resource_disposition"]["state"],
             "released"
+        );
+    }
+    #[test]
+    fn cleanup_evidence_must_be_bounded_ordered_and_planned() {
+        let (mut plan, mut result) = fixtures();
+        let disposition = plan.resource_disposition.as_mut().unwrap();
+        disposition.cleanup_obligation_ids = vec!["a".into(), "b".into()];
+        result.cleanup_outcomes = vec![
+            CleanupOutcome {
+                obligation_id: "a".into(),
+                state: CleanupState::Released,
+                reason: None,
+            },
+            CleanupOutcome {
+                obligation_id: "b".into(),
+                state: CleanupState::DeferredRestoration,
+                reason: Some("later".into()),
+            },
+        ];
+        assert!(validate_action_disposition_result(disposition, &result).is_ok());
+        let completed = ActionProviderCompleted {
+            status: ActionProviderCompletionStatus::Failed,
+            receipt: json!({}),
+            cleanup_complete: None,
+            resource_disposition: Some(result.clone()),
+        };
+        assert!(validate_action_provider_completed(Some(disposition), &completed).is_err());
+        result.cleanup_outcomes[0].reason = Some("x".repeat(4097));
+        assert!(validate_action_disposition_result(disposition, &result).is_err());
+        result.cleanup_outcomes[0].reason = None;
+        result
+            .cleanup_outcomes
+            .push(result.cleanup_outcomes[0].clone());
+        assert!(validate_action_disposition_result(disposition, &result).is_err());
+        result.cleanup_outcomes.pop();
+        result.cleanup_outcomes[0].obligation_id = "foreign".into();
+        assert!(validate_action_disposition_result(disposition, &result).is_err());
+        result.cleanup_outcomes[0].obligation_id = "a".into();
+        result.state = ActionResourceDispositionState::Retained;
+        assert!(validate_action_disposition_result(disposition, &result).is_err());
+        result.cleanup_outcomes[0].state = CleanupState::Pending;
+        assert!(validate_action_disposition_result(disposition, &result).is_ok());
+        disposition.cleanup_obligation_ids = vec!["b".into(), "a".into()];
+        assert!(validate_action_disposition_plan(disposition).is_err());
+        disposition.cleanup_obligation_ids = vec!["a".into(), "a".into()];
+        assert!(validate_action_disposition_plan(disposition).is_err());
+        disposition.cleanup_obligation_ids = (0..129).map(|id| format!("{id:03}")).collect();
+        assert!(validate_action_disposition_plan(disposition).is_err());
+        let (legacy, result) = fixtures();
+        let disposition = legacy.resource_disposition.as_ref().unwrap();
+        assert!(
+            serde_json::to_value(disposition)
+                .unwrap()
+                .get("cleanup_obligation_ids")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(result)
+                .unwrap()
+                .get("cleanup_outcomes")
+                .is_none()
         );
     }
     #[test]
