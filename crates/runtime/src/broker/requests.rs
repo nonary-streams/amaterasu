@@ -69,6 +69,24 @@ impl RequestRouter {
         Ok(&parent.authority.initiator)
     }
 
+    pub fn discovery_authority(
+        &self,
+        caller: &str,
+        parent_id: u64,
+    ) -> Result<(String, BTreeSet<String>), Response> {
+        let parent = self
+            .requests
+            .get(&parent_id)
+            .ok_or_else(permission_denied)?;
+        if parent.provider != caller || !parent.delivered || parent.result.is_some() {
+            return Err(permission_denied());
+        }
+        Ok((
+            parent.authority.initiator.clone(),
+            parent.authority.allowed_services.clone(),
+        ))
+    }
+
     pub fn register_service(&mut self, caller: &str, grants: &Grants, service: String) -> Response {
         if !grants.provide.contains(&service) {
             return permission_denied();

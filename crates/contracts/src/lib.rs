@@ -293,6 +293,37 @@ pub enum Command {
     HookResult {
         invocation: u64,
     },
+    /// Idempotent, owner-scoped invocation with retained results.
+    RunHookOperation {
+        hook: String,
+        payload: Value,
+        operation_id: String,
+        cleanup: bool,
+    },
+    ListApiApprovals {
+        parent: Option<u64>,
+        after: Option<ApiApprovalCursor>,
+        limit: u16,
+    },
+    LookupHook {
+        operation_id: String,
+    },
+    CancelHook {
+        invocation: u64,
+    },
+    ReleaseHook {
+        invocation: u64,
+    },
+}
+
+/// Exclusive, stable ordering key for approved API discovery.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApiApprovalCursor {
+    pub revision: u64,
+    pub service: String,
+    pub method: String,
+    pub interface_major: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -334,6 +365,15 @@ pub enum Response {
     HookResult {
         proposals: Vec<Proposal>,
     },
+    /// Each cleanup participant is attempted in configured order until the deadline.
+    ApiApprovals {
+        revision: u64,
+        approvals: Vec<ApiMethodApproval>,
+        next: Option<ApiApprovalCursor>,
+    },
+    HookCleanupResult {
+        outcomes: Vec<HookOutcome>,
+    },
     /// Returned only to the reserved host control endpoint.
     HostLifecycle {
         action: Option<HostLifecycleAction>,
@@ -359,6 +399,12 @@ pub enum HostLogEvent {
         log_path: String,
     },
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HookOutcome {
+    pub participant: String,
+    pub result: Box<Response>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proposal {
     pub participant: String,

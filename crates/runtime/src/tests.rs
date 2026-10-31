@@ -1673,3 +1673,308 @@ fn provider_can_check_only_delivered_active_requests() {
         "request_ended",
     );
 }
+
+#[test]
+fn hook_operation_lookup_cancel_and_expired_identity_are_owner_scoped() {
+    let mut broker = test_broker();
+    broker.dispatch(
+        "provider",
+        Command::RegisterHook {
+            hook: "prepare/1".into(),
+        },
+    );
+    let start = Instant::now();
+    let operation = || Command::RunHookOperation {
+        hook: "prepare/1".into(),
+        payload: json!({"x":1}),
+        operation_id: "op.1".into(),
+        cleanup: false,
+    };
+    let id = accepted_id(broker.dispatch_at("client", operation(), start));
+    assert_eq!(
+        accepted_id(broker.dispatch_at("client", operation(), start)),
+        id
+    );
+    assert_error_code(
+        broker.dispatch(
+            "client",
+            Command::RunHookOperation {
+                hook: "prepare/1".into(),
+                payload: json!({"x":2}),
+                operation_id: "op.1".into(),
+                cleanup: false,
+            },
+        ),
+        "conflict",
+    );
+    assert_error_code(
+        broker.dispatch(
+            "outsider",
+            Command::LookupHook {
+                operation_id: "op.1".into(),
+            },
+        ),
+        "not_found",
+    );
+    assert!(matches!(
+        broker.dispatch_at("client", Command::HookResult { invocation: id }, start),
+        Response::Pending
+    ));
+    let Response::Request { id: request, .. } =
+        broker.dispatch_at("provider", Command::Poll {}, start)
+    else {
+        panic!()
+    };
+    assert_error_code(
+        broker.dispatch_at("outsider", Command::CancelHook { invocation: id }, start),
+        "permission_denied",
+    );
+    assert!(matches!(
+        broker.dispatch_at("client", Command::CancelHook { invocation: id }, start),
+        Response::Ok
+    ));
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::Complete {
+                request,
+                payload: json!({}),
+            },
+            start,
+        ),
+        "not_found",
+    );
+    assert_error_code(
+        broker.dispatch_at("client", Command::HookResult { invocation: id }, start),
+        "cancelled",
+    );
+    assert!(matches!(
+        broker.dispatch_at("client", Command::ReleaseHook { invocation: id }, start),
+        Response::Ok
+    ));
+    assert_error_code(
+        broker.dispatch_at("client", operation(), start),
+        "operation_expired",
+    );
+}
+
+#[test]
+fn cleanup_hook_continues_after_absent_participant() {
+    let mut config = RuntimeConfig::default();
+    config.principals.insert("client".into(), Grants::default());
+    for participant in ["missing", "provider"] {
+        config.principals.insert(
+            participant.into(),
+            Grants {
+                hook: names(&["release/1"]),
+                ..Default::default()
+            },
+        );
+    }
+    config.hooks.insert(
+        "release/1".into(),
+        HookSpec {
+            owner: "client".into(),
+            participants: vec!["missing".into(), "provider".into()],
+            timeout_ms: 1000,
+        },
+    );
+    let mut broker = Broker::new(config).unwrap();
+    broker.dispatch(
+        "provider",
+        Command::RegisterHook {
+            hook: "release/1".into(),
+        },
+    );
+    let id = accepted_id(broker.dispatch(
+        "client",
+        Command::RunHookOperation {
+            hook: "release/1".into(),
+            payload: json!({}),
+            operation_id: "cleanup.1".into(),
+            cleanup: true,
+        },
+    ));
+    assert!(matches!(
+        broker.dispatch("client", Command::HookResult { invocation: id }),
+        Response::Pending
+    ));
+    let Response::Request { id: request, .. } = broker.dispatch("provider", Command::Poll {})
+    else {
+        panic!()
+    };
+    broker.dispatch(
+        "provider",
+        Command::Complete {
+            request,
+            payload: json!({"released":true}),
+        },
+    );
+    let Response::HookCleanupResult { outcomes } =
+        broker.dispatch("client", Command::HookResult { invocation: id })
+    else {
+        panic!()
+    };
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes[0].participant, "missing");
+    assert!(matches!(&*outcomes[0].result, Response::Error { code, .. } if code == "unavailable"));
+    assert_eq!(outcomes[1].participant, "provider");
+    assert!(matches!(&*outcomes[1].result, Response::Result { .. }));
+    assert!(matches!(
+        broker.dispatch("client", Command::HookResult { invocation: id }),
+        Response::HookCleanupResult { .. }
+    ));
+}
+
+#[test]
+fn api_approval_discovery_intersects_delegation_and_fences_pages() {
+    let (mut config, method) = synthetic_api(ApiPrivilege::User);
+    let mut second = method.clone();
+    second.method = "resize".into();
+    config.api_methods[0]
+        .callers
+        .insert("org.example.registry".into());
+    let mut second_approval = config.api_methods[0].clone();
+    second_approval.method = second.clone();
+    config.api_methods.push(second_approval);
+    config.principals.insert(
+        "org.example.registry".into(),
+        Grants {
+            provide: names(&["registry/1"]),
+            call: names(&["org.example.paint/1"]),
+            ..Default::default()
+        },
+    );
+    for principal in ["org.example.client", "org.example.outsider"] {
+        config
+            .principals
+            .get_mut(principal)
+            .unwrap()
+            .call
+            .insert("registry/1".into());
+    }
+    let mut broker = Broker::new(config).unwrap();
+    broker.dispatch(
+        "org.example.registry",
+        Command::Register {
+            service: "registry/1".into(),
+        },
+    );
+    broker.dispatch(
+        "org.example.provider",
+        Command::RegisterApi {
+            method: method.clone(),
+        },
+    );
+    let list = |parent, after| Command::ListApiApprovals {
+        parent,
+        after,
+        limit: 1,
+    };
+    assert!(
+        matches!(broker.dispatch("org.example.outsider", list(None, None)), Response::ApiApprovals { approvals, .. } if approvals.is_empty())
+    );
+    let request = accepted_id(broker.dispatch(
+        "org.example.outsider",
+        Command::Request {
+            service: "registry/1".into(),
+            payload: json!({}),
+            timeout_ms: 1000,
+            operation_id: "parent.1".into(),
+            parent: None,
+        },
+    ));
+    assert!(
+        matches!(broker.dispatch("org.example.registry", Command::Poll {}), Response::Request { id, .. } if id == request)
+    );
+    assert!(
+        matches!(broker.dispatch("org.example.registry", list(Some(request), None)), Response::ApiApprovals { approvals, .. } if approvals.is_empty())
+    );
+    assert_error_code(
+        broker.dispatch("org.example.provider", list(Some(request), None)),
+        "permission_denied",
+    );
+    broker.dispatch(
+        "org.example.provider",
+        Command::RegisterApi { method: second },
+    );
+    let Response::ApiApprovals {
+        approvals,
+        next: Some(cursor),
+        ..
+    } = broker.dispatch("org.example.client", list(None, None))
+    else {
+        panic!()
+    };
+    assert_eq!(approvals.len(), 1);
+    assert!(
+        matches!(broker.dispatch("org.example.client", list(None, Some(cursor.clone()))), Response::ApiApprovals { approvals, next: None, .. } if approvals.len() == 1)
+    );
+    let mut stale = cursor;
+    stale.revision -= 1;
+    assert_error_code(
+        broker.dispatch("org.example.client", list(None, Some(stale))),
+        "stale_revision",
+    );
+}
+
+#[test]
+fn cleanup_deadline_reports_unknown_and_unattempted_participants() {
+    let mut config = RuntimeConfig::default();
+    config.principals.insert("client".into(), Grants::default());
+    for participant in ["first", "second"] {
+        config.principals.insert(
+            participant.into(),
+            Grants {
+                hook: names(&["release/1"]),
+                ..Default::default()
+            },
+        );
+    }
+    config.hooks.insert(
+        "release/1".into(),
+        HookSpec {
+            owner: "client".into(),
+            participants: vec!["first".into(), "second".into()],
+            timeout_ms: 100,
+        },
+    );
+    let mut broker = Broker::new(config).unwrap();
+    for participant in ["first", "second"] {
+        broker.dispatch(
+            participant,
+            Command::RegisterHook {
+                hook: "release/1".into(),
+            },
+        );
+    }
+    let now = Instant::now();
+    let id = accepted_id(broker.dispatch_at(
+        "client",
+        Command::RunHookOperation {
+            hook: "release/1".into(),
+            payload: json!({}),
+            operation_id: "cleanup.2".into(),
+            cleanup: true,
+        },
+        now,
+    ));
+    assert!(matches!(
+        broker.dispatch_at("client", Command::HookResult { invocation: id }, now),
+        Response::Pending
+    ));
+    let Response::HookCleanupResult { outcomes } = broker.dispatch_at(
+        "client",
+        Command::HookResult { invocation: id },
+        now + Duration::from_millis(100),
+    ) else {
+        panic!()
+    };
+    assert_eq!(outcomes.len(), 2);
+    assert!(
+        matches!(&*outcomes[0].result, Response::Error { message, .. } if message.contains("unknown"))
+    );
+    assert!(
+        matches!(&*outcomes[1].result, Response::Error { message, .. } if message.contains("not attempted"))
+    );
+}
