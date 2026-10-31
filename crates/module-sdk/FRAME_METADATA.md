@@ -79,3 +79,20 @@ association and an explicit application state, and reject missing required data
 or a second application. Current production video/session/transport paths do
 not consume these tails or enable framer-owned carriage. Codec carriage,
 negotiated client support and real HDR hardware remain separate work.
+
+`EncodedMetadataAssociation` is an opt-in SDK guard for this output-side work.
+It copies the encoder-stage admitted AFM1 bundle, checks the exact selected
+unit and submission/source/configuration identities, preserves the original
+source generation in that bundle, and requires one declared application owner
+through encoder and framer stages before transport. Callers must provide the
+current capability generation for each operation, check before every transport
+attempt, and retire only after local admission. The capture clock in AFM1 and
+the separately selected stream clock in the encoded unit are distinct; the
+guard does not infer a timestamp conversion. The application state is a
+provider assertion, not proof of encoded bytes or client interoperability. The
+caller must separately own the immutable access-unit bytes across retries; the
+guard pins its scalar identity and length, not its contents.
+No existing native unit or framer table carries this state or bundle, and no
+production path invokes the guard. Required-metadata profiles must stay closed
+until versioned provider tables, trusted selection and actual codec carriage
+are wired and verified.

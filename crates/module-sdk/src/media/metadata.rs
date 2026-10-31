@@ -1,6 +1,7 @@
 //! Bounded, canonical frame metadata and trusted stage-policy validation.
 mod admission;
 mod capabilities;
+mod output;
 use crate::encode::FormatId;
 pub use admission::{
     BorrowedEncoderFrameOptions, FrameMetadataAdmission, FrameMetadataContext,
@@ -17,6 +18,7 @@ pub use capabilities::{
     CAPABILITIES_CONTRACT, MetadataCapabilityClaim, MetadataCapabilitySnapshot, bind_capabilities,
     enumerate_capabilities, register_capabilities,
 };
+pub use output::{EncodedMetadataAssociation, EncodedMetadataSelection, MetadataApplication};
 
 const MAGIC: &[u8; 4] = b"AFM1";
 const HEADER_BYTES: usize = 80;

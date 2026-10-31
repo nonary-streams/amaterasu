@@ -193,6 +193,189 @@ fn canonical_envelope_binds_schema_and_frame_identity() {
 }
 
 #[test]
+fn encoded_output_association_enforces_selected_carriage_and_identity() {
+    for owner in [CarriageOwner::EncoderEmbed, CarriageOwner::FramerInsert] {
+        let mut admitted = bundle();
+        admitted.owner = owner;
+        let source = admitted.encode().unwrap();
+        let treatment = match owner {
+            CarriageOwner::EncoderEmbed => MetadataTreatment::Apply,
+            CarriageOwner::FramerInsert => MetadataTreatment::Forward,
+        };
+        let p = policy(
+            MetadataStage::Encoder,
+            owner,
+            &[(1, treatment), (2, treatment)],
+            false,
+        );
+        let mut input = FrameMetadataAdmission::new(context(identity()), p, 4096).unwrap();
+        unsafe { input.prepare(&frame(&source, identity()), identity(), 1) }.unwrap();
+        let encoded = input.pending(1).unwrap().unwrap().bytes().to_vec();
+        let codec = EncoderFormatId {
+            namespace_id: 1,
+            value: 50,
+            schema: 1,
+        };
+        let framing = EncoderFormatId {
+            namespace_id: 1,
+            value: 51,
+            schema: 1,
+        };
+        let selection = EncodedMetadataSelection {
+            stream: 2,
+            generation: 3,
+            offer_id: 4,
+            codec,
+            framing,
+            clock_epoch: [7; 16],
+        };
+        let mut association = EncodedMetadataAssociation::new(&input, 1, selection).unwrap();
+        let payload = [1, 2, 3];
+        let unit = NegotiatedVideoUnit {
+            size: size_of::<NegotiatedVideoUnit>() as u32,
+            version: VIDEO_UNIT_VERSION,
+            stream: 2,
+            generation: 3,
+            offer_id: 4,
+            codec,
+            framing,
+            access_unit_id: 5,
+            submission_id: identity().submission_id,
+            source_id: identity().source_id,
+            config_generation: identity().config_generation,
+            timestamp_us: 999,
+            clock: FrameClockMetadata {
+                version: 1,
+                size: size_of::<FrameClockMetadata>() as u32,
+                domain: FRAME_CLOCK_STREAM_RELATIVE,
+                reserved: 0,
+                epoch_id: [7; 16],
+            },
+            flags: VIDEO_UNIT_KEYFRAME,
+            reserved: 0,
+            data: BorrowedBytes::new(&payload),
+        };
+        let expected = match owner {
+            CarriageOwner::EncoderEmbed => MetadataApplication::EncoderApplied,
+            CarriageOwner::FramerInsert => MetadataApplication::Forwarded,
+        };
+        assert_eq!(
+            association.accept_encoder_output(&unit, &encoded, expected, 2),
+            Err(MetadataError::Stale)
+        );
+        assert_eq!(
+            association.accept_encoder_output(
+                &NegotiatedVideoUnit {
+                    submission_id: 13,
+                    ..unit
+                },
+                &encoded,
+                expected,
+                1
+            ),
+            Err(MetadataError::Foreign)
+        );
+        assert_eq!(
+            association.accept_encoder_output(&unit, &encoded[..encoded.len() - 1], expected, 1),
+            Err(MetadataError::Foreign)
+        );
+        assert_eq!(
+            association.accept_encoder_output(
+                &unit,
+                &encoded,
+                MetadataApplication::FramerApplied,
+                1
+            ),
+            Err(MetadataError::WrongOwner)
+        );
+        association
+            .accept_encoder_output(&unit, &encoded, expected, 1)
+            .unwrap();
+        assert_eq!(
+            association.accept_encoder_output(&unit, &encoded, expected, 1),
+            Err(MetadataError::Duplicate)
+        );
+        if owner == CarriageOwner::FramerInsert {
+            assert_eq!(
+                association.retire(&unit, &encoded, 1),
+                Err(MetadataError::WrongOwner)
+            );
+            assert_eq!(
+                association.accept_framer_output(
+                    &unit,
+                    &encoded,
+                    MetadataApplication::EncoderApplied,
+                    1
+                ),
+                Err(MetadataError::WrongOwner)
+            );
+            association
+                .accept_framer_output(&unit, &encoded, MetadataApplication::FramerApplied, 1)
+                .unwrap();
+        } else {
+            assert_eq!(
+                association.retire(&unit, &encoded, 1),
+                Err(MetadataError::WrongOwner)
+            );
+            assert_eq!(
+                association.accept_framer_output(
+                    &unit,
+                    &encoded,
+                    MetadataApplication::FramerApplied,
+                    1
+                ),
+                Err(MetadataError::WrongOwner)
+            );
+            association
+                .accept_framer_output(&unit, &encoded, MetadataApplication::EncoderApplied, 1)
+                .unwrap();
+        }
+        assert_eq!(
+            association.accept_framer_output(
+                &unit,
+                &encoded,
+                MetadataApplication::FramerApplied,
+                1
+            ),
+            Err(MetadataError::Duplicate)
+        );
+        association.check_transport(&unit, &encoded, 1).unwrap();
+        association.check_transport(&unit, &encoded, 1).unwrap(); // BUSY did not retire it.
+        assert_eq!(
+            association.check_transport(&unit, &encoded, 2),
+            Err(MetadataError::Stale)
+        );
+        assert_eq!(
+            association.check_transport(
+                &NegotiatedVideoUnit {
+                    timestamp_us: 1000,
+                    ..unit
+                },
+                &encoded,
+                1
+            ),
+            Err(MetadataError::Foreign)
+        );
+        assert_eq!(
+            association.retire(
+                &NegotiatedVideoUnit {
+                    access_unit_id: 6,
+                    ..unit
+                },
+                &encoded,
+                1
+            ),
+            Err(MetadataError::Foreign)
+        );
+        association.retire(&unit, &encoded, 1).unwrap();
+        assert_eq!(
+            association.retire(&unit, &encoded, 1),
+            Err(MetadataError::Closed)
+        );
+    }
+}
+
+#[test]
 fn trusted_policy_rejects_unknown_required_and_controls_optional_passthrough() {
     let bundle = bundle();
     let unknown = policy(
