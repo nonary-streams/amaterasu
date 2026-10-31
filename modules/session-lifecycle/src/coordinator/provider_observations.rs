@@ -13,6 +13,24 @@ pub(super) fn metadata(
     session: &SessionRecord,
     provider: &str,
 ) -> ModuleResult<Value> {
+    metadata_with_scope(journal, session, provider, None)
+}
+
+pub(super) fn session_metadata(
+    journal: &Journal,
+    session: &SessionRecord,
+    provider: &str,
+    domains: &BTreeSet<String>,
+) -> ModuleResult<Value> {
+    metadata_with_scope(journal, session, provider, Some(domains))
+}
+
+fn metadata_with_scope(
+    journal: &Journal,
+    session: &SessionRecord,
+    provider: &str,
+    scoped_domains: Option<&BTreeSet<String>>,
+) -> ModuleResult<Value> {
     let owned = |id: &String| {
         journal
             .authority
@@ -33,18 +51,24 @@ pub(super) fn metadata(
             );
         }
     }
+    if let Some(allowed) = scoped_domains {
+        selected_domains.retain(|domain| allowed.contains(domain));
+    }
     let mut admitted = Vec::new();
     let mut domains = BTreeMap::new();
     let mut target_values = BTreeSet::new();
     let mut obligations = Vec::new();
     for candidate_session in journal.sessions.values() {
         let is_origin = candidate_session.id == session.id;
+        if scoped_domains.is_some() && !is_origin {
+            continue;
+        }
         let mut included = false;
         for id in &candidate_session.admission_ids {
             let Some(admission) = owned(id) else {
                 continue;
             };
-            if !is_origin
+            if (!is_origin || scoped_domains.is_some())
                 && !admission
                     .plan
                     .mutation_domains
@@ -112,7 +136,7 @@ pub(super) fn metadata(
                     .iter()
                     .filter(|obligation| {
                         obligation.provider == provider
-                            && (is_origin
+                            && ((is_origin && scoped_domains.is_none())
                                 || obligation
                                     .mutation_domain
                                     .as_ref()

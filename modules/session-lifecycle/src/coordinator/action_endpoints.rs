@@ -1666,6 +1666,72 @@ mod tests {
             action_borrower_scope(&scoped, &stream_target, "display", &stale),
             Err("foreign_borrower")
         );
+        let mut paused = scoped.clone();
+        let session = paused.sessions.get_mut("session").unwrap();
+        session.phase = SessionPhase::Paused;
+        session.streams.clear();
+        session.admission_ids.remove("stream-admission");
+        session.admission_targets.remove("stream-admission");
+        session.admission_phases.remove("stream-admission");
+        paused.authority.settled.remove("stream-admission");
+        paused
+            .authority
+            .snapshot
+            .domains
+            .get_mut("domain")
+            .unwrap()
+            .borrowers = [("session".into(), 3)].into();
+        paused.authority.snapshot.resources.insert(
+            "display".into(),
+            [(
+                "output".into(),
+                crate::planning::ResourceRef {
+                    provider: "display".into(),
+                    resource_id: "output".into(),
+                    incarnation: "native".into(),
+                    revision: 1,
+                    execution_domain: "actual-seat".into(),
+                    mutation_domains: ["domain".into()].into(),
+                },
+            )]
+            .into(),
+        );
+        paused
+            .admission_transitions
+            .insert("session-admission".into(), "transition".into());
+        paused.composition = serde_json::from_value(json!({"outputs":[{"output":{"output_id":"owned","capability":"screen","schema":{"id":"screen","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"display","producer_service":"display/2","origin":{"kind":"session","host_epoch":epoch,"session_id":"session","generation":3},"resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"actual-seat","mutation_domain":"domain"},"domain_observations":[{"domain":"domain","revision":6,"borrowers":{"session":3},"complete":true}],"data":{}},"admission_id":"session-admission","transition_id":"transition","plan":plan,"state":"retained"}]})).unwrap();
+        save(&coordinator.shared, paused.clone()).unwrap();
+        let v2 = json!({"operation":"describe_action_target","version":2,"target":{"kind":"session","host_epoch":epoch,"session_id":"session","expected_generation":3}});
+        let described = coordinator.describe_action_target("display", &v2);
+        assert_eq!(described["status"], "succeeded", "{described}");
+        let typed: amaterasu_extension_api::ActionTargetDescription =
+            serde_json::from_value(described.clone()).unwrap();
+        amaterasu_extension_api::validate_action_target_description(&typed).unwrap();
+        assert_eq!(described["owner_output"]["output_id"], "owned");
+        assert_eq!(described["settings_revision"], "session-rev");
+        assert_eq!(described["streams"], json!([]));
+        let mut unavailable = paused.clone();
+        let mut book = serde_json::to_value(&unavailable.composition).unwrap();
+        book["outputs"][0]["state"] = json!("recovery_required");
+        unavailable.composition = serde_json::from_value(book).unwrap();
+        save(&coordinator.shared, unavailable).unwrap();
+        assert_eq!(
+            coordinator.describe_action_target("display", &v2)["reason"],
+            "owner_output_ambiguous_or_unavailable"
+        );
+        paused
+            .authority
+            .snapshot
+            .domains
+            .get_mut("domain")
+            .unwrap()
+            .borrowers
+            .insert("foreign".into(), 1);
+        save(&coordinator.shared, paused).unwrap();
+        assert_eq!(
+            coordinator.describe_action_target("display", &v2)["reason"],
+            "foreign_borrower"
+        );
         scoped
             .sessions
             .get_mut("session")
