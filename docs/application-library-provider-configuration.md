@@ -1,5 +1,13 @@
 # Configuring an application-library provider
 
+For independently owned library data and opaque execution references, see the
+optional [version 2 interoperability profile](application-library-interoperability.md).
+
+For the cross-host requirements survey, current composition limits, and proposed
+contracts between independently replaceable plugins, see the
+[application-library ecosystem and extension plan](application-library-ecosystem.md).
+That plan records requirements; it does not change the interfaces described here.
+
 This is a development-host example for a separately built, trusted component
 that both imports catalog snapshots and implements the SDK provider service.
 The bundled example provider is a synthetic fixture: it does not import a catalog

@@ -15,6 +15,7 @@ use std::{
 pub enum CatalogSelection {
     Initiator,
     Exported,
+    Library,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -28,6 +29,8 @@ pub struct Record {
     pub launch_id: u64,
     pub operation_id: String,
     pub app_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library_selection: Option<crate::library::Selection>,
     pub state: State,
     pub session_id: Option<u64>,
     pub process_id: Option<u64>,
@@ -232,6 +235,10 @@ impl Records {
                     record.catalog_selection == CatalogSelection::Exported
                         && record.catalog_initiator == initiator
                 }
+                CatalogSelection::Library => {
+                    record.catalog_selection == CatalogSelection::Library
+                        && record.catalog_initiator == initiator
+                }
             };
             return if record.app_id == app_id
                 && same_catalog
@@ -266,6 +273,7 @@ impl Records {
                 launch_id: id,
                 operation_id,
                 app_id,
+                library_selection: None,
                 state: State::Starting,
                 outstanding_request: None,
                 session_id: None,

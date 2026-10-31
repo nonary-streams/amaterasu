@@ -403,7 +403,7 @@ const DISPLAY: ComponentDefinition = ComponentDefinition {
 const LAUNCH: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.launch",
     library: "amaterasu_launch",
-    provides: &["amaterasu.launch/1"],
+    provides: &["amaterasu.launch/1", "amaterasu.launch/2"],
     calls: &[
         "amaterasu.catalog/1",
         "amaterasu.state/1",

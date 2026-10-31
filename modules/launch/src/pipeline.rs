@@ -1,5 +1,6 @@
+#[cfg(test)]
+use crate::SERVICE;
 use crate::{
-    SERVICE,
     protocol::*,
     records::{
         CatalogSelection, DisplayAdmission, GlobalPreparation, Records, StreamLimiterSnapshot,
@@ -419,6 +420,7 @@ pub struct Pipeline {
     environment: BTreeMap<String, String>,
     retirement_observers: BTreeSet<String>,
     provider_routes: BTreeMap<String, ProviderRoute>,
+    library_routes: BTreeMap<String, crate::library::Route>,
 }
 impl Pipeline {
     pub fn new(environment: BTreeMap<String, String>) -> Result<Self, &'static str> {
@@ -431,6 +433,7 @@ impl Pipeline {
             environment,
             retirement_observers: BTreeSet::new(),
             provider_routes: BTreeMap::new(),
+            library_routes: BTreeMap::new(),
         })
     }
     pub fn set_retirement_observers(&mut self, observers: BTreeSet<String>) {
@@ -439,6 +442,10 @@ impl Pipeline {
 
     pub fn set_provider_routes(&mut self, routes: BTreeMap<String, ProviderRoute>) {
         self.provider_routes = routes;
+    }
+
+    pub fn set_library_routes(&mut self, routes: BTreeMap<String, crate::library::Route>) {
+        self.library_routes = routes;
     }
 
     fn verify_retirement(
@@ -572,15 +579,7 @@ impl Pipeline {
                 remaining_ms,
             } => {
                 self.ingress_since_monitor = self.ingress_since_monitor.saturating_add(1);
-                if service != SERVICE {
-                    return complete(&mut send, id, error("invalid_service"));
-                }
-                let operation = serde_json::from_value::<Operation>(payload)
-                    .map_err(|_| "invalid_request")
-                    .and_then(|operation| {
-                        operation.validate()?;
-                        Ok(operation)
-                    });
+                let operation = crate::library::decode(&service, payload, &caller, &initiator);
                 match operation {
                     Ok(operation) => {
                         self.receive(id, &caller, &initiator, remaining_ms, operation, &mut send)
@@ -605,6 +604,7 @@ impl Pipeline {
         let Response::Request {
             id,
             caller,
+            initiator,
             service,
             payload,
             ..
@@ -612,15 +612,7 @@ impl Pipeline {
         else {
             return Ok(());
         };
-        if service != SERVICE {
-            return complete(send, id, error("invalid_service"));
-        }
-        let operation = serde_json::from_value::<Operation>(payload)
-            .map_err(|_| "invalid_request")
-            .and_then(|operation| {
-                operation.validate()?;
-                Ok(operation)
-            });
+        let operation = crate::library::decode(&service, payload, &caller, &initiator);
         let response = match operation {
             Ok(Operation::EpochRead {}) => {
                 serde_json::json!({"ok":true,"operation_epoch":self.records.operation_epoch()})
@@ -671,16 +663,7 @@ impl Pipeline {
         else {
             return Ok(false);
         };
-        if service != SERVICE {
-            complete(send, id, error("invalid_service"))?;
-            return Ok(true);
-        }
-        let operation = serde_json::from_value::<Operation>(payload)
-            .map_err(|_| "invalid_request")
-            .and_then(|operation| {
-                operation.validate()?;
-                Ok(operation)
-            });
+        let operation = crate::library::decode(&service, payload, &caller, &initiator);
         match operation {
             Ok(Operation::EpochRead {}) => {
                 complete(
@@ -771,6 +754,60 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         match operation {
+            Operation::DescribeLibrary {} => complete(
+                send,
+                request,
+                serde_json::json!({
+                    "ok":true,"version":2,"reference_launch":true,"direct_callers_only":true,
+                    "durable_recovery":false
+                }),
+            ),
+            Operation::LaunchLibrary {
+                operation_id,
+                application,
+                revision,
+            } => {
+                let Some(route) = self
+                    .library_routes
+                    .get(&application.library)
+                    .filter(|route| caller == initiator && route.callers.contains(caller))
+                else {
+                    return complete(send, request, error("permission_denied"));
+                };
+                let selection = crate::library::Selection {
+                    application,
+                    revision,
+                    service: route.service.clone(),
+                };
+                // A changed revision/reference cannot reuse an accepted operation.
+                if let Ok(record) = self.records.owned_operation(caller, &operation_id)
+                    && record.library_selection.as_ref() != Some(&selection)
+                {
+                    return complete(send, request, error("operation_conflict"));
+                }
+                match self.records.start(
+                    caller,
+                    initiator,
+                    operation_id,
+                    selection.application.id.clone(),
+                    CatalogSelection::Library,
+                    GlobalPreparation::default(),
+                ) {
+                    Ok((id, true)) => {
+                        self.records
+                            .values
+                            .get_mut(&id)
+                            .expect("library launch record")
+                            .library_selection = Some(selection);
+                        let mut workflow = Workflow::launch(id, request, remaining_ms);
+                        workflow.step = Step::Library;
+                        self.job = Some(workflow);
+                        Ok(())
+                    }
+                    Ok((id, false)) => complete(send, request, self.records.values[&id].response()),
+                    Err(code) => complete(send, request, error(code)),
+                }
+            }
             Operation::EpochRead {} => complete(
                 send,
                 request,
@@ -1447,6 +1484,9 @@ impl Pipeline {
             return self.consume_cleanup(job, payload, send);
         }
         if payload["ok"] != true {
+            if job.step == Step::Library {
+                return self.dependency_failed(job, crate::library::rejection_code(&payload), send);
+            }
             if matches!(job.step, Step::LutrisStatus | Step::LutrisPreSpawn) {
                 return self.dependency_failed(job, "lutris_unavailable", send);
             }
@@ -1484,6 +1524,25 @@ impl Pipeline {
             .get_mut(&job.launch_id)
             .expect("workflow record");
         match job.step {
+            Step::Library => {
+                let Some(selection) = record.library_selection.as_ref() else {
+                    return self.dependency_failed(job, "invalid_library_response", send);
+                };
+                let Some(route) = self.library_routes.get(&selection.application.library) else {
+                    return self.dependency_failed(job, "library_not_configured", send);
+                };
+                let (target, service, resource) =
+                    match crate::library::resolve_target(selection, route, payload) {
+                        Ok(target) => target,
+                        Err(code) => return self.dependency_failed(job, code, send),
+                    };
+                record.cleanup_budget_ms = u64::try_from(cleanup_budget(Some(&target)).as_millis())
+                    .map_err(|_| "cleanup budget exceeds protocol range")?;
+                record.target = Some(target);
+                record.generic_provider_service = Some(service);
+                record.resource = Some(resource);
+                job.step = Step::CreateSession;
+            }
             Step::Catalog => {
                 if payload["id"] != record.app_id {
                     return self.dependency_failed(job, "invalid_catalog_response", send);
@@ -1504,6 +1563,9 @@ impl Pipeline {
                         }
                     }
                     CatalogSelection::Initiator => {}
+                    CatalogSelection::Library => {
+                        return self.dependency_failed(job, "invalid_catalog_response", send);
+                    }
                 }
                 record.output = match resolve_catalog_output(&payload["entry"], &self.environment) {
                     Ok(output) => output,

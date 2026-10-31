@@ -5,7 +5,8 @@ creates an owned coordination session, acquires an exclusive application lease,
 launches the process through the application provider, and activates the session.
 An active record means a managed application and coordination session exist;
 it does not imply capture, encoding, media transport, input delivery, or streaming
-readiness.
+readiness. An optional [independent-library handoff](#optional-independent-library-handoff)
+also supports libraries that own their data outside Catalog.
 
 Requests are strict JSON:
 
@@ -408,3 +409,11 @@ based on frame size or runtime limits. NVHTTP resolves each field client before
 application before global and freezes the launch snapshot.
 See [software policy](../nvhttp/README.md#software-encoder-policy) for runtime
 availability, source differences and remaining qualification gates.
+
+## Optional independent-library handoff
+
+The opt-in `amaterasu.launch/2` endpoint accepts opaque library references using
+startup-selected library/executor routes. It reuses execution reconciliation and
+retirement fencing without requiring Catalog records. See the
+[interoperability profile](../../docs/application-library-interoperability.md)
+for settings, grants, versioned payloads, qualification and remaining limits.

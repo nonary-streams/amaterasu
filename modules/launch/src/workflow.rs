@@ -11,6 +11,7 @@ pub const LUTRIS: &str = "amaterasu.lutris/1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Catalog,
+    Library,
     LutrisStatus,
     LutrisPreSpawn,
     CreateSession,
@@ -106,8 +107,20 @@ impl Workflow {
                 let action = match record.catalog_selection {
                     CatalogSelection::Initiator => "resolve_launch",
                     CatalogSelection::Exported => "resolve_exported_launch",
+                    CatalogSelection::Library => return Err("invalid_workflow"),
                 };
                 (CATALOG, json!({"action":action,"id":record.app_id}))
+            }
+            Step::Library => {
+                let selection = record
+                    .library_selection
+                    .as_ref()
+                    .ok_or("invalid_workflow")?;
+                (
+                    &selection.service,
+                    json!({"action":"resolve_launch",
+                    "id":selection.application.id,"revision":selection.revision}),
+                )
             }
             Step::LutrisStatus | Step::LutrisPreSpawn => (LUTRIS, json!({"action":"status"})),
             Step::CreateSession => (SESSION, json!({"action":"create","key":record.session_key})),

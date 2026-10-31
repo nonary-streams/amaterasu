@@ -19,8 +19,8 @@ use std::collections::BTreeSet;
 pub const LIBRARY_SERVICE: &str = "amaterasu.library/1";
 
 /// Catalog-issued continuation. Preserve all fields from the previous page;
-/// mutations invalidate the collection revision. Follow cursors until null,
-/// including when a page contains no rows.
+/// mutations invalidate the collection revision. The NVHTTP compatibility
+/// profile requires nonempty continuation pages and ascending canonical IDs.
 #[derive(Clone, Debug, serde::Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LibraryCursor {
@@ -422,3 +422,7 @@ pub mod provider_adapter;
 
 /// Incarnation-bound lifecycle requests and retirement assertions.
 pub mod provider_lifecycle;
+
+/// Optional, transport-neutral library reads and opaque execution handoff.
+/// This is a separate service; it does not change the legacy `/1` wire format.
+pub mod v2;

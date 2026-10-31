@@ -1,0 +1,409 @@
+{
+  "schema_version": 1,
+  "audited_on": "2026-10-31",
+  "amaterasu_revision": "f8aa56337288632df64db1cca807dd3b0cd6beaa",
+  "amaterasu_working_tree_qualification": "preexisting dirty third-party/libvirtualdisplay preserved",
+  "scope": "host-audit-and-extension-plan-with-first-contract-implementation",
+  "agent_model": "gpt-6.1-terra",
+  "agent_reasoning_effort": "high",
+  "host_audit_count": 12,
+  "summary": "application-library-ecosystem.md",
+  "boundary_review": "application-library-hosts/boundary-review.md",
+  "architecture": {
+    "shell": "generic component loading, routing and authority; no product-specific library or packet behavior",
+    "intended_replaceable_implementations": [
+      "library",
+      "source-provider",
+      "management",
+      "launch",
+      "session",
+      "client-protocol",
+      "networking",
+      "packet-delivery"
+    ],
+    "library_transport_dependency": false,
+    "currently_verified_selection_scope": "documented development Linux library replacement path only",
+    "contract_policy": "versioned optional interoperability profiles; current NVHTTP/Catalog constraints are composition-specific"
+  },
+  "requirement_association_semantics": "planning links; consult report for conditional or unknown requirements; not every host implements every part",
+  "requirements": [
+    {
+      "id": "LIB-001",
+      "priority": "P0",
+      "title": "Plugin contract compatibility and explicit version selection",
+      "status": "partially-implemented-see-interoperability-profile",
+      "implementation_document": "application-library-interoperability.md"
+    },
+    {
+      "id": "LIB-002",
+      "priority": "P0-in-bundled-catalog-profile",
+      "title": "Provider-neutral artwork interoperability",
+      "status": "proposed-not-implemented-by-this-audit"
+    },
+    {
+      "id": "LIB-003",
+      "priority": "P0-for-participating-rich-consumers",
+      "title": "Rich safe reads and distinct identity domains",
+      "status": "partially-implemented-see-interoperability-profile",
+      "implementation_document": "application-library-interoperability.md"
+    },
+    {
+      "id": "LIB-004",
+      "priority": "P0-for-participating-editors",
+      "title": "Ownership, user overlays and ordering",
+      "status": "proposed-not-implemented-by-this-audit"
+    },
+    {
+      "id": "LIB-005",
+      "priority": "P0-where-required",
+      "title": "Authenticated scope and effective launch context",
+      "status": "proposed-not-implemented-by-this-audit"
+    },
+    {
+      "id": "LIB-006",
+      "priority": "P1-optional",
+      "title": "Source management and selected import",
+      "status": "proposed-not-implemented-by-this-audit"
+    },
+    {
+      "id": "LIB-007",
+      "priority": "P1-optional",
+      "title": "Availability and asynchronous provider actions",
+      "status": "proposed-not-implemented-by-this-audit"
+    },
+    {
+      "id": "LIB-008",
+      "priority": "P1-optional",
+      "title": "Refresh and change reconciliation",
+      "status": "proposed-not-implemented-by-this-audit"
+    },
+    {
+      "id": "HOST-001",
+      "priority": "separate-plugin-capability-work",
+      "title": "Execution lifetime, restart recovery and concurrency",
+      "status": "proposed-not-implemented-by-this-audit"
+    }
+  ],
+  "hosts": [
+    {
+      "id": "sunshine",
+      "name": "Sunshine",
+      "repository": "https://github.com/LizardByte/Sunshine",
+      "aliases": [],
+      "lineage": "upstream",
+      "selection_basis": "community-mentioned-or-behaviorally-relevant; not a popularity ranking",
+      "audit_status": "source-or-document-review-complete",
+      "report": "application-library-hosts/sunshine.md",
+      "evidence_status": "moving-source-and-docs",
+      "observed_revision": null,
+      "revision_scope": "not-pinned",
+      "runtime_qualified": false,
+      "related_requirements": [
+        "LIB-001",
+        "LIB-002",
+        "LIB-004",
+        "LIB-006"
+      ]
+    },
+    {
+      "id": "apollo",
+      "name": "Apollo",
+      "repository": "https://github.com/ClassicOldSong/Apollo",
+      "aliases": [],
+      "lineage": "sunshine-fork",
+      "selection_basis": "community-mentioned-or-behaviorally-relevant; not a popularity ranking",
+      "audit_status": "source-or-document-review-complete",
+      "report": "application-library-hosts/apollo.md",
+      "evidence_status": "moving-source-and-docs",
+      "observed_revision": null,
+      "revision_scope": "not-pinned",
+      "runtime_qualified": false,
+      "related_requirements": [
+        "LIB-001",
+        "LIB-002",
+        "LIB-004",
+        "LIB-005",
+        "HOST-001"
+      ]
+    },
+    {
+      "id": "vibeshine",
+      "name": "Vibeshine",
+      "repository": "https://github.com/Nonary/Vibeshine",
+      "aliases": [],
+      "lineage": "sunshine-fork",
+      "selection_basis": "community-mentioned-or-behaviorally-relevant; not a popularity ranking",
+      "audit_status": "source-or-document-review-complete",
+      "report": "application-library-hosts/vibeshine.md",
+      "evidence_status": "local-dirty-canary-behind-tracked-remote",
+      "observed_revision": "3ed14cda3c5a6f622173200287faabe811cfedb1",
+      "revision_scope": "local-reference-with-working-tree-qualification",
+      "runtime_qualified": false,
+      "related_requirements": [
+        "LIB-001",
+        "LIB-002",
+        "LIB-003",
+        "LIB-004",
+        "LIB-005",
+        "LIB-006",
+        "LIB-008"
+      ]
+    },
+    {
+      "id": "vibepollo",
+      "name": "Vibepollo",
+      "repository": "https://github.com/Nonary/Vibepollo",
+      "aliases": [],
+      "lineage": "apollo-fork",
+      "selection_basis": "community-mentioned-or-behaviorally-relevant; not a popularity ranking",
+      "audit_status": "source-or-document-review-complete",
+      "report": "application-library-hosts/vibepollo.md",
+      "evidence_status": "local-canary-ahead-with-dirty-submodules",
+      "observed_revision": "c5e4f21632f0d22a8e91bb89b7df357a0bd677d7",
+      "revision_scope": "local-reference-with-working-tree-qualification",
+      "runtime_qualified": false,
+      "related_requirements": [
+        "LIB-001",
+        "LIB-002",
+        "LIB-003",
+        "LIB-004",
+        "LIB-005",
+        "LIB-006",
+        "LIB-008",
+        "HOST-001"
+      ]
+    },
+    {
+      "id": "foundation",
+      "name": "Foundation Sunshine",
+      "repository": "https://github.com/AlkaidLab/foundation-sunshine",
+      "aliases": [
+        "Foundation-Sunshine"
+      ],
+      "lineage": "sunshine-fork",
+      "selection_basis": "community-mentioned-or-behaviorally-relevant; not a popularity ranking",
+      "audit_status": "source-or-document-review-complete",
+      "report": "application-library-hosts/foundation.md",
+      "evidence_status": "pinned-official-documents",
+      "observed_revision": "204a96826606b3a34cf2cd813aed0f0a9bba7db0",
+      "revision_scope": "official-document-snapshot",
+      "runtime_qualified": false,
+      "related_requirements": [
+        "LIB-001",
+        "LIB-002",
+        "LIB-003",
+        "LIB-004",
+        "LIB-006"
+      ]
+    },
+    {
+      "id": "wolf",
+      "name": "Wolf",
+      "repository": "https://github.com/games-on-whales/wolf",
+      "aliases": [
+        "Games on Whales"
+      ],
+      "lineage": "independent-host",
+      "selection_basis": "community-mentioned-or-behaviorally-relevant; not a popularity ranking",
+      "audit_status": "source-or-document-review-complete",
+      "report": "application-library-hosts/wolf.md",
+      "evidence_status": "moving-official-stable-docs",
+      "observed_revision": null,
+      "revision_scope": "not-pinned",
+      "runtime_qualified": false,
+      "related_requirements": [
+        "LIB-001",
+        "LIB-002",
+        "LIB-003",
+        "LIB-005",
+        "LIB-007",
+        "LIB-008",
+        "HOST-001"
+      ]
+    },
+    {
+      "id": "duostream",
+      "name": "DuoStream",
+      "repository": "https://github.com/DuoStream/Duo",
+      "aliases": [
+        "Duo"
+      ],
+      "lineage": "multiseat-host-wrapper",
+      "selection_basis": "community-mentioned-or-behaviorally-relevant; not a popularity ranking",
+      "audit_status": "source-or-document-review-complete",
+      "report": "application-library-hosts/duostream.md",
+      "evidence_status": "official-docs-no-public-implementation-audited",
+      "observed_revision": null,
+      "revision_scope": "not-pinned",
+      "runtime_qualified": false,
+      "related_requirements": [
+        "LIB-001",
+        "LIB-005",
+        "HOST-001"
+      ]
+    },
+    {
+      "id": "rubylight",
+      "name": "Rubylight",
+      "repository": "https://github.com/RamazanKara/Rubylight",
+      "aliases": [
+        "Butterpollo"
+      ],
+      "lineage": "host-with-sunshine-apollo-vibepollo-lineage",
+      "selection_basis": "community-mentioned-or-behaviorally-relevant; not a popularity ranking",
+      "audit_status": "source-or-document-review-complete",
+      "report": "application-library-hosts/rubylight.md",
+      "evidence_status": "pinned-official-documents",
+      "observed_revision": "55decb95abfe49847cfa06ed2567fb7b0d913054",
+      "revision_scope": "official-document-snapshot",
+      "runtime_qualified": false,
+      "related_requirements": [
+        "LIB-001",
+        "LIB-002",
+        "LIB-003",
+        "LIB-004",
+        "LIB-005",
+        "LIB-006",
+        "LIB-007",
+        "LIB-008",
+        "HOST-001"
+      ]
+    },
+    {
+      "id": "punktfunk",
+      "name": "Punktfunk",
+      "repository": "https://github.com/punktfunk/punktfunk",
+      "aliases": [],
+      "lineage": "independent-host",
+      "selection_basis": "community-mentioned-or-behaviorally-relevant; not a popularity ranking",
+      "audit_status": "source-or-document-review-complete",
+      "report": "application-library-hosts/punktfunk.md",
+      "evidence_status": "official-docs-code-and-revision-unverified",
+      "observed_revision": null,
+      "revision_scope": "not-pinned",
+      "runtime_qualified": false,
+      "related_requirements": [
+        "LIB-001",
+        "LIB-002",
+        "LIB-003",
+        "LIB-004",
+        "LIB-006",
+        "LIB-007",
+        "LIB-008",
+        "HOST-001"
+      ]
+    },
+    {
+      "id": "hermes",
+      "name": "Hermes",
+      "repository": "https://github.com/MrOz59/Hermes",
+      "aliases": [],
+      "lineage": "apollo-derived-linux-host",
+      "selection_basis": "community-mentioned-or-behaviorally-relevant; not a popularity ranking",
+      "audit_status": "source-or-document-review-complete",
+      "report": "application-library-hosts/hermes.md",
+      "evidence_status": "moving-source-and-docs",
+      "observed_revision": null,
+      "revision_scope": "not-pinned",
+      "runtime_qualified": false,
+      "related_requirements": [
+        "LIB-001",
+        "LIB-002",
+        "LIB-005",
+        "HOST-001"
+      ]
+    },
+    {
+      "id": "polaris",
+      "name": "Polaris",
+      "repository": "https://github.com/papi-ux/polaris",
+      "aliases": [],
+      "lineage": "sunshine-apollo-lineage",
+      "selection_basis": "community-mentioned-or-behaviorally-relevant; not a popularity ranking",
+      "audit_status": "source-or-document-review-complete",
+      "report": "application-library-hosts/polaris.md",
+      "evidence_status": "moving-source-and-docs",
+      "observed_revision": null,
+      "revision_scope": "not-pinned",
+      "runtime_qualified": false,
+      "related_requirements": [
+        "LIB-001",
+        "LIB-002",
+        "LIB-003",
+        "LIB-004",
+        "LIB-005",
+        "LIB-006",
+        "LIB-008",
+        "HOST-001"
+      ]
+    },
+    {
+      "id": "moonshine",
+      "name": "Moonshine",
+      "repository": "https://github.com/hgaiser/moonshine",
+      "aliases": [],
+      "lineage": "independent-rust-host",
+      "selection_basis": "community-mentioned-or-behaviorally-relevant; not a popularity ranking",
+      "audit_status": "source-or-document-review-complete",
+      "report": "application-library-hosts/moonshine.md",
+      "evidence_status": "official-readme-implementation-revision-unpinned",
+      "observed_revision": null,
+      "revision_scope": "not-pinned",
+      "runtime_qualified": false,
+      "related_requirements": [
+        "LIB-001",
+        "LIB-002",
+        "LIB-006",
+        "HOST-001"
+      ]
+    }
+  ],
+  "watchlist": [
+    {
+      "name": "SolarFlare",
+      "repository": "https://github.com/vindeckyy/Solar-Flare",
+      "status": "archived-eol",
+      "audit_status": "discovery-only"
+    },
+    {
+      "name": "Slipstream",
+      "repository": "https://github.com/vindeckyy/slipstream",
+      "status": "SolarFlare-successor",
+      "audit_status": "not-audited"
+    },
+    {
+      "name": "ChildStream",
+      "reference": "https://www.reddit.com/r/MoonlightStreaming/comments/1wmzxsg/i_made_a_free_opensource_way_to_stream_a_second/",
+      "status": "Windows-session-wrapper-around-Sunshine",
+      "audit_status": "not-audited"
+    }
+  ],
+  "discovery_references": [
+    "https://www.reddit.com/r/MoonlightStreaming/comments/1vr8jct/moonlight_hosts_clients_forks/",
+    "https://www.reddit.com/r/MoonlightStreaming/comments/1ulw7t6/a_small_list_of_hosts_clients/",
+    "https://www.reddit.com/r/MoonlightStreaming/comments/1wzko2g/are_there_any_new_forks_besides_apollo_and_artemis/"
+  ],
+  "limitations": [
+    "No exhaustive popularity census",
+    "Moving-source/doc and local-dirty qualifiers are retained",
+    "No runtime, client interoperability, installed binary or hardware qualification",
+    "No Rust API/runtime changes in this pass",
+    "No claim all intended plugin replacements are already supported by shipped tooling"
+  ],
+  "implementation": {
+    "document": "application-library-interoperability.md",
+    "library_profile": "amaterasu.library/2",
+    "execution_profile": "amaterasu.launch/2",
+    "status": "partial-library-read-and-opaque-execution-handoff",
+    "remaining": [
+      "generic-artwork",
+      "revision-checked-edits-and-sync-ownership",
+      "authenticated-user-device-seat-context",
+      "optional-source-management",
+      "optional-async-actions",
+      "change-reconciliation",
+      "durable-execution-recovery"
+    ],
+    "qualification": "real-broker-and-launch-with-two-library-fixtures; separately-built-library-C-ABI; synthetic-session-and-executor-effects; no-host-parity-claim"
+  }
+}

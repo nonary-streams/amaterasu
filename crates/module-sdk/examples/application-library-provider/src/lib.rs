@@ -204,6 +204,9 @@ amaterasu_module_sdk::export_module!(Module);
 mod launch_composition;
 
 #[cfg(test)]
+mod library_composition;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use amaterasu_module_sdk::requests::IncomingRequest;

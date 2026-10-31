@@ -19,3 +19,5 @@ getrandom = "0.3"
 amaterasu-runtime = { path = "../../../runtime" }
 amaterasu-contracts = { path = "../../../contracts" }
 amaterasu-launch = { path = "../../../../modules/launch" }
+example-application-library-v2 = { path = "../application-library-v2", features = ["embedded"] }
+libloading = "0.8"
