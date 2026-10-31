@@ -85,6 +85,7 @@ mod tests {
             },
             arguments: json!({"enabled":true}),
             expected_settings_revision: None,
+            input_reservation_id: None,
         };
         (action, invoke)
     }

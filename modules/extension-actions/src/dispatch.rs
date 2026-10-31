@@ -263,6 +263,7 @@ mod tests {
             },
             arguments: json!({}),
             expected_settings_revision: None,
+            input_reservation_id: None,
         };
         Dispatch::new(request, descriptor, "caller".into(), "initiator".into()).unwrap()
     }
