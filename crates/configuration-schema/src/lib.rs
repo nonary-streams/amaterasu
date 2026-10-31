@@ -47,6 +47,11 @@ pub enum Definition {
         default: Values,
         fields: Fields,
     },
+    TaggedUnion {
+        default: Values,
+        tag: String,
+        variants: BTreeMap<String, Fields>,
+    },
 }
 
 impl Definition {
@@ -59,7 +64,7 @@ impl Definition {
                 .unwrap_or(Value::Null),
             Self::String { default, .. } | Self::Enum { default, .. } => default.clone().into(),
             Self::List { default, .. } => Value::Array(default.clone()),
-            Self::Object { default, .. } => Value::Object(
+            Self::Object { default, .. } | Self::TaggedUnion { default, .. } => Value::Object(
                 default
                     .iter()
                     .map(|(name, value)| (name.clone(), value.clone()))
@@ -112,6 +117,20 @@ impl Definition {
                         object
                             .get(name)
                             .is_some_and(|field_value| definition.accepts(field_value))
+                    })
+            }),
+            Self::TaggedUnion { tag, variants, .. } => value.as_object().is_some_and(|object| {
+                object
+                    .get(tag)
+                    .and_then(Value::as_str)
+                    .and_then(|variant| variants.get(variant))
+                    .is_some_and(|fields| {
+                        object.len() == fields.len() + 1
+                            && fields.iter().all(|(name, definition)| {
+                                object
+                                    .get(name)
+                                    .is_some_and(|value| definition.accepts(value))
+                            })
                     })
             }),
         }
@@ -224,6 +243,24 @@ fn validate_definition(
             }
             defaults_for_fields(fields, depth + 1, remaining_fields, path)?;
         }
+        Definition::TaggedUnion { tag, variants, .. } => {
+            if depth == MAX_SCHEMA_DEPTH {
+                return Err(format!("schema exceeds maximum nesting depth: {path}"));
+            }
+            validate_field_name(tag)?;
+            if variants.is_empty() || variants.len() > MAX_COLLECTION_ITEMS {
+                return Err(format!("invalid tagged union variants: {path}"));
+            }
+            for (variant, fields) in variants {
+                if variant.is_empty() || variant.chars().count() > MAX_STRING_LENGTH {
+                    return Err(format!("invalid tagged union variant: {path}"));
+                }
+                if fields.contains_key(tag) {
+                    return Err(format!("tagged union tag conflicts with field: {path}"));
+                }
+                defaults_for_fields(fields, depth + 1, remaining_fields, path)?;
+            }
+        }
     }
 
     let default = definition.default_value();
@@ -261,6 +298,64 @@ pub fn validate_values(fields: &Fields, values: &Values) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tagged_union_validates_selected_variant_and_round_trips() {
+        let wire = json!({"key": {
+            "type":"tagged_union", "tag":"kind",
+            "default":{"kind":"physical","code":30},
+            "variants":{
+                "physical":{"code":{"type":"integer","default":30,"minimum":0,"maximum":255}},
+                "named":{"name":{"type":"string","default":"Enter","min_length":1,"max_length":32}}
+            }
+        }});
+        let fields: Fields = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&fields).unwrap(), wire);
+        assert_eq!(
+            defaults(&fields).unwrap()["key"],
+            json!({"kind":"physical","code":30})
+        );
+        validate_values(
+            &fields,
+            &serde_json::from_value(json!({"key":{"kind":"named","name":"Escape"}})).unwrap(),
+        )
+        .unwrap();
+        for value in [
+            json!({"kind":"physical","code":256}),
+            json!({"kind":"physical"}),
+            json!({"kind":"named","name":"Enter","code":30}),
+            json!({"kind":"other"}),
+            json!({"kind":1}),
+        ] {
+            assert!(validate_values(&fields, &[("key".into(), value)].into()).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_tagged_union_schemas_and_nested_limits() {
+        for union in [
+            json!({"type":"tagged_union","tag":"kind","default":{"kind":"a"},"variants":{}}),
+            json!({"type":"tagged_union","tag":"kind","default":{"kind":"missing"},"variants":{"a":{}}}),
+            json!({"type":"tagged_union","tag":"kind","default":{"kind":"a"},"variants":{"a":{"kind":{"type":"boolean","default":true}}}}),
+            json!({"type":"tagged_union","tag":"kind","default":{"kind":"a"},"variants":{"a":{},"b":{"bad":{"type":"integer","default":0,"minimum":1}}}}),
+        ] {
+            let fields: Fields = serde_json::from_value(json!({"key": union})).unwrap();
+            assert!(defaults(&fields).is_err());
+        }
+        let mut nested = Definition::Boolean { default: true };
+        for _ in 0..=MAX_SCHEMA_DEPTH {
+            nested = Definition::TaggedUnion {
+                default: [
+                    ("kind".into(), json!("a")),
+                    ("child".into(), nested.default_value()),
+                ]
+                .into(),
+                tag: "kind".into(),
+                variants: [("a".into(), [("child".into(), nested)].into())].into(),
+            };
+        }
+        assert!(defaults(&[("key".into(), nested)].into()).is_err());
+    }
 
     #[test]
     fn preserves_the_schema_wire_format() {
