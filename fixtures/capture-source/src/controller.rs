@@ -1,6 +1,6 @@
 use crate::model::{
-    FPS, FRAME_COUNT, FixtureResult, HEIGHT, MAX_OPENS, MAX_STREAMS, OUTPUT, Operation, WIDTH,
-    frame_bytes, geometry, validate_operation_id,
+    FPS, FRAME_COUNT, FixtureResult, HEIGHT, MAX_OPENS, MAX_STREAMS, OUTPUT, Operation,
+    ResourceCaptureClock, WIDTH, frame_bytes, geometry, validate_operation_id,
 };
 use amaterasu_media::{MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING};
 use amaterasu_module_sdk::abi::{STATUS_OK, Status};
@@ -30,6 +30,7 @@ struct Stream {
     operation_id: Option<String>,
     delivery: Arc<DeliveryState>,
     resource_selected: bool,
+    resource_capture_clock: Option<ResourceCaptureClock>,
 }
 
 /// One exclusively reserved frame. Dropping a rejected delivery permits an
@@ -37,6 +38,7 @@ struct Stream {
 pub struct FrameDelivery {
     pub sequence: u64,
     pub bytes: Vec<u8>,
+    pub resource_clock_epoch: Option<[u8; 16]>,
     delivery: Arc<DeliveryState>,
     global_frames: Arc<AtomicU64>,
     caller_frames: Arc<AtomicU64>,
@@ -85,7 +87,17 @@ impl Controller {
             Operation::Open {
                 output,
                 operation_id,
-            } => return self.open(caller, &output, operation_id),
+                resource_capture_clock,
+                resource_callback_contract,
+            } => {
+                return self.open(
+                    caller,
+                    &output,
+                    operation_id,
+                    resource_capture_clock,
+                    resource_callback_contract,
+                );
+            }
             Operation::Lookup { operation_id } => self.lookup(caller, &operation_id)?,
             Operation::Close { stream } => {
                 self.close(caller, stream)?;
@@ -100,14 +112,30 @@ impl Controller {
         caller: &str,
         output: &str,
         operation_id: Option<String>,
+        resource_capture_clock: Option<ResourceCaptureClock>,
+        resource_callback_contract: Option<String>,
     ) -> FixtureResult<(Value, Option<u64>)> {
+        match (
+            resource_capture_clock.is_some(),
+            resource_callback_contract.as_deref(),
+        ) {
+            (false, None) | (true, Some("cross_service_safe")) => {}
+            _ => return Err("invalid_resource_callback_contract"),
+        }
+        if let Some(clock) = &resource_capture_clock {
+            clock.epoch()?;
+        }
         if let Some(operation) = &operation_id {
             validate_operation_id(operation)?;
             if let Some(id) = self.find_operation(caller, operation) {
-                if output != OUTPUT {
+                let stream = self.streams.get(&id).expect("existing operation");
+                if output != OUTPUT || stream.resource_capture_clock != resource_capture_clock {
                     return Err("operation_conflict");
                 }
-                return Ok((stream_reply(id), None));
+                return Ok((
+                    stream_reply(id, stream.resource_capture_clock.as_ref()),
+                    None,
+                ));
             }
         }
         if output != OUTPUT {
@@ -125,10 +153,11 @@ impl Controller {
                 operation_id,
                 delivery: Arc::new(DeliveryState::default()),
                 resource_selected: false,
+                resource_capture_clock: resource_capture_clock.clone(),
             },
         );
         self.callers.entry(caller.into()).or_default().opened += 1;
-        Ok((stream_reply(id), Some(id)))
+        Ok((stream_reply(id, resource_capture_clock.as_ref()), Some(id)))
     }
 
     fn find_operation(&self, caller: &str, operation: &str) -> Option<u64> {
@@ -141,7 +170,7 @@ impl Controller {
     fn lookup(&self, caller: &str, operation: &str) -> FixtureResult<Value> {
         validate_operation_id(operation)?;
         self.find_operation(caller, operation)
-            .map(stream_reply)
+            .map(|id| stream_reply(id, self.streams[&id].resource_capture_clock.as_ref()))
             .ok_or("not_found")
     }
 
@@ -218,6 +247,10 @@ impl Controller {
         let sequence = stream.delivery.accepted.load(Ordering::SeqCst);
         let delivery = FrameDelivery {
             sequence,
+            resource_clock_epoch: stream
+                .resource_capture_clock
+                .as_ref()
+                .map(|clock| clock.epoch().expect("validated clock")),
             bytes: if sequence < FRAME_COUNT {
                 frame_bytes(sequence)
             } else {
@@ -238,7 +271,7 @@ impl Controller {
             .streams
             .iter()
             .filter(|(_, stream)| stream.owner == caller)
-            .map(|(&id, _)| stream_reply(id))
+            .map(|(&id, stream)| stream_reply(id, stream.resource_capture_clock.as_ref()))
             .collect();
         json!({"ok": true, "enabled": true, "native_supported": true,
             "fixture": true, "test_only": true, "native_capture_qualified": false,
@@ -278,9 +311,14 @@ impl Controller {
     }
 }
 
-fn stream_reply(id: u64) -> Value {
-    json!({"ok": true, "stream": id, "output": OUTPUT,
-        "desktop_geometry": geometry(), "fixture": true, "test_only": true})
+fn stream_reply(id: u64, clock: Option<&ResourceCaptureClock>) -> Value {
+    let mut reply = json!({"ok": true, "stream": id, "output": OUTPUT,
+        "desktop_geometry": geometry(), "fixture": true, "test_only": true});
+    if let Some(clock) = clock {
+        reply["resource_capture_clock"] = json!(clock);
+        reply["resource_callback_contract"] = json!("cross_service_safe");
+    }
+    reply
 }
 
 fn enumerate(offset: Option<usize>, limit: Option<usize>) -> FixtureResult<Value> {

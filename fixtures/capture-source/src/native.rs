@@ -7,9 +7,10 @@ use amaterasu_media::{
     CaptureApiV1_8, CaptureEventSink, CaptureFrameV1_3, CaptureGeometry, CaptureResourceFrame,
     CaptureResourceFrameSink, CaptureResourceOffer, CaptureResourceOfferSink, CpuFrame,
     CpuResourceCapabilities, DmaBufFrameSink, DmaBufLeaseSink, FRAME_ACCESS_CPU,
-    FRAME_OWNERSHIP_RETAINABLE, FRAME_RESOURCE_CPU, FRAME_SYNC_NONE, FrameDescriptor, FrameSink,
-    FreshFrameSinkV1_2, FreshFrameSinkV1_3, INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY,
-    MEDIA_CLOSED, MEDIA_UNSUPPORTED, PIXEL_NV12, PresentationStatus,
+    FRAME_CLOCK_HOST_MONOTONIC, FRAME_OWNERSHIP_RETAINABLE, FRAME_RESOURCE_CPU, FRAME_SYNC_NONE,
+    FrameClockMetadata, FrameDescriptor, FrameSink, FreshFrameSinkV1_2, FreshFrameSinkV1_3,
+    INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_UNSUPPORTED, PIXEL_NV12,
+    PresentationStatus, host_monotonic_micros,
 };
 use amaterasu_module_sdk::abi::{
     AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery, NativeServiceFactory,
@@ -382,6 +383,16 @@ struct CpuLease {
     retained: std::sync::atomic::AtomicUsize,
 }
 
+fn fixture_clock(epoch_id: [u8; 16]) -> FrameClockMetadata {
+    FrameClockMetadata {
+        version: 1,
+        size: size_of::<FrameClockMetadata>() as u32,
+        domain: FRAME_CLOCK_HOST_MONOTONIC,
+        reserved: 0,
+        epoch_id,
+    }
+}
+
 // SAFETY: frame.data points into this lease's immutable boxed byte allocation,
 // which never moves or mutates; the only mutable state is atomic reference accounting.
 unsafe impl Send for CpuLease {}
@@ -476,10 +487,27 @@ unsafe extern "C" fn read_resource_frame(
             return MEDIA_UNSUPPORTED;
         }
         deliver(context, stream, |delivery, frame| {
+            // Rejected deliveries retry the same generated frame and identity.
+            let Some(sequence) = frame.sequence.checked_add(1) else {
+                return MEDIA_BACKEND_ERROR;
+            };
             let bytes = delivery.bytes.clone().into_boxed_slice();
+            // This fixture generates pixels on demand, so this is delivery time,
+            // not a measurement of a physical capture or acquisition event.
+            let (timestamp_us, clock) = if let Some(epoch) = delivery.resource_clock_epoch {
+                let timestamp_us = host_monotonic_micros();
+                if timestamp_us == 0 {
+                    return MEDIA_BACKEND_ERROR;
+                }
+                (timestamp_us, fixture_clock(epoch))
+            } else {
+                (frame.timestamp_us, FrameClockMetadata::default())
+            };
             let lease = Arc::new(CpuLease {
                 frame: CpuFrame {
                     data: bytes.as_ptr(),
+                    timestamp_us,
+                    sequence,
                     ..*frame
                 },
                 _bytes: bytes,
@@ -496,16 +524,16 @@ unsafe extern "C" fn read_resource_frame(
             let offered = CaptureResourceFrame {
                 offer_generation: 1,
                 offer_id: 1,
-                timestamp_us: frame.timestamp_us,
-                capture_pacing_timestamp_us: frame.timestamp_us,
-                sequence: frame.sequence,
+                timestamp_us,
+                capture_pacing_timestamp_us: timestamp_us,
+                sequence,
                 width: WIDTH,
                 height: HEIGHT,
                 freshness: CAPTURE_FRAME_FRESH,
                 reserved: 0,
                 color: Default::default(),
-                clock: Default::default(),
-                pacing_clock: Default::default(),
+                clock,
+                pacing_clock: clock,
                 resource,
                 acquire_sync: none_descriptor(),
                 context: Arc::as_ptr(&lease).cast_mut().cast(),

@@ -4,6 +4,7 @@ mod custom_video;
 mod hardware;
 mod opus;
 mod pipewire;
+mod source_video;
 mod transport;
 
 use amaterasu_media::{
@@ -19,6 +20,7 @@ struct Probe {
     opus: Option<opus::OpusProbe>,
     control: Option<control::ControlProbe>,
     custom_video: Option<custom_video::CustomVideoProbe>,
+    source_video: Option<source_video::SourceVideoProbe>,
     hardware: Option<hardware::HardwareVideoProbe>,
     pipewire: Option<pipewire::CaptureProbe>,
     pipewire_control: Option<pipewire::ControlStatusProbe>,
@@ -35,6 +37,7 @@ impl ManagedModule for Probe {
             opus: None,
             control: None,
             custom_video: None,
+            source_video: None,
             hardware: None,
             pipewire: None,
             pipewire_control: None,
@@ -42,6 +45,12 @@ impl ManagedModule for Probe {
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
+        if let Some(probe) = &mut self.source_video {
+            if probe.tick(&self.runtime)? {
+                self.source_video = None;
+            }
+            return Ok(());
+        }
         if let Some(probe) = &mut self.custom_video {
             if probe.tick(&self.runtime)? {
                 self.custom_video = None;
@@ -103,6 +112,35 @@ impl ManagedModule for Probe {
                 if payload["action"] == "custom_video" {
                     self.custom_video =
                         Some(custom_video::CustomVideoProbe::start(&self.runtime, id)?);
+                    return Ok(());
+                }
+                if payload["action"] == "source_video" {
+                    self.source_video =
+                        Some(source_video::SourceVideoProbe::start(&self.runtime, id)?);
+                    return Ok(());
+                }
+                if payload["action"] == "generic_encoder_video" {
+                    self.source_video = Some(source_video::SourceVideoProbe::start_generic(
+                        &self.runtime,
+                        id,
+                    )?);
+                    return Ok(());
+                }
+                if payload["action"] == "source_video_foreign_receive" {
+                    let stream = payload["stream"].as_u64().ok_or("missing stream")?;
+                    let status = source_video::foreign_receive(&self.runtime, stream)?;
+                    return self.runtime.require_success(Command::Complete {
+                        request: id,
+                        payload: serde_json::json!({"status": status}),
+                    });
+                }
+                if payload["action"] == "source_video_foreign_close" {
+                    let stream = payload["stream"].as_u64().ok_or("missing stream")?;
+                    self.source_video = Some(source_video::SourceVideoProbe::foreign_close(
+                        &self.runtime,
+                        id,
+                        stream,
+                    )?);
                     return Ok(());
                 }
                 if payload["action"] == "control_echo" {

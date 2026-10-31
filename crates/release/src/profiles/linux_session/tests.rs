@@ -236,9 +236,45 @@ fn explicitly_enabled_virtual_displays_select_a_stream_owned_output() {
         "amaterasu-owned-display"
     );
     assert_eq!(
+        streaming_settings(&options)["capture"]["capture_provider"],
+        "vkms"
+    );
+    let physical = LinuxSessionOptions {
+        capture_output: "card0-HDMI-A-1".into(),
+        ..options
+    };
+    assert_eq!(
+        streaming_settings(&physical)["capture"]["capture_provider"],
+        "kms"
+    );
+    assert_eq!(
+        streaming_settings(&physical)["capture"]["output"],
+        "card0-HDMI-A-1"
+    );
+    assert_eq!(
         streaming_settings(&LinuxSessionOptions::default())["capture"]["output"],
         "portal-selected-session-source"
     );
+}
+
+#[test]
+fn owned_display_defaults_to_registered_plugin_without_implicitly_granting_authority() {
+    let options = LinuxSessionOptions {
+        enable_capture: true,
+        enable_virtual_display: true,
+        ..Default::default()
+    };
+    let root = local_parity::TemporaryRoot::new("default-virtual-screen");
+    let policy = linux_session_policy(root.path(), &options).unwrap();
+    assert_eq!(
+        policy.settings["amaterasu.nvhttp"]["streaming"]["capture"]["capture_provider"],
+        "vkms"
+    );
+    assert_eq!(
+        policy.settings[VIDEO_COMPONENT_ID]["capture_providers"],
+        json!(["kms", "pipewire", "vkms"])
+    );
+    assert_eq!(policy.settings["amaterasu.capture-vkms"]["enabled"], false);
 }
 
 #[test]
@@ -502,7 +538,7 @@ fn opt_in_virtual_screen_alias_matches_bootstrap_and_retains_provider_grants() {
 }
 
 #[test]
-fn package_capture_authority_requires_explicit_scoped_virtual_screen_options() {
+fn package_capture_authority_requires_scoped_owned_display_options() {
     let parse = |values: &[&str]| LinuxSessionOptions::from_arguments(&arguments(values));
     let helper = "/opt/amaterasu/artifacts/amaterasu-vkms-frame-helper";
     let base = [
@@ -517,12 +553,45 @@ fn package_capture_authority_requires_explicit_scoped_virtual_screen_options() {
     assert_eq!(options.capture_authority_card, 0);
     assert!(options.frame_helper.is_none());
 
+    let default_options = parse(&[
+        "--enable-capture",
+        "--enable-virtual-display",
+        "--capture-authority-helper",
+        helper,
+        "--capture-authority-card",
+        "3",
+    ])
+    .unwrap();
+    assert_eq!(
+        streaming_settings(&default_options)["capture"]["capture_provider"],
+        "vkms"
+    );
+    assert_eq!(default_options.capture_authority_card, 3);
+    assert_eq!(
+        vkms_capture_settings(&default_options)["authority_channel"],
+        true
+    );
+
     let mut scoped = base.to_vec();
     scoped.extend(["--capture-authority-card", "63"]);
     assert_eq!(parse(&scoped).unwrap().capture_authority_card, 63);
 
     for values in [
         vec!["--capture-authority-helper", helper],
+        vec!["--enable-capture", "--capture-authority-helper", helper],
+        vec![
+            "--enable-virtual-display",
+            "--capture-authority-helper",
+            helper,
+        ],
+        vec![
+            "--enable-capture",
+            "--enable-virtual-display",
+            "--capture-output",
+            "card0-HDMI-A-1",
+            "--capture-authority-helper",
+            helper,
+        ],
         vec!["--capture-authority-card", "0"],
         vec!["--capture-authority-card", "1"],
         vec!["--frame-helper", helper, "--capture-authority-card", "0"],
@@ -653,6 +722,15 @@ fn programmatic_capture_authority_options_preserve_validation() {
             ..valid.clone()
         }
         .validate()
+        .is_ok()
+    );
+    assert!(
+        LinuxSessionOptions {
+            enable_virtual_screen_capture: false,
+            enable_capture: false,
+            ..valid.clone()
+        }
+        .validate()
         .is_err()
     );
     assert!(
@@ -682,7 +760,7 @@ fn package_authority_profile_uses_only_the_inherited_channel() {
             "enabled": true,
             "capture_principals": [VIDEO_COMPONENT_ID],
             "authority_channel": true,
-            "gpu_snapshot": true,
+            "gpu_snapshot": false,
         })
     );
     assert!(

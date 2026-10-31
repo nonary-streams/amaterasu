@@ -111,11 +111,11 @@ imported again with the console `import_identity` call, or created by `initializ
 | `--management-port PORT` | Enables the management API on `127.0.0.1:PORT` (1024 or higher). Needs a staged web bundle (`pack-web`/`stage-web`). |
 | `--capture-output ID` | The KMS output Moonlight streams. Default `amaterasu-managed-output`, which deliberately matches no physical output. |
 | `--audio-endpoint NAME` | Audio endpoint selector passed to the audio module. Default `default`. |
-| `--enable-capture` | Enables the video module and KMS capture (`capture_providers=["kms"]`). |
+| `--enable-capture` | Enables the video module and KMS capture. |
 | `--enable-audio` | Enables host audio capture. |
-| `--enable-virtual-display` | Enables the owned virtual display provider. |
-| `--enable-virtual-screen-capture` | Selects the VKMS capture plugin for owned virtual screens. Requires `--enable-capture`, `--enable-virtual-display`, the default capture output, and one helper mode below. |
-| `--capture-authority-helper ABSOLUTE_SOURCE` | Packages helper bytes and requests broker-mediated authority for the capture plugin. Requires `--enable-virtual-screen-capture`; enables immutable GPU snapshots in the generated provider settings. This declares a request, not an approval or installation. |
+| `--enable-virtual-display` | Enables the owned virtual display provider and defaults its capture to the VKMS plugin when no physical output is specified. Capture still requires a configured and authorized helper. |
+| `--enable-virtual-screen-capture` | Selects the existing `virtual_screen` alias for the VKMS plugin and requires `--enable-capture`, `--enable-virtual-display`, the default capture output, and one helper mode below. |
+| `--capture-authority-helper ABSOLUTE_SOURCE` | Packages helper bytes and requests broker-mediated authority for the capture plugin. Requires `--enable-capture`, `--enable-virtual-display`, and the default capture output. This declares a request, not an approval or installation. |
 | `--capture-authority-card CARD` | Exact DRM card scope for the packaged request, from 0 through 63; default 0. Requires `--capture-authority-helper`, including when CARD is explicitly 0. |
 | `--frame-helper ABSOLUTE_PATH` | Legacy direct-helper mode, mutually exclusive with `--capture-authority-helper`. The root-owned capability-bearing executable must already be installed and authorized separately; it is independent of package approval. |
 | `--enable-input` | Sets `amaterasu.input` `allow_injection=true` and stream-session `enable_input=true`. A relative pointer can leave an owned screen and move the live cursor; keep this off on a shared desktop. |
@@ -127,9 +127,9 @@ value stops `init-linux-session` before it creates anything.
 ### Package-approved virtual-screen capture
 
 For the package authority mode, also build `amaterasu-capture-vkms` with
-`linux-kwin-geometry,linux-gpu-snapshot`, plus `amaterasu-vkms-frame-helper` and
+`linux-kwin-geometry`, plus `amaterasu-vkms-frame-helper` and
 `amaterasu-capture-authority`. Build the helper separately from
-`modules/capture-vkms/helper-wire/Cargo.toml`. The snapshot feature needs the EGL/GBM build
+`modules/capture-vkms/helper-wire/Cargo.toml`. The optional `linux-gpu-snapshot` feature needs the EGL/GBM build
 prerequisites and a usable GPU render node at runtime. The normal profile build
 must include every component in its composition; the helper and broker are
 separate binaries.
@@ -137,8 +137,8 @@ separate binaries.
 `init-linux-session` records the local helper source in
 `capture-authority-package.json`. `pack-linux-session` copies those bytes into
 the signed package and records the exact helper digest, component and card
-scope. The new mode sets `authority_channel:true` and `gpu_snapshot:true`; a
-missing approved channel or snapshot implementation is an explicit availability
+scope. The new mode sets `authority_channel:true` and `gpu_snapshot:false`; a
+missing approved channel is an explicit availability
 failure and does not fall back to the legacy helper.
 
 Run `capture-authority-review` to inspect the verified publisher, package,
@@ -209,9 +209,14 @@ Authentication has its own authorization generation (9). Advance it with any
 change to the administrator principals or allowed scopes, including a revert;
 TTL edits do not need it.
 
-Capture is `amaterasu.capture-kms` through the video component
-`amaterasu.linux-session-video`. The one capture library serves both physical KMS
-outputs and managed virtual outputs.
+The video component `amaterasu.linux-session-video` uses `amaterasu.capture-kms`
+for an explicitly named physical output. With an owned virtual display and the
+default output, it selects the independently built `amaterasu.capture-vkms`
+plugin. Without a configured helper that plugin remains disabled and the
+virtual capture is unavailable; it does not silently fall back to PipeWire.
+Without an owned display, the default is the user-selected PipeWire source.
+The default provider identity is `vkms`; profiles explicitly configured with
+`--enable-virtual-screen-capture` retain their existing `virtual_screen` alias.
 
 ## First stream
 

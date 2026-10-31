@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{FRAME_COUNT, OUTPUT, Operation, frame_bytes};
+use crate::model::{FRAME_COUNT, OUTPUT, Operation, ResourceCaptureClock, frame_bytes};
 use amaterasu_media::{CAPTURE_INTERFACE_MINOR, CaptureApi};
 
 struct TestBinding(*const CaptureApi);
@@ -68,6 +68,8 @@ fn setup() -> (SharedController, Box<Factory>, u64) {
             Operation::Open {
                 output: OUTPUT.into(),
                 operation_id: Some("capture-operation".into()),
+                resource_capture_clock: Some(test_clock("11111111111111111111111111111111")),
+                resource_callback_contract: Some("cross_service_safe".into()),
             },
         )
         .unwrap()
@@ -75,6 +77,13 @@ fn setup() -> (SharedController, Box<Factory>, u64) {
         .unwrap();
     let factory = Factory::new(controller.clone());
     (controller, factory, id)
+}
+
+fn test_clock(epoch_id: &str) -> ResourceCaptureClock {
+    ResourceCaptureClock {
+        domain: "host_monotonic".into(),
+        epoch_id: epoch_id.into(),
+    }
 }
 
 #[derive(Default)]
@@ -339,6 +348,8 @@ struct ResourceProbe {
     retained: Option<CaptureResourceFrame>,
     status: Status,
     sequences: Vec<u64>,
+    clocks: Vec<(u64, [u8; 16])>,
+    controller: Option<SharedController>,
 }
 
 unsafe extern "C" fn inspect_offer(
@@ -347,6 +358,12 @@ unsafe extern "C" fn inspect_offer(
 ) -> Status {
     // SAFETY: the test passes a live probe and the provider supplies a borrowed offer.
     let probe = unsafe { &mut *context.cast::<ResourceProbe>() };
+    if let Some(controller) = &probe.controller {
+        assert!(
+            controller.try_lock().is_ok(),
+            "offer callback must not hold the controller lock"
+        );
+    }
     let offer = unsafe { &*offer };
     assert_eq!(offer.resource.kind, FRAME_RESOURCE_CPU);
     assert_eq!(offer.resource.version, 1);
@@ -377,6 +394,12 @@ unsafe extern "C" fn inspect_resource(
 ) -> Status {
     // SAFETY: probe and borrowed frame are valid for the synchronous callback.
     let probe = unsafe { &mut *context.cast::<ResourceProbe>() };
+    if let Some(controller) = &probe.controller {
+        assert!(
+            controller.try_lock().is_ok(),
+            "frame callback must not hold the controller lock"
+        );
+    }
     let frame = unsafe { &*frame };
     assert_eq!((frame.offer_generation, frame.offer_id), (1, 1));
     assert_eq!(
@@ -385,16 +408,38 @@ unsafe extern "C" fn inspect_resource(
     );
     assert_eq!(frame.acquire_sync.kind, FRAME_SYNC_NONE);
     assert_eq!((frame.color.version, frame.color.size), (0, 0));
-    assert_eq!((frame.clock.version, frame.clock.size), (0, 0));
     assert_eq!(
-        (frame.pacing_clock.version, frame.pacing_clock.size),
-        (0, 0)
+        (
+            frame.clock.version,
+            frame.clock.size,
+            frame.clock.domain,
+            frame.clock.reserved
+        ),
+        (
+            1,
+            size_of::<FrameClockMetadata>() as u32,
+            FRAME_CLOCK_HOST_MONOTONIC,
+            0
+        )
     );
+    assert_ne!(frame.clock.epoch_id, [0; 16]);
+    assert_eq!(frame.pacing_clock.version, frame.clock.version);
+    assert_eq!(frame.pacing_clock.size, frame.clock.size);
+    assert_eq!(frame.pacing_clock.domain, frame.clock.domain);
+    assert_eq!(frame.pacing_clock.reserved, 0);
+    assert_eq!(frame.pacing_clock.epoch_id, frame.clock.epoch_id);
+    assert_eq!(frame.capture_pacing_timestamp_us, frame.timestamp_us);
+    assert!(frame.timestamp_us > 0 && frame.timestamp_us <= host_monotonic_micros());
     // SAFETY: the CPU frame descriptor is valid and immutable during this call.
     let cpu = unsafe { &*frame.resource.data.cast::<CpuFrame>() };
     assert_eq!(cpu.validate(), Ok(()));
     assert_eq!(cpu.sequence, frame.sequence);
+    assert_ne!(frame.sequence, 0);
+    assert_eq!(cpu.timestamp_us, frame.timestamp_us);
     probe.sequences.push(frame.sequence);
+    probe
+        .clocks
+        .push((frame.timestamp_us, frame.clock.epoch_id));
     if probe.status == STATUS_OK && probe.retained.is_none() {
         // SAFETY: the provider holds its reference during this callback.
         assert_eq!(unsafe { (frame.retain)(frame.context) }, STATUS_OK);
@@ -412,7 +457,10 @@ fn resource_negotiation_is_owned_and_leases_keep_accepted_pixels_immutable() {
     let api = unsafe { &*owner.0.cast::<CaptureApiV1_8>() };
     let wrong_api = unsafe { &*wrong.0.cast::<CaptureApiV1_8>() };
     let context = api.base.base.base.context;
-    let mut probe = ResourceProbe::default();
+    let mut probe = ResourceProbe {
+        controller: Some(controller.clone()),
+        ..Default::default()
+    };
     let sink = CaptureResourceFrameSink {
         context: (&mut probe as *mut ResourceProbe).cast(),
         write: inspect_resource,
@@ -456,7 +504,13 @@ fn resource_negotiation_is_owned_and_leases_keep_accepted_pixels_immutable() {
         assert_eq!((api.read_resource_frame)(context, id, sink), STATUS_OK);
         assert_eq!((api.read_resource_frame)(context, id, sink), STATUS_OK);
     }
-    assert_eq!(probe.sequences, [0, 0, 1]);
+    assert_eq!(probe.sequences, [1, 1, 2]);
+    assert!(
+        probe
+            .clocks
+            .windows(2)
+            .all(|pair| pair[0].0 <= pair[1].0 && pair[0].1 == pair[1].1)
+    );
     let retained = probe.retained.take().unwrap();
     controller
         .lock()
@@ -474,4 +528,113 @@ fn resource_negotiation_is_owned_and_leases_keep_accepted_pixels_immutable() {
         MEDIA_CLOSED
     );
     assert_eq!(controller.lock().unwrap().metrics()["frames"], 2);
+}
+
+#[test]
+fn generic_streams_use_agreed_epochs_while_legacy_timestamps_remain_relative() {
+    let (controller, factory, first) = setup();
+    let second = controller
+        .lock()
+        .unwrap()
+        .handle(
+            "amaterasu.video",
+            Operation::Open {
+                output: OUTPUT.into(),
+                operation_id: Some("second-operation".into()),
+                resource_capture_clock: Some(test_clock("22222222222222222222222222222222")),
+                resource_callback_contract: Some("cross_service_safe".into()),
+            },
+        )
+        .unwrap()
+        .1
+        .unwrap();
+    let binding = TestBinding::new(&factory, b"amaterasu.video");
+    // SAFETY: the binding advertises v1.8 and remains live for this test.
+    let api = unsafe { &*binding.0.cast::<CaptureApiV1_8>() };
+    let context = api.base.base.base.context;
+    let mut probe = ResourceProbe::default();
+    let sink = CaptureResourceFrameSink {
+        context: (&mut probe as *mut ResourceProbe).cast(),
+        write: inspect_resource,
+    };
+    let before = host_monotonic_micros();
+    // SAFETY: stream IDs, binding and synchronous sink remain valid throughout the calls.
+    unsafe {
+        assert_eq!((api.select_resource)(context, first, 1, 1), STATUS_OK);
+        assert_eq!((api.select_resource)(context, second, 1, 1), STATUS_OK);
+        assert_eq!((api.read_resource_frame)(context, first, sink), STATUS_OK);
+        assert_eq!((api.read_resource_frame)(context, second, sink), STATUS_OK);
+    }
+    let after = host_monotonic_micros();
+    assert_eq!(probe.sequences, [1, 1]);
+    assert!(
+        before <= probe.clocks[0].0
+            && probe.clocks[0].0 <= probe.clocks[1].0
+            && probe.clocks[1].0 <= after
+    );
+    assert_eq!(probe.clocks[0].1, [0x11; 16]);
+    assert_eq!(probe.clocks[1].1, [0x22; 16]);
+    let retained = probe.retained.take().unwrap();
+    // SAFETY: release consumes the reference acquired by inspect_resource.
+    unsafe { (retained.release)(retained.context, &none_descriptor()) };
+    let mut legacy = CopiedFrames::default();
+    assert_eq!(binding.read(first, &mut legacy), STATUS_OK);
+    assert_eq!(
+        (legacy.frames[0].0, legacy.frames[0].1),
+        (1, 1_000_000 / FPS)
+    );
+}
+
+unsafe extern "C" fn inspect_unnegotiated_clock(
+    _context: *mut c_void,
+    frame: *const CaptureResourceFrame,
+) -> Status {
+    // SAFETY: the provider supplies the frame and CPU descriptor during this callback.
+    let frame = unsafe { &*frame };
+    let cpu = unsafe { &*frame.resource.data.cast::<CpuFrame>() };
+    assert_eq!(
+        (
+            frame.clock.version,
+            frame.clock.size,
+            frame.pacing_clock.version
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!((frame.timestamp_us, cpu.timestamp_us), (0, 0));
+    assert_eq!((frame.sequence, cpu.sequence), (1, 1));
+    STATUS_OK
+}
+
+#[test]
+fn generic_without_clock_agreement_keeps_unknown_clock() {
+    let controller = Arc::new(Mutex::new(Controller::default()));
+    let id = controller
+        .lock()
+        .unwrap()
+        .handle(
+            "amaterasu.video",
+            Operation::Open {
+                output: OUTPUT.into(),
+                operation_id: None,
+                resource_capture_clock: None,
+                resource_callback_contract: None,
+            },
+        )
+        .unwrap()
+        .1
+        .unwrap();
+    let factory = Factory::new(controller);
+    let binding = TestBinding::new(&factory, b"amaterasu.video");
+    // SAFETY: binding advertises v1.8 and remains live through calls.
+    let api = unsafe { &*binding.0.cast::<CaptureApiV1_8>() };
+    let context = api.base.base.base.context;
+    let sink = CaptureResourceFrameSink {
+        context: std::ptr::null_mut(),
+        write: inspect_unnegotiated_clock,
+    };
+    // SAFETY: the live binding and synchronous sink are valid.
+    unsafe {
+        assert_eq!((api.select_resource)(context, id, 1, 1), STATUS_OK);
+        assert_eq!((api.read_resource_frame)(context, id, sink), STATUS_OK);
+    }
 }

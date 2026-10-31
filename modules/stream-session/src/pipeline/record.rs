@@ -268,6 +268,9 @@ impl Record {
                 .expect("resolved audio endpoint")
                 .as_bytes()
                 .to_vec()
+        } else if let Some(source_id) = start.source_id {
+            serde_json::to_vec(&(&start.encoder_provider, source_id))
+                .expect("bounded source identity")
         } else {
             serde_json::to_vec(&(&start.capture_provider, start.constant_rate, &start.output))
                 .expect("bounded configuration")
@@ -326,6 +329,8 @@ impl Record {
             "history_activity_id": self.config.history_activity_id,
             "rtsp_operation_id": self.config.rtsp_operation_id,
             "state": self.state,
+            "encoder_provider": self.start.as_ref().and_then(|start| start.encoder_provider.as_deref()),
+            "source_id": self.start.as_ref().and_then(|start| start.source_id),
             "client_feature_flags": self.start.as_ref().and_then(|start| start.client_feature_flags),
             "haptics_pcm_negotiated": self.start.as_ref().is_some_and(|start| {
                 start.client_feature_flags.is_some_and(|flags| {
@@ -426,10 +431,28 @@ impl Record {
             }
             Resource::Video => {
                 let start = self.start.as_ref().expect("validated start workflow");
-                json!({"action":"open","capture_provider":start.capture_provider,"output":self.virtual_display_output.as_deref().unwrap_or(&start.output),
-                    "constant_rate":start.constant_rate,"minimum_fps_target":start.minimum_fps_target,
-                    "wgc_pacing_smoothing":start.wgc_pacing_smoothing,"encoder":start.encoder,
-                    "configuration":start.configuration,"packet_boundaries":true})
+                let mut payload = json!({"action":"open", "encoder":start.encoder,
+                    "configuration":start.configuration,"packet_boundaries":true});
+                if let Some(alias) = &start.encoder_provider {
+                    payload["encoder_provider"] = json!(alias);
+                }
+                if let Some(options) = &start.encoder_options {
+                    payload["encoder_options"] = options.clone();
+                }
+                if let Some(source_id) = start.source_id {
+                    payload["source_id"] = json!(source_id);
+                } else {
+                    payload["capture_provider"] = json!(start.capture_provider);
+                    payload["output"] = json!(
+                        self.virtual_display_output
+                            .as_deref()
+                            .unwrap_or(&start.output)
+                    );
+                    payload["constant_rate"] = json!(start.constant_rate);
+                    payload["minimum_fps_target"] = json!(start.minimum_fps_target);
+                    payload["wgc_pacing_smoothing"] = json!(start.wgc_pacing_smoothing);
+                }
+                payload
             }
             Resource::AudioCapture => {
                 let start = self.start.as_ref().expect("validated start workflow");

@@ -858,7 +858,7 @@ fn is_default_qp(value: &i32) -> bool {
 }
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct StartConfig {
+pub struct StartConfigData {
     #[serde(default)]
     pub capture_provider: CaptureProvider,
     #[serde(default)]
@@ -919,12 +919,78 @@ pub struct StartConfig {
     pub virtual_sink: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<u32>,
+    #[serde(default)]
     pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_options: Option<serde_json::Value>,
     pub encoder: EncoderSelection,
     pub configuration: VideoConfiguration,
     pub audio_endpoint: String,
     #[serde(default)]
     pub host_audio_enabled: bool,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct StartConfig(StartConfigData);
+
+impl Serialize for StartConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut value = serde_json::to_value(&self.0).map_err(serde::ser::Error::custom)?;
+        if self.source_id.is_some() {
+            let object = value
+                .as_object_mut()
+                .expect("start configuration is an object");
+            for field in [
+                "capture_provider",
+                "output",
+                "constant_rate",
+                "minimum_fps_target",
+                "wgc_pacing_smoothing",
+            ] {
+                object.remove(field);
+            }
+        }
+        value.serialize(serializer)
+    }
+}
+
+impl std::ops::Deref for StartConfig {
+    type Target = StartConfigData;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for StartConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl<'de> Deserialize<'de> for StartConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("source_id").is_some_and(|id| !id.is_null()) {
+            for field in [
+                "capture_provider",
+                "output",
+                "constant_rate",
+                "minimum_fps_target",
+                "wgc_pacing_smoothing",
+            ] {
+                if value.get(field).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "source mode cannot specify capture options",
+                    ));
+                }
+            }
+        }
+        serde_json::from_value(value)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl StartConfig {
@@ -964,6 +1030,32 @@ impl StartConfig {
 
     pub fn validate(&self, stream_audio: bool) -> Result<(), &'static str> {
         self.encoder.validate()?;
+        if self.encoder_provider.as_deref().is_some_and(|alias| {
+            alias.is_empty()
+                || alias.len() > 64
+                || !alias.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'-')
+                })
+        }) {
+            return Err("invalid_encoder_provider");
+        }
+        if self.encoder_options.as_ref().is_some_and(|options| {
+            self.encoder_provider.is_none()
+                || !options.is_object()
+                || serde_json::to_vec(options).map_or(true, |bytes| bytes.len() > 64 * 1024)
+        }) {
+            return Err("invalid_encoder_options");
+        }
+        if let Some(source_id) = self.source_id {
+            if source_id == 0 || self.encoder_provider.is_none() {
+                return Err("invalid_encoder_source");
+            }
+            if !matches!(self.encoder, EncoderSelection::Identity(_)) {
+                return Err("source_encoder_identity_required");
+            }
+        }
         if self.continuous_audio == Some(true) && !stream_audio {
             return Err("continuous_audio_requires_stream_audio");
         }
@@ -1009,7 +1101,7 @@ impl StartConfig {
         if self.constant_rate && self.capture_provider != CaptureProvider::Wgc {
             return Err("constant_rate_requires_wgc");
         }
-        if !valid_label(&self.output, 512)
+        if (self.source_id.is_none() && !valid_label(&self.output, 512))
             || (!self.audio_endpoint.is_empty() && !valid_label(&self.audio_endpoint, 4096))
             || !self.configuration.valid()
         {
@@ -1897,5 +1989,78 @@ mod tests {
             serde_json::from_value::<Operation>(json!({"action":"status","owner":"forged"}))
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod encoder_source_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn source() -> serde_json::Value {
+        json!({"source_id":42,"encoder_provider":"fixture","encoder":{"clsid":"source","friendly_name":"Source","hardware_url":null},"configuration":{"width":1280,"height":720,"fps":60,"bitrate":10000000},"audio_endpoint":"default"})
+    }
+
+    #[test]
+    fn source_round_trips_and_requires_authorizable_identity() {
+        let config: StartConfig = serde_json::from_value(source()).unwrap();
+        assert!(config.validate(true).is_ok());
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert!(encoded.get("capture_provider").is_none());
+        assert!(
+            serde_json::from_value::<StartConfig>(encoded)
+                .unwrap()
+                .validate(true)
+                .is_ok()
+        );
+        for field in [
+            "capture_provider",
+            "output",
+            "constant_rate",
+            "minimum_fps_target",
+            "wgc_pacing_smoothing",
+        ] {
+            let mut request = source();
+            request[field] = json!(null);
+            assert!(serde_json::from_value::<StartConfig>(request).is_err());
+        }
+        for options in [
+            json!([]),
+            json!("invalid"),
+            json!({"large": "x".repeat(65536)}),
+        ] {
+            let mut request = source();
+            request["encoder_options"] = options;
+            assert_eq!(
+                serde_json::from_value::<StartConfig>(request)
+                    .unwrap()
+                    .validate(true),
+                Err("invalid_encoder_options")
+            );
+        }
+        let mut without_provider = source();
+        without_provider["encoder_options"] = json!({});
+        without_provider["encoder_provider"] = json!(null);
+        assert_eq!(
+            serde_json::from_value::<StartConfig>(without_provider)
+                .unwrap()
+                .validate(true),
+            Err("invalid_encoder_options")
+        );
+        for (field, value) in [
+            ("source_id", json!(0)),
+            ("encoder_provider", json!("bad/service")),
+            ("encoder_provider", json!(null)),
+            ("encoder", json!(0)),
+        ] {
+            let mut request = source();
+            request[field] = value;
+            assert!(
+                serde_json::from_value::<StartConfig>(request)
+                    .unwrap()
+                    .validate(true)
+                    .is_err()
+            );
+        }
     }
 }

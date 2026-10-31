@@ -332,7 +332,7 @@ output.
 Use `--capture-authority-helper ABSOLUTE_SOURCE` and optionally
 `--capture-authority-card CARD` to package the helper and declare an exact signed
 request for frame export. The generated provider selects `authority_channel:true`
-and `gpu_snapshot:true`. The protected broker launches the approved unprivileged
+and `gpu_snapshot:false`. The protected broker launches the approved unprivileged
 worker and the host injects its private channel; user policy cannot name an
 authoritative descriptor. Build capture-vkms with
 `linux-kwin-geometry` for this mode. The default build uses the existing `WAIT_PRESENT` / `GET_FRAME` driver ABI

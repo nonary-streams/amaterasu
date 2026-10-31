@@ -93,7 +93,7 @@ impl fmt::Display for OptionError {
                 "--capture-authority-card expects a DRM card number from 0 through 63, got {value:?}"
             ),
             Self::CaptureAuthorityRequirements => formatter.write_str(
-                "--capture-authority-helper requires --enable-virtual-screen-capture"
+                "--capture-authority-helper requires --enable-capture, --enable-virtual-display, and the default capture output"
             ),
             Self::CaptureAuthorityCardWithoutHelper => formatter.write_str(
                 "--capture-authority-card requires --capture-authority-helper"
@@ -452,7 +452,11 @@ impl LinuxSessionOptions {
         if self.capture_authority_helper.is_some() && self.frame_helper.is_some() {
             return Err(OptionError::ConflictingCaptureHelpers);
         }
-        if self.capture_authority_helper.is_some() && !self.enable_virtual_screen_capture {
+        if self.capture_authority_helper.is_some()
+            && (!self.enable_capture
+                || !self.enable_virtual_display
+                || self.capture_output != DEFAULT_CAPTURE_OUTPUT)
+        {
             return Err(OptionError::CaptureAuthorityRequirements);
         }
         if self.capture_authority_helper.is_none() && self.capture_authority_card != 0 {

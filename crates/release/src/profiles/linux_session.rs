@@ -106,9 +106,8 @@ const LINUX_SESSION_LAUNCH: ComponentDefinition = ComponentDefinition {
 };
 
 /// Video supports explicitly selected KMS outputs and captures owned virtual
-/// outputs as DMA-BUF scanout through
-/// capture-vkms when its frame helper is usable, and otherwise through a
-/// current-user PipeWire stream (KWin ScreenCast or the portal).
+/// outputs as DMA-BUF scanout through capture-vkms. PipeWire remains available
+/// for explicitly selected current-user capture.
 const LINUX_SESSION_VIDEO: ComponentDefinition = ComponentDefinition {
     id: VIDEO_COMPONENT_ID,
     calls: &[
@@ -532,7 +531,7 @@ fn vkms_capture_settings(options: &LinuxSessionOptions) -> Value {
             "enabled": options.enable_capture,
             "capture_principals": [VIDEO_COMPONENT_ID],
             "authority_channel": true,
-            "gpu_snapshot": true,
+            "gpu_snapshot": false,
         });
     }
     match &options.frame_helper {
@@ -579,7 +578,7 @@ fn nvhttp_settings(options: &LinuxSessionOptions) -> Value {
 fn streaming_settings(options: &LinuxSessionOptions) -> Value {
     json!({
         "capture": {
-            "capture_provider": if options.enable_virtual_screen_capture { "virtual_screen" } else if options.capture_output == options::DEFAULT_CAPTURE_OUTPUT { "pipewire" } else { "kms" },
+            "capture_provider": if options.capture_output != options::DEFAULT_CAPTURE_OUTPUT { "kms" } else if options.enable_virtual_screen_capture { "virtual_screen" } else if options.enable_virtual_display { "vkms" } else { "pipewire" },
             "output": if options.capture_output != options::DEFAULT_CAPTURE_OUTPUT { options.capture_output.as_str() } else if options.enable_virtual_display { "amaterasu-owned-display" } else { "portal-selected-session-source" },
             // Automatic selection lets the video module open a hardware
             // encoder for whichever codec the client negotiates, then the

@@ -1,5 +1,86 @@
 use super::*;
 
+#[test]
+fn open_clock_agreement_is_validated_owned_and_idempotent() {
+    let mut controller = Controller::default();
+    let request = |epoch: &str| {
+        json!({"action":"open", "output":OUTPUT,
+        "operation_id":"clock-test", "resource_callback_contract":"cross_service_safe", "resource_capture_clock": {
+            "domain":"host_monotonic", "epoch_id":epoch}})
+    };
+    let parse = |value| serde_json::from_value::<Operation>(value).unwrap();
+    let token = "0123456789abcdef0123456789abcdef";
+    let (reply, created) = controller.handle("owner", parse(request(token))).unwrap();
+    assert!(created.is_some());
+    assert_eq!(reply["resource_callback_contract"], "cross_service_safe");
+    assert_eq!(
+        reply["resource_capture_clock"],
+        request(token)["resource_capture_clock"]
+    );
+    let (retry, created) = controller.handle("owner", parse(request(token))).unwrap();
+    assert_eq!(retry, reply);
+    assert_eq!(created, None);
+    assert_eq!(
+        controller.handle("owner", parse(request("11111111111111111111111111111111"))),
+        Err("operation_conflict")
+    );
+    let (other, _) = controller
+        .handle("other", parse(request("11111111111111111111111111111111")))
+        .unwrap();
+    assert_ne!(other["stream"], reply["stream"]);
+    let lookup = controller
+        .handle(
+            "owner",
+            Operation::Lookup {
+                operation_id: "clock-test".into(),
+            },
+        )
+        .unwrap()
+        .0;
+    assert_eq!(
+        lookup["resource_capture_clock"],
+        reply["resource_capture_clock"]
+    );
+    for invalid in [
+        "",
+        "00000000000000000000000000000000",
+        "ABCDEF0123456789abcdef0123456789",
+        "gggggggggggggggggggggggggggggggg",
+    ] {
+        assert_eq!(
+            controller.handle("bad", parse(request(invalid))),
+            Err("invalid_resource_capture_clock")
+        );
+    }
+    let mut wrong_domain = request(token);
+    wrong_domain["resource_capture_clock"]["domain"] = json!("stream_relative");
+    assert_eq!(
+        controller.handle("bad", parse(wrong_domain)),
+        Err("invalid_resource_capture_clock")
+    );
+    let mut null_clock = request(token);
+    null_clock["resource_capture_clock"] = Value::Null;
+    assert!(serde_json::from_value::<Operation>(null_clock).is_err());
+    for contract in [None, Some("unsupported")] {
+        let mut value = request(token);
+        if let Some(contract) = contract {
+            value["resource_callback_contract"] = json!(contract);
+        } else {
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("resource_callback_contract");
+        }
+        assert_eq!(
+            controller.handle("bad", parse(value)),
+            Err("invalid_resource_callback_contract")
+        );
+    }
+    let mut null_contract = request(token);
+    null_contract["resource_callback_contract"] = Value::Null;
+    assert!(serde_json::from_value::<Operation>(null_contract).is_err());
+}
+
 fn open(
     controller: &mut Controller,
     caller: &str,
@@ -11,6 +92,8 @@ fn open(
             Operation::Open {
                 output: OUTPUT.into(),
                 operation_id: operation.map(str::to_owned),
+                resource_capture_clock: None,
+                resource_callback_contract: None,
             },
         )
         .unwrap()
@@ -48,6 +131,8 @@ fn open_retry_and_lookup_are_scoped_to_the_authenticated_caller() {
             Operation::Open {
                 output: "different-output".into(),
                 operation_id: Some("launch-capture".into()),
+                resource_capture_clock: None,
+                resource_callback_contract: None,
             }
         ),
         Err("operation_conflict")
@@ -191,6 +276,8 @@ fn active_and_lifetime_open_limits_bound_retained_fixture_state() {
     let attempt = || Operation::Open {
         output: OUTPUT.into(),
         operation_id: None,
+        resource_capture_clock: None,
+        resource_callback_contract: None,
     };
     assert_eq!(
         controller.handle("owner", attempt()),
