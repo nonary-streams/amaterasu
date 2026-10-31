@@ -13,7 +13,7 @@ class CompositionPreflightTest(unittest.TestCase):
     def setUp(self):
         self.provider = check.OWNER
         service = self.provider + "/2"
-        self.descriptor = {"provider": self.provider, "revision": 1,
+        self.descriptor = {"provider": self.provider, "revision": 1, "actions": [],
                            "settings_validate": {"service": service, "method": "settings_validate",
                                                  "interface_major": 2, "interface_minor": 0, "schema_revision": 1},
                            "options": [{"id": "enabled", "definition": {"type": "boolean", "default": False}}]}
@@ -79,6 +79,25 @@ class CompositionPreflightTest(unittest.TestCase):
     def test_malformed_approval_schema_fails(self):
         self.approvals[0]["method"]["request"]["required"]["value"] = "wrong"
         with self.assertRaisesRegex(ValueError, "schema field"):
+            self.check()
+
+    def test_actions_require_complete_methods_and_advertisement(self):
+        def action_ref(name):
+            return {"service": self.provider + "/2", "method": name, "interface_major": 2,
+                    "interface_minor": 0, "schema_revision": 1}
+        self.descriptor["actions"] = [{"id": self.provider + "/remove-owned", "execution": "session_mutation",
+                                       "allowed_targets": ["session", "stream"], "arguments": {},
+                                       "plan": action_ref("action_plan"), "execute": action_ref("action_execute"),
+                                       "status": action_ref("action_status")}]
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.check()
+        for name in sorted(check.ACTION_METHODS):
+            item = copy.deepcopy(self.approvals[0])
+            item["method"]["method"] = name
+            self.approvals.append(item)
+        self.check()
+        self.descriptor["actions"] = []
+        with self.assertRaisesRegex(ValueError, "unexpected"):
             self.check()
 
 

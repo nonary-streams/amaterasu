@@ -49,6 +49,10 @@ class CompositionPolicyTest(unittest.TestCase):
             "plan": policy.method_ref(check.OWNER, "action_plan"),
             "execute": policy.method_ref(check.OWNER, "action_execute"),
             "status": policy.method_ref(check.OWNER, "action_status")}]
+        for name in sorted(check.ACTION_METHODS):
+            approval = copy.deepcopy(self.owner["approvals"][0])
+            approval["method"]["method"] = name
+            self.owner["approvals"].append(approval)
         result = policy.provider_entries(self.selected, True)
         self.assertEqual(result["input_actions"], [check.OWNER + "/remove-owned"])
         self.assertEqual(len(result["action_grants"]), 3)

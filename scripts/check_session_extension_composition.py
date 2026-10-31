@@ -22,8 +22,8 @@ TARGET_DIGEST = "8521cdfd92da98b25136bd01720d397f0d7fee14748c08afde76a0379fa1894
 CONTROL_DIGEST = "c2c3ce866277cb29bbd9fbd947899917538d46b1020df3197fbd264159607d87"
 DISPLAY_METHODS = {"settings_validate", "resource_plan", "lifecycle_callback", "lifecycle_status"}
 OWNER_METHODS = {"settings_validate", "resource_plan", "lifecycle_callback", "lifecycle_status",
-                 "binding_validate", "resource_control", "resource_finalize", "resource_status",
-                 "action_plan", "action_execute", "action_status"}
+                 "binding_validate", "resource_control", "resource_finalize", "resource_status"}
+ACTION_METHODS = {"action_plan", "action_execute", "action_status"}
 PROVIDER_CALLS = {
     DISPLAY: {"amaterasu.session-lifecycle/1"},
     OWNER: {"amaterasu.state/1", "amaterasu.session-lifecycle/1", "amaterasu.virtual-display/1"},
@@ -81,6 +81,22 @@ def check_provider(descriptor: dict, component: dict, approvals: list, provider:
     enabled = [option for option in options if isinstance(option, dict) and option.get("id") == "enabled"]
     if len(enabled) != 1 or enabled[0].get("definition") != {"type": "boolean", "default": False}:
         raise ValueError("provider must start disabled")
+    actions = descriptor.get("actions")
+    if not isinstance(actions, list) or (provider == DISPLAY and actions) or len(actions) > 1:
+        raise ValueError("unsupported provider actions")
+    if actions:
+        action = actions[0]
+        def action_ref(name: str) -> dict:
+            return {"service": service, "method": name, "interface_major": 2,
+                    "interface_minor": 0, "schema_revision": 1}
+        if (not isinstance(action, dict) or action.get("id") != OWNER + "/remove-owned"
+                or action.get("execution") != "session_mutation"
+                or set(action.get("allowed_targets", [])) != {"session", "stream"}
+                or action.get("arguments") != {} or action.get("plan") != action_ref("action_plan")
+                or action.get("execute") != action_ref("action_execute")
+                or action.get("status") != action_ref("action_status")):
+            raise ValueError("unsupported owner action contract")
+    expected_methods = methods | ACTION_METHODS if provider == OWNER and actions else methods
     names = []
     for approval in approvals:
         if not isinstance(approval, dict) or approval.get("provider") != provider:
@@ -90,7 +106,7 @@ def check_provider(descriptor: dict, component: dict, approvals: list, provider:
             raise ValueError("approval does not select v2")
         check_method_schema(method)
         names.append(method.get("method"))
-    if len(names) != len(methods) or set(names) != methods:
+    if len(names) != len(expected_methods) or set(names) != expected_methods:
         raise ValueError("provider method approvals are incomplete, duplicated or unexpected")
 
 
@@ -120,7 +136,8 @@ def check_selected(publisher: Path, repository: Path, library: Path, provider: s
         raise ValueError("invalid validated descriptor digest")
     return {"provider": provider, "service": provider + "/2", "descriptor_sha256": digest,
             "artifact_sha256": file_digest(library), "component_template_sha256": hashlib.sha256(component_bytes).hexdigest(),
-            "approvals_sha256": hashlib.sha256(approvals_bytes).hexdigest(), "methods": sorted(methods)}
+            "approvals_sha256": hashlib.sha256(approvals_bytes).hexdigest(),
+            "methods": sorted(approval["method"]["method"] for approval in approvals["api_methods"])}
 
 
 def main() -> None:
