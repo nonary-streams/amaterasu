@@ -37,6 +37,7 @@ struct ArchivedStream {
     finalize_tuple: String,
     finalize_policy: String,
     finalize_schemas: Vec<String>,
+    settlement_commitments: Vec<String>,
     settlement_tuples: Vec<SettlementTuple>,
     closed_obligations: Vec<String>,
 }
@@ -90,6 +91,8 @@ impl ArchivedStream {
             && valid_digest(&self.finalize_policy)
             && valid_schemas(&self.finalize_schemas)
             && valid_commitments(&self.closed_obligations)
+            && valid_commitments(&self.settlement_commitments)
+            && self.settlement_commitments.len() == self.settlement_tuples.len()
             && self.settlement_tuples.len() <= 128
             && self
                 .settlement_tuples
@@ -346,6 +349,7 @@ pub(super) fn retire_closed_stream(
             finalize_tuple: old.finalize_tuple.clone(),
             finalize_policy: old.finalize_policy.clone(),
             finalize_schemas: old.finalize_schemas.clone(),
+            settlement_commitments: old.settlement_commitments.clone(),
             settlement_tuples: old.settlement_tuples.clone(),
             closed_obligations: old.closed_obligations.clone(),
         };
