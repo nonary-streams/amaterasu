@@ -32,6 +32,18 @@ fn target_phase_allowed(
     }
 }
 
+fn settlement_dispatch_eligible(
+    dispatch: Option<&crate::provider_dispatch::DispatchRecord>,
+    preflight: bool,
+) -> bool {
+    use crate::provider_dispatch::DispatchState;
+    if preflight {
+        dispatch.is_none_or(|record| record.state == DispatchState::Ready)
+    } else {
+        dispatch.is_some_and(|record| record.state == DispatchState::OutcomeUnknown)
+    }
+}
+
 impl Backend<'_> {
     fn authority(
         &self,
@@ -71,6 +83,7 @@ impl Backend<'_> {
         &mut self,
         request: &ResourceControlRequest,
         settlement: Option<&ResourceControlSettlementRequest>,
+        preflight: bool,
     ) -> ModuleResult<ResolvedControl> {
         let journal = &self.coordinator.shared.borrow().value;
         let admission = journal
@@ -170,9 +183,15 @@ impl Backend<'_> {
                             && control.settlement.as_ref().is_some_and(|stage| {
                                 stage.request == *tuple
                                     && stage.policy == selection.control_policy
-                                    && matches!(stage.phase, super::settlement_dispatch::SettlementPhase::Ready)
+                                    && matches!(
+                                        stage.phase,
+                                        super::settlement_dispatch::SettlementPhase::Ready
+                                    )
                                     && stage.owner_ack.is_none()
-                                    && stage.dispatch.as_ref().is_some_and(|dispatch| dispatch.state == crate::provider_dispatch::DispatchState::OutcomeUnknown)
+                                    && settlement_dispatch_eligible(
+                                        stage.dispatch.as_ref(),
+                                        preflight,
+                                    )
                             })
                     }
                     _ => false,
@@ -348,7 +367,7 @@ impl Backend<'_> {
 
 impl ControlEndpointBackend for Backend<'_> {
     fn resolve(&mut self, request: &ResourceControlRequest) -> ModuleResult<ResolvedControl> {
-        self.resolve_control(request, None)
+        self.resolve_control(request, None, false)
     }
     fn validate_arguments(&mut self, schema: &SchemaRef, arguments: &Value) -> ModuleResult<()> {
         self.coordinator
@@ -412,6 +431,25 @@ impl Coordinator {
     /// Owner CAS verification. The tuple must already be durably recorded in
     /// the selected pending work and a matching authenticated refinement.
     pub(super) fn verify_control_settlement(&mut self, caller: &str, mut payload: Value) -> Value {
+        self.verify_control_settlement_inner(caller, &mut payload, false)
+    }
+
+    /// Internal read-only check before arming the broker call. The public owner
+    /// endpoint always requires the separately journaled armed dispatch.
+    pub(super) fn preflight_control_settlement(
+        &mut self,
+        caller: &str,
+        mut payload: Value,
+    ) -> Value {
+        self.verify_control_settlement_inner(caller, &mut payload, true)
+    }
+
+    fn verify_control_settlement_inner(
+        &mut self,
+        caller: &str,
+        payload: &mut Value,
+        preflight: bool,
+    ) -> Value {
         let result = (|| -> ModuleResult<Value> {
             let object = payload
                 .as_object_mut()
@@ -420,16 +458,17 @@ impl Coordinator {
                 return Err("invalid_settlement_operation".into());
             }
             let tuple: ResourceControlSettlementRequest =
-                serde_json::from_value(payload).map_err(|_| "invalid_settlement_request")?;
+                serde_json::from_value(payload.clone())
+                    .map_err(|_| "invalid_settlement_request")?;
             amaterasu_extension_api::validate_resource_control_settlement_request(&tuple)?;
             if caller.is_empty() || caller != tuple.request.proposal.owner_provider {
                 return Err("settlement_owner_mismatch".into());
             }
-            if let Some(result) = self.verify_historical_settlement(caller, &tuple)? {
+            if !preflight && let Some(result) = self.verify_historical_settlement(caller, &tuple)? {
                 return Ok(result);
             }
             let mut backend = Backend { coordinator: self };
-            let resolved = backend.resolve_control(&tuple.request, Some(&tuple))?;
+            let resolved = backend.resolve_control(&tuple.request, Some(&tuple), preflight)?;
             {
                 let shared = backend.coordinator.shared.borrow();
                 let record = shared
@@ -658,6 +697,22 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_preflight_never_grants_unarmed_owner_verification() {
+        use crate::provider_dispatch::{DispatchRecord, DispatchState};
+        let mut dispatch: DispatchRecord = serde_json::from_value(json!({
+            "call":{"service":"owner/2","method":"settle","interface_major":2,"interface_minor":0,"approval":{"provider":"owner"},"arguments":{},"timeout_ms":1000,"operation_id":"settle"},
+            "state":{"state":"ready"}
+        })).unwrap();
+        assert!(settlement_dispatch_eligible(None, true));
+        assert!(!settlement_dispatch_eligible(None, false));
+        assert!(settlement_dispatch_eligible(Some(&dispatch), true));
+        assert!(!settlement_dispatch_eligible(Some(&dispatch), false));
+        dispatch.state = DispatchState::OutcomeUnknown;
+        assert!(!settlement_dispatch_eligible(Some(&dispatch), true));
+        assert!(settlement_dispatch_eligible(Some(&dispatch), false));
+    }
     #[test]
     fn restore_requires_exact_quiescence_and_consumer_retirement() {
         let mut stream = StreamRecord {

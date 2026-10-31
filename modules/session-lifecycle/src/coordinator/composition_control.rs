@@ -868,7 +868,8 @@ impl Coordinator {
             let mut envelope =
                 serde_json::to_value(&state.request).map_err(|_| "invalid_settlement")?;
             envelope["operation"] = json!("verify_control_settlement");
-            let verified = self.verify_control_settlement(&state.policy.owner_provider, envelope);
+            let verified =
+                self.preflight_control_settlement(&state.policy.owner_provider, envelope);
             if verified["status"] != "valid" {
                 return Err("settlement_not_authorized".into());
             }
