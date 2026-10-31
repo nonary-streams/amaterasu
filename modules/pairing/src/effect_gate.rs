@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 const MAX_SOURCES: usize = 64;
 const MAX_OPERATIONS: usize = 256;
 
-pub use amaterasu_module_sdk::effect_authority::{Request, Source};
+pub use amaterasu_module_sdk::effect_authority::{Request, Source, StreamRetirement, StreamScope};
 
 fn token(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
@@ -17,6 +17,7 @@ struct Admission {
     ticket: String,
     sequence: u64,
     complete: bool,
+    scope: Option<StreamScope>,
 }
 
 /// An admission is kept until its source is retired. A lost reply can be
@@ -25,8 +26,9 @@ struct Admission {
 pub struct EffectGate {
     epoch: String,
     owner_epoch: Option<String>,
-    sources: BTreeMap<Source, ()>,
+    sources: BTreeMap<Source, Option<StreamScope>>,
     operations: BTreeMap<String, Admission>,
+    lease_admissions: BTreeMap<Source, String>,
     highwater: u64,
     fenced: bool,
     fence_generation: u64,
@@ -43,6 +45,7 @@ impl EffectGate {
             owner_epoch: None,
             sources: BTreeMap::new(),
             operations: BTreeMap::new(),
+            lease_admissions: BTreeMap::new(),
             highwater: 0,
             fenced: true,
             fence_generation: 0,
@@ -83,6 +86,7 @@ impl EffectGate {
         self.epoch = bytes.iter().map(|b| format!("{b:02x}")).collect();
         self.sources.clear();
         self.operations.clear();
+        self.lease_admissions.clear();
         self.highwater = 0;
         self.fence_generation = 0;
         self.drain_required = false;
@@ -95,6 +99,17 @@ impl EffectGate {
     /// Called only by the selected protocol owner after checking live pairing
     /// and joining its TLS session to lifecycle's independently issued source.
     pub fn bind(&mut self, source: Source) -> Result<(), &'static str> {
+        self.bind_scoped(source, None)
+    }
+
+    pub fn bind_scoped(
+        &mut self,
+        source: Source,
+        scope: Option<StreamScope>,
+    ) -> Result<(), &'static str> {
+        if scope.as_ref().is_some_and(|scope| !scope.valid()) {
+            return Err("invalid_stream_scope");
+        }
         if self.fenced
             || !source.valid()
             || self.owner_epoch.as_deref() != Some(&source.effect_owner_epoch)
@@ -104,7 +119,14 @@ impl EffectGate {
         if !self.sources.contains_key(&source) && self.sources.len() >= MAX_SOURCES {
             return Err("source_capacity");
         }
-        self.sources.insert(source, ());
+        if self
+            .sources
+            .get(&source)
+            .is_some_and(|previous| previous != &scope)
+        {
+            return Err("source_scope_conflict");
+        }
+        self.sources.insert(source, scope);
         Ok(())
     }
 
@@ -114,11 +136,53 @@ impl EffectGate {
         operation: &str,
         sequence: u64,
     ) -> Result<&str, &'static str> {
+        self.admit_with_scope(source, operation, sequence, None)
+    }
+
+    pub fn admit_stream_lease(
+        &mut self,
+        source: &Source,
+        operation: &str,
+        sequence: u64,
+        scope: StreamScope,
+    ) -> Result<&str, &'static str> {
+        if !scope.valid() || self.sources.get(source) != Some(&Some(scope.clone())) {
+            return Err("stream_scope_denied");
+        }
+        if self
+            .lease_admissions
+            .get(source)
+            .is_some_and(|id| id != operation)
+        {
+            return Err("stream_lease_in_use");
+        }
+        self.admit_with_scope(source, operation, sequence, Some(scope))?;
+        self.lease_admissions
+            .entry(source.clone())
+            .or_insert_with(|| operation.to_owned());
+        Ok(&self
+            .operations
+            .get(operation)
+            .expect("admitted lease")
+            .ticket)
+    }
+
+    fn admit_with_scope(
+        &mut self,
+        source: &Source,
+        operation: &str,
+        sequence: u64,
+        scope: Option<StreamScope>,
+    ) -> Result<&str, &'static str> {
         if self.fenced || !self.sources.contains_key(source) || !token(operation) {
             return Err("admission_denied");
         }
         if let Some(prior) = self.operations.get(operation) {
-            if &prior.source != source || prior.complete || prior.sequence != sequence {
+            if &prior.source != source
+                || prior.complete
+                || prior.sequence != sequence
+                || prior.scope != scope
+            {
                 return Err("operation_conflict");
             }
         } else {
@@ -137,6 +201,7 @@ impl EffectGate {
                     ticket: bytes.iter().map(|b| format!("{b:02x}")).collect(),
                     sequence,
                     complete: false,
+                    scope,
                 },
             );
             self.highwater = sequence;
@@ -152,6 +217,25 @@ impl EffectGate {
         let admission = self.operations.get(operation).ok_or("unknown_admission")?;
         if admission.complete {
             return Err("operation_complete");
+        }
+        if admission.scope.is_some() {
+            return Err("lease_lookup_required");
+        }
+        Ok((&admission.ticket, self.fenced))
+    }
+
+    pub fn lookup_stream_lease(
+        &self,
+        source: &Source,
+        operation: &str,
+        scope: &StreamScope,
+    ) -> Result<(&str, bool), &'static str> {
+        let admission = self.operations.get(operation).ok_or("unknown_admission")?;
+        if admission.complete {
+            return Err("operation_complete");
+        }
+        if &admission.source != source || admission.scope.as_ref() != Some(scope) {
+            return Err("stream_scope_denied");
         }
         Ok((&admission.ticket, self.fenced))
     }
@@ -169,8 +253,34 @@ impl EffectGate {
             .operations
             .get_mut(operation)
             .ok_or("unknown_admission")?;
-        if admission.ticket != ticket {
+        if admission.ticket != ticket || admission.scope.is_some() {
             return Err("unknown_admission");
+        }
+        admission.complete = true;
+        Ok(())
+    }
+
+    /// The owner must first verify the matching broker receipt and stop its
+    /// local producer. A payload is an owner assertion, not a transport proof.
+    pub fn complete_stream_lease(
+        &mut self,
+        epoch: &str,
+        operation: &str,
+        ticket: &str,
+        retirement: &StreamRetirement,
+    ) -> Result<(), &'static str> {
+        self.require_epoch(epoch)?;
+        let admission = self
+            .operations
+            .get_mut(operation)
+            .ok_or("unknown_admission")?;
+        if admission.ticket != ticket
+            || admission
+                .scope
+                .as_ref()
+                .is_none_or(|scope| !retirement.matches(scope))
+        {
+            return Err("retirement_mismatch");
         }
         admission.complete = true;
         Ok(())
@@ -316,6 +426,143 @@ mod tests {
         gate.acknowledge(&epoch, "first", &ticket).unwrap();
         assert_eq!(gate.admit(&source, "first", 1), Err("operation_conflict"));
         assert!(gate.admit(&source, "second", 2).is_ok());
+    }
+
+    fn stream_scope() -> StreamScope {
+        StreamScope {
+            capabilities: ["controller.speaker.pcm/1".into()].into(),
+            transport_service: "amaterasu.control-transport/1".into(),
+            transport_stream: 7,
+            transport_epoch: "transport-epoch".into(),
+        }
+    }
+
+    #[test]
+    fn stream_lease_stays_bounded_and_fence_waits_for_exact_transport_retirement() {
+        let mut gate = EffectGate::new().unwrap();
+        gate.recover("owner").unwrap();
+        let source = source();
+        let scope = stream_scope();
+        gate.bind_scoped(source.clone(), Some(scope.clone()))
+            .unwrap();
+        let ticket = gate
+            .admit_stream_lease(&source, "lease", 1, scope.clone())
+            .unwrap()
+            .to_owned();
+        for _ in 0..1000 {
+            assert_eq!(
+                gate.admit_stream_lease(&source, "lease", 1, scope.clone())
+                    .unwrap(),
+                ticket
+            );
+        }
+        assert_eq!(gate.in_flight(), 1);
+        assert_eq!(gate.lookup("lease"), Err("lease_lookup_required"));
+        assert_eq!(
+            gate.lookup_stream_lease(&source, "lease", &scope).unwrap(),
+            (ticket.as_str(), false)
+        );
+        assert_eq!(
+            gate.admit_stream_lease(&source, "other", 2, scope.clone()),
+            Err("stream_lease_in_use")
+        );
+        let mut wrong_session = source.clone();
+        wrong_session.session_id = "other-session".into();
+        assert_eq!(
+            gate.admit_stream_lease(&wrong_session, "other", 2, scope.clone()),
+            Err("stream_scope_denied")
+        );
+        let mut wrong_owner = source.clone();
+        wrong_owner.effect_owner_epoch = "other-owner".into();
+        assert_eq!(
+            gate.admit_stream_lease(&wrong_owner, "other", 2, scope.clone()),
+            Err("stream_scope_denied")
+        );
+        let mut wrong_source = source.clone();
+        wrong_source.device_generation += 1;
+        assert_eq!(
+            gate.admit_stream_lease(&wrong_source, "other", 2, scope.clone()),
+            Err("stream_scope_denied")
+        );
+        let mut wrong_scope = scope.clone();
+        wrong_scope.capabilities.insert("foreign/1".into());
+        assert_eq!(
+            gate.admit_stream_lease(&source, "lease", 1, wrong_scope),
+            Err("stream_scope_denied")
+        );
+        let epoch = gate.epoch().to_owned();
+        gate.fence();
+        assert_eq!(
+            gate.lookup_stream_lease(&source, "lease", &scope).unwrap(),
+            (ticket.as_str(), true)
+        );
+        assert!(
+            gate.admit_stream_lease(&source, "late", 2, scope.clone())
+                .is_err()
+        );
+        assert_eq!(
+            gate.complete(&epoch, "lease", &ticket),
+            Err("unknown_admission")
+        );
+        assert_eq!(
+            gate.acknowledge_drain(&epoch, gate.fence_generation()),
+            Err("effects_in_flight")
+        );
+        let mut retirement = StreamRetirement {
+            ok: true,
+            service: scope.transport_service.clone(),
+            stream: 8,
+            provider_epoch: scope.transport_epoch.clone(),
+            operation_id: "retire".into(),
+            scope: "whole_control_stream".into(),
+            state: "retired".into(),
+        };
+        assert_eq!(
+            gate.complete_stream_lease(&epoch, "lease", &ticket, &retirement),
+            Err("retirement_mismatch")
+        );
+        retirement.stream = scope.transport_stream;
+        assert_eq!(
+            gate.complete_stream_lease("stale-epoch", "lease", &ticket, &retirement),
+            Err("stale_epoch")
+        );
+        gate.complete_stream_lease(&epoch, "lease", &ticket, &retirement)
+            .unwrap();
+        assert!(!gate.drained());
+        gate.acknowledge_drain(&epoch, gate.fence_generation())
+            .unwrap();
+        assert!(gate.drained());
+    }
+
+    #[test]
+    fn a_retired_lease_cannot_be_replaced_on_the_same_source_generation() {
+        let mut gate = EffectGate::new().unwrap();
+        gate.recover("owner").unwrap();
+        let source = source();
+        let scope = stream_scope();
+        gate.bind_scoped(source.clone(), Some(scope.clone()))
+            .unwrap();
+        let ticket = gate
+            .admit_stream_lease(&source, "first", 1, scope.clone())
+            .unwrap()
+            .to_owned();
+        let epoch = gate.epoch().to_owned();
+        let retirement = StreamRetirement {
+            ok: true,
+            service: scope.transport_service.clone(),
+            stream: scope.transport_stream,
+            provider_epoch: scope.transport_epoch.clone(),
+            operation_id: "retire".into(),
+            scope: "whole_control_stream".into(),
+            state: "retired".into(),
+        };
+        gate.complete_stream_lease(&epoch, "first", &ticket, &retirement)
+            .unwrap();
+        gate.acknowledge(&epoch, "first", &ticket).unwrap();
+        assert_eq!(
+            gate.admit_stream_lease(&source, "second", 2, scope),
+            Err("stream_lease_in_use")
+        );
     }
 
     #[test]
