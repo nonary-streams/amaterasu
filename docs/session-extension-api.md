@@ -278,6 +278,23 @@ response contains `session_target`, `target`, `root_output`,
 response is limited to 16 KiB. This read-only lookup grants no effect authority;
 the endpoint and its integrated recovery path require qualification.
 
+The planned `lookup_stream_closure` operation provides read-only historical
+evidence that an exact owner control belongs to a closed stream. Its request is
+`{operation: "lookup_stream_closure", target, resource_generation, resource_id,
+incarnation, operation_id, request_digest}`. The target is the exact stream
+lifecycle target, the resource generation is positive, and the digest is lowercase
+SHA-256 of `serde_json::to_vec` of the exact typed `ResourceControlRequest`.
+Only the configured and selected owner may query it. A verified result echoes the
+identity fields with `status: "closed"`; failures return `status: "rejected"`
+and `reason: "stream_closure_unavailable"`.
+
+The live proof checks the release graph and the owner's acknowledged settlement;
+the archived path checks the selected checkpoint against current policy and
+schemas. Neither result grants native effect authority. Archive retention and
+garbage collection remain under review; finite capacity must fence admission
+rather than silently discard necessary evidence. The endpoint and integrated
+recovery path remain subject to qualification.
+
 A failed or rejected preparation callback does not establish that its effects
 were absent or cleaned up. Its admission remains held for recovery. A known
 partial preparation cannot currently settle as a clean failure; that requires
