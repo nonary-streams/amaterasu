@@ -770,6 +770,7 @@ mod tests {
             .is_none()
         );
         let input = crate::input_authority::ActiveBinding {
+            source_id: None,
             host_epoch: "epoch".into(),
             session_id: "session".into(),
             stream_id: "stream".into(),

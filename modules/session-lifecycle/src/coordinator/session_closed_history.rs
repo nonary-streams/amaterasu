@@ -430,6 +430,7 @@ impl EndedSessionCertificate {
             return false;
         }
         let session = SessionRecord {
+            paired_source_attested: false,
             provider_graph: Some(self.graph.clone()),
             host_epoch: epoch.into(),
             id: session_id.into(),

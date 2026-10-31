@@ -167,6 +167,7 @@ mod tests {
         coordinator.shared.borrow_mut().value.sessions.insert(
             "session".into(),
             SessionRecord {
+                paired_source_attested: false,
                 provider_graph: None,
                 host_epoch: epoch.clone(),
                 id: "session".into(),
@@ -236,6 +237,7 @@ mod tests {
         );
         coordinator.settings.consumers.input.insert("input".into());
         let binding = crate::input_authority::ActiveBinding {
+            source_id: None,
             host_epoch: epoch.clone(),
             session_id: "session".into(),
             stream_id: "stream".into(),

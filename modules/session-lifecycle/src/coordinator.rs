@@ -401,6 +401,10 @@ struct StreamRecord {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionRecord {
+    /// Only the trusted direct protocol owner may attest a paired TLS source.
+    /// Older sessions have no such attestation and cannot issue source handles.
+    #[serde(default, skip_serializing_if = "is_false")]
+    paired_source_attested: bool,
     #[serde(default)]
     provider_graph: Option<ProviderGraph>,
     host_epoch: String,
@@ -631,17 +635,20 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
             })
         })
         || journal.sessions.values().any(|session| {
-            session
-                .application_retirement_proof
-                .as_ref()
-                .is_some_and(|_| {
-                    let target = LifecycleTarget::Session {
-                        host_epoch: session.host_epoch.clone(),
-                        session_id: session.id.clone(),
-                        generation: session.generation,
-                    };
-                    !application::valid_retirement_proof(session, &target)
-                })
+            (session.paired_source_attested
+                && (session.owner.caller != "amaterasu.nvhttp"
+                    || session.owner.initiator != "amaterasu.nvhttp"))
+                || session
+                    .application_retirement_proof
+                    .as_ref()
+                    .is_some_and(|_| {
+                        let target = LifecycleTarget::Session {
+                            host_epoch: session.host_epoch.clone(),
+                            session_id: session.id.clone(),
+                            generation: session.generation,
+                        };
+                        !application::valid_retirement_proof(session, &target)
+                    })
                 || session.resource_generations.len() > 32
                 || session
                     .resource_generations
@@ -1052,6 +1059,14 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                 })
         })
         || !journal.inputs.validate()
+        || {
+            let sources: Vec<_> = journal
+                .input_bindings
+                .values()
+                .filter_map(|binding| binding.source_id.as_ref())
+                .collect();
+            sources.iter().collect::<BTreeSet<_>>().len() != sources.len()
+        }
         || journal.actions.validate().is_err()
         || journal
             .input_boot_epochs
@@ -1134,6 +1149,9 @@ impl Coordinator {
             }
         }
         for session in journal.sessions.values_mut() {
+            // The original protocol-side TLS association does not survive a
+            // coordinator restart. A recovered session cannot inherit it.
+            session.paired_source_attested = false;
             if session.phase != SessionPhase::Ended {
                 session.phase = SessionPhase::RecoveryRequired;
             }

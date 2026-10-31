@@ -203,6 +203,7 @@ fn required_extension_lifecycle_polls_pending_before_application_launch() {
     }).collect();
     assert_eq!(lifecycle.len(), 2);
     assert_eq!(lifecycle[0]["operation"], "prepare");
+    assert_eq!(lifecycle[0]["source_attestation"], json!({"version":1,"kind":"paired_tls"}));
     assert_eq!(lifecycle[1]["operation"], "lookup");
     assert_eq!(lifecycle[0]["operation_id"], lifecycle[1]["operation_id"]);
     let released = broker.commands.iter().filter(|command| matches!(command,

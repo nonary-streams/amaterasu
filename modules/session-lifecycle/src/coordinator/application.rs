@@ -390,6 +390,7 @@ mod tests {
         next.sessions.insert(
             "session".into(),
             SessionRecord {
+                paired_source_attested: false,
                 provider_graph: None,
                 host_epoch: epoch.clone(),
                 id: "session".into(),

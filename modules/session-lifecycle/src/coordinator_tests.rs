@@ -96,6 +96,289 @@ fn lookup_and_replay_are_bound_to_broker_caller_initiator_and_request() {
 }
 
 #[test]
+fn paired_source_attestation_requires_the_direct_protocol_owner_and_is_fenced_on_restart() {
+    let dir = TestDirectory::new();
+    let mut coordinator = Coordinator::open(&dir.journal()).unwrap();
+    let request = json!({"operation":"prepare","operation_id":"source-session",
+        "source_attestation":{"version":1,"kind":"paired_tls"}});
+    for (caller, initiator) in [
+        ("other", "other"),
+        ("amaterasu.nvhttp", "other"),
+        ("other", "amaterasu.nvhttp"),
+    ] {
+        assert_eq!(
+            coordinator.handle(caller, initiator, request.clone())["reason"],
+            "invalid_source_attestation"
+        );
+    }
+    let result = coordinator.handle("amaterasu.nvhttp", "amaterasu.nvhttp", request.clone());
+    assert_eq!(result["status"], "pending");
+    let id = result["session_id"].as_str().unwrap();
+    assert!(coordinator.shared.borrow().value.sessions[id].paired_source_attested);
+    let mut changed = request;
+    changed["source_attestation"] = json!({"version":1,"kind":"paired_tls","client_id":"forged"});
+    assert_eq!(
+        coordinator.handle("amaterasu.nvhttp", "amaterasu.nvhttp", changed)["reason"],
+        "operation_id_conflict"
+    );
+    let session = id.to_owned();
+    drop(coordinator);
+    let coordinator = Coordinator::open(&dir.journal()).unwrap();
+    assert!(!coordinator.shared.borrow().value.sessions[&session].paired_source_attested);
+}
+
+#[test]
+fn real_broker_identity_cannot_be_replaced_by_payload_attestation_fields() {
+    use amaterasu_contracts::{Grants, RuntimeConfig};
+    use amaterasu_module_sdk::{Command, Response};
+    use amaterasu_runtime::Broker;
+    let dir = TestDirectory::new();
+    let mut coordinator = Coordinator::open(&dir.journal()).unwrap();
+    let service = "amaterasu.session-lifecycle/1";
+    let mut configuration = RuntimeConfig::default();
+    for caller in ["amaterasu.nvhttp", "untrusted"] {
+        configuration.principals.insert(
+            caller.into(),
+            Grants {
+                call: [service.into()].into(),
+                ..Default::default()
+            },
+        );
+    }
+    configuration.principals.insert(
+        "lifecycle".into(),
+        Grants {
+            provide: [service.into()].into(),
+            ..Default::default()
+        },
+    );
+    let mut broker = Broker::new(configuration).unwrap();
+    assert!(matches!(
+        broker.dispatch(
+            "lifecycle",
+            Command::Register {
+                service: service.into()
+            }
+        ),
+        Response::Ok
+    ));
+    for (caller, expected) in [("untrusted", "rejected"), ("amaterasu.nvhttp", "pending")] {
+        let payload = json!({"operation":"prepare","operation_id":format!("source-{caller}"),
+            "caller":"amaterasu.nvhttp","initiator":"amaterasu.nvhttp",
+            "source_attestation":{"version":1,"kind":"paired_tls"}});
+        let Response::Accepted { id } = broker.dispatch(
+            caller,
+            Command::Request {
+                service: service.into(),
+                payload,
+                timeout_ms: 1000,
+                operation_id: format!("broker-{caller}"),
+                parent: None,
+            },
+        ) else {
+            panic!("broker admission failed")
+        };
+        let Response::Request {
+            id: incoming,
+            caller: actual,
+            initiator,
+            payload,
+            ..
+        } = broker.dispatch("lifecycle", Command::Poll {})
+        else {
+            panic!("missing request")
+        };
+        assert_eq!(actual, caller);
+        let response = coordinator.handle(&actual, &initiator, payload);
+        assert_eq!(response["status"], expected);
+        assert!(matches!(
+            broker.dispatch(
+                "lifecycle",
+                Command::Complete {
+                    request: incoming,
+                    payload: response
+                }
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            broker.dispatch(caller, Command::TakeResult { request: id }),
+            Response::Result { .. }
+        ));
+        assert!(matches!(
+            broker.dispatch(caller, Command::ReleaseResult { request: id }),
+            Response::Ok
+        ));
+    }
+}
+
+#[test]
+fn opted_in_input_source_is_private_unique_and_fenced_by_binding_state() {
+    let dir = TestDirectory::new();
+    let mut coordinator = Coordinator::open(&dir.journal()).unwrap();
+    coordinator.settings.consumers.input.insert("input".into());
+    let session = coordinator.handle(
+        "amaterasu.nvhttp",
+        "amaterasu.nvhttp",
+        json!({
+        "operation":"prepare","operation_id":"source-session",
+        "source_attestation":{"version":1,"kind":"paired_tls"}}),
+    );
+    let epoch = session["host_epoch"].as_str().unwrap().to_owned();
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
+    let target = json!({"kind":"stream","host_epoch":epoch,"session_id":session_id,"stream_id":"stream","generation":4});
+    let candidate: CaptureBinding = serde_json::from_value(json!({"capture_provider":"capture", "selector_schema":"selector/1", "selector":{}, "resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null},"mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":7,"generation":4})).unwrap();
+    {
+        let mut shared = coordinator.shared.borrow_mut();
+        let session = shared.value.sessions.get_mut(&session_id).unwrap();
+        session.phase = SessionPhase::Ready;
+        session.streams.insert(
+            "stream".into(),
+            StreamRecord {
+                provider_graph: None,
+                generation: 4,
+                phase: StreamPhase::Ready,
+                candidate: Some(candidate),
+                required: BTreeSet::new(),
+                acknowledgements: BTreeSet::from(["capture".into()]),
+                retirements: BTreeSet::new(),
+                binding_owner: String::new(),
+                preparation_transition: String::new(),
+                provider_settings: Default::default(),
+            },
+        );
+    }
+    let issue = |operation: &str| json!({"operation":"issue_input_binding","operation_id":operation,"target":target});
+    let first = coordinator.handle("amaterasu.nvhttp", "amaterasu.nvhttp", issue("first"));
+    let second = coordinator.handle("amaterasu.nvhttp", "amaterasu.nvhttp", issue("second"));
+    assert_eq!(first["status"], "succeeded", "{first}");
+    assert_eq!(second["status"], "succeeded", "{second}");
+    let token = first["token"].as_str().unwrap();
+    let mut validate =
+        json!({"operation":"validate_input_binding","token":token,"source_version":1});
+    let ready = coordinator.handle("input", "amaterasu.nvhttp", validate.clone());
+    assert!(ready["source"].is_null());
+    coordinator
+        .shared
+        .borrow_mut()
+        .value
+        .sessions
+        .get_mut(&session_id)
+        .unwrap()
+        .streams
+        .get_mut("stream")
+        .unwrap()
+        .phase = StreamPhase::Active;
+    let active = coordinator.handle("input", "input", validate.clone());
+    assert_eq!(active["source"]["version"], 1);
+    assert_eq!(active["source"]["generation"], 4);
+    assert_ne!(active["source"]["id"], first["token"]);
+    assert!(active["paired_client"].is_null());
+    let legacy = coordinator.handle(
+        "input",
+        "input",
+        json!({"operation":"validate_input_binding","token":token}),
+    );
+    assert!(legacy.get("source").is_none());
+    let other = coordinator.handle(
+        "input",
+        "amaterasu.nvhttp",
+        json!({"operation":"validate_input_binding","token":second["token"],"source_version":1}),
+    );
+    assert_ne!(active["source"]["id"], other["source"]["id"]);
+    let mut restarted = validate.clone();
+    restarted["input_boot_epoch"] = json!("different-provider-boot");
+    assert_eq!(
+        coordinator.handle("input", "input", restarted)["reason"],
+        "input_provider_restarted"
+    );
+    coordinator
+        .shared
+        .borrow_mut()
+        .value
+        .sessions
+        .get_mut(&session_id)
+        .unwrap()
+        .streams
+        .get_mut("stream")
+        .unwrap()
+        .generation = 5;
+    assert_eq!(
+        coordinator.handle("input", "input", validate.clone())["reason"],
+        "stale_input_binding"
+    );
+    coordinator
+        .shared
+        .borrow_mut()
+        .value
+        .sessions
+        .get_mut(&session_id)
+        .unwrap()
+        .streams
+        .get_mut("stream")
+        .unwrap()
+        .generation = 4;
+    coordinator
+        .shared
+        .borrow_mut()
+        .value
+        .sessions
+        .get_mut(&session_id)
+        .unwrap()
+        .paired_source_attested = false;
+    assert!(coordinator.handle("input", "input", validate.clone())["source"].is_null());
+    coordinator
+        .shared
+        .borrow_mut()
+        .value
+        .sessions
+        .get_mut(&session_id)
+        .unwrap()
+        .paired_source_attested = true;
+    assert_eq!(
+        coordinator.handle("foreign", "stream-session", validate.clone())["status"],
+        "rejected"
+    );
+    assert_eq!(
+        coordinator.handle("input", "foreign", validate.clone())["reason"],
+        "source_initiator_denied"
+    );
+    coordinator
+        .shared
+        .borrow_mut()
+        .value
+        .sessions
+        .get_mut(&session_id)
+        .unwrap()
+        .phase = SessionPhase::Ending;
+    assert!(coordinator.handle("input", "input", validate.clone())["source"].is_null());
+    coordinator
+        .shared
+        .borrow_mut()
+        .value
+        .sessions
+        .get_mut(&session_id)
+        .unwrap()
+        .phase = SessionPhase::Ready;
+    validate["source_version"] = json!(2);
+    assert_eq!(
+        coordinator.handle("input", "input", validate.clone())["reason"],
+        "unsupported_source_version"
+    );
+    validate["source_version"] = json!(1);
+    coordinator
+        .shared
+        .borrow_mut()
+        .value
+        .revoked_inputs
+        .insert(token.into());
+    assert_eq!(
+        coordinator.handle("input", "input", validate)["reason"],
+        "binding_revoked"
+    );
+}
+
+#[test]
 fn failed_journal_replacement_never_exposes_a_pending_receipt() {
     let dir = TestDirectory::new();
     let path = dir.journal();
@@ -485,6 +768,7 @@ fn frozen_action_lineage_survives_restart_and_rejects_tampering() {
         .into(),
     };
     let session = SessionRecord {
+        paired_source_attested: false,
         resource_generations: BTreeMap::new(),
         provider_graph: Some(graph),
         host_epoch: epoch.clone(),
