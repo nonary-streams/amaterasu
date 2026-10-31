@@ -143,6 +143,40 @@ impl ControlSettlementBook {
         self.replay_fences
             .contains(&replay_digest(&["operation", owner, operation_id]))
     }
+    /// Fence and retire the entire exact set, or leave the book untouched.
+    /// The caller must first prove closure and atomically persist the resulting
+    /// journal with the checkpoint and all other reference retirements.
+    #[allow(dead_code, reason = "awaits complete closed-stream retirement")]
+    pub fn retire_exact(
+        &mut self,
+        ids: &BTreeSet<String>,
+        closed: &impl Fn(&ControlSettlementRecord) -> bool,
+    ) -> Result<(), &'static str> {
+        let selected: Vec<_> = self
+            .records
+            .iter()
+            .filter(|item| ids.contains(&item.settlement.settlement_id))
+            .collect();
+        if selected.len() != ids.len()
+            || selected.iter().any(|item| {
+                item.owner_ack.is_none()
+                    || item.owner_dispatch.is_none()
+                    || !valid_record(item)
+                    || !closed(item)
+            })
+        {
+            return Err("control_settlement_not_closed");
+        }
+        let keys: BTreeSet<_> = selected.iter().flat_map(|item| replay_keys(item)).collect();
+        let additional = keys.difference(&self.replay_fences).count();
+        if self.replay_fences.len() + additional > MAX_REPLAY_FENCES {
+            return Err("control_replay_fence_capacity");
+        }
+        self.replay_fences.extend(keys);
+        self.records
+            .retain(|item| !ids.contains(&item.settlement.settlement_id));
+        Ok(())
+    }
     /// Remove acknowledged records only after the coordinator independently
     /// proves every dependent and owner obligation closed. Persist this book
     /// atomically with that proof and the rest of the lineage retirement.
@@ -409,6 +443,39 @@ mod tests {
         book.compact_confirmed(&|_| true);
         assert_eq!(book.records, vec![item]);
         assert!(book.validate_structure());
+    }
+    #[test]
+    fn exact_retirement_is_all_or_nothing() {
+        let first = acknowledged_fixture(0);
+        let second = acknowledged_fixture(1);
+        let mut book = ControlSettlementBook {
+            records: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+        let ids = [
+            first.settlement.settlement_id.clone(),
+            second.settlement.settlement_id.clone(),
+        ]
+        .into_iter()
+        .collect();
+        assert!(book.retire_exact(&ids, &|item| item != &second).is_err());
+        assert_eq!(book.records, vec![first.clone(), second.clone()]);
+        assert!(!book.operation_fenced("owner", "effect-0"));
+        assert!(book.retire_exact(&ids, &|_| true).is_ok());
+        assert!(book.records.is_empty());
+        assert!(book.operation_fenced("owner", "effect-0"));
+        assert!(book.operation_fenced("owner", "effect-1"));
+        assert!(book.validate_structure());
+
+        let mut full = ControlSettlementBook {
+            records: vec![first.clone(), second.clone()],
+            replay_fences: (0..MAX_REPLAY_FENCES)
+                .map(|i| format!("{i:064x}"))
+                .collect(),
+        };
+        assert!(full.retire_exact(&ids, &|_| true).is_err());
+        assert_eq!(full.records, vec![first, second]);
+        assert_eq!(full.replay_fences.len(), MAX_REPLAY_FENCES);
     }
     #[test]
     fn retained_raw_owner_response_accepts_omitted_default_field() {
