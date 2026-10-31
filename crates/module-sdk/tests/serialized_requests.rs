@@ -1,5 +1,5 @@
 use amaterasu_module_sdk::{
-    RuntimeClient,
+    ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, RuntimeClient,
     abi::{AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_OK},
     extension_api::{ActionTarget, EXTENSION_ACTIONS_SERVICE},
     requests::RequestOptions,
@@ -17,6 +17,28 @@ struct Payload {
 struct Fixture {
     commands: RefCell<Vec<Value>>,
     replies: RefCell<VecDeque<Value>>,
+}
+
+#[test]
+fn provider_can_declare_an_approved_method_through_the_sdk() {
+    let method = ApiMethod {
+        service: "example.provider/1".into(),
+        method: "action_execute".into(),
+        interface_major: 1,
+        interface_minor: 0,
+        request: ApiSchema {
+            required: [("operation".into(), ApiFieldKind::String)].into(),
+            optional: Default::default(),
+            allow_extra: false,
+        },
+        response: ApiSchema {
+            required: [("status".into(), ApiFieldKind::String)].into(),
+            optional: Default::default(),
+            allow_extra: false,
+        },
+        privilege: ApiPrivilege::User,
+    };
+    assert_eq!(method.interface_major, 1);
 }
 
 unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, reply: ReplySink) -> i32 {

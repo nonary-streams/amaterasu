@@ -3,19 +3,22 @@ pub mod capture;
 pub mod encode;
 pub mod exports;
 pub mod media;
-pub mod requests;
 mod native;
+pub mod requests;
 pub use native::NativeBinding;
 
 pub use amaterasu_abi as abi;
-pub use amaterasu_extension_api as extension_api;
 pub use amaterasu_contracts::encoder::{
     DynamicRange, EncoderBackend, EncoderIdentity, EncoderSelection, NvencSettings,
     NvencSettingsOverrides, NvencSplitEncode, NvencTwoPass, SOFTWARE_ENCODER_ID,
     SoftwareEncoderOptions, VideoCodec, VideoStreamFormat, validate_min_threads,
     validate_software_options,
 };
-pub use amaterasu_contracts::{Command, HostLifecycleAction, Response, RuntimeHostContext};
+pub use amaterasu_contracts::{
+    ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, Command, HostLifecycleAction, Response,
+    RuntimeHostContext,
+};
+pub use amaterasu_extension_api as extension_api;
 pub use amaterasu_media as media_abi;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 
