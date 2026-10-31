@@ -11,6 +11,36 @@ impl AuthorityJournal for AuthorityWriter {
         save(&self.0, next)
     }
 }
+/// Atomically bind an admission to its exact target. Reusing an admission ID
+/// for a different session or generation is never an ownership transfer.
+fn record_admission(
+    next: &mut Journal,
+    session_id: &str,
+    admission_id: &str,
+    target: &LifecycleTarget,
+) -> ModuleResult<()> {
+    if next
+        .sessions
+        .iter()
+        .any(|(id, session)| id != session_id && session.admission_ids.contains(admission_id))
+    {
+        return Err("admission_owned_by_other_session".into());
+    }
+    let session = next.sessions.get_mut(session_id).ok_or("unknown_session")?;
+    if session
+        .admission_targets
+        .get(admission_id)
+        .is_some_and(|old| old != target)
+    {
+        return Err("admission_target_conflict".into());
+    }
+    session.admission_ids.insert(admission_id.to_owned());
+    session
+        .admission_targets
+        .insert(admission_id.to_owned(), target.clone());
+    Ok(())
+}
+
 struct ActionAdmissionWriter {
     shared: Shared,
     key: String,
@@ -37,14 +67,14 @@ impl AuthorityJournal for ActionAdmissionWriter {
             return Err("action_already_admitted".into());
         }
         transfer.admission_id = Some(fresh[0].clone());
-        let target = &next.receipts[&self.key].work.as_ref().unwrap().target;
-        let (_, session_id, _, _) = super::operations::target_parts(target)?;
-        let session_id = session_id.to_owned();
-        next.sessions
-            .get_mut(&session_id)
-            .ok_or("unknown_session")?
-            .admission_ids
-            .insert(fresh[0].clone());
+        let target = next.receipts[&self.key]
+            .work
+            .as_ref()
+            .ok_or("action_transition_missing")?
+            .target
+            .clone();
+        let (_, session_id, _, _) = super::operations::target_parts(&target)?;
+        record_admission(&mut next, session_id, &fresh[0], &target)?;
         next.authority = state.clone();
         save(&self.shared, next)
     }
@@ -64,14 +94,13 @@ impl PrepareJournal for WorkWriter {
             .and_then(|r| r.work.as_mut())
             .ok_or("transition_no_longer_active")?;
         work.states.insert(self.provider.clone(), state.clone());
-        let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;
-        let session_id = session_id.to_owned();
+        let target = work.target.clone();
+        if state.request.target != target {
+            return Err("admission_target_mismatch".into());
+        }
+        let (_, session_id, _, _) = super::operations::target_parts(&target)?;
         if let Some(id) = &state.admission_id {
-            next.sessions
-                .get_mut(&session_id)
-                .ok_or("unknown_session")?
-                .admission_ids
-                .insert(id.clone());
+            record_admission(&mut next, session_id, id, &target)?;
         }
         save(&self.shared, next)
     }
@@ -745,6 +774,9 @@ impl Coordinator {
                 next.authority.admissions.contains_key(id)
                     || next.authority.settled.contains_key(id)
             });
+            session
+                .admission_targets
+                .retain(|id, _| session.admission_ids.contains(id));
         }
         save(&self.shared, next)
     }
@@ -993,5 +1025,85 @@ impl Coordinator {
         // Keep the work and obligations for explicit reconciliation, but never
         // submit it again from the background pending-work loop.
         save(&self.shared, next)
+    }
+}
+
+#[cfg(test)]
+mod admission_target_tests {
+    use super::*;
+
+    fn session(id: &str) -> SessionRecord {
+        SessionRecord {
+            host_epoch: "epoch".into(),
+            id: id.into(),
+            generation: 1,
+            phase: SessionPhase::Ready,
+            owner: crate::action_authority::Principal {
+                caller: "caller".into(),
+                initiator: "owner".into(),
+            },
+            delegates: Default::default(),
+            application_ref: json!({}),
+            settings_revision: "revision".into(),
+            application_retired: false,
+            streams: Default::default(),
+            obligations: vec![],
+            required_consumers: None,
+            application: None,
+            application_operation_id: None,
+            admission_ids: Default::default(),
+            admission_targets: Default::default(),
+            provider_settings: Default::default(),
+        }
+    }
+
+    #[test]
+    fn admission_target_survives_roundtrip_and_rejects_rebinding() {
+        let mut journal = Journal {
+            version: 3,
+            host_epoch: "epoch".into(),
+            receipts: Default::default(),
+            sessions: [
+                ("first".into(), session("first")),
+                ("second".into(), session("second")),
+            ]
+            .into(),
+            authority: Default::default(),
+            inputs: Default::default(),
+            actions: Default::default(),
+            input_bindings: Default::default(),
+            revoked_inputs: Default::default(),
+            recovery_sources: Default::default(),
+            input_boot_epochs: Default::default(),
+            retention: Default::default(),
+        };
+        let target = LifecycleTarget::Stream {
+            host_epoch: "epoch".into(),
+            session_id: "first".into(),
+            stream_id: "stream".into(),
+            generation: 7,
+        };
+        record_admission(&mut journal, "first", "admission", &target).unwrap();
+        record_admission(&mut journal, "first", "admission", &target).unwrap();
+        let changed = LifecycleTarget::Stream {
+            host_epoch: "epoch".into(),
+            session_id: "first".into(),
+            stream_id: "stream".into(),
+            generation: 8,
+        };
+        assert!(record_admission(&mut journal, "first", "admission", &changed).is_err());
+        let foreign = LifecycleTarget::Session {
+            host_epoch: "epoch".into(),
+            session_id: "second".into(),
+            generation: 1,
+        };
+        assert!(record_admission(&mut journal, "second", "admission", &foreign).is_err());
+        let restored: Journal =
+            serde_json::from_slice(&serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert_eq!(
+            restored.sessions["first"].admission_targets["admission"],
+            target
+        );
+        assert!(restored.sessions["second"].admission_ids.is_empty());
     }
 }

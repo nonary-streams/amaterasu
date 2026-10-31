@@ -871,6 +871,7 @@ mod tests {
                 application: None,
                 application_operation_id: None,
                 admission_ids: Default::default(),
+                admission_targets: Default::default(),
                 provider_settings: Default::default(),
                 required_consumers: None,
                 settings_revision: "revision".into(),
@@ -1004,6 +1005,7 @@ mod tests {
                 application: None,
                 application_operation_id: None,
                 admission_ids: Default::default(),
+                admission_targets: Default::default(),
                 provider_settings: Default::default(),
                 required_consumers: None,
                 settings_revision: "revision".into(),
@@ -1243,6 +1245,7 @@ mod tests {
                 application: None,
                 application_operation_id: None,
                 admission_ids: Default::default(),
+                admission_targets: Default::default(),
                 provider_settings: [(
                     "display".into(),
                     super::super::settings_snapshot::FrozenSettings {

@@ -151,6 +151,10 @@ struct SessionRecord {
     application_operation_id: Option<String>,
     #[serde(default)]
     admission_ids: BTreeSet<String>,
+    /// Exact coordinator-issued target for each retained admission. Older
+    /// journals may lack provenance; operations requiring it must fail closed.
+    #[serde(default)]
+    admission_targets: BTreeMap<String, LifecycleTarget>,
     #[serde(default)]
     provider_settings: BTreeMap<String, settings_snapshot::FrozenSettings>,
 }

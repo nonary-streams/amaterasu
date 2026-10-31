@@ -205,6 +205,7 @@ mod tests {
             application: None,
             application_operation_id: None,
             admission_ids: Default::default(),
+            admission_targets: Default::default(),
             provider_settings: Default::default(),
             streams: [(
                 "stream".into(),
