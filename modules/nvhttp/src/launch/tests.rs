@@ -3,7 +3,7 @@ use amaterasu_module_sdk::{Command, Response};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-fn config() -> StreamingConfig {
+pub(super) fn config() -> StreamingConfig {
     StreamingConfig {
         capture: CaptureConfig {
             capture_provider: CaptureProvider::Dxgi,
@@ -97,7 +97,7 @@ fn linux_pipewire_profile_accepts_auto_encoder_selection() {
     assert!(software.validate().is_ok());
 }
 
-fn peer(marker: u8) -> PeerIdentity {
+pub(super) fn peer(marker: u8) -> PeerIdentity {
     peer_with_fec(marker, None)
 }
 
@@ -359,7 +359,7 @@ fn peer_with_ds4_back_as_touchpad_click(
         .unwrap()
 }
 
-fn request(key: u8) -> LaunchRequest {
+pub(super) fn request(key: u8) -> LaunchRequest {
     LaunchRequest {
         hdr: false,
         app_id: 1,
@@ -1328,6 +1328,10 @@ fn unavailable_selected_output_fails_without_opening_bootstrap_output() {
 }
 
 struct Broker {
+    lifecycle_replies: std::collections::VecDeque<Value>,
+    lifecycle_unavailable: bool,
+    lifecycle_release_failure: bool,
+    lifecycle_requests: BTreeSet<u64>,
     next: u64,
     results: BTreeMap<u64, Value>,
     commands: Vec<Command>,
@@ -1410,6 +1414,10 @@ struct Broker {
 impl Default for Broker {
     fn default() -> Self {
         Self {
+            lifecycle_replies: Default::default(),
+            lifecycle_unavailable: false,
+            lifecycle_release_failure: false,
+            lifecycle_requests: BTreeSet::new(),
             next: 0,
             results: BTreeMap::new(),
             commands: Vec::new(),
@@ -1503,6 +1511,9 @@ impl Broker {
             Command::Request {
                 service, payload, ..
             } => {
+                if service == "amaterasu.session-lifecycle/1" && self.lifecycle_unavailable {
+                    return Ok(Response::error("unavailable", "fixture"));
+                }
                 if self.lose_history_reserve_once
                     && !self.lost_history_reserve
                     && service == "amaterasu.stream-session/1"
@@ -1522,6 +1533,9 @@ impl Broker {
                 }
                 self.next += 1;
                 let request = self.next;
+                if service == "amaterasu.session-lifecycle/1" {
+                    self.lifecycle_requests.insert(request);
+                }
                 if service == "amaterasu.stream-session/1"
                     && payload["action"] == "release_history_activity"
                     && self.lose_history_release_result_once
@@ -1589,13 +1603,28 @@ impl Broker {
             {
                 Ok(Response::error("unavailable", "fixture settlement failure"))
             }
+            Command::ReleaseResult { request }
+                if self.lifecycle_release_failure && self.lifecycle_requests.contains(&request) =>
+            {
+                Err("lost lifecycle result release".into())
+            }
             Command::Cancel { .. } | Command::ReleaseResult { .. } => Ok(Response::Ok),
             _ => Ok(Response::error("unexpected", "unexpected command")),
         }
     }
 
     fn response(&mut self, service: &str, payload: &Value) -> Value {
+        if service == "amaterasu.session-lifecycle/1" {
+            let mut reply = self.lifecycle_replies.pop_front().unwrap_or_else(|| json!({"status":"pending"}));
+            if reply.get("operation_id").is_none() {
+                reply["operation_id"] = payload["operation_id"].clone();
+            }
+            return reply;
+        }
         let action = payload["action"].as_str().unwrap_or_default();
+        if service == "amaterasu.launch/1" && action == "operation_epoch" {
+            return json!({"ok":true,"operation_epoch":"0123456789abcdef0123456789abcdef"});
+        }
         if service == "amaterasu.input/1" && action == "settings_get" {
             self.input_policy_requests += 1;
             return self.input_policy_response.clone();

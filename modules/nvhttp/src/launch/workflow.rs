@@ -26,9 +26,23 @@ const INPUT_SERVICE: &str = "amaterasu.input/1";
 const RTSP_SERVICE: &str = "amaterasu.rtsp/1";
 const DISPLAY_SERVICE: &str = "amaterasu.display/1";
 const STREAM_SESSION_SERVICE: &str = "amaterasu.stream-session/1";
+const SESSION_LIFECYCLE_SERVICE: &str = "amaterasu.session-lifecycle/1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
+    ReadLaunchEpoch,
+    PrepareLifecycle,
+    LookupLifecycle,
+    BindApplication,
+    LookupApplicationBinding,
+    EndLifecycle,
+    ReportApplicationRetired,
+    AwaitLifecycleEnd,
+    VerifyPaused,
+    VerifyResumeSession,
+    VerifyResumeApplication,
+    RefreshResumePolicy,
+    AuthorizeResumeSnapshot,
     ReserveHistory,
     ReadProtonPolicy,
     PreflightApplication,
@@ -85,6 +99,25 @@ impl Controller {
             record.retrying_uncertainty = false;
         }
         let phase = next_phase(&record);
+        if matches!(phase, Phase::PrepareLifecycle | Phase::LookupLifecycle)
+            && now >= record.deadline
+        {
+            if record.lifecycle_prepare_dispatched {
+                record.fail_cleanup("lifecycle_prepare_unconfirmed");
+                reply_failure(&mut record, &mut self.management_replies);
+            } else {
+                record.request_cleanup(Some("launch_deadline_exceeded"), now);
+            }
+            self.records.insert(id, record);
+            return;
+        }
+        if phase == Phase::PrepareLifecycle
+            && (record.global_display_revision.is_none() || record.peer.client_id.is_none())
+        {
+            record.request_cleanup(Some("lifecycle_context_unavailable"), now);
+            self.records.insert(id, record);
+            return;
+        }
         eprintln!("amaterasu launch phase start={phase:?}");
         let call = self.make_call(&mut record, phase);
         let deadline = if matches!(
@@ -116,7 +149,32 @@ impl Controller {
         }
         match job.call.poll(send) {
             Outcome::Waiting => self.job = Some(take_job(job)),
-            Outcome::Result(payload) => self.consume(job, payload, now, replies),
+            Outcome::Result(payload) => {
+                if matches!(
+                    job.phase,
+                    Phase::ReadLaunchEpoch
+                        | Phase::PrepareLifecycle
+                        | Phase::LookupLifecycle
+                        | Phase::BindApplication
+                        | Phase::LookupApplicationBinding
+                        | Phase::EndLifecycle
+                        | Phase::ReportApplicationRetired
+                        | Phase::AwaitLifecycleEnd
+                        | Phase::VerifyPaused
+                        | Phase::VerifyResumeSession
+                        | Phase::VerifyResumeApplication
+                        | Phase::RefreshResumePolicy
+                        | Phase::AuthorizeResumeSnapshot
+                ) && !job.call.release_result(send)
+                {
+                    let record = self.records.get_mut(&job.record).expect("workflow record");
+                    record.uncertain.push_back((job.phase, take_call(job)));
+                    record.fail_cleanup("lifecycle_result_release_unconfirmed");
+                    reply_failure(record, replies);
+                } else {
+                    self.consume(job, payload, now, replies);
+                }
+            }
             Outcome::Rejected => self.rejected(job, now, replies),
             Outcome::Settled => self.settled(job, now, replies),
             Outcome::Uncertain => {
@@ -128,6 +186,24 @@ impl Controller {
                 record.retrying_uncertainty = false;
                 record.cleanup_error = Some("broker_settlement_unconfirmed");
                 match job.phase {
+                    Phase::ReadLaunchEpoch
+                    | Phase::PrepareLifecycle
+                    | Phase::LookupLifecycle
+                    | Phase::BindApplication
+                    | Phase::LookupApplicationBinding
+                    | Phase::EndLifecycle
+                    | Phase::ReportApplicationRetired
+                    | Phase::AwaitLifecycleEnd
+                    | Phase::VerifyPaused
+                    | Phase::VerifyResumeSession
+                    | Phase::VerifyResumeApplication
+                    | Phase::RefreshResumePolicy
+                    | Phase::AuthorizeResumeSnapshot => {
+                        record.fail_cleanup("lifecycle_prepare_unconfirmed");
+                        reply_failure(record, replies);
+                        self.finish_or_retain(job.record, now, replies);
+                        return;
+                    }
                     Phase::ReserveHistory | Phase::ReleaseHistory => {}
                     Phase::OpenRtsp | Phase::StopRtsp | Phase::LookupRtsp => {
                         record.rtsp_cleanup_blocked = true;
@@ -162,6 +238,17 @@ impl Controller {
 
     fn advance_after_history(config: Option<&StreamingConfig>, record: &mut Record, now: Instant) {
         if record.state != State::Starting {
+            return;
+        }
+        if record.resumed && record.lifecycle_session_target.is_some() {
+            if !record.desktop
+                && record.executable_path.is_some()
+                && record.frame_limiter_snapshot.is_some()
+            {
+                record.stage = Stage::AuthorizeResumeSnapshot;
+            } else {
+                advance_resume_display(record, now);
+            }
             return;
         }
         if !record.desktop {
@@ -217,6 +304,68 @@ impl Controller {
             record.application_reconcile = None;
         }
         let (service, mut payload, timeout_ms) = match phase {
+            Phase::ReadLaunchEpoch => (LAUNCH_SERVICE, json!({"action":"operation_epoch"}), 5_000),
+            Phase::PrepareLifecycle => {
+                record.lifecycle_prepare_dispatched = true;
+                (
+                    SESSION_LIFECYCLE_SERVICE,
+                    json!({"operation":"prepare",
+                        "operation_id":format!("{}-lifecycle", record.application_operation),
+                        "application_ref":{"kind":if record.desktop {"desktop"} else {"application"},"app_id":app_id(record.request.app_id)},
+                        "application_operation_id":record.application_operation,
+                        "owner":{"kind":"paired_client","client_ref":record.peer.client_id},
+                        "settings_revision":record.global_display_revision.expect("validated revision").to_string(),
+                        "requested_video":{"width":record.request.width,"height":record.request.height,
+                            "refresh_millihz":record.request.fps * 1000,"hdr":record.request.hdr}}),
+                    5_000,
+                )
+            }
+            Phase::LookupLifecycle => (
+                SESSION_LIFECYCLE_SERVICE,
+                json!({"operation":"lookup", "operation_id":format!("{}-lifecycle", record.application_operation)}),
+                5_000,
+            ),
+            Phase::BindApplication => (
+                SESSION_LIFECYCLE_SERVICE,
+                json!({"operation":"bind_application", "operation_id":format!("{}-lifecycle-bind",record.application_operation), "target":record.lifecycle_session_target, "launch_id":record.application_launch, "application_operation_id":record.application_operation}),
+                5_000,
+            ),
+            Phase::LookupApplicationBinding => (
+                SESSION_LIFECYCLE_SERVICE,
+                json!({"operation":"lookup", "operation_id":format!("{}-lifecycle-bind",record.application_operation)}),
+                5_000,
+            ),
+            Phase::EndLifecycle => (
+                SESSION_LIFECYCLE_SERVICE,
+                json!({"operation":"end_session", "operation_id":format!("{}-lifecycle-end",record.application_operation), "target":record.lifecycle_session_target}),
+                5_000,
+            ),
+            Phase::ReportApplicationRetired => (
+                SESSION_LIFECYCLE_SERVICE,
+                json!({"operation":"application_retired", "operation_id":format!("{}-lifecycle-app-retired",record.application_operation), "target":record.lifecycle_session_target, "retired":true, "retirement_receipt":{"service":LAUNCH_SERVICE,"launch_id":record.lifecycle_retirement_launch,"operation_id":record.application_operation}}),
+                5_000,
+            ),
+            Phase::AwaitLifecycleEnd => (
+                SESSION_LIFECYCLE_SERVICE,
+                json!({"operation":"lookup", "operation_id":format!("{}-lifecycle-end",record.application_operation)}),
+                5_000,
+            ),
+            Phase::VerifyPaused | Phase::VerifyResumeSession => (
+                SESSION_LIFECYCLE_SERVICE,
+                json!({"operation":"snapshot", "target":record.lifecycle_session_target}),
+                5_000,
+            ),
+            Phase::VerifyResumeApplication => (
+                LAUNCH_SERVICE,
+                json!({"action":"status", "launch_id":record.application_launch}),
+                5_000,
+            ),
+            Phase::RefreshResumePolicy => (INPUT_SERVICE, json!({"action":"settings_get"}), 5_000),
+            Phase::AuthorizeResumeSnapshot => (
+                LAUNCH_SERVICE,
+                json!({"action":"authorize_stream_snapshot", "launch_id":record.application_launch, "application_operation_id":record.application_operation, "rtsp_operation_id":record.rtsp_operation, "frame_limiter_settings":record.frame_limiter_snapshot}),
+                5_000,
+            ),
             Phase::ReserveHistory => {
                 record.history_release_required = true;
                 (
@@ -457,6 +606,18 @@ impl Controller {
             payload["history_activity_id"] = json!(record.rtsp_operation);
         }
         if matches!(phase, Phase::OpenRtsp)
+            && let Some(target) = record.lifecycle_session_target.as_ref()
+        {
+            payload["lifecycle_session_target"] = json!(target);
+            payload["lifecycle_settings_revision"] = json!(
+                record
+                    .global_display_revision
+                    .expect("lifecycle revision")
+                    .to_string()
+            );
+            payload["lifecycle_intent"] = json!(if record.resumed { "resume" } else { "initial" });
+        }
+        if matches!(phase, Phase::OpenRtsp)
             && let Some(policy) = record.video_encryption_policy
         {
             payload["video_encryption_policy"] = json!({
@@ -500,8 +661,178 @@ impl Controller {
             job.phase,
             payload["ok"] == true
         );
+        if job.phase == Phase::RefreshResumePolicy {
+            let Some(mut record) = self.records.remove(&job.record) else {
+                return;
+            };
+            if record.state == State::Stopping {
+                record.stage = Stage::Cleanup;
+            } else {
+                let pending = self
+                    .pending_resume
+                    .take()
+                    .filter(|pending| pending.record == job.record);
+                let candidate = pending.and_then(|pending| {
+                    let proton = proton_policy_response(&payload).ok()?;
+                    let connect_data = super::random_nonzero_u32().ok()?;
+                    super::resume_snapshot::ResumeSnapshot::build(
+                        self,
+                        &record,
+                        pending.request,
+                        pending.peer,
+                        connect_data,
+                        proton,
+                    )
+                    .ok()
+                });
+                if let Some(candidate) = candidate {
+                    candidate.apply(&mut record);
+                    record.stage = Stage::ReserveHistory;
+                } else {
+                    reject_resume(&mut record, replies);
+                }
+            }
+            self.records.insert(job.record, record);
+            self.finish_or_retain(job.record, now, replies);
+            return;
+        }
         let record = self.records.get_mut(&job.record).expect("workflow record");
+        if record.state == State::Stopping
+            && matches!(
+                job.phase,
+                Phase::VerifyPaused
+                    | Phase::VerifyResumeSession
+                    | Phase::VerifyResumeApplication
+                    | Phase::RefreshResumePolicy
+                    | Phase::AuthorizeResumeSnapshot
+            )
+        {
+            record.stage = Stage::Cleanup;
+            self.finish_or_retain(job.record, now, replies);
+            return;
+        }
         match job.phase {
+            Phase::ReadLaunchEpoch => {
+                let epoch = payload["operation_epoch"].as_str().filter(|value| {
+                    value.len() == 32
+                        && value
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                });
+                if payload["ok"] == true
+                    && let Some(epoch) = epoch
+                {
+                    record.application_operation =
+                        format!("ale1:{epoch}:{}", record.application_operation);
+                    record.lifecycle_launch_epoch_ready = true;
+                } else {
+                    fail_record(record, "launch_epoch_unavailable", now);
+                }
+            }
+            Phase::PrepareLifecycle | Phase::LookupLifecycle => {
+                if payload["operation_id"] != format!("{}-lifecycle", record.application_operation)
+                {
+                    record.fail_cleanup("lifecycle_prepare_unconfirmed");
+                    reply_failure(record, replies);
+                } else if payload["status"] == "pending" {
+                    record.lifecycle_prepare_pending = true;
+                    record.next_monitor = now + CLEANUP_POLL_INTERVAL;
+                } else if payload["status"] == "succeeded"
+                    && let Some(target) = lifecycle_session_target(&payload)
+                {
+                    record.lifecycle_session_target = Some(target);
+                    record.lifecycle_prepare_pending = false;
+                } else {
+                    record.fail_cleanup("lifecycle_retirement_unavailable");
+                    reply_failure(record, replies);
+                }
+            }
+            Phase::EndLifecycle => {
+                if payload["target"] == json!(record.lifecycle_session_target)
+                    && payload["fenced"] == true
+                    && matches!(payload["status"].as_str(), Some("pending" | "succeeded"))
+                {
+                    record.lifecycle_end_fenced = true;
+                } else {
+                    record.fail_cleanup("lifecycle_end_unconfirmed");
+                    reply_failure(record, replies);
+                }
+            }
+            Phase::BindApplication | Phase::LookupApplicationBinding => {
+                if payload["status"] == "pending" {
+                    record.lifecycle_binding_pending = true;
+                    record.next_monitor = now + CLEANUP_POLL_INTERVAL;
+                } else if payload["status"] == "succeeded"
+                    && payload["target"] == json!(record.lifecycle_session_target)
+                    && payload["launch_id"] == json!(record.application_launch)
+                    && payload["application_operation_id"] == record.application_operation
+                {
+                    record.lifecycle_application_bound = true;
+                    record.lifecycle_binding_pending = false;
+                    if record.state == State::Starting && record.rtsp_ticket.is_some() {
+                        complete_launch(record, now, replies);
+                    }
+                } else {
+                    record.fail_cleanup("lifecycle_application_binding_unconfirmed");
+                    reply_failure(record, replies);
+                }
+            }
+            Phase::ReportApplicationRetired => {
+                if payload["target"] == json!(record.lifecycle_session_target)
+                    && matches!(payload["status"].as_str(), Some("pending" | "succeeded"))
+                {
+                    record.lifecycle_application_retired = true;
+                    record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL;
+                } else {
+                    record.fail_cleanup("lifecycle_application_retirement_unconfirmed");
+                    reply_failure(record, replies);
+                }
+            }
+            Phase::AwaitLifecycleEnd => {
+                if payload["status"] == "succeeded" {
+                    record.lifecycle_end_complete = true;
+                } else if payload["status"] == "pending" {
+                    record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL;
+                } else {
+                    record.fail_cleanup("lifecycle_end_unconfirmed");
+                    reply_failure(record, replies);
+                }
+            }
+            Phase::VerifyPaused | Phase::VerifyResumeSession => {
+                if lifecycle_session_is_paused(record, &payload) {
+                    if job.phase == Phase::VerifyPaused {
+                        record.state = State::Paused;
+                        record.stage = Stage::Live;
+                    } else if record.desktop {
+                        record.stage = Stage::RefreshResumePolicy;
+                    } else {
+                        record.stage = Stage::VerifyResumeApplication;
+                    }
+                } else {
+                    record.request_cleanup(Some("lifecycle_pause_unconfirmed"), now);
+                }
+            }
+            Phase::VerifyResumeApplication => {
+                if application_response(record, &payload)
+                    .is_ok_and(|(_, state, healthy)| state == "active" && healthy)
+                {
+                    record.stage = Stage::RefreshResumePolicy;
+                } else {
+                    record.request_cleanup(Some("retained_application_unavailable"), now);
+                }
+            }
+            Phase::RefreshResumePolicy => unreachable!("handled before borrowing the record"),
+            Phase::AuthorizeResumeSnapshot => {
+                if payload["ok"] == true
+                    && payload["application_operation_id"] == record.application_operation
+                    && payload["rtsp_operation_id"] == record.rtsp_operation
+                    && payload["frame_limiter_settings"] == json!(record.frame_limiter_snapshot)
+                {
+                    advance_resume_display(record, now);
+                } else {
+                    reject_resume(record, replies);
+                }
+            }
             Phase::ReserveHistory => {
                 if record.cleanup_error == Some("broker_settlement_unconfirmed") {
                     record.cleanup_error = None;
@@ -523,7 +854,11 @@ impl Controller {
                     "unavailable"
                 };
                 if record.state == State::Starting {
-                    record.stage = Stage::ReadProtonPolicy;
+                    if record.resumed && record.lifecycle_session_target.is_some() {
+                        Self::advance_after_history(self.config.as_ref(), record, now);
+                    } else {
+                        record.stage = Stage::ReadProtonPolicy;
+                    }
                 }
             }
             Phase::ReadProtonPolicy => {
@@ -642,8 +977,10 @@ impl Controller {
                     record.display_snapshot_ids = ids;
                     record.stage = Stage::EnumerateDisplay;
                 }
-                Ok(_) => fail_record(record, "display_snapshot_unavailable", now),
-                Err(code) => fail_record(record, code, now),
+                Ok(_) => {
+                    fail_before_resume_stream(record, "display_snapshot_unavailable", now, replies)
+                }
+                Err(code) => fail_before_resume_stream(record, code, now, replies),
             },
             Phase::EnumerateDisplay if record.state == State::Starting => {
                 match display_enumeration(record, &payload) {
@@ -651,10 +988,12 @@ impl Controller {
                         record.display_enumeration_offset = next_offset;
                     }
                     Ok(None) => record.stage = Stage::ConfirmDisplay,
-                    Err(code) => fail_record(record, code, now),
+                    Err(code) => fail_before_resume_stream(record, code, now, replies),
                 }
             }
-            Phase::EnumerateDisplay => fail_record(record, "display_enumeration_unavailable", now),
+            Phase::EnumerateDisplay => {
+                fail_before_resume_stream(record, "display_enumeration_unavailable", now, replies)
+            }
             Phase::ConfirmDisplay => match display_snapshot(&payload) {
                 Ok((revision, configuration, ids))
                     if record.state == State::Starting
@@ -672,15 +1011,19 @@ impl Controller {
                                 || record.application_display_settings.is_some()
                             {
                                 Stage::PrepareDisplayAdmission
+                            } else if record.resumed {
+                                Stage::OpenRtsp
                             } else {
                                 Stage::LaunchApplication
                             };
                         }
-                        Err(code) => fail_record(record, code, now),
+                        Err(code) => fail_before_resume_stream(record, code, now, replies),
                     }
                 }
-                Ok(_) => fail_record(record, "display_topology_changed", now),
-                Err(code) => fail_record(record, code, now),
+                Ok(_) => {
+                    fail_before_resume_stream(record, "display_topology_changed", now, replies)
+                }
+                Err(code) => fail_before_resume_stream(record, code, now, replies),
             },
             Phase::LaunchApplication | Phase::LookupApplication => {
                 match application_response(record, &payload) {
@@ -789,6 +1132,24 @@ impl Controller {
             },
             Phase::MonitorRtsp => match rtsp_response(record, &payload) {
                 Ok((_, _, "ready" | "arming" | "playing", true)) => record.monitored(now),
+                Ok((_, _, "closed" | "failed", true))
+                    if record.lifecycle_required
+                        && matches!(
+                            payload["authenticated_disconnect_reason"].as_str(),
+                            Some("peer_disconnected" | "authenticated_peer_idle" | "peer_timeout")
+                        )
+                        && payload["lifecycle_retired"] == true =>
+                {
+                    record.rtsp_requested = false;
+                    record.rtsp_ticket = None;
+                    record.rtsp_url = None;
+                    record.stage = if record.history_release_required {
+                        Stage::ReleasePausedHistory
+                    } else {
+                        Stage::VerifyPaused
+                    };
+                    record.deadline = now + INITIAL_DEADLINE;
+                }
                 Ok(_) => record.request_cleanup(Some("stream_ended"), now),
                 Err(code) => fail_record(record, code, now),
             },
@@ -807,6 +1168,7 @@ impl Controller {
             }
             Phase::StopApplication | Phase::VerifyApplicationStopped => {
                 if clean_application_terminal(record, &payload) {
+                    record.lifecycle_retirement_launch = record.application_launch;
                     record.application_requested = false;
                     record.application_launch = None;
                 } else if job.phase == Phase::StopApplication
@@ -837,7 +1199,20 @@ impl Controller {
                     } else {
                         "unavailable"
                     };
+                    if record.stage == Stage::ReleasePausedHistory {
+                        record.stage = Stage::VerifyPaused;
+                    } else if record.stage == Stage::ReleaseRejectedResumeHistory {
+                        record.state = State::Paused;
+                        record.stage = Stage::Live;
+                        record.next_monitor = now;
+                    }
                 } else {
+                    if matches!(
+                        record.stage,
+                        Stage::ReleasePausedHistory | Stage::ReleaseRejectedResumeHistory
+                    ) {
+                        record.request_cleanup(Some("history_release_unconfirmed"), now);
+                    }
                     record.cleanup_error = Some("history_release_unconfirmed");
                     record.stage = Stage::Cleanup;
                 }
@@ -849,7 +1224,47 @@ impl Controller {
     fn rejected(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
         eprintln!("amaterasu launch phase rejected={:?}", job.phase);
         let record = self.records.get_mut(&job.record).expect("workflow record");
+        if record.state == State::Stopping
+            && matches!(
+                job.phase,
+                Phase::VerifyPaused
+                    | Phase::VerifyResumeSession
+                    | Phase::VerifyResumeApplication
+                    | Phase::RefreshResumePolicy
+                    | Phase::AuthorizeResumeSnapshot
+            )
+        {
+            record.stage = Stage::Cleanup;
+            self.finish_or_retain(job.record, now, replies);
+            return;
+        }
         match job.phase {
+            Phase::RefreshResumePolicy | Phase::AuthorizeResumeSnapshot => {
+                self.pending_resume = None;
+                reject_resume(record, replies);
+            }
+            Phase::ReadLaunchEpoch
+            | Phase::VerifyPaused
+            | Phase::VerifyResumeSession
+            | Phase::VerifyResumeApplication
+            | Phase::BindApplication
+            | Phase::LookupApplicationBinding
+            | Phase::EndLifecycle
+            | Phase::ReportApplicationRetired
+            | Phase::AwaitLifecycleEnd => {
+                record.fail_cleanup("lifecycle_retirement_unconfirmed");
+                reply_failure(record, replies);
+            }
+            Phase::PrepareLifecycle => {
+                // A previous admission reply may have been lost before this
+                // rejection; preserve the fence until reconciliation exists.
+                record.fail_cleanup("lifecycle_prepare_unconfirmed");
+                reply_failure(record, replies);
+            }
+            Phase::LookupLifecycle => {
+                record.fail_cleanup("lifecycle_prepare_unconfirmed");
+                reply_failure(record, replies);
+            }
             Phase::ReserveHistory => {
                 if record.cleanup_error == Some("broker_settlement_unconfirmed") {
                     record.cleanup_error = None;
@@ -864,6 +1279,12 @@ impl Controller {
                 fail_record(record, "input_policy_unavailable", now);
             }
             Phase::ReleaseHistory => {
+                if matches!(
+                    record.stage,
+                    Stage::ReleasePausedHistory | Stage::ReleaseRejectedResumeHistory
+                ) {
+                    record.request_cleanup(Some("history_release_unavailable"), now);
+                }
                 record.cleanup_error = Some("history_release_unavailable");
                 record.stage = Stage::Cleanup;
             }
@@ -895,13 +1316,13 @@ impl Controller {
                 record.next_monitor = now;
             }
             Phase::PrepareDisplayAdmission => {
-                fail_record(record, "display_admission_unavailable", now);
+                fail_before_resume_stream(record, "display_admission_unavailable", now, replies);
             }
             Phase::PreflightApplication => {
                 fail_record(record, "application_preflight_rejected", now)
             }
             Phase::SnapshotDisplay | Phase::EnumerateDisplay | Phase::ConfirmDisplay => {
-                fail_record(record, "display_verification_unavailable", now)
+                fail_before_resume_stream(record, "display_verification_unavailable", now, replies)
             }
             Phase::OpenRtsp => {
                 record.rtsp_requested = false;
@@ -914,8 +1335,41 @@ impl Controller {
     fn settled(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
         eprintln!("amaterasu launch phase settled={:?}", job.phase);
         let record = self.records.get_mut(&job.record).expect("workflow record");
+        let releasing_paused_history = matches!(
+            record.stage,
+            Stage::ReleasePausedHistory | Stage::ReleaseRejectedResumeHistory
+        );
         record.stage = Stage::Cleanup;
+        if record.state == State::Stopping
+            && matches!(
+                job.phase,
+                Phase::VerifyPaused
+                    | Phase::VerifyResumeSession
+                    | Phase::VerifyResumeApplication
+                    | Phase::RefreshResumePolicy
+                    | Phase::AuthorizeResumeSnapshot
+            )
+        {
+            self.finish_or_retain(job.record, now, replies);
+            return;
+        }
         match job.phase {
+            Phase::ReadLaunchEpoch
+            | Phase::RefreshResumePolicy
+            | Phase::AuthorizeResumeSnapshot
+            | Phase::VerifyPaused
+            | Phase::VerifyResumeSession
+            | Phase::VerifyResumeApplication
+            | Phase::PrepareLifecycle
+            | Phase::LookupLifecycle
+            | Phase::BindApplication
+            | Phase::LookupApplicationBinding
+            | Phase::EndLifecycle
+            | Phase::ReportApplicationRetired
+            | Phase::AwaitLifecycleEnd => {
+                record.fail_cleanup("lifecycle_prepare_unconfirmed");
+                reply_failure(record, replies);
+            }
             Phase::ReserveHistory => {
                 if record.cleanup_error == Some("broker_settlement_unconfirmed") {
                     record.cleanup_error = None;
@@ -926,6 +1380,9 @@ impl Controller {
                 }
             }
             Phase::ReleaseHistory => {
+                if releasing_paused_history {
+                    record.request_cleanup(Some("history_release_unavailable"), now);
+                }
                 record.cleanup_error = Some("history_release_unavailable");
                 record.stage = Stage::Cleanup;
             }
@@ -983,9 +1440,27 @@ impl Controller {
         self.finish_or_retain(job.record, now, replies);
     }
 
-    fn finish_or_retain(&mut self, record_id: u64, now: Instant, replies: &mut Vec<(u64, Reply)>) {
+    pub(super) fn finish_or_retain(
+        &mut self,
+        record_id: u64,
+        now: Instant,
+        replies: &mut Vec<(u64, Reply)>,
+    ) {
         let record = self.records.get_mut(&record_id).expect("workflow record");
         if record.state == State::Stopping {
+            if record.lifecycle_session_target.is_some() && !record.lifecycle_end_complete {
+                if record.rtsp_requested && record.rtsp_cleanup_blocked {
+                    record.fail_cleanup("rtsp_cleanup_unconfirmed");
+                    reply_failure(record, replies);
+                } else if record.application_requested && record.application_cleanup_blocked {
+                    record.fail_cleanup("application_cleanup_unconfirmed");
+                    reply_failure(record, replies);
+                } else if now >= record.deadline {
+                    record.fail_cleanup("lifecycle_retirement_unconfirmed");
+                    reply_failure(record, replies);
+                }
+                return;
+            }
             if now >= record.deadline && (record.rtsp_requested || record.application_requested) {
                 record.fail_cleanup("cleanup_deadline_exceeded");
                 reply_failure(record, replies);
@@ -1021,9 +1496,77 @@ impl Controller {
     }
 }
 
+pub(super) fn lifecycle_session_is_paused(record: &Record, payload: &Value) -> bool {
+    use amaterasu_module_sdk::extension_api::LifecycleTarget;
+    let Some(LifecycleTarget::Session {
+        host_epoch,
+        session_id,
+        generation,
+    }) = &record.lifecycle_session_target
+    else {
+        return false;
+    };
+    if payload["status"] != "ok" || payload["host_epoch"] != *host_epoch {
+        return false;
+    }
+    let Some(sessions) = payload["sessions"].as_array() else {
+        return false;
+    };
+    sessions
+        .iter()
+        .filter(|session| {
+            session["session_id"] == *session_id
+                && session["generation"] == *generation
+                && session["phase"] == "paused"
+        })
+        .count()
+        == 1
+}
+
+pub(super) fn lifecycle_session_target(
+    payload: &Value,
+) -> Option<amaterasu_module_sdk::extension_api::LifecycleTarget> {
+    use amaterasu_module_sdk::extension_api::LifecycleTarget;
+    let target: LifecycleTarget = serde_json::from_value(payload.get("target")?.clone()).ok()?;
+    match &target {
+        LifecycleTarget::Session {
+            host_epoch,
+            session_id,
+            generation,
+        } if !host_epoch.is_empty()
+            && host_epoch.len() <= 128
+            && !session_id.is_empty()
+            && session_id.len() <= 128
+            && host_epoch
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+            && session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+            && *generation > 0 =>
+        {
+            Some(target)
+        }
+        _ => None,
+    }
+}
+
 impl Phase {
     fn name(self) -> &'static str {
         match self {
+            Self::ReadLaunchEpoch => "read-launch-epoch",
+            Self::PrepareLifecycle => "prepare-lifecycle",
+            Self::LookupLifecycle => "lookup-lifecycle",
+            Self::BindApplication => "bind-application",
+            Self::LookupApplicationBinding => "lookup-application-binding",
+            Self::EndLifecycle => "end-lifecycle",
+            Self::ReportApplicationRetired => "report-application-retired",
+            Self::AwaitLifecycleEnd => "await-lifecycle-end",
+            Self::VerifyPaused => "verify-paused",
+            Self::VerifyResumeSession => "verify-resume-session",
+            Self::VerifyResumeApplication => "verify-resume-application",
+            Self::RefreshResumePolicy => "refresh-resume-policy",
+            Self::AuthorizeResumeSnapshot => "authorize-resume-snapshot",
             Self::ReserveHistory => "reserve-history",
             Self::ReadProtonPolicy => "read-proton-policy",
             Self::PreflightApplication => "preflight-launch",
@@ -1068,6 +1611,21 @@ fn needs_work(record: &Record, now: Instant) -> bool {
     if record.retrying_uncertainty {
         return true;
     }
+    if record.lifecycle_required
+        && (record.lifecycle_prepare_pending || record.lifecycle_binding_pending)
+        && record.state == State::Starting
+        && now < record.next_monitor
+    {
+        return false;
+    }
+    if record.stage == Stage::Cleanup
+        && record.lifecycle_end_fenced
+        && record.lifecycle_application_retired
+        && !record.lifecycle_end_complete
+        && now < record.next_cleanup_poll
+    {
+        return false;
+    }
     matches!(
         record.stage,
         Stage::ReserveHistory
@@ -1079,7 +1637,16 @@ fn needs_work(record: &Record, now: Instant) -> bool {
             | Stage::LaunchApplication
             | Stage::PrepareDisplayAdmission
             | Stage::OpenRtsp
-    ) || (record.stage == Stage::Live && now >= record.next_monitor)
+            | Stage::VerifyPaused
+            | Stage::VerifyResumeSession
+            | Stage::VerifyResumeApplication
+            | Stage::RefreshResumePolicy
+            | Stage::AuthorizeResumeSnapshot
+            | Stage::ReleasePausedHistory
+            | Stage::ReleaseRejectedResumeHistory
+    ) || (record.stage == Stage::Live
+        && (record.state == State::Ready || (record.state == State::Paused && !record.desktop))
+        && now >= record.next_monitor)
         || (record.stage == Stage::AwaitApplicationReady && now >= record.next_monitor)
         || matches!(
             record.stage,
@@ -1089,12 +1656,67 @@ fn needs_work(record: &Record, now: Instant) -> bool {
             && (now >= record.next_cleanup_poll || now >= record.deadline))
 }
 
-fn next_phase(record: &Record) -> Phase {
+pub(super) fn next_phase(record: &Record) -> Phase {
+    if record.state == State::Starting
+        && record.lifecycle_required
+        && !record.lifecycle_launch_epoch_ready
+        && matches!(
+            record.stage,
+            Stage::PreflightApplication
+                | Stage::LaunchApplication
+                | Stage::PrepareDisplayAdmission
+                | Stage::OpenRtsp
+        )
+    {
+        return Phase::ReadLaunchEpoch;
+    }
+    if record.state == State::Starting
+        && record.lifecycle_required
+        && record.lifecycle_session_target.is_none()
+        && matches!(
+            record.stage,
+            Stage::LaunchApplication | Stage::PrepareDisplayAdmission | Stage::OpenRtsp
+        )
+    {
+        return if record.lifecycle_prepare_pending {
+            Phase::LookupLifecycle
+        } else {
+            Phase::PrepareLifecycle
+        };
+    }
     if let Some(phase) = record.rtsp_reconcile {
         return phase;
     }
     if let Some(phase) = record.application_reconcile {
         return phase;
+    }
+    if matches!(record.state, State::Starting | State::Stopping)
+        && matches!(
+            record.stage,
+            Stage::OpenRtsp | Stage::AwaitApplicationReady | Stage::Cleanup
+        )
+        && record.lifecycle_session_target.is_some()
+        && record.application_launch.is_some()
+        && !record.lifecycle_application_bound
+    {
+        return if record.lifecycle_binding_pending {
+            Phase::LookupApplicationBinding
+        } else {
+            Phase::BindApplication
+        };
+    }
+    if record.stage == Stage::Cleanup && record.lifecycle_session_target.is_some() {
+        if !record.lifecycle_end_fenced {
+            return Phase::EndLifecycle;
+        }
+        if !record.rtsp_requested && !record.application_requested {
+            if !record.lifecycle_application_retired {
+                return Phase::ReportApplicationRetired;
+            }
+            if !record.lifecycle_end_complete {
+                return Phase::AwaitLifecycleEnd;
+            }
+        }
     }
     match record.stage {
         Stage::ReserveHistory => Phase::ReserveHistory,
@@ -1107,7 +1729,17 @@ fn next_phase(record: &Record) -> Phase {
         Stage::AwaitApplicationReady => Phase::AwaitApplication,
         Stage::PrepareDisplayAdmission => Phase::PrepareDisplayAdmission,
         Stage::OpenRtsp => Phase::OpenRtsp,
-        Stage::Live if !record.desktop && record.monitor_application_next => {
+        Stage::VerifyPaused => Phase::VerifyPaused,
+        Stage::VerifyResumeSession => Phase::VerifyResumeSession,
+        Stage::VerifyResumeApplication => Phase::VerifyResumeApplication,
+        Stage::RefreshResumePolicy => Phase::RefreshResumePolicy,
+        Stage::AuthorizeResumeSnapshot => Phase::AuthorizeResumeSnapshot,
+        Stage::ReleasePausedHistory => Phase::ReleaseHistory,
+        Stage::ReleaseRejectedResumeHistory => Phase::ReleaseHistory,
+        Stage::Live
+            if !record.desktop
+                && (record.monitor_application_next || record.state == State::Paused) =>
+        {
             Phase::MonitorApplication
         }
         Stage::Live => Phase::MonitorRtsp,
@@ -1485,7 +2117,7 @@ fn capture_source(record: &Record) -> Result<&str, &'static str> {
     capture_source_for(&record.capture_provider, &record.capture_output)
 }
 
-fn route_capture(
+pub(super) fn route_capture(
     record: &mut Record,
     mode: super::CaptureMode,
     virtual_intent: bool,
@@ -1846,6 +2478,75 @@ fn fail_record(record: &mut Record, code: &'static str, now: Instant) {
     record.request_cleanup(Some(code), now);
 }
 
+fn fail_before_resume_stream(
+    record: &mut Record,
+    code: &'static str,
+    now: Instant,
+    replies: &mut Vec<(u64, Reply)>,
+) {
+    if record.resumed
+        && record.lifecycle_session_target.is_some()
+        && !record.rtsp_requested
+        && record.rtsp_ticket.is_none()
+        && record.state == State::Starting
+    {
+        reject_resume(record, replies);
+    } else {
+        fail_record(record, code, now);
+    }
+}
+
+pub(super) fn reject_resume(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
+    if let Some(connection) = record.launch_connection.take() {
+        replies.push((
+            connection,
+            private_error(409, "resume settings are unavailable"),
+        ));
+    }
+    record.state = if record.history_release_required {
+        State::Starting
+    } else {
+        State::Paused
+    };
+    record.stage = if record.history_release_required {
+        Stage::ReleaseRejectedResumeHistory
+    } else {
+        Stage::Live
+    };
+    record.adopted = true;
+}
+
+fn advance_resume_display(record: &mut Record, now: Instant) {
+    if record.desktop {
+        record.stage = Stage::OpenRtsp;
+    } else if record
+        .virtual_display_intent
+        .as_ref()
+        .is_some_and(VirtualDisplayIntent::active)
+    {
+        record.stage = Stage::PrepareDisplayAdmission;
+    } else {
+        match record
+            .display_policy_snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot["effective_overrides"]["dd_configuration_option"].as_str()
+            }) {
+            Some("verify_only" | "ensure_active" | "ensure_primary" | "ensure_only_display") => {
+                record.stage = Stage::SnapshotDisplay
+            }
+            None | Some("disabled") => {
+                record.stage = if record.application_display_settings.is_some() {
+                    Stage::PrepareDisplayAdmission
+                } else {
+                    Stage::OpenRtsp
+                }
+            }
+            Some(_) => fail_record(record, "display_mutation_unavailable", now),
+        }
+    }
+}
+
 fn complete_launch(record: &mut Record, now: Instant, replies: &mut Vec<(u64, Reply)>) {
     eprintln!("amaterasu launch preparation complete");
     record.state = State::AwaitingDelivery;
@@ -1857,7 +2558,7 @@ fn complete_launch(record: &mut Record, now: Instant, replies: &mut Vec<(u64, Re
     }
 }
 
-fn project_application_policy(
+pub(super) fn project_application_policy(
     record: &mut Record,
     application_overrides: &ApplicationConfigOverrides,
     profile: &mut super::StreamProfile,
@@ -2149,7 +2850,9 @@ fn advance_after_application_ready(
     replies: &mut Vec<(u64, Reply)>,
 ) {
     record.deadline = now + INITIAL_DEADLINE;
-    if record.rtsp_ticket.is_some() {
+    if record.rtsp_ticket.is_some()
+        && (!record.lifecycle_required || record.lifecycle_application_bound)
+    {
         complete_launch(record, now, replies);
     } else {
         record.stage = Stage::OpenRtsp;
@@ -2164,7 +2867,7 @@ pub(super) struct ApplicationConfigOverrides {
     qp: Option<i32>,
     minimum_fps_target: Option<f64>,
     video_max_batch_size_kb: Option<u8>,
-    capture: Option<super::CaptureMode>,
+    pub(super) capture: Option<super::CaptureMode>,
     display_policy: Option<Value>,
     sw_preset: Option<String>,
     sw_tune: Option<String>,
@@ -2383,7 +3086,7 @@ fn valid_application_display_policy(policy: &Value) -> bool {
     crate::product_settings::validate_display_policy_values(&complete).is_ok()
 }
 
-fn display_policy_snapshot(record: &Record) -> Value {
+pub(super) fn display_policy_snapshot(record: &Record) -> Value {
     let application = record
         .application_display_overrides
         .as_ref()
@@ -2417,7 +3120,9 @@ fn display_policy_snapshot(record: &Record) -> Value {
     snapshot
 }
 
-fn virtual_display_intent(record: &Record) -> Result<Option<VirtualDisplayIntent>, &'static str> {
+pub(super) fn virtual_display_intent(
+    record: &Record,
+) -> Result<Option<VirtualDisplayIntent>, &'static str> {
     let global = record
         .global_display_policy
         .as_object()
@@ -3120,6 +3825,17 @@ fn rtsp_response<'a>(
     if record
         .rtsp_ticket
         .is_some_and(|expected| expected != ticket)
+        || (record.lifecycle_required
+            && (record.lifecycle_session_target.is_none()
+                || payload["lifecycle_session_target"] != json!(record.lifecycle_session_target)
+                || payload["lifecycle_settings_revision"]
+                    != json!(
+                        record
+                            .global_display_revision
+                            .map(|revision| revision.to_string())
+                    )
+                || payload["lifecycle_intent"]
+                    != json!(if record.resumed { "resume" } else { "initial" })))
         || payload["encoder"] != json!(record.selected_encoder)
         || payload["sw_preset"] != record.effective_software_encoder.effective_preset()
         || payload["sw_tune"] != record.effective_software_encoder.effective_tune()
@@ -3195,6 +3911,10 @@ fn clean_rtsp_terminal(record: &Record, payload: &Value) -> bool {
     rtsp_response(record, payload)
         .is_ok_and(|(_, _, state, healthy)| healthy && matches!(state, "closed" | "failed"))
         && payload["cleanup_error"].is_null()
+        && (!record.lifecycle_required
+            || payload["lifecycle_cleanup_state"] == "not_admitted"
+            || (payload["lifecycle_cleanup_state"] == "retired"
+                && payload["lifecycle_retired"] == true))
 }
 
 fn clean_application_terminal(record: &Record, payload: &Value) -> bool {
@@ -3203,7 +3923,7 @@ fn clean_application_terminal(record: &Record, payload: &Value) -> bool {
     }) && payload["cleanup_error"].is_null()
 }
 
-fn frame_limiter_launch_snapshot(record: &Record) -> Value {
+pub(super) fn frame_limiter_launch_snapshot(record: &Record) -> Value {
     let settings = resolve_frame_limiter_settings(
         &record.global_frame_limiter_settings,
         &record.application_frame_limiter_settings,

@@ -28,6 +28,7 @@ pub struct Settings {
     pub allow_remote: bool,
     pub hostname: String,
     pub streaming: Option<StreamingConfig>,
+    pub session_lifecycle_required: bool,
 }
 
 impl Default for Settings {
@@ -41,6 +42,7 @@ impl Default for Settings {
             allow_remote: false,
             hostname: default_hostname(),
             streaming: None,
+            session_lifecycle_required: false,
         }
     }
 }

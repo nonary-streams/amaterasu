@@ -569,6 +569,16 @@ can use; and any behavior of a real Moonlight session.
 
 ## Public launch lifecycle
 
+The optional NVHTTP startup setting `session_lifecycle_required` defaults to
+false. When enabled, NVHTTP prepares the session before application launch,
+binds the application to the coordinator, and fences explicit termination
+before retiring the stream and application. An authenticated stream disconnect
+can leave the application paused for a later resume, after confirming coordinator
+state. Resume rebuilds the stream snapshot and admits a new RTSP operation;
+frame-limiter policy changes beyond cadence require a fresh application session.
+Uncertain effects remain fenced. Restart reconciliation, live hardware and
+end-to-end client behavior require separate validation.
+
 Moonlight launch accepts required `appid`, `mode=WIDTHxHEIGHTxFPS`, `rikey`, and
 `rikeyid`. The application ID is a decimal catalog ID in `1..=2147483647`.
 Dimensions are even and at least 16, and cannot exceed the configured maxima; FPS

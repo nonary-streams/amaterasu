@@ -18,6 +18,16 @@ pub struct Call {
 }
 
 impl Call {
+    pub fn release_result(&mut self, send: &mut Send<'_>) -> bool {
+        let Some(request) = self.request else {
+            return false;
+        };
+        match send(Command::ReleaseResult { request }) {
+            Ok(Response::Ok) => true,
+            Ok(Response::Error { code, .. }) if code == "not_found" => true,
+            _ => false,
+        }
+    }
     pub fn new(service: &str, payload: Value, operation_id: String, timeout_ms: u64) -> Self {
         Self {
             command: Command::Request {

@@ -8,6 +8,7 @@ use amaterasu_module_sdk::{
 };
 mod call;
 mod record;
+mod resume_snapshot;
 mod workflow;
 
 #[cfg(test)]
@@ -681,10 +682,12 @@ struct PendingResume {
     record: u64,
     request: LaunchRequest,
     peer: PeerIdentity,
+    retained: bool,
 }
 
 pub struct Controller {
     config: Option<StreamingConfig>,
+    session_lifecycle_required: bool,
     /// Latest encoder enumeration; `None` until the first one completes.
     encoder_snapshot: Option<EncoderSnapshot>,
     configured_output_name: Option<String>,
@@ -729,6 +732,7 @@ impl Controller {
         getrandom::fill(&mut nonce).map_err(|_| "random_unavailable")?;
         Ok(Self {
             config,
+            session_lifecycle_required: false,
             encoder_snapshot: None,
             configured_output_name: None,
             configured_audio_sink: None,
@@ -766,6 +770,10 @@ impl Controller {
 
     pub fn supported(&self) -> bool {
         self.config.is_some()
+    }
+
+    pub fn set_session_lifecycle_required(&mut self, required: bool) {
+        self.session_lifecycle_required = required;
     }
 
     pub fn set_encoder_snapshot(&mut self, snapshot: EncoderSnapshot) {
@@ -985,6 +993,9 @@ impl Controller {
             .records
             .get_mut(&id)
             .expect("selected launch remains present");
+        if record.lifecycle_prepare_dispatched && record.lifecycle_session_target.is_none() {
+            return json!({"ok":false,"code":"lifecycle_retirement_unavailable"});
+        }
         let already_stopping = record.state == State::Stopping;
         if record.state == State::CleanupFailed {
             if let Some((phase, call)) = record.retry_cleanup(now) {
@@ -1153,6 +1164,7 @@ impl Controller {
             now + INITIAL_DEADLINE,
         );
         record.requested_capture_output = requested_capture_output;
+        record.lifecycle_required = self.session_lifecycle_required;
         record.desktop = desktop;
         record.video_codec_offer = video_codec_offer;
         record.encoder_snapshot = self.encoder_snapshot.clone();
@@ -1179,6 +1191,13 @@ impl Controller {
     }
 
     pub fn cancel(&mut self, connection: u64, peer: &PeerIdentity, now: Instant) -> Option<Reply> {
+        if self
+            .pending_resume
+            .as_ref()
+            .is_some_and(|pending| pending.retained && pending.peer.certificate == peer.certificate)
+        {
+            self.pending_resume = None;
+        }
         let cancel_pending_resume = self.pending_resume.as_ref().is_some_and(|pending| {
             self.records.get(&pending.record).is_some_and(|record| {
                 record.peer.certificate == peer.certificate && record.state == State::Stopping
@@ -1197,6 +1216,9 @@ impl Controller {
             }
             return Some(cancel_reply());
         };
+        if record.lifecycle_prepare_dispatched && record.lifecycle_session_target.is_none() {
+            return Some(private_error(503, "lifecycle cleanup is not yet available"));
+        }
         if cancel_pending_resume && record.state == State::Stopping {
             record.cancel_connection = Some(connection);
             return None;
@@ -1239,7 +1261,13 @@ impl Controller {
         let Some(config) = &self.config else {
             return Some(private_error(503, "streaming is disabled"));
         };
-        if !config.desktop.enabled || request.app_id != DESKTOP_APP_ID {
+        let retained = self.records.values().any(|record| {
+            record.lifecycle_required
+                && record.state == State::Paused
+                && record.request.app_id == request.app_id
+                && record.peer.certificate == peer.certificate
+        });
+        if !retained && (!config.desktop.enabled || request.app_id != DESKTOP_APP_ID) {
             return Some(private_error(404, "Desktop session is unavailable"));
         }
         if !self.output_settings_ready {
@@ -1269,11 +1297,53 @@ impl Controller {
         if self.records.values().any(|record| {
             record.request.remote_input_key == request.remote_input_key
                 && (record.peer != *peer || record.request != request)
+                && !(record.lifecycle_required
+                    && record.state == State::Paused
+                    && record.peer.certificate == peer.certificate
+                    && record.peer.client_id == peer.client_id)
         }) {
             return Some(private_error(
                 409,
                 "launch key conflicts with an existing request",
             ));
+        }
+        if retained {
+            let id = match self.allocate_id() {
+                Ok(id) => id,
+                Err(_) => return Some(private_error(503, "resume capacity exhausted")),
+            };
+            let operation = operation_id(&self.nonce, id, "rtsp");
+            let record = self
+                .records
+                .values_mut()
+                .find(|record| {
+                    record.lifecycle_required
+                        && record.state == State::Paused
+                        && record.request.app_id == request.app_id
+                        && record.peer.certificate == peer.certificate
+                })
+                .expect("retained session remains available");
+            if record.revoked
+                || record.peer.certificate != peer.certificate
+                || record.peer.client_id != peer.client_id
+            {
+                return Some(private_error(401, "paired client is no longer trusted"));
+            }
+            record.rtsp_operation = operation;
+            record.resumed = true;
+            record.adopted = false;
+            record.launch_connection = Some(connection);
+            record.state = State::Starting;
+            record.stage = Stage::VerifyResumeSession;
+            record.deadline = now + INITIAL_DEADLINE;
+            self.pending_resume = Some(PendingResume {
+                connection,
+                record: record.id,
+                request,
+                peer: peer.clone(),
+                retained: true,
+            });
+            return None;
         }
         let Some(record) = self.records.values_mut().find(|record| {
             record.desktop
@@ -1289,6 +1359,7 @@ impl Controller {
             record: id,
             request,
             peer: peer.clone(),
+            retained: false,
         });
         None
     }
@@ -1297,7 +1368,8 @@ impl Controller {
         self.records
             .values()
             .find(|record| {
-                record.peer.certificate == peer.certificate && record.state == State::Ready
+                record.peer.certificate == peer.certificate
+                    && matches!(record.state, State::Ready | State::Paused)
             })
             .map_or(0, |record| record.request.app_id)
     }
@@ -1321,9 +1393,11 @@ impl Controller {
             self.schedule(now);
         }
         let resume_ready = self.pending_resume.as_ref().is_some_and(|pending| {
-            self.records.get(&pending.record).is_some_and(|record| {
-                record.state.terminal() || record.state == State::CleanupFailed
-            }) && self.job.is_none()
+            !pending.retained
+                && self.records.get(&pending.record).is_some_and(|record| {
+                    record.state.terminal() || record.state == State::CleanupFailed
+                })
+                && self.job.is_none()
         });
         if resume_ready && let Some(pending) = self.pending_resume.take() {
             if self
@@ -1369,6 +1443,14 @@ impl Controller {
                     private_error(503, "Desktop cleanup failed"),
                 ));
             }
+        }
+        if self.pending_resume.as_ref().is_some_and(|pending| {
+            pending.retained
+                && self.records.get(&pending.record).is_none_or(|record| {
+                    record.state.terminal() || record.state == State::CleanupFailed
+                })
+        }) {
+            self.pending_resume = None;
         }
         replies
     }
@@ -1598,6 +1680,7 @@ fn management_state(state: State) -> &'static str {
     match state {
         State::Starting | State::AwaitingDelivery => "starting",
         State::Ready => "ready",
+        State::Paused => "paused",
         State::Stopping => "stopping",
         State::Stopped | State::Failed => "ended",
         State::CleanupFailed => "cleanup_failed",

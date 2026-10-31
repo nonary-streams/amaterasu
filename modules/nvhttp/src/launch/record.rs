@@ -23,6 +23,7 @@ pub enum State {
     Starting,
     AwaitingDelivery,
     Ready,
+    Paused,
     Stopping,
     Stopped,
     Failed,
@@ -49,6 +50,13 @@ pub enum Stage {
     OpenRtsp,
     AwaitingDelivery,
     Live,
+    VerifyPaused,
+    ReleasePausedHistory,
+    ReleaseRejectedResumeHistory,
+    VerifyResumeSession,
+    VerifyResumeApplication,
+    RefreshResumePolicy,
+    AuthorizeResumeSnapshot,
     Cleanup,
     VerifyRtspCleanup,
     VerifyApplicationCleanup,
@@ -67,6 +75,17 @@ pub struct Record {
     pub device_name: String,
     pub application_operation: String,
     pub rtsp_operation: String,
+    pub lifecycle_required: bool,
+    pub lifecycle_prepare_dispatched: bool,
+    pub lifecycle_prepare_pending: bool,
+    pub lifecycle_session_target: Option<amaterasu_module_sdk::extension_api::LifecycleTarget>,
+    pub lifecycle_end_fenced: bool,
+    pub lifecycle_end_complete: bool,
+    pub lifecycle_application_retired: bool,
+    pub lifecycle_retirement_launch: Option<u64>,
+    pub lifecycle_application_bound: bool,
+    pub lifecycle_binding_pending: bool,
+    pub lifecycle_launch_epoch_ready: bool,
     pub history_release_required: bool,
     pub history_reserved: bool,
     pub history_state: &'static str,
@@ -252,6 +271,17 @@ impl Record {
             device_name,
             application_operation,
             rtsp_operation,
+            lifecycle_required: false,
+            lifecycle_prepare_dispatched: false,
+            lifecycle_prepare_pending: false,
+            lifecycle_session_target: None,
+            lifecycle_end_fenced: false,
+            lifecycle_end_complete: false,
+            lifecycle_application_retired: false,
+            lifecycle_retirement_launch: None,
+            lifecycle_application_bound: false,
+            lifecycle_binding_pending: false,
+            lifecycle_launch_epoch_ready: false,
             history_release_required: false,
             history_reserved: false,
             history_state: "unavailable",
@@ -372,6 +402,10 @@ impl Record {
         if let Some(failure) = failure {
             self.failure.get_or_insert(failure);
         }
+        if self.lifecycle_prepare_dispatched && self.lifecycle_session_target.is_none() {
+            self.fail_cleanup("lifecycle_retirement_unavailable");
+            return;
+        }
         let already_stopping = self.state == State::Stopping;
         self.state = State::Stopping;
         self.stage = Stage::Cleanup;
@@ -415,6 +449,10 @@ impl Record {
     }
 
     pub fn retry_cleanup(&mut self, now: Instant) -> Option<(Phase, Call)> {
+        if self.lifecycle_prepare_dispatched && self.lifecycle_session_target.is_none() {
+            self.fail_cleanup("lifecycle_retirement_unavailable");
+            return None;
+        }
         self.state = State::Stopping;
         self.stage = Stage::Cleanup;
         self.cleanup_error = None;

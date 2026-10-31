@@ -272,7 +272,8 @@ impl ManagedModule for NvhttpModule {
         let (server, router, identity) = if settings.enabled {
             let identity = tls::Identity::bind(&runtime)?;
             let server = server::Server::bind(&settings)?;
-            let launches = launch::Controller::new(settings.streaming.clone())?;
+            let mut launches = launch::Controller::new(settings.streaming.clone())?;
+            launches.set_session_lifecycle_required(settings.session_lifecycle_required);
             let router = wire::Router::new(
                 wire::RouterConfig {
                     hostname: hostname.clone(),
