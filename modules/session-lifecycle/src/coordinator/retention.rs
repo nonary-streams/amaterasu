@@ -112,11 +112,31 @@ fn target_is_absent(journal: &Journal, target: &LifecycleTarget) -> bool {
 /// Compact only closed records. The caller persists this journal atomically
 /// before admitting further work; any write failure fences later admission.
 pub(super) fn compact(journal: &mut Journal) {
-    // There is currently no per-session index for provider admission/locks.
-    // Any such unresolved state conservatively prevents target pruning.
-    let authority_quiet = journal.authority.admissions.is_empty()
-        && journal.authority.settled.is_empty()
-        && journal.authority.domain_locks.is_empty();
+    // An admission without a journaled owning work item is ambiguous and must
+    // fence all pruning. Once ownership is known, unrelated sessions may retire.
+    let authority_quiet = journal
+        .authority
+        .domain_locks
+        .values()
+        .all(|id| journal.authority.admissions.contains_key(id))
+        && journal.authority.admissions.keys().all(|id| {
+            journal.receipts.values().any(|receipt| {
+                receipt.work.as_ref().is_some_and(|work| {
+                    work.states
+                        .values()
+                        .any(|state| state.admission_id.as_deref() == Some(id.as_str()))
+                })
+            })
+        })
+        && journal.authority.settled.values().all(|admission| {
+            !admission.plan.obligations.is_empty()
+                && admission.plan.obligations.iter().all(|obligation| {
+                    journal
+                        .sessions
+                        .values()
+                        .any(|session| session.obligations.contains(obligation))
+                })
+        });
     if authority_quiet {
         let sessions: Vec<_> = journal
             .sessions
@@ -124,15 +144,18 @@ pub(super) fn compact(journal: &mut Journal) {
             .map(|(id, session)| (id.clone(), session.host_epoch.clone()))
             .collect();
         for (id, epoch) in &sessions {
-            if !matches!(
-                journal.sessions[id].phase,
-                SessionPhase::Paused | SessionPhase::Ended
-            ) || journal.receipts.values().any(|receipt| {
-                receipt
-                    .work
-                    .as_ref()
-                    .is_some_and(|work| matches_target(&work.target, id, None))
-            }) {
+            if !journal.sessions[id].obligations.is_empty()
+                || !matches!(
+                    journal.sessions[id].phase,
+                    SessionPhase::Paused | SessionPhase::Ended
+                )
+                || journal.receipts.values().any(|receipt| {
+                    receipt
+                        .work
+                        .as_ref()
+                        .is_some_and(|work| matches_target(&work.target, id, None))
+                })
+            {
                 continue;
             }
             let removable: Vec<_> = journal.sessions[id]
@@ -223,7 +246,12 @@ pub(super) fn compact(journal: &mut Journal) {
     let mut kept = VecDeque::new();
     while let Some(key) = journal.retention.order.pop_front() {
         let receipt = &journal.receipts[&key];
-        let closed = receipt.work.is_none()
+        let referenced_by_alias = journal
+            .recovery_sources
+            .iter()
+            .any(|(alias, original)| original == &key && journal.receipts.contains_key(alias));
+        let closed = !referenced_by_alias
+            && receipt.work.is_none()
             && receipt.wait_target.is_none()
             && matches!(
                 receipt.response["status"].as_str(),
@@ -250,6 +278,9 @@ pub(super) fn compact(journal: &mut Journal) {
         }
     }
     journal.retention.order = kept;
+    journal
+        .recovery_sources
+        .retain(|alias, _| journal.receipts.contains_key(alias));
 }
 
 #[cfg(test)]
@@ -403,6 +434,81 @@ mod tests {
             &receipt_key("transport", "client", "create-0")
         ));
         assert!(validate(&journal));
+    }
+
+    #[test]
+    fn recovery_alias_never_outlives_its_original_receipt() {
+        let mut journal = journal();
+        let original = insert_ended(&mut journal, 0, "succeeded");
+        let alias = receipt_key("transport", "client", "recovery-0");
+        let target = journal.receipts[&original].response["target"].clone();
+        journal.receipts.insert(alias.clone(), Receipt { caller:"transport".into(), initiator:"client".into(), request:json!({"operation":"recover_session","operation_id":"recovery-0","target":target}), response:json!({"operation_id":"recovery-0","status":"succeeded","target":target}), work:None, wait_target:None });
+        journal
+            .recovery_sources
+            .insert(alias.clone(), original.clone());
+        for id in 1..200 {
+            insert_ended(&mut journal, id, "succeeded");
+            compact(&mut journal);
+        }
+        assert!(!journal.receipts.contains_key(&alias) || journal.receipts.contains_key(&original));
+        assert!(
+            !journal.recovery_sources.contains_key(&alias) || journal.receipts.contains_key(&alias)
+        );
+    }
+
+    #[test]
+    fn attributed_obligation_does_not_pin_unrelated_ended_sessions() {
+        let mut journal = journal();
+        insert_ended(&mut journal, 0, "succeeded");
+        journal.sessions.get_mut("session-0").unwrap().phase = SessionPhase::Ready;
+        let method = json!({"service":"example.display/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let obligation = json!({"obligation_id":"restore","provider":"display","resource_id":"output","mutation_domain":null,"depends_on":[],"cleanup_method":method,"payload":{}});
+        journal
+            .sessions
+            .get_mut("session-0")
+            .unwrap()
+            .obligations
+            .push(serde_json::from_value(obligation.clone()).unwrap());
+        let selection = json!({"participant":{"provider":"display","plan_method":method,"callback_method":method,"status_method":method,"binding_validate_method":null,"capabilities":[],"cleanup_methods":[],"settings_revision":"one","settings":{}},"approvals":[],"capabilities":[],"cleanup_methods":[],"authorized_borrowers":[]});
+        let plan = json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[obligation],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
+        journal.authority.settled.insert(
+            "admission".into(),
+            serde_json::from_value(
+                json!({"provider":"display","selection":selection,"plan":plan,"rights":[]}),
+            )
+            .unwrap(),
+        );
+        for id in 1..100 {
+            insert_ended(&mut journal, id, "succeeded");
+            compact(&mut journal);
+        }
+        assert!(journal.sessions.contains_key("session-0"));
+        assert!(journal.authority.settled.contains_key("admission"));
+        assert!(journal.sessions.len() < MAX_SESSIONS);
+        assert!(
+            expired(&journal, &receipt_key("transport", "client", "create-1"))
+                || journal
+                    .receipts
+                    .contains_key(&receipt_key("transport", "client", "create-1"))
+        );
+    }
+
+    #[test]
+    fn unattributed_native_admission_fences_all_target_pruning() {
+        let mut journal = journal();
+        journal
+            .authority
+            .domain_locks
+            .insert("topology".into(), "unknown-admission".into());
+        for id in 0..80 {
+            insert_ended(&mut journal, id, "succeeded");
+            compact(&mut journal);
+        }
+        assert_eq!(journal.sessions.len(), 80);
+        assert!(!expired(
+            &journal,
+            &receipt_key("transport", "client", "create-0")
+        ));
     }
 
     #[test]
