@@ -19,7 +19,7 @@ use std::{
 // An action transition currently retires consumers but does not run dependent
 // provider cleanup. Until it does, a persisted dependency graph must prove that
 // no provider depends on the provider whose resource the action will mutate.
-pub(super) fn graph_proves_no_dependents(
+fn valid_dependency_graph(
     order: &[String],
     dependencies: &BTreeMap<String, Vec<String>>,
     provider: &str,
@@ -29,29 +29,32 @@ pub(super) fn graph_proves_no_dependents(
         .enumerate()
         .map(|(index, id)| (id.as_str(), index))
         .collect();
-    if positions.len() != order.len()
-        || dependencies.len() != order.len()
-        || !positions.contains_key(provider)
-        || dependencies.iter().any(|(id, parents)| {
+    positions.len() == order.len()
+        && dependencies.len() == order.len()
+        && positions.contains_key(provider)
+        && dependencies.iter().all(|(id, parents)| {
             let Some(position) = positions.get(id.as_str()) else {
-                return true;
+                return false;
             };
             let unique: BTreeSet<_> = parents.iter().collect();
-            unique.len() != parents.len()
-                || parents.iter().any(|parent| {
+            unique.len() == parents.len()
+                && parents.iter().all(|parent| {
                     positions
                         .get(parent.as_str())
-                        .is_none_or(|parent_position| parent_position >= position)
+                        .is_some_and(|parent_position| parent_position < position)
                 })
         })
-    {
-        return false;
-    }
-    // Any transitive dependent implies an immediate dependent, so checking
-    // every edge is sufficient and also avoids trusting admission provenance.
-    !dependencies
-        .values()
-        .any(|parents| parents.iter().any(|parent| parent == provider))
+}
+
+pub(super) fn graph_proves_no_dependents(
+    order: &[String],
+    dependencies: &BTreeMap<String, Vec<String>>,
+    provider: &str,
+) -> bool {
+    valid_dependency_graph(order, dependencies, provider)
+        && !dependencies
+            .values()
+            .any(|parents| parents.iter().any(|parent| parent == provider))
 }
 
 // Admission is staged in memory and committed with the permit and transfer.
@@ -1564,6 +1567,74 @@ fn rebind_borrower_scope(
     action_borrower_scope(&scope, target, provider, plan)
 }
 
+/// Preflight only: a future qualified cleanup scheduler may use this before
+/// transferring a composed action. It grants neither rights nor a release proof.
+#[allow(dead_code)]
+pub(super) fn composed_action_preflight(
+    journal: &super::Journal,
+    target: &amaterasu_extension_api::LifecycleTarget,
+    provider: &str,
+) -> bool {
+    let amaterasu_extension_api::LifecycleTarget::Stream {
+        host_epoch,
+        session_id,
+        stream_id,
+        generation,
+    } = target
+    else {
+        return false;
+    };
+    let Some(session) = journal.sessions.get(session_id) else {
+        return false;
+    };
+    let Some(stream) = session.streams.get(stream_id) else {
+        return false;
+    };
+    if journal.host_epoch != *host_epoch
+        || session.host_epoch != *host_epoch
+        || stream.generation != *generation
+        || stream.binding_owner != provider
+        || stream.phase != StreamPhase::Active
+        || session
+            .streams
+            .iter()
+            .any(|(id, other)| id != stream_id && other.phase != StreamPhase::Retired)
+    {
+        return false;
+    }
+    let Ok(snapshot) = capture_action_snapshot(journal, target) else {
+        return false;
+    };
+    let session_graph = &snapshot.session_graph;
+    let stream_graph = &snapshot.stream_graph;
+    if !valid_dependency_graph(&session_graph.order, &session_graph.dependencies, provider)
+        || !valid_dependency_graph(&stream_graph.order, &stream_graph.dependencies, provider)
+    {
+        return false;
+    }
+    let affected = |graph: &super::ProviderGraph| {
+        let mut result = BTreeSet::from([provider.to_owned()]);
+        for id in &graph.order {
+            if graph.dependencies[id]
+                .iter()
+                .any(|dependency| result.contains(dependency))
+            {
+                result.insert(id.clone());
+            }
+        }
+        result
+    };
+    if !affected(stream_graph).is_subset(&affected(session_graph)) {
+        return false;
+    }
+    super::session_prepare_evidence::all_dependent_session_prepares_noop(
+        journal,
+        &snapshot.session_target,
+        session_graph,
+        provider,
+    )
+}
+
 fn action_dependencies_clear(
     journal: &super::Journal,
     target: &amaterasu_extension_api::LifecycleTarget,
@@ -2044,6 +2115,17 @@ mod tests {
             .dependencies
             .insert("control".into(), vec!["display".into()]);
         save(&coordinator.shared, blocked).unwrap();
+        let stream_target = amaterasu_extension_api::LifecycleTarget::Stream {
+            host_epoch: epoch.clone(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 4,
+        };
+        assert!(!composed_action_preflight(
+            &coordinator.shared.borrow().value,
+            &stream_target,
+            "display"
+        ));
         assert_eq!(
             coordinator.action_operation(&service, "service", &auth)["reason"],
             "action_dependencies_unresolved"
@@ -2059,6 +2141,31 @@ mod tests {
         graph.order.pop();
         graph.dependencies.remove("control");
         save(&coordinator.shared, restored).unwrap();
+        assert!(composed_action_preflight(
+            &coordinator.shared.borrow().value,
+            &stream_target,
+            "display"
+        ));
+        let mut stream_only = coordinator.shared.borrow().value.clone();
+        let graph = stream_only
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .streams
+            .get_mut("stream")
+            .unwrap()
+            .provider_graph
+            .as_mut()
+            .unwrap();
+        graph.order.push("control".into());
+        graph
+            .dependencies
+            .insert("control".into(), vec!["display".into()]);
+        assert!(!composed_action_preflight(
+            &stream_only,
+            &stream_target,
+            "display"
+        ));
         let issued = coordinator.action_operation(&service, "service", &auth);
         assert_eq!(issued["status"], "succeeded");
         let mut request = json!({"operation":"consume_action_permit","operation_id":"op-transition","action_id":"display/remove","target":target,"plan_digest":auth["plan_digest"],"permit":issued["permit"]});
