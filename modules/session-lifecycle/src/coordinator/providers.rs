@@ -465,6 +465,8 @@ impl Coordinator {
                     plan_revision: None,
                     admission_id: None,
                     approved_plan: None,
+                    dependency_inputs: vec![],
+                    control_results: vec![],
                 };
                 let state = PrepareState {
                     provider: provider.clone(),
@@ -812,8 +814,12 @@ impl Coordinator {
         if let Some(ProviderResponse::Prepared {
             candidate,
             obligations,
+            outputs,
         }) = &state.response
         {
+            if state.request.version != 1 || !outputs.is_empty() {
+                return Err("composition_response_not_supported".into());
+            }
             if let Some(candidate) = candidate {
                 if work.candidate.as_ref().is_some_and(|old| old != candidate) {
                     return Err("participants_disagree_on_capture".into());
@@ -1409,3 +1415,7 @@ mod dependency_cleanup_tests {
         assert!(legacy.cleanup_blocked("root"));
     }
 }
+
+#[cfg(test)]
+#[path = "cleanup_dispatch_tests.rs"]
+mod cleanup_dispatch_tests;
