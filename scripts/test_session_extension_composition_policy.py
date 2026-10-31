@@ -202,12 +202,13 @@ class CompositionPolicyTest(unittest.TestCase):
     def test_lifecycle_settings_retain_baseline_and_reviewed_provider_grants(self):
         graph = {"control_policies": [], "finalize_policies": [], "schema_documents": []}
         settings = policy.lifecycle_configuration("/private/journal.json", graph,
-            {check.OWNER: ["verify_resource_control"], check.DISPLAY: [], legacy.ACTIONS: ["rebind_action_plan"]})
+            {check.OWNER: ["verify_resource_control"], check.DISPLAY: [], legacy.ACTIONS: ["rebind_action_plan", "cancel_action"]})
         self.assertIn("prepare", settings["operation_grants"][legacy.NVHTTP])
         self.assertIn("verify_resource_control", settings["operation_grants"][check.OWNER])
         self.assertEqual(settings["operation_grants"][check.DISPLAY], [])
         self.assertIn("authorize_action", settings["operation_grants"][legacy.ACTIONS])
         self.assertIn("rebind_action_plan", settings["operation_grants"][legacy.ACTIONS])
+        self.assertIn("cancel_action", settings["operation_grants"][legacy.ACTIONS])
         self.assertIn(check.OWNER, settings["trusted_callers"])
         self.assertEqual(settings["consumer_requirements"]["capture_providers"], ["amaterasu.capture-pipewire/1"])
         with self.assertRaisesRegex(ValueError, "both providers"):

@@ -13,7 +13,7 @@ import prepare_session_extension_profile as legacy
 
 ACTION_OWNER_OPERATIONS = {"describe_action_target", "inspect_action_effect",
                            "verify_action_effect", "check_action_effect"}
-ACTION_COORDINATOR_OPERATIONS = {"rebind_action_plan"}
+ACTION_COORDINATOR_OPERATIONS = {"rebind_action_plan", "cancel_action"}
 
 
 def method_ref(provider: str, name: str) -> dict:
