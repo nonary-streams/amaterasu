@@ -67,7 +67,7 @@ impl FinalizeResultRecord {
             && api::validate_provider_response(&self.plan_request, &planned).is_ok()
             && request.target == selection.target
             && request.transition_id == selection.transition_id
-            && request.output == selection.input.output
+            && request.output == *selection.current_output()
             && api::validate_resource_finalize_response(request, &self.applied).is_ok()
             && serde_json::from_value::<ResourceControlResponse>(payload.clone())
                 .ok()
@@ -263,7 +263,8 @@ mod tests {
     use serde_json::json;
 
     fn fixture() -> FinalizeResultRecord {
-        let selection = super::super::finalize_selection::tests::fixture();
+        let mut selection = super::super::finalize_selection::tests::fixture();
+        selection.input.output.origin = selection.target.clone();
         let output = &selection.input.output;
         let mode = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
         let plan = json!({"plan_id":"finalize-plan","revision":2,"resources":[{"provider":"owner","resource_id":"display","incarnation":"native","expected_revision":2,"execution_domain":"seat","mutation_domains":["topology"],"access":"exclusive"}],"mutation_domains":[{"domain":"topology","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":{"capture_provider":"capture","selector_schema":"selector/1","resource_provider":"owner","resource_id":"display","incarnation":"native","execution_domain":"seat","mode":mode,"plan_revision":2,"geometry_revision":4},"allowed_degradation":[]});

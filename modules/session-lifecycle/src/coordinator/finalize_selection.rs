@@ -3,7 +3,7 @@
 //! Structural validation does not authenticate the current installation or prove
 //! that the native resource is still present. The coordinator must independently
 //! verify policy, broker approvals, parent generation, rights and observations.
-use super::composition::{OutputState, StoredOutput};
+use super::composition::{OutputState, StagedOutputRefinement, StoredOutput};
 use crate::adapter::SchemaDocument;
 use crate::prepare_authority::{DomainScope, FinalizePolicy, MethodApproval};
 use amaterasu_extension_api::{self as api, LifecycleTarget, MethodRef, ResourceAccess};
@@ -22,6 +22,8 @@ pub struct FinalizeSelectionSnapshot {
     pub parent_generation: Option<u64>,
     pub transition_id: String,
     pub input: StoredOutput,
+    #[serde(default)]
+    pub stage: Option<StagedOutputRefinement>,
     pub policy: FinalizePolicy,
     pub finalize_approval: MethodApproval,
     pub finalize_status_approval: MethodApproval,
@@ -29,13 +31,24 @@ pub struct FinalizeSelectionSnapshot {
 }
 
 impl FinalizeSelectionSnapshot {
+    pub fn current_output(&self) -> &api::ResourceOutput {
+        self.stage
+            .as_ref()
+            .map_or(&self.input.output, |stage| &stage.after)
+    }
+
     /// Validate immutable data and schema bytes; current authorization and
     /// resource observations are checked separately by the owning coordinator.
     pub fn validate_structure(&self) -> bool {
-        let output = &self.input.output;
+        let output = self.current_output();
         let resource = &output.resource;
         let policy = &self.policy;
-        if !valid_text(&self.transition_id)
+        if self.stage.as_ref().is_some_and(|stage| {
+            stage.target != self.target
+                || stage.transition_id != self.transition_id
+                || stage.parent_generation != self.parent_generation.unwrap_or(0)
+                || api::validate_output_refinement(&self.input.output, &stage.after).is_err()
+        }) || !valid_text(&self.transition_id)
             || !valid_text(&self.input.transition_id)
             || !valid_text(&self.input.admission_id)
             || self.input.state != OutputState::Retained
@@ -204,12 +217,34 @@ pub(super) mod tests {
         let policy = json!({"owner_provider":"owner","owner_service":"owner/2","method":effect,"status_method":status,"output_capability":"display/output","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","domain_scope":"resource","mutation_domains":[]});
         FinalizeSelectionSnapshot {
             target: serde_json::from_value(json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1})).unwrap(),
-            parent_generation:Some(3),transition_id:"finalize-transition".into(),
+            parent_generation:Some(3),transition_id:"finalize-transition".into(),stage:None,
             input:StoredOutput {output:serde_json::from_value(output).unwrap(),admission_id:"admission".into(),transition_id:"prepare-transition".into(),plan:serde_json::from_value(plan).unwrap(),state:OutputState::Retained,callback_proof:None},
             policy:serde_json::from_value(policy).unwrap(),finalize_approval:approval(&effect),finalize_status_approval:approval(&status),
             schema_documents:vec![SchemaDocument {reference:serde_json::from_value(schema).unwrap(),document:document.into()}],
         }
     }
+    #[test]
+    fn session_output_cannot_finalize_for_stream_without_durable_stage() {
+        use super::super::composition::{CompositionBook, OutputSelection};
+        let selection = fixture();
+        let output = &selection.input.output;
+        let selected = OutputSelection {
+            producer: output.producer.clone(),
+            service: output.producer_service.clone(),
+            capability: output.capability.clone(),
+            schema: output.schema.clone(),
+        };
+        let mut book = CompositionBook::default();
+        book.record(selection.input.clone(), &selected, &output.origin, &|_| {
+            true
+        })
+        .unwrap();
+        assert!(
+            book.record_finalize_selection(selection, &|_| true)
+                .is_err()
+        );
+    }
+
     #[test]
     fn owner_only_finalization_freezes_exact_output_and_method_approvals() {
         let selection = fixture();

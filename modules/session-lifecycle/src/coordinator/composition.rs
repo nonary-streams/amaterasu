@@ -496,7 +496,24 @@ impl CompositionBook {
         selection: FinalizeSelectionSnapshot,
         verify_installed: &impl Fn(&FinalizeSelectionSnapshot) -> bool,
     ) -> Result<(), &'static str> {
+        let requires_stage = matches!(
+            (&selection.input.output.origin, &selection.target),
+            (
+                LifecycleTarget::Session { .. },
+                LifecycleTarget::Stream { .. }
+            )
+        );
         if !selection.validate_structure()
+            || (requires_stage && selection.stage.is_none())
+            || selection.stage.as_ref().is_some_and(|stage| {
+                self.staged_for(
+                    &selection.target,
+                    &selection.input.output.producer,
+                    &selection.input.output.output_id,
+                )
+                .ok()
+                    != Some(stage)
+            })
             || !verify_installed(&selection)
             || self.get(
                 &selection.input.output.producer,
@@ -797,6 +814,23 @@ pub(super) fn validate_finalize_selections(journal: &super::Journal) -> bool {
         {
             return false;
         }
+        let requires_stage = matches!(
+            (&selection.input.output.origin, &selection.target),
+            (
+                LifecycleTarget::Session { .. },
+                LifecycleTarget::Stream { .. }
+            )
+        );
+        if (requires_stage && selection.stage.is_none())
+            || selection.stage.as_ref().is_some_and(|stage| {
+                !journal
+                    .composition
+                    .staged_outputs()
+                    .any(|item| item == stage)
+            })
+        {
+            return false;
+        }
         let output = &selection.input.output;
         let Some(canonical) = journal
             .composition
@@ -809,6 +843,7 @@ pub(super) fn validate_finalize_selections(journal: &super::Journal) -> bool {
             || canonical.admission_id != selection.input.admission_id
             || canonical.transition_id != selection.input.transition_id
             || canonical.plan != selection.input.plan
+            || canonical.callback_proof != selection.input.callback_proof
         {
             return false;
         }
@@ -1477,6 +1512,7 @@ mod tests {
         let finalize = FinalizeSelectionSnapshot {
             target: target(),
             parent_generation: None,
+            stage: None,
             transition_id: "finalize-transition".into(),
             input: snapshot.input.clone(),
             policy: snapshot.finalize_policy.clone(),
