@@ -1211,6 +1211,13 @@ impl ActionAuthority {
         })
     }
 
+    /// Terminal and cross-session reservations can retain resource or domain
+    /// references until their independently certified retirement.
+    #[allow(dead_code)] // Used by terminal-root checkpoint preflight.
+    pub(crate) fn has_any_reservation(&self) -> bool {
+        !self.reservations.is_empty()
+    }
+
     /// Any live or uncertain action for this logical target blocks retirement,
     /// including an action from a previous host epoch after restart.
     pub fn has_unresolved_session(&self, _host_epoch: &str, session_id: &str) -> bool {
@@ -1369,6 +1376,7 @@ mod tests {
         let token = authority
             .authorize_action("action-service", &binding, &canonical(&binding), 10, 20)
             .unwrap();
+        assert!(authority.has_any_reservation());
         assert!(authority.has_any_session_reference("session"));
         assert_eq!(
             authority.retire_certified_success("action-service", &token, &binding),
@@ -1397,6 +1405,7 @@ mod tests {
             .retire_certified_success("action-service", &token, &binding)
             .unwrap();
         assert!(!authority.has_any_session_reference("session"));
+        assert!(!authority.has_any_reservation());
         let mut recovered: ActionAuthority =
             serde_json::from_slice(&serde_json::to_vec(&authority).unwrap()).unwrap();
         assert!(recovered.validate().is_ok());
