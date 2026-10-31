@@ -73,6 +73,7 @@ mod tests {
             status: None,
         };
         let invoke = ActionInvoke {
+            input_reservation_id: None,
             epoch: "abc".into(),
             sequence: 1,
             operation_id: "abc:1".into(),

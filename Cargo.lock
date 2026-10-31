@@ -361,6 +361,7 @@ dependencies = [
  "amaterasu-contracts",
  "amaterasu-extension-api",
  "amaterasu-module-sdk",
+ "amaterasu-runtime",
  "serde",
  "serde_json",
  "sha2",
