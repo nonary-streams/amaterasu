@@ -788,7 +788,7 @@ impl Manager {
         else {
             return failure("recovery_required");
         };
-        if observation.compositor_id != old_observation.compositor_id
+        if !same_output_identity(old_observation, observation)
             || observation.width != desired.width
             || observation.height != desired.height
             || observation.refresh != desired.refresh_millihz
@@ -1052,6 +1052,9 @@ impl Manager {
             "activation_requested":self.settings.dd_activate_virtual_display,
             "configured_permanent_monitor_count":self.settings.dd_virtual_display_permanent_count,"permanent_monitor_runtime_supported":false})
     }
+}
+fn same_output_identity(before: observer::Observation, after: observer::Observation) -> bool {
+    before.compositor_id == after.compositor_id && before.global == after.global
 }
 impl Drop for Manager {
     fn drop(&mut self) {

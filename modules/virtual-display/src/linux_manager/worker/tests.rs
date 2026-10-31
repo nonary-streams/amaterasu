@@ -144,6 +144,28 @@ fn specification(identity: &str) -> Specification {
 const FIRST: &str = "11111111-1111-4111-8111-111111111111";
 const SECOND: &str = "22222222-2222-4222-8222-222222222222";
 #[test]
+fn mode_change_retains_the_same_compositor_and_registry_global() {
+    use super::super::{observer::Observation, same_output_identity};
+    let before = Observation {
+        global: 4,
+        width: 1920,
+        height: 1080,
+        refresh: 60000,
+        generation: 1,
+        compositor_id: [1; 32],
+    };
+    let mut after = before;
+    after.width = 1280;
+    after.height = 720;
+    after.generation = 2;
+    assert!(same_output_identity(before, after));
+    after.global = 5;
+    assert!(!same_output_identity(before, after));
+    after.global = 4;
+    after.compositor_id = [2; 32];
+    assert!(!same_output_identity(before, after));
+}
+#[test]
 fn reconfigure_persists_old_and_new_modes_and_retains_uncertain_intent() {
     let (root, mut controller) = fixture();
     let old = specification(FIRST);
