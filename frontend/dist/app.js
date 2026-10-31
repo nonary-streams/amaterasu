@@ -553,11 +553,10 @@ var Amaterasu;
         const text = (name) => String(data.get(name) ?? "").trim();
         const output = parseApplicationOutput(data);
         const rawPreparation = parseRawPreparation(String(data.get("prep_cmd") ?? "[]"));
-        const kind = text("kind") === "executable"
-            ? "executable"
-            : text("kind") === "playnite_fullscreen"
-                ? "playnite_fullscreen"
-                : "application";
+        const requestedKind = text("kind");
+        if (requestedKind && !["application", "executable", "playnite_fullscreen", "desktop"].includes(requestedKind))
+            throw new Error("Choose a supported launch type before saving.");
+        const kind = (requestedKind || "application");
         const fecPercentage = parseFecOverride(text("fec_percentage"));
         const streamAudio = parseStreamAudioOverride(text("stream_audio"));
         const audioSink = parseAudioSinkOverride(text("audio_sink_mode") || "inherit", String(data.get("audio_sink_id") ?? ""));
@@ -575,8 +574,8 @@ var Amaterasu;
         const refreshRateOption = parseRefreshRateOptionOverride(String(data.get("dd_refresh_rate_option") ?? ""));
         const displayPolicy = parseDisplayPolicyOverrideMap(String(data.get("display_policy") ?? ""), "application");
         const prefer10BitSdr = parsePrefer10BitSdrOverride(String(data.get("prefer_10bit_sdr") ?? ""));
-        const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
-        const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
+        const steamId = kind === "playnite_fullscreen" || kind === "desktop" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
+        const steamInstallDir = kind === "playnite_fullscreen" || kind === "desktop" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
         const configOverrides = fecPercentage === null &&
             streamAudio === null &&
             audioSink === null &&
@@ -610,11 +609,13 @@ var Amaterasu;
             };
         const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
         const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];
-        const preparation = kind === "executable" ? parsePreparation(text("preparation")) : [];
+        const preparation = kind !== "application" ? parsePreparation(text("preparation")) : [];
         if (preparation.length + rawPreparation.length > 8)
             throw new Error("An application can contain at most 8 preparation steps.");
-        const launch = kind === "playnite_fullscreen"
-            ? { kind, exit_timeout_seconds: parseExitTimeout(text("fullscreen_exit_timeout_seconds")) ?? 10 }
+        const launch = kind === "playnite_fullscreen" || kind === "desktop"
+            ? { kind, exit_timeout_seconds: parseExitTimeout(text("fullscreen_exit_timeout_seconds")) ?? 10,
+                ...(text("working_directory") ? { working_directory: text("working_directory") } : {}),
+                ...(preparation.length ? { preparation } : {}) }
             : kind === "application"
                 ? { kind, path: text("path") }
                 : {
@@ -697,6 +698,8 @@ var Amaterasu;
                 return `Playnite game ${entry.launch.game_id}`;
             case "playnite_fullscreen":
                 return "Playnite Fullscreen";
+            case "desktop":
+                return "Desktop session";
         }
     }
     Amaterasu.launchPath = launchPath;
@@ -3884,7 +3887,7 @@ var Amaterasu;
     }
     Amaterasu.input = input;
     function sectionHeading(title, description, ...actions) {
-        return el("header", "page-heading", el("div", "", el("p", "eyebrow", "HOST CONSOLE"), el("h1", "", title), el("p", "muted", description)), el("div", "actions", ...actions));
+        return el("header", "page-heading", el("div", "", el("h1", "", title), el("p", "muted", description)), el("div", "actions", ...actions));
     }
     Amaterasu.sectionHeading = sectionHeading;
     function empty(title, description, action) {
@@ -3907,6 +3910,54 @@ var Amaterasu;
         return el("section", "panel", el("h2", "", title), ...children);
     }
     Amaterasu.panel = panel;
+    function trackDrafts(root, onChange = () => { }) {
+        const baselines = new Map();
+        const signature = (control) => control instanceof HTMLInputElement && (control.type === "checkbox" || control.type === "radio")
+            ? `${control.checked}:${control.value}`
+            : control.value;
+        const controls = () => Array.from(root.querySelectorAll("input, textarea, select"))
+            .filter((control) => !(control instanceof HTMLInputElement && control.type === "hidden") &&
+            !control.hasAttribute("data-draft-ignore"));
+        const synchronize = () => {
+            for (const control of baselines.keys())
+                if (!root.contains(control))
+                    baselines.delete(control);
+            for (const control of controls())
+                if (!baselines.has(control))
+                    baselines.set(control, signature(control));
+        };
+        const dirty = (scope) => {
+            synchronize();
+            return [...baselines].some(([control, baseline]) => (!scope || scope.contains(control)) && signature(control) !== baseline);
+        };
+        const changed = () => onChange(dirty());
+        root.addEventListener("input", changed);
+        root.addEventListener("change", changed);
+        const observer = new MutationObserver(changed);
+        observer.observe(root, { childList: true, subtree: true });
+        synchronize();
+        return {
+            isDirty: dirty,
+            capture: (scope) => {
+                synchronize();
+                return new Map([...baselines.keys()].filter((control) => scope.contains(control))
+                    .map((control) => [control, signature(control)]));
+            },
+            markSaved: (snapshot) => {
+                for (const [control, value] of snapshot)
+                    if (root.contains(control))
+                        baselines.set(control, value);
+                changed();
+            },
+            dispose: () => {
+                observer.disconnect();
+                root.removeEventListener("input", changed);
+                root.removeEventListener("change", changed);
+                baselines.clear();
+            },
+        };
+    }
+    Amaterasu.trackDrafts = trackDrafts;
     async function runAction(target, status, action) {
         if (target.disabled)
             return;
@@ -4111,6 +4162,63 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function parseThemePreference(value) {
+        return value === "dark" || value === "light" || value === "auto" ? value : "auto";
+    }
+    Amaterasu.parseThemePreference = parseThemePreference;
+    function resolveTheme(preference, systemLight) {
+        return preference === "auto" ? (systemLight ? "light" : "dark") : preference;
+    }
+    Amaterasu.resolveTheme = resolveTheme;
+    class ThemeController {
+        preference;
+        media;
+        controls = new Map();
+        constructor() {
+            let saved = null;
+            try {
+                saved = localStorage.getItem("amaterasu.theme");
+            }
+            catch { }
+            this.preference = parseThemePreference(saved);
+            this.media = typeof window.matchMedia === "function" ? window.matchMedia("(prefers-color-scheme: light)") : null;
+            this.media?.addEventListener("change", () => {
+                if (this.preference === "auto")
+                    this.apply();
+            });
+            this.apply();
+        }
+        apply() {
+            document.documentElement.setAttribute("data-theme", resolveTheme(this.preference, this.media?.matches ?? false));
+            for (const [value, control] of this.controls)
+                control.setAttribute("aria-pressed", String(value === this.preference));
+        }
+        setPreference(value) {
+            this.preference = value;
+            try {
+                localStorage.setItem("amaterasu.theme", value);
+            }
+            catch { }
+            this.apply();
+        }
+        mount() {
+            this.controls.clear();
+            const options = Amaterasu.el("div", "theme-options");
+            options.setAttribute("role", "group");
+            Amaterasu.setLocalizedAttribute(options, "aria-label", "Appearance");
+            for (const [value, label] of [["light", "Light"], ["dark", "Dark"], ["auto", "System"]]) {
+                const choice = Amaterasu.button(label, () => this.setPreference(value), "theme-option");
+                this.controls.set(value, choice);
+                options.append(choice);
+            }
+            this.apply();
+            return Amaterasu.el("div", "theme-picker", Amaterasu.el("span", "muted", "Appearance"), options);
+        }
+    }
+    Amaterasu.ThemeController = ThemeController;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function catalogTextLiteral(value) {
         return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
     }
@@ -4192,7 +4300,7 @@ var Amaterasu;
         };
     }
     Amaterasu.parseCatalogApplicationDisplaySettings = parseCatalogApplicationDisplaySettings;
-    async function readSteamArtwork(api, reference) {
+    async function readSteamArtwork(api, reference, active = () => true) {
         if (reference.provider !== "steam" ||
             !Number.isSafeInteger(reference.app_id) ||
             reference.app_id < 1 ||
@@ -4209,6 +4317,8 @@ var Amaterasu;
                 revision: reference.revision,
                 offset,
             });
+            if (!active())
+                throw new Error("Artwork transfer cancelled.");
             if (reply.ok !== true ||
                 reply.app_id !== reference.app_id ||
                 reply.revision !== reference.revision ||
@@ -4218,6 +4328,7 @@ var Amaterasu;
                 reply.total_bytes > 16 * 1024 * 1024 ||
                 !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
                 typeof reply.data !== "string" ||
+                reply.data.length > 10924 ||
                 (totalBytes !== null && totalBytes !== reply.total_bytes) ||
                 (mimeType !== null && mimeType !== reply.mime_type))
                 throw new Error("Steam artwork changed during transfer.");
@@ -4242,7 +4353,7 @@ var Amaterasu;
         }
     }
     Amaterasu.readSteamArtwork = readSteamArtwork;
-    async function readLutrisArtwork(api, reference) {
+    async function readLutrisArtwork(api, reference, active = () => true) {
         if (reference.provider !== "lutris" ||
             !Number.isSafeInteger(reference.game_id) ||
             reference.game_id < 1 ||
@@ -4258,6 +4369,8 @@ var Amaterasu;
                 revision: reference.revision,
                 offset,
             });
+            if (!active())
+                throw new Error("Artwork transfer cancelled.");
             if (reply.ok !== true ||
                 reply.game_id !== reference.game_id ||
                 reply.revision !== reference.revision ||
@@ -4292,16 +4405,17 @@ var Amaterasu;
         }
     }
     Amaterasu.readLutrisArtwork = readLutrisArtwork;
-    function showCatalogArtwork(api, reference, art, content) {
+    function showCatalogArtwork(api, reference, art, content, onLoad) {
         if (!reference)
             return;
         if (reference.provider === "steam" && !api.allows("steam.read"))
             return;
         if (reference.provider === "lutris" && !api.allows("lutris.read"))
             return;
+        const active = () => content.isConnected && art.isConnected;
         const imageRead = reference.provider === "steam"
-            ? readSteamArtwork(api, reference)
-            : readLutrisArtwork(api, reference);
+            ? readSteamArtwork(api, reference, active)
+            : readLutrisArtwork(api, reference, active);
         void imageRead.then((blob) => {
             if (!content.isConnected || !art.isConnected)
                 return;
@@ -4320,8 +4434,9 @@ var Amaterasu;
                 observer.disconnect();
                 URL.revokeObjectURL(url);
             };
-            image.addEventListener("load", release, { once: true });
-            image.addEventListener("error", release, { once: true });
+            image.addEventListener("load", () => { release(); if (active())
+                onLoad?.(); }, { once: true });
+            image.addEventListener("error", () => { image.remove(); release(); }, { once: true });
             observer.observe(document, { childList: true, subtree: true });
             image.src = url;
             art.prepend(image);
@@ -4770,86 +4885,456 @@ var Amaterasu;
             controls: Amaterasu.el("div", "form-grid", Amaterasu.field("Virtual audio sink", mode, "Inherit the next scope, clear inherited selection, or choose a virtual device."), Amaterasu.field("Virtual sink ID or name", selector, "Used for a specific device; Windows matches IDs and names exactly.")),
         };
     }
+    function librarySource(entry) {
+        if (entry.launch.kind === "playnite" || entry.launch.kind === "playnite_fullscreen")
+            return "Playnite";
+        if (entry.steam_id || entry.artwork?.provider === "steam")
+            return "Steam";
+        if (entry.artwork?.provider === "lutris")
+            return "Lutris";
+        return "Other";
+    }
+    function sortLibraryRows(rows, sort) {
+        let locale = typeof document !== "undefined" ? document.documentElement?.lang : "";
+        locale = locale?.replaceAll("_", "-") ?? "";
+        let collator;
+        try {
+            collator = new Intl.Collator(locale || undefined, { numeric: true, sensitivity: "base" });
+        }
+        catch {
+            collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+        }
+        return [...rows].sort((left, right) => {
+            const name = collator.compare(left.name, right.name);
+            if (sort === "source")
+                return collator.compare(left.source, right.source) || name || left.id.localeCompare(right.id);
+            return (sort === "name-desc" ? -name : name) || left.id.localeCompare(right.id);
+        });
+    }
+    function libraryLocation(address) {
+        const fragment = address.hash.slice(1);
+        const parameters = new URLSearchParams(fragment.startsWith("catalog?") ? fragment.slice(8) : "");
+        const requestedSort = parameters.get("sort");
+        return {
+            query: (parameters.get("q") ?? "").trim(),
+            sort: requestedSort === "name-desc" || requestedSort === "source" ? requestedSort : "name",
+        };
+    }
+    Amaterasu.libraryLocation = libraryLocation;
+    function updateLibraryLocation(address, query, sort) {
+        const next = new URL(address);
+        const parameters = new URLSearchParams(next.hash.startsWith("#catalog?") ? next.hash.slice(9) : "");
+        if (query)
+            parameters.set("q", query);
+        else
+            parameters.delete("q");
+        if (sort !== "name")
+            parameters.set("sort", sort);
+        else
+            parameters.delete("sort");
+        const suffix = parameters.toString();
+        next.hash = suffix ? `catalog?${suffix}` : "catalog";
+        return next;
+    }
+    Amaterasu.updateLibraryLocation = updateLibraryLocation;
+    async function scanLibraryIndex(api, query, active, progress) {
+        const rows = [];
+        const cachedRows = new Map();
+        const seenIds = new Set();
+        const seenCursors = new Set();
+        let cursor = null;
+        let revision = null;
+        let capabilities = null;
+        do {
+            if (!active())
+                throw new Error("Library scan cancelled.");
+            const reply = await api.post(query ? "catalog/search" : "catalog/list", {
+                ...(query ? { query } : {}), cursor, limit: 32,
+            });
+            if (!active())
+                throw new Error("Library scan cancelled.");
+            if (revision !== null && reply.revision !== revision)
+                throw new Error("The catalog changed while sorting. Refresh the library to try again.");
+            revision = reply.revision;
+            capabilities = reply.config_override_capabilities;
+            for (const row of reply.entries) {
+                if (seenIds.has(row.id) || rows.length >= 100_000)
+                    throw new Error("The catalog returned an invalid or oversized library.");
+                seenIds.add(row.id);
+                rows.push({ id: row.id, name: row.entry.name, source: librarySource(row.entry) });
+                if (cachedRows.size < 32)
+                    cachedRows.set(row.id, row);
+            }
+            progress(rows.length);
+            cursor = reply.next_cursor;
+            if (cursor !== null) {
+                const marker = JSON.stringify(cursor);
+                if (seenCursors.has(marker))
+                    throw new Error("The catalog returned a repeated continuation.");
+                seenCursors.add(marker);
+            }
+        } while (cursor !== null);
+        if (revision === null || capabilities === null)
+            throw new Error("The catalog returned no library revision.");
+        return { revision, capabilities, rows, cachedRows };
+    }
     function renderCatalog(context) {
         const { content, api, notify } = context;
         const search = Amaterasu.input("search");
         search.type = "search";
-        catalogLocalizedAttribute(search, "placeholder", "Search names, descriptions, tags");
+        catalogLocalizedAttribute(search, "placeholder", "Search names, sources, commands and tags");
         catalogLocalizedAttribute(search, "aria-label", "Search catalog");
         const searchForm = Amaterasu.el("form", "search-form", search);
         const searchButton = Amaterasu.el("button", "button secondary", "Search");
         searchButton.type = "submit";
         searchForm.append(searchButton);
         const results = Amaterasu.el("div");
+        results.addEventListener("keydown", (event) => {
+            if (event.key === "Escape" && selectedIds.size) {
+                event.preventDefault();
+                clearSelection();
+            }
+        });
         const editor = Amaterasu.el("div");
+        const editorDrafts = context.registerDraftGuard ? Amaterasu.trackDrafts(editor) : null;
+        let editorSaving = false;
+        if (editorDrafts)
+            context.registerDraftGuard?.(() => editorSaving || editorDrafts.isDirty(), editorDrafts.dispose);
+        let editorGeneration = 0;
         const status = Amaterasu.el("div");
-        let query = "";
+        const selectionCount = Amaterasu.el("span", "muted");
+        const selectionBar = Amaterasu.el("div", "library-selection");
+        const selectedIds = new Set();
+        const visibleSelection = new Map();
+        let selectionAnchor = "";
+        let selectedRevision = null;
+        let visibleIds = [];
+        const clearSelectionButton = Amaterasu.button("Clear selection", () => clearSelection(), "quiet");
+        selectionBar.setAttribute("role", "status");
+        selectionBar.hidden = true;
+        selectionBar.append(selectionCount, Amaterasu.el("span", "muted", "Space selects · Escape clears"), clearSelectionButton);
+        function updateSelection() {
+            selectionBar.hidden = selectedIds.size === 0;
+            selectionCount.textContent = `${selectedIds.size} selected`;
+            for (const update of visibleSelection.values())
+                update();
+        }
+        function clearSelection() {
+            selectedIds.clear();
+            selectedRevision = null;
+            selectionAnchor = "";
+            updateSelection();
+        }
+        function toggleSelection(id) {
+            if (selectedIds.has(id))
+                selectedIds.delete(id);
+            else
+                selectedIds.add(id);
+            selectedRevision = selectedIds.size ? revision : null;
+            selectionAnchor = id;
+            updateSelection();
+        }
+        function selectRange(from, to) {
+            const first = visibleIds.indexOf(selectionAnchor || from);
+            const last = visibleIds.indexOf(to);
+            if (first < 0 || last < 0)
+                return;
+            for (let index = Math.min(first, last); index <= Math.max(first, last); index++) {
+                const id = visibleIds[index];
+                if (id)
+                    selectedIds.add(id);
+            }
+            if (!selectionAnchor)
+                selectionAnchor = from;
+            selectedRevision = revision;
+            updateSelection();
+        }
+        function moveCollectionFocus(current, key, extend) {
+            if (!currentGrid)
+                return;
+            const start = current.getBoundingClientRect();
+            const centerX = start.left + start.width / 2;
+            const centerY = start.top + start.height / 2;
+            const candidates = Array.from(currentGrid.querySelectorAll("button.catalog-open:not(:disabled)"))
+                .filter((candidate) => candidate !== current)
+                .map((candidate) => {
+                const rect = candidate.getBoundingClientRect();
+                const x = rect.left + rect.width / 2 - centerX;
+                const y = rect.top + rect.height / 2 - centerY;
+                const horizontal = key === "ArrowLeft" || key === "ArrowRight";
+                const primary = horizontal ? x : y;
+                const secondary = horizontal ? y : x;
+                const forward = (key === "ArrowRight" || key === "ArrowDown") ? primary > 1 : primary < -1;
+                return { candidate, forward, distance: Math.abs(primary) + Math.abs(secondary) * 4 };
+            })
+                .filter((candidate) => candidate.forward)
+                .sort((a, b) => a.distance - b.distance);
+            const next = candidates[0]?.candidate;
+            if (!next)
+                return;
+            if (extend && current.dataset.catalogId && next.dataset.catalogId)
+                selectRange(current.dataset.catalogId, next.dataset.catalogId);
+            next.focus();
+        }
+        const initialLocation = typeof window === "undefined" || typeof window.location === "undefined"
+            ? { query: "", sort: "name" }
+            : libraryLocation(new URL(window.location.href));
+        let query = initialLocation.query;
+        search.value = query;
         let revision = 0;
-        let cursors = [null];
         let page = 0;
         let generation = 0;
+        let libraryIndex = null;
         let configOverrideCapabilities = null;
+        let currentGrid = null;
+        let openMenu = null;
+        function closeCatalogMenu(restoreFocus = false) {
+            const current = openMenu;
+            if (!current)
+                return;
+            openMenu = null;
+            current.menu.open = false;
+            document.removeEventListener("pointerdown", dismissCatalogMenu);
+            current.observer.disconnect();
+            if (restoreFocus && current.trigger.isConnected)
+                current.trigger.focus();
+        }
+        function dismissCatalogMenu(event) {
+            if (openMenu && event.target instanceof Node && !openMenu.menu.contains(event.target))
+                closeCatalogMenu();
+        }
+        function showCatalogMenu(menu, trigger, focusAction) {
+            if (openMenu?.menu !== menu) {
+                closeCatalogMenu();
+                const observer = new MutationObserver(() => {
+                    if (!menu.isConnected)
+                        closeCatalogMenu();
+                });
+                openMenu = { menu, trigger, observer };
+                observer.observe(document.body, { childList: true, subtree: true });
+                document.addEventListener("pointerdown", dismissCatalogMenu);
+            }
+            menu.open = true;
+            if (focusAction)
+                (menu.querySelector(".catalog-card-actions button:not(:disabled)") ?? menu.querySelector("summary"))?.focus();
+        }
+        let view = "grid";
+        try {
+            if (typeof localStorage !== "undefined" && localStorage.getItem("amaterasu.library.view") === "list")
+                view = "list";
+        }
+        catch { }
+        const gridView = Amaterasu.button("Grid", () => setView("grid"), "library-view-button");
+        const listView = Amaterasu.button("List", () => setView("list"), "library-view-button");
+        const viewControls = Amaterasu.el("div", "library-view-controls", gridView, listView);
+        viewControls.setAttribute("role", "group");
+        viewControls.setAttribute("aria-label", "Library view");
+        function setView(next) {
+            view = next;
+            gridView.setAttribute("aria-pressed", String(view === "grid"));
+            listView.setAttribute("aria-pressed", String(view === "list"));
+            if (currentGrid)
+                currentGrid.className = `catalog-grid catalog-grid--${view}`;
+            try {
+                if (typeof localStorage !== "undefined")
+                    localStorage.setItem("amaterasu.library.view", view);
+            }
+            catch { }
+        }
+        setView(view);
+        const sort = Amaterasu.el("select", "library-sort");
+        sort.name = "sort";
+        catalogLocalizedAttribute(sort, "aria-label", "Sort library");
+        for (const [value, label] of [["name", "Name (A–Z)"], ["name-desc", "Name (Z–A)"], ["source", "Known source"]]) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = value ?? "";
+            sort.append(option);
+        }
+        sort.value = initialLocation.sort;
+        function replaceLibraryLocation() {
+            if (typeof window === "undefined" || typeof window.location === "undefined" || typeof window.history === "undefined")
+                return;
+            const next = updateLibraryLocation(new URL(window.location.href), query, sort.value);
+            if (next.href !== window.location.href)
+                window.history.replaceState(window.history.state, "", next);
+        }
+        sort.addEventListener("change", () => { replaceLibraryLocation(); page = 0; void load(); });
         const add = Amaterasu.button("+ Add application", () => {
             if (configOverrideCapabilities)
                 showEditor(undefined, configOverrideCapabilities);
         }, "primary");
         add.disabled = true;
-        content.append(Amaterasu.sectionHeading("Your library", "A durable catalog of the applications on your host.", add), searchForm, status, editor, results);
+        const sources = Amaterasu.button("Library sources", () => context.navigate("integrations"));
+        sources.disabled = !api.allows("configuration.read");
+        content.append(Amaterasu.sectionHeading("Your library", "A durable catalog of the applications on your host.", sources, add), Amaterasu.el("div", "library-toolbar", searchForm, sort, viewControls), selectionBar, status, editor, results);
         async function load() {
             const current = ++generation;
             results.setAttribute("aria-busy", "true");
             try {
-                const reply = await api.post(query ? "catalog/search" : "catalog/list", { ...(query ? { query } : {}), cursor: cursors[page], limit: 12 });
+                const active = () => content.isConnected && current === generation;
+                const changed = () => {
+                    if (active()) {
+                        libraryIndex = null;
+                        if (selectedIds.size) {
+                            clearSelection();
+                            notify("The catalog changed, so the selection was cleared.");
+                        }
+                    }
+                    return new Error("The catalog changed while sorting. Refresh the library to try again.");
+                };
+                if (!libraryIndex) {
+                    results.replaceChildren(Amaterasu.el("p", "muted", "Sorting the library…"));
+                    const indexed = await scanLibraryIndex(api, query, active, (count) => {
+                        if (active())
+                            results.replaceChildren(Amaterasu.el("p", "muted", catalogTextLiteral(`Sorting the library… ${count} applications found`)));
+                    });
+                    if (!active())
+                        return;
+                    libraryIndex = indexed;
+                }
+                const indexed = libraryIndex;
+                const probe = await api.post("catalog/list", { cursor: null, limit: 1 });
+                if (!active())
+                    return;
+                if (probe.revision !== indexed.revision) {
+                    throw changed();
+                }
+                const ordered = sortLibraryRows(indexed.rows, sort.value);
+                const selectedRows = ordered.slice(page * 12, (page + 1) * 12);
+                const rows = [];
+                for (let offset = 0; offset < selectedRows.length; offset += 4) {
+                    const chunk = selectedRows.slice(offset, offset + 4);
+                    const loaded = await Promise.all(chunk.map(async ({ id }) => {
+                        const cached = indexed.cachedRows.get(id);
+                        if (cached)
+                            return cached;
+                        const response = await api.post("catalog/get", { id });
+                        if (response.revision !== indexed.revision || response.id !== id) {
+                            throw changed();
+                        }
+                        return { id, entry: response.entry };
+                    }));
+                    if (!active())
+                        return;
+                    rows.push(...loaded);
+                }
                 if (!content.isConnected || current !== generation)
                     return;
-                revision = reply.revision;
-                configOverrideCapabilities = reply.config_override_capabilities;
+                if (selectedRevision !== null && selectedRevision !== indexed.revision) {
+                    clearSelection();
+                    notify("The catalog changed, so the selection was cleared.");
+                }
+                revision = indexed.revision;
+                visibleIds = rows.map((row) => row.id);
+                visibleSelection.clear();
+                configOverrideCapabilities = indexed.capabilities;
                 add.disabled = !api.allows("catalog.write");
-                const grid = Amaterasu.el("div", "catalog-grid");
-                for (const row of reply.entries)
-                    grid.append(card(row, reply.config_override_capabilities));
-                results.replaceChildren(Amaterasu.el("div", "section-meta", Amaterasu.el("span", "", catalogTextLiteral(`${reply.entries.length} applications on this page`)), Amaterasu.badge(catalogTextLiteral(`Revision ${revision}`))), reply.entries.length
+                const grid = Amaterasu.el("div", `catalog-grid catalog-grid--${view}`);
+                currentGrid = grid;
+                for (const row of rows)
+                    grid.append(card(row, indexed.capabilities));
+                results.replaceChildren(Amaterasu.el("div", "section-meta", Amaterasu.el("h2", "", "Collection"), Amaterasu.el("span", "muted", catalogTextLiteral(`${ordered.length} applications`))), rows.length
                     ? grid
                     : Amaterasu.empty(query
-                        ? "No matches on this page"
-                        : "Make room for your favorites", reply.next_cursor
-                        ? "Search continues on the next page."
-                        : query
-                            ? "Try a different name or tag."
-                            : "Add your first application to start building this host’s library."), Amaterasu.pager(page
+                        ? "No matching applications"
+                        : "Make room for your favorites", query
+                        ? "Try a different name, source, command or tag."
+                        : "Add your first application to start building this host’s library."), Amaterasu.pager(page
                     ? () => {
                         page--;
                         void load();
                     }
-                    : null, reply.next_cursor != null
+                    : null, (page + 1) * 12 < ordered.length
                     ? () => {
-                        cursors = cursors.slice(0, page + 1);
-                        cursors.push(reply.next_cursor);
                         page++;
                         void load();
                     }
                     : null, catalogTextLiteral(`Page ${page + 1}`)));
             }
             catch (error) {
-                if (content.isConnected && current === generation)
+                if (content.isConnected && current === generation) {
+                    if (error && typeof error === "object" && "code" in error && error.code === "revision_conflict" && selectedIds.size) {
+                        clearSelection();
+                        notify("The catalog changed, so the selection was cleared.");
+                    }
                     results.replaceChildren(Amaterasu.errorPanel(error, reset));
+                }
             }
             finally {
-                results.removeAttribute("aria-busy");
+                if (current === generation)
+                    results.removeAttribute("aria-busy");
             }
         }
         function reset() {
-            cursors = [null];
+            libraryIndex = null;
             page = 0;
             void load();
         }
+        let searchTimer = 0;
+        function searchCatalog() {
+            window.clearTimeout(searchTimer);
+            const next = search.value.trim();
+            if (next === query)
+                return;
+            query = next;
+            replaceLibraryLocation();
+            reset();
+        }
+        search.addEventListener("input", () => {
+            window.clearTimeout(searchTimer);
+            searchTimer = window.setTimeout(() => {
+                if (content.isConnected)
+                    searchCatalog();
+            }, 300);
+        });
+        search.addEventListener("keydown", (event) => {
+            if (event.key === "Escape" && search.value) {
+                event.preventDefault();
+                search.value = "";
+                searchCatalog();
+            }
+        });
         searchForm.addEventListener("submit", (event) => {
             event.preventDefault();
-            query = search.value.trim();
-            reset();
+            searchCatalog();
         });
+        if (typeof window !== "undefined" && typeof window.addEventListener === "function" && typeof MutationObserver !== "undefined") {
+            const restoreLocation = () => {
+                if (!content.isConnected || (window.location.hash !== "#catalog" &&
+                    !window.location.hash.startsWith("#catalog?")))
+                    return;
+                const restored = libraryLocation(new URL(window.location.href));
+                window.clearTimeout(searchTimer);
+                search.value = restored.query;
+                const queryChanged = query !== restored.query;
+                const sortChanged = sort.value !== restored.sort;
+                query = restored.query;
+                sort.value = restored.sort;
+                if (queryChanged)
+                    reset();
+                else if (sortChanged) {
+                    page = 0;
+                    void load();
+                }
+            };
+            window.addEventListener("popstate", restoreLocation);
+            window.addEventListener("hashchange", restoreLocation);
+            const observer = new MutationObserver(() => {
+                if (!content.isConnected) {
+                    observer.disconnect();
+                    window.removeEventListener("popstate", restoreLocation);
+                    window.removeEventListener("hashchange", restoreLocation);
+                    window.clearTimeout(searchTimer);
+                }
+            });
+            observer.observe(document, { childList: true, subtree: true });
+        }
         function card(row, capabilities) {
             const providerLaunch = row.entry.launch.kind === "playnite";
+            const launchLabel = row.entry.launch.kind === "desktop" ? "Desktop" :
+                row.entry.launch.kind === "playnite_fullscreen" ? "Playnite Fullscreen" :
+                    row.entry.steam_id ? "Steam-linked" : row.entry.launch.kind === "executable" ? "Executable" :
+                        providerLaunch ? "Playnite" : "Application";
             const edit = Amaterasu.button("Edit", () => showEditor(row, capabilities));
             edit.disabled = !api.allows("catalog.write") || providerLaunch;
             if (providerLaunch)
@@ -4881,20 +5366,98 @@ var Amaterasu;
             }, "quiet danger-text");
             remove.disabled = !api.allows("catalog.write");
             actions.push(remove);
-            const art = Amaterasu.el("div", "app-art", Amaterasu.el("span", "", catalogTextLiteral(row.entry.name.slice(0, 2).toUpperCase())), Amaterasu.badge(row.entry.launch.kind === "executable"
-                ? "Executable"
-                : providerLaunch
-                    ? "Playnite"
-                    : "Application"));
+            const art = Amaterasu.el("span", "app-art", Amaterasu.el("span", "app-monogram", catalogTextLiteral(row.entry.name.slice(0, 2).toUpperCase())), Amaterasu.badge(launchLabel));
             showCatalogArtwork(api, row.entry.artwork, art, content);
-            return Amaterasu.el("article", "app-card", art, Amaterasu.el("div", "app-details", Amaterasu.el("h2", "", catalogTextLiteral(row.entry.name)), Amaterasu.el("p", "muted description", row.entry.description ? catalogTextLiteral(row.entry.description) : "No description added."), Amaterasu.el("div", "tags", ...(row.entry.tags ?? []).map((tag) => Amaterasu.badge(catalogTextLiteral(tag)))), Amaterasu.el("p", "path", catalogTextLiteral(Amaterasu.launchPath(row.entry))), Amaterasu.el("div", "card-footer", ...actions)));
+            const open = Amaterasu.button("", () => {
+                if (providerLaunch)
+                    showProviderOverrideEditor(row, capabilities);
+                else
+                    showEditor(row, capabilities);
+            }, "catalog-open");
+            open.disabled = !api.allows("catalog.write");
+            open.dataset.catalogId = row.id;
+            open.addEventListener("keydown", (event) => {
+                if ((event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) && !event.isComposing) {
+                    event.preventDefault();
+                    showCatalogMenu(menu, open, true);
+                }
+                else if (event.key === " " && !event.isComposing) {
+                    event.preventDefault();
+                    toggleSelection(row.id);
+                }
+                else if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+                    event.preventDefault();
+                    moveCollectionFocus(open, event.key, event.shiftKey);
+                }
+                else if (event.key === "Escape" && selectedIds.size) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    clearSelection();
+                }
+            });
+            catalogLocalizedAttributeTemplate(open, "aria-label", "Edit {name}", { name: catalogTextLiteral(row.entry.name) });
+            open.append(art, Amaterasu.el("span", "catalog-card-title", Amaterasu.el("strong", "", catalogTextLiteral(row.entry.name)), Amaterasu.el("small", "muted", launchLabel)));
+            const summary = Amaterasu.el("summary", "catalog-menu-toggle", "Actions");
+            catalogLocalizedAttributeTemplate(summary, "aria-label", "Actions for {name}", { name: catalogTextLiteral(row.entry.name) });
+            const menu = Amaterasu.el("details", "catalog-card-menu", summary, Amaterasu.el("div", "catalog-card-menu-content", Amaterasu.el("p", "muted", row.entry.description ? catalogTextLiteral(row.entry.description) : "No description added."), Amaterasu.el("div", "tags", ...(row.entry.tags ?? []).map((tag) => Amaterasu.badge(catalogTextLiteral(tag)))), Amaterasu.el("p", "path", catalogTextLiteral(Amaterasu.launchPath(row.entry))), Amaterasu.el("div", "catalog-card-actions", ...actions)));
+            menu.addEventListener("toggle", () => {
+                if (menu.open)
+                    showCatalogMenu(menu, open, false);
+                else if (openMenu?.menu === menu)
+                    closeCatalogMenu();
+            });
+            menu.addEventListener("keydown", (event) => {
+                if (event.key === "Escape" && menu.open) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    closeCatalogMenu(true);
+                }
+            });
+            const select = Amaterasu.button("", () => toggleSelection(row.id), "catalog-select");
+            const article = Amaterasu.el("article", "app-card", open, select, menu);
+            article.addEventListener("contextmenu", (event) => {
+                event.preventDefault();
+                showCatalogMenu(menu, open, true);
+            });
+            const update = () => {
+                const selected = selectedIds.has(row.id);
+                article.className = `app-card${selected ? " is-selected" : ""}`;
+                select.textContent = selected ? "✓" : "+";
+                select.setAttribute("aria-pressed", String(selected));
+                catalogLocalizedAttributeTemplate(select, "aria-label", selected ? "Deselect {name}" : "Select {name}", { name: catalogTextLiteral(row.entry.name) });
+            };
+            visibleSelection.set(row.id, update);
+            update();
+            return article;
+        }
+        function closeEditor() {
+            if (editorSaving) {
+                notify("Wait for the application save to finish.");
+                return false;
+            }
+            if (editorDrafts?.isDirty() && !window.confirm("Discard your unsaved application changes?"))
+                return false;
+            editorGeneration += 1;
+            editor.replaceChildren();
+            return true;
         }
         function showProviderOverrideEditor(row, capabilities) {
+            if (!closeEditor())
+                return;
+            const request = editorGeneration;
             editor.replaceChildren(Amaterasu.el("p", "muted", "Loading input profiles…"));
             void loadInputRuntimeStatus().then((status) => {
-                if (context.content.isConnected)
+                if (context.content.isConnected && request === editorGeneration)
                     renderProviderOverrideEditor(row, status, capabilities);
             });
+        }
+        function lockEditorControls(form) {
+            if (typeof form.querySelectorAll !== "function")
+                return () => { };
+            const controls = Array.from(form.querySelectorAll("input, textarea, select, button"));
+            const states = controls.map((control) => control.disabled);
+            controls.forEach((control) => { control.disabled = true; });
+            return () => controls.forEach((control, index) => { control.disabled = states[index] ?? false; });
         }
         async function loadInputRuntimeStatus() {
             try {
@@ -4955,12 +5518,13 @@ var Amaterasu;
             displayPolicy.rows = 12;
             displayPolicy.spellcheck = false;
             displayPolicy.value = JSON.stringify(row.entry.config_overrides?.display_policy ?? {}, null, 2);
-            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null/empty to inherit the next scope; global-only keys are rejected."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettingsFields);
+            const form = Amaterasu.el("form", "editor-form", catalogEditorSection("Streaming and audio", "Override streaming and audio for this provider-managed application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...frameLimiterFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Display", "Choose display and adapter overrides.", ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized unavailable profiles remain selectable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
+            revealInvalidEditorControls(form);
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
             save.type = "submit";
-            const cancel = Amaterasu.button("Cancel", () => editor.replaceChildren());
-            form.append(feedback, Amaterasu.el("div", "actions", save, cancel));
+            const cancel = Amaterasu.button("Cancel", () => { closeEditor(); });
+            form.append(feedback, Amaterasu.el("div", "catalog-editor-save-bar", Amaterasu.el("span", "muted", "Save or cancel your changes."), Amaterasu.el("div", "actions", cancel, save)));
             form.addEventListener("submit", (event) => {
                 event.preventDefault();
                 if (!form.reportValidity())
@@ -4970,6 +5534,8 @@ var Amaterasu;
                         dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
                         display_policy: Amaterasu.parseDisplayPolicyOverrideMap(displayPolicy.value, "application"),
                     });
+                    editorSaving = true;
+                    const unlock = lockEditorControls(form);
                     try {
                         const reply = await api.post("catalog/update_provider_overrides", {
                             id: row.id,
@@ -4987,22 +5553,35 @@ var Amaterasu;
                     }
                     catch (error) {
                         if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
-                            editor.replaceChildren();
-                            await load();
-                            notify(`Streaming settings for ${row.entry.name} changed elsewhere. The latest value was reloaded; reopen the editor to review it.`);
+                            const reload = Amaterasu.button("Reload library", () => {
+                                if (!closeEditor())
+                                    return;
+                                void load();
+                            });
+                            feedback.replaceChildren(Amaterasu.el("div", "notice error", Amaterasu.el("strong", "", "Application changed elsewhere"), Amaterasu.el("p", "", "Your edits are still here. Review or copy them before reloading the library."), reload));
                             return;
                         }
                         throw error;
                     }
+                    finally {
+                        editorSaving = false;
+                        unlock();
+                    }
                 });
             });
-            editor.replaceChildren(Amaterasu.panel("Playnite streaming settings", Amaterasu.el("p", "muted", catalogTextLiteral(`${row.entry.name} · Playnite game ${row.entry.launch.kind === "playnite" ? row.entry.launch.game_id : ""}`)), Amaterasu.el("p", "muted", "The Playnite game identity and provider-managed launch metadata stay unchanged."), form));
+            const cover = catalogEditorCover(row);
+            editor.replaceChildren(Amaterasu.panel("Playnite streaming settings", Amaterasu.el("p", "muted", catalogTextLiteral(`${row.entry.name} · Playnite game ${row.entry.launch.kind === "playnite" ? row.entry.launch.game_id : ""}`)), Amaterasu.el("p", "muted", "The Playnite game identity and provider-managed launch metadata stay unchanged."), Amaterasu.el("div", "catalog-editor-layout", cover.figure, form)));
+            showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; });
             editor.scrollIntoView({ behavior: "smooth", block: "start" });
             fec.focus();
         }
         function showEditor(row, capabilities) {
+            if (!closeEditor())
+                return;
+            const request = editorGeneration;
+            editor.replaceChildren(Amaterasu.el("p", "muted", "Loading input profiles…"));
             void loadInputRuntimeStatus().then((runtimeStatus) => {
-                if (context.content.isConnected)
+                if (context.content.isConnected && request === editorGeneration)
                     renderEditor(row, runtimeStatus, capabilities);
             });
         }
@@ -5012,8 +5591,8 @@ var Amaterasu;
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", row ? "Save changes" : "Add application");
             save.type = "submit";
-            const cancel = Amaterasu.button("Cancel", () => editor.replaceChildren());
-            form.append(feedback, Amaterasu.el("div", "actions", save, cancel));
+            const cancel = Amaterasu.button("Cancel", () => { closeEditor(); });
+            form.append(feedback, Amaterasu.el("div", "catalog-editor-save-bar", Amaterasu.el("span", "muted", "Save or cancel your changes."), Amaterasu.el("div", "actions", cancel, save)));
             form.addEventListener("submit", (event) => {
                 event.preventDefault();
                 if (!form.reportValidity())
@@ -5022,23 +5601,58 @@ var Amaterasu;
                     const entry = Amaterasu.entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
                     Object.assign(entry, parseCatalogApplicationDisplaySettings(new FormData(form)));
                     entry.config_overrides = mergeCatalogConfigOverrides(row?.entry.config_overrides, new FormData(form).keys(), entry.config_overrides, parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row?.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form)), parseCatalogInputCompatibilityOverrides(new FormData(form)));
-                    await api.post(row ? "catalog/update" : "catalog/create", {
-                        ...(row ? { id: row.id } : {}),
-                        entry,
-                        expected_revision: editRevision,
-                    });
-                    editor.replaceChildren();
-                    notify(catalogTextMessage(row ? "Application updated." : "Application added."));
-                    reset();
+                    editorSaving = true;
+                    const unlock = lockEditorControls(form);
+                    try {
+                        await api.post(row ? "catalog/update" : "catalog/create", {
+                            ...(row ? { id: row.id } : {}),
+                            entry,
+                            expected_revision: editRevision,
+                        });
+                        editor.replaceChildren();
+                        notify(catalogTextMessage(row ? "Application updated." : "Application added."));
+                        reset();
+                    }
+                    finally {
+                        editorSaving = false;
+                        unlock();
+                    }
                 });
             });
-            editor.replaceChildren(Amaterasu.panel(row ? "Edit application" : "Add application", Amaterasu.el("p", "muted", "Save launch metadata for this host. Adding an entry does not launch it."), form));
+            const cover = row ? catalogEditorCover(row) : null;
+            editor.replaceChildren(Amaterasu.panel(row ? "Edit application" : "Add application", Amaterasu.el("p", "muted", "Save launch metadata for this host. Adding an entry does not launch it."), cover ? Amaterasu.el("div", "catalog-editor-layout", cover.figure, form) : form));
+            if (cover && row)
+                showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; });
             editor.scrollIntoView({ behavior: "smooth", block: "start" });
             form.querySelector("input")?.focus();
         }
         void load();
     }
     Amaterasu.renderCatalog = renderCatalog;
+    function catalogEditorCover(row) {
+        const fallback = Amaterasu.el("span", "catalog-editor-artwork-fallback", "Cover unavailable");
+        const art = Amaterasu.el("div", "catalog-editor-artwork", fallback);
+        const provider = row.entry.artwork?.provider;
+        const description = provider === "steam" ? "Steam artwork" :
+            provider === "lutris" ? "Lutris artwork" : "No provider cover";
+        const figure = Amaterasu.el("figure", "catalog-editor-cover", art, Amaterasu.el("figcaption", "muted", description));
+        return { figure, art, fallback };
+    }
+    function catalogEditorSection(title, description, ...children) {
+        return Amaterasu.el("section", "catalog-editor-section", Amaterasu.el("div", "catalog-editor-heading", Amaterasu.el("h3", "", title), Amaterasu.el("p", "muted", description)), ...children);
+    }
+    function catalogEditorDisclosure(title, description, ...children) {
+        return Amaterasu.el("details", "catalog-editor-section catalog-editor-disclosure", Amaterasu.el("summary", "", Amaterasu.el("strong", "", title), Amaterasu.el("small", "muted", description)), Amaterasu.el("div", "catalog-editor-disclosure-content", ...children));
+    }
+    function revealInvalidEditorControls(form) {
+        form.addEventListener("invalid", (event) => {
+            let details = event.target?.closest("details");
+            while (details && form.contains(details)) {
+                details.open = true;
+                details = details.parentElement?.closest("details") ?? null;
+            }
+        }, true);
+    }
     function entryForm(entry, runtimeStatus, capabilities) {
         const form = Amaterasu.el("form", "editor-form");
         const name = Amaterasu.input("name", entry?.name ?? "");
@@ -5121,6 +5735,7 @@ var Amaterasu;
             ["application", "Application / bundle"],
             ["executable", "Executable with arguments"],
             ["playnite_fullscreen", "Playnite Fullscreen"],
+            ["desktop", "Desktop session"],
         ]) {
             const option = Amaterasu.el("option", "", text);
             option.value = value ?? "";
@@ -5135,9 +5750,9 @@ var Amaterasu;
         argumentsField.name = "arguments";
         argumentsField.rows = 2;
         argumentsField.value = JSON.stringify(executableLaunch?.arguments ?? []);
-        const directory = Amaterasu.input("working_directory", entry?.launch.kind === "executable"
-            ? (entry.launch.working_directory ?? "")
-            : "");
+        const preparedLaunch = entry?.launch.kind === "executable" || entry?.launch.kind === "desktop" || entry?.launch.kind === "playnite_fullscreen"
+            ? entry.launch : undefined;
+        const directory = Amaterasu.input("working_directory", preparedLaunch?.working_directory ?? "");
         const autoDetach = Amaterasu.el("input");
         autoDetach.type = "checkbox";
         autoDetach.name = "auto_detach";
@@ -5156,7 +5771,7 @@ var Amaterasu;
         detached.name = "detached";
         detached.rows = 3;
         detached.value = executableLaunch?.detached?.join("\n") ?? "";
-        const preparation = Amaterasu.input("preparation", JSON.stringify(executableLaunch?.preparation ?? []), "hidden");
+        const preparation = Amaterasu.input("preparation", JSON.stringify(preparedLaunch?.preparation ?? []), "hidden");
         const rawPreparation = Amaterasu.input("prep_cmd", JSON.stringify(entry?.prep_cmd ?? []), "hidden");
         const fec = Amaterasu.input("fec_percentage", entry?.config_overrides?.fec_percentage?.toString() ?? "", "number");
         fec.min = "1";
@@ -5191,33 +5806,39 @@ var Amaterasu;
         steamId.maxLength = 10;
         const steamInstallDir = Amaterasu.input("steam_install_dir", entry?.steam_install_dir ?? "");
         steamInstallDir.maxLength = 1024;
-        const fullscreenTimeout = Amaterasu.input("fullscreen_exit_timeout_seconds", String(entry?.launch.kind === "playnite_fullscreen" ? entry.launch.exit_timeout_seconds : 10), "number");
+        const fullscreenTimeout = Amaterasu.input("fullscreen_exit_timeout_seconds", String(entry?.launch.kind === "playnite_fullscreen" || entry?.launch.kind === "desktop" ? entry.launch.exit_timeout_seconds : 10), "number");
         fullscreenTimeout.min = "0";
         fullscreenTimeout.max = "300";
         fullscreenTimeout.step = "1";
         fullscreenTimeout.required = true;
         const processPolicy = Amaterasu.el("div", "form-grid", Amaterasu.field("Auto detach", autoDetach, "Retain a quick successful launcher."), Amaterasu.field("Run with administrator privileges", elevated, "Windows uses an available elevated user token. Other platforms keep the host's normal launch identity."), Amaterasu.field("Wait for all processes", waitAll, "Keep the app active while its process group is running."), Amaterasu.field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."), Amaterasu.field("Detached commands", detached, "One ordered command per line; up to 16."));
-        const executable = Amaterasu.el("div", "form-grid", Amaterasu.field("Arguments", argumentsField, 'A JSON array of literal arguments. Example: ["--fullscreen"]'), Amaterasu.field("Working directory", directory, "Optional absolute path."), processPolicy, preparation);
+        const executable = Amaterasu.el("div", "form-grid", Amaterasu.field("Arguments", argumentsField, 'A JSON array of literal arguments. Example: ["--fullscreen"]'), processPolicy);
+        const sharedLaunchOptions = Amaterasu.el("div", "form-grid", Amaterasu.field("Working directory", directory, "Optional absolute path."), preparation);
         const pathField = Amaterasu.field("Absolute application path", path);
         const steamIdField = Amaterasu.field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
         const steamInstallDirField = Amaterasu.field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it.");
-        const fullscreen = Amaterasu.field("Exit timeout (seconds)", fullscreenTimeout, "Graceful Playnite Fullscreen close window, from 0 to 300 seconds.");
+        const fullscreen = Amaterasu.field("Exit timeout (seconds)", fullscreenTimeout, "Graceful session close window, from 0 to 300 seconds.");
         const showKind = () => {
             executable.hidden = kind.value !== "executable";
             elevated.disabled = kind.value !== "executable";
-            const isFullscreen = kind.value === "playnite_fullscreen";
-            fullscreen.hidden = !isFullscreen;
-            pathField.hidden = isFullscreen;
-            path.required = !isFullscreen;
-            steamIdField.hidden = isFullscreen;
-            steamInstallDirField.hidden = isFullscreen;
+            const processless = kind.value === "playnite_fullscreen" || kind.value === "desktop";
+            fullscreen.hidden = !processless;
+            fullscreenTimeout.disabled = !processless;
+            pathField.hidden = processless;
+            path.disabled = processless;
+            path.required = !processless;
+            steamIdField.hidden = processless;
+            steamInstallDirField.hidden = processless;
+            sharedLaunchOptions.hidden = kind.value === "application";
+            directory.disabled = kind.value === "application";
             path.placeholder =
                 kind.value === "executable"
                     ? "/opt/games/example"
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null/empty to inherit the next scope; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettingsFields, steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(catalogEditorSection("Identity", "Name and describe this application in your library.", Amaterasu.field("Name", name), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas.")), catalogEditorSection("Launch", "Choose how the host starts and tracks the application.", Amaterasu.field("Launch type", kind), pathField, steamIdField, steamInstallDirField, fullscreen, sharedLaunchOptions, executable, Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application.")), catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.", Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application.")), catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
+        revealInvalidEditorControls(form);
         showKind();
         return form;
     }
@@ -5271,10 +5892,10 @@ var Amaterasu;
         return saved;
     }
     Amaterasu.saveManagementPolicy = saveManagementPolicy;
-    function renderManagementPolicy(context) {
+    function renderManagementPolicy(context, container = context.content) {
         const area = Amaterasu.el("div");
         let generation = 0;
-        context.content.append(area);
+        container.append(area);
         async function load() {
             const request = ++generation;
             area.replaceChildren(Amaterasu.el("p", "muted", "Loading management access policy…"));
@@ -5418,10 +6039,10 @@ var Amaterasu;
         return saved;
     }
     Amaterasu.saveCsrfPolicy = saveCsrfPolicy;
-    function renderCsrfPolicy(context) {
+    function renderCsrfPolicy(context, container = context.content) {
         const area = Amaterasu.el("div");
         let generation = 0;
-        context.content.append(area);
+        container.append(area);
         async function load() {
             const request = ++generation;
             area.replaceChildren(Amaterasu.el("p", "muted", "Loading CSRF origin policy…"));
@@ -6798,6 +7419,28 @@ var Amaterasu;
             throw new Error("The paired client has override fields this editor cannot preserve.");
         return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== null && value !== undefined));
     }
+    function mergePairingOverrides(original, local, latest) {
+        const values = { ...latest };
+        const conflicts = [];
+        const keys = new Set([...Object.keys(original), ...Object.keys(local), ...Object.keys(latest)]);
+        const equalAt = (left, right, key) => Object.hasOwn(left, key) === Object.hasOwn(right, key) &&
+            (!Object.hasOwn(left, key) || sameConfigurationValue(left[key], right[key]));
+        for (const key of keys) {
+            const localChanged = !equalAt(original, local, key);
+            const remoteChanged = !equalAt(original, latest, key);
+            if (localChanged && remoteChanged && !equalAt(local, latest, key)) {
+                conflicts.push(key);
+            }
+            else if (localChanged) {
+                if (Object.hasOwn(local, key))
+                    values[key] = local[key];
+                else
+                    delete values[key];
+            }
+        }
+        return { values, conflicts };
+    }
+    Amaterasu.mergePairingOverrides = mergePairingOverrides;
     async function savePairingClientOverrides(api, current, certificateId, values) {
         const client = current.clients.find((candidate) => candidate.certificate_id === certificateId);
         if (!client || !Number.isSafeInteger(current.revision) || current.revision >= Number.MAX_SAFE_INTEGER)
@@ -6832,6 +7475,28 @@ var Amaterasu;
         return saved;
     }
     Amaterasu.savePairingClientOverrides = savePairingClientOverrides;
+    async function removePairedClient(api, current, certificateId) {
+        if (!current.clients.some((client) => client.certificate_id === certificateId) ||
+            !Number.isSafeInteger(current.revision) || current.revision >= Number.MAX_SAFE_INTEGER)
+            throw new Error("Paired client or settings revision is invalid.");
+        const response = await api.post("pairing/unpair", {
+            certificate_id: certificateId,
+            expected_revision: current.revision,
+        });
+        if (!response || typeof response !== "object" || Array.isArray(response) ||
+            response.ok !== true)
+            throw new Error("Device removal response was not confirmed.");
+        const saved = parsePairingClientsReply(await api.post("pairing/list_clients"));
+        const remaining = current.clients.filter((client) => client.certificate_id !== certificateId);
+        if (saved.revision !== current.revision + 1 || saved.clients.length !== remaining.length ||
+            !remaining.every((before) => {
+                const after = saved.clients.find((client) => client.certificate_id === before.certificate_id);
+                return after !== undefined && sameConfigurationValue(before, after);
+            }))
+            throw new Error("Device removal could not be confirmed. Reload paired clients before trying again.");
+        return saved;
+    }
+    Amaterasu.removePairedClient = removePairedClient;
     class PairingClientsLoadGate {
         generation = 0;
         invalidate() {
@@ -7662,32 +8327,636 @@ var Amaterasu;
         return `Steam discovery enabled · ${scanState} · ${status.game_count} games · ${warningCount}.`;
     }
     Amaterasu.steamStatusDescription = steamStatusDescription;
-    function renderSettings(context) {
-        const area = Amaterasu.el("div");
-        const registeredLoads = new RegisteredConfigurationLoadGate();
-        const authArea = Amaterasu.el("div");
-        const authLoads = new AuthTokenSettingsLoadGate();
-        const hostLoggingArea = Amaterasu.el("div");
-        const hostLoggingLoads = new HostLoggingLoadGate();
-        const hostArea = Amaterasu.el("div");
-        const hostLoads = new NvhttpSettingsLoadGate();
-        const pipewireArea = Amaterasu.el("div");
-        const steamArea = Amaterasu.el("div");
-        const steamLoads = new ImportSettingsLoadGate();
-        const lutrisArea = Amaterasu.el("div");
-        const lutrisLoads = new ImportSettingsLoadGate();
-        const playniteArea = Amaterasu.el("div");
-        const playniteLoads = new PlayniteSettingsLoadGate();
-        const inputArea = Amaterasu.el("div");
-        const inputLoads = new InputPolicyLoadGate();
-        const historyArea = Amaterasu.el("div");
-        const metricsArea = Amaterasu.el("div");
-        const updaterArea = Amaterasu.el("div");
-        const systemTrayArea = Amaterasu.el("div");
-        const historyLoads = new HistorySettingsLoadGate();
-        const pairingArea = Amaterasu.el("div");
+    function pairingEditorControls(card) {
+        if (typeof card.querySelectorAll !== "function")
+            return [];
+        return Array.from(card.querySelectorAll("input, textarea, select"))
+            .filter((control) => control.type !== "hidden" && !control.hasAttribute("data-draft-ignore"));
+    }
+    function pairingControlStates(card) {
+        return pairingEditorControls(card).map((control) => {
+            if ("validity" in control && control.validity.badInput)
+                throw new Error("Correct the incomplete number before reviewing the latest device settings.");
+            return {
+                name: control.name, tag: control.tagName, type: control.type, value: control.value,
+                checked: control.tagName === "INPUT" && (control.type === "checkbox" || control.type === "radio")
+                    ? control.checked : null,
+            };
+        });
+    }
+    function pairingRowHasDraft(row, tracker) {
+        if (tracker?.isDirty(row.card))
+            return true;
+        const current = pairingControlStates(row.card);
+        const baseline = row.baseline();
+        return current.length !== baseline.length || current.some((state, index) => !pairingStateShapeMatches(state, baseline[index]) ||
+            pairingStateSignature(state) !== pairingStateSignature(baseline[index]));
+    }
+    function pairingStateSignature(state) {
+        return state.checked === null ? state.value : `${state.checked}:${state.value}`;
+    }
+    function pairingStateShapeMatches(left, right) {
+        return left.name === right.name && left.tag === right.tag && left.type === right.type &&
+            (left.checked === null) === (right.checked === null);
+    }
+    function pairingRebaseValue(value, present) {
+        if (!present)
+            return "inherit";
+        const text = JSON.stringify(value) ?? "inherit";
+        return text.length > 160 ? `${text.slice(0, 157)}…` : text;
+    }
+    function createPairedClientEditor(context, pairingArea, draftTracker = () => null, onSaveBusy = () => { }) {
         const pairingLoads = new PairingClientsLoadGate();
-        context.content.append(Amaterasu.sectionHeading("Settings", "Edit host options and values registered for this management console.", Amaterasu.button("Refresh", () => {
+        async function loadPairing(rebase) {
+            if (!rebase)
+                pairingArea.replaceChildren(Amaterasu.el("p", "muted", "Loading paired clients…"));
+            try {
+                const loaded = await pairingLoads.read(context.api);
+                if (loaded === null)
+                    return;
+                let { settings } = loaded;
+                const { inputStatus } = loaded;
+                if (!context.content.isConnected)
+                    return;
+                let displayedClients = settings.clients;
+                if (rebase) {
+                    if (settings.revision < rebase.settings.revision)
+                        throw new Error("The host returned an older pairing revision; your drafts remain unchanged.");
+                    const mergedClients = new Map();
+                    for (const oldRow of rebase.rows) {
+                        const original = rebase.settings.clients.find((client) => client.certificate_id === oldRow.client.certificate_id);
+                        const latest = settings.clients.find((client) => client.certificate_id === oldRow.client.certificate_id);
+                        if (!original)
+                            throw new Error("A device no longer has its original revision; your drafts remain unchanged.");
+                        if (!latest) {
+                            if (pairingRowHasDraft(oldRow, draftTracker()))
+                                throw new Error(`${original.name} was removed elsewhere and has unsaved edits. Copy or review them before reloading.`);
+                            continue;
+                        }
+                        if (latest.client_id !== original.client_id || latest.paired_at !== original.paired_at)
+                            throw new Error(`${original.name} was replaced elsewhere. Your drafts remain unchanged.`);
+                        if (unsupportedPairingOverrideFields(original).length || unsupportedPairingOverrideFields(latest).length) {
+                            if (pairingRowHasDraft(oldRow, draftTracker()))
+                                throw new Error(`${original.name} has settings this editor cannot safely reconcile. Your drafts remain unchanged.`);
+                            mergedClients.set(latest.certificate_id, latest);
+                            continue;
+                        }
+                        const base = canonicalPairingOverrides(original.config_overrides ?? {});
+                        const local = oldRow.readOverrides();
+                        const remote = canonicalPairingOverrides(latest.config_overrides ?? {});
+                        const merged = mergePairingOverrides(base, local, remote);
+                        if (merged.conflicts.length) {
+                            const details = merged.conflicts.map((key) => `${key}: yours ${pairingRebaseValue(local[key], Object.hasOwn(local, key))}, latest ${pairingRebaseValue(remote[key], Object.hasOwn(remote, key))}`).join("; ");
+                            throw new Error(`${original.name} has conflicting changes: ${details}. Your drafts remain unchanged. Enter the latest values and review again, then reapply any changes you still want.`);
+                        }
+                        mergedClients.set(latest.certificate_id, { ...latest, config_overrides: merged.values });
+                    }
+                    displayedClients = settings.clients.map((client) => mergedClients.get(client.certificate_id) ?? client);
+                }
+                if (settings.clients.length === 0) {
+                    pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.empty("No paired clients", "Pair a Moonlight client before setting client-specific streaming values."), Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
+                    return;
+                }
+                const revisionBadge = Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`));
+                const clientSaveControls = [];
+                let clientSaveInProgress = false;
+                let clientReloadRequired = false;
+                function reviewLatestAction() {
+                    const errors = Amaterasu.el("div");
+                    const review = Amaterasu.button("Review latest and keep drafts", () => {
+                        void Amaterasu.runAction(review, errors, async () => {
+                            if (clientSaveInProgress)
+                                return;
+                            clientSaveInProgress = true;
+                            onSaveBusy(true);
+                            try {
+                                await loadPairing({ settings, rows, search: clientSearch, errorArea: errors });
+                            }
+                            finally {
+                                clientSaveInProgress = false;
+                                onSaveBusy(false);
+                            }
+                        });
+                    });
+                    return Amaterasu.el("div", "client-rebase-actions", review, errors);
+                }
+                const buildClientRow = (client) => {
+                    const fec = Amaterasu.input(`fec_${client.certificate_id}`, String(client.config_overrides?.fec_percentage ?? ""), "number");
+                    fec.min = "1";
+                    fec.max = "255";
+                    fec.step = "1";
+                    fec.placeholder = "Inherit";
+                    settingsClientOverrideAttribute(fec, "FEC percentage", client.name);
+                    const backButtonTimeout = Amaterasu.input(`back_button_timeout_${client.certificate_id}`, client.config_overrides?.back_button_timeout?.toString() ?? "", "number");
+                    backButtonTimeout.min = String(-0x8000_0000);
+                    backButtonTimeout.max = String(0x7fff_ffff);
+                    backButtonTimeout.step = "1";
+                    backButtonTimeout.placeholder = "Inherit";
+                    settingsClientOverrideAttribute(backButtonTimeout, "Back button timeout (milliseconds)", client.name);
+                    const controller = sparseInputOverrideSelect("controller", client.config_overrides?.controller, "Controller input");
+                    const gamepadChoices = inputGamepadProfileChoices(client.config_overrides?.gamepad ?? "", inputStatus?.supported_profiles ?? ["auto"], inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])]);
+                    const gamepad = Amaterasu.el("select");
+                    settingsClientOverrideAttribute(gamepad, "Gamepad profile", client.name);
+                    const inheritGamepad = Amaterasu.el("option", "", "Inherit");
+                    inheritGamepad.value = "";
+                    gamepad.append(inheritGamepad);
+                    for (const choice of gamepadChoices) {
+                        const option = Amaterasu.el("option", "", settingsTextLiteral(choice.label));
+                        option.value = choice.value;
+                        gamepad.append(option);
+                    }
+                    gamepad.value = client.config_overrides?.gamepad ?? "";
+                    const keyboard = sparseInputOverrideSelect("keyboard", client.config_overrides?.keyboard, "Keyboard input");
+                    settingsClientOverrideAttribute(keyboard, "Keyboard input", client.name);
+                    const mouse = sparseInputOverrideSelect("mouse", client.config_overrides?.mouse, "Mouse input");
+                    settingsClientOverrideAttribute(mouse, "Mouse input", client.name);
+                    const nativePenTouch = sparseInputOverrideSelect("native_pen_touch", client.config_overrides?.native_pen_touch, "Native pen and touch policy");
+                    settingsClientOverrideAttribute(nativePenTouch, "Native pen and touch policy", client.name);
+                    const ds4BackAsTouchpadClick = sparseInputOverrideSelect("ds4_back_as_touchpad_click", client.config_overrides?.ds4_back_as_touchpad_click);
+                    settingsClientOverrideAttribute(ds4BackAsTouchpadClick, "DS4 Back as touchpad click", client.name);
+                    const motionAsDs4 = sparseInputOverrideSelect("motion_as_ds4", client.config_overrides?.motion_as_ds4);
+                    settingsClientOverrideAttribute(motionAsDs4, "Motion selects DS4", client.name);
+                    const touchpadAsDs4 = sparseInputOverrideSelect("touchpad_as_ds4", client.config_overrides?.touchpad_as_ds4);
+                    settingsClientOverrideAttribute(touchpadAsDs4, "Touchpad selects DS4", client.name);
+                    const ds5InputtinoRandomizeMac = sparseInputOverrideSelect("ds5_inputtino_randomize_mac", client.config_overrides?.ds5_inputtino_randomize_mac);
+                    settingsClientOverrideAttribute(ds5InputtinoRandomizeMac, "DS5 random MAC", client.name);
+                    const protonDualsenseCompatibility = sparseInputOverrideSelect("proton_dualsense_compatibility", client.config_overrides?.proton_dualsense_compatibility);
+                    settingsClientOverrideAttribute(protonDualsenseCompatibility, "Proton DualSense compatibility", client.name);
+                    const advancedInput = Amaterasu.advancedInputOverrideControls(client.config_overrides);
+                    const softwareEncoder = Amaterasu.softwareEncoderOverrideControls(client.config_overrides);
+                    const nvencSettings = nvencSettingsOverrideControls(client.config_overrides);
+                    const streamAudio = Amaterasu.el("select");
+                    settingsClientOverrideAttribute(streamAudio, "Audio streaming", client.name);
+                    const audioChoices = [
+                        ["", "Inherit"],
+                        ["true", "Enabled"],
+                        ["false", "Disabled"],
+                    ];
+                    for (const [value, label] of audioChoices) {
+                        const option = Amaterasu.el("option", "", label);
+                        option.value = value;
+                        streamAudio.append(option);
+                    }
+                    streamAudio.value = client.config_overrides?.stream_audio === undefined
+                        ? ""
+                        : String(client.config_overrides.stream_audio);
+                    const audioSinkMode = Amaterasu.el("select");
+                    settingsClientOverrideAttribute(audioSinkMode, "Audio capture endpoint", client.name);
+                    for (const [value, label] of [
+                        ["inherit", "Inherit application/host"],
+                        ["automatic", "Automatic/default endpoint"],
+                        ["specific", "Specific endpoint ID"],
+                    ]) {
+                        const option = Amaterasu.el("option", "", label);
+                        option.value = value ?? "";
+                        audioSinkMode.append(option);
+                    }
+                    const currentAudioSink = client.config_overrides?.audio_sink;
+                    audioSinkMode.value = currentAudioSink === undefined ? "inherit" : currentAudioSink === "" ? "automatic" : "specific";
+                    const audioSinkId = Amaterasu.input(`audio_sink_${client.certificate_id}`, currentAudioSink ?? "");
+                    audioSinkId.maxLength = 4096;
+                    audioSinkId.placeholder = "Exact endpoint ID";
+                    settingsClientOverrideAttribute(audioSinkId, "Specific endpoint ID", client.name);
+                    const updateAudioSink = () => { audioSinkId.disabled = audioSinkMode.value !== "specific"; };
+                    audioSinkMode.addEventListener("change", updateAudioSink);
+                    updateAudioSink();
+                    const virtualSinkMode = Amaterasu.el("select");
+                    settingsClientOverrideAttribute(virtualSinkMode, "Virtual audio sink", client.name);
+                    for (const [value, label] of [
+                        ["inherit", "Inherit application/host"],
+                        ["automatic", "Clear inherited virtual sink"],
+                        ["specific", "Specific virtual sink selector"],
+                    ]) {
+                        const option = Amaterasu.el("option", "", label);
+                        option.value = value ?? "";
+                        virtualSinkMode.append(option);
+                    }
+                    const currentVirtualSink = client.config_overrides?.virtual_sink;
+                    virtualSinkMode.value = currentVirtualSink === undefined ? "inherit" : currentVirtualSink === "" ? "automatic" : "specific";
+                    const virtualSinkSelector = Amaterasu.input(`virtual_sink_${client.certificate_id}`, currentVirtualSink ?? "");
+                    virtualSinkSelector.maxLength = 4096;
+                    virtualSinkSelector.placeholder = "Exact ID or device name";
+                    settingsClientOverrideAttribute(virtualSinkSelector, "Virtual sink ID or name", client.name);
+                    const updateVirtualSink = () => { virtualSinkSelector.disabled = virtualSinkMode.value !== "specific"; };
+                    virtualSinkMode.addEventListener("change", updateVirtualSink);
+                    updateVirtualSink();
+                    const captureOnly = Amaterasu.el("select");
+                    settingsClientOverrideAttribute(captureOnly, "Capture audio without changing default outputs", client.name);
+                    for (const [value, label] of [
+                        ["", "Inherit"],
+                        ["true", "Capture without routing"],
+                        ["false", "Allow default-output routing"],
+                    ]) {
+                        const option = Amaterasu.el("option", "", label);
+                        option.value = value ?? "";
+                        captureOnly.append(option);
+                    }
+                    captureOnly.value = client.config_overrides?.audio_sink_capture_only === undefined
+                        ? ""
+                        : String(client.config_overrides.audio_sink_capture_only);
+                    const capture = sparseCaptureOverrideSelect(client.config_overrides?.capture);
+                    const displayPolicy = Amaterasu.el("textarea");
+                    displayPolicy.rows = 12;
+                    displayPolicy.spellcheck = false;
+                    displayPolicy.value = JSON.stringify(client.config_overrides?.display_policy ?? {}, null, 2);
+                    const status = Amaterasu.el("div");
+                    const unsupported = unsupportedPairingOverrideFields(client);
+                    const readValues = () => ({
+                        ...advancedInput.read(),
+                        ...softwareEncoder.read(),
+                        ...nvencSettings.read(),
+                        ...parseClientFecOverride(fec.value),
+                        back_button_timeout: Amaterasu.parseBackButtonTimeoutOverride(backButtonTimeout.value),
+                        stream_audio: Amaterasu.parseStreamAudioOverride(streamAudio.value),
+                        audio_sink: Amaterasu.parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
+                        virtual_sink: Amaterasu.parseVirtualSinkOverride(virtualSinkMode.value, virtualSinkSelector.value),
+                        audio_sink_capture_only: Amaterasu.parseAudioSinkCaptureOnlyOverride(captureOnly.value),
+                        capture: parseClientCaptureOverride(capture.value),
+                        display_policy: Amaterasu.parseDisplayPolicyOverrideMap(displayPolicy.value, "client"),
+                        controller: Amaterasu.parseInputBooleanOverride(controller.value, "Controller input"),
+                        gamepad: Amaterasu.parseGamepadProfileOverride(gamepad.value, inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])]),
+                        keyboard: Amaterasu.parseInputBooleanOverride(keyboard.value, "Keyboard input"),
+                        mouse: Amaterasu.parseInputBooleanOverride(mouse.value, "Mouse input"),
+                        native_pen_touch: Amaterasu.parseInputBooleanOverride(nativePenTouch.value, "Native pen/touch preference"),
+                        ds4_back_as_touchpad_click: Amaterasu.parseInputBooleanOverride(ds4BackAsTouchpadClick.value, "DS4 Back as touchpad click preference"),
+                        motion_as_ds4: Amaterasu.parseInputBooleanOverride(motionAsDs4.value, "Motion selects DS4 preference"),
+                        touchpad_as_ds4: Amaterasu.parseInputBooleanOverride(touchpadAsDs4.value, "Touchpad selects DS4 preference"),
+                        ds5_inputtino_randomize_mac: Amaterasu.parseInputBooleanOverride(ds5InputtinoRandomizeMac.value, "DS5 random MAC preference"),
+                        proton_dualsense_compatibility: Amaterasu.parseInputBooleanOverride(protonDualsenseCompatibility.value, "Proton DualSense compatibility"),
+                    });
+                    const save = Amaterasu.button("Save", () => {
+                        void Amaterasu.runAction(save, status, async () => {
+                            if (clientSaveInProgress || clientReloadRequired)
+                                return;
+                            clientSaveInProgress = true;
+                            onSaveBusy(true);
+                            for (const item of clientSaveControls)
+                                item.control.disabled = true;
+                            pairingLoads.invalidate();
+                            let saveStarted = false;
+                            try {
+                                const values = readValues();
+                                const submittedControls = pairingControlStates(clientCard);
+                                const submittedDraft = draftTracker()?.capture(clientCard);
+                                saveStarted = true;
+                                settings = await savePairingClientOverrides(context.api, settings, client.certificate_id, values);
+                                baselineControls = submittedControls;
+                                if (submittedDraft)
+                                    draftTracker()?.markSaved(submittedDraft);
+                                revisionBadge.textContent = `Revision ${settings.revision}`;
+                                context.notify(`Stored overrides confirmed for ${client.name}. Active stream application is not confirmed.`);
+                            }
+                            catch (error) {
+                                if (saveStarted) {
+                                    clientReloadRequired = true;
+                                    const reload = Amaterasu.button("Reload paired clients", () => {
+                                        if (draftTracker()?.isDirty(pairingArea) &&
+                                            !window.confirm("Reload paired clients and discard unsaved client changes?"))
+                                            return;
+                                        void loadPairing();
+                                    });
+                                    const notice = Amaterasu.el("div", "notice error", Amaterasu.el("strong", "", error instanceof Amaterasu.ApiError && error.code === "revision_conflict"
+                                        ? "Paired clients changed elsewhere"
+                                        : "Client save could not be confirmed"), Amaterasu.el("p", "", "Your edits are still here. Review the latest settings to keep non-conflicting drafts, or reload and discard unsaved client changes."), reviewLatestAction(), reload);
+                                    notice.setAttribute("role", "alert");
+                                    status.replaceChildren(notice);
+                                    return;
+                                }
+                                throw error;
+                            }
+                            finally {
+                                clientSaveInProgress = false;
+                                onSaveBusy(false);
+                                for (const item of clientSaveControls)
+                                    item.control.disabled = !item.allowed || clientReloadRequired;
+                            }
+                        }).finally(() => {
+                            if (clientReloadRequired)
+                                save.disabled = true;
+                        });
+                    }, "primary");
+                    save.disabled = !context.api.allows("pairing.admin") || unsupported.length > 0;
+                    clientSaveControls.push({ control: save, allowed: !save.disabled });
+                    if (unsupported.length > 0)
+                        status.textContent = `Save unavailable: this client has stored overrides this editor cannot preserve (${unsupported.join(", ")}).`;
+                    const remove = Amaterasu.button("Remove device", () => {
+                        if (remove.disabled || clientSaveInProgress || clientReloadRequired)
+                            return;
+                        if (!window.confirm(`Remove ${client.name}? This device will need to pair again. Unsaved changes for this device will be discarded.`))
+                            return;
+                        void Amaterasu.runAction(remove, status, async () => {
+                            clientSaveInProgress = true;
+                            onSaveBusy(true);
+                            for (const item of clientSaveControls)
+                                item.control.disabled = true;
+                            pairingLoads.invalidate();
+                            try {
+                                settings = await removePairedClient(context.api, settings, client.certificate_id);
+                                if (!context.content.isConnected)
+                                    return;
+                                clientCard.remove();
+                                const index = rows.findIndex((row) => row.client.certificate_id === client.certificate_id);
+                                if (index !== -1)
+                                    rows.splice(index, 1);
+                                revisionBadge.textContent = `Revision ${settings.revision}`;
+                                filterClients();
+                                context.notify(`${client.name} was removed from paired devices. Existing stream termination is not confirmed.`);
+                            }
+                            catch (error) {
+                                if (!context.content.isConnected)
+                                    return;
+                                clientReloadRequired = true;
+                                const reload = Amaterasu.button("Reload paired clients", () => {
+                                    if (draftTracker()?.isDirty(pairingArea) &&
+                                        !window.confirm("Reload paired clients and discard unsaved client changes?"))
+                                        return;
+                                    void loadPairing();
+                                });
+                                const notice = Amaterasu.el("div", "notice error", Amaterasu.el("strong", "", error instanceof Amaterasu.ApiError && error.code === "revision_conflict"
+                                    ? "Paired clients changed elsewhere" : "Device removal could not be confirmed"), Amaterasu.el("p", "", "Your edits are still here. Review the latest settings to keep non-conflicting drafts, or reload and discard unsaved client changes."), reviewLatestAction(), reload);
+                                notice.setAttribute("role", "alert");
+                                status.replaceChildren(notice);
+                            }
+                            finally {
+                                clientSaveInProgress = false;
+                                onSaveBusy(false);
+                                for (const item of clientSaveControls)
+                                    item.control.disabled = !item.allowed || clientReloadRequired;
+                            }
+                        }).finally(() => {
+                            if (clientReloadRequired)
+                                remove.disabled = true;
+                        });
+                    }, "danger");
+                    remove.disabled = !context.api.allows("pairing.admin");
+                    clientSaveControls.push({ control: remove, allowed: !remove.disabled });
+                    const identity = Amaterasu.el("summary", "client-settings-summary", Amaterasu.el("span", "client-settings-name", settingsTextLiteral(client.name)), Amaterasu.el("small", "muted", settingsTextLiteral(`${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`)));
+                    const audioSettings = Amaterasu.el("details", "client-settings-group", Amaterasu.el("summary", "", "Audio"), Amaterasu.el("div", "form-grid", Amaterasu.field("Audio streaming", streamAudio), Amaterasu.field("Audio capture endpoint", audioSinkMode), Amaterasu.field("Specific endpoint ID", audioSinkId), Amaterasu.field("Virtual audio sink", virtualSinkMode), Amaterasu.field("Virtual sink ID or name", virtualSinkSelector), Amaterasu.field("Capture audio without changing default outputs", captureOnly)));
+                    const inputSettings = Amaterasu.el("details", "client-settings-group", Amaterasu.el("summary", "", "Input"), Amaterasu.el("div", "form-grid", Amaterasu.field("Controller input", controller), Amaterasu.field("Gamepad profile", gamepad), Amaterasu.field("Keyboard input", keyboard), Amaterasu.field("Mouse input", mouse), Amaterasu.field("Native pen and touch", nativePenTouch), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick), Amaterasu.field("Motion selects DS4", motionAsDs4), Amaterasu.field("Touchpad selects DS4", touchpadAsDs4), Amaterasu.field("DS5 random MAC", ds5InputtinoRandomizeMac), Amaterasu.field("Proton DualSense compatibility", protonDualsenseCompatibility)));
+                    const advancedSettings = Amaterasu.el("details", "client-settings-group", Amaterasu.el("summary", "", "Advanced input and encoding"), Amaterasu.el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields));
+                    const clientCard = Amaterasu.el("details", "client-settings-card", identity, Amaterasu.el("div", "client-settings-body", Amaterasu.el("p", "muted", "Blank values inherit the application or host setting."), Amaterasu.el("div", "form-grid", Amaterasu.field("FEC percentage", fec), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Use -1 to disable the timeout."), Amaterasu.field("Capture provider", capture)), Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse per-client overrides. Use null or empty values to inherit; global-only keys are rejected."), audioSettings, inputSettings, advancedSettings, Amaterasu.el("div", "client-settings-save", save, remove, status)));
+                    let baselineControls = pairingControlStates(clientCard);
+                    return {
+                        client, card: clientCard,
+                        readOverrides: () => canonicalPairingOverrides({ ...client.config_overrides, ...readValues() }),
+                        baseline: () => baselineControls,
+                        setBaseline: (states) => { baselineControls = states; },
+                    };
+                };
+                const rows = displayedClients.map(buildClientRow);
+                const originalControlCount = clientSaveControls.length;
+                const shadowRows = rebase ? settings.clients.map(buildClientRow) : [];
+                clientSaveControls.splice(originalControlCount);
+                const rebaseBaselines = new Map();
+                if (rebase) {
+                    for (const row of rows) {
+                        const shadow = shadowRows.find((candidate) => candidate.client.certificate_id === row.client.certificate_id);
+                        if (!shadow)
+                            throw new Error("A device changed while reviewing its settings.");
+                        const latestStates = pairingControlStates(shadow.card);
+                        const controls = pairingEditorControls(row.card);
+                        const currentStates = pairingControlStates(row.card);
+                        if (latestStates.length !== controls.length || currentStates.length !== controls.length)
+                            throw new Error("The device editor changed shape; your drafts remain unchanged.");
+                        const oldRow = rebase.rows.find((candidate) => candidate.client.certificate_id === row.client.certificate_id);
+                        if (oldRow) {
+                            const oldStates = pairingControlStates(oldRow.card);
+                            const oldBaseline = oldRow.baseline();
+                            if (oldStates.length !== controls.length || oldBaseline.length !== controls.length)
+                                throw new Error("The device editor changed shape; your drafts remain unchanged.");
+                            for (let index = 0; index < controls.length; index++) {
+                                const control = controls[index];
+                                const before = oldBaseline[index];
+                                const local = oldStates[index];
+                                const latest = latestStates[index];
+                                if (!pairingStateShapeMatches(before, local) || !pairingStateShapeMatches(before, latest))
+                                    throw new Error("The device editor changed shape; your drafts remain unchanged.");
+                                if (pairingStateSignature(before) !== pairingStateSignature(local)) {
+                                    control.value = local.value;
+                                    if (local.checked !== null)
+                                        control.checked = local.checked;
+                                    if (control.value !== local.value)
+                                        throw new Error("A selected device setting is no longer available; your drafts remain unchanged.");
+                                    control.dispatchEvent(new Event("change"));
+                                }
+                            }
+                            if (!unsupportedPairingOverrideFields(row.client).length &&
+                                !sameConfigurationValue(row.readOverrides(), canonicalPairingOverrides(row.client.config_overrides ?? {})))
+                                throw new Error(`${row.client.name} has interdependent edits that need review. Your drafts remain unchanged.`);
+                            row.card.open = oldRow.card.open;
+                            const oldDetails = oldRow.card.querySelectorAll("details");
+                            const newDetails = row.card.querySelectorAll("details");
+                            if (oldDetails.length === newDetails.length)
+                                oldDetails.forEach((detail, index) => { newDetails[index].open = detail.open; });
+                        }
+                        row.setBaseline(latestStates);
+                        controls.forEach((control, index) => rebaseBaselines.set(control, pairingStateSignature(latestStates[index])));
+                    }
+                }
+                const clientSearch = Amaterasu.input("client_search", "", "search");
+                clientSearch.setAttribute("data-draft-ignore", "");
+                clientSearch.placeholder = "Search clients";
+                if (rebase)
+                    clientSearch.value = rebase.search.value;
+                const searchSummary = Amaterasu.el("p", "muted client-search-summary");
+                searchSummary.setAttribute("role", "status");
+                const noMatches = Amaterasu.el("p", "muted client-search-empty", "No paired clients match this search.");
+                function filterClients() {
+                    const query = clientSearch.value.trim().toLocaleLowerCase();
+                    let visible = 0;
+                    for (const { client, card } of rows) {
+                        const identity = `${client.name} ${client.client_id} ${client.certificate_id}`.toLocaleLowerCase();
+                        card.hidden = !!query && !identity.includes(query);
+                        if (!card.hidden)
+                            visible++;
+                    }
+                    searchSummary.textContent = `${visible} of ${rows.length} paired clients`;
+                    noMatches.hidden = visible !== 0;
+                    noMatches.textContent = rows.length === 0 ? "No paired clients remain." : "No paired clients match this search.";
+                }
+                clientSearch.addEventListener("input", filterClients);
+                filterClients();
+                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Open a client to review its streaming overrides. Saves confirm the stored pairing revision; input preferences apply when the next stream acquires its input lease."), Amaterasu.el("div", "client-search", Amaterasu.field("Search paired clients", clientSearch), searchSummary), noMatches, Amaterasu.el("div", "client-settings-list", ...rows.map(({ card }) => card)), Amaterasu.el("div", "actions", revisionBadge)));
+                if (rebase) {
+                    draftTracker()?.markSaved(rebaseBaselines);
+                    context.notify("Latest paired devices loaded. Your non-conflicting edits are still unsaved.");
+                }
+            }
+            catch (error) {
+                if (context.content.isConnected) {
+                    if (rebase)
+                        rebase.errorArea.replaceChildren(Amaterasu.errorPanel(error));
+                    else
+                        pairingArea.replaceChildren(Amaterasu.errorPanel(error, loadPairing));
+                }
+            }
+        }
+        return () => loadPairing();
+    }
+    Amaterasu.createPairedClientEditor = createPairedClientEditor;
+    function settingsSearchMatches(query, ...parts) {
+        const needle = query.trim().toLocaleLowerCase();
+        return !needle || parts.join(" ").toLocaleLowerCase().includes(needle);
+    }
+    Amaterasu.settingsSearchMatches = settingsSearchMatches;
+    function renderSettings(context) {
+        const area = Amaterasu.el("div", "settings-area-registered");
+        const registeredLoads = new RegisteredConfigurationLoadGate();
+        const authArea = Amaterasu.el("div", "settings-area-auth");
+        const authLoads = new AuthTokenSettingsLoadGate();
+        const hostLoggingArea = Amaterasu.el("div", "settings-area-logging");
+        const hostLoggingLoads = new HostLoggingLoadGate();
+        const hostArea = Amaterasu.el("div", "settings-area-host");
+        const hostLoads = new NvhttpSettingsLoadGate();
+        const pipewireArea = Amaterasu.el("div", "settings-area-pipewire");
+        const steamArea = Amaterasu.el("div", "settings-area-steam");
+        const steamLoads = new ImportSettingsLoadGate();
+        const lutrisArea = Amaterasu.el("div", "settings-area-lutris");
+        const lutrisLoads = new ImportSettingsLoadGate();
+        const playniteArea = Amaterasu.el("div", "settings-area-playnite");
+        const playniteLoads = new PlayniteSettingsLoadGate();
+        const inputArea = Amaterasu.el("div", "settings-area-input");
+        const inputLoads = new InputPolicyLoadGate();
+        const historyArea = Amaterasu.el("div", "settings-area-history");
+        const metricsArea = Amaterasu.el("div", "settings-area-metrics");
+        const updaterArea = Amaterasu.el("div", "settings-area-updater");
+        const systemTrayArea = Amaterasu.el("div", "settings-area-tray");
+        const historyLoads = new HistorySettingsLoadGate();
+        const pairingArea = Amaterasu.el("div", "settings-area-pairing");
+        let drafts = null;
+        let clientSaveBusy = false;
+        const updateDraftStatus = () => {
+            const dirty = drafts?.isDirty() ?? false;
+            refreshSettings.disabled = dirty || clientSaveBusy;
+            dirtyNotice.hidden = !dirty && !clientSaveBusy;
+            settingsSetLocalizedTextContent(dirtyNotice, clientSaveBusy ? "Saving changes…" : "Unsaved changes");
+        };
+        const loadPairing = createPairedClientEditor(context, pairingArea, () => drafts, (busy) => {
+            clientSaveBusy = busy;
+            updateDraftStatus();
+        });
+        const managementArea = Amaterasu.el("div", "settings-area-management");
+        const csrfArea = Amaterasu.el("div", "settings-area-csrf");
+        const categories = [
+            { id: "general", label: "General", description: "Host logging, updates, and registered settings.", areas: [area, hostLoggingArea, updaterArea, systemTrayArea] },
+            { id: "streaming", label: "Streaming", description: "Configure the host, capture, input, and session reporting.", areas: [hostArea, pipewireArea, inputArea, historyArea, metricsArea] },
+            { id: "integrations", label: "Integrations", description: "Manage application providers and library imports.", areas: [steamArea, lutrisArea, playniteArea] },
+            { id: "devices", label: "Devices", description: "Manage paired client settings.", areas: [pairingArea] },
+            { id: "access", label: "Access & security", description: "Configure session lifetimes and management access.", areas: [authArea, managementArea, csrfArea] },
+        ];
+        let selectedCategory = context.initialSettingsCategory ?? categories[0].id;
+        const categoryContent = Amaterasu.el("div", "settings-content");
+        const categoryHeading = Amaterasu.el("h2");
+        const categoryDescription = Amaterasu.el("p", "muted");
+        const categoryStatus = Amaterasu.el("div", "settings-category-heading", categoryHeading, categoryDescription);
+        categoryStatus.setAttribute("aria-live", "polite");
+        const noResults = Amaterasu.el("p", "muted settings-no-results", "No settings match your search.");
+        noResults.hidden = true;
+        const search = Amaterasu.input("settings_search", "", "search");
+        search.placeholder = "Search settings";
+        search.setAttribute("aria-label", "Search settings");
+        const categoryPicker = Amaterasu.el("select");
+        categoryPicker.setAttribute("aria-label", "Settings category");
+        const categoryNavigation = Amaterasu.el("nav", "settings-nav");
+        categoryNavigation.setAttribute("aria-label", "Settings categories");
+        const categoryButtons = new Map();
+        const searchOpenedDetails = new Set();
+        categoryContent.append(categoryStatus, noResults);
+        for (const category of categories) {
+            const option = Amaterasu.el("option", "", category.label);
+            option.value = category.id;
+            categoryPicker.append(option);
+            const item = Amaterasu.button(category.label, () => selectCategory(category.id), "settings-nav-item");
+            categoryButtons.set(category.id, item);
+            categoryNavigation.append(item);
+            categoryContent.append(...category.areas);
+        }
+        function selectCategory(id) {
+            if (!categories.some((category) => category.id === id))
+                return;
+            selectedCategory = id;
+            context.replaceSettingsCategory?.(id);
+            search.value = "";
+            updateCategoryDisplay();
+        }
+        function restoreSearchDisclosures() {
+            for (const details of searchOpenedDetails)
+                details.open = false;
+            searchOpenedDetails.clear();
+        }
+        function showFieldInSearch(field) {
+            let parent = field.parentElement;
+            while (parent && parent !== categoryContent) {
+                if (parent.tagName === "DETAILS") {
+                    const details = parent;
+                    if (!details.open && !details.hidden) {
+                        details.open = true;
+                        searchOpenedDetails.add(details);
+                    }
+                }
+                parent = parent.parentElement;
+            }
+        }
+        function updateCategoryDisplay() {
+            const query = search.value.trim().toLocaleLowerCase();
+            const selected = categories.find((category) => category.id === selectedCategory) ?? categories[0];
+            categoryPicker.value = selected.id;
+            restoreSearchDisclosures();
+            let matches = 0;
+            for (const category of categories) {
+                for (const area of category.areas) {
+                    const fields = typeof area.querySelectorAll === "function"
+                        ? Array.from(area.querySelectorAll(".field")) : [];
+                    let fieldMatches = 0;
+                    for (const wrapper of fields) {
+                        const controls = Array.from(wrapper.querySelectorAll("input, select, textarea"));
+                        if (controls.length && controls.every((control) => control.hasAttribute("data-draft-ignore")))
+                            continue;
+                        const panelTitle = wrapper.closest(".panel")?.querySelector("h2")?.textContent ?? "";
+                        const matched = !query || settingsSearchMatches(query, category.label, panelTitle, wrapper.textContent ?? "", ...controls.map((control) => control.name));
+                        if (query && !matched)
+                            wrapper.setAttribute("data-settings-search-hidden", "");
+                        else
+                            wrapper.removeAttribute("data-settings-search-hidden");
+                        if (query && matched) {
+                            fieldMatches++;
+                            showFieldInSearch(wrapper);
+                        }
+                    }
+                    const title = typeof area.querySelector === "function" ? area.querySelector(".panel > h2")?.textContent ?? "" : "";
+                    const visible = query
+                        ? fieldMatches > 0 || settingsSearchMatches(query, category.label, title) ||
+                            (!fields.length && settingsSearchMatches(query, area.textContent ?? ""))
+                        : category.id === selected.id;
+                    area.hidden = !visible;
+                    if (visible)
+                        matches++;
+                }
+                const item = categoryButtons.get(category.id);
+                item.className = `button settings-nav-item${!query && category.id === selected.id ? " selected" : ""}`;
+                item.setAttribute("aria-current", !query && category.id === selected.id ? "page" : "false");
+            }
+            settingsSetLocalizedTextContent(categoryHeading, query ? "Search results" : selected.label);
+            settingsSetLocalizedTextContent(categoryDescription, query
+                ? "Matching settings are shown across categories. Saving an editor also saves its hidden fields and unsaved changes."
+                : selected.description);
+            noResults.hidden = !query || matches !== 0;
+        }
+        categoryContent.addEventListener("invalid", (event) => {
+            if (!search.value.trim())
+                return;
+            const target = event.target;
+            const category = categories.find((candidate) => candidate.areas.some((area) => target && area.contains(target)));
+            if (!category || !target)
+                return;
+            selectCategory(category.id);
+            showFieldInSearch(target);
+            searchOpenedDetails.clear();
+        }, true);
+        search.addEventListener("input", updateCategoryDisplay);
+        categoryPicker.addEventListener("change", () => selectCategory(categoryPicker.value));
+        const settingsNavigation = Amaterasu.el("div", "settings-navigation", Amaterasu.field("Category", categoryPicker), categoryNavigation);
+        const refreshSettings = Amaterasu.button("Refresh", () => {
             void load();
             void loadAuth();
             void loadHostLogging();
@@ -7702,9 +8971,31 @@ var Amaterasu;
             Amaterasu.renderUpdaterSettings(context, updaterArea);
             Amaterasu.renderSystemTraySettings(context, systemTrayArea);
             void loadPairing();
-        })), area, authArea, hostLoggingArea, hostArea, steamArea, lutrisArea, playniteArea, inputArea, historyArea, metricsArea, updaterArea, systemTrayArea, pairingArea, pipewireArea);
-        Amaterasu.renderManagementPolicy(context);
-        Amaterasu.renderCsrfPolicy(context);
+        });
+        const dirtyNotice = Amaterasu.badge("Unsaved changes", "accent");
+        dirtyNotice.hidden = true;
+        dirtyNotice.setAttribute("role", "status");
+        context.content.append(Amaterasu.sectionHeading("Settings", "Configure your host, streaming, integrations, and access.", refreshSettings), Amaterasu.el("div", "settings-tools", search, dirtyNotice), Amaterasu.el("div", "settings-layout", settingsNavigation, categoryContent));
+        if (context.registerDraftGuard) {
+            drafts = Amaterasu.trackDrafts(categoryContent, updateDraftStatus);
+            context.registerDraftGuard(() => clientSaveBusy || (drafts?.isDirty() ?? false), drafts.dispose);
+        }
+        Amaterasu.renderManagementPolicy(context, managementArea);
+        Amaterasu.renderCsrfPolicy(context, csrfArea);
+        updateCategoryDisplay();
+        if (typeof MutationObserver !== "undefined") {
+            const observer = new MutationObserver(() => {
+                if (!context.content.isConnected) {
+                    observer.disconnect();
+                }
+                else if (search.value.trim()) {
+                    updateCategoryDisplay();
+                }
+            });
+            for (const category of categories)
+                for (const item of category.areas)
+                    observer.observe(item, { childList: true, subtree: true, characterData: true });
+        }
         let pipewireGeneration = 0;
         let pipewireOperation = 0;
         async function loadPipewireChooser() {
@@ -8267,197 +9558,6 @@ var Amaterasu;
             catch (error) {
                 if (context.content.isConnected)
                     playniteArea.replaceChildren(Amaterasu.errorPanel(error, loadPlaynite));
-            }
-        }
-        async function loadPairing() {
-            pairingArea.replaceChildren(Amaterasu.el("p", "muted", "Loading paired clients…"));
-            try {
-                const loaded = await pairingLoads.read(context.api);
-                if (loaded === null)
-                    return;
-                const { settings, inputStatus } = loaded;
-                if (!context.content.isConnected)
-                    return;
-                if (settings.clients.length === 0) {
-                    pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.empty("No paired clients", "Pair a Moonlight client before setting client-specific streaming values."), Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
-                    return;
-                }
-                const rows = settings.clients.map((client) => {
-                    const fec = Amaterasu.input(`fec_${client.certificate_id}`, String(client.config_overrides?.fec_percentage ?? ""), "number");
-                    fec.min = "1";
-                    fec.max = "255";
-                    fec.step = "1";
-                    fec.placeholder = "Inherit";
-                    settingsClientOverrideAttribute(fec, "FEC percentage", client.name);
-                    const backButtonTimeout = Amaterasu.input(`back_button_timeout_${client.certificate_id}`, client.config_overrides?.back_button_timeout?.toString() ?? "", "number");
-                    backButtonTimeout.min = String(-0x8000_0000);
-                    backButtonTimeout.max = String(0x7fff_ffff);
-                    backButtonTimeout.step = "1";
-                    backButtonTimeout.placeholder = "Inherit";
-                    settingsClientOverrideAttribute(backButtonTimeout, "Back button timeout (milliseconds)", client.name);
-                    const controller = sparseInputOverrideSelect("controller", client.config_overrides?.controller, "Controller input");
-                    const gamepadChoices = inputGamepadProfileChoices(client.config_overrides?.gamepad ?? "", inputStatus?.supported_profiles ?? ["auto"], inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])]);
-                    const gamepad = Amaterasu.el("select");
-                    settingsClientOverrideAttribute(gamepad, "Gamepad profile", client.name);
-                    const inheritGamepad = Amaterasu.el("option", "", "Inherit");
-                    inheritGamepad.value = "";
-                    gamepad.append(inheritGamepad);
-                    for (const choice of gamepadChoices) {
-                        const option = Amaterasu.el("option", "", settingsTextLiteral(choice.label));
-                        option.value = choice.value;
-                        gamepad.append(option);
-                    }
-                    gamepad.value = client.config_overrides?.gamepad ?? "";
-                    const keyboard = sparseInputOverrideSelect("keyboard", client.config_overrides?.keyboard, "Keyboard input");
-                    settingsClientOverrideAttribute(keyboard, "Keyboard input", client.name);
-                    const mouse = sparseInputOverrideSelect("mouse", client.config_overrides?.mouse, "Mouse input");
-                    settingsClientOverrideAttribute(mouse, "Mouse input", client.name);
-                    const nativePenTouch = sparseInputOverrideSelect("native_pen_touch", client.config_overrides?.native_pen_touch, "Native pen and touch policy");
-                    settingsClientOverrideAttribute(nativePenTouch, "Native pen and touch policy", client.name);
-                    const ds4BackAsTouchpadClick = sparseInputOverrideSelect("ds4_back_as_touchpad_click", client.config_overrides?.ds4_back_as_touchpad_click);
-                    settingsClientOverrideAttribute(ds4BackAsTouchpadClick, "DS4 Back as touchpad click", client.name);
-                    const motionAsDs4 = sparseInputOverrideSelect("motion_as_ds4", client.config_overrides?.motion_as_ds4);
-                    settingsClientOverrideAttribute(motionAsDs4, "Motion selects DS4", client.name);
-                    const touchpadAsDs4 = sparseInputOverrideSelect("touchpad_as_ds4", client.config_overrides?.touchpad_as_ds4);
-                    settingsClientOverrideAttribute(touchpadAsDs4, "Touchpad selects DS4", client.name);
-                    const ds5InputtinoRandomizeMac = sparseInputOverrideSelect("ds5_inputtino_randomize_mac", client.config_overrides?.ds5_inputtino_randomize_mac);
-                    settingsClientOverrideAttribute(ds5InputtinoRandomizeMac, "DS5 random MAC", client.name);
-                    const protonDualsenseCompatibility = sparseInputOverrideSelect("proton_dualsense_compatibility", client.config_overrides?.proton_dualsense_compatibility);
-                    settingsClientOverrideAttribute(protonDualsenseCompatibility, "Proton DualSense compatibility", client.name);
-                    const advancedInput = Amaterasu.advancedInputOverrideControls(client.config_overrides);
-                    const softwareEncoder = Amaterasu.softwareEncoderOverrideControls(client.config_overrides);
-                    const nvencSettings = nvencSettingsOverrideControls(client.config_overrides);
-                    const streamAudio = Amaterasu.el("select");
-                    settingsClientOverrideAttribute(streamAudio, "Audio streaming", client.name);
-                    const audioChoices = [
-                        ["", "Inherit"],
-                        ["true", "Enabled"],
-                        ["false", "Disabled"],
-                    ];
-                    for (const [value, label] of audioChoices) {
-                        const option = Amaterasu.el("option", "", label);
-                        option.value = value;
-                        streamAudio.append(option);
-                    }
-                    streamAudio.value = client.config_overrides?.stream_audio === undefined
-                        ? ""
-                        : String(client.config_overrides.stream_audio);
-                    const audioSinkMode = Amaterasu.el("select");
-                    settingsClientOverrideAttribute(audioSinkMode, "Audio capture endpoint", client.name);
-                    for (const [value, label] of [
-                        ["inherit", "Inherit application/host"],
-                        ["automatic", "Automatic/default endpoint"],
-                        ["specific", "Specific endpoint ID"],
-                    ]) {
-                        const option = Amaterasu.el("option", "", label);
-                        option.value = value ?? "";
-                        audioSinkMode.append(option);
-                    }
-                    const currentAudioSink = client.config_overrides?.audio_sink;
-                    audioSinkMode.value = currentAudioSink === undefined ? "inherit" : currentAudioSink === "" ? "automatic" : "specific";
-                    const audioSinkId = Amaterasu.input(`audio_sink_${client.certificate_id}`, currentAudioSink ?? "");
-                    audioSinkId.maxLength = 4096;
-                    audioSinkId.placeholder = "Exact endpoint ID";
-                    settingsClientOverrideAttribute(audioSinkId, "Specific endpoint ID", client.name);
-                    const updateAudioSink = () => { audioSinkId.disabled = audioSinkMode.value !== "specific"; };
-                    audioSinkMode.addEventListener("change", updateAudioSink);
-                    updateAudioSink();
-                    const virtualSinkMode = Amaterasu.el("select");
-                    settingsClientOverrideAttribute(virtualSinkMode, "Virtual audio sink", client.name);
-                    for (const [value, label] of [
-                        ["inherit", "Inherit application/host"],
-                        ["automatic", "Clear inherited virtual sink"],
-                        ["specific", "Specific virtual sink selector"],
-                    ]) {
-                        const option = Amaterasu.el("option", "", label);
-                        option.value = value ?? "";
-                        virtualSinkMode.append(option);
-                    }
-                    const currentVirtualSink = client.config_overrides?.virtual_sink;
-                    virtualSinkMode.value = currentVirtualSink === undefined ? "inherit" : currentVirtualSink === "" ? "automatic" : "specific";
-                    const virtualSinkSelector = Amaterasu.input(`virtual_sink_${client.certificate_id}`, currentVirtualSink ?? "");
-                    virtualSinkSelector.maxLength = 4096;
-                    virtualSinkSelector.placeholder = "Exact ID or device name";
-                    settingsClientOverrideAttribute(virtualSinkSelector, "Virtual sink ID or name", client.name);
-                    const updateVirtualSink = () => { virtualSinkSelector.disabled = virtualSinkMode.value !== "specific"; };
-                    virtualSinkMode.addEventListener("change", updateVirtualSink);
-                    updateVirtualSink();
-                    const captureOnly = Amaterasu.el("select");
-                    settingsClientOverrideAttribute(captureOnly, "Capture audio without changing default outputs", client.name);
-                    for (const [value, label] of [
-                        ["", "Inherit"],
-                        ["true", "Capture without routing"],
-                        ["false", "Allow default-output routing"],
-                    ]) {
-                        const option = Amaterasu.el("option", "", label);
-                        option.value = value ?? "";
-                        captureOnly.append(option);
-                    }
-                    captureOnly.value = client.config_overrides?.audio_sink_capture_only === undefined
-                        ? ""
-                        : String(client.config_overrides.audio_sink_capture_only);
-                    const capture = sparseCaptureOverrideSelect(client.config_overrides?.capture);
-                    const displayPolicy = Amaterasu.el("textarea");
-                    displayPolicy.rows = 12;
-                    displayPolicy.spellcheck = false;
-                    displayPolicy.value = JSON.stringify(client.config_overrides?.display_policy ?? {}, null, 2);
-                    const status = Amaterasu.el("div");
-                    const unsupported = unsupportedPairingOverrideFields(client);
-                    const save = Amaterasu.button("Save", () => Amaterasu.runAction(save, status, async () => {
-                        pairingLoads.invalidate();
-                        let saveStarted = false;
-                        try {
-                            const values = {
-                                ...advancedInput.read(),
-                                ...softwareEncoder.read(),
-                                ...nvencSettings.read(),
-                                ...parseClientFecOverride(fec.value),
-                                back_button_timeout: Amaterasu.parseBackButtonTimeoutOverride(backButtonTimeout.value),
-                                stream_audio: Amaterasu.parseStreamAudioOverride(streamAudio.value),
-                                audio_sink: Amaterasu.parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
-                                virtual_sink: Amaterasu.parseVirtualSinkOverride(virtualSinkMode.value, virtualSinkSelector.value),
-                                audio_sink_capture_only: Amaterasu.parseAudioSinkCaptureOnlyOverride(captureOnly.value),
-                                capture: parseClientCaptureOverride(capture.value),
-                                display_policy: Amaterasu.parseDisplayPolicyOverrideMap(displayPolicy.value, "client"),
-                                controller: Amaterasu.parseInputBooleanOverride(controller.value, "Controller input"),
-                                gamepad: Amaterasu.parseGamepadProfileOverride(gamepad.value, inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])]),
-                                keyboard: Amaterasu.parseInputBooleanOverride(keyboard.value, "Keyboard input"),
-                                mouse: Amaterasu.parseInputBooleanOverride(mouse.value, "Mouse input"),
-                                native_pen_touch: Amaterasu.parseInputBooleanOverride(nativePenTouch.value, "Native pen/touch preference"),
-                                ds4_back_as_touchpad_click: Amaterasu.parseInputBooleanOverride(ds4BackAsTouchpadClick.value, "DS4 Back as touchpad click preference"),
-                                motion_as_ds4: Amaterasu.parseInputBooleanOverride(motionAsDs4.value, "Motion selects DS4 preference"),
-                                touchpad_as_ds4: Amaterasu.parseInputBooleanOverride(touchpadAsDs4.value, "Touchpad selects DS4 preference"),
-                                ds5_inputtino_randomize_mac: Amaterasu.parseInputBooleanOverride(ds5InputtinoRandomizeMac.value, "DS5 random MAC preference"),
-                                proton_dualsense_compatibility: Amaterasu.parseInputBooleanOverride(protonDualsenseCompatibility.value, "Proton DualSense compatibility"),
-                            };
-                            saveStarted = true;
-                            await savePairingClientOverrides(context.api, settings, client.certificate_id, values);
-                            await loadPairing();
-                            context.notify(`Stored overrides confirmed for ${client.name}. Active stream application is not confirmed.`);
-                        }
-                        catch (error) {
-                            if (saveStarted) {
-                                await loadPairing();
-                                context.notify(error instanceof Amaterasu.ApiError && error.code === "revision_conflict"
-                                    ? settingsTextMessage("Paired clients changed elsewhere. Review the refreshed overrides before saving again.")
-                                    : settingsTextMessage("Paired client override save could not be confirmed. Review the refreshed values before saving again."));
-                                return;
-                            }
-                            throw error;
-                        }
-                    }), "primary");
-                    save.disabled = !context.api.allows("pairing.admin") || unsupported.length > 0;
-                    if (unsupported.length > 0)
-                        status.textContent = `Save unavailable: this client has stored overrides this editor cannot preserve (${unsupported.join(", ")}).`;
-                    const identity = Amaterasu.el("div", "", Amaterasu.el("strong", "", settingsTextLiteral(client.name)), Amaterasu.el("small", "muted", settingsTextLiteral(`${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`)));
-                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, capture, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse per-client overrides. Use null/empty to inherit the application or host value; global-only keys are rejected."), controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, motionAsDs4, touchpadAsDs4, ds5InputtinoRandomizeMac, protonDualsenseCompatibility, Amaterasu.el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields), Amaterasu.el("div", "", save, status)];
-                });
-                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Capture provider", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "DS4 Back as touchpad click", "Motion selects DS4", "Touchpad selects DS4", "DS5 random MAC", "Proton DualSense compatibility", "Input and software encoding preferences", ""], rows);
-                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save confirms the stored pairing revision. Input preferences apply when the next stream acquires its input lease."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`)))));
-            }
-            catch (error) {
-                if (context.content.isConnected)
-                    pairingArea.replaceChildren(Amaterasu.errorPanel(error, loadPairing));
             }
         }
         async function loadHistorySettings() {
@@ -9134,6 +10234,122 @@ var Amaterasu;
         void loadPairing();
     }
     Amaterasu.renderSettings = renderSettings;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    function providerRecord(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Provider status is invalid.");
+        const record = value;
+        if (record.ok !== true)
+            throw new Error("Provider status is unavailable.");
+        return record;
+    }
+    function providerBoolean(record, key) {
+        if (typeof record[key] !== "boolean")
+            throw new Error("Provider status is invalid.");
+        return record[key];
+    }
+    function providerCount(record, key) {
+        const count = record[key];
+        if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0)
+            throw new Error("Provider status is invalid.");
+        return count;
+    }
+    function summarizeProvider(name, value) {
+        const record = providerRecord(value);
+        if (name === "steam" && (record.settings_ready === undefined || record.enabled === undefined))
+            return { state: "Unverified", tone: "", detail: "The host did not report Steam provider settings." };
+        const ready = providerBoolean(record, "settings_ready");
+        const enabled = providerBoolean(record, "enabled");
+        if (!ready)
+            return { state: "Loading settings", tone: "", detail: "Provider settings are not ready yet." };
+        if (!enabled)
+            return { state: "Disabled", tone: "", detail: "This provider is disabled in host settings." };
+        if (name === "steam") {
+            const count = providerCount(record, "game_count");
+            const scanning = providerBoolean(record, "scanning");
+            const complete = providerBoolean(record, "complete");
+            const warnings = providerCount(record, "warning_count");
+            return {
+                state: scanning ? "Scanning" : complete ? "Scan complete" : "Awaiting scan",
+                tone: "",
+                detail: `${count} discovered games · ${warnings} scan warnings.`,
+            };
+        }
+        if (name === "lutris") {
+            if (!providerBoolean(record, "platform_supported"))
+                return { state: "Unsupported", tone: "", detail: "Lutris discovery is available on Linux hosts." };
+            const database = providerBoolean(record, "database_available");
+            const executable = providerBoolean(record, "executable_available");
+            const available = providerBoolean(record, "available");
+            if (!available)
+                return { state: "Needs setup", tone: "", detail: !database || !executable
+                        ? "The Lutris database or executable is unavailable to the host."
+                        : "No usable Lutris database and executable installation pair was found." };
+            const count = providerCount(record, "game_count");
+            const pending = providerBoolean(record, "refresh_pending");
+            const lastError = record.last_error;
+            if (lastError !== null && typeof lastError !== "string")
+                throw new Error("Provider status is invalid.");
+            return { state: lastError ? "Scan issue" : pending ? "Scanning" : "Available", tone: lastError ? "bad" : "",
+                detail: lastError ? `Last scan issue: ${lastError}` : `${count} discovered games.` };
+        }
+        const running = providerBoolean(record, "playnite_running");
+        const count = providerCount(record, "snapshot_game_count");
+        const pending = providerBoolean(record, "snapshot_pending");
+        const lastError = record.last_error;
+        if (lastError !== null && typeof lastError !== "string")
+            throw new Error("Provider status is invalid.");
+        return {
+            state: lastError ? "Sync issue" : pending ? "Syncing" : running ? "Running" : "Not detected",
+            tone: lastError ? "bad" : "",
+            detail: lastError ? `Last sync issue: ${lastError}` : `${count} games in the last snapshot.`,
+        };
+    }
+    Amaterasu.summarizeProvider = summarizeProvider;
+    function renderIntegrations(context) {
+        const area = Amaterasu.el("div", "integration-grid");
+        const providers = [
+            { name: "steam", label: "Steam", description: "Discover games from local Steam libraries.", scope: "steam.read" },
+            { name: "lutris", label: "Lutris", description: "Discover games from the current user's Lutris library.", scope: "configuration.read" },
+            { name: "playnite", label: "Playnite", description: "Sync a Playnite library and provider-managed applications.", scope: "configuration.read" },
+        ];
+        let generation = 0;
+        context.content.append(Amaterasu.sectionHeading("Integrations", "Connect and manage application providers on this host.", Amaterasu.button("Refresh", load)), area);
+        async function load() {
+            const request = ++generation;
+            const cards = providers.map((provider) => {
+                const status = Amaterasu.el("div", "integration-status", Amaterasu.el("p", "muted", "Loading provider status…"));
+                const settings = Amaterasu.button("Configure", () => context.navigate("settings/integrations"));
+                settings.disabled = !context.api.allows("configuration.read");
+                const actions = Amaterasu.el("div", "actions", settings);
+                if (provider.name === "steam" && context.api.allows("steam.read"))
+                    actions.append(Amaterasu.button("Browse games", () => context.navigate("steam")));
+                const card = Amaterasu.el("section", "panel integration-card", Amaterasu.el("h2", "", provider.label), Amaterasu.el("p", "muted", provider.description), status, actions);
+                return { provider, status, card };
+            });
+            area.replaceChildren(...cards.map((item) => item.card));
+            await Promise.all(cards.map(async ({ provider, status }) => {
+                if (!context.api.allows(provider.scope)) {
+                    status.replaceChildren(Amaterasu.badge("Unavailable"), Amaterasu.el("p", "muted", "This account cannot read this provider's status."));
+                    return;
+                }
+                try {
+                    const summary = summarizeProvider(provider.name, await context.api.post(`${provider.name}/status`));
+                    if (!context.content.isConnected || request !== generation)
+                        return;
+                    status.replaceChildren(Amaterasu.badge(summary.state, summary.tone), Amaterasu.el("p", "muted", Amaterasu.literalText(summary.detail)));
+                }
+                catch (error) {
+                    if (context.content.isConnected && request === generation)
+                        status.replaceChildren(Amaterasu.errorPanel(error));
+                }
+            }));
+        }
+        void load();
+    }
+    Amaterasu.renderIntegrations = renderIntegrations;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -9840,6 +11056,281 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function liveUnsigned(value) {
+        if (typeof value !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(value))
+            throw new Error("Live stream counter is invalid.");
+        const parsed = BigInt(value);
+        if (parsed > 18446744073709551615n)
+            throw new Error("Live stream counter is invalid.");
+        return parsed;
+    }
+    function liveUnixMillis(value) {
+        if (typeof value !== "string" || !/^(0|[1-9][0-9]{0,15}|-[1-9][0-9]{0,15})$/.test(value))
+            throw new Error("Live stream observation time is invalid.");
+        const parsed = BigInt(value);
+        if (parsed < -8640000000000000n || parsed > 8640000000000000n)
+            throw new Error("Live stream observation time is invalid.");
+        return Number(parsed);
+    }
+    function parseLiveStreamSnapshot(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Live stream status is invalid.");
+        const reply = value;
+        if (reply.ok !== true || typeof reply.epoch !== "string" || !/^[0-9a-f]{32}$/.test(reply.epoch) ||
+            !Array.isArray(reply.sessions) || reply.sessions.length > 2)
+            throw new Error("Live stream status is invalid.");
+        const sampledAt = liveUnsigned(reply.sampled_at_ms);
+        const sampledAtUnixMs = liveUnixMillis(reply.sampled_at_unix_ms);
+        const ids = new Set();
+        const streams = reply.sessions.map((value) => {
+            if (!value || typeof value !== "object" || Array.isArray(value))
+                throw new Error("Live stream status is invalid.");
+            const row = value;
+            const id = row.session_id;
+            if (typeof id !== "string" || !id || new TextEncoder().encode(id).length > 128 || /[\u0000-\u001f\u007f-\u009f]/u.test(id) || ids.has(id) ||
+                !Number.isSafeInteger(row.started_at_unix) ||
+                (row.device_name !== null && (typeof row.device_name !== "string" || new TextEncoder().encode(row.device_name).length > 128 || /[\u0000-\u001f\u007f-\u009f]/u.test(row.device_name))) ||
+                !["h264", "hevc", "av1"].includes(String(row.codec)) ||
+                ["width", "height", "target_fps", "target_bitrate_kbps"].some((key) => !Number.isSafeInteger(row[key]) || row[key] < 0 || row[key] > 0xffff_ffff))
+                throw new Error("Live stream metadata is invalid.");
+            ids.add(id);
+            return {
+                session: { session_id: id, started_at_unix: row.started_at_unix, ended_at_unix: null, duration_seconds: null,
+                    protocol: "sunshine-modern", client_name: "", device_name: row.device_name ?? "", app_name: "",
+                    width: row.width, height: row.height, target_fps: row.target_fps,
+                    target_bitrate_kbps: row.target_bitrate_kbps, codec: row.codec },
+                counters: { frames: liveUnsigned(row.frames_sent), bytes: liveUnsigned(row.bytes_sent), gaps: liveUnsigned(row.sequence_gaps) },
+            };
+        });
+        return { epoch: reply.epoch, sampledAt, sampledAtUnixMs, streams };
+    }
+    Amaterasu.parseLiveStreamSnapshot = parseLiveStreamSnapshot;
+    class LiveStreamTracker {
+        entries = new Map();
+        epoch = null;
+        clear() { this.entries.clear(); this.epoch = null; }
+        update(snapshot, retentionSeconds, maxPoints) {
+            if (snapshot.epoch !== this.epoch) {
+                this.entries.clear();
+                this.epoch = snapshot.epoch;
+            }
+            const active = new Set(snapshot.streams.map((stream) => stream.session.session_id));
+            for (const id of this.entries.keys())
+                if (!active.has(id))
+                    this.entries.delete(id);
+            const results = new Map();
+            for (const stream of snapshot.streams) {
+                const id = stream.session.session_id;
+                const old = this.entries.get(id);
+                let samples = old?.samples ?? [];
+                const monotonic = old && old.startedAt === stream.session.started_at_unix && snapshot.sampledAt >= old.sampledAt &&
+                    stream.counters.frames >= old.counters.frames && stream.counters.bytes >= old.counters.bytes && stream.counters.gaps >= old.counters.gaps;
+                if (!monotonic)
+                    samples = [];
+                else if (snapshot.sampledAt > old.sampledAt) {
+                    const elapsed = Number(snapshot.sampledAt - old.sampledAt);
+                    const wallElapsed = snapshot.sampledAtUnixMs - old.sampledAtUnixMs;
+                    if (elapsed > retentionSeconds * 1000 || wallElapsed <= 0 || Math.abs(wallElapsed - elapsed) > 1000)
+                        samples = [];
+                    else {
+                        samples = [...samples, { session_id: id, recorded_at_unix: snapshot.sampledAtUnixMs / 1000,
+                                interval_start_unix_ms: old.sampledAtUnixMs, chart_source: "live",
+                                frames_sent: Number(stream.counters.frames), bytes_sent: Number(stream.counters.bytes), dropped_frames: Number(stream.counters.gaps),
+                                actual_fps: Number(stream.counters.frames - old.counters.frames) * 1000 / elapsed,
+                                actual_bitrate_kbps: Number(stream.counters.bytes - old.counters.bytes) * 8 / elapsed,
+                                encode_latency_ms: null }];
+                    }
+                }
+                samples = samples.filter((sample) => sample.recorded_at_unix >= snapshot.sampledAtUnixMs / 1000 - retentionSeconds).slice(-maxPoints);
+                if (!old || !monotonic || snapshot.sampledAt > old.sampledAt) {
+                    this.entries.set(id, { startedAt: stream.session.started_at_unix, sampledAt: snapshot.sampledAt,
+                        sampledAtUnixMs: snapshot.sampledAtUnixMs, counters: stream.counters, samples });
+                }
+                else
+                    old.samples = samples;
+                const limit = BigInt(Number.MAX_SAFE_INTEGER);
+                results.set(id, { detail: { session: stream.session, sample_count: samples.length, event_count: 0,
+                        samples_truncated: false, events_truncated: false, samples, events: [] },
+                    rounded: stream.counters.frames > limit || stream.counters.bytes > limit || stream.counters.gaps > limit });
+            }
+            return results;
+        }
+    }
+    Amaterasu.LiveStreamTracker = LiveStreamTracker;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    function parseManagedLaunchStatus(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Managed stream status is invalid.");
+        const reply = value;
+        if (reply.ok !== true)
+            throw new Error("Managed stream status is unavailable.");
+        if (reply.launch === null)
+            return null;
+        if (!reply.launch || typeof reply.launch !== "object" || Array.isArray(reply.launch))
+            throw new Error("Managed stream status is invalid.");
+        const launch = reply.launch;
+        if (typeof launch.reference !== "string" || !/^[a-f0-9]{64}$/.test(launch.reference) ||
+            typeof launch.revision !== "string" || !/^[a-f0-9]{64}$/.test(launch.revision) ||
+            typeof launch.state !== "string" || !["starting", "ready", "stopping", "ended", "cleanup_failed"].includes(launch.state) ||
+            typeof launch.pending_resume !== "boolean")
+            throw new Error("Managed stream status is invalid.");
+        return launch;
+    }
+    Amaterasu.parseManagedLaunchStatus = parseManagedLaunchStatus;
+    function renderManagedStreamControls(context, container) {
+        const canStop = () => typeof context.api.allowsLaunchAction === "function" && context.api.allowsLaunchAction("stop");
+        if (!context.api.allows("session.read") || !canStop())
+            return;
+        let disposed = false;
+        let generation = 0;
+        let timer;
+        let current = null;
+        let watched = null;
+        let busy = false;
+        let notice = "";
+        const description = Amaterasu.el("p", "muted");
+        const message = Amaterasu.el("p", "muted");
+        const stop = Amaterasu.button("Stop managed stream", () => void requestStop(), "secondary");
+        const box = Amaterasu.panel("Managed stream controls", description, message, stop);
+        box.hidden = true;
+        container.append(box);
+        function render() {
+            box.hidden = !current && !notice;
+            if (!current) {
+                description.textContent = "";
+                message.textContent = notice;
+                stop.hidden = true;
+                return;
+            }
+            const state = current.state;
+            description.textContent = state === "cleanup_failed"
+                ? "The host could not confirm all stream and application cleanup. You can retry cleanup."
+                : state === "stopping"
+                    ? "Stopping the managed stream and its application; cleanup is still in progress."
+                    : state === "ended"
+                        ? "The managed launch has ended and its cleanup completed."
+                        : "Stopping the managed stream also closes its associated application and may discard unsaved work.";
+            message.textContent = notice || (current.pending_resume ? "A pending reconnect will also be cancelled." : "");
+            stop.hidden = state === "stopping" || state === "ended";
+            stop.disabled = busy || !canStop();
+            stop.textContent = state === "cleanup_failed" ? "Retry stream cleanup" : "Stop managed stream";
+        }
+        function cleanup() {
+            if (disposed)
+                return;
+            disposed = true;
+            generation++;
+            if (timer !== undefined)
+                window.clearTimeout(timer);
+            document.removeEventListener("visibilitychange", visibilityChanged);
+            observer.disconnect();
+        }
+        function visibilityChanged() {
+            if (!container.isConnected) {
+                cleanup();
+                return;
+            }
+            if (timer !== undefined)
+                window.clearTimeout(timer);
+            timer = undefined;
+            generation++;
+            if (document.visibilityState === "visible")
+                void refresh();
+        }
+        async function refresh() {
+            if (disposed || !container.isConnected || document.visibilityState !== "visible")
+                return;
+            if (timer !== undefined)
+                window.clearTimeout(timer);
+            timer = undefined;
+            const request = ++generation;
+            const reference = watched;
+            try {
+                const launch = parseManagedLaunchStatus(await context.api.post("nvhttp/launch_status", reference ? { reference } : {}));
+                if (disposed || !container.isConnected || request !== generation)
+                    return;
+                if (reference && (!launch || launch.reference !== reference))
+                    throw new Error("Managed stream identity changed.");
+                current = launch;
+                if (reference && launch?.state === "ended") {
+                    notice = "The host confirmed stream and application cleanup.";
+                    watched = null;
+                }
+                else if (reference && launch?.state === "cleanup_failed") {
+                    notice = "Cleanup is not confirmed. Review the host status before retrying.";
+                    watched = null;
+                }
+                render();
+            }
+            catch {
+                if (disposed || !container.isConnected || request !== generation)
+                    return;
+                current = null;
+                notice = reference ? "Stop outcome is unconfirmed. Refresh to check the host before retrying." : "Managed stream controls are unavailable.";
+                render();
+            }
+            finally {
+                if (!disposed && container.isConnected && request === generation && document.visibilityState === "visible")
+                    timer = window.setTimeout(() => void refresh(), 3000);
+            }
+        }
+        async function requestStop() {
+            const selected = current;
+            if (!selected || busy || !canStop() || selected.state === "stopping" || selected.state === "ended")
+                return;
+            busy = true;
+            render();
+            const retry = selected.state === "cleanup_failed";
+            const approved = await Amaterasu.confirmAction(retry ? "Retry stream cleanup?" : "Stop the managed stream?", retry ? "The host will retry cleanup of the same managed launch." :
+                "This ends the current managed stream and its associated application. Unsaved work may be lost. A pending reconnect will be cancelled.", retry ? "Retry cleanup" : "Stop stream");
+            if (!approved || disposed || !container.isConnected || !canStop()) {
+                busy = false;
+                render();
+                return;
+            }
+            generation++;
+            if (timer !== undefined)
+                window.clearTimeout(timer);
+            timer = undefined;
+            watched = selected.reference;
+            current = null;
+            notice = "Requesting stream cleanup…";
+            render();
+            try {
+                const result = await context.api.post("nvhttp/stop_launch", { reference: selected.reference, revision: selected.revision });
+                if (!result || typeof result !== "object" || result.ok !== true ||
+                    result.accepted !== true || result.reference !== selected.reference)
+                    throw new Error("Stop admission was not confirmed.");
+                notice = "Stop requested. Waiting for the host to confirm cleanup.";
+            }
+            catch (error) {
+                if (error && typeof error === "object" && error.code === "launch_changed") {
+                    watched = null;
+                    notice = "The launch changed while confirmation was open. Review the current stream before trying again.";
+                }
+                else
+                    notice = "Stop outcome is unconfirmed. Checking the host; do not repeat the request yet.";
+            }
+            finally {
+                busy = false;
+                if (!disposed && container.isConnected) {
+                    render();
+                    void refresh();
+                }
+            }
+        }
+        const observer = new MutationObserver(() => { if (!container.isConnected)
+            cleanup(); });
+        observer.observe(document.body, { childList: true, subtree: true });
+        document.addEventListener("visibilitychange", visibilityChanged);
+        void refresh();
+    }
+    Amaterasu.renderManagedStreamControls = renderManagedStreamControls;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function hostMetricsTextLiteral(value) {
         return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
     }
@@ -10047,16 +11538,31 @@ var Amaterasu;
         void load();
     }
     Amaterasu.renderHostMetricsSettings = renderHostMetricsSettings;
-    function renderHostMetricsDashboard(context, container, sessionHistoryContainer) {
+    function renderHostMetricsDashboard(context, container, sessionHistoryContainer, view = "full") {
         dashboardCleanup.get(container)?.();
         let requestGeneration = 0;
+        let initializationGeneration = 0;
         let timer;
         let disposed = false;
         let observer;
         let settings = realtimeDefaults;
+        let settingsLoaded = false;
+        const canReadHost = typeof context.api.allows !== "function" || context.api.allows("diagnostics.read");
+        const canReadLive = typeof context.api.allows !== "function" || context.api.allows("session.read");
+        const canReadSettings = typeof context.api.allows !== "function" || context.api.allows("configuration.read");
         const area = Amaterasu.el("div");
+        const activeArea = Amaterasu.el("div");
+        const activeList = Amaterasu.el("div", "live-session-list");
+        const activeNote = Amaterasu.el("p", "muted");
+        const activePanel = Amaterasu.panel("Active streaming sessions", activeNote, activeList);
+        const liveTracker = new Amaterasu.LiveStreamTracker();
+        let activeEpoch = null;
+        const activeCards = new Map();
+        let loadingLiveHistory = false;
+        let liveHistoryPending = false;
         const status = Amaterasu.el("p", "muted", "Loading live host metrics…");
-        container.replaceChildren(Amaterasu.button("Refresh host metrics", () => void refresh()), area, status);
+        const preferenceNotice = Amaterasu.el("p", "muted");
+        container.replaceChildren(Amaterasu.el("div", "host-metrics-toolbar", status, Amaterasu.button("Refresh host metrics", () => void refresh())), preferenceNotice, area, activeArea);
         const cleanup = () => {
             if (disposed)
                 return;
@@ -10071,7 +11577,7 @@ var Amaterasu;
         };
         dashboardCleanup.set(container, cleanup);
         function applyVisibility() {
-            if (disposed || !container.isConnected)
+            if (disposed || !container.isConnected || !settingsLoaded)
                 return;
             if (sessionHistoryContainer)
                 sessionHistoryContainer.hidden = !settings.show_session_history;
@@ -10079,6 +11585,8 @@ var Amaterasu;
                 renderDisabledState();
                 return;
             }
+            if (view === "overview" && !settings.show_host_stats)
+                return;
             if (settings.pause_when_hidden && document.visibilityState !== "visible") {
                 if (timer !== undefined)
                     window.clearTimeout(timer);
@@ -10089,31 +11597,49 @@ var Amaterasu;
             }
         }
         async function refresh() {
+            if (timer !== undefined)
+                window.clearTimeout(timer);
             timer = undefined;
             const request = ++requestGeneration;
-            if (disposed || !container.isConnected)
+            if (disposed || !container.isConnected || !settingsLoaded)
                 return;
             if (!settings.enabled) {
                 renderDisabledState();
                 return;
             }
+            if (view === "overview" && !settings.show_host_stats)
+                return;
             if (settings.pause_when_hidden && document.visibilityState !== "visible")
                 return;
+            const current = () => !disposed && container.isConnected && request === requestGeneration &&
+                !(settings.pause_when_hidden && document.visibilityState !== "visible");
+            await Promise.all([refreshHost(current), refreshActive(current)]);
+            if (current())
+                schedule();
+        }
+        async function refreshHost(current) {
+            if (!canReadHost) {
+                if (current()) {
+                    hostMetricsSetLocalizedTextContent(status, "Host telemetry is unavailable for this account.");
+                    area.replaceChildren();
+                }
+                return;
+            }
             try {
                 const result = parseHostStatsReply(await context.api.post("host-metrics/stats"));
-                if (disposed || !container.isConnected || request !== requestGeneration ||
-                    settings.pause_when_hidden && document.visibilityState !== "visible")
+                if (!current())
                     return;
                 const panels = [];
-                if (settings.show_host_stats)
-                    panels.push(renderHostStats(result));
-                if (settings.show_host_charts)
+                if (settings.show_host_stats) {
+                    if (!result.available)
+                        panels.push(Amaterasu.panel("Host vitals", Amaterasu.el("p", "muted", "Host telemetry is unavailable on this platform.")));
+                    else if (result.sampled_at_unix_ms === null)
+                        panels.push(Amaterasu.panel("Host vitals", Amaterasu.el("p", "muted", "Waiting for the first measured host sample.")));
+                    else
+                        panels.push(renderHostStats(result));
+                }
+                if (view === "full" && settings.show_host_charts)
                     panels.push(renderHostCharts(result.samples));
-                if (settings.show_active_sessions)
-                    panels.push(await renderActiveSessions(context));
-                if (disposed || !container.isConnected || request !== requestGeneration ||
-                    settings.pause_when_hidden && document.visibilityState !== "visible")
-                    return;
                 area.replaceChildren(...panels);
                 const locale = typeof Amaterasu.activeIntlLocale === "function"
                     ? Amaterasu.activeIntlLocale()
@@ -10125,39 +11651,238 @@ var Amaterasu;
                     : `Host telemetry is unsupported on this platform (${result.platform}); no sample values were invented.`;
             }
             catch (error) {
-                if (!disposed && container.isConnected && request === requestGeneration)
+                if (current()) {
+                    hostMetricsSetLocalizedTextContent(status, "Host metrics could not be refreshed.");
                     area.replaceChildren(Amaterasu.errorPanel(error));
+                }
             }
-            schedule();
+        }
+        async function refreshActive(current) {
+            if (view !== "full" || !settings.show_active_sessions) {
+                clearActiveSessions();
+                return;
+            }
+            if (!canReadLive) {
+                clearActiveSessions();
+                if (current())
+                    activeArea.replaceChildren(Amaterasu.panel("Active streaming sessions", Amaterasu.el("p", "muted", "Live stream status is unavailable for this account.")));
+                return;
+            }
+            if (activeArea.firstElementChild === activePanel)
+                activeNote.textContent = "Refreshing active stream samples…";
+            try {
+                const snapshot = Amaterasu.parseLiveStreamSnapshot(await context.api.post("live-streams/status"));
+                if (!current())
+                    return;
+                if (activeEpoch !== snapshot.epoch) {
+                    clearActiveSessions();
+                    activeEpoch = snapshot.epoch;
+                }
+                const observed = liveTracker.update(snapshot, settings.history_retention_seconds, settings.max_history_points);
+                updateActiveSessions(observed);
+            }
+            catch (error) {
+                if (!current())
+                    return;
+                clearActiveSessions();
+                activeArea.replaceChildren(Amaterasu.panel("Active streaming sessions", Amaterasu.errorPanel(error)));
+            }
         }
         function schedule() {
-            if (disposed || !container.isConnected || !settings.enabled || timer !== undefined)
+            if (disposed || !container.isConnected || !settingsLoaded || !settings.enabled || timer !== undefined ||
+                (view === "overview" && !settings.show_host_stats))
                 return;
             if (settings.pause_when_hidden && document.visibilityState !== "visible")
                 return;
             timer = window.setTimeout(() => void refresh(), settings.poll_interval_ms);
         }
         function renderDisabledState() {
+            clearActiveSessions();
             area.replaceChildren(Amaterasu.empty("Real-time statistics are disabled", "Enable collection in Settings to show live host telemetry."));
             hostMetricsSetLocalizedTextContent(status, "Sampling is disabled.");
         }
+        function clearActiveSessions() {
+            activeCards.clear();
+            liveTracker.clear();
+            activeEpoch = null;
+            activeList.replaceChildren();
+            activeArea.replaceChildren();
+        }
+        function updateActiveSessions(result) {
+            if (activeArea.firstElementChild !== activePanel)
+                activeArea.replaceChildren(activePanel);
+            const remaining = new Set(result.keys());
+            for (const [id, state] of activeCards) {
+                if (!remaining.has(id)) {
+                    state.card.element.remove();
+                    activeCards.delete(id);
+                }
+            }
+            [...result.values()].forEach(({ detail, rounded }, index) => {
+                const session = detail.session;
+                let state = activeCards.get(session.session_id);
+                if (!state) {
+                    state = { card: Amaterasu.createLiveSessionCard(), session, liveDetail: detail, recordedDetail: null,
+                        snapshot: null, historyNote: "", rounded, lastAttempt: 0 };
+                    activeCards.set(session.session_id, state);
+                }
+                else {
+                    if (state.session.started_at_unix !== session.started_at_unix) {
+                        state.snapshot = null;
+                        state.recordedDetail = null;
+                    }
+                    state.session = session;
+                    state.liveDetail = detail;
+                    state.rounded = rounded;
+                }
+                renderActiveCard(state);
+                if (activeList.children[index] !== state.card.element)
+                    activeList.insertBefore(state.card.element, activeList.children[index] ?? null);
+            });
+            activeNote.textContent = result.size ? `${result.size} active ${result.size === 1 ? "stream" : "streams"} reported by the host.` : "No active streams reported.";
+            refreshLiveHistory();
+        }
+        function renderActiveCard(state) {
+            const show = (recorded) => state.card.update(state.session, state.liveDetail, recorded, state.historyNote, state.rounded, settings.history_retention_seconds, settings.max_history_points);
+            if (!state.recordedDetail) {
+                show(null);
+                return;
+            }
+            if (!state.snapshot) {
+                show({ ...state.recordedDetail, session: state.session });
+                return;
+            }
+            const newest = state.snapshot.samples.length
+                ? Math.max(...state.snapshot.samples.map((sample) => sample.recorded_at_unix)) : 0;
+            const samples = state.snapshot.samples.filter((sample) => sample.recorded_at_unix >= newest - settings.history_retention_seconds);
+            const count = Math.max(state.recordedDetail.sample_count, samples.length);
+            show({ ...state.recordedDetail, session: state.session,
+                samples, sample_count: count, samples_truncated: samples.length < count });
+        }
+        function refreshLiveHistory() {
+            if (loadingLiveHistory) {
+                liveHistoryPending = true;
+                return;
+            }
+            const now = Date.now();
+            const states = [...activeCards.values()].filter((state) => now - state.lastAttempt >= 1000);
+            if (!states.length)
+                return;
+            for (const state of states)
+                state.lastAttempt = now;
+            loadingLiveHistory = true;
+            liveHistoryPending = false;
+            const current = (state) => !disposed && container.isConnected && settings.enabled &&
+                activeCards.get(state.session.session_id) === state &&
+                !(settings.pause_when_hidden && document.visibilityState !== "visible");
+            async function refresh() {
+                let unavailable = "";
+                try {
+                    const runtime = Amaterasu.parseHistoryRuntimeStatus(await context.api.post("history/history_status"));
+                    if (!runtime.available || !runtime.configuration_ready)
+                        unavailable = "Recorded history is unavailable; charts use live observations in this browser.";
+                    else if (!runtime.effective_enabled)
+                        unavailable = "History recording is disabled; charts use live observations in this browser.";
+                }
+                catch {
+                    unavailable = "Recorded history is unavailable; charts use live observations in this browser.";
+                }
+                if (unavailable) {
+                    for (const state of states)
+                        if (current(state)) {
+                            state.recordedDetail = null;
+                            state.snapshot = null;
+                            state.historyNote = unavailable;
+                            renderActiveCard(state);
+                        }
+                    return;
+                }
+                let next = 0;
+                async function worker() {
+                    while (next < states.length) {
+                        const state = states[next++];
+                        if (!current(state))
+                            continue;
+                        try {
+                            const detail = Amaterasu.parseHistoryDetailReply(await context.api.post("history/session_detail", {
+                                session_id: state.session.session_id,
+                            }), state.session.session_id).detail;
+                            if (!current(state))
+                                continue;
+                            if (detail.session.started_at_unix !== state.session.started_at_unix || detail.session.ended_at_unix !== null)
+                                throw new Error("Recorded history does not match the active stream.");
+                            state.recordedDetail = detail;
+                            if (!state.snapshot) {
+                                state.historyNote = "Loading longer history…";
+                                renderActiveCard(state);
+                            }
+                            try {
+                                const snapshot = await Amaterasu.loadLiveSampleSnapshot(context.api, state.session.session_id, settings.max_history_points, state.snapshot, () => current(state));
+                                if (!current(state) || !snapshot)
+                                    continue;
+                                if (snapshot.session.started_at_unix !== state.session.started_at_unix || snapshot.session.ended_at_unix !== null)
+                                    throw new Error("Recorded history does not match the active stream.");
+                                state.snapshot = snapshot;
+                                state.historyNote = "";
+                            }
+                            catch {
+                                if (!current(state))
+                                    continue;
+                                state.snapshot = null;
+                                state.historyNote = "Longer history is unavailable; showing recent recorded samples. It will be retried.";
+                            }
+                        }
+                        catch {
+                            if (!current(state))
+                                continue;
+                            state.recordedDetail = null;
+                            state.snapshot = null;
+                            state.historyNote = "Recorded history is unavailable; charts use live observations in this browser.";
+                        }
+                        if (current(state))
+                            renderActiveCard(state);
+                    }
+                }
+                await Promise.all(Array.from({ length: Math.min(4, states.length) }, () => worker()));
+            }
+            void refresh().finally(() => {
+                loadingLiveHistory = false;
+                if (liveHistoryPending && !disposed)
+                    refreshLiveHistory();
+            });
+        }
         async function initialize() {
+            const request = ++initializationGeneration;
+            hostMetricsSetLocalizedTextContent(status, "Loading live host metrics…");
+            if (!canReadSettings) {
+                settingsLoaded = true;
+                preferenceNotice.textContent = "Display preferences are unavailable for this account; the live view uses defaults.";
+                applyVisibility();
+                return;
+            }
             try {
                 const loaded = await loadRealtimeSettings(context.api);
-                if (disposed || !container.isConnected)
+                if (disposed || !container.isConnected || request !== initializationGeneration)
                     return;
                 settings = loaded.settings;
+                settingsLoaded = true;
                 if (sessionHistoryContainer)
                     sessionHistoryContainer.hidden = !settings.show_session_history;
                 if (!settings.enabled) {
                     renderDisabledState();
                     return;
                 }
+                if (view === "overview" && !settings.show_host_stats) {
+                    hostMetricsSetLocalizedTextContent(status, "Host statistics are hidden in your settings.");
+                    return;
+                }
                 applyVisibility();
             }
             catch (error) {
-                if (!disposed && container.isConnected)
-                    area.replaceChildren(Amaterasu.errorPanel(error));
+                if (!disposed && container.isConnected && request === initializationGeneration) {
+                    hostMetricsSetLocalizedTextContent(status, "Host metrics settings are unavailable.");
+                    area.replaceChildren(Amaterasu.errorPanel(error, initialize));
+                }
             }
         }
         document.addEventListener("visibilitychange", applyVisibility);
@@ -10175,19 +11900,14 @@ var Amaterasu;
         const temperature = (value) => value === null ? "Unavailable" : `${value.toFixed(1)} °C`;
         const bytes = (used, total) => used === null || total === null ? "Unavailable" : `${formatBytes(used)} / ${formatBytes(total)}`;
         const rate = (value) => value === null ? "Unavailable" : `${(value / 1_000_000).toFixed(2)} Mbit/s`;
-        return Amaterasu.panel("Current host metrics", Amaterasu.table(["Metric", "Measured value"], [
-            ["CPU utilization", percent(host.cpu_percent)],
-            ["CPU temperature", temperature(host.cpu_temp_c)],
-            ["Memory used / total", bytes(host.ram_used_bytes, host.ram_total_bytes)],
-            ["GPU utilization", percent(host.gpu_percent)],
-            ["GPU encoder utilization", percent(host.gpu_encoder_percent)],
-            ["GPU temperature", temperature(host.gpu_temp_c)],
-            ["Video memory used / total", bytes(host.vram_used_bytes, host.vram_total_bytes)],
-            ["Network receive", rate(host.net_rx_bps)],
-            ["Network transmit", rate(host.net_tx_bps)],
-        ]));
+        const memoryPercent = (used, total) => used === null || total === null || total === 0 ? null : used * 100 / total;
+        const vital = (label, value, detail) => Amaterasu.el("div", "host-vital", Amaterasu.el("span", "muted", label), Amaterasu.el("strong", value === null ? "host-vital-unavailable" : "", hostMetricsTextLiteral(percent(value))), Amaterasu.el("small", "muted", hostMetricsTextLiteral(detail)));
+        const supporting = (label, value) => Amaterasu.el("div", "host-metric-detail", Amaterasu.el("span", "muted", label), Amaterasu.el("strong", "", hostMetricsTextLiteral(value)));
+        return Amaterasu.panel("Host vitals", Amaterasu.el("div", "host-vital-grid", vital("CPU", host.cpu_percent, temperature(host.cpu_temp_c)), vital("GPU", host.gpu_percent, temperature(host.gpu_temp_c)), vital("Memory", memoryPercent(host.ram_used_bytes, host.ram_total_bytes), bytes(host.ram_used_bytes, host.ram_total_bytes)), vital("Video memory", memoryPercent(host.vram_used_bytes, host.vram_total_bytes), bytes(host.vram_used_bytes, host.vram_total_bytes))), Amaterasu.el("div", "host-metric-details", supporting("Encoder utilization", percent(host.gpu_encoder_percent)), supporting("Network receive", rate(host.net_rx_bps)), supporting("Network transmit", rate(host.net_tx_bps))));
     }
     function renderHostCharts(samples) {
+        if (samples.length === 0)
+            return Amaterasu.panel("Recent host charts", Amaterasu.empty("No samples yet", "Measured history appears as the host collects samples."));
         const charts = [
             { label: "CPU utilization", values: samples.map((sample) => sample.host.cpu_percent), maximum: 100 },
             { label: "GPU utilization", values: samples.map((sample) => sample.host.gpu_percent), maximum: 100 },
@@ -10196,15 +11916,19 @@ var Amaterasu;
                     const total = sample.host.ram_total_bytes;
                     return used === null || total === null || total === 0 ? null : used * 100 / total;
                 }), maximum: 100 },
+            { label: "Video memory use", values: samples.map((sample) => {
+                    const used = sample.host.vram_used_bytes;
+                    const total = sample.host.vram_total_bytes;
+                    return used === null || total === null || total === 0 ? null : used * 100 / total;
+                }), maximum: 100 },
             { label: "Network receive", values: samples.map((sample) => sample.host.net_rx_bps === null ? null : sample.host.net_rx_bps / 1_000_000), maximum: Math.max(10, ...samples.map((sample) => (sample.host.net_rx_bps ?? 0) / 1_000_000)) },
+            { label: "Network transmit", values: samples.map((sample) => sample.host.net_tx_bps === null ? null : sample.host.net_tx_bps / 1_000_000), maximum: Math.max(10, ...samples.map((sample) => (sample.host.net_tx_bps ?? 0) / 1_000_000)) },
         ];
         const graphics = charts.map((chart) => {
             const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
             svg.setAttribute("viewBox", "0 0 320 84");
             svg.setAttribute("width", "320");
             svg.setAttribute("height", "84");
-            svg.style.width = "100%";
-            svg.style.height = "84px";
             svg.setAttribute("role", "img");
             if (typeof Amaterasu.setLocalizedAttributeTemplate === "function") {
                 Amaterasu.setLocalizedAttributeTemplate(svg, "aria-label", "{label} over recent measured samples", { label: hostMetricsTextMessage(chart.label) });
@@ -10257,49 +11981,13 @@ var Amaterasu;
                     svg.append(line);
                 }
             }
-            return Amaterasu.el("div", "host-metric-chart-card", Amaterasu.el("strong", "", chart.label), svg, Amaterasu.el("small", "muted", hostMetricsTextLiteral(`${chart.values.filter((value) => value !== null).length} measured points`)));
+            const unit = chart.label.startsWith("Network") ? "Mbit/s" : "%";
+            const lastValue = chart.values.at(-1);
+            const latest = lastValue == null ? "Unavailable" : `${lastValue.toFixed(1)} ${unit}`;
+            return Amaterasu.el("div", "host-metric-chart-card", Amaterasu.el("div", "host-metric-chart-heading", Amaterasu.el("strong", "", chart.label), Amaterasu.el("span", "", hostMetricsTextLiteral(latest))), svg, Amaterasu.el("small", "muted", hostMetricsTextLiteral(`${chart.values.filter((value) => value !== null).length} measured points · scale 0–${chart.maximum.toFixed(1)} ${unit}`)));
         });
         const grid = Amaterasu.el("div", "host-metric-chart-grid", ...graphics);
-        grid.style.display = "grid";
-        grid.style.gridTemplateColumns = "repeat(auto-fit, minmax(240px, 1fr))";
-        grid.style.gap = "12px";
         return Amaterasu.panel("Recent host charts", grid);
-    }
-    async function renderActiveSessions(context) {
-        try {
-            const status = await context.api.post("history/history_status");
-            if (!status || typeof status !== "object" || Array.isArray(status) ||
-                status.ok !== true)
-                throw new Error("Session history availability is unavailable.");
-            const runtime = status;
-            if (runtime.effective_enabled !== true)
-                return Amaterasu.panel("Active streaming sessions", Amaterasu.el("p", "muted", "Active stream metadata is unavailable while session history recording is disabled."));
-        }
-        catch (error) {
-            return Amaterasu.panel("Active streaming sessions", Amaterasu.errorPanel(error));
-        }
-        const value = await context.api.post("history/active_sessions", { limit: 16, offset: 0 });
-        if (!value || typeof value !== "object" || Array.isArray(value) ||
-            value.ok !== true || !Array.isArray(value.sessions))
-            throw new Error("Active session metrics reply is invalid.");
-        const sessions = value.sessions;
-        if (sessions.length > 16)
-            throw new Error("Active session metrics reply exceeds its limit.");
-        const rows = sessions.map((entry) => {
-            if (!entry || typeof entry !== "object" || Array.isArray(entry))
-                throw new Error("Active session row is invalid.");
-            const session = entry;
-            const sessionId = session.session_id;
-            const appName = session.app_name;
-            const clientName = session.client_name;
-            const protocol = session.protocol;
-            if (typeof sessionId !== "string" || typeof appName !== "string" ||
-                typeof clientName !== "string" || typeof protocol !== "string")
-                throw new Error("Active session row is invalid.");
-            return [appName || sessionId, clientName || protocol, protocol];
-        });
-        return Amaterasu.panel("Active streaming sessions", rows.length ? Amaterasu.table(["Application / session", "Client", "Protocol"], rows) :
-            Amaterasu.empty("No active streams", "Active stream metadata appears here while session history is enabled."));
     }
     function formatBytes(value) {
         if (!Number.isFinite(value) || value < 0)
@@ -10664,6 +12352,955 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    const HOST_LOG_MAX_BYTES = 10 * 1024 * 1024;
+    const HOST_LOG_CHUNK_BYTES = 4096;
+    const HOST_LOG_PREVIEW_LINES = 300;
+    const HOST_LOG_REFRESH_MS = 5000;
+    const SUPPORT_BUNDLE_MAX_BYTES = 96 * 1024 * 1024;
+    const SUPPORT_BUNDLE_CHUNK_BYTES = 8192;
+    function hostLogReply(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("The host returned an invalid log response.");
+        const reply = value;
+        if (reply.ok !== true)
+            throw new Error("The host log is unavailable. Refresh to try again.");
+        return reply;
+    }
+    function hostLogInteger(value, maximum) {
+        if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > maximum)
+            throw new Error("The host returned an invalid log response.");
+        return value;
+    }
+    function renderHostLogs(context, target) {
+        let generation = 0;
+        let contents = "";
+        let latestContents = "";
+        let retainedBytes = [];
+        let retainedLength = 0;
+        let retainedStream = null;
+        let retainedDiscarded = 0;
+        let pendingContents = null;
+        let lines = [];
+        let matches = [];
+        let selected = 0;
+        let paused = false;
+        let disposed = false;
+        let activeLoads = 0;
+        let refreshPending = false;
+        let timer;
+        let observer;
+        let exportGeneration = 0;
+        let exportBusy = false;
+        const following = Amaterasu.el("span", "muted", "Following");
+        const status = Amaterasu.el("p", "muted");
+        status.setAttribute("role", "status");
+        const progress = Amaterasu.el("p", "muted");
+        progress.setAttribute("role", "status");
+        const search = Amaterasu.input("host_log_search", "", "search");
+        search.placeholder = "Search the current host log";
+        const level = Amaterasu.el("select");
+        level.name = "host_log_level";
+        for (const value of ["All levels", "Verbose", "Debug", "Info", "Warning", "Error", "Fatal"]) {
+            const option = Amaterasu.el("option", "", value);
+            option.value = value === "All levels" ? "" : value;
+            level.append(option);
+        }
+        const output = Amaterasu.el("pre", "host-log-output");
+        output.setAttribute("aria-label", "Host log contents");
+        const follow = Amaterasu.input("host_log_follow", "", "checkbox");
+        follow.checked = true;
+        const followLabel = Amaterasu.el("label", "host-log-follow", follow, Amaterasu.el("span", "", "Follow newest"));
+        const showLatest = Amaterasu.button("Show latest", () => applyPending());
+        showLatest.hidden = true;
+        const pause = Amaterasu.button("Pause", () => togglePause());
+        const exportStatus = Amaterasu.el("p", "muted");
+        exportStatus.setAttribute("role", "status");
+        const cancelExport = Amaterasu.button("Cancel export", () => {
+            if (exportBusy) {
+                ++exportGeneration;
+                exportStatus.textContent = "Cancelling support bundle…";
+            }
+        });
+        cancelExport.hidden = true;
+        const exportButton = Amaterasu.button("Download support bundle", () => void downloadSupportBundle());
+        const previous = Amaterasu.button("Previous match", () => move(-1));
+        const next = Amaterasu.button("Next match", () => move(1));
+        const download = Amaterasu.button("Download log", () => {
+            const url = URL.createObjectURL(new Blob([latestContents], { type: "text/plain;charset=utf-8" }));
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = "amaterasu-host-log.txt";
+            link.click();
+            window.setTimeout(() => URL.revokeObjectURL(url), 0);
+        });
+        const refresh = Amaterasu.button("Refresh host log", () => load());
+        const controls = Amaterasu.el("div", "diagnostics-toolbar", Amaterasu.field("Search host log", search), Amaterasu.field("Level", level), followLabel, pause, refresh, download);
+        const matchControls = Amaterasu.el("div", "diagnostics-match-navigation", previous, next, status);
+        matchControls.setAttribute("role", "group");
+        matchControls.setAttribute("aria-label", "Host log search navigation");
+        const box = Amaterasu.panel("Host log", Amaterasu.el("p", "muted", "Current host session only; older rotated segments may have been discarded."), controls, following, showLatest, progress, matchControls, output, Amaterasu.el("div", "support-log-export", exportButton, cancelExport, exportStatus, Amaterasu.el("p", "muted", "The support bundle includes retained sessions from the current log location. Common identifying details are redacted; review it before sharing.")));
+        target.append(box);
+        function render() {
+            const query = search.value.trim().toLocaleLowerCase();
+            const filtered = lines.flatMap((line, index) => {
+                const severity = /^\[[^\]]+\]: (Verbose|Debug|Info|Warning|Error|Fatal): /.exec(line)?.[1];
+                return !level.value || severity === level.value ? [index] : [];
+            });
+            matches = query ? filtered.filter((index) => (lines[index] ?? "").toLocaleLowerCase().includes(query)) : [];
+            if (selected >= matches.length)
+                selected = 0;
+            previous.disabled = next.disabled = !matches.length;
+            download.disabled = !latestContents;
+            if (query) {
+                const index = matches[selected];
+                status.textContent = index === undefined ? "No matching lines" : `Match ${selected + 1} of ${matches.length} · line ${index + 1}`;
+                output.replaceChildren();
+                if (index !== undefined) {
+                    const start = Math.max(0, index - 3);
+                    const end = Math.min(lines.length, index + 4);
+                    for (let line = start; line < end; line++) {
+                        if (line > start)
+                            output.append(document.createTextNode("\n"));
+                        const content = lines[line] ?? "";
+                        if (line === index)
+                            output.append(Amaterasu.el("mark", "host-log-match", Amaterasu.literalText(content)));
+                        else
+                            output.append(document.createTextNode(content));
+                    }
+                }
+            }
+            else {
+                status.textContent = filtered.length > HOST_LOG_PREVIEW_LINES
+                    ? `Showing the last ${HOST_LOG_PREVIEW_LINES} of ${filtered.length} matching lines. Search covers the full snapshot.`
+                    : `${filtered.length} matching lines in this snapshot.`;
+                output.textContent = filtered.slice(-HOST_LOG_PREVIEW_LINES).map((index) => lines[index] ?? "").join("\n");
+            }
+        }
+        function nearBottom() {
+            const distance = output.scrollHeight - output.scrollTop - output.clientHeight;
+            return !Number.isFinite(distance) || distance <= 24;
+        }
+        function viewerHasSelection() {
+            const selection = window.getSelection?.();
+            return !!selection && !selection.isCollapsed && !!selection.anchorNode && output.contains(selection.anchorNode);
+        }
+        function mayFollow() {
+            return follow.checked && !search.value.trim() && nearBottom() && !viewerHasSelection();
+        }
+        function displayContents(value, scroll) {
+            contents = value;
+            lines = contents ? contents.split("\n") : [];
+            if (lines.at(-1) === "")
+                lines.pop();
+            render();
+            if (scroll)
+                output.scrollTop = output.scrollHeight;
+        }
+        function applyPending() {
+            if (pendingContents === null)
+                return;
+            const pending = pendingContents;
+            pendingContents = null;
+            showLatest.hidden = true;
+            selected = 0;
+            displayContents(pending, follow.checked && !search.value.trim());
+            updateFollowing();
+        }
+        function updateFollowing() {
+            following.textContent = paused ? "Paused" : pendingContents === null ? "Following" : "Following · new log data available";
+            pause.textContent = paused ? "Resume" : "Pause";
+            pause.setAttribute("aria-pressed", String(paused));
+        }
+        function stopTimer() {
+            if (timer !== undefined)
+                window.clearTimeout(timer);
+            timer = undefined;
+        }
+        function schedule(immediate = false) {
+            if (disposed || !target.isConnected || paused || document.visibilityState === "hidden" || activeLoads || timer !== undefined)
+                return;
+            timer = window.setTimeout(() => { timer = undefined; void load(); }, immediate ? 0 : HOST_LOG_REFRESH_MS);
+        }
+        function togglePause() {
+            paused = !paused;
+            updateFollowing();
+            if (paused) {
+                ++generation;
+                refreshPending = false;
+                stopTimer();
+            }
+            else if (activeLoads)
+                refreshPending = true;
+            else
+                schedule(true);
+        }
+        function visibilityChanged() {
+            if (document.visibilityState === "hidden")
+                stopTimer();
+            else if (!paused) {
+                if (activeLoads)
+                    refreshPending = true;
+                else
+                    schedule(true);
+            }
+        }
+        function cleanup() {
+            if (disposed)
+                return;
+            disposed = true;
+            ++generation;
+            ++exportGeneration;
+            stopTimer();
+            document.removeEventListener("visibilitychange", visibilityChanged);
+            observer?.disconnect();
+        }
+        follow.addEventListener("change", () => { if (mayFollow())
+            applyPending(); });
+        output.addEventListener("scroll", () => { if (mayFollow())
+            applyPending(); });
+        function move(direction) {
+            if (!matches.length)
+                return;
+            selected = (selected + direction + matches.length) % matches.length;
+            render();
+        }
+        search.addEventListener("input", () => { selected = 0; render(); });
+        level.addEventListener("change", () => { selected = 0; render(); });
+        search.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" && !event.isComposing && search.value.trim()) {
+                event.preventDefault();
+                move(event.shiftKey ? -1 : 1);
+            }
+        });
+        async function downloadSupportBundle() {
+            if (exportBusy || disposed || !target.isConnected)
+                return;
+            exportBusy = true;
+            const current = ++exportGeneration;
+            const valid = () => !disposed && target.isConnected && current === exportGeneration;
+            let snapshot = null;
+            exportButton.disabled = true;
+            cancelExport.hidden = false;
+            exportStatus.textContent = "Preparing support bundle…";
+            try {
+                const opened = hostLogReply(await context.api.post("host-logs/export_start"));
+                if (typeof opened.snapshot !== "string" || !/^[a-f0-9]{32}$/.test(opened.snapshot) || opened.status !== "building")
+                    throw new Error("The host returned an invalid support bundle response.");
+                snapshot = opened.snapshot;
+                const deadline = Date.now() + 300_000;
+                let ready = null;
+                while (valid() && Date.now() < deadline) {
+                    const reply = hostLogReply(await context.api.post("host-logs/export_status", { snapshot }));
+                    if (reply.snapshot !== snapshot || (reply.status !== "building" && reply.status !== "ready"))
+                        throw new Error("The host returned an invalid support bundle response.");
+                    if (reply.status === "ready") {
+                        ready = reply;
+                        break;
+                    }
+                    await new Promise((resolve) => window.setTimeout(resolve, 400));
+                }
+                if (!valid())
+                    return;
+                if (!ready)
+                    throw new Error("The support bundle took too long to prepare.");
+                const length = hostLogInteger(ready.length, SUPPORT_BUNDLE_MAX_BYTES);
+                const sessions = hostLogInteger(ready.sessions, 32);
+                if (!length || !sessions || typeof ready.truncated !== "boolean")
+                    throw new Error("The host returned an invalid support bundle response.");
+                const chunks = [];
+                let offset = 0;
+                while (offset < length && valid()) {
+                    const reply = hostLogReply(await context.api.post("host-logs/export_read", { snapshot, offset, limit: SUPPORT_BUNDLE_CHUNK_BYTES }));
+                    const next = hostLogInteger(reply.next_offset, length);
+                    if (reply.snapshot !== snapshot || reply.offset !== offset || reply.length !== length || typeof reply.data !== "string" ||
+                        typeof reply.eof !== "boolean" || next <= offset || next - offset > SUPPORT_BUNDLE_CHUNK_BYTES || reply.eof !== (next === length))
+                        throw new Error("The host returned an invalid support bundle response.");
+                    let decoded;
+                    try {
+                        decoded = atob(reply.data);
+                    }
+                    catch {
+                        throw new Error("The host returned an invalid support bundle response.");
+                    }
+                    if (decoded.length !== next - offset)
+                        throw new Error("The host returned an invalid support bundle response.");
+                    chunks.push(Uint8Array.from(decoded, (character) => character.charCodeAt(0)).buffer);
+                    offset = next;
+                    if (valid())
+                        exportStatus.textContent = `Downloading support bundle… ${Math.floor(offset * 100 / length)}%`;
+                }
+                if (!valid())
+                    return;
+                const url = URL.createObjectURL(new Blob(chunks, { type: "application/zip" }));
+                const link = document.createElement("a");
+                link.href = url;
+                link.download = "amaterasu-support-logs.zip";
+                link.click();
+                window.setTimeout(() => URL.revokeObjectURL(url), 0);
+                exportStatus.textContent = `${sessions} retained session${sessions === 1 ? "" : "s"} included.${ready.truncated ? " Some older data was omitted." : ""}`;
+            }
+            catch (error) {
+                if (valid())
+                    exportStatus.replaceChildren(Amaterasu.errorPanel(error));
+            }
+            finally {
+                if (snapshot)
+                    await context.api.post("host-logs/close", { snapshot }).catch(() => undefined);
+                exportBusy = false;
+                exportButton.disabled = false;
+                cancelExport.hidden = true;
+                if (target.isConnected && !disposed && current !== exportGeneration)
+                    exportStatus.textContent = "Support bundle cancelled.";
+            }
+        }
+        async function load() {
+            if (disposed || !target.isConnected)
+                return;
+            stopTimer();
+            if (activeLoads >= 2) {
+                ++generation;
+                refreshPending = true;
+                return;
+            }
+            activeLoads++;
+            const current = ++generation;
+            const valid = () => !disposed && current === generation && target.isConnected;
+            let snapshot = null;
+            progress.textContent = "Opening host log…";
+            try {
+                const opened = hostLogReply(await context.api.post("host-logs/open"));
+                if (typeof opened.snapshot !== "string" || !/^[a-f0-9]{32}$/.test(opened.snapshot))
+                    throw new Error("The host returned an invalid log response.");
+                snapshot = opened.snapshot;
+                const length = hostLogInteger(opened.length, HOST_LOG_MAX_BYTES);
+                const discarded = hostLogInteger(opened.earlier_segments_discarded, Number.MAX_SAFE_INTEGER);
+                const stream = typeof opened.stream_id === "string" && /^[a-f0-9]{32}$/.test(opened.stream_id) ? opened.stream_id : null;
+                const append = stream !== null && stream === retainedStream && discarded === retainedDiscarded && length >= retainedLength;
+                const chunks = append ? [...retainedBytes] : [];
+                let offset = append ? retainedLength : 0;
+                while (offset < length && valid()) {
+                    const reply = hostLogReply(await context.api.post("host-logs/read", { snapshot, offset, limit: HOST_LOG_CHUNK_BYTES }));
+                    const nextOffset = hostLogInteger(reply.next_offset, length);
+                    if (reply.snapshot !== snapshot || reply.offset !== offset || reply.length !== length ||
+                        typeof reply.data !== "string" || typeof reply.eof !== "boolean" ||
+                        nextOffset <= offset || nextOffset - offset > HOST_LOG_CHUNK_BYTES || reply.eof !== (nextOffset === length))
+                        throw new Error("The host returned an invalid log response.");
+                    let decoded;
+                    try {
+                        decoded = atob(reply.data);
+                    }
+                    catch {
+                        throw new Error("The host returned an invalid log response.");
+                    }
+                    if (decoded.length !== nextOffset - offset)
+                        throw new Error("The host returned an invalid log response.");
+                    const bytes = Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+                    chunks.push(bytes);
+                    offset = nextOffset;
+                    if (valid())
+                        progress.textContent = `Loading host log… ${Math.floor(offset * 100 / length)}%`;
+                }
+                if (!valid())
+                    return;
+                const changed = !append || offset !== retainedLength;
+                retainedBytes = chunks;
+                retainedLength = length;
+                retainedStream = stream;
+                retainedDiscarded = discarded;
+                if (changed) {
+                    const decoder = new TextDecoder("utf-8");
+                    latestContents = chunks.map((bytes) => decoder.decode(bytes, { stream: true })).join("") + decoder.decode();
+                    if (!contents || mayFollow()) {
+                        pendingContents = null;
+                        showLatest.hidden = true;
+                        selected = 0;
+                        displayContents(latestContents, follow.checked && !search.value.trim());
+                    }
+                    else {
+                        pendingContents = latestContents;
+                        showLatest.hidden = false;
+                        download.disabled = !latestContents;
+                    }
+                    updateFollowing();
+                }
+                progress.textContent = discarded ? `${discarded} older log segments were discarded before this snapshot.` : "Snapshot loaded.";
+            }
+            catch (error) {
+                if (valid()) {
+                    progress.replaceChildren(Amaterasu.errorPanel(error));
+                }
+            }
+            finally {
+                if (snapshot)
+                    await context.api.post("host-logs/close", { snapshot }).catch(() => undefined);
+                activeLoads--;
+                if (!activeLoads) {
+                    const immediate = refreshPending;
+                    refreshPending = false;
+                    schedule(immediate);
+                }
+            }
+        }
+        document.addEventListener("visibilitychange", visibilityChanged);
+        if (typeof MutationObserver !== "undefined") {
+            observer = new MutationObserver(() => { if (!target.isConnected)
+                cleanup(); });
+            observer.observe(document.body, { childList: true, subtree: true });
+        }
+        render();
+        void load();
+        return load;
+    }
+    Amaterasu.renderHostLogs = renderHostLogs;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    function groupRecordedSessions(sessions) {
+        const groups = [];
+        for (const session of sessions) {
+            const group = groups.at(-1);
+            const newer = group?.at(-1);
+            const identityKnown = !!session.protocol.trim() && !!(session.client_name.trim() || session.device_name.trim());
+            const matching = newer && identityKnown && newer.protocol === session.protocol &&
+                newer.app_name === session.app_name && newer.client_name === session.client_name &&
+                newer.device_name === session.device_name;
+            const gap = newer && (newer.ended_at_unix === null || newer.ended_at_unix >= newer.started_at_unix) &&
+                session.ended_at_unix !== null && session.ended_at_unix >= session.started_at_unix
+                ? newer.started_at_unix - session.ended_at_unix : null;
+            if (group && matching && gap !== null && gap >= 0 && gap <= 120)
+                group.push(session);
+            else
+                groups.push([session]);
+        }
+        return groups;
+    }
+    Amaterasu.groupRecordedSessions = groupRecordedSessions;
+    function mergeRecordedSessionDetails(members) {
+        if (members.length < 2)
+            throw new Error("A grouped history needs at least two streams.");
+        const ordered = [...members].sort((a, b) => a.session.started_at_unix - b.session.started_at_unix);
+        const first = ordered[0];
+        const last = ordered.at(-1);
+        const total = (read) => {
+            const result = ordered.reduce((sum, member) => sum + read(member), 0);
+            if (!Number.isSafeInteger(result))
+                throw new Error("Grouped history counts exceed the browser limit.");
+            return result;
+        };
+        const same = (key) => ordered.every((member) => member.session[key] === last.session[key]);
+        const duration = ordered.every((member) => member.session.duration_seconds !== null)
+            ? total((member) => member.session.duration_seconds) : null;
+        return {
+            session: { ...last.session, started_at_unix: first.session.started_at_unix, duration_seconds: duration,
+                width: same("width") ? last.session.width : 0, height: same("height") ? last.session.height : 0,
+                target_fps: same("target_fps") ? last.session.target_fps : 0,
+                target_bitrate_kbps: same("target_bitrate_kbps") ? last.session.target_bitrate_kbps : 0,
+                codec: same("codec") ? last.session.codec : "" },
+            sample_count: total((member) => member.sample_count), event_count: total((member) => member.event_count),
+            samples_truncated: ordered.some((member) => member.samples_truncated),
+            events_truncated: ordered.some((member) => member.events_truncated),
+            samples: ordered.flatMap((member) => member.samples), events: ordered.flatMap((member) => member.events),
+        };
+    }
+    Amaterasu.mergeRecordedSessionDetails = mergeRecordedSessionDetails;
+    function historyLiteral(value) {
+        return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
+    }
+    function historyTime(unixSeconds) {
+        const date = new Date(unixSeconds * 1000);
+        return typeof Amaterasu.localeFormattedTextNode === "function"
+            ? Amaterasu.localeFormattedTextNode((locale) => date.toLocaleString(locale))
+            : date.toLocaleString();
+    }
+    function historyValue(value, unit, digits = 1) {
+        return value == null ? "Unavailable" : `${value.toFixed(digits)} ${unit}`;
+    }
+    function historySummaryItem(label, value) {
+        return Amaterasu.el("div", "recorded-session-summary-item", Amaterasu.el("dt", "", label), Amaterasu.el("dd", "", value));
+    }
+    function recordedChart(label, unit, samples, valueOf, source = "recorded") {
+        const values = samples.map(valueOf);
+        const available = values.filter((value) => value !== null);
+        const current = values.at(-1);
+        const maximum = Math.max(1, ...available);
+        const orderedTime = samples.every((sample, index) => index === 0 ||
+            sample.recorded_at_unix > samples[index - 1].recorded_at_unix);
+        const start = samples[0]?.recorded_at_unix ?? 0;
+        const span = (samples.at(-1)?.recorded_at_unix ?? start) - start;
+        const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        svg.setAttribute("viewBox", "0 0 320 84");
+        svg.setAttribute("width", "320");
+        svg.setAttribute("height", "84");
+        svg.setAttribute("role", "img");
+        const observation = source === "live" ? "observed " : source === "recorded" ? "recorded " : "";
+        svg.setAttribute("aria-label", `${label}; ${available.length} ${observation}${available.length === 1 ? "value" : "values"}, latest ${historyValue(current, unit, unit === "gaps" ? 0 : 1)}.`);
+        svg.setAttribute("class", "host-metric-chart");
+        const axis = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        axis.setAttribute("d", "M 0 78 H 320");
+        axis.setAttribute("class", "host-metric-chart-axis");
+        axis.setAttribute("stroke", "currentColor");
+        axis.setAttribute("stroke-opacity", "0.3");
+        svg.append(axis);
+        const segments = [];
+        let segment = [];
+        let segmentSource = source === "live" ? "live" : "recorded";
+        values.forEach((value, index) => {
+            const pointSource = samples[index].chart_source ?? (source === "live" ? "live" : "recorded");
+            if (index > 0 && (samples[index].session_id !== samples[index - 1].session_id || pointSource !== segmentSource)) {
+                if (segment.length)
+                    segments.push({ source: segmentSource, points: segment });
+                segment = [];
+            }
+            if (value === null) {
+                if (segment.length)
+                    segments.push({ source: segmentSource, points: segment });
+                segment = [];
+                return;
+            }
+            segmentSource = pointSource;
+            const timestamp = samples[index].recorded_at_unix;
+            const x = orderedTime && span > 0
+                ? (timestamp - start) / span * 320
+                : index / Math.max(samples.length - 1, 1) * 320;
+            segment.push({ x, y: 78 - value / maximum * 72 });
+        });
+        if (segment.length)
+            segments.push({ source: segmentSource, points: segment });
+        for (const { source: segmentKind, points } of segments) {
+            if (points.length === 1) {
+                const point = points[0];
+                const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+                dot.setAttribute("cx", String(point.x));
+                dot.setAttribute("cy", String(point.y));
+                dot.setAttribute("r", "3");
+                dot.setAttribute("class", `host-metric-chart-line${segmentKind === "live" ? " host-metric-chart-live" : ""}`);
+                svg.append(dot);
+            }
+            else {
+                const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+                line.setAttribute("points", points.map((point) => `${point.x},${point.y}`).join(" "));
+                line.setAttribute("class", `host-metric-chart-line${segmentKind === "live" ? " host-metric-chart-live" : ""}`);
+                if (segmentKind === "live")
+                    line.setAttribute("stroke-dasharray", "4 3");
+                line.setAttribute("fill", "none");
+                line.setAttribute("stroke", "currentColor");
+                line.setAttribute("stroke-width", "2");
+                svg.append(line);
+            }
+        }
+        return Amaterasu.el("div", "host-metric-chart-card", Amaterasu.el("div", "host-metric-chart-heading", Amaterasu.el("strong", "", label), Amaterasu.el("span", "", historyLiteral(historyValue(current, unit, unit === "gaps" ? 0 : 1)))), svg, Amaterasu.el("small", "muted", historyLiteral(available.length
+            ? `${available.length} ${observation}values · scale 0–${maximum.toFixed(unit === "gaps" ? 0 : 1)} ${unit}`
+            : source === "live" ? "No observed values." : "No recorded values.")));
+    }
+    function combineActiveSamples(recorded, live, retentionSeconds, maxPoints) {
+        const livePoints = live.samples.filter((sample) => sample.chart_source === "live" &&
+            Number.isSafeInteger(sample.interval_start_unix_ms) && sample.session_id === live.session.session_id);
+        const recordedPoints = (recorded?.samples ?? []).map((sample) => ({ ...sample, chart_source: "recorded" }));
+        let note = "";
+        let appended = livePoints;
+        if (recordedPoints.length) {
+            const ordered = recordedPoints.every((sample, index) => sample.session_id === live.session.session_id &&
+                (index === 0 || sample.recorded_at_unix > recordedPoints[index - 1].recorded_at_unix));
+            const last = recordedPoints.at(-1).recorded_at_unix;
+            const boundary = (last + 1) * 1000;
+            if (!ordered || !Number.isSafeInteger(boundary) || (livePoints.length > 0 &&
+                livePoints.at(-1).recorded_at_unix * 1000 < last * 1000)) {
+                appended = [];
+                note = "Recorded and live times cannot be safely joined; select Live only for current observations.";
+            }
+            else {
+                appended = livePoints.filter((sample) => sample.interval_start_unix_ms >= boundary);
+                if (livePoints.length && !appended.length)
+                    note = "Recent live intervals overlap recorded samples; select Live only to inspect them.";
+            }
+        }
+        const combined = [...recordedPoints, ...appended];
+        const newest = combined.length ? Math.max(...combined.map((sample) => sample.recorded_at_unix)) : 0;
+        const samples = combined.filter((sample) => sample.recorded_at_unix >= newest - retentionSeconds).slice(-maxPoints);
+        return { samples, recordedCount: samples.filter((sample) => sample.chart_source === "recorded").length,
+            liveCount: samples.filter((sample) => sample.chart_source === "live").length, note };
+    }
+    Amaterasu.combineActiveSamples = combineActiveSamples;
+    function createLiveSessionCard() {
+        const heading = Amaterasu.el("div");
+        const liveSummary = Amaterasu.el("p", "live-session-current");
+        const sourceControls = Amaterasu.el("div", "recorded-session-ranges live-session-sources");
+        sourceControls.setAttribute("role", "group");
+        sourceControls.setAttribute("aria-label", "Stream chart source");
+        const controls = Amaterasu.el("div", "recorded-session-ranges");
+        controls.setAttribute("role", "group");
+        controls.setAttribute("aria-label", "Live session sample range");
+        const status = Amaterasu.el("p", "muted recorded-session-range-status");
+        const legend = Amaterasu.el("p", "muted live-session-legend");
+        const charts = Amaterasu.el("div");
+        const choices = [];
+        const sourceChoices = [];
+        let mode = "combined";
+        let range = null;
+        let live = null;
+        let recorded = null;
+        let historyNote = "";
+        let rounded = false;
+        let retentionSeconds = 300;
+        let maxPoints = 300;
+        function draw() {
+            for (const choice of sourceChoices)
+                choice.node.setAttribute("aria-pressed", String(choice.mode === mode));
+            for (const choice of choices)
+                choice.node.setAttribute("aria-pressed", String(choice.minutes === range));
+            if (!live) {
+                charts.replaceChildren();
+                return;
+            }
+            const latestLive = live.samples.at(-1);
+            liveSummary.textContent = latestLive
+                ? `Latest live rate: ${historyValue(latestLive.actual_fps, "fps")} · ${historyValue(latestLive.actual_bitrate_kbps / 1000, "Mbit/s")} · host observation ${new Date(latestLive.recorded_at_unix * 1000).toLocaleString()}.${rounded ? " Very large counters are rounded for display." : ""}`
+                : "Latest live rate: waiting for two host counter readings.";
+            if (mode === "recorded" && !recorded) {
+                status.textContent = historyNote || "Recorded history is unavailable. Select Live only to see current observations.";
+                legend.textContent = "";
+                charts.replaceChildren();
+                return;
+            }
+            const combined = combineActiveSamples(recorded, live, retentionSeconds, maxPoints);
+            const points = mode === "live" ? live.samples : mode === "recorded"
+                ? (recorded?.samples ?? []).map((sample) => ({ ...sample, chart_source: "recorded" })) : combined.samples;
+            const newest = points.length ? Math.max(...points.map((sample) => sample.recorded_at_unix)) : 0;
+            const selectedRange = range;
+            const selected = selectedRange === null ? points : points.filter((sample) => sample.recorded_at_unix >= newest - selectedRange * 60);
+            const recordedCount = points.filter((sample) => sample.chart_source === "recorded").length;
+            const liveCount = points.filter((sample) => sample.chart_source === "live").length;
+            const description = mode === "combined" ? `${recordedCount} recorded · ${liveCount} live.`
+                : mode === "live" ? "Live observations stay in this browser." : "Recorded samples are retained by the host.";
+            status.textContent = `${selected.length} of ${points.length} samples shown. ${description}${mode === "combined" && combined.note ? ` ${combined.note}` : ""}${historyNote ? ` ${historyNote}` : ""}`;
+            legend.textContent = mode === "combined" && liveCount ? "Recorded: solid / filled · Live: dashed / hollow" : "";
+            if (!selected.length) {
+                charts.replaceChildren(Amaterasu.empty("No samples in this range", points.length ? "Choose a longer range." : mode === "recorded" ? "Waiting for recorded samples." : "Waiting for another live counter reading."));
+                return;
+            }
+            const chartSource = mode === "combined" ? "combined" : mode;
+            charts.replaceChildren(Amaterasu.el("div", "recorded-session-chart-grid", recordedChart("Accepted video rate", "fps", selected, (sample) => sample.actual_fps, chartSource), recordedChart("Accepted audio/video payload rate", "Mbit/s", selected, (sample) => sample.actual_bitrate_kbps / 1000, chartSource), recordedChart("Encoder latency", "ms", selected, (sample) => sample.encode_latency_ms ?? null, chartSource), recordedChart("Observed video sequence gaps", "gaps", selected, (sample) => sample.dropped_frames, chartSource)));
+        }
+        for (const [nextMode, label] of [["combined", "History + live"], ["live", "Live only"], ["recorded", "Recorded only"]]) {
+            const node = Amaterasu.button(label, () => { mode = nextMode; draw(); }, "recorded-range-button");
+            sourceChoices.push({ mode: nextMode, node });
+            sourceControls.append(node);
+        }
+        for (const minutes of [null, 3, 5, 15, 30, 60]) {
+            const node = Amaterasu.button(minutes === null ? "Available samples" : `${minutes} min`, () => { range = minutes; draw(); }, "recorded-range-button");
+            choices.push({ minutes, node });
+            controls.append(node);
+        }
+        const element = Amaterasu.el("article", "live-session-card", heading, Amaterasu.el("p", "muted", "Host-side accepted media and observed sequence gaps; client delivery is not confirmed."), liveSummary, sourceControls, controls, status, legend, charts);
+        return { element, update(session, nextLive, nextRecorded, nextNote, nextRounded, nextRetention, nextMaximum) {
+                live = nextLive;
+                recorded = nextRecorded;
+                historyNote = nextNote;
+                rounded = nextRounded;
+                retentionSeconds = nextRetention;
+                maxPoints = nextMaximum;
+                const resolution = session.width && session.height ? `${session.width} × ${session.height}` : "Resolution unavailable";
+                const fps = session.target_fps ? ` · ${session.target_fps} fps target` : "";
+                const title = session.app_name || session.device_name || "Live stream";
+                const client = session.app_name ? session.device_name || session.client_name || "Client unavailable"
+                    : session.device_name ? "" : `Stream ${session.session_id}`;
+                heading.replaceChildren(Amaterasu.el("div", "live-session-heading", Amaterasu.el("div", "", Amaterasu.el("span", "live-session-label", "Active"), Amaterasu.el("h3", "", historyLiteral(title)), Amaterasu.el("p", "muted", historyLiteral([client, session.protocol || "Protocol unavailable"].filter(Boolean).join(" · ")))), Amaterasu.el("p", "muted", historyLiteral(`${resolution}${fps} · ${session.codec || "Codec unavailable"}`))));
+                draw();
+            } };
+    }
+    Amaterasu.createLiveSessionCard = createLiveSessionCard;
+    function renderRecordedSessionDetail(detail, close, complete = false, members) {
+        const session = detail.session;
+        const chartArea = Amaterasu.el("div");
+        const rangeStatus = Amaterasu.el("p", "muted recorded-session-range-status");
+        rangeStatus.setAttribute("role", "status");
+        const rangeControls = Amaterasu.el("div", "recorded-session-ranges");
+        rangeControls.setAttribute("role", "group");
+        rangeControls.setAttribute("aria-label", "Recorded sample range");
+        const rangeButtons = [];
+        const newest = detail.samples.length ? Math.max(...detail.samples.map((sample) => sample.recorded_at_unix)) : 0;
+        let range = null;
+        function draw() {
+            const selectedRange = range;
+            const samples = selectedRange === null ? detail.samples : detail.samples.filter((sample) => sample.recorded_at_unix >= newest - selectedRange * 60);
+            for (const choice of rangeButtons)
+                choice.node.setAttribute("aria-pressed", String(choice.minutes === range));
+            if (!samples.length) {
+                chartArea.replaceChildren(Amaterasu.empty("No samples in this range", detail.samples.length
+                    ? "Choose a longer range to inspect retained samples." : "No samples were recorded for this session."));
+                rangeStatus.textContent = "No recorded samples in this range.";
+                return;
+            }
+            const ordered = samples.every((sample, index) => index === 0 || sample.recorded_at_unix > samples[index - 1].recorded_at_unix);
+            const spacing = samples.length === 1 ? " · single sample" : ordered
+                ? " · time-proportional spacing" : " · evenly spaced in recorded order because timestamps repeat or move backward";
+            rangeStatus.textContent = `${samples.length} of ${detail.samples.length} returned samples${spacing}.`;
+            chartArea.replaceChildren(Amaterasu.el("div", "recorded-session-chart-grid", recordedChart("Accepted video rate", "fps", samples, (sample) => sample.actual_fps), recordedChart("Accepted audio/video payload rate", "Mbit/s", samples, (sample) => sample.actual_bitrate_kbps / 1000), recordedChart("Encoder latency", "ms", samples, (sample) => sample.encode_latency_ms ?? null), recordedChart("Observed video sequence gaps", "gaps", samples, (sample) => sample.dropped_frames)));
+        }
+        for (const minutes of [null, 3, 5, 15, 30, 60]) {
+            const node = Amaterasu.button(minutes === null ? "Available samples" : `${minutes} min`, () => { range = minutes; draw(); }, "recorded-range-button");
+            rangeButtons.push({ minutes, node });
+            rangeControls.append(node);
+        }
+        const download = Amaterasu.button(complete ? "Download retained history (JSON)" : "Download returned history (JSON)", () => {
+            const payload = JSON.stringify(members
+                ? { format: "amaterasu-session-history-group/1", scope: complete ? "retained_snapshots" : "recent_snapshots", members }
+                : { format: "amaterasu-session-history/1", scope: complete ? "retained_snapshot" : "recent_snapshot", detail }, null, 2);
+            const url = URL.createObjectURL(new Blob([payload], { type: "application/json;charset=utf-8" }));
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = members ? "amaterasu-session-history-group.json" : "amaterasu-session-history.json";
+            link.click();
+            window.setTimeout(() => URL.revokeObjectURL(url), 0);
+        });
+        const resolution = session.width && session.height ? `${session.width} × ${session.height}` : "Unavailable";
+        const targetFps = session.target_fps ? `${session.target_fps} fps` : "Unavailable";
+        const targetBitrate = session.target_bitrate_kbps ? `${(session.target_bitrate_kbps / 1000).toFixed(1)} Mbit/s` : "Unavailable";
+        const duration = session.duration_seconds === null ? (session.ended_at_unix === null ? "Active" : "Unavailable") : `${session.duration_seconds} seconds`;
+        const sampleArea = Amaterasu.el("div");
+        let samplePage = 0;
+        function drawSamples() {
+            const start = samplePage * 50;
+            const visible = detail.samples.slice(start, start + 50);
+            sampleArea.replaceChildren(visible.length ? Amaterasu.table([...(members ? ["Stream"] : []), "Recorded time", "Accepted frames", "Accepted bytes", "Sequence gaps", "Video fps", "Payload kbps", "Encoder latency"], visible.map((sample) => [...(members ? [historyLiteral(sample.session_id)] : []), historyTime(sample.recorded_at_unix), String(sample.frames_sent), String(sample.bytes_sent),
+                String(sample.dropped_frames), sample.actual_fps.toFixed(1), sample.actual_bitrate_kbps.toFixed(1), historyValue(sample.encode_latency_ms, "ms")])) : Amaterasu.el("p", "muted", "No samples recorded."), ...(detail.samples.length > 50 ? [Amaterasu.pager(samplePage > 0 ? () => { samplePage--; drawSamples(); } : null, start + visible.length < detail.samples.length ? () => { samplePage++; drawSamples(); } : null, historyLiteral(`Samples ${start + 1}–${start + visible.length} of ${detail.samples.length}`))] : []));
+        }
+        drawSamples();
+        const sampleDisclosure = Amaterasu.el("details", "recorded-session-disclosure", Amaterasu.el("summary", "", "Sample table"), sampleArea);
+        const eventDisclosure = Amaterasu.el("details", "recorded-session-disclosure", Amaterasu.el("summary", "", "Recorded events"));
+        const eventArea = Amaterasu.el("div");
+        let eventPage = 0;
+        function drawEvents() {
+            const start = eventPage * 25;
+            const visible = detail.events.slice(start, start + 25);
+            const rows = visible.map((event) => {
+                const row = Amaterasu.el("div", "recorded-session-event", Amaterasu.el("strong", "", historyLiteral(event.event_type)), Amaterasu.el("small", "muted", historyTime(event.recorded_at_unix)), ...(members ? [Amaterasu.el("small", "muted", historyLiteral(`Stream ${event.session_id}`))] : []));
+                if (event.payload != null)
+                    row.append(Amaterasu.el("details", "", Amaterasu.el("summary", "", "Event details"), Amaterasu.el("pre", "recorded-session-event-payload", historyLiteral(JSON.stringify(event.payload, null, 2)))));
+                return row;
+            });
+            eventArea.replaceChildren(...(rows.length ? rows : [Amaterasu.el("p", "muted", "No events recorded.")]), ...(detail.events.length > 25 ? [Amaterasu.pager(eventPage > 0 ? () => { eventPage--; drawEvents(); } : null, start + visible.length < detail.events.length ? () => { eventPage++; drawEvents(); } : null, historyLiteral(`Events ${start + 1}–${start + visible.length} of ${detail.events.length}`))] : []));
+        }
+        drawEvents();
+        eventDisclosure.append(eventArea);
+        const info = Amaterasu.el("dl", "recorded-session-summary", historySummaryItem("Client", historyLiteral(session.client_name || session.device_name || "Unavailable")), historySummaryItem("Protocol", historyLiteral(session.protocol || "Unavailable")), historySummaryItem("Resolution", historyLiteral(resolution)), historySummaryItem("Target frame rate", historyLiteral(targetFps)), historySummaryItem("Target bitrate", historyLiteral(targetBitrate)), historySummaryItem("Codec", historyLiteral(session.codec || "Unavailable")), historySummaryItem(members ? "Total stream time" : "Duration", historyLiteral(duration)), historySummaryItem("Started", historyTime(session.started_at_unix)));
+        const heading = Amaterasu.el("div", "recorded-session-heading", Amaterasu.el("div", "", Amaterasu.el("h2", "", historyLiteral(`History for ${session.app_name || (members ? "Unnamed application" : session.session_id)}${members ? ` · ${members.length} nearby streams` : ""}`)), Amaterasu.el("p", "muted", historyLiteral(`${detail.samples.length} of ${detail.sample_count} samples · ${detail.events.length} of ${detail.event_count} events`))), Amaterasu.el("div", "actions", download, Amaterasu.button("Close details", close)));
+        const limitation = detail.samples_truncated || detail.events_truncated
+            ? Amaterasu.el("p", "notice", "Only the latest returned samples and events are available here and in the JSON download.")
+            : Amaterasu.el("p", "muted", complete
+                ? members ? "The JSON download contains each retained snapshot regardless of chart range. Older records may have been removed before the snapshots."
+                    : "The JSON download contains the retained snapshot regardless of chart range. Older records may have been removed before this snapshot."
+                : "The JSON download contains all returned session metadata, samples and events regardless of chart range.");
+        const groupNote = members ? Amaterasu.el("p", "muted", "These streams are grouped by matching names and a short time gap; a reconnect is not confirmed. Chart lines stop between streams, and the download preserves each stream separately.") : null;
+        const box = Amaterasu.el("section", "panel recorded-session-detail", heading, info, groupNote, limitation, Amaterasu.el("h3", "", "Recorded stream performance"), Amaterasu.el("p", "muted", "Rates and counters describe host-side media accepted by the local transport queue, including audio payload bytes. Sequence gaps are not client-reported loss; client delivery is not confirmed. Zero rates can also represent a zero-duration final sample."), rangeControls, rangeStatus, chartArea, sampleDisclosure, eventDisclosure);
+        draw();
+        return box;
+    }
+    Amaterasu.renderRecordedSessionDetail = renderRecordedSessionDetail;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    const TIMELINE_LIMITS = { samples: 25_000, events: 5_000 };
+    const TIMELINE_PAGE_LIMITS = { samples: 32, events: 8 };
+    function timelineRecord(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("The retained history response is invalid.");
+        return value;
+    }
+    function timelineId(value) {
+        if (typeof value !== "string" || !/^[1-9][0-9]{0,18}$/.test(value) || BigInt(value) > 9223372036854775807n)
+            throw new Error("The retained history cursor is invalid.");
+        return value;
+    }
+    function timelineCursor(value) {
+        const cursor = timelineRecord(value);
+        if (Object.keys(cursor).sort().join(",") !== "after_id,first_id,kind,last_id,session_id,total" ||
+            typeof cursor.session_id !== "string" || !cursor.session_id || (cursor.kind !== "samples" && cursor.kind !== "events") ||
+            !Number.isSafeInteger(cursor.total) || cursor.total < 1)
+            throw new Error("The retained history cursor is invalid.");
+        const first = timelineId(cursor.first_id);
+        const last = timelineId(cursor.last_id);
+        const after = cursor.after_id === null ? null : timelineId(cursor.after_id);
+        if (BigInt(first) > BigInt(last) || (after !== null && (BigInt(after) < BigInt(first) || BigInt(after) >= BigInt(last))))
+            throw new Error("The retained history cursor is invalid.");
+        return { session_id: cursor.session_id, kind: cursor.kind, first_id: first, last_id: last, after_id: after, total: cursor.total };
+    }
+    function timelineWindow(value, kind, sessionId) {
+        const window = timelineRecord(value);
+        if (!Number.isSafeInteger(window.total) || window.total < 0)
+            throw new Error("The retained history count is invalid.");
+        const total = window.total;
+        if (total > TIMELINE_LIMITS[kind])
+            throw new Error(`This session exceeds the browser limit of ${TIMELINE_LIMITS[kind]} retained ${kind}. The recent snapshot remains available.`);
+        if (total === 0 && window.cursor === null)
+            return { total, cursor: null };
+        const cursor = timelineCursor(window.cursor);
+        if (cursor.session_id !== sessionId || cursor.kind !== kind || cursor.total !== total || cursor.after_id !== null)
+            throw new Error("The retained history window is inconsistent.");
+        return { total, cursor };
+    }
+    async function loadLiveSampleSnapshot(api, sessionId, limit, previous, active) {
+        const opened = timelineRecord(await api.post("history/timeline_open", { session_id: sessionId, sample_limit: limit }));
+        if (!active())
+            return null;
+        if (opened.ok !== true)
+            throw new Error("Live sample history is unavailable.");
+        const session = Amaterasu.parseHistoryDetailReply({ ok: true, detail: { session: opened.session,
+                sample_count: 0, event_count: 0, samples_truncated: false, events_truncated: false, samples: [], events: [] } }, sessionId).detail.session;
+        const window = timelineWindow(opened.samples, "samples", sessionId);
+        if (window.total > limit)
+            throw new Error("The live sample window exceeds its limit.");
+        if (!window.cursor)
+            return { session, ids: [], samples: [] };
+        const boundary = window.cursor;
+        let prefix = { session, ids: [], samples: [] };
+        if (previous && previous.ids.length === previous.samples.length && previous.session.session_id === sessionId) {
+            const keep = previous.ids.map((id, index) => ({ id, sample: previous.samples[index] })).filter(({ id }) => BigInt(id) >= BigInt(boundary.first_id) && BigInt(id) <= BigInt(boundary.last_id));
+            if (keep[0]?.id === boundary.first_id && keep.length <= window.total &&
+                keep.every(({ id }, index) => index === 0 || BigInt(id) > BigInt(keep[index - 1].id)))
+                prefix = { session, ids: keep.map(({ id }) => id), samples: keep.map(({ sample }) => sample) };
+        }
+        async function read(reuse) {
+            const result = { session, ids: [...reuse.ids], samples: [...reuse.samples] };
+            const lastKnown = result.ids.at(-1);
+            if (lastKnown === boundary.last_id)
+                return result.ids.length === window.total ? result : null;
+            let cursor = { ...boundary, after_id: lastKnown ?? null };
+            while (cursor && active()) {
+                const previousCursor = cursor;
+                const reply = timelineRecord(await api.post("history/timeline_page", {
+                    session_id: sessionId, kind: "samples", cursor, limit: TIMELINE_PAGE_LIMITS.samples,
+                }));
+                if (!active())
+                    return null;
+                if (reply.ok !== true || reply.session_id !== sessionId || reply.kind !== "samples" || reply.total !== window.total ||
+                    !Array.isArray(reply.entries) || !Array.isArray(reply.entry_ids) || reply.entries.length === 0 ||
+                    reply.entries.length > TIMELINE_PAGE_LIMITS.samples || reply.entry_ids.length !== reply.entries.length)
+                    throw new Error("The live sample page is invalid.");
+                const ids = reply.entry_ids.map(timelineId);
+                let last = previousCursor.after_id;
+                for (const id of ids) {
+                    if (BigInt(id) < BigInt(boundary.first_id) || BigInt(id) > BigInt(boundary.last_id) ||
+                        (last !== null && BigInt(id) <= BigInt(last)))
+                        throw new Error("The live sample IDs are invalid.");
+                    last = id;
+                }
+                const parsed = Amaterasu.parseHistoryDetailReply({ ok: true, detail: { session,
+                        sample_count: reply.entries.length, event_count: 0, samples_truncated: false, events_truncated: false,
+                        samples: reply.entries, events: [] } }, sessionId).detail;
+                result.ids.push(...ids);
+                result.samples.push(...parsed.samples);
+                if (result.ids.length > window.total)
+                    return null;
+                if (reply.next_cursor === null) {
+                    if (last !== boundary.last_id)
+                        throw new Error("The live sample page ended early.");
+                    cursor = null;
+                }
+                else {
+                    const next = timelineCursor(reply.next_cursor);
+                    if (next.session_id !== sessionId || next.kind !== "samples" || next.first_id !== boundary.first_id ||
+                        next.last_id !== boundary.last_id || next.total !== boundary.total || next.after_id !== last)
+                        throw new Error("The live sample cursor is invalid.");
+                    cursor = next;
+                }
+            }
+            if (!active())
+                return null;
+            return result.ids.length === window.total ? result : null;
+        }
+        let result;
+        try {
+            result = await read(prefix);
+        }
+        catch (error) {
+            if (!prefix.ids.length || !error || typeof error !== "object" || error.code !== "invalid_request")
+                throw error;
+            result = null;
+        }
+        if (!active())
+            return null;
+        if (!result && prefix.ids.length)
+            result = await read({ session, ids: [], samples: [] });
+        if (!active())
+            return null;
+        if (!result)
+            throw new Error("The live sample window changed while it was loading.");
+        return result;
+    }
+    Amaterasu.loadLiveSampleSnapshot = loadLiveSampleSnapshot;
+    async function loadRetainedTimeline(api, sessionId, active, progress) {
+        let halted = false;
+        const current = () => !halted && active();
+        const opened = timelineRecord(await api.post("history/timeline_open", { session_id: sessionId }));
+        if (!current())
+            return null;
+        if (opened.ok !== true)
+            throw new Error("Retained history is unavailable.");
+        const session = timelineRecord(opened.session);
+        const sampleWindow = timelineWindow(opened.samples, "samples", sessionId);
+        const eventWindow = timelineWindow(opened.events, "events", sessionId);
+        const metadata = Amaterasu.parseHistoryDetailReply({ ok: true, detail: { session,
+                sample_count: 0, event_count: 0, samples_truncated: false, events_truncated: false, samples: [], events: [] } }, sessionId).detail.session;
+        const counts = { samples: 0, events: 0 };
+        const report = () => { if (current())
+            progress(counts.samples, sampleWindow.total, counts.events, eventWindow.total); };
+        async function read(kind, window) {
+            let cursor = window.cursor;
+            const rows = [];
+            while (cursor && current()) {
+                const previous = cursor;
+                const reply = timelineRecord(await api.post("history/timeline_page", {
+                    session_id: sessionId, kind, cursor, limit: TIMELINE_PAGE_LIMITS[kind],
+                }));
+                if (!current())
+                    break;
+                if (reply.ok !== true || reply.session_id !== sessionId || reply.kind !== kind || reply.total !== window.total ||
+                    !Array.isArray(reply.entries) || reply.entries.length === 0 || reply.entries.length > TIMELINE_PAGE_LIMITS[kind])
+                    throw new Error("The retained history page is invalid.");
+                const entries = reply.entries;
+                Amaterasu.parseHistoryDetailReply({ ok: true, detail: { session: metadata,
+                        sample_count: kind === "samples" ? entries.length : 0, event_count: kind === "events" ? entries.length : 0,
+                        samples_truncated: false, events_truncated: false, samples: kind === "samples" ? entries : [], events: kind === "events" ? entries : [] } }, sessionId);
+                rows.push(...entries);
+                if (rows.length > window.total)
+                    throw new Error("The retained history page exceeds its snapshot.");
+                counts[kind] = rows.length;
+                report();
+                if (reply.next_cursor === null)
+                    cursor = null;
+                else {
+                    const next = timelineCursor(reply.next_cursor);
+                    if (next.session_id !== previous.session_id || next.kind !== previous.kind || next.first_id !== previous.first_id || next.last_id !== previous.last_id || next.total !== previous.total ||
+                        next.after_id === null || (previous.after_id !== null && BigInt(next.after_id) <= BigInt(previous.after_id)))
+                        throw new Error("The retained history cursor did not advance.");
+                    cursor = next;
+                }
+                if ((cursor === null) !== (rows.length === window.total))
+                    throw new Error("The retained history page does not match its snapshot count.");
+            }
+            return rows;
+        }
+        report();
+        try {
+            const [samples, events] = await Promise.all([read("samples", sampleWindow), read("events", eventWindow)]);
+            if (!current())
+                return null;
+            return { session: metadata, sample_count: sampleWindow.total, event_count: eventWindow.total,
+                samples_truncated: false, events_truncated: false,
+                samples: samples, events: events };
+        }
+        catch (error) {
+            halted = true;
+            if (!active())
+                return null;
+            throw error;
+        }
+    }
+    Amaterasu.loadRetainedTimeline = loadRetainedTimeline;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function pagesTextLiteral(value) {
         return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
     }
@@ -10686,34 +13323,63 @@ var Amaterasu;
     }
     function renderOverview(context) {
         const area = Amaterasu.el("div");
-        context.content.append(Amaterasu.sectionHeading("Host overview", "Your applications, sessions, and local services in one place.", Amaterasu.button("Refresh", load)), area);
+        const activityArea = Amaterasu.el("div", "overview-activity-area");
+        const hostMetricsArea = Amaterasu.el("div", "overview-host-metrics");
+        area.append(Amaterasu.el("p", "muted overview-loading", "Loading host information…"));
+        let refreshGeneration = 0;
+        let refreshActivity = () => { };
+        context.content.append(Amaterasu.sectionHeading("Host overview", "Your applications, sessions, and local services in one place.", Amaterasu.button("Refresh", () => { void load(); refreshActivity(); })), activityArea, hostMetricsArea, area);
+        refreshActivity = renderOverviewActivity(context, activityArea);
+        if (context.api.allows("configuration.read") && context.api.allows("diagnostics.read")) {
+            Amaterasu.renderHostMetricsDashboard(context, hostMetricsArea, undefined, "overview");
+        }
+        else {
+            hostMetricsArea.append(Amaterasu.panel("Host vitals", Amaterasu.el("p", "muted", "Host measurements require configuration.read and diagnostics.read.")));
+        }
         async function load() {
+            const generation = ++refreshGeneration;
             const snapshots = await Promise.allSettled([
                 context.api.post("catalog/list", { limit: 32 }),
                 context.api.post("session/list", { limit: 16 }),
                 context.api.post("application/list", { limit: 16 }),
                 context.api.post("steam/status"),
             ]);
-            if (!context.content.isConnected)
+            if (!context.content.isConnected || generation !== refreshGeneration)
                 return;
             const [catalog, sessions, applications, steam] = snapshots;
             const metrics = Amaterasu.el("div", "metrics");
             const addMetric = (label, value, detail) => metrics.append(Amaterasu.el("div", "metric", Amaterasu.el("span", "muted", label), Amaterasu.el("strong", "", pagesTextLiteral(value)), Amaterasu.el("small", "muted", detail)));
             addMetric("Catalog applications", catalog?.status === "fulfilled"
                 ? Amaterasu.countLabel(catalog.value.entries.length, catalog.value.next_cursor)
-                : "—", "Manual library entries");
-            addMetric("Sessions", sessions?.status === "fulfilled"
+                : "—", "Catalog entries returned");
+            addMetric("Session records", sessions?.status === "fulfilled"
                 ? Amaterasu.countLabel(sessions.value.sessions.length, sessions.value.next_offset)
-                : "—", "Current host instance");
+                : "—", "Caller-scoped coordination records");
             addMetric("Tracked processes", applications?.status === "fulfilled"
                 ? Amaterasu.countLabel(applications.value.processes.length, applications.value.next_offset)
                 : "—", "Running and recently exited");
             addMetric("Steam discoveries", steam?.status === "fulfilled" ? String(steam.value.game_count) : "—", steam?.status === "fulfilled" && steam.value.scanning
                 ? "Scanning local libraries"
                 : "Latest provider scan");
-            const hero = Amaterasu.el("section", "overview-hero", Amaterasu.el("div", "", Amaterasu.badge("YOUR HOST, YOUR LIBRARY", "accent"), Amaterasu.el("h2", "", "A home for your applications."), Amaterasu.el("p", "", "Curate your library and manage the services that keep this host running."), Amaterasu.button("Open your library →", () => context.navigate("catalog"), "primary")), Amaterasu.el("div", "orbit-art", Amaterasu.el("span", "orbit one"), Amaterasu.el("span", "orbit two"), Amaterasu.el("span", "orbit-core", "A")));
+            const available = snapshots.filter((snapshot) => snapshot.status === "fulfilled").length;
+            const status = Amaterasu.el("section", "overview-status", Amaterasu.el("div", "overview-status-icon", available === snapshots.length ? "✓" : "!"), Amaterasu.el("div", "overview-status-copy", Amaterasu.el("p", "overview-status-label", "SERVICE ACCESS"), Amaterasu.el("h2", "", available === snapshots.length ? "Services responding" : "Some information is unavailable"), Amaterasu.el("p", "muted", available === snapshots.length
+                ? "Catalog, session coordination, applications, and Steam responded to the latest refresh."
+                : "Some service requests could not be completed. Check service access below for details.")));
+            const quickActions = Amaterasu.el("div", "quick-actions");
+            for (const [page, label, detail, scope] of [
+                ["host", "Host & devices", "Review pairing and host services", "configuration.read"],
+                ["catalog", "Library", "Manage applications in your library", "catalog.read"],
+                ["sessions", "Sessions", "View sessions and host metrics", "session.read"],
+                ["settings", "Settings", "Configure your host", "configuration.read"],
+            ]) {
+                if (!context.api.allows(scope))
+                    continue;
+                const action = Amaterasu.button(label, () => context.navigate(page), "quick-action");
+                action.append(Amaterasu.el("small", "muted", detail), Amaterasu.el("span", "quick-action-arrow", "→"));
+                quickActions.append(action);
+            }
             const serviceRows = snapshots.map((snapshot, index) => [
-                Amaterasu.el("strong", "", pagesTextMessage(["Catalog", "Sessions", "Applications", "Steam provider"][index] ?? "")),
+                Amaterasu.el("strong", "", pagesTextMessage(["Catalog", "Session coordination", "Applications", "Steam provider"][index] ?? "")),
                 snapshot.status === "fulfilled"
                     ? Amaterasu.badge(pagesTextMessage("Available"), "good")
                     : Amaterasu.badge(pagesTextMessage("Unavailable")),
@@ -10721,11 +13387,103 @@ var Amaterasu;
                     ? Amaterasu.messageOf(snapshot.reason)
                     : pagesTextMessage("Responded to the latest refresh"),
             ]);
-            area.replaceChildren(hero, metrics, Amaterasu.panel("Service access", Amaterasu.table(["Service", "Status", "Details"], serviceRows)), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Streaming is still being built"), Amaterasu.el("p", "", "Review pending device pairing from Host & devices. Capture controls and a browser streaming view are not available in this release.")));
+            const details = Amaterasu.el("div", "overview-details", Amaterasu.panel("Service access", Amaterasu.table(["Service", "Status", "Details"], serviceRows)));
+            if (quickActions.hasChildNodes())
+                details.append(Amaterasu.panel("Quick actions", quickActions));
+            area.replaceChildren(status, metrics, details);
         }
         void load();
     }
     Amaterasu.renderOverview = renderOverview;
+    function renderOverviewActivity(context, container) {
+        if (!context.api.allows("session.read")) {
+            container.append(Amaterasu.panel("Stream activity", Amaterasu.el("p", "muted", "Stream activity requires session.read.")));
+            return () => { };
+        }
+        const summary = Amaterasu.el("strong", "", "Loading host stream activity…");
+        const launchStatus = Amaterasu.el("p", "muted");
+        const observation = Amaterasu.el("p", "muted");
+        const icon = Amaterasu.el("div", "overview-status-icon", "↗");
+        icon.setAttribute("aria-hidden", "true");
+        container.append(Amaterasu.el("section", "overview-activity-panel", Amaterasu.el("div", "overview-activity-state", icon, Amaterasu.el("div", "overview-activity-copy", Amaterasu.el("p", "overview-status-label", "STREAM ACTIVITY"), Amaterasu.el("h2", "overview-activity-summary", summary), launchStatus, observation)), Amaterasu.button("View sessions", () => context.navigate("sessions"))));
+        let generation = 0;
+        let timer;
+        let disposed = false;
+        const observer = new MutationObserver(() => {
+            if (!container.isConnected)
+                cleanup();
+        });
+        function cleanup() {
+            if (disposed)
+                return;
+            disposed = true;
+            generation++;
+            if (timer !== undefined)
+                window.clearTimeout(timer);
+            document.removeEventListener("visibilitychange", visibilityChanged);
+            observer.disconnect();
+        }
+        function current(request) {
+            return !disposed && container.isConnected && document.visibilityState === "visible" && request === generation;
+        }
+        function visibilityChanged() {
+            if (!container.isConnected) {
+                cleanup();
+                return;
+            }
+            if (document.visibilityState === "visible")
+                refresh();
+            else {
+                generation++;
+                if (timer !== undefined)
+                    window.clearTimeout(timer);
+                timer = undefined;
+            }
+        }
+        function refresh() {
+            if (disposed || !container.isConnected || document.visibilityState !== "visible")
+                return;
+            if (timer !== undefined)
+                window.clearTimeout(timer);
+            timer = undefined;
+            const request = ++generation;
+            launchStatus.textContent = "Refreshing pending launch tracking…";
+            void context.api.post("live-streams/status").then((reply) => {
+                const snapshot = Amaterasu.parseLiveStreamSnapshot(reply);
+                if (!current(request))
+                    return;
+                const count = snapshot.streams.length;
+                summary.textContent = count === 0 ? "No active streams reported" :
+                    `${count} active ${count === 1 ? "stream" : "streams"} reported`;
+                observation.textContent = `Host observation: ${new Date(snapshot.sampledAtUnixMs).toLocaleString()}. Client media delivery is not verified.`;
+            }).catch(() => {
+                if (!current(request))
+                    return;
+                summary.textContent = "Live stream status is unavailable";
+                observation.textContent = "The host did not provide a current stream status. Try refreshing.";
+            }).finally(() => {
+                if (current(request))
+                    timer = window.setTimeout(refresh, 10_000);
+            });
+            void context.api.post("history/history_status").then((reply) => {
+                const status = parseHistoryRuntimeStatus(reply);
+                if (!current(request))
+                    return;
+                if (!status.available || !status.configuration_ready) {
+                    launchStatus.textContent = "Pending launch tracking is unavailable.";
+                    return;
+                }
+                launchStatus.textContent = `${status.pending_activities} pending ${status.pending_activities === 1 ? "launch" : "launches"}.${status.degraded ? " Launch tracking is degraded; counts may be incomplete." : ""}`;
+            }).catch(() => {
+                if (current(request))
+                    launchStatus.textContent = "Pending launch tracking is unavailable.";
+            });
+        }
+        document.addEventListener("visibilitychange", visibilityChanged);
+        observer.observe(document.body, { childList: true, subtree: true });
+        refresh();
+        return refresh;
+    }
     function parseHistoryRuntimeStatus(value) {
         if (!value || typeof value !== "object" || Array.isArray(value))
             throw new Error("History status reply is invalid.");
@@ -10817,6 +13575,11 @@ var Amaterasu;
         if (!session || typeof session !== "object" || Array.isArray(session) ||
             session.session_id !== sessionId)
             throw new Error("History detail belongs to a different session.");
+        parseHistoryListReply({ ok: true, sessions: [session], next_offset: null }, 0);
+        const summary = session;
+        if (["device_name", "codec"].some((key) => typeof summary[key] !== "string") ||
+            ["width", "height", "target_fps", "target_bitrate_kbps"].some((key) => !Number.isSafeInteger(summary[key]) || summary[key] < 0 || summary[key] > 0xffff_ffff))
+            throw new Error("History session metadata is invalid.");
         for (const key of ["sample_count", "event_count"])
             if (!Number.isSafeInteger(detail[key]) || detail[key] < 0)
                 throw new Error(`History ${key} is invalid.`);
@@ -10825,14 +13588,22 @@ var Amaterasu;
                 throw new Error(`History ${key} is invalid.`);
         for (const [key, countKey] of [["samples", "sample_count"], ["events", "event_count"]]) {
             const rows = detail[key];
-            if (!Array.isArray(rows) || rows.length > detail[countKey] || rows.some((row) => !row || typeof row !== "object" || Array.isArray(row) || row.session_id !== sessionId ||
+            const truncated = detail[key === "samples" ? "samples_truncated" : "events_truncated"];
+            if (!Array.isArray(rows) || rows.length > (key === "samples" ? 32 : 8) ||
+                rows.length > detail[countKey] || truncated !== (rows.length < detail[countKey]) || rows.some((row) => !row || typeof row !== "object" || Array.isArray(row) || row.session_id !== sessionId ||
                 !Number.isSafeInteger(row.recorded_at_unix)))
                 throw new Error(`History ${key} are invalid.`);
         }
         for (const sample of detail.samples) {
-            for (const key of ["frames_sent", "bytes_sent", "dropped_frames", "actual_fps", "actual_bitrate_kbps"])
+            for (const key of ["frames_sent", "bytes_sent", "dropped_frames"])
+                if (!Number.isSafeInteger(sample[key]) || sample[key] < 0)
+                    throw new Error(`History sample ${key} is invalid.`);
+            for (const key of ["actual_fps", "actual_bitrate_kbps"])
                 if (typeof sample[key] !== "number" || !Number.isFinite(sample[key]) || sample[key] < 0)
                     throw new Error(`History sample ${key} is invalid.`);
+            if (sample.encode_latency_ms != null && (typeof sample.encode_latency_ms !== "number" ||
+                !Number.isFinite(sample.encode_latency_ms) || sample.encode_latency_ms < 0))
+                throw new Error("History sample encode_latency_ms is invalid.");
         }
         if (detail.events.some((event) => typeof event.event_type !== "string"))
             throw new Error("History event type is invalid.");
@@ -10847,6 +13618,7 @@ var Amaterasu;
             (reply.next_offset !== null && (!Number.isSafeInteger(reply.next_offset) ||
                 reply.next_offset <= offset)))
             throw new Error("History session page is invalid.");
+        const ids = new Set();
         for (const entry of reply.sessions) {
             if (!entry || typeof entry !== "object" || Array.isArray(entry))
                 throw new Error("History session row is invalid.");
@@ -10854,12 +13626,16 @@ var Amaterasu;
             if (typeof session.session_id !== "string" || session.session_id.length === 0 ||
                 new TextEncoder().encode(session.session_id).length > 128 ||
                 /[\u0000-\u001f\u007f-\u009f]/u.test(session.session_id) ||
-                ["app_name", "client_name", "protocol"].some((key) => typeof session[key] !== "string") ||
+                ["app_name", "client_name", "device_name", "protocol", "codec"].some((key) => typeof session[key] !== "string") ||
+                ["width", "height", "target_fps", "target_bitrate_kbps"].some((key) => !Number.isSafeInteger(session[key]) || session[key] < 0 || session[key] > 0xffff_ffff) ||
                 !Number.isSafeInteger(session.started_at_unix) ||
                 (session.ended_at_unix !== null && !Number.isSafeInteger(session.ended_at_unix)) ||
                 (session.duration_seconds !== null &&
                     (!Number.isSafeInteger(session.duration_seconds) || session.duration_seconds < 0)))
                 throw new Error("History session row is invalid.");
+            if (ids.has(session.session_id))
+                throw new Error("History session page contains a duplicate stream.");
+            ids.add(session.session_id);
         }
         return reply;
     }
@@ -10887,6 +13663,7 @@ var Amaterasu;
         const area = Amaterasu.el("div");
         const status = Amaterasu.el("div");
         const metricsArea = Amaterasu.el("div");
+        const streamControlsArea = Amaterasu.el("div");
         const historyRuntimeArea = Amaterasu.el("div");
         const savedArea = Amaterasu.el("div");
         const savedDetail = Amaterasu.el("div");
@@ -10897,18 +13674,20 @@ var Amaterasu;
         const savedHistory = [0];
         let savedListRequest = 0;
         let savedDetailRequest = 0;
+        let timelineRequest = 0;
         let historyStatusRequest = 0;
         let historyDeleteAvailable = false;
         let historyDeleteReason = "Checking history status before deletion is available.";
         let deleteControls = [];
         const deleteNotice = Amaterasu.el("p", "muted", historyDeleteReason);
-        let selectedSavedSession = null;
+        let selectedSavedSessions = new Set();
         const savedHistoryPanel = Amaterasu.panel("Recorded stream sessions", savedArea, savedStatus, savedDetail);
-        context.content.append(Amaterasu.sectionHeading("Sessions", "Inspect and stop sessions owned by this management console.", Amaterasu.button("Refresh", () => {
+        context.content.append(Amaterasu.sectionHeading("Sessions", "Inspect stream history and session coordination for this host.", Amaterasu.button("Refresh", () => {
             void load();
             void loadHistoryRuntime();
             void loadSaved();
-        })), status, area, Amaterasu.panel("Live host metrics", metricsArea), Amaterasu.panel("History runtime status", historyRuntimeArea), savedHistoryPanel);
+        })), status, streamControlsArea, metricsArea, Amaterasu.panel("Session coordination", area), Amaterasu.panel("History runtime status", historyRuntimeArea), savedHistoryPanel);
+        Amaterasu.renderManagedStreamControls(context, streamControlsArea);
         function applyHistoryDeleteAvailability() {
             pagesSetLocalizedTextContent(deleteNotice, historyDeleteReason);
             for (const control of deleteControls)
@@ -10972,7 +13751,7 @@ var Amaterasu;
                 });
                 area.replaceChildren(reply.sessions.length
                     ? Amaterasu.table(["Session", "State", "Leases", "Action"], rows)
-                    : Amaterasu.empty("No sessions yet", "Sessions created through the management API appear here. Streaming clients and pairing are not available yet."), Amaterasu.pager(history.length > 1
+                    : Amaterasu.empty("No sessions yet", "Sessions created through the management API appear here. Live stream activity is shown in the metrics section."), Amaterasu.pager(history.length > 1
                     ? () => {
                         history.pop();
                         offset = history[history.length - 1] ?? 0;
@@ -10984,7 +13763,7 @@ var Amaterasu;
                         history.push(offset);
                         void load();
                     }
-                    : null, pagesTextLiteral(`Showing from ${offset + 1}`)));
+                    : null, reply.sessions.length ? pagesTextLiteral(`Showing from ${offset + 1}`) : "No sessions on this page"));
             }
             catch (error) {
                 if (context.content.isConnected)
@@ -10999,8 +13778,7 @@ var Amaterasu;
                 if (!context.content.isConnected || request !== savedListRequest)
                     return;
                 const currentDeleteControls = [];
-                const rows = reply.sessions.map((session) => {
-                    const details = Amaterasu.button("Details", () => loadSavedDetail(session.session_id));
+                function deleteButton(session) {
                     const remove = Amaterasu.button("Delete", async () => {
                         if (!context.api.allows("session.write") || !historyDeleteAvailable || !(await loadHistoryRuntime()))
                             return;
@@ -11013,9 +13791,10 @@ var Amaterasu;
                                 session_id: session.session_id,
                             }));
                             await confirmHistoryDeletion(context.api, session.session_id);
-                            if (selectedSavedSession === session.session_id) {
+                            if (selectedSavedSessions.has(session.session_id)) {
                                 ++savedDetailRequest;
-                                selectedSavedSession = null;
+                                ++timelineRequest;
+                                selectedSavedSessions.clear();
                                 savedDetail.replaceChildren();
                             }
                             context.notify(pagesTextMessage("Recorded session deleted."));
@@ -11024,18 +13803,22 @@ var Amaterasu;
                         await loadHistoryRuntime();
                     }, "quiet danger-text");
                     currentDeleteControls.push({ button: remove, ended: session.ended_at_unix != null });
-                    return [
-                        Amaterasu.el("div", "", Amaterasu.el("strong", "", pagesTextLiteral(session.app_name || session.session_id)), Amaterasu.el("small", "muted block", pagesTextLiteral(session.client_name || session.protocol))),
-                        localizedDateTime(session.started_at_unix),
-                        session.ended_at_unix == null ? Amaterasu.badge("Active", "good") :
-                            `${session.duration_seconds ?? 0} seconds`,
-                        Amaterasu.el("div", "actions", details, remove),
-                    ];
+                    return remove;
+                }
+                const groups = Amaterasu.groupRecordedSessions(reply.sessions);
+                const cards = groups.map((members) => {
+                    const session = members[0];
+                    const details = Amaterasu.button("Details", () => members.length > 1
+                        ? loadSavedGroup(members) : loadSavedDetail(session.session_id));
+                    const memberControls = members.length === 1 ? deleteButton(session) : Amaterasu.el("details", "history-card-members", Amaterasu.el("summary", "", pagesTextLiteral(`Manage ${members.length} individual streams`)), ...members.map((member) => Amaterasu.el("div", "history-card-member", Amaterasu.el("div", "", Amaterasu.el("strong", "", pagesTextLiteral(member.session_id)), Amaterasu.el("small", "muted block", localizedDateTime(member.started_at_unix))), Amaterasu.el("div", "actions", Amaterasu.button("Details", () => loadSavedDetail(member.session_id)), deleteButton(member)))));
+                    const resolution = session.width && session.height ? `${session.width} × ${session.height}` : "Resolution unavailable";
+                    return Amaterasu.el("article", "history-card", Amaterasu.el("div", "history-card-topline", members.length > 1
+                        ? Amaterasu.badge(pagesTextLiteral(`${members.length} nearby streams`)) : Amaterasu.badge(pagesTextLiteral(session.protocol || "Unknown")), Amaterasu.el("time", "muted", localizedDateTime(session.started_at_unix))), Amaterasu.el("strong", "history-card-title", pagesTextLiteral(session.app_name || (members.length > 1 ? "Unnamed application" : session.session_id))), Amaterasu.el("span", "muted", pagesTextLiteral(session.client_name || session.device_name || "Client unavailable")), Amaterasu.el("span", "muted", pagesTextLiteral(`${resolution}${session.target_fps ? ` · ${session.target_fps} fps` : ""} · ${session.codec || "Codec unavailable"}`)), Amaterasu.el("div", "actions", details, ...(members.length === 1 ? [memberControls] : [])), ...(members.length > 1 ? [memberControls] : []));
                 });
                 deleteControls = currentDeleteControls;
                 applyHistoryDeleteAvailability();
-                savedArea.replaceChildren(deleteNotice, reply.sessions.length
-                    ? Amaterasu.table(["Application / client", "Started", "Duration", "Actions"], rows)
+                savedArea.replaceChildren(deleteNotice, ...(groups.some((members) => members.length > 1) ? [Amaterasu.el("p", "muted", "Nearby streams with matching names are grouped on this page; a reconnect is not confirmed.")] : []), reply.sessions.length
+                    ? Amaterasu.el("div", "history-card-grid", ...cards)
                     : Amaterasu.empty("No recorded streams", "Completed streams appear here when history recording is enabled."), Amaterasu.pager(savedHistory.length > 1
                     ? () => {
                         savedHistory.pop();
@@ -11056,8 +13839,9 @@ var Amaterasu;
             }
         }
         async function loadSavedDetail(sessionId) {
-            selectedSavedSession = sessionId;
+            selectedSavedSessions = new Set([sessionId]);
             const request = ++savedDetailRequest;
+            ++timelineRequest;
             savedDetail.replaceChildren(Amaterasu.el("p", "muted", "Loading session details…"));
             try {
                 const reply = parseHistoryDetailReply(await context.api.post("history/session_detail", { session_id: sessionId }), sessionId);
@@ -11066,34 +13850,202 @@ var Amaterasu;
                 const detail = reply.detail;
                 if (!detail)
                     return;
-                savedDetail.replaceChildren(Amaterasu.panel(pagesTextLiteral(`History for ${detail.session.app_name || detail.session.session_id}`), Amaterasu.el("p", "muted", pagesTextLiteral(`${detail.session.protocol} · ${detail.session.width}×${detail.session.height} · ${detail.session.target_fps} FPS · ${detail.session.codec || "codec unavailable"}`)), Amaterasu.el("p", "muted", pagesTextLiteral(`${detail.sample_count} samples${detail.samples_truncated ? " (recent samples shown)" : ""} · ${detail.event_count} events${detail.events_truncated ? " (recent events shown)" : ""}`)), detail.samples.length
-                    ? Amaterasu.table(["Sample time", "Frames", "Bytes", "Dropped", "FPS", "Bitrate (kbps)"], detail.samples.map((sample) => [
-                        localizedDateTime(sample.recorded_at_unix),
-                        String(sample.frames_sent),
-                        String(sample.bytes_sent),
-                        String(sample.dropped_frames),
-                        sample.actual_fps.toFixed(1),
-                        sample.actual_bitrate_kbps.toFixed(1),
-                    ]))
-                    : Amaterasu.el("p", "muted", "No samples recorded."), detail.events.length
-                    ? Amaterasu.table(["Event time", "Event"], detail.events.map((event) => [
-                        localizedDateTime(event.recorded_at_unix),
-                        event.event_type,
-                    ]))
-                    : Amaterasu.el("p", "muted", "No events recorded.")));
+                const close = () => {
+                    ++savedDetailRequest;
+                    ++timelineRequest;
+                    selectedSavedSessions.clear();
+                    savedDetail.replaceChildren();
+                };
+                const complete = !detail.samples_truncated && !detail.events_truncated;
+                let view = Amaterasu.renderRecordedSessionDetail(detail, close, complete);
+                const timelineStatus = Amaterasu.el("div", "recorded-timeline-status");
+                savedDetail.replaceChildren(timelineStatus, view);
+                if (!complete) {
+                    let engaged = false;
+                    const markEngaged = () => { engaged = true; };
+                    for (const event of ["pointerdown", "keydown", "input", "change"])
+                        view.addEventListener(event, markEngaged);
+                    function installComplete(full) {
+                        view = Amaterasu.renderRecordedSessionDetail(full, close, true);
+                        timelineStatus.replaceChildren(Amaterasu.el("p", "muted", "All retained history in the captured snapshot is loaded."));
+                        savedDetail.replaceChildren(timelineStatus, view);
+                    }
+                    async function loadTimeline() {
+                        const timeline = ++timelineRequest;
+                        const active = () => context.content.isConnected && request === savedDetailRequest && timeline === timelineRequest;
+                        const progress = Amaterasu.el("p", "muted", "Loading retained history…");
+                        progress.setAttribute("role", "status");
+                        const cancel = Amaterasu.button("Cancel history loading", () => {
+                            if (!active())
+                                return;
+                            ++timelineRequest;
+                            timelineStatus.replaceChildren(Amaterasu.el("p", "muted", "Full history loading was cancelled; the recent snapshot remains available."), Amaterasu.button("Retry full history", () => void loadTimeline()));
+                        });
+                        timelineStatus.replaceChildren(progress, cancel);
+                        try {
+                            const full = await Amaterasu.loadRetainedTimeline(context.api, sessionId, active, (samples, sampleTotal, events, eventTotal) => {
+                                if (active())
+                                    progress.textContent = `Loading retained history… ${samples} of ${sampleTotal} samples · ${events} of ${eventTotal} events`;
+                            });
+                            if (!active() || !full)
+                                return;
+                            const selection = typeof document.getSelection === "function" ? document.getSelection() : null;
+                            const viewingSelection = !!selection && !selection.isCollapsed && !!selection.anchorNode && view.contains(selection.anchorNode);
+                            if (engaged || viewingSelection || (document.activeElement && view.contains(document.activeElement))) {
+                                timelineStatus.replaceChildren(Amaterasu.el("p", "muted", "Full retained history is ready."), Amaterasu.button("Show full retained history", () => { if (active())
+                                    installComplete(full); }));
+                            }
+                            else
+                                installComplete(full);
+                        }
+                        catch (error) {
+                            if (active())
+                                timelineStatus.replaceChildren(Amaterasu.errorPanel(error, () => void loadTimeline()), Amaterasu.el("p", "muted", "The recent snapshot remains available; no partial full-history result was applied."));
+                        }
+                    }
+                    void loadTimeline();
+                }
             }
             catch (error) {
                 if (context.content.isConnected && request === savedDetailRequest)
                     savedDetail.replaceChildren(Amaterasu.errorPanel(error, () => loadSavedDetail(sessionId)));
             }
         }
+        async function loadSavedGroup(members) {
+            selectedSavedSessions = new Set(members.map((member) => member.session_id));
+            const request = ++savedDetailRequest;
+            ++timelineRequest;
+            savedDetail.replaceChildren(Amaterasu.el("p", "muted", "Loading nearby stream details…"));
+            let halted = false;
+            const current = () => !halted && context.content.isConnected && request === savedDetailRequest;
+            try {
+                const details = new Array(members.length);
+                let next = 0;
+                async function readDetails() {
+                    while (current() && next < members.length) {
+                        const index = next++;
+                        const id = members[index].session_id;
+                        details[index] = parseHistoryDetailReply(await context.api.post("history/session_detail", { session_id: id }), id).detail;
+                    }
+                }
+                try {
+                    await Promise.all(Array.from({ length: Math.min(3, members.length) }, () => readDetails()));
+                }
+                catch (error) {
+                    halted = true;
+                    throw error;
+                }
+                if (!current())
+                    return;
+                if (Amaterasu.groupRecordedSessions(details.map((detail) => detail.session)).length !== 1)
+                    throw new Error("These streams no longer match this group. Refresh the session list.");
+                const close = () => {
+                    ++savedDetailRequest;
+                    ++timelineRequest;
+                    selectedSavedSessions.clear();
+                    savedDetail.replaceChildren();
+                };
+                const complete = details.every((detail) => !detail.samples_truncated && !detail.events_truncated);
+                let view = Amaterasu.renderRecordedSessionDetail(Amaterasu.mergeRecordedSessionDetails(details), close, complete, details);
+                const timelineStatus = Amaterasu.el("div", "recorded-timeline-status");
+                savedDetail.replaceChildren(timelineStatus, view);
+                if (complete)
+                    return;
+                let engaged = false;
+                const markEngaged = () => { engaged = true; };
+                for (const event of ["pointerdown", "keydown", "input", "change"])
+                    view.addEventListener(event, markEngaged);
+                function withinLimit(samples, events) {
+                    return samples.reduce((sum, value) => sum + value, 0) <= 25_000 &&
+                        events.reduce((sum, value) => sum + value, 0) <= 5_000;
+                }
+                function installComplete(full) {
+                    view = Amaterasu.renderRecordedSessionDetail(Amaterasu.mergeRecordedSessionDetails(full), close, true, full);
+                    timelineStatus.replaceChildren(Amaterasu.el("p", "muted", "All retained history in each captured stream snapshot is loaded."));
+                    savedDetail.replaceChildren(timelineStatus, view);
+                }
+                async function loadTimelines() {
+                    const timeline = ++timelineRequest;
+                    let stopped = false;
+                    const active = () => current() && !stopped && timeline === timelineRequest;
+                    const sampleTotals = details.map((detail) => detail.sample_count);
+                    const eventTotals = details.map((detail) => detail.event_count);
+                    if (!withinLimit(sampleTotals, eventTotals)) {
+                        timelineStatus.replaceChildren(Amaterasu.el("p", "notice", "This group exceeds the browser limit for a complete history. Recent snapshots remain available; open an individual stream for its full history."));
+                        return;
+                    }
+                    const progress = Amaterasu.el("p", "muted", "Loading retained history for nearby streams…");
+                    progress.setAttribute("role", "status");
+                    const cancel = Amaterasu.button("Cancel history loading", () => {
+                        if (!active())
+                            return;
+                        ++timelineRequest;
+                        timelineStatus.replaceChildren(Amaterasu.el("p", "muted", "Full history loading was cancelled; recent snapshots remain available."), Amaterasu.button("Retry full history", () => void loadTimelines()));
+                    });
+                    timelineStatus.replaceChildren(progress, cancel);
+                    const full = [...details];
+                    let index = 0;
+                    let done = 0;
+                    async function readTimeline() {
+                        while (active() && index < full.length) {
+                            const position = index++;
+                            const detail = full[position];
+                            if (detail.samples_truncated || detail.events_truncated) {
+                                const loaded = await Amaterasu.loadRetainedTimeline(context.api, detail.session.session_id, active, (_samples, sampleTotal, _events, eventTotal) => {
+                                    sampleTotals[position] = sampleTotal;
+                                    eventTotals[position] = eventTotal;
+                                    if (!withinLimit(sampleTotals, eventTotals))
+                                        throw new Error("This group exceeds the browser limit for a complete history. Open an individual stream instead.");
+                                });
+                                if (!active() || !loaded)
+                                    return;
+                                full[position] = loaded;
+                            }
+                            done++;
+                            if (active())
+                                progress.textContent = `Loading retained history… ${done} of ${full.length} streams`;
+                        }
+                    }
+                    try {
+                        try {
+                            await Promise.all(Array.from({ length: Math.min(3, full.length) }, () => readTimeline()));
+                        }
+                        catch (error) {
+                            stopped = true;
+                            throw error;
+                        }
+                        if (!active())
+                            return;
+                        if (Amaterasu.groupRecordedSessions(full.map((detail) => detail.session)).length !== 1)
+                            throw new Error("These streams no longer match this group. Refresh the session list.");
+                        const selection = typeof document.getSelection === "function" ? document.getSelection() : null;
+                        const viewingSelection = !!selection && !selection.isCollapsed && !!selection.anchorNode && view.contains(selection.anchorNode);
+                        if (engaged || viewingSelection || (document.activeElement && view.contains(document.activeElement))) {
+                            timelineStatus.replaceChildren(Amaterasu.el("p", "muted", "Full retained history is ready for all streams."), Amaterasu.button("Show full retained history", () => { if (active())
+                                installComplete(full); }));
+                        }
+                        else
+                            installComplete(full);
+                    }
+                    catch (error) {
+                        if (current() && timeline === timelineRequest)
+                            timelineStatus.replaceChildren(Amaterasu.errorPanel(error, () => void loadTimelines()), Amaterasu.el("p", "muted", "Recent snapshots remain available; no partial full-history result was applied."));
+                    }
+                }
+                void loadTimelines();
+            }
+            catch (error) {
+                if (context.content.isConnected && request === savedDetailRequest)
+                    savedDetail.replaceChildren(Amaterasu.errorPanel(error, () => loadSavedGroup(members)));
+            }
+        }
         void load();
         void loadHistoryRuntime();
         void loadSaved();
-        if (context.api.allows("diagnostics.read"))
+        if (context.api.allows("diagnostics.read") || context.api.allows("session.read"))
             Amaterasu.renderHostMetricsDashboard(context, metricsArea, savedHistoryPanel);
         else
-            metricsArea.replaceChildren(Amaterasu.el("p", "muted", "Host metrics are unavailable for this account."));
+            metricsArea.replaceChildren(Amaterasu.panel("Live host metrics", Amaterasu.el("p", "muted", "Host metrics are unavailable for this account.")));
     }
     Amaterasu.renderSessions = renderSessions;
     function renderApplications(context) {
@@ -11485,6 +14437,49 @@ var Amaterasu;
         return reply;
     }
     Amaterasu.parseDiagnosticQueryReply = parseDiagnosticQueryReply;
+    async function readDiagnosticSnapshot(api, isCurrent) {
+        let cursor = 0;
+        let target;
+        let droppedTotal = 0;
+        let incomplete = false;
+        const records = [];
+        for (let page = 0; page < 32; page++) {
+            const value = await api.post("diagnostics/query", { after: cursor, limit: 4 });
+            if (!isCurrent())
+                return null;
+            const reply = parseDiagnosticQueryReply(value, cursor);
+            if (target === undefined) {
+                target = reply.latest_sequence;
+                droppedTotal = reply.dropped_total;
+            }
+            else if (reply.resync_required) {
+                incomplete = true;
+            }
+            const expectedFirst = page === 0 ? (reply.oldest_sequence ?? 1) : cursor + 1;
+            let expected = expectedFirst;
+            for (const record of reply.records) {
+                if (record.sequence !== expected)
+                    incomplete = true;
+                expected = record.sequence + 1;
+                if (record.sequence <= target)
+                    records.push(record);
+            }
+            if (reply.next_cursor >= target)
+                return { records, latestSequence: target, droppedTotal, incomplete };
+            if (reply.next_cursor <= cursor)
+                throw new Error("Diagnostics query did not advance through the journal.");
+            cursor = reply.next_cursor;
+        }
+        return { records, latestSequence: target ?? 0, droppedTotal, incomplete: true };
+    }
+    Amaterasu.readDiagnosticSnapshot = readDiagnosticSnapshot;
+    function formatDiagnosticRecords(records) {
+        return records.map((record) => {
+            const fields = Object.entries(record.fields).map(([key, value]) => `${key}: ${value}`).join(" · ");
+            return `#${record.sequence} [${record.level}] ${record.target}: ${record.message}${fields ? ` · ${fields}` : ""}`;
+        }).join("\n");
+    }
+    Amaterasu.formatDiagnosticRecords = formatDiagnosticRecords;
     function parseDiagnosticCountersReply(value) {
         if (!value || typeof value !== "object" || Array.isArray(value))
             throw new Error("Diagnostics counters reply is invalid.");
@@ -11499,6 +14494,17 @@ var Amaterasu;
         return counters;
     }
     Amaterasu.parseDiagnosticCountersReply = parseDiagnosticCountersReply;
+    function filterDiagnosticPage(records, query, level) {
+        const needle = query.trim().toLocaleLowerCase();
+        return records.filter((record) => {
+            if (level && record.level !== level)
+                return false;
+            const text = [record.target, record.message, ...Object.entries(record.fields).flat()]
+                .join(" ").toLocaleLowerCase();
+            return !needle || text.includes(needle);
+        });
+    }
+    Amaterasu.filterDiagnosticPage = filterDiagnosticPage;
     const DIAGNOSTIC_SESSION_LIMIT = 4;
     function diagnosticFailureStage(reason) {
         if (typeof reason !== "string")
@@ -11556,17 +14562,106 @@ var Amaterasu;
     Amaterasu.diagnosticSessionOutcome = diagnosticSessionOutcome;
     function renderDiagnostics(context) {
         const area = Amaterasu.el("div");
+        const hostLogArea = Amaterasu.el("div");
         const sessionsArea = Amaterasu.el("div");
-        let after = 0;
-        const history = [0];
         let loadRequest = 0;
         let sessionRequest = 0;
-        context.content.append(Amaterasu.sectionHeading("Diagnostics", "Caller-scoped records and counters, plus separately recorded stream outcomes.", Amaterasu.button("Refresh", () => {
-            after = 0;
-            history.splice(0, history.length, 0);
+        let refreshHostLogs = null;
+        let currentRecords = [];
+        const filter = Amaterasu.input("diagnostics_filter", "", "search");
+        filter.placeholder = "Search retained records";
+        const level = Amaterasu.el("select");
+        for (const [value, label] of [["", "All levels"], ["trace", "Trace"], ["debug", "Debug"],
+            ["info", "Info"], ["warn", "Warning"], ["error", "Error"]]) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = value ?? "";
+            level.append(option);
+        }
+        const filteredRecords = Amaterasu.el("div", "records");
+        const filterSummary = Amaterasu.el("p", "muted diagnostics-filter-summary");
+        filterSummary.setAttribute("role", "status");
+        const copyStatus = Amaterasu.el("div");
+        const matchStatus = Amaterasu.el("span", "muted diagnostics-match-status");
+        matchStatus.setAttribute("role", "status");
+        let selectedMatch = 0;
+        const previousMatch = Amaterasu.button("Previous match", () => moveMatch(-1));
+        const nextMatch = Amaterasu.button("Next match", () => moveMatch(1));
+        const matchNavigation = Amaterasu.el("div", "diagnostics-match-navigation", previousMatch, nextMatch, matchStatus);
+        matchNavigation.setAttribute("role", "group");
+        matchNavigation.setAttribute("aria-label", "Search match navigation");
+        let copying = false;
+        const copy = Amaterasu.button("Copy visible records", () => {
+            if (copying)
+                return;
+            copying = true;
+            void Amaterasu.runAction(copy, copyStatus, async () => {
+                const records = filterDiagnosticPage(currentRecords, filter.value, level.value);
+                if (!navigator.clipboard?.writeText)
+                    throw new Error("Clipboard access is unavailable in this browser context.");
+                await navigator.clipboard.writeText(formatDiagnosticRecords(records));
+                context.notify("Visible diagnostic records copied.");
+            }).finally(() => {
+                copying = false;
+                copy.disabled = filterDiagnosticPage(currentRecords, filter.value, level.value).length === 0;
+            });
+        });
+        const download = Amaterasu.button("Download visible records", () => {
+            const records = filterDiagnosticPage(currentRecords, filter.value, level.value);
+            if (!records.length)
+                return;
+            const url = URL.createObjectURL(new Blob([formatDiagnosticRecords(records)], { type: "text/plain;charset=utf-8" }));
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = "amaterasu-diagnostics.txt";
+            link.click();
+            window.setTimeout(() => URL.revokeObjectURL(url), 0);
+        });
+        function moveMatch(direction) {
+            const visible = filterDiagnosticPage(currentRecords, filter.value, level.value);
+            if (!filter.value.trim() || visible.length === 0)
+                return;
+            selectedMatch = (selectedMatch + direction + visible.length) % visible.length;
+            renderFilteredRecords(true);
+        }
+        function renderFilteredRecords(scrollToMatch = false) {
+            const visible = filterDiagnosticPage(currentRecords, filter.value, level.value);
+            const searching = filter.value.trim().length > 0;
+            if (selectedMatch >= visible.length)
+                selectedMatch = 0;
+            matchNavigation.hidden = !searching;
+            previousMatch.disabled = nextMatch.disabled = visible.length === 0;
+            matchStatus.textContent = visible.length ? `Match ${selectedMatch + 1} of ${visible.length}` : "No matches";
+            copy.disabled = copying || visible.length === 0;
+            download.disabled = visible.length === 0;
+            filterSummary.textContent = `${visible.length} of ${currentRecords.length} retained records`;
+            const articles = visible.map((record, index) => {
+                const active = searching && index === selectedMatch;
+                const article = Amaterasu.el("article", `record${active ? " diagnostics-record-active" : ""}`, Amaterasu.el("div", "section-meta", Amaterasu.badge(pagesTextLiteral(record.level), record.level === "error" ? "bad" : ""), Amaterasu.el("small", "muted", pagesTextLiteral(`#${record.sequence} · ${record.target}`))), Amaterasu.el("p", "", pagesTextLiteral(record.message)), ...Object.entries(record.fields).map(([key, value]) => Amaterasu.el("p", "record-field", Amaterasu.el("strong", "", pagesTextLiteral(`${key}: `)), pagesTextLiteral(value))));
+                if (active)
+                    article.setAttribute("aria-current", "true");
+                return article;
+            });
+            filteredRecords.replaceChildren(...articles);
+            if (scrollToMatch && searching && articles[selectedMatch]?.scrollIntoView)
+                articles[selectedMatch].scrollIntoView({ block: "nearest", behavior: "smooth" });
+            if (!visible.length)
+                filteredRecords.append(Amaterasu.el("p", "muted diagnostics-empty", currentRecords.length
+                    ? "No retained records match the filter."
+                    : "No diagnostic records are retained."));
+        }
+        filter.addEventListener("input", () => { selectedMatch = 0; renderFilteredRecords(); });
+        filter.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter" || event.isComposing || !filter.value.trim())
+                return;
+            event.preventDefault();
+            moveMatch(event.shiftKey ? -1 : 1);
+        });
+        level.addEventListener("change", () => { selectedMatch = 0; renderFilteredRecords(); });
+        context.content.append(Amaterasu.sectionHeading("Diagnostics", "Host logs, caller-scoped records, and separately recorded stream outcomes.", Amaterasu.button("Refresh", () => {
+            void refreshHostLogs?.();
             void loadRecentSessions();
             return load();
-        })), area, Amaterasu.panel("Recent stream outcomes", sessionsArea, Amaterasu.el("p", "muted", "Session history is separate from caller-scoped diagnostics; no record-to-session correlation is implied. Only recognized termination codes receive a stage label.")));
+        })), hostLogArea, area, Amaterasu.panel("Recent stream outcomes", sessionsArea, Amaterasu.el("p", "muted", "Session history is separate from caller-scoped diagnostics; no record-to-session correlation is implied. Only recognized termination codes receive a stage label.")));
         async function loadRecentSessions() {
             const request = ++sessionRequest;
             if (!context.api.allows("session.read")) {
@@ -11606,50 +14701,52 @@ var Amaterasu;
         }
         async function load() {
             const request = ++loadRequest;
-            const cursor = after;
+            const isCurrent = () => context.content.isConnected && request === loadRequest;
+            if (!context.api.allows("diagnostics.read")) {
+                area.replaceChildren(Amaterasu.panel("Caller-scoped diagnostics", Amaterasu.el("p", "muted", "This session does not have diagnostics.read access.")));
+                return;
+            }
+            area.replaceChildren(Amaterasu.el("p", "muted", "Loading retained diagnostic records…"));
             try {
-                const [queryValue, counterValue] = await Promise.all([
-                    context.api.post("diagnostics/query", {
-                        after: cursor,
-                        limit: 4,
-                    }),
+                const [snapshotResult, countersResult] = await Promise.allSettled([
+                    readDiagnosticSnapshot(context.api, isCurrent),
                     context.api.post("diagnostics/counters"),
                 ]);
-                if (!context.content.isConnected || request !== loadRequest)
+                if (!isCurrent())
                     return;
-                const reply = parseDiagnosticQueryReply(queryValue, cursor);
-                const counters = parseDiagnosticCountersReply(counterValue);
-                if (reply.resync_required)
-                    history.splice(0, history.length, cursor);
-                const records = Amaterasu.el("div", "records", ...reply.records.map((record) => Amaterasu.el("article", "record", Amaterasu.el("div", "section-meta", Amaterasu.badge(pagesTextLiteral(record.level), record.level === "error" ? "bad" : ""), Amaterasu.el("small", "muted", pagesTextLiteral(`#${record.sequence} · ${record.target}`))), Amaterasu.el("p", "", pagesTextLiteral(record.message)), ...Object.entries(record.fields).map(([key, value]) => Amaterasu.el("p", "record-field", Amaterasu.el("strong", "", pagesTextLiteral(`${key}: `)), pagesTextLiteral(value))))));
-                area.replaceChildren(reply.resync_required
-                    ? Amaterasu.el("p", "notice", "Older records were removed from the bounded journal. Showing the records still available.")
-                    : nullNode(), Amaterasu.panel("Recent records", reply.records.length
-                    ? records
-                    : Amaterasu.empty("No diagnostic records", "Records appear when a service explicitly submits them. Automatic host log collection is not enabled.")), Amaterasu.pager(history.length > 1
-                    ? () => {
-                        history.pop();
-                        after = history[history.length - 1] ?? 0;
-                        void load();
-                    }
-                    : null, reply.has_more
-                    ? () => {
-                        after = reply.next_cursor;
-                        history.push(after);
-                        void load();
-                    }
-                    : null, pagesTextLiteral(`Page ${history.length}`)), Amaterasu.panel("Counters", Object.keys(counters).length
-                    ? Amaterasu.table(["Counter", "Value"], Object.entries(counters).map(([name, value]) => [
-                        name,
-                        String(value),
-                    ]))
-                    : Amaterasu.el("p", "muted", "No counters have been recorded.")));
+                if (snapshotResult.status === "rejected")
+                    throw snapshotResult.reason;
+                const snapshot = snapshotResult.value;
+                if (!snapshot)
+                    return;
+                currentRecords = snapshot.records;
+                selectedMatch = 0;
+                renderFilteredRecords();
+                let countersContent;
+                try {
+                    if (countersResult.status === "rejected")
+                        throw countersResult.reason;
+                    const counters = parseDiagnosticCountersReply(countersResult.value);
+                    countersContent = Object.keys(counters).length
+                        ? Amaterasu.table(["Counter", "Value"], Object.entries(counters).map(([name, value]) => [name, String(value)]))
+                        : Amaterasu.el("p", "muted", "No counters have been recorded.");
+                }
+                catch (error) {
+                    countersContent = Amaterasu.errorPanel(error, load);
+                }
+                area.replaceChildren(snapshot.incomplete
+                    ? Amaterasu.el("p", "notice", "Some records disappeared while this snapshot was loading. Refresh to try again.")
+                    : nullNode(), snapshot.droppedTotal > 0
+                    ? Amaterasu.el("p", "notice", `${snapshot.droppedTotal} older records were removed from the bounded journal before this snapshot.`)
+                    : nullNode(), Amaterasu.panel("Recent records", Amaterasu.el("p", "muted", "Search, copy or download this caller-scoped snapshot of up to 128 retained records. Host log files are not included; refresh to see newer records."), Amaterasu.el("div", "diagnostics-toolbar", Amaterasu.field("Search retained records", filter), Amaterasu.field("Level", level), copy, download), filterSummary, matchNavigation, copyStatus, filteredRecords), Amaterasu.panel("Counters", countersContent));
             }
             catch (error) {
-                if (context.content.isConnected && request === loadRequest)
+                if (isCurrent())
                     area.replaceChildren(Amaterasu.errorPanel(error, load));
             }
         }
+        if (context.api.allows("host-logs.read"))
+            refreshHostLogs = Amaterasu.renderHostLogs(context, hostLogArea);
         void load();
         void loadRecentSessions();
     }
@@ -11762,6 +14859,14 @@ var Amaterasu;
     }
     function renderHostManagement(context) {
         const pairingArea = Amaterasu.el("div");
+        const pairedClientsArea = Amaterasu.el("div");
+        const drafts = context.registerDraftGuard ? Amaterasu.trackDrafts(pairedClientsArea) : null;
+        let clientSaveBusy = false;
+        if (drafts)
+            context.registerDraftGuard?.(() => clientSaveBusy || drafts.isDirty(), drafts.dispose);
+        const loadPairedClients = Amaterasu.createPairedClientEditor(context, pairedClientsArea, () => drafts, (busy) => {
+            clientSaveBusy = busy;
+        });
         const captureArea = Amaterasu.el("div");
         const hostArea = Amaterasu.el("div");
         const sessionArea = Amaterasu.el("div");
@@ -11772,10 +14877,16 @@ var Amaterasu;
         let runtimeRequest = 0;
         context.content.append(Amaterasu.sectionHeading("Host & devices", "Review pending device access and the status reported by this host.", Amaterasu.button("Refresh all", () => {
             void loadPairings();
+            if (context.api.allows("pairing.admin")) {
+                if (clientSaveBusy)
+                    context.notify("Wait for the client save to finish before refreshing.");
+                else if (!drafts?.isDirty() || window.confirm("Reload paired clients and discard unsaved client changes?"))
+                    void loadPairedClients();
+            }
             void loadHost();
             void loadSessions();
             void loadRuntime();
-        })), Amaterasu.panel("Pending device pairing", pairingArea), Amaterasu.panel("KDE desktop capture consent", captureArea), Amaterasu.panel("Host listeners", hostArea), Amaterasu.panel("Streaming status", runtimeArea), Amaterasu.panel("Management sessions", sessionArea));
+        })), Amaterasu.panel("Pending device pairing", pairingArea), pairedClientsArea, Amaterasu.panel("KDE desktop capture consent", captureArea), Amaterasu.panel("Host listeners", hostArea), Amaterasu.panel("Streaming status", runtimeArea), Amaterasu.panel("Session coordination", sessionArea));
         async function loadPairings(notice) {
             if (!context.content.isConnected)
                 return;
@@ -11891,10 +15002,10 @@ var Amaterasu;
         async function loadSessions() {
             const request = ++sessionRequest;
             if (!context.api.allows("session.read")) {
-                sessionArea.replaceChildren(Amaterasu.el("p", "muted", "Management session status requires session.read permission."));
+                sessionArea.replaceChildren(Amaterasu.el("p", "muted", "Session coordination requires session.read permission."));
                 return;
             }
-            sessionArea.replaceChildren(Amaterasu.el("p", "muted", "Loading management sessions…"));
+            sessionArea.replaceChildren(Amaterasu.el("p", "muted", "Loading session coordination…"));
             try {
                 const reply = parseSessionStatus(await context.api.post("session/list", { limit: 16 }));
                 if (!context.content.isConnected || request !== sessionRequest)
@@ -11907,7 +15018,7 @@ var Amaterasu;
                 ]);
                 sessionArea.replaceChildren(rows.length
                     ? Amaterasu.table(["Session", "State", "Leases", "Outcome"], rows)
-                    : Amaterasu.empty("No management sessions", "Sessions created through the management API will appear here."), reply.next_offset === null
+                    : Amaterasu.empty("No coordination sessions", "Sessions created through the session API will appear here."), reply.next_offset === null
                     ? Amaterasu.el("p", "muted", `Showing ${reply.sessions.length} session${reply.sessions.length === 1 ? "" : "s"}.`)
                     : Amaterasu.el("p", "muted", `Showing the first ${reply.sessions.length} sessions; more are available.`), Amaterasu.button("Refresh sessions", () => { void loadSessions(); }));
             }
@@ -11936,6 +15047,10 @@ var Amaterasu;
             }
         }
         void loadPairings();
+        if (context.api.allows("pairing.admin"))
+            void loadPairedClients();
+        else
+            pairedClientsArea.append(Amaterasu.panel("Paired clients", Amaterasu.el("p", "muted", "This account does not have permission to manage paired clients.")));
         renderCaptureConsent(context, captureArea);
         void loadHost();
         void loadSessions();
@@ -12221,12 +15336,21 @@ var Amaterasu;
             event.preventDefault();
             if (!passwordForm.reportValidity())
                 return;
-            void Amaterasu.runAction(change, passwordStatus, async () => { await context.api.post("auth/change_password", { current_password: current.value, new_password: next.value }); current.value = ""; next.value = ""; context.notify("Password changed."); });
+            void Amaterasu.runAction(change, passwordStatus, async () => {
+                await context.api.post("auth/change_password", { current_password: current.value, new_password: next.value });
+                current.value = "";
+                next.value = "";
+                context.notify("Password changed.");
+            });
         });
-        context.content.append(Amaterasu.el("h1", "", "Accounts"));
+        context.content.append(Amaterasu.sectionHeading("Accounts", "Manage your credentials and host accounts."));
         if (context.api.allows("account.self"))
             context.content.append(Amaterasu.panel("Your password", passwordForm));
         context.content.append(area);
+        if (context.registerDraftGuard) {
+            const drafts = Amaterasu.trackDrafts(context.content);
+            context.registerDraftGuard(drafts.isDirty, drafts.dispose);
+        }
         async function load() {
             area.replaceChildren(Amaterasu.el("p", "muted", "Loading accounts…"));
             try {
@@ -12235,7 +15359,7 @@ var Amaterasu;
                     return;
                 if (!Array.isArray(reply.accounts))
                     throw new Error("Invalid account list.");
-                const list = Amaterasu.el("div");
+                const list = Amaterasu.el("div", "account-list");
                 for (const account of reply.accounts) {
                     if (typeof account.username !== "string" || !["administrator", "operator", "viewer"].includes(account.role) || typeof account.enabled !== "boolean")
                         throw new Error("Invalid account list.");
@@ -12244,14 +15368,30 @@ var Amaterasu;
                     const enabled = Amaterasu.input("enabled", "", "checkbox");
                     enabled.checked = account.enabled;
                     const status = Amaterasu.el("div");
-                    const save = Amaterasu.button("Save", () => void Amaterasu.runAction(save, status, async () => { await context.api.post("accounts/update", { username: account.username, role: role.value, enabled: enabled.checked }); context.notify("Account updated."); await load(); }));
+                    const save = Amaterasu.button("Save account", () => void Amaterasu.runAction(save, status, async () => {
+                        await context.api.post("accounts/update", { username: account.username, role: role.value, enabled: enabled.checked });
+                        context.notify("Account updated.");
+                        await load();
+                    }));
                     const reset = Amaterasu.input("password", "", "password");
                     reset.autocomplete = "new-password";
-                    const setPassword = Amaterasu.button("Set password", () => void Amaterasu.runAction(setPassword, status, async () => { if (!reset.value)
-                        throw new Error("Enter a new password."); await context.api.post("accounts/set_password", { username: account.username, password: reset.value }); reset.value = ""; context.notify("Password updated."); }));
-                    const remove = Amaterasu.button("Delete account", () => { if (!window.confirm(`Delete account ${account.username}?`))
-                        return; void Amaterasu.runAction(remove, status, async () => { await context.api.post("accounts/delete", { username: account.username }); await load(); }); });
-                    list.append(Amaterasu.panel(account.username, Amaterasu.field("Role", role), Amaterasu.field("Enabled", enabled), save, Amaterasu.field("New password", reset), setPassword, remove, status));
+                    const setPassword = Amaterasu.button("Set password", () => void Amaterasu.runAction(setPassword, status, async () => {
+                        if (!reset.value)
+                            throw new Error("Enter a new password.");
+                        await context.api.post("accounts/set_password", { username: account.username, password: reset.value });
+                        reset.value = "";
+                        context.notify("Password updated.");
+                    }));
+                    const remove = Amaterasu.button("Delete account", () => {
+                        if (!window.confirm(`Delete account ${account.username}?`))
+                            return;
+                        void Amaterasu.runAction(remove, status, async () => {
+                            await context.api.post("accounts/delete", { username: account.username });
+                            await load();
+                        });
+                    }, "quiet danger-text");
+                    const identity = typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(account.username) : account.username;
+                    list.append(Amaterasu.el("section", "account-card", Amaterasu.el("div", "section-meta", Amaterasu.el("h3", "", identity), Amaterasu.badge(account.enabled ? "Enabled" : "Disabled", account.enabled ? "good" : "")), Amaterasu.el("div", "form-grid", Amaterasu.field("Role", role), Amaterasu.field("Enabled", enabled)), Amaterasu.el("div", "actions", save, remove), Amaterasu.el("div", "account-password", Amaterasu.field("New password", reset), setPassword), status));
                 }
                 const username = Amaterasu.input("username");
                 username.required = true;
@@ -12265,9 +15405,18 @@ var Amaterasu;
                 const create = Amaterasu.el("button", "button primary", "Create account");
                 create.type = "submit";
                 const form = Amaterasu.el("form", "settings-form", Amaterasu.field("Username", username), Amaterasu.field("Password", password), Amaterasu.field("Role", role), create, status);
-                form.addEventListener("submit", (event) => { event.preventDefault(); if (!form.reportValidity())
-                    return; void Amaterasu.runAction(create, status, async () => { await context.api.post("accounts/create", { username: username.value.trim(), password: password.value, role: role.value }); password.value = ""; context.notify("Account created."); await load(); }); });
-                area.replaceChildren(Amaterasu.panel("Manage accounts", Amaterasu.el("p", "muted", "Accounts share this host's resources. Permissions are enforced by the host."), list, form));
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    if (!form.reportValidity())
+                        return;
+                    void Amaterasu.runAction(create, status, async () => {
+                        await context.api.post("accounts/create", { username: username.value.trim(), password: password.value, role: role.value });
+                        password.value = "";
+                        context.notify("Account created.");
+                        await load();
+                    });
+                });
+                area.replaceChildren(Amaterasu.panel("Host accounts", Amaterasu.el("p", "muted", "Accounts share this host's resources. Permissions are enforced by the host."), reply.accounts.length ? list : Amaterasu.empty("No accounts", "Create an account to grant access to this host.")), Amaterasu.panel("Add account", form));
             }
             catch (error) {
                 if (context.content.isConnected) {
@@ -12282,6 +15431,252 @@ var Amaterasu;
             void load();
     }
     Amaterasu.renderAccounts = renderAccounts;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    function tokenRecord(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("The host returned an invalid token list.");
+        const record = value;
+        if (typeof record.token_id !== "string" || !/^[a-f0-9]{64}$/.test(record.token_id) ||
+            !Array.isArray(record.scopes) || record.scopes.length === 0 || record.scopes.length > 64 ||
+            !record.scopes.every((scope) => typeof scope === "string" && /^[a-zA-Z0-9._:/-]{1,64}$/.test(scope)) ||
+            !Number.isSafeInteger(record.issued_at) || !Number.isSafeInteger(record.expires_at) ||
+            record.issued_at < 0 || record.expires_at <= record.issued_at)
+            throw new Error("The host returned an invalid token list.");
+        return { token_id: record.token_id, scopes: record.scopes,
+            issued_at: record.issued_at, expires_at: record.expires_at };
+    }
+    function renderTokens(context) {
+        const listArea = Amaterasu.el("div");
+        const secretArea = Amaterasu.el("div");
+        let secretNode = null;
+        const createStatus = Amaterasu.el("div");
+        const scopeSearch = Amaterasu.input("token_scope_search", "", "search");
+        scopeSearch.placeholder = "Filter permissions";
+        const tokenSearch = Amaterasu.input("token_search", "", "search");
+        tokenSearch.placeholder = "Search permissions or token ID";
+        const scopeList = Amaterasu.el("div", "token-scope-list");
+        scopeList.setAttribute("role", "group");
+        scopeList.setAttribute("aria-label", "Available token permissions");
+        const scopeSummary = Amaterasu.el("p", "muted token-scope-summary");
+        scopeSummary.setAttribute("role", "status");
+        const allowed = Array.from(new Set(context.api.scopes ?? []))
+            .filter((scope) => scope !== "tokens.manage" && /^[a-zA-Z0-9._:/-]{1,64}$/.test(scope)).sort();
+        const checks = allowed.map((scope) => {
+            const checkbox = Amaterasu.input(`token_scope_${scope}`, "", "checkbox");
+            const label = Amaterasu.el("label", "token-scope", checkbox, Amaterasu.el("span", "", Amaterasu.literalText(scope)));
+            scopeList.append(label);
+            return { scope, checkbox, label };
+        });
+        function updateScopes() {
+            const query = scopeSearch.value.trim().toLocaleLowerCase();
+            let visible = 0;
+            for (const entry of checks) {
+                entry.label.hidden = !entry.scope.toLocaleLowerCase().includes(query);
+                if (!entry.label.hidden)
+                    visible++;
+            }
+            const selected = checks.filter((entry) => entry.checkbox.checked).length;
+            scopeSummary.textContent = `${selected} selected · ${visible} of ${checks.length} permissions${visible > 5 ? " · Scroll to see more" : ""}`;
+        }
+        scopeSearch.addEventListener("input", updateScopes);
+        for (const entry of checks)
+            entry.checkbox.addEventListener("change", updateScopes);
+        updateScopes();
+        const expiry = Amaterasu.el("select");
+        expiry.name = "token_lifetime";
+        for (const [seconds, label] of [["3600", "1 hour"], ["86400", "1 day"], ["604800", "7 days"], ["2592000", "30 days"]]) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = seconds ?? "";
+            expiry.append(option);
+        }
+        expiry.value = "86400";
+        const create = Amaterasu.el("button", "button primary", "Create token");
+        create.type = "submit";
+        const form = Amaterasu.el("form", "settings-form", Amaterasu.field("Filter permissions", scopeSearch), scopeSummary, scopeList, Amaterasu.field("Expires after", expiry), create, createStatus);
+        form.addEventListener("submit", (event) => {
+            event.preventDefault();
+            if (secretNode) {
+                createStatus.replaceChildren(Amaterasu.errorPanel(new Error("Copy or dismiss the current token before creating another.")));
+                return;
+            }
+            const scopes = checks.filter((entry) => entry.checkbox.checked).map((entry) => entry.scope);
+            if (!scopes.length) {
+                createStatus.replaceChildren(Amaterasu.errorPanel(new Error("Select at least one permission.")));
+                return;
+            }
+            void Amaterasu.runAction(create, createStatus, async () => {
+                const reply = await context.api.post("tokens/issue", { scopes, ttl_seconds: Number(expiry.value) });
+                if (!reply || typeof reply !== "object" || Array.isArray(reply))
+                    throw new Error("Token creation was not confirmed. Refresh the list before trying again.");
+                const result = reply;
+                if (result.ok !== true || typeof result.bearer !== "string" || !/^ama_[a-f0-9]{64}$/.test(result.bearer) ||
+                    typeof result.token_id !== "string" || !/^[a-f0-9]{64}$/.test(result.token_id) ||
+                    !Array.isArray(result.scopes) || result.scopes.length !== scopes.length ||
+                    new Set(result.scopes).size !== scopes.length || !result.scopes.every((scope) => typeof scope === "string" && scopes.includes(scope)) ||
+                    !Number.isSafeInteger(result.expires_at) || result.expires_at <= 0)
+                    throw new Error("Token creation was not confirmed. Refresh the list before trying again.");
+                if (!context.content.isConnected)
+                    return;
+                const secret = Amaterasu.el("textarea", "token-secret");
+                secret.readOnly = true;
+                secret.spellcheck = false;
+                secret.value = result.bearer;
+                secretNode = secret;
+                secret.setAttribute("aria-label", "New API token");
+                const copy = Amaterasu.button("Copy token", () => void Amaterasu.runAction(copy, createStatus, async () => {
+                    if (!navigator.clipboard?.writeText)
+                        throw new Error("Clipboard access is unavailable in this browser.");
+                    await navigator.clipboard.writeText(secret.value);
+                    context.notify("Token copied.");
+                }));
+                const dismiss = Amaterasu.button("Done", () => { secret.value = ""; secretNode = null; secretArea.replaceChildren(); });
+                secretArea.replaceChildren(Amaterasu.panel("Copy your new token", Amaterasu.el("p", "notice", "This secret is shown only once. Store it somewhere safe before leaving this page."), secret, Amaterasu.el("div", "actions", copy, dismiss)));
+                for (const entry of checks)
+                    entry.checkbox.checked = false;
+                updateScopes();
+                await load();
+            });
+        });
+        context.content.append(Amaterasu.sectionHeading("API tokens", "Create scoped credentials for tools that access this host."), secretArea, Amaterasu.panel("Create token", Amaterasu.el("p", "muted", "Choose only the permissions this tool needs. Tokens expire automatically."), form), Amaterasu.panel("Issued tokens", Amaterasu.el("p", "muted", "Only tokens created through this management interface are shown. Other native callers manage their own tokens."), Amaterasu.el("div", "diagnostics-toolbar", Amaterasu.field("Search issued tokens", tokenSearch), Amaterasu.button("Refresh tokens", load)), listArea));
+        context.registerDraftGuard?.(() => secretNode !== null || checks.some((entry) => entry.checkbox.checked), () => { if (secretNode)
+            secretNode.value = ""; secretNode = null; });
+        let generation = 0;
+        let records = [];
+        function renderList() {
+            const query = tokenSearch.value.trim().toLocaleLowerCase();
+            const visible = records.filter((token) => token.token_id.includes(query) || token.scopes.some((scope) => scope.toLocaleLowerCase().includes(query)));
+            if (!visible.length) {
+                listArea.replaceChildren(Amaterasu.empty(records.length ? "No matching tokens" : "No issued tokens", records.length ? "Try another search." : "Create a token when a tool needs access."));
+                return;
+            }
+            const rows = visible.map((token) => {
+                const state = Amaterasu.el("div");
+                const remove = Amaterasu.button("Revoke", () => {
+                    if (!window.confirm(`Revoke token ${token.token_id.slice(0, 8)}…? Tools using it will lose access.`))
+                        return;
+                    void Amaterasu.runAction(remove, state, async () => {
+                        await context.api.post("tokens/revoke", { token_id: token.token_id });
+                        context.notify("Token revoked.");
+                        await load();
+                    });
+                }, "quiet danger-text");
+                return Amaterasu.el("section", "token-card", Amaterasu.el("div", "section-meta", Amaterasu.el("strong", "", Amaterasu.literalText(`${token.token_id.slice(0, 8)}…${token.token_id.slice(-4)}`)), remove), Amaterasu.el("p", "muted", Amaterasu.literalText(`Created ${new Date(token.issued_at * 1000).toLocaleString()} · Expires ${new Date(token.expires_at * 1000).toLocaleString()}`)), Amaterasu.el("div", "token-badges", ...token.scopes.map((scope) => Amaterasu.badge(Amaterasu.literalText(scope)))), state);
+            });
+            listArea.replaceChildren(...rows);
+        }
+        tokenSearch.addEventListener("input", renderList);
+        async function load() {
+            const current = ++generation;
+            try {
+                const reply = await context.api.post("tokens/list");
+                if (!context.content.isConnected || current !== generation)
+                    return;
+                if (!Array.isArray(reply.tokens) || reply.tokens.length > 32)
+                    throw new Error("The host returned an invalid token list.");
+                records = reply.tokens.map(tokenRecord).sort((a, b) => b.issued_at - a.issued_at);
+                renderList();
+            }
+            catch (error) {
+                if (context.content.isConnected && current === generation)
+                    listArea.replaceChildren(Amaterasu.errorPanel(error, load));
+            }
+        }
+        if (!allowed.length)
+            scopeList.append(Amaterasu.el("p", "muted", "No permissions are available for this session."));
+        listArea.replaceChildren(Amaterasu.el("p", "muted", "Loading issued tokens…"));
+        void load();
+    }
+    Amaterasu.renderTokens = renderTokens;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    function parseBrowserSessions(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("The host returned an invalid session list.");
+        const reply = value;
+        if (reply.ok !== true || !Array.isArray(reply.sessions) || reply.sessions.length > 16)
+            throw new Error("The host returned an invalid session list.");
+        const ids = new Set();
+        const sessions = reply.sessions.map((value) => {
+            if (!value || typeof value !== "object" || Array.isArray(value))
+                throw new Error("The host returned an invalid session list.");
+            const session = value;
+            if (typeof session.session_id !== "string" || !/^[a-f0-9]{64}$/.test(session.session_id) || ids.has(session.session_id) ||
+                typeof session.subject !== "string" || session.subject.length < 1 || session.subject.length > 64 ||
+                !/^[a-zA-Z0-9._:/-]+$/.test(session.subject) || typeof session.remember_me !== "boolean" || typeof session.current !== "boolean" ||
+                !Number.isSafeInteger(session.expires_at) || !Number.isSafeInteger(session.refresh_expires_at) ||
+                session.expires_at < 0 || session.refresh_expires_at < session.expires_at ||
+                session.refresh_expires_at > 8_640_000_000)
+                throw new Error("The host returned an invalid session list.");
+            ids.add(session.session_id);
+            return { id: session.session_id, subject: session.subject, expiresAt: session.expires_at,
+                refreshExpiresAt: session.refresh_expires_at, remembered: session.remember_me, current: session.current };
+        });
+        if (sessions.filter((session) => session.current).length !== 1)
+            throw new Error("The current session could not be identified.");
+        return sessions.sort((left, right) => Number(right.current) - Number(left.current) || right.refreshExpiresAt - left.refreshExpiresAt);
+    }
+    function renderMaintenance(context) {
+        const sessionsArea = Amaterasu.el("div");
+        const actionStatus = Amaterasu.el("div");
+        let generation = 0;
+        context.content.append(Amaterasu.sectionHeading("Maintenance", "Review signed-in sessions and manage this host's credentials and software.", Amaterasu.button("Refresh sessions", () => { void load(); })), Amaterasu.panel("Signed-in sessions", Amaterasu.el("p", "muted", "Revoke another session to remove its access. Sessions may include other management clients; the host does not record device names or last activity."), actionStatus, sessionsArea), Amaterasu.panel("Credentials", Amaterasu.el("p", "muted", "Manage accounts, passwords, and API tokens for this host."), Amaterasu.el("div", "actions", Amaterasu.button("Manage accounts", () => context.navigate("accounts")), ...(context.api.allows("tokens.manage") ? [Amaterasu.button("Manage API tokens", () => context.navigate("tokens"))] : []))), Amaterasu.panel("Modules & UI", Amaterasu.el("p", "muted", "Review the selected package and approved publishers."), context.api.allows("configuration.read") ? Amaterasu.button("View modules and UI", () => context.navigate("updates")) : Amaterasu.el("p", "muted", "Package details require configuration.read.")));
+        function render(sessions) {
+            const cards = sessions.map((session) => {
+                const title = Amaterasu.el("div", "section-meta", Amaterasu.el("strong", "", Amaterasu.literalText(session.subject)), session.current ? Amaterasu.badge("This session", "good") : session.remembered ? Amaterasu.badge("Remembered") : Amaterasu.badge("Session only"));
+                const details = Amaterasu.el("p", "muted", Amaterasu.literalText(`Access expires ${new Date(session.expiresAt * 1000).toLocaleString()} · Refresh expires ${new Date(session.refreshExpiresAt * 1000).toLocaleString()}`));
+                if (session.current)
+                    return Amaterasu.el("section", "browser-session-card", title, details);
+                const revoke = Amaterasu.button("Revoke session", () => {
+                    if (!window.confirm(`Revoke this session for ${session.subject}? It will lose access on its next request.`))
+                        return;
+                    void Amaterasu.runAction(revoke, actionStatus, async () => {
+                        let acknowledged;
+                        try {
+                            const reply = await context.api.post("account-sessions/revoke", { session_id: session.id });
+                            if (typeof reply.revoked !== "boolean")
+                                throw new Error("The host did not confirm the session action.");
+                            acknowledged = reply.revoked;
+                        }
+                        catch (error) {
+                            const latest = await load();
+                            if (latest && !latest.some((candidate) => candidate.id === session.id)) {
+                                actionStatus.replaceChildren(Amaterasu.el("p", "notice", "This session is no longer listed. The revoke response was interrupted, so its cause could not be confirmed."));
+                                return;
+                            }
+                            throw error;
+                        }
+                        const latest = await load();
+                        if (!latest || latest.some((candidate) => candidate.id === session.id))
+                            throw new Error("The session's removal could not be confirmed. Refresh before retrying.");
+                        context.notify(acknowledged ? "Session revoked." : "That session had already ended.");
+                    });
+                }, "quiet danger-text");
+                return Amaterasu.el("section", "browser-session-card", title, details, revoke);
+            });
+            sessionsArea.replaceChildren(...cards);
+        }
+        async function load() {
+            const request = ++generation;
+            try {
+                const sessions = parseBrowserSessions(await context.api.post("account-sessions/list"));
+                if (!context.content.isConnected || request !== generation)
+                    return null;
+                render(sessions);
+                return sessions;
+            }
+            catch (error) {
+                if (context.content.isConnected && request === generation)
+                    sessionsArea.replaceChildren(Amaterasu.errorPanel(error, () => { void load(); }));
+                return null;
+            }
+        }
+        sessionsArea.replaceChildren(Amaterasu.el("p", "muted", "Loading signed-in sessions…"));
+        void load();
+    }
+    Amaterasu.renderMaintenance = renderMaintenance;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -12428,39 +15823,66 @@ var Amaterasu;
         host: "Host & devices",
         catalog: "Library",
         settings: "Settings",
+        integrations: "Integrations",
         updates: "Modules & UI",
         sessions: "Sessions",
         applications: "Applications",
         steam: "Steam",
         diagnostics: "Diagnostics",
         accounts: "Accounts",
+        tokens: "API tokens",
+        maintenance: "Maintenance",
     };
     const pageIcons = {
-        updates: "+",
-        host: "⌂",
-        overview: "▦",
-        catalog: "⊞",
-        settings: "≡",
-        sessions: "⇄",
-        applications: "□",
-        steam: "◇",
-        diagnostics: "⌁",
-        accounts: "♙",
+        overview: "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",
+        host: "M4 5h16v11H4z M8 20h8 M12 16v4",
+        catalog: "M4 4h7v7H4z M13 4h7v7h-7z M4 13h7v7H4z M13 13h7v7h-7z",
+        integrations: "M8 3v5 M16 3v5 M6 8h12v3a6 6 0 0 1-12 0z M12 17v4",
+        settings: "M4 6h16 M4 12h16 M4 18h16 M8 4v4 M16 10v4 M10 16v4",
+        updates: "M12 3v12 M8 11l4 4 4-4 M4 17v3h16v-3",
+        sessions: "M4 8h14 M15 5l3 3-3 3 M20 16H6 M9 13l-3 3 3 3",
+        applications: "M4 5h16v14H4z M4 9h16 M8 7h.01",
+        steam: "M12 3a9 9 0 1 1-8.5 12 M3 12l6 3 M9 15a2 2 0 1 0 4 0 2 2 0 0 0-4 0 M13 14l3-4 M18 8a2 2 0 1 1-4 0 2 2 0 0 1 4 0",
+        diagnostics: "M3 12h4l2-6 4 12 2-6h6",
+        maintenance: "M14 4a5 5 0 0 0-6 6L3 15l3 3 5-5a5 5 0 0 0 6-6l-3 3-3-3z",
+        tokens: "M8 14a4 4 0 1 1 3.5-6H21v4h-3v3h-3v-3h-3.5A4 4 0 0 1 8 14z M7 10h.01",
+        accounts: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M4 20a8 8 0 0 1 16 0",
     };
+    function navigationIcon(page) {
+        const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        icon.setAttribute("viewBox", "0 0 24 24");
+        icon.setAttribute("class", "nav-icon");
+        icon.setAttribute("aria-hidden", "true");
+        icon.setAttribute("fill", "none");
+        icon.setAttribute("stroke", "currentColor");
+        icon.setAttribute("stroke-width", "1.7");
+        icon.setAttribute("stroke-linecap", "round");
+        icon.setAttribute("stroke-linejoin", "round");
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute("d", pageIcons[page]);
+        icon.append(path);
+        return icon;
+    }
+    const navigationGroups = [
+        { label: "HOST", pages: ["overview", "host", "sessions", "diagnostics"] },
+        { label: "LIBRARY", pages: ["catalog", "applications", "steam"] },
+        { label: "SYSTEM", pages: ["settings", "integrations", "updates", "accounts", "tokens", "maintenance"] },
+    ];
     const corePages = new Map([
         ["overview", Amaterasu.renderOverview], ["host", Amaterasu.renderHostManagement], ["catalog", Amaterasu.renderCatalog],
-        ["settings", Amaterasu.renderSettings], ["updates", Amaterasu.renderUpdates], ["sessions", Amaterasu.renderSessions],
+        ["settings", Amaterasu.renderSettings], ["integrations", Amaterasu.renderIntegrations], ["updates", Amaterasu.renderUpdates], ["sessions", Amaterasu.renderSessions],
         ["applications", Amaterasu.renderApplications], ["steam", Amaterasu.renderSteam], ["diagnostics", Amaterasu.renderDiagnostics],
-        ["accounts", Amaterasu.renderAccounts],
+        ["accounts", Amaterasu.renderAccounts], ["tokens", Amaterasu.renderTokens], ["maintenance", Amaterasu.renderMaintenance],
     ]);
     const pageScopes = {
         host: "configuration.read", catalog: "catalog.read", settings: "configuration.read",
-        updates: "configuration.read", sessions: "session.read", applications: "application.read",
+        integrations: "configuration.read", updates: "configuration.read", sessions: "session.read", applications: "application.read",
         steam: "steam.read", diagnostics: "diagnostics.read", accounts: "account.self",
     };
     class Application {
         api;
         root;
+        theme;
         signedIn = false;
         content = Amaterasu.el("main");
         navigation = new Map();
@@ -12469,8 +15891,11 @@ var Amaterasu;
         notification = Amaterasu.el("div");
         notificationTimer = 0;
         restorationGeneration = 0;
+        displayedPage = null;
+        draftGuard = null;
         constructor() {
             this.root = document.getElementById("app");
+            this.theme = new Amaterasu.ThemeController();
             document
                 .querySelector(".skip-link")
                 ?.addEventListener("click", (event) => {
@@ -12488,9 +15913,21 @@ var Amaterasu;
                     this.loginScreen();
                 }
             };
-            window.addEventListener("hashchange", () => {
+            window.addEventListener("hashchange", (event) => {
                 if (this.signedIn)
-                    this.renderPage(this.currentPage());
+                    this.renderRequestedPage(event.oldURL);
+            });
+            window.addEventListener("beforeunload", (event) => {
+                if (this.signedIn && this.draftGuard?.isDirty()) {
+                    event.preventDefault();
+                    event.returnValue = "";
+                }
+            });
+            window.addEventListener("resize", () => {
+                if (window.innerWidth > 800) {
+                    this.root.querySelector(".shell")?.classList.remove("menu-open");
+                    this.root.querySelector(".menu-toggle")?.setAttribute("aria-expanded", "false");
+                }
             });
             window.addEventListener("pagehide", () => this.api.suspend());
             window.addEventListener("pageshow", (event) => {
@@ -12517,6 +15954,8 @@ var Amaterasu;
                 this.loginScreen();
         }
         sessionRestoringScreen() {
+            this.releaseDraftGuard();
+            this.displayedPage = null;
             this.signedIn = false;
             const main = Amaterasu.el("main", "login-layout");
             main.id = "main";
@@ -12532,21 +15971,53 @@ var Amaterasu;
             Amaterasu.setLocalizedPageTitle("Restoring session");
         }
         currentPage() {
-            const value = location.hash.slice(1);
+            const fragment = location.hash.slice(1);
+            const value = fragment.startsWith("catalog?") ? "catalog" : fragment;
             const core = Object.hasOwn(pageNames, value) && this.pageAvailable(value);
-            return core || (value.startsWith("extension/") && this.extensionIds.has(value.slice(10))) ? value : "overview";
+            const settingsCategory = value.startsWith("settings/") &&
+                ["general", "streaming", "integrations", "devices", "access"].includes(value.slice(9)) &&
+                this.pageAvailable("settings");
+            return core || settingsCategory || (value.startsWith("extension/") && this.extensionIds.has(value.slice(10))) ? value : "overview";
         }
         pageAvailable(page) {
+            if (page === "tokens")
+                return this.api.role === "administrator" && this.api.allows("tokens.manage");
+            if (page === "maintenance")
+                return this.api.role === "administrator" && this.api.allows("configuration.write");
             const scope = pageScopes[page];
-            return !scope || this.api.allows(scope) || (page === "accounts" && this.api.allows("configuration.write"));
+            return !scope || this.api.allows(scope) || (page === "diagnostics" && this.api.allows("host-logs.read")) || (page === "accounts" && this.api.allows("configuration.write"));
+        }
+        releaseDraftGuard() {
+            this.draftGuard?.dispose();
+            this.draftGuard = null;
+        }
+        mayLeaveDraft() {
+            return !this.draftGuard?.isDirty() || window.confirm("Discard your unsaved changes?");
+        }
+        renderRequestedPage(previousUrl) {
+            const page = this.currentPage();
+            if (page === this.displayedPage)
+                return;
+            if (!this.mayLeaveDraft()) {
+                if (this.displayedPage) {
+                    const previous = new URL(location.href);
+                    const previousFragment = previousUrl ? new URL(previousUrl).hash.slice(1) : "";
+                    previous.hash = previousFragment === this.displayedPage ||
+                        (this.displayedPage === "catalog" && previousFragment.startsWith("catalog?"))
+                        ? previousFragment : this.displayedPage;
+                    history.replaceState(history.state, "", previous);
+                }
+                return;
+            }
+            this.renderPage(page);
         }
         navigate(page) {
-            if (location.hash === `#${page}`)
-                this.renderPage(page);
-            else
+            if (page !== this.displayedPage)
                 location.hash = page;
         }
         loginScreen() {
+            this.releaseDraftGuard();
+            this.displayedPage = null;
             this.signedIn = false;
             this.extensions.reset();
             this.extensionIds.clear();
@@ -12651,21 +16122,27 @@ var Amaterasu;
             this.navigation.clear();
             const shell = Amaterasu.el("div", "shell");
             const sidebar = Amaterasu.el("aside", "sidebar");
-            const nav = Amaterasu.el("nav", "navigation");
-            Amaterasu.setLocalizedAttribute(nav, "aria-label", "Main navigation");
-            for (const page of corePages.keys()) {
-                if (!this.pageAvailable(page))
+            const navigationContainer = Amaterasu.el("div", "navigation-container");
+            const closeMenu = () => {
+                shell.classList.remove("menu-open");
+                menu.setAttribute("aria-expanded", "false");
+            };
+            for (const group of navigationGroups) {
+                const pages = group.pages.filter((page) => this.pageAvailable(page));
+                if (pages.length === 0)
                     continue;
-                const icon = Amaterasu.el("span", "nav-icon", pageIcons[page]);
-                icon.setAttribute("aria-hidden", "true");
-                const item = Amaterasu.button(pageNames[page], () => {
-                    shell.classList.remove("menu-open");
-                    menu.setAttribute("aria-expanded", "false");
-                    this.navigate(page);
-                }, "nav-item");
-                item.prepend(icon);
-                nav.append(item);
-                this.navigation.set(page, item);
+                const nav = Amaterasu.el("nav", "navigation");
+                Amaterasu.setLocalizedAttribute(nav, "aria-label", group.label);
+                for (const page of pages) {
+                    const item = Amaterasu.button(pageNames[page], () => {
+                        closeMenu();
+                        this.navigate(page);
+                    }, "nav-item");
+                    item.prepend(navigationIcon(page));
+                    nav.append(item);
+                    this.navigation.set(page, item);
+                }
+                navigationContainer.append(Amaterasu.el("p", "nav-heading", group.label), nav);
             }
             const extensionsNav = Amaterasu.el("nav", "navigation");
             Amaterasu.setLocalizedAttribute(extensionsNav, "aria-label", "Extensions");
@@ -12687,21 +16164,47 @@ var Amaterasu;
                 }
                 extensionsHeading.hidden = entries.length === 0;
                 if (location.hash.startsWith("#extension/"))
-                    this.renderPage(this.currentPage());
+                    this.renderRequestedPage();
             }).catch(() => {
                 if (this.signedIn && shell.isConnected) {
                     extensionsHeading.textContent = "Extensions unavailable";
                     extensionsHeading.hidden = false;
                 }
             });
-            sidebar.append(this.brand(), Amaterasu.el("p", "nav-heading", "WORKSPACE"), nav, extensionsHeading, extensionsNav, Amaterasu.el("div", "sidebar-bottom", Amaterasu.badge("Development preview"), Amaterasu.el("p", "muted", "Local management console"), Amaterasu.el("small", "muted", "Streaming features are in progress.")));
+            sidebar.append(this.brand(), Amaterasu.el("div", "sidebar-navigation", navigationContainer, extensionsHeading, extensionsNav, Amaterasu.mountLocaleSelector(this.api)), Amaterasu.el("div", "sidebar-bottom", this.theme.mount(), Amaterasu.el("strong", "", "Host console"), Amaterasu.el("p", "muted", "Manage this host and its devices")));
             const menu = Amaterasu.button("☰", () => {
                 const open = shell.classList.toggle("menu-open");
                 menu.setAttribute("aria-expanded", String(open));
+                if (open)
+                    sidebar.querySelector(".nav-item")?.focus();
             }, "menu-toggle");
             Amaterasu.setLocalizedAttribute(menu, "aria-label", "Toggle navigation");
             menu.setAttribute("aria-expanded", "false");
+            sidebar.id = "main-navigation";
+            menu.setAttribute("aria-controls", sidebar.id);
+            const scrim = Amaterasu.button("Close navigation", () => { closeMenu(); menu.focus(); }, "nav-scrim");
+            shell.addEventListener("keydown", (event) => {
+                if (event.key === "Escape" && shell.classList.contains("menu-open")) {
+                    closeMenu();
+                    menu.focus();
+                }
+                else if (event.key === "Tab" && shell.classList.contains("menu-open")) {
+                    const controls = Array.from(sidebar.querySelectorAll("button:not(:disabled), select:not(:disabled), a[href]")).filter((control) => control.getClientRects().length > 0);
+                    const first = controls[0];
+                    const last = controls.at(-1);
+                    if (event.shiftKey && document.activeElement === first) {
+                        event.preventDefault();
+                        last?.focus();
+                    }
+                    else if (!event.shiftKey && document.activeElement === last) {
+                        event.preventDefault();
+                        first?.focus();
+                    }
+                }
+            });
             const logout = Amaterasu.button("Sign out", () => {
+                if (!this.mayLeaveDraft())
+                    return;
                 logout.disabled = true;
                 void this.api.logout().then(() => {
                     clearTimeout(this.notificationTimer);
@@ -12725,18 +16228,24 @@ var Amaterasu;
                     this.root.querySelector(".login-card")?.prepend(warning);
                 });
             }, "quiet");
-            const top = Amaterasu.el("header", "topbar", Amaterasu.el("div", "actions", menu, Amaterasu.el("span", "topbar-label", "Host workspace")), Amaterasu.el("div", "account", Amaterasu.el("span", "account-avatar", this.api.subject.slice(0, 1).toUpperCase()), Amaterasu.el("span", "account-name", appTextLiteral(this.api.subject)), Amaterasu.mountLocaleSelector(this.api), logout));
+            const top = Amaterasu.el("header", "topbar", Amaterasu.el("div", "actions", menu, Amaterasu.el("span", "topbar-label", "Host workspace")), Amaterasu.el("div", "account", Amaterasu.el("span", "account-avatar", this.api.subject.slice(0, 1).toUpperCase()), Amaterasu.el("span", "account-name", appTextLiteral(this.api.subject)), logout));
             this.notification = Amaterasu.el("div", "toast");
             this.notification.setAttribute("role", "status");
             this.notification.hidden = true;
             this.content = Amaterasu.el("main", "content");
             this.content.id = "main";
             this.content.tabIndex = -1;
-            shell.append(sidebar, Amaterasu.el("div", "workspace", top, this.content), this.notification);
+            shell.append(sidebar, scrim, Amaterasu.el("div", "workspace", top, this.content), this.notification);
             this.root.replaceChildren(shell);
             this.renderPage(this.currentPage());
         }
         renderPage(page) {
+            this.releaseDraftGuard();
+            this.displayedPage = page;
+            clearTimeout(this.notificationTimer);
+            this.notification.hidden = true;
+            this.root.querySelector(".shell")?.classList.remove("menu-open");
+            this.root.querySelector(".menu-toggle")?.setAttribute("aria-expanded", "false");
             this.extensions.dispose();
             const fresh = Amaterasu.el("main", "content");
             fresh.id = "main";
@@ -12744,8 +16253,9 @@ var Amaterasu;
             this.content.replaceWith(fresh);
             this.content = fresh;
             for (const [name, item] of this.navigation) {
-                item.classList.toggle("selected", name === page);
-                if (name === page)
+                const selected = name === page || (name === "settings" && page.startsWith("settings/"));
+                item.classList.toggle("selected", selected);
+                if (selected)
                     item.setAttribute("aria-current", "page");
                 else
                     item.removeAttribute("aria-current");
@@ -12755,6 +16265,22 @@ var Amaterasu;
                 content: fresh,
                 notify: (message) => this.notify(message),
                 navigate: (page) => this.navigate(page),
+                ...(page.startsWith("settings/") ? { initialSettingsCategory: page.slice(9) } : {}),
+                replaceSettingsCategory: (category) => {
+                    if (!fresh.isConnected || !(this.displayedPage === "settings" || this.displayedPage?.startsWith("settings/")))
+                        return;
+                    const next = `settings/${category}`;
+                    const address = new URL(location.href);
+                    address.hash = next;
+                    history.replaceState(history.state, "", address);
+                    this.displayedPage = next;
+                },
+                registerDraftGuard: (isDirty, dispose) => {
+                    if (fresh.isConnected)
+                        this.draftGuard = { isDirty, dispose };
+                    else
+                        dispose();
+                },
             };
             if (page.startsWith("extension/")) {
                 fresh.append(Amaterasu.el("p", "muted", "Loading extension…"));
@@ -12765,7 +16291,7 @@ var Amaterasu;
                 Amaterasu.setLocalizedPageTitle("Extension");
             }
             else {
-                const corePage = page;
+                const corePage = (page.startsWith("settings/") ? "settings" : page);
                 const renderer = corePages.get(corePage);
                 if (!renderer)
                     return;

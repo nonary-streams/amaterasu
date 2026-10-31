@@ -10,6 +10,7 @@ class Element {
     this.children = [];
     this.listeners = new Map();
     this.value = "";
+    this.dataset = {};
     this.isConnected = false;
   }
   setConnected(connected) {
@@ -155,4 +156,39 @@ test("application DOM saves output and keybindings while preserving raw preparat
     assert.equal(entry.config_overrides.nvenc_spatial_aq, false);
   }
   assert.deepEqual(updates.map((update) => update.expected_revision), [7, 8, 9]);
+});
+
+test("desktop editor saves its process-less target, preparation and display settings", async () => {
+  const context = vm.createContext({ FormData:EditorFormData, TextEncoder, URL, Error,
+    HTMLSelectElement:SelectElement,
+    document:{createElement:(tag)=>tag === "select" ? new SelectElement(tag) : new Element(tag)} });
+  for (const source of ["src/model.ts","src/ui.ts","src/pages.ts","src/settings.ts","src/catalog.ts"]) {
+    vm.runInContext(ts.transpile(readFileSync(source,"utf8"),{target:ts.ScriptTarget.ES2022}),context);
+    vm.runInContext("Object.assign(globalThis, Amaterasu)",context);
+  }
+  const content = new Element("main"); content.setConnected(true);
+  const preparation = [{run:{executable:"/usr/bin/setup",args:["enable"]}}];
+  const desktop = {name:"Desktop",description:"",tags:[],"display-output":"Virtual-1","virtual-screen":false,
+    launch:{kind:"desktop",exit_timeout_seconds:30,working_directory:"/home/player",preparation}};
+  let saved;
+  context.Amaterasu.renderCatalog({content,notify(){},navigate(){},api:{allows:()=>true, async post(route,payload){
+    if (route === "catalog/list") return {ok:true,revision:1,next_cursor:null,config_override_capabilities:{frame_limiter_provider:["auto"],rtss_frame_limit_type:[]},entries:[{id:"app-1",entry:desktop}]};
+    if (route === "input/status") throw new Error("unavailable");
+    if (route === "catalog/update") { saved=ordinary(payload); return {ok:true,revision:2}; }
+    throw new Error(`unexpected route ${route}`);
+  }}});
+  await settle();
+  find(content,(node)=>node.tagName === "button" && node.textContent === "Edit").fire("click");
+  await settle();
+  const form = find(content,(node)=>node.className === "editor-form");
+  assert.equal(find(form,(node)=>node.name === "kind").value,"desktop");
+  assert.equal(find(form,(node)=>node.name === "path").disabled,true);
+  assert.equal(find(form,(node)=>node.name === "working_directory").value,"/home/player");
+  assert.equal(find(form,(node)=>node.name === "fullscreen_exit_timeout_seconds").value,"30");
+  form.fire("submit");
+  await settle();
+  assert.deepEqual(saved.entry.launch,{kind:"desktop",exit_timeout_seconds:30,working_directory:"/home/player",preparation});
+  assert.equal(saved.entry["display-output"],"Virtual-1");
+  assert.equal(saved.entry["virtual-screen"],false);
+  assert.equal(Object.hasOwn(saved.entry,"steam_id"),false);
 });

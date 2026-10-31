@@ -662,6 +662,24 @@ test("Lutris artwork reads signed 8 KiB chunks for the catalog digest", async ()
   assert.deepEqual(Buffer.from(await image.arrayBuffer()), source);
 });
 
+test("provider artwork stops requesting chunks when the view is removed", async () => {
+  for (const [read, ref, idField, id] of [
+    [readSteamArtwork, reference, "app_id", 730],
+    [readLutrisArtwork, lutrisReference, "game_id", 42],
+  ]) {
+    let active = true;
+    let calls = 0;
+    const api = { async post(_route, request) {
+      calls++;
+      active = false;
+      return {ok:true, [idField]:id, revision:ref.revision, offset:request.offset,
+        next_offset:8192, total_bytes:8193, mime_type:"image/png", data:Buffer.alloc(8192).toString("base64")};
+    } };
+    await assert.rejects(read(api, ref, () => active), /transfer cancelled/i);
+    assert.equal(calls, 1);
+  }
+});
+
 test("Lutris artwork rejects malformed references, changed digests, cursors and size", async () => {
   const valid = {
     ok: true, game_id: 42, revision: lutrisReference.revision,
@@ -701,7 +719,8 @@ test("Lutris artwork rejects malformed references, changed digests, cursors and 
 test("Lutris card refresh ignores stale A and revokes B on load or removal", async () => {
   class Element {
     constructor() { this.isConnected = true; this.children = []; this.listeners = new Map(); }
-    prepend(child) { this.children.unshift(child); }
+    prepend(child) { child.parent = this; this.children.unshift(child); }
+    remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); }
     addEventListener(type, listener) { this.listeners.set(type, listener); }
     fire(type) { this.listeners.get(type)?.(); }
   }
@@ -792,5 +811,6 @@ test("Lutris card refresh ignores stale A and revokes B on load or removal", asy
   await new Promise(setImmediate);
   assert.equal(steamArt.children.length, 1);
   steamArt.children[0].fire("error");
+  assert.equal(steamArt.children.length, 0);
   assert.deepEqual(revoked, ["blob:1", "blob:2", "blob:3"]);
 });

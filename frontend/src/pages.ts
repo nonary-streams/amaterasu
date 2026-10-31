@@ -24,22 +24,37 @@ namespace Amaterasu {
 
   export function renderOverview(context: PageContext): void {
     const area = el("div");
+    const activityArea = el("div", "overview-activity-area");
+    const hostMetricsArea = el("div", "overview-host-metrics");
+    area.append(el("p", "muted overview-loading", "Loading host information…"));
+    let refreshGeneration = 0;
+    let refreshActivity = (): void => {};
     context.content.append(
       sectionHeading(
         "Host overview",
         "Your applications, sessions, and local services in one place.",
-        button("Refresh", load),
+        button("Refresh", () => { void load(); refreshActivity(); }),
       ),
+      activityArea,
+      hostMetricsArea,
       area,
     );
+    refreshActivity = renderOverviewActivity(context, activityArea);
+    if (context.api.allows("configuration.read") && context.api.allows("diagnostics.read")) {
+      renderHostMetricsDashboard(context, hostMetricsArea, undefined, "overview");
+    } else {
+      hostMetricsArea.append(panel("Host vitals", el("p", "muted",
+        "Host measurements require configuration.read and diagnostics.read.")));
+    }
     async function load(): Promise<void> {
+      const generation = ++refreshGeneration;
       const snapshots = await Promise.allSettled([
         context.api.post<CatalogReply>("catalog/list", { limit: 32 }),
         context.api.post<SessionReply>("session/list", { limit: 16 }),
         context.api.post<ProcessReply>("application/list", { limit: 16 }),
         context.api.post<SteamStatus>("steam/status"),
       ]);
-      if (!context.content.isConnected) return;
+      if (!context.content.isConnected || generation !== refreshGeneration) return;
       const [catalog, sessions, applications, steam] = snapshots;
       const metrics = el("div", "metrics");
       const addMetric = (label: string, value: string, detail: string) =>
@@ -57,17 +72,17 @@ namespace Amaterasu {
         catalog?.status === "fulfilled"
           ? countLabel(catalog.value.entries.length, catalog.value.next_cursor)
           : "—",
-        "Manual library entries",
+        "Catalog entries returned",
       );
       addMetric(
-        "Sessions",
+        "Session records",
         sessions?.status === "fulfilled"
           ? countLabel(
               sessions.value.sessions.length,
               sessions.value.next_offset,
             )
           : "—",
-        "Current host instance",
+        "Caller-scoped coordination records",
       );
       addMetric(
         "Tracked processes",
@@ -86,38 +101,34 @@ namespace Amaterasu {
           ? "Scanning local libraries"
           : "Latest provider scan",
       );
-      const hero = el(
-        "section",
-        "overview-hero",
-        el(
-          "div",
-          "",
-          badge("YOUR HOST, YOUR LIBRARY", "accent"),
-          el("h2", "", "A home for your applications."),
-          el(
-            "p",
-            "",
-            "Curate your library and manage the services that keep this host running.",
-          ),
-          button(
-            "Open your library →",
-            () => context.navigate("catalog"),
-            "primary",
-          ),
-        ),
-        el(
-          "div",
-          "orbit-art",
-          el("span", "orbit one"),
-          el("span", "orbit two"),
-          el("span", "orbit-core", "A"),
-        ),
+      const available = snapshots.filter((snapshot) => snapshot.status === "fulfilled").length;
+      const status = el(
+        "section", "overview-status",
+        el("div", "overview-status-icon", available === snapshots.length ? "✓" : "!"),
+        el("div", "overview-status-copy",
+          el("p", "overview-status-label", "SERVICE ACCESS"),
+          el("h2", "", available === snapshots.length ? "Services responding" : "Some information is unavailable"),
+          el("p", "muted", available === snapshots.length
+            ? "Catalog, session coordination, applications, and Steam responded to the latest refresh."
+            : "Some service requests could not be completed. Check service access below for details.")),
       );
+      const quickActions = el("div", "quick-actions");
+      for (const [page, label, detail, scope] of [
+        ["host", "Host & devices", "Review pairing and host services", "configuration.read"],
+        ["catalog", "Library", "Manage applications in your library", "catalog.read"],
+        ["sessions", "Sessions", "View sessions and host metrics", "session.read"],
+        ["settings", "Settings", "Configure your host", "configuration.read"],
+      ] as const) {
+        if (!context.api.allows(scope)) continue;
+        const action = button(label, () => context.navigate(page), "quick-action");
+        action.append(el("small", "muted", detail), el("span", "quick-action-arrow", "→"));
+        quickActions.append(action);
+      }
       const serviceRows = snapshots.map((snapshot, index) => [
         el(
           "strong",
           "",
-          pagesTextMessage(["Catalog", "Sessions", "Applications", "Steam provider"][index] ?? ""),
+          pagesTextMessage(["Catalog", "Session coordination", "Applications", "Steam provider"][index] ?? ""),
         ),
         snapshot.status === "fulfilled"
           ? badge(pagesTextMessage("Available"), "good")
@@ -126,26 +137,93 @@ namespace Amaterasu {
           ? messageOf(snapshot.reason)
           : pagesTextMessage("Responded to the latest refresh"),
       ]);
-      area.replaceChildren(
-        hero,
-        metrics,
-        panel(
-          "Service access",
-          table(["Service", "Status", "Details"], serviceRows),
-        ),
-        el(
-          "div",
-          "notice",
-          el("strong", "", "Streaming is still being built"),
-          el(
-            "p",
-            "",
-            "Review pending device pairing from Host & devices. Capture controls and a browser streaming view are not available in this release.",
-          ),
-        ),
-      );
+      const details = el("div", "overview-details", panel("Service access", table(["Service", "Status", "Details"], serviceRows)));
+      if (quickActions.hasChildNodes()) details.append(panel("Quick actions", quickActions));
+      area.replaceChildren(status, metrics, details);
+
     }
     void load();
+  }
+
+  function renderOverviewActivity(context: PageContext, container: HTMLElement): () => void {
+    if (!context.api.allows("session.read")) {
+      container.append(panel("Stream activity", el("p", "muted", "Stream activity requires session.read.")));
+      return () => {};
+    }
+
+    const summary = el("strong", "", "Loading host stream activity…");
+    const launchStatus = el("p", "muted");
+    const observation = el("p", "muted");
+    const icon = el("div", "overview-status-icon", "↗");
+    icon.setAttribute("aria-hidden", "true");
+    container.append(el("section", "overview-activity-panel",
+      el("div", "overview-activity-state", icon,
+        el("div", "overview-activity-copy", el("p", "overview-status-label", "STREAM ACTIVITY"),
+          el("h2", "overview-activity-summary", summary), launchStatus, observation)),
+      button("View sessions", () => context.navigate("sessions"))));
+
+    let generation = 0;
+    let timer: number | undefined;
+    let disposed = false;
+    const observer = new MutationObserver(() => {
+      if (!container.isConnected) cleanup();
+    });
+    function cleanup(): void {
+      if (disposed) return;
+      disposed = true;
+      generation++;
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", visibilityChanged);
+      observer.disconnect();
+    }
+    function current(request: number): boolean {
+      return !disposed && container.isConnected && document.visibilityState === "visible" && request === generation;
+    }
+    function visibilityChanged(): void {
+      if (!container.isConnected) { cleanup(); return; }
+      if (document.visibilityState === "visible") refresh();
+      else {
+        generation++;
+        if (timer !== undefined) window.clearTimeout(timer);
+        timer = undefined;
+      }
+    }
+    function refresh(): void {
+      if (disposed || !container.isConnected || document.visibilityState !== "visible") return;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = undefined;
+      const request = ++generation;
+      launchStatus.textContent = "Refreshing pending launch tracking…";
+      void context.api.post<unknown>("live-streams/status").then((reply) => {
+        const snapshot = Amaterasu.parseLiveStreamSnapshot(reply);
+        if (!current(request)) return;
+        const count = snapshot.streams.length;
+        summary.textContent = count === 0 ? "No active streams reported" :
+          `${count} active ${count === 1 ? "stream" : "streams"} reported`;
+        observation.textContent = `Host observation: ${new Date(snapshot.sampledAtUnixMs).toLocaleString()}. Client media delivery is not verified.`;
+      }).catch(() => {
+        if (!current(request)) return;
+        summary.textContent = "Live stream status is unavailable";
+        observation.textContent = "The host did not provide a current stream status. Try refreshing.";
+      }).finally(() => {
+        if (current(request)) timer = window.setTimeout(refresh, 10_000);
+      });
+      void context.api.post<unknown>("history/history_status").then((reply) => {
+        const status = parseHistoryRuntimeStatus(reply);
+        if (!current(request)) return;
+        if (!status.available || !status.configuration_ready) {
+          launchStatus.textContent = "Pending launch tracking is unavailable.";
+          return;
+        }
+        launchStatus.textContent = `${status.pending_activities} pending ${status.pending_activities === 1 ? "launch" : "launches"}.${status.degraded ? " Launch tracking is degraded; counts may be incomplete." : ""}`;
+      }).catch(() => {
+        if (current(request)) launchStatus.textContent = "Pending launch tracking is unavailable.";
+      });
+    }
+    document.addEventListener("visibilitychange", visibilityChanged);
+    observer.observe(document.body, { childList: true, subtree: true });
+    refresh();
+    return refresh;
   }
 
   export function parseHistoryRuntimeStatus(value: unknown): HistoryRuntimeStatus {
@@ -238,6 +316,12 @@ namespace Amaterasu {
     if (!session || typeof session !== "object" || Array.isArray(session) ||
       (session as Record<string, unknown>).session_id !== sessionId)
       throw new Error("History detail belongs to a different session.");
+    parseHistoryListReply({ ok: true, sessions: [session], next_offset: null }, 0);
+    const summary = session as Record<string, unknown>;
+    if (["device_name", "codec"].some((key) => typeof summary[key] !== "string") ||
+      ["width", "height", "target_fps", "target_bitrate_kbps"].some((key) =>
+        !Number.isSafeInteger(summary[key]) || (summary[key] as number) < 0 || (summary[key] as number) > 0xffff_ffff))
+      throw new Error("History session metadata is invalid.");
     for (const key of ["sample_count", "event_count"])
       if (!Number.isSafeInteger(detail[key]) || (detail[key] as number) < 0)
         throw new Error(`History ${key} is invalid.`);
@@ -245,15 +329,23 @@ namespace Amaterasu {
       if (typeof detail[key] !== "boolean") throw new Error(`History ${key} is invalid.`);
     for (const [key, countKey] of [["samples", "sample_count"], ["events", "event_count"]] as const) {
       const rows = detail[key];
-      if (!Array.isArray(rows) || rows.length > (detail[countKey] as number) || rows.some((row) =>
+      const truncated = detail[key === "samples" ? "samples_truncated" : "events_truncated"];
+      if (!Array.isArray(rows) || rows.length > (key === "samples" ? 32 : 8) ||
+        rows.length > (detail[countKey] as number) || truncated !== (rows.length < (detail[countKey] as number)) || rows.some((row) =>
         !row || typeof row !== "object" || Array.isArray(row) || row.session_id !== sessionId ||
         !Number.isSafeInteger(row.recorded_at_unix)))
         throw new Error(`History ${key} are invalid.`);
     }
     for (const sample of detail.samples as Record<string, unknown>[]) {
-      for (const key of ["frames_sent", "bytes_sent", "dropped_frames", "actual_fps", "actual_bitrate_kbps"])
+      for (const key of ["frames_sent", "bytes_sent", "dropped_frames"])
+        if (!Number.isSafeInteger(sample[key]) || (sample[key] as number) < 0)
+          throw new Error(`History sample ${key} is invalid.`);
+      for (const key of ["actual_fps", "actual_bitrate_kbps"])
         if (typeof sample[key] !== "number" || !Number.isFinite(sample[key]) || sample[key] < 0)
           throw new Error(`History sample ${key} is invalid.`);
+      if (sample.encode_latency_ms != null && (typeof sample.encode_latency_ms !== "number" ||
+        !Number.isFinite(sample.encode_latency_ms) || sample.encode_latency_ms < 0))
+        throw new Error("History sample encode_latency_ms is invalid.");
     }
     if ((detail.events as Record<string, unknown>[]).some((event) => typeof event.event_type !== "string"))
       throw new Error("History event type is invalid.");
@@ -268,6 +360,7 @@ namespace Amaterasu {
         (reply.next_offset !== null && (!Number.isSafeInteger(reply.next_offset) ||
           (reply.next_offset as number) <= offset)))
       throw new Error("History session page is invalid.");
+    const ids = new Set<string>();
     for (const entry of reply.sessions) {
       if (!entry || typeof entry !== "object" || Array.isArray(entry))
         throw new Error("History session row is invalid.");
@@ -275,12 +368,16 @@ namespace Amaterasu {
       if (typeof session.session_id !== "string" || session.session_id.length === 0 ||
           new TextEncoder().encode(session.session_id).length > 128 ||
           /[\u0000-\u001f\u007f-\u009f]/u.test(session.session_id) ||
-          ["app_name", "client_name", "protocol"].some((key) => typeof session[key] !== "string") ||
+          ["app_name", "client_name", "device_name", "protocol", "codec"].some((key) => typeof session[key] !== "string") ||
+          ["width", "height", "target_fps", "target_bitrate_kbps"].some((key) =>
+            !Number.isSafeInteger(session[key]) || (session[key] as number) < 0 || (session[key] as number) > 0xffff_ffff) ||
           !Number.isSafeInteger(session.started_at_unix) ||
           (session.ended_at_unix !== null && !Number.isSafeInteger(session.ended_at_unix)) ||
           (session.duration_seconds !== null &&
             (!Number.isSafeInteger(session.duration_seconds) || (session.duration_seconds as number) < 0)))
         throw new Error("History session row is invalid.");
+      if (ids.has(session.session_id)) throw new Error("History session page contains a duplicate stream.");
+      ids.add(session.session_id);
     }
     return reply as unknown as HistoryListReply;
   }
@@ -306,6 +403,7 @@ namespace Amaterasu {
     const area = el("div");
     const status = el("div");
     const metricsArea = el("div");
+    const streamControlsArea = el("div");
     const historyRuntimeArea = el("div");
     const savedArea = el("div");
     const savedDetail = el("div");
@@ -316,17 +414,18 @@ namespace Amaterasu {
     const savedHistory = [0];
     let savedListRequest = 0;
     let savedDetailRequest = 0;
+    let timelineRequest = 0;
     let historyStatusRequest = 0;
     let historyDeleteAvailable = false;
     let historyDeleteReason = "Checking history status before deletion is available.";
     let deleteControls: { button: HTMLButtonElement; ended: boolean }[] = [];
     const deleteNotice = el("p", "muted", historyDeleteReason);
-    let selectedSavedSession: string | null = null;
+    let selectedSavedSessions = new Set<string>();
     const savedHistoryPanel = panel("Recorded stream sessions", savedArea, savedStatus, savedDetail);
     context.content.append(
       sectionHeading(
         "Sessions",
-        "Inspect and stop sessions owned by this management console.",
+        "Inspect stream history and session coordination for this host.",
         button("Refresh", () => {
           void load();
           void loadHistoryRuntime();
@@ -334,11 +433,13 @@ namespace Amaterasu {
         }),
       ),
       status,
-      area,
-      panel("Live host metrics", metricsArea),
+      streamControlsArea,
+      metricsArea,
+      panel("Session coordination", area),
       panel("History runtime status", historyRuntimeArea),
       savedHistoryPanel,
     );
+    Amaterasu.renderManagedStreamControls(context, streamControlsArea);
     function applyHistoryDeleteAvailability(): void {
       pagesSetLocalizedTextContent(deleteNotice, historyDeleteReason);
       for (const control of deleteControls)
@@ -424,7 +525,7 @@ namespace Amaterasu {
             ? table(["Session", "State", "Leases", "Action"], rows)
             : empty(
                 "No sessions yet",
-                "Sessions created through the management API appear here. Streaming clients and pairing are not available yet.",
+                "Sessions created through the management API appear here. Live stream activity is shown in the metrics section.",
               ),
           pager(
             history.length > 1
@@ -441,7 +542,7 @@ namespace Amaterasu {
                   void load();
                 }
               : null,
-            pagesTextLiteral(`Showing from ${offset + 1}`),
+            reply.sessions.length ? pagesTextLiteral(`Showing from ${offset + 1}`) : "No sessions on this page",
           ),
         );
       } catch (error) {
@@ -459,8 +560,7 @@ namespace Amaterasu {
         ), savedOffset);
         if (!context.content.isConnected || request !== savedListRequest) return;
         const currentDeleteControls: typeof deleteControls = [];
-        const rows = reply.sessions.map((session) => {
-          const details = button("Details", () => loadSavedDetail(session.session_id));
+        function deleteButton(session: HistorySessionSummary): HTMLButtonElement {
           const remove = button(
             "Delete",
             async () => {
@@ -480,9 +580,10 @@ namespace Amaterasu {
                   session_id: session.session_id,
                 }));
                 await confirmHistoryDeletion(context.api, session.session_id);
-                if (selectedSavedSession === session.session_id) {
+                if (selectedSavedSessions.has(session.session_id)) {
                   ++savedDetailRequest;
-                  selectedSavedSession = null;
+                  ++timelineRequest;
+                  selectedSavedSessions.clear();
                   savedDetail.replaceChildren();
                 }
                 context.notify(pagesTextMessage("Recorded session deleted."));
@@ -493,21 +594,37 @@ namespace Amaterasu {
             "quiet danger-text",
           );
           currentDeleteControls.push({ button: remove, ended: session.ended_at_unix != null });
-          return [
-            el("div", "", el("strong", "", pagesTextLiteral(session.app_name || session.session_id)),
-              el("small", "muted block", pagesTextLiteral(session.client_name || session.protocol))),
-            localizedDateTime(session.started_at_unix),
-            session.ended_at_unix == null ? badge("Active", "good") :
-              `${session.duration_seconds ?? 0} seconds`,
-            el("div", "actions", details, remove),
-          ];
+          return remove;
+        }
+        const groups = groupRecordedSessions(reply.sessions);
+        const cards = groups.map((members) => {
+          const session = members[0]!;
+          const details = button("Details", () => members.length > 1
+            ? loadSavedGroup(members) : loadSavedDetail(session.session_id));
+          const memberControls = members.length === 1 ? deleteButton(session) : el("details", "history-card-members",
+            el("summary", "", pagesTextLiteral(`Manage ${members.length} individual streams`)),
+            ...members.map((member) => el("div", "history-card-member",
+              el("div", "", el("strong", "", pagesTextLiteral(member.session_id)),
+                el("small", "muted block", localizedDateTime(member.started_at_unix))),
+              el("div", "actions", button("Details", () => loadSavedDetail(member.session_id)), deleteButton(member)))));
+          const resolution = session.width && session.height ? `${session.width} × ${session.height}` : "Resolution unavailable";
+          return el("article", "history-card",
+            el("div", "history-card-topline", members.length > 1
+              ? badge(pagesTextLiteral(`${members.length} nearby streams`)) : badge(pagesTextLiteral(session.protocol || "Unknown")),
+              el("time", "muted", localizedDateTime(session.started_at_unix))),
+            el("strong", "history-card-title", pagesTextLiteral(session.app_name || (members.length > 1 ? "Unnamed application" : session.session_id))),
+            el("span", "muted", pagesTextLiteral(session.client_name || session.device_name || "Client unavailable")),
+            el("span", "muted", pagesTextLiteral(`${resolution}${session.target_fps ? ` · ${session.target_fps} fps` : ""} · ${session.codec || "Codec unavailable"}`)),
+            el("div", "actions", details, ...(members.length === 1 ? [memberControls] : [])),
+            ...(members.length > 1 ? [memberControls] : []));
         });
         deleteControls = currentDeleteControls;
         applyHistoryDeleteAvailability();
         savedArea.replaceChildren(
           deleteNotice,
+          ...(groups.some((members) => members.length > 1) ? [el("p", "muted", "Nearby streams with matching names are grouped on this page; a reconnect is not confirmed.")] : []),
           reply.sessions.length
-            ? table(["Application / client", "Started", "Duration", "Actions"], rows)
+            ? el("div", "history-card-grid", ...cards)
             : empty("No recorded streams", "Completed streams appear here when history recording is enabled."),
           pager(
             savedHistory.length > 1
@@ -534,8 +651,9 @@ namespace Amaterasu {
     }
 
     async function loadSavedDetail(sessionId: string): Promise<void> {
-      selectedSavedSession = sessionId;
+      selectedSavedSessions = new Set([sessionId]);
       const request = ++savedDetailRequest;
+      ++timelineRequest;
       savedDetail.replaceChildren(el("p", "muted", "Loading session details…"));
       try {
         const reply = parseHistoryDetailReply(await context.api.post<unknown>(
@@ -545,45 +663,176 @@ namespace Amaterasu {
         if (!context.content.isConnected || request !== savedDetailRequest) return;
         const detail = reply.detail;
         if (!detail) return;
-        savedDetail.replaceChildren(
-          panel(
-            pagesTextLiteral(`History for ${detail.session.app_name || detail.session.session_id}`),
-            el("p", "muted", pagesTextLiteral(`${detail.session.protocol} · ${detail.session.width}×${detail.session.height} · ${detail.session.target_fps} FPS · ${detail.session.codec || "codec unavailable"}`)),
-            el("p", "muted", pagesTextLiteral(`${detail.sample_count} samples${detail.samples_truncated ? " (recent samples shown)" : ""} · ${detail.event_count} events${detail.events_truncated ? " (recent events shown)" : ""}`)),
-            detail.samples.length
-              ? table(
-                  ["Sample time", "Frames", "Bytes", "Dropped", "FPS", "Bitrate (kbps)"],
-                  detail.samples.map((sample) => [
-                    localizedDateTime(sample.recorded_at_unix),
-                    String(sample.frames_sent),
-                    String(sample.bytes_sent),
-                    String(sample.dropped_frames),
-                    sample.actual_fps.toFixed(1),
-                    sample.actual_bitrate_kbps.toFixed(1),
-                  ]),
-                )
-              : el("p", "muted", "No samples recorded."),
-            detail.events.length
-              ? table(
-                  ["Event time", "Event"],
-                  detail.events.map((event) => [
-                    localizedDateTime(event.recorded_at_unix),
-                    event.event_type,
-                  ]),
-                )
-              : el("p", "muted", "No events recorded."),
-          ),
-        );
+        const close = () => {
+          ++savedDetailRequest;
+          ++timelineRequest;
+          selectedSavedSessions.clear();
+          savedDetail.replaceChildren();
+        };
+        const complete = !detail.samples_truncated && !detail.events_truncated;
+        let view = renderRecordedSessionDetail(detail, close, complete);
+        const timelineStatus = el("div", "recorded-timeline-status");
+        savedDetail.replaceChildren(timelineStatus, view);
+        if (!complete) {
+          let engaged = false;
+          const markEngaged = () => { engaged = true; };
+          for (const event of ["pointerdown", "keydown", "input", "change"])
+            view.addEventListener(event, markEngaged);
+          function installComplete(full: NonNullable<HistoryDetailReply["detail"]>): void {
+            view = renderRecordedSessionDetail(full, close, true);
+            timelineStatus.replaceChildren(el("p", "muted", "All retained history in the captured snapshot is loaded."));
+            savedDetail.replaceChildren(timelineStatus, view);
+          }
+          async function loadTimeline(): Promise<void> {
+            const timeline = ++timelineRequest;
+            const active = () => context.content.isConnected && request === savedDetailRequest && timeline === timelineRequest;
+            const progress = el("p", "muted", "Loading retained history…");
+            progress.setAttribute("role", "status");
+            const cancel = button("Cancel history loading", () => {
+              if (!active()) return;
+              ++timelineRequest;
+              timelineStatus.replaceChildren(el("p", "muted", "Full history loading was cancelled; the recent snapshot remains available."),
+                button("Retry full history", () => void loadTimeline()));
+            });
+            timelineStatus.replaceChildren(progress, cancel);
+            try {
+              const full = await loadRetainedTimeline(context.api, sessionId, active, (samples, sampleTotal, events, eventTotal) => {
+                if (active()) progress.textContent = `Loading retained history… ${samples} of ${sampleTotal} samples · ${events} of ${eventTotal} events`;
+              });
+              if (!active() || !full) return;
+              const selection = typeof document.getSelection === "function" ? document.getSelection() : null;
+              const viewingSelection = !!selection && !selection.isCollapsed && !!selection.anchorNode && view.contains(selection.anchorNode);
+              if (engaged || viewingSelection || (document.activeElement && view.contains(document.activeElement))) {
+                timelineStatus.replaceChildren(el("p", "muted", "Full retained history is ready."),
+                  button("Show full retained history", () => { if (active()) installComplete(full); }));
+              } else installComplete(full);
+            } catch (error) {
+              if (active()) timelineStatus.replaceChildren(errorPanel(error, () => void loadTimeline()),
+                el("p", "muted", "The recent snapshot remains available; no partial full-history result was applied."));
+            }
+          }
+          void loadTimeline();
+        }
       } catch (error) {
         if (context.content.isConnected && request === savedDetailRequest)
           savedDetail.replaceChildren(errorPanel(error, () => loadSavedDetail(sessionId)));
       }
     }
+
+    async function loadSavedGroup(members: HistorySessionSummary[]): Promise<void> {
+      selectedSavedSessions = new Set(members.map((member) => member.session_id));
+      const request = ++savedDetailRequest;
+      ++timelineRequest;
+      savedDetail.replaceChildren(el("p", "muted", "Loading nearby stream details…"));
+      let halted = false;
+      const current = () => !halted && context.content.isConnected && request === savedDetailRequest;
+      try {
+        const details: NonNullable<HistoryDetailReply["detail"]>[] = new Array(members.length);
+        let next = 0;
+        async function readDetails(): Promise<void> {
+          while (current() && next < members.length) {
+            const index = next++;
+            const id = members[index]!.session_id;
+            details[index] = parseHistoryDetailReply(await context.api.post<unknown>(
+              "history/session_detail", { session_id:id },
+            ), id).detail!;
+          }
+        }
+        try { await Promise.all(Array.from({length:Math.min(3, members.length)}, () => readDetails())); }
+        catch (error) { halted = true; throw error; }
+        if (!current()) return;
+        if (groupRecordedSessions(details.map((detail) => detail.session)).length !== 1)
+          throw new Error("These streams no longer match this group. Refresh the session list.");
+        const close = () => {
+          ++savedDetailRequest;
+          ++timelineRequest;
+          selectedSavedSessions.clear();
+          savedDetail.replaceChildren();
+        };
+        const complete = details.every((detail) => !detail.samples_truncated && !detail.events_truncated);
+        let view = renderRecordedSessionDetail(mergeRecordedSessionDetails(details), close, complete, details);
+        const timelineStatus = el("div", "recorded-timeline-status");
+        savedDetail.replaceChildren(timelineStatus, view);
+        if (complete) return;
+        let engaged = false;
+        const markEngaged = () => { engaged = true; };
+        for (const event of ["pointerdown", "keydown", "input", "change"]) view.addEventListener(event, markEngaged);
+        function withinLimit(samples: number[], events: number[]): boolean {
+          return samples.reduce((sum, value) => sum + value, 0) <= 25_000 &&
+            events.reduce((sum, value) => sum + value, 0) <= 5_000;
+        }
+        function installComplete(full: NonNullable<HistoryDetailReply["detail"]>[]): void {
+          view = renderRecordedSessionDetail(mergeRecordedSessionDetails(full), close, true, full);
+          timelineStatus.replaceChildren(el("p", "muted", "All retained history in each captured stream snapshot is loaded."));
+          savedDetail.replaceChildren(timelineStatus, view);
+        }
+        async function loadTimelines(): Promise<void> {
+          const timeline = ++timelineRequest;
+          let stopped = false;
+          const active = () => current() && !stopped && timeline === timelineRequest;
+          const sampleTotals = details.map((detail) => detail.sample_count);
+          const eventTotals = details.map((detail) => detail.event_count);
+          if (!withinLimit(sampleTotals, eventTotals)) {
+            timelineStatus.replaceChildren(el("p", "notice", "This group exceeds the browser limit for a complete history. Recent snapshots remain available; open an individual stream for its full history."));
+            return;
+          }
+          const progress = el("p", "muted", "Loading retained history for nearby streams…");
+          progress.setAttribute("role", "status");
+          const cancel = button("Cancel history loading", () => {
+            if (!active()) return;
+            ++timelineRequest;
+            timelineStatus.replaceChildren(el("p", "muted", "Full history loading was cancelled; recent snapshots remain available."),
+              button("Retry full history", () => void loadTimelines()));
+          });
+          timelineStatus.replaceChildren(progress, cancel);
+          const full = [...details];
+          let index = 0;
+          let done = 0;
+          async function readTimeline(): Promise<void> {
+            while (active() && index < full.length) {
+              const position = index++;
+              const detail = full[position]!;
+              if (detail.samples_truncated || detail.events_truncated) {
+                const loaded = await loadRetainedTimeline(context.api, detail.session.session_id, active, (_samples, sampleTotal, _events, eventTotal) => {
+                  sampleTotals[position] = sampleTotal;
+                  eventTotals[position] = eventTotal;
+                  if (!withinLimit(sampleTotals, eventTotals)) throw new Error("This group exceeds the browser limit for a complete history. Open an individual stream instead.");
+                });
+                if (!active() || !loaded) return;
+                full[position] = loaded;
+              }
+              done++;
+              if (active()) progress.textContent = `Loading retained history… ${done} of ${full.length} streams`;
+            }
+          }
+          try {
+            try { await Promise.all(Array.from({length:Math.min(3, full.length)}, () => readTimeline())); }
+            catch (error) { stopped = true; throw error; }
+            if (!active()) return;
+            if (groupRecordedSessions(full.map((detail) => detail.session)).length !== 1)
+              throw new Error("These streams no longer match this group. Refresh the session list.");
+            const selection = typeof document.getSelection === "function" ? document.getSelection() : null;
+            const viewingSelection = !!selection && !selection.isCollapsed && !!selection.anchorNode && view.contains(selection.anchorNode);
+            if (engaged || viewingSelection || (document.activeElement && view.contains(document.activeElement))) {
+              timelineStatus.replaceChildren(el("p", "muted", "Full retained history is ready for all streams."),
+                button("Show full retained history", () => { if (active()) installComplete(full); }));
+            } else installComplete(full);
+          } catch (error) {
+            if (current() && timeline === timelineRequest) timelineStatus.replaceChildren(errorPanel(error, () => void loadTimelines()),
+              el("p", "muted", "Recent snapshots remain available; no partial full-history result was applied."));
+          }
+        }
+        void loadTimelines();
+      } catch (error) {
+        if (context.content.isConnected && request === savedDetailRequest)
+          savedDetail.replaceChildren(errorPanel(error, () => loadSavedGroup(members)));
+      }
+    }
     void load();
     void loadHistoryRuntime();
     void loadSaved();
-    if (context.api.allows("diagnostics.read")) renderHostMetricsDashboard(context, metricsArea, savedHistoryPanel);
-    else metricsArea.replaceChildren(el("p", "muted", "Host metrics are unavailable for this account."));
+    if (context.api.allows("diagnostics.read") || context.api.allows("session.read")) renderHostMetricsDashboard(context, metricsArea, savedHistoryPanel);
+    else metricsArea.replaceChildren(panel("Live host metrics", el("p", "muted", "Host metrics are unavailable for this account.")));
   }
 
   export function renderApplications(context: PageContext): void {
@@ -1107,6 +1356,55 @@ namespace Amaterasu {
     return reply as unknown as DiagnosticReply;
   }
 
+  export interface DiagnosticSnapshot {
+    records: DiagnosticRecord[];
+    latestSequence: number;
+    droppedTotal: number;
+    incomplete: boolean;
+  }
+
+  // The journal is bounded to 128 records and the API permits four per request.
+  // Freeze the first reply's endpoint so new writes cannot extend the read forever.
+  export async function readDiagnosticSnapshot(
+    api: Pick<Api, "post">,
+    isCurrent: () => boolean,
+  ): Promise<DiagnosticSnapshot | null> {
+    let cursor = 0;
+    let target: number | undefined;
+    let droppedTotal = 0;
+    let incomplete = false;
+    const records: DiagnosticRecord[] = [];
+    for (let page = 0; page < 32; page++) {
+      const value = await api.post<unknown>("diagnostics/query", { after: cursor, limit: 4 });
+      if (!isCurrent()) return null;
+      const reply = parseDiagnosticQueryReply(value, cursor);
+      if (target === undefined) {
+        target = reply.latest_sequence;
+        droppedTotal = reply.dropped_total;
+      } else if (reply.resync_required) {
+        incomplete = true;
+      }
+      const expectedFirst = page === 0 ? (reply.oldest_sequence ?? 1) : cursor + 1;
+      let expected = expectedFirst;
+      for (const record of reply.records) {
+        if (record.sequence !== expected) incomplete = true;
+        expected = record.sequence + 1;
+        if (record.sequence <= target) records.push(record);
+      }
+      if (reply.next_cursor >= target) return { records, latestSequence: target, droppedTotal, incomplete };
+      if (reply.next_cursor <= cursor) throw new Error("Diagnostics query did not advance through the journal.");
+      cursor = reply.next_cursor;
+    }
+    return { records, latestSequence: target ?? 0, droppedTotal, incomplete: true };
+  }
+
+  export function formatDiagnosticRecords(records: DiagnosticRecord[]): string {
+    return records.map((record) => {
+      const fields = Object.entries(record.fields).map(([key, value]) => `${key}: ${value}`).join(" · ");
+      return `#${record.sequence} [${record.level}] ${record.target}: ${record.message}${fields ? ` · ${fields}` : ""}`;
+    }).join("\n");
+  }
+
   export function parseDiagnosticCountersReply(value: unknown): Record<string, number> {
     if (!value || typeof value !== "object" || Array.isArray(value))
       throw new Error("Diagnostics counters reply is invalid.");
@@ -1120,6 +1418,16 @@ namespace Amaterasu {
       typeof count !== "number" || !Number.isSafeInteger(count) || count < 0))
       throw new Error("Diagnostics counter value is invalid or exceeds exact browser integer range.");
     return counters as Record<string, number>;
+  }
+
+  export function filterDiagnosticPage(records: DiagnosticRecord[], query: string, level: string): DiagnosticRecord[] {
+    const needle = query.trim().toLocaleLowerCase();
+    return records.filter((record) => {
+      if (level && record.level !== level) return false;
+      const text = [record.target, record.message, ...Object.entries(record.fields).flat()]
+        .join(" ").toLocaleLowerCase();
+      return !needle || text.includes(needle);
+    });
   }
 
   const DIAGNOSTIC_SESSION_LIMIT = 4;
@@ -1176,22 +1484,112 @@ namespace Amaterasu {
 
   export function renderDiagnostics(context: PageContext): void {
     const area = el("div");
+    const hostLogArea = el("div");
     const sessionsArea = el("div");
-    let after = 0;
-    const history = [0];
     let loadRequest = 0;
     let sessionRequest = 0;
+    let refreshHostLogs: (() => Promise<void>) | null = null;
+    let currentRecords: DiagnosticRecord[] = [];
+    const filter = input("diagnostics_filter", "", "search");
+    filter.placeholder = "Search retained records";
+    const level = el("select");
+    for (const [value, label] of [["", "All levels"], ["trace", "Trace"], ["debug", "Debug"],
+      ["info", "Info"], ["warn", "Warning"], ["error", "Error"]]) {
+      const option = el("option", "", label);
+      option.value = value ?? "";
+      level.append(option);
+    }
+    const filteredRecords = el("div", "records");
+    const filterSummary = el("p", "muted diagnostics-filter-summary");
+    filterSummary.setAttribute("role", "status");
+    const copyStatus = el("div");
+    const matchStatus = el("span", "muted diagnostics-match-status");
+    matchStatus.setAttribute("role", "status");
+    let selectedMatch = 0;
+    const previousMatch = button("Previous match", () => moveMatch(-1));
+    const nextMatch = button("Next match", () => moveMatch(1));
+    const matchNavigation = el("div", "diagnostics-match-navigation", previousMatch, nextMatch, matchStatus);
+    matchNavigation.setAttribute("role", "group");
+    matchNavigation.setAttribute("aria-label", "Search match navigation");
+    let copying = false;
+    const copy = button("Copy visible records", () => {
+      if (copying) return;
+      copying = true;
+      void runAction(copy, copyStatus, async () => {
+        const records = filterDiagnosticPage(currentRecords, filter.value, level.value);
+        if (!navigator.clipboard?.writeText) throw new Error("Clipboard access is unavailable in this browser context.");
+        await navigator.clipboard.writeText(formatDiagnosticRecords(records));
+        context.notify("Visible diagnostic records copied.");
+      }).finally(() => {
+        copying = false;
+        copy.disabled = filterDiagnosticPage(currentRecords, filter.value, level.value).length === 0;
+      });
+    });
+    const download = button("Download visible records", () => {
+      const records = filterDiagnosticPage(currentRecords, filter.value, level.value);
+      if (!records.length) return;
+      const url = URL.createObjectURL(new Blob([formatDiagnosticRecords(records)], { type: "text/plain;charset=utf-8" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "amaterasu-diagnostics.txt";
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    });
+    function moveMatch(direction: number): void {
+      const visible = filterDiagnosticPage(currentRecords, filter.value, level.value);
+      if (!filter.value.trim() || visible.length === 0) return;
+      selectedMatch = (selectedMatch + direction + visible.length) % visible.length;
+      renderFilteredRecords(true);
+    }
+    function renderFilteredRecords(scrollToMatch = false): void {
+      const visible = filterDiagnosticPage(currentRecords, filter.value, level.value);
+      const searching = filter.value.trim().length > 0;
+      if (selectedMatch >= visible.length) selectedMatch = 0;
+      matchNavigation.hidden = !searching;
+      previousMatch.disabled = nextMatch.disabled = visible.length === 0;
+      matchStatus.textContent = visible.length ? `Match ${selectedMatch + 1} of ${visible.length}` : "No matches";
+      copy.disabled = copying || visible.length === 0;
+      download.disabled = visible.length === 0;
+      filterSummary.textContent = `${visible.length} of ${currentRecords.length} retained records`;
+      const articles = visible.map((record, index) => {
+        const active = searching && index === selectedMatch;
+        const article = el(
+          "article", `record${active ? " diagnostics-record-active" : ""}`,
+          el("div", "section-meta",
+            badge(pagesTextLiteral(record.level), record.level === "error" ? "bad" : ""),
+            el("small", "muted", pagesTextLiteral(`#${record.sequence} · ${record.target}`))),
+          el("p", "", pagesTextLiteral(record.message)),
+          ...Object.entries(record.fields).map(([key, value]) =>
+            el("p", "record-field", el("strong", "", pagesTextLiteral(`${key}: `)), pagesTextLiteral(value))),
+        );
+        if (active) article.setAttribute("aria-current", "true");
+        return article;
+      });
+      filteredRecords.replaceChildren(...articles);
+      if (scrollToMatch && searching && articles[selectedMatch]?.scrollIntoView)
+        articles[selectedMatch]!.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      if (!visible.length) filteredRecords.append(el("p", "muted diagnostics-empty", currentRecords.length
+        ? "No retained records match the filter."
+        : "No diagnostic records are retained."));
+    }
+    filter.addEventListener("input", () => { selectedMatch = 0; renderFilteredRecords(); });
+    filter.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || event.isComposing || !filter.value.trim()) return;
+      event.preventDefault();
+      moveMatch(event.shiftKey ? -1 : 1);
+    });
+    level.addEventListener("change", () => { selectedMatch = 0; renderFilteredRecords(); });
     context.content.append(
       sectionHeading(
         "Diagnostics",
-        "Caller-scoped records and counters, plus separately recorded stream outcomes.",
+        "Host logs, caller-scoped records, and separately recorded stream outcomes.",
         button("Refresh", () => {
-          after = 0;
-          history.splice(0, history.length, 0);
+          void refreshHostLogs?.();
           void loadRecentSessions();
           return load();
         }),
       ),
+      hostLogArea,
       area,
       panel("Recent stream outcomes", sessionsArea,
         el("p", "muted", "Session history is separate from caller-scoped diagnostics; no record-to-session correlation is implied. Only recognized termination codes receive a stage label.")),
@@ -1244,93 +1642,54 @@ namespace Amaterasu {
     }
     async function load(): Promise<void> {
       const request = ++loadRequest;
-      const cursor = after;
+      const isCurrent = () => context.content.isConnected && request === loadRequest;
+      if (!context.api.allows("diagnostics.read")) {
+        area.replaceChildren(panel("Caller-scoped diagnostics", el("p", "muted", "This session does not have diagnostics.read access.")));
+        return;
+      }
+      area.replaceChildren(el("p", "muted", "Loading retained diagnostic records…"));
       try {
-        const [queryValue, counterValue] = await Promise.all([
-          context.api.post<unknown>("diagnostics/query", {
-            after: cursor,
-            limit: 4,
-          }),
-          context.api.post<unknown>(
-            "diagnostics/counters",
-          ),
+        const [snapshotResult, countersResult] = await Promise.allSettled([
+          readDiagnosticSnapshot(context.api, isCurrent),
+          context.api.post<unknown>("diagnostics/counters"),
         ]);
-        if (!context.content.isConnected || request !== loadRequest) return;
-        const reply = parseDiagnosticQueryReply(queryValue, cursor);
-        const counters = parseDiagnosticCountersReply(counterValue);
-        if (reply.resync_required) history.splice(0, history.length, cursor);
-        const records = el(
-          "div",
-          "records",
-          ...reply.records.map((record) =>
-            el(
-              "article",
-              "record",
-              el(
-                "div",
-                "section-meta",
-                badge(pagesTextLiteral(record.level), record.level === "error" ? "bad" : ""),
-                el("small", "muted", pagesTextLiteral(`#${record.sequence} · ${record.target}`)),
-              ),
-              el("p", "", pagesTextLiteral(record.message)),
-              ...Object.entries(record.fields).map(([key, value]) =>
-                el("p", "record-field", el("strong", "", pagesTextLiteral(`${key}: `)), pagesTextLiteral(value)),
-              ),
-            ),
-          ),
-        );
+        if (!isCurrent()) return;
+        if (snapshotResult.status === "rejected") throw snapshotResult.reason;
+        const snapshot = snapshotResult.value;
+        if (!snapshot) return;
+        currentRecords = snapshot.records;
+        selectedMatch = 0;
+        renderFilteredRecords();
+        let countersContent: HTMLElement;
+        try {
+          if (countersResult.status === "rejected") throw countersResult.reason;
+          const counters = parseDiagnosticCountersReply(countersResult.value);
+          countersContent = Object.keys(counters).length
+            ? table(["Counter", "Value"], Object.entries(counters).map(([name, value]) => [name, String(value)]))
+            : el("p", "muted", "No counters have been recorded.");
+        } catch (error) {
+          countersContent = errorPanel(error, load);
+        }
         area.replaceChildren(
-          reply.resync_required
-            ? el(
-                "p",
-                "notice",
-                "Older records were removed from the bounded journal. Showing the records still available.",
-              )
+          snapshot.incomplete
+            ? el("p", "notice", "Some records disappeared while this snapshot was loading. Refresh to try again.")
+            : nullNode(),
+          snapshot.droppedTotal > 0
+            ? el("p", "notice", `${snapshot.droppedTotal} older records were removed from the bounded journal before this snapshot.`)
             : nullNode(),
           panel(
             "Recent records",
-            reply.records.length
-              ? records
-              : empty(
-                  "No diagnostic records",
-                  "Records appear when a service explicitly submits them. Automatic host log collection is not enabled.",
-                ),
+            el("p", "muted", "Search, copy or download this caller-scoped snapshot of up to 128 retained records. Host log files are not included; refresh to see newer records."),
+            el("div", "diagnostics-toolbar", field("Search retained records", filter), field("Level", level), copy, download),
+            filterSummary, matchNavigation, copyStatus, filteredRecords,
           ),
-          pager(
-            history.length > 1
-              ? () => {
-                  history.pop();
-                  after = history[history.length - 1] ?? 0;
-                  void load();
-                }
-              : null,
-            reply.has_more
-              ? () => {
-                  after = reply.next_cursor;
-                  history.push(after);
-                  void load();
-                }
-              : null,
-            pagesTextLiteral(`Page ${history.length}`),
-          ),
-          panel(
-            "Counters",
-            Object.keys(counters).length
-              ? table(
-                  ["Counter", "Value"],
-                  Object.entries(counters).map(([name, value]) => [
-                    name,
-                    String(value),
-                  ]),
-                )
-              : el("p", "muted", "No counters have been recorded."),
-          ),
+          panel("Counters", countersContent),
         );
       } catch (error) {
-        if (context.content.isConnected && request === loadRequest)
-          area.replaceChildren(errorPanel(error, load));
+        if (isCurrent()) area.replaceChildren(errorPanel(error, load));
       }
     }
+    if (context.api.allows("host-logs.read")) refreshHostLogs = renderHostLogs(context, hostLogArea);
     void load();
     void loadRecentSessions();
   }

@@ -210,7 +210,7 @@ test("manual Playnite Fullscreen entries use a typed bounded launch", () => {
   form.set("steam_install_dir", "C:\\Ignored");
   form.set("exit_timeout_seconds", "invalid inactive value");
   form.set("detached", "bad\tcommand");
-  form.set("preparation", "invalid inactive value");
+  form.set("preparation", "[]");
   form.set("fullscreen_exit_timeout_seconds", "0");
   const entry = ordinary(model.entryFromForm(form));
   assert.deepEqual(entry.launch, { kind: "playnite_fullscreen", exit_timeout_seconds: 0 });
@@ -554,4 +554,24 @@ test("software override editor preserves null versus empty, raw strings, and app
     const invalid = new FormData();invalid.set("sw_preset_mode","value");invalid.set("sw_tune_mode","value");invalid.set(key,value);
     assert.throws(()=>model.parseSoftwareEncoderOverrides(invalid));
   }
+});
+
+test("desktop and fullscreen launches retain working directories and structured preparation", () => {
+  for (const kind of ["desktop", "playnite_fullscreen"]) {
+    const form = new FormData();
+    form.set("name", "Desktop");
+    form.set("kind", kind);
+    form.set("working_directory", "/home/player");
+    form.set("fullscreen_exit_timeout_seconds", "30");
+    form.set("preparation", JSON.stringify([{run:{executable:"/usr/bin/setup",args:["enable"]}}]));
+    form.set("steam_id", "123");
+    const entry = ordinary(model.entryFromForm(form));
+    assert.deepEqual(entry.launch, {kind,exit_timeout_seconds:30,working_directory:"/home/player",preparation:[{run:{executable:"/usr/bin/setup",args:["enable"]}}]});
+    assert.equal(Object.hasOwn(entry, "steam_id"), false);
+    assert.equal(model.launchPath(entry), kind === "desktop" ? "Desktop session" : "Playnite Fullscreen");
+    form.set("preparation", "malformed");
+    assert.throws(() => model.entryFromForm(form), /preparation commands/i);
+  }
+  const unsupported = new FormData(); unsupported.set("kind", "future_kind");
+  assert.throws(() => model.entryFromForm(unsupported), /supported launch type/);
 });

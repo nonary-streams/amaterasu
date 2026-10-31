@@ -133,6 +133,7 @@ namespace Amaterasu {
   export async function readSteamArtwork(
     api: Pick<Api, "post">,
     reference: Extract<NonNullable<Entry["artwork"]>, { provider: "steam" }>,
+    active: () => boolean = () => true,
   ): Promise<Blob> {
     if (
       reference.provider !== "steam" ||
@@ -151,6 +152,7 @@ namespace Amaterasu {
         revision: reference.revision,
         offset,
       });
+      if (!active()) throw new Error("Artwork transfer cancelled.");
       if (
         reply.ok !== true ||
         reply.app_id !== reference.app_id ||
@@ -161,6 +163,7 @@ namespace Amaterasu {
         reply.total_bytes > 16 * 1024 * 1024 ||
         !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
         typeof reply.data !== "string" ||
+        reply.data.length > 10924 ||
         (totalBytes !== null && totalBytes !== reply.total_bytes) ||
         (mimeType !== null && mimeType !== reply.mime_type)
       ) throw new Error("Steam artwork changed during transfer.");
@@ -187,6 +190,7 @@ namespace Amaterasu {
   export async function readLutrisArtwork(
     api: Pick<Api, "post">,
     reference: Extract<NonNullable<Entry["artwork"]>, { provider: "lutris" }>,
+    active: () => boolean = () => true,
   ): Promise<Blob> {
     if (
       reference.provider !== "lutris" ||
@@ -204,6 +208,7 @@ namespace Amaterasu {
         revision: reference.revision,
         offset,
       });
+      if (!active()) throw new Error("Artwork transfer cancelled.");
       if (
         reply.ok !== true ||
         reply.game_id !== reference.game_id ||
@@ -243,13 +248,15 @@ namespace Amaterasu {
     reference: Entry["artwork"],
     art: HTMLElement,
     content: HTMLElement,
+    onLoad?: () => void,
   ): void {
     if (!reference) return;
     if (reference.provider === "steam" && !api.allows("steam.read")) return;
     if (reference.provider === "lutris" && !api.allows("lutris.read")) return;
+    const active = () => content.isConnected && art.isConnected;
     const imageRead = reference.provider === "steam"
-      ? readSteamArtwork(api, reference)
-      : readLutrisArtwork(api, reference);
+      ? readSteamArtwork(api, reference, active)
+      : readLutrisArtwork(api, reference, active);
     void imageRead.then((blob) => {
       if (!content.isConnected || !art.isConnected) return;
       const url = URL.createObjectURL(blob);
@@ -265,8 +272,8 @@ namespace Amaterasu {
         observer.disconnect();
         URL.revokeObjectURL(url);
       };
-      image.addEventListener("load", release, { once: true });
-      image.addEventListener("error", release, { once: true });
+      image.addEventListener("load", () => { release(); if (active()) onLoad?.(); }, { once: true });
+      image.addEventListener("error", () => { image.remove(); release(); }, { once: true });
       observer.observe(document, { childList: true, subtree: true });
       image.src = url;
       art.prepend(image);
@@ -1023,36 +1030,267 @@ namespace Amaterasu {
     };
   }
 
+  type LibrarySort = "name" | "name-desc" | "source";
+  interface LibraryIndexRow { id: string; name: string; source: string; }
+  interface LibraryIndex {
+    revision: number;
+    capabilities: CatalogConfigOverrideCapabilities;
+    rows: LibraryIndexRow[];
+    cachedRows: Map<string, CatalogRow>;
+  }
+
+  function librarySource(entry: Entry): string {
+    if (entry.launch.kind === "playnite" || entry.launch.kind === "playnite_fullscreen") return "Playnite";
+    if (entry.steam_id || entry.artwork?.provider === "steam") return "Steam";
+    if (entry.artwork?.provider === "lutris") return "Lutris";
+    return "Other";
+  }
+
+  function sortLibraryRows(rows: LibraryIndexRow[], sort: LibrarySort): LibraryIndexRow[] {
+    let locale = typeof document !== "undefined" ? document.documentElement?.lang : "";
+    locale = locale?.replaceAll("_", "-") ?? "";
+    let collator: Intl.Collator;
+    try { collator = new Intl.Collator(locale || undefined, { numeric: true, sensitivity: "base" }); }
+    catch { collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" }); }
+    return [...rows].sort((left, right) => {
+      const name = collator.compare(left.name, right.name);
+      if (sort === "source") return collator.compare(left.source, right.source) || name || left.id.localeCompare(right.id);
+      return (sort === "name-desc" ? -name : name) || left.id.localeCompare(right.id);
+    });
+  }
+
+  export function libraryLocation(address: URL): { query: string; sort: LibrarySort } {
+    const fragment = address.hash.slice(1);
+    const parameters = new URLSearchParams(fragment.startsWith("catalog?") ? fragment.slice(8) : "");
+    const requestedSort = parameters.get("sort");
+    return {
+      query: (parameters.get("q") ?? "").trim(),
+      sort: requestedSort === "name-desc" || requestedSort === "source" ? requestedSort : "name",
+    };
+  }
+
+  export function updateLibraryLocation(address: URL, query: string, sort: LibrarySort): URL {
+    const next = new URL(address);
+    const parameters = new URLSearchParams(next.hash.startsWith("#catalog?") ? next.hash.slice(9) : "");
+    if (query) parameters.set("q", query);
+    else parameters.delete("q");
+    if (sort !== "name") parameters.set("sort", sort);
+    else parameters.delete("sort");
+    const suffix = parameters.toString();
+    next.hash = suffix ? `catalog?${suffix}` : "catalog";
+    return next;
+  }
+
+  async function scanLibraryIndex(
+    api: Api, query: string, active: () => boolean, progress: (count: number) => void,
+  ): Promise<LibraryIndex> {
+    const rows: LibraryIndexRow[] = [];
+    const cachedRows = new Map<string, CatalogRow>();
+    const seenIds = new Set<string>();
+    const seenCursors = new Set<string>();
+    let cursor: unknown = null;
+    let revision: number | null = null;
+    let capabilities: CatalogConfigOverrideCapabilities | null = null;
+    do {
+      if (!active()) throw new Error("Library scan cancelled.");
+      const reply: CatalogReply = await api.post(query ? "catalog/search" : "catalog/list", {
+        ...(query ? { query } : {}), cursor, limit: 32,
+      });
+      if (!active()) throw new Error("Library scan cancelled.");
+      if (revision !== null && reply.revision !== revision) throw new Error("The catalog changed while sorting. Refresh the library to try again.");
+      revision = reply.revision;
+      capabilities = reply.config_override_capabilities;
+      for (const row of reply.entries) {
+        if (seenIds.has(row.id) || rows.length >= 100_000) throw new Error("The catalog returned an invalid or oversized library.");
+        seenIds.add(row.id);
+        rows.push({id: row.id, name: row.entry.name, source: librarySource(row.entry)});
+        if (cachedRows.size < 32) cachedRows.set(row.id, row);
+      }
+      progress(rows.length);
+      cursor = reply.next_cursor;
+      if (cursor !== null) {
+        const marker = JSON.stringify(cursor);
+        if (seenCursors.has(marker)) throw new Error("The catalog returned a repeated continuation.");
+        seenCursors.add(marker);
+      }
+    } while (cursor !== null);
+    if (revision === null || capabilities === null) throw new Error("The catalog returned no library revision.");
+    return {revision, capabilities, rows, cachedRows};
+  }
+
   export function renderCatalog(context: PageContext): void {
     const { content, api, notify } = context;
     const search = input("search");
     search.type = "search";
-    catalogLocalizedAttribute(search, "placeholder", "Search names, descriptions, tags");
+    catalogLocalizedAttribute(search, "placeholder", "Search names, sources, commands and tags");
     catalogLocalizedAttribute(search, "aria-label", "Search catalog");
     const searchForm = el("form", "search-form", search);
     const searchButton = el("button", "button secondary", "Search");
     searchButton.type = "submit";
     searchForm.append(searchButton);
     const results = el("div");
+    results.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && selectedIds.size) {
+        event.preventDefault();
+        clearSelection();
+      }
+    });
     const editor = el("div");
+    const editorDrafts = context.registerDraftGuard ? trackDrafts(editor) : null;
+    let editorSaving = false;
+    if (editorDrafts) context.registerDraftGuard?.(() => editorSaving || editorDrafts.isDirty(), editorDrafts.dispose);
+    let editorGeneration = 0;
     const status = el("div");
-    let query = "";
+    const selectionCount = el("span", "muted");
+    const selectionBar = el("div", "library-selection");
+    const selectedIds = new Set<string>();
+    const visibleSelection = new Map<string, () => void>();
+    let selectionAnchor = "";
+    let selectedRevision: number | null = null;
+    let visibleIds: string[] = [];
+    const clearSelectionButton = button("Clear selection", () => clearSelection(), "quiet");
+    selectionBar.setAttribute("role", "status");
+    selectionBar.hidden = true;
+    selectionBar.append(selectionCount, el("span", "muted", "Space selects · Escape clears"), clearSelectionButton);
+    function updateSelection(): void {
+      selectionBar.hidden = selectedIds.size === 0;
+      selectionCount.textContent = `${selectedIds.size} selected`;
+      for (const update of visibleSelection.values()) update();
+    }
+    function clearSelection(): void {
+      selectedIds.clear();
+      selectedRevision = null;
+      selectionAnchor = "";
+      updateSelection();
+    }
+    function toggleSelection(id: string): void {
+      if (selectedIds.has(id)) selectedIds.delete(id);
+      else selectedIds.add(id);
+      selectedRevision = selectedIds.size ? revision : null;
+      selectionAnchor = id;
+      updateSelection();
+    }
+    function selectRange(from: string, to: string): void {
+      const first = visibleIds.indexOf(selectionAnchor || from);
+      const last = visibleIds.indexOf(to);
+      if (first < 0 || last < 0) return;
+      for (let index = Math.min(first, last); index <= Math.max(first, last); index++) {
+        const id = visibleIds[index];
+        if (id) selectedIds.add(id);
+      }
+      if (!selectionAnchor) selectionAnchor = from;
+      selectedRevision = revision;
+      updateSelection();
+    }
+    function moveCollectionFocus(current: HTMLButtonElement, key: string, extend: boolean): void {
+      if (!currentGrid) return;
+      const start = current.getBoundingClientRect();
+      const centerX = start.left + start.width / 2;
+      const centerY = start.top + start.height / 2;
+      const candidates = Array.from(currentGrid.querySelectorAll<HTMLButtonElement>("button.catalog-open:not(:disabled)"))
+        .filter((candidate) => candidate !== current)
+        .map((candidate) => {
+          const rect = candidate.getBoundingClientRect();
+          const x = rect.left + rect.width / 2 - centerX;
+          const y = rect.top + rect.height / 2 - centerY;
+          const horizontal = key === "ArrowLeft" || key === "ArrowRight";
+          const primary = horizontal ? x : y;
+          const secondary = horizontal ? y : x;
+          const forward = (key === "ArrowRight" || key === "ArrowDown") ? primary > 1 : primary < -1;
+          return { candidate, forward, distance: Math.abs(primary) + Math.abs(secondary) * 4 };
+        })
+        .filter((candidate) => candidate.forward)
+        .sort((a, b) => a.distance - b.distance);
+      const next = candidates[0]?.candidate;
+      if (!next) return;
+      if (extend && current.dataset.catalogId && next.dataset.catalogId)
+        selectRange(current.dataset.catalogId, next.dataset.catalogId);
+      next.focus();
+    }
+    const initialLocation = typeof window === "undefined" || typeof window.location === "undefined"
+      ? { query: "", sort: "name" as LibrarySort }
+      : libraryLocation(new URL(window.location.href));
+    let query = initialLocation.query;
+    search.value = query;
     let revision = 0;
-    let cursors: unknown[] = [null];
     let page = 0;
     let generation = 0;
+    let libraryIndex: LibraryIndex | null = null;
     let configOverrideCapabilities: CatalogConfigOverrideCapabilities | null = null;
+    let currentGrid: HTMLElement | null = null;
+    let openMenu: { menu: HTMLDetailsElement; trigger: HTMLButtonElement; observer: MutationObserver } | null = null;
+    function closeCatalogMenu(restoreFocus = false): void {
+      const current = openMenu;
+      if (!current) return;
+      openMenu = null;
+      current.menu.open = false;
+      document.removeEventListener("pointerdown", dismissCatalogMenu);
+      current.observer.disconnect();
+      if (restoreFocus && current.trigger.isConnected) current.trigger.focus();
+    }
+    function dismissCatalogMenu(event: PointerEvent): void {
+      if (openMenu && event.target instanceof Node && !openMenu.menu.contains(event.target)) closeCatalogMenu();
+    }
+    function showCatalogMenu(menu: HTMLDetailsElement, trigger: HTMLButtonElement, focusAction: boolean): void {
+      if (openMenu?.menu !== menu) {
+        closeCatalogMenu();
+        const observer = new MutationObserver(() => {
+          if (!menu.isConnected) closeCatalogMenu();
+        });
+        openMenu = { menu, trigger, observer };
+        observer.observe(document.body, { childList: true, subtree: true });
+        document.addEventListener("pointerdown", dismissCatalogMenu);
+      }
+      menu.open = true;
+      if (focusAction) (menu.querySelector<HTMLButtonElement>(".catalog-card-actions button:not(:disabled)") ?? menu.querySelector<HTMLElement>("summary"))?.focus();
+    }
+    let view: "grid" | "list" = "grid";
+    try {
+      if (typeof localStorage !== "undefined" && localStorage.getItem("amaterasu.library.view") === "list") view = "list";
+    } catch { /* The library remains usable when storage is unavailable. */ }
+    const gridView = button("Grid", () => setView("grid"), "library-view-button");
+    const listView = button("List", () => setView("list"), "library-view-button");
+    const viewControls = el("div", "library-view-controls", gridView, listView);
+    viewControls.setAttribute("role", "group");
+    viewControls.setAttribute("aria-label", "Library view");
+    function setView(next: "grid" | "list"): void {
+      view = next;
+      gridView.setAttribute("aria-pressed", String(view === "grid"));
+      listView.setAttribute("aria-pressed", String(view === "list"));
+      if (currentGrid) currentGrid.className = `catalog-grid catalog-grid--${view}`;
+      try { if (typeof localStorage !== "undefined") localStorage.setItem("amaterasu.library.view", view); }
+      catch { /* View preference is optional. */ }
+    }
+    setView(view);
+    const sort = el("select", "library-sort") as HTMLSelectElement;
+    sort.name = "sort";
+    catalogLocalizedAttribute(sort, "aria-label", "Sort library");
+    for (const [value, label] of [["name", "Name (A–Z)"], ["name-desc", "Name (Z–A)"], ["source", "Known source"]]) {
+      const option = el("option", "", label) as HTMLOptionElement;
+      option.value = value ?? "";
+      sort.append(option);
+    }
+    sort.value = initialLocation.sort;
+    function replaceLibraryLocation(): void {
+      if (typeof window === "undefined" || typeof window.location === "undefined" || typeof window.history === "undefined") return;
+      const next = updateLibraryLocation(new URL(window.location.href), query, sort.value as LibrarySort);
+      if (next.href !== window.location.href) window.history.replaceState(window.history.state, "", next);
+    }
+    sort.addEventListener("change", () => { replaceLibraryLocation(); page = 0; void load(); });
     const add = button("+ Add application", () => {
       if (configOverrideCapabilities) showEditor(undefined, configOverrideCapabilities);
     }, "primary");
     add.disabled = true;
+    const sources = button("Library sources", () => context.navigate("integrations"));
+    sources.disabled = !api.allows("configuration.read");
     content.append(
       sectionHeading(
         "Your library",
         "A durable catalog of the applications on your host.",
-        add,
+        sources, add,
       ),
-      searchForm,
+      el("div", "library-toolbar", searchForm, sort, viewControls),
+      selectionBar,
       status,
       editor,
       results,
@@ -1062,34 +1300,77 @@ namespace Amaterasu {
       const current = ++generation;
       results.setAttribute("aria-busy", "true");
       try {
-        const reply = await api.post<CatalogReply>(
-          query ? "catalog/search" : "catalog/list",
-          { ...(query ? { query } : {}), cursor: cursors[page], limit: 12 },
-        );
+        const active = () => content.isConnected && current === generation;
+        const changed = () => {
+          if (active()) {
+            libraryIndex = null;
+            if (selectedIds.size) {
+              clearSelection();
+              notify("The catalog changed, so the selection was cleared.");
+            }
+          }
+          return new Error("The catalog changed while sorting. Refresh the library to try again.");
+        };
+        if (!libraryIndex) {
+          results.replaceChildren(el("p", "muted", "Sorting the library…"));
+          const indexed = await scanLibraryIndex(api, query, active, (count) => {
+            if (active()) results.replaceChildren(el("p", "muted", catalogTextLiteral(`Sorting the library… ${count} applications found`)));
+          });
+          if (!active()) return;
+          libraryIndex = indexed;
+        }
+        const indexed = libraryIndex;
+        const probe = await api.post<CatalogReply>("catalog/list", { cursor: null, limit: 1 });
+        if (!active()) return;
+        if (probe.revision !== indexed.revision) {
+          throw changed();
+        }
+        const ordered = sortLibraryRows(indexed.rows, sort.value as LibrarySort);
+        const selectedRows = ordered.slice(page * 12, (page + 1) * 12);
+        const rows: CatalogRow[] = [];
+        for (let offset = 0; offset < selectedRows.length; offset += 4) {
+          const chunk = selectedRows.slice(offset, offset + 4);
+          const loaded = await Promise.all(chunk.map(async ({ id }) => {
+            const cached = indexed.cachedRows.get(id);
+            if (cached) return cached;
+            const response = await api.post<{ revision: number; id: string; entry: Entry }>("catalog/get", { id });
+            if (response.revision !== indexed.revision || response.id !== id) {
+              throw changed();
+            }
+            return { id, entry: response.entry };
+          }));
+          if (!active()) return;
+          rows.push(...loaded);
+        }
         if (!content.isConnected || current !== generation) return;
-        revision = reply.revision;
-        configOverrideCapabilities = reply.config_override_capabilities;
+        if (selectedRevision !== null && selectedRevision !== indexed.revision) {
+          clearSelection();
+          notify("The catalog changed, so the selection was cleared.");
+        }
+        revision = indexed.revision;
+        visibleIds = rows.map((row) => row.id);
+        visibleSelection.clear();
+        configOverrideCapabilities = indexed.capabilities;
         add.disabled = !api.allows("catalog.write");
-        const grid = el("div", "catalog-grid");
-        for (const row of reply.entries)
-          grid.append(card(row, reply.config_override_capabilities));
+        const grid = el("div", `catalog-grid catalog-grid--${view}`);
+        currentGrid = grid;
+        for (const row of rows)
+          grid.append(card(row, indexed.capabilities));
         results.replaceChildren(
           el(
             "div",
             "section-meta",
-            el("span", "", catalogTextLiteral(`${reply.entries.length} applications on this page`)),
-            badge(catalogTextLiteral(`Revision ${revision}`)),
+            el("h2", "", "Collection"),
+            el("span", "muted", catalogTextLiteral(`${ordered.length} applications`)),
           ),
-          reply.entries.length
+          rows.length
             ? grid
             : empty(
                 query
-                  ? "No matches on this page"
+                  ? "No matching applications"
                   : "Make room for your favorites",
-                reply.next_cursor
-                  ? "Search continues on the next page."
-                  : query
-                    ? "Try a different name or tag."
+                query
+                    ? "Try a different name, source, command or tag."
                     : "Add your first application to start building this host’s library.",
               ),
           pager(
@@ -1099,10 +1380,8 @@ namespace Amaterasu {
                   void load();
                 }
               : null,
-            reply.next_cursor != null
+            (page + 1) * 12 < ordered.length
               ? () => {
-                  cursors = cursors.slice(0, page + 1);
-                  cursors.push(reply.next_cursor);
                   page++;
                   void load();
                 }
@@ -1111,29 +1390,86 @@ namespace Amaterasu {
           ),
         );
       } catch (error) {
-        if (content.isConnected && current === generation)
+        if (content.isConnected && current === generation) {
+          if (error && typeof error === "object" && "code" in error && error.code === "revision_conflict" && selectedIds.size) {
+            clearSelection();
+            notify("The catalog changed, so the selection was cleared.");
+          }
           results.replaceChildren(errorPanel(error, reset));
+        }
       } finally {
-        results.removeAttribute("aria-busy");
+        if (current === generation) results.removeAttribute("aria-busy");
       }
     }
 
     function reset(): void {
-      cursors = [null];
+      libraryIndex = null;
       page = 0;
       void load();
     }
+    let searchTimer = 0;
+    function searchCatalog(): void {
+      window.clearTimeout(searchTimer);
+      const next = search.value.trim();
+      if (next === query) return;
+      query = next;
+      replaceLibraryLocation();
+      reset();
+    }
+    search.addEventListener("input", () => {
+      window.clearTimeout(searchTimer);
+      searchTimer = window.setTimeout(() => {
+        if (content.isConnected) searchCatalog();
+      }, 300);
+    });
+    search.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && search.value) {
+        event.preventDefault();
+        search.value = "";
+        searchCatalog();
+      }
+    });
     searchForm.addEventListener("submit", (event) => {
       event.preventDefault();
-      query = search.value.trim();
-      reset();
+      searchCatalog();
     });
+
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function" && typeof MutationObserver !== "undefined") {
+      const restoreLocation = (): void => {
+        if (!content.isConnected || (window.location.hash !== "#catalog" &&
+            !window.location.hash.startsWith("#catalog?"))) return;
+        const restored = libraryLocation(new URL(window.location.href));
+        window.clearTimeout(searchTimer);
+        search.value = restored.query;
+        const queryChanged = query !== restored.query;
+        const sortChanged = sort.value !== restored.sort;
+        query = restored.query;
+        sort.value = restored.sort;
+        if (queryChanged) reset();
+        else if (sortChanged) { page = 0; void load(); }
+      };
+      window.addEventListener("popstate", restoreLocation);
+      window.addEventListener("hashchange", restoreLocation);
+      const observer = new MutationObserver(() => {
+        if (!content.isConnected) {
+          observer.disconnect();
+          window.removeEventListener("popstate", restoreLocation);
+          window.removeEventListener("hashchange", restoreLocation);
+          window.clearTimeout(searchTimer);
+        }
+      });
+      observer.observe(document, { childList: true, subtree: true });
+    }
 
     function card(
       row: CatalogRow,
       capabilities: CatalogConfigOverrideCapabilities,
     ): HTMLElement {
       const providerLaunch = row.entry.launch.kind === "playnite";
+      const launchLabel = row.entry.launch.kind === "desktop" ? "Desktop" :
+        row.entry.launch.kind === "playnite_fullscreen" ? "Playnite Fullscreen" :
+        row.entry.steam_id ? "Steam-linked" : row.entry.launch.kind === "executable" ? "Executable" :
+        providerLaunch ? "Playnite" : "Application";
       const edit = button("Edit", () => showEditor(row, capabilities));
       edit.disabled = !api.allows("catalog.write") || providerLaunch;
       if (providerLaunch) catalogLocalizedAttribute(edit, "title", "Playnite launch targets are managed by the provider.");
@@ -1179,47 +1515,107 @@ namespace Amaterasu {
       remove.disabled = !api.allows("catalog.write");
       actions.push(remove);
       const art = el(
-        "div",
-        "app-art",
-        el("span", "", catalogTextLiteral(row.entry.name.slice(0, 2).toUpperCase())),
-        badge(
-          row.entry.launch.kind === "executable"
-            ? "Executable"
-            : providerLaunch
-              ? "Playnite"
-              : "Application",
-        ),
+        "span", "app-art",
+        el("span", "app-monogram", catalogTextLiteral(row.entry.name.slice(0, 2).toUpperCase())),
+        badge(launchLabel),
       );
       showCatalogArtwork(api, row.entry.artwork, art, content);
-      return el(
-        "article",
-        "app-card",
-        art,
-        el(
-          "div",
-          "app-details",
-          el("h2", "", catalogTextLiteral(row.entry.name)),
-          el(
-            "p",
-            "muted description",
-            row.entry.description ? catalogTextLiteral(row.entry.description) : "No description added.",
-          ),
+      const open = button("", () => {
+        if (providerLaunch) showProviderOverrideEditor(row, capabilities);
+        else showEditor(row, capabilities);
+      }, "catalog-open");
+      open.disabled = !api.allows("catalog.write");
+      open.dataset.catalogId = row.id;
+      open.addEventListener("keydown", (event) => {
+        if ((event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) && !event.isComposing) {
+          event.preventDefault();
+          showCatalogMenu(menu, open, true);
+        } else if (event.key === " " && !event.isComposing) {
+          event.preventDefault();
+          toggleSelection(row.id);
+        } else if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+          event.preventDefault();
+          moveCollectionFocus(open, event.key, event.shiftKey);
+        } else if (event.key === "Escape" && selectedIds.size) {
+          event.preventDefault();
+          event.stopPropagation();
+          clearSelection();
+        }
+      });
+      catalogLocalizedAttributeTemplate(open, "aria-label", "Edit {name}", { name: catalogTextLiteral(row.entry.name) });
+      open.append(art, el("span", "catalog-card-title",
+        el("strong", "", catalogTextLiteral(row.entry.name)),
+        el("small", "muted", launchLabel)));
+      const summary = el("summary", "catalog-menu-toggle", "Actions");
+      catalogLocalizedAttributeTemplate(summary, "aria-label", "Actions for {name}", { name: catalogTextLiteral(row.entry.name) });
+      const menu = el("details", "catalog-card-menu", summary,
+        el("div", "catalog-card-menu-content",
+          el("p", "muted", row.entry.description ? catalogTextLiteral(row.entry.description) : "No description added."),
           el("div", "tags", ...(row.entry.tags ?? []).map((tag) => badge(catalogTextLiteral(tag)))),
           el("p", "path", catalogTextLiteral(launchPath(row.entry))),
-          el("div", "card-footer", ...actions),
-        ),
-      );
+          el("div", "catalog-card-actions", ...actions)));
+      menu.addEventListener("toggle", () => {
+        if (menu.open) showCatalogMenu(menu, open, false);
+        else if (openMenu?.menu === menu) closeCatalogMenu();
+      });
+      menu.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && menu.open) {
+          event.preventDefault();
+          event.stopPropagation();
+          closeCatalogMenu(true);
+        }
+      });
+      const select = button("", () => toggleSelection(row.id), "catalog-select");
+      const article = el("article", "app-card", open, select, menu);
+      article.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        showCatalogMenu(menu, open, true);
+      });
+      const update = () => {
+        const selected = selectedIds.has(row.id);
+        article.className = `app-card${selected ? " is-selected" : ""}`;
+        select.textContent = selected ? "✓" : "+";
+        select.setAttribute("aria-pressed", String(selected));
+        catalogLocalizedAttributeTemplate(select, "aria-label", selected ? "Deselect {name}" : "Select {name}",
+          { name: catalogTextLiteral(row.entry.name) });
+      };
+      visibleSelection.set(row.id, update);
+      update();
+      return article;
+    }
+
+    function closeEditor(): boolean {
+      if (editorSaving) {
+        notify("Wait for the application save to finish.");
+        return false;
+      }
+      if (editorDrafts?.isDirty() && !window.confirm("Discard your unsaved application changes?")) return false;
+      editorGeneration += 1;
+      editor.replaceChildren();
+      return true;
     }
 
     function showProviderOverrideEditor(
       row: CatalogRow,
       capabilities: CatalogConfigOverrideCapabilities,
     ): void {
+      if (!closeEditor()) return;
+      const request = editorGeneration;
       editor.replaceChildren(el("p", "muted", "Loading input profiles…"));
       void loadInputRuntimeStatus().then((status) => {
-        if (context.content.isConnected)
+        if (context.content.isConnected && request === editorGeneration)
           renderProviderOverrideEditor(row, status, capabilities);
       });
+    }
+
+    function lockEditorControls(form: HTMLFormElement): () => void {
+      if (typeof form.querySelectorAll !== "function") return () => {};
+      const controls = Array.from(form.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | HTMLButtonElement>(
+        "input, textarea, select, button",
+      ));
+      const states = controls.map((control) => control.disabled);
+      controls.forEach((control) => { control.disabled = true; });
+      return () => controls.forEach((control, index) => { control.disabled = states[index] ?? false; });
     }
 
     async function loadInputRuntimeStatus(): Promise<InputRuntimeStatus> {
@@ -1316,36 +1712,34 @@ namespace Amaterasu {
       displayPolicy.rows = 12;
       displayPolicy.spellcheck = false;
       displayPolicy.value = JSON.stringify(row.entry.config_overrides?.display_policy ?? {}, null, 2);
-      const form = el(
-        "form",
-        "editor-form",
-        field(
-          "FEC percentage",
-          fec,
-          "Leave blank to inherit the global setting. Supported values are 1–255.",
-        ),
-        ...frameLimiterFields,
-        ...refreshRateOptionFields,
-        field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null/empty to inherit the next scope; global-only keys are rejected."),
-        field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."),
-        audioSink.controls,
-        virtualSink.controls,
-        field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."),
-        field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."),
-        field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."),
-        field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."),
-        field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."),
-        field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
-        ...inputCompatibilityFields,
-        ...advancedInput.fields,
-        ...softwareEncoder.fields,
-        ...nvencSettingsFields,
-      );
+      const form = el("form", "editor-form",
+        catalogEditorSection("Streaming and audio", "Override streaming and audio for this provider-managed application.",
+          field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."),
+          ...frameLimiterFields,
+          field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."),
+          audioSink.controls, virtualSink.controls,
+          field("Capture audio without changing default outputs", captureOnly,
+            "Inherit the host setting, enable capture only, or allow Windows default-output routing.")),
+        catalogEditorDisclosure("Display", "Choose display and adapter overrides.",
+          ...refreshRateOptionFields,
+          field("Display and adapter policy (JSON)", displayPolicy,
+            "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected.")),
+        catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.",
+          field("Back button timeout (milliseconds)", backButtonTimeout,
+            "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."),
+          field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."),
+          field("Gamepad profile", gamepad, "Inherit the next scope. Recognized unavailable profiles remain selectable."),
+          field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."),
+          field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
+          ...inputCompatibilityFields, ...advancedInput.fields),
+        catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.",
+          ...softwareEncoder.fields, ...nvencSettingsFields));
+      revealInvalidEditorControls(form);
       const feedback = el("div");
       const save = el("button", "button primary", "Save streaming settings");
       save.type = "submit";
-      const cancel = button("Cancel", () => editor.replaceChildren());
-      form.append(feedback, el("div", "actions", save, cancel));
+      const cancel = button("Cancel", () => { closeEditor(); });
+      form.append(feedback, el("div", "catalog-editor-save-bar", el("span", "muted", "Save or cancel your changes."), el("div", "actions", cancel, save)));
       form.addEventListener("submit", (event) => {
         event.preventDefault();
         if (!form.reportValidity()) return;
@@ -1368,6 +1762,8 @@ namespace Amaterasu {
               display_policy: parseDisplayPolicyOverrideMap(displayPolicy.value, "application"),
             },
           );
+          editorSaving = true;
+          const unlock = lockEditorControls(form);
           try {
             const reply = await api.post<{
               id: string;
@@ -1405,17 +1801,23 @@ namespace Amaterasu {
             await load();
           } catch (error) {
             if (error instanceof ApiError && error.code === "revision_conflict") {
-              editor.replaceChildren();
-              await load();
-              notify(
-                `Streaming settings for ${row.entry.name} changed elsewhere. The latest value was reloaded; reopen the editor to review it.`,
-              );
+              const reload = button("Reload library", () => {
+                if (!closeEditor()) return;
+                void load();
+              });
+              feedback.replaceChildren(el("div", "notice error",
+                el("strong", "", "Application changed elsewhere"),
+                el("p", "", "Your edits are still here. Review or copy them before reloading the library."), reload));
               return;
             }
             throw error;
+          } finally {
+            editorSaving = false;
+            unlock();
           }
         });
       });
+      const cover = catalogEditorCover(row);
       editor.replaceChildren(
         panel(
           "Playnite streaming settings",
@@ -1425,9 +1827,10 @@ namespace Amaterasu {
             "muted",
             "The Playnite game identity and provider-managed launch metadata stay unchanged.",
           ),
-          form,
+          el("div", "catalog-editor-layout", cover.figure, form),
         ),
       );
+      showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; });
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
       fec.focus();
     }
@@ -1436,8 +1839,11 @@ namespace Amaterasu {
       row: CatalogRow | undefined,
       capabilities: CatalogConfigOverrideCapabilities,
     ): void {
+      if (!closeEditor()) return;
+      const request = editorGeneration;
+      editor.replaceChildren(el("p", "muted", "Loading input profiles…"));
       void loadInputRuntimeStatus().then((runtimeStatus) => {
-        if (context.content.isConnected)
+        if (context.content.isConnected && request === editorGeneration)
           renderEditor(row, runtimeStatus, capabilities);
       });
     }
@@ -1456,8 +1862,8 @@ namespace Amaterasu {
         row ? "Save changes" : "Add application",
       );
       save.type = "submit";
-      const cancel = button("Cancel", () => editor.replaceChildren());
-      form.append(feedback, el("div", "actions", save, cancel));
+      const cancel = button("Cancel", () => { closeEditor(); });
+      form.append(feedback, el("div", "catalog-editor-save-bar", el("span", "muted", "Save or cancel your changes."), el("div", "actions", cancel, save)));
       form.addEventListener("submit", (event) => {
         event.preventDefault();
         if (!form.reportValidity()) return;
@@ -1476,16 +1882,24 @@ namespace Amaterasu {
             parseCatalogNvencSettingsOverrides(new FormData(form)),
             parseCatalogInputCompatibilityOverrides(new FormData(form)),
           );
-          await api.post(row ? "catalog/update" : "catalog/create", {
-            ...(row ? { id: row.id } : {}),
-            entry,
-            expected_revision: editRevision,
-          });
-          editor.replaceChildren();
-          notify(catalogTextMessage(row ? "Application updated." : "Application added."));
-          reset();
+          editorSaving = true;
+          const unlock = lockEditorControls(form);
+          try {
+            await api.post(row ? "catalog/update" : "catalog/create", {
+              ...(row ? { id: row.id } : {}),
+              entry,
+              expected_revision: editRevision,
+            });
+            editor.replaceChildren();
+            notify(catalogTextMessage(row ? "Application updated." : "Application added."));
+            reset();
+          } finally {
+            editorSaving = false;
+            unlock();
+          }
         });
       });
+      const cover = row ? catalogEditorCover(row) : null;
       editor.replaceChildren(
         panel(
           row ? "Edit application" : "Add application",
@@ -1494,13 +1908,47 @@ namespace Amaterasu {
             "muted",
             "Save launch metadata for this host. Adding an entry does not launch it.",
           ),
-          form,
+          cover ? el("div", "catalog-editor-layout", cover.figure, form) : form,
         ),
       );
+      if (cover && row) showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; });
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
       form.querySelector("input")?.focus();
     }
     void load();
+  }
+
+  function catalogEditorCover(row: CatalogRow): { figure: HTMLElement; art: HTMLElement; fallback: HTMLElement } {
+    const fallback = el("span", "catalog-editor-artwork-fallback", "Cover unavailable");
+    const art = el("div", "catalog-editor-artwork", fallback);
+    const provider = row.entry.artwork?.provider;
+    const description = provider === "steam" ? "Steam artwork" :
+      provider === "lutris" ? "Lutris artwork" : "No provider cover";
+    const figure = el("figure", "catalog-editor-cover", art,
+      el("figcaption", "muted", description));
+    return { figure, art, fallback };
+  }
+
+  function catalogEditorSection(title: string, description: string, ...children: HTMLElement[]): HTMLElement {
+    return el("section", "catalog-editor-section",
+      el("div", "catalog-editor-heading", el("h3", "", title), el("p", "muted", description)),
+      ...children);
+  }
+
+  function catalogEditorDisclosure(title: string, description: string, ...children: HTMLElement[]): HTMLElement {
+    return el("details", "catalog-editor-section catalog-editor-disclosure",
+      el("summary", "", el("strong", "", title), el("small", "muted", description)),
+      el("div", "catalog-editor-disclosure-content", ...children));
+  }
+
+  function revealInvalidEditorControls(form: HTMLFormElement): void {
+    form.addEventListener("invalid", (event) => {
+      let details = (event.target as HTMLElement | null)?.closest("details");
+      while (details && form.contains(details)) {
+        details.open = true;
+        details = details.parentElement?.closest("details") ?? null;
+      }
+    }, true);
   }
 
   function entryForm(
@@ -1593,6 +2041,7 @@ namespace Amaterasu {
       ["application", "Application / bundle"],
       ["executable", "Executable with arguments"],
       ["playnite_fullscreen", "Playnite Fullscreen"],
+      ["desktop", "Desktop session"],
     ]) {
       const option = el("option", "", text);
       option.value = value ?? "";
@@ -1608,12 +2057,9 @@ namespace Amaterasu {
     argumentsField.name = "arguments";
     argumentsField.rows = 2;
     argumentsField.value = JSON.stringify(executableLaunch?.arguments ?? []);
-    const directory = input(
-      "working_directory",
-      entry?.launch.kind === "executable"
-        ? (entry.launch.working_directory ?? "")
-        : "",
-    );
+    const preparedLaunch = entry?.launch.kind === "executable" || entry?.launch.kind === "desktop" || entry?.launch.kind === "playnite_fullscreen"
+      ? entry.launch : undefined;
+    const directory = input("working_directory", preparedLaunch?.working_directory ?? "");
     const autoDetach = el("input");
     autoDetach.type = "checkbox";
     autoDetach.name = "auto_detach";
@@ -1638,7 +2084,7 @@ namespace Amaterasu {
     detached.value = executableLaunch?.detached?.join("\n") ?? "";
     const preparation = input(
       "preparation",
-      JSON.stringify(executableLaunch?.preparation ?? []),
+      JSON.stringify(preparedLaunch?.preparation ?? []),
       "hidden",
     );
     const rawPreparation = input("prep_cmd", JSON.stringify(entry?.prep_cmd ?? []), "hidden");
@@ -1701,7 +2147,7 @@ namespace Amaterasu {
     steamInstallDir.maxLength = 1024;
     const fullscreenTimeout = input(
       "fullscreen_exit_timeout_seconds",
-      String(entry?.launch.kind === "playnite_fullscreen" ? entry.launch.exit_timeout_seconds : 10),
+      String(entry?.launch.kind === "playnite_fullscreen" || entry?.launch.kind === "desktop" ? entry.launch.exit_timeout_seconds : 10),
       "number",
     );
     fullscreenTimeout.min = "0";
@@ -1725,23 +2171,26 @@ namespace Amaterasu {
         argumentsField,
         'A JSON array of literal arguments. Example: ["--fullscreen"]',
       ),
-      field("Working directory", directory, "Optional absolute path."),
       processPolicy,
-      preparation,
     );
+    const sharedLaunchOptions = el("div", "form-grid", field("Working directory", directory, "Optional absolute path."), preparation);
     const pathField = field("Absolute application path", path);
     const steamIdField = field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
     const steamInstallDirField = field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it.");
-    const fullscreen = field("Exit timeout (seconds)", fullscreenTimeout, "Graceful Playnite Fullscreen close window, from 0 to 300 seconds.");
+    const fullscreen = field("Exit timeout (seconds)", fullscreenTimeout, "Graceful session close window, from 0 to 300 seconds.");
     const showKind = () => {
       executable.hidden = kind.value !== "executable";
       elevated.disabled = kind.value !== "executable";
-      const isFullscreen = kind.value === "playnite_fullscreen";
-      fullscreen.hidden = !isFullscreen;
-      pathField.hidden = isFullscreen;
-      path.required = !isFullscreen;
-      steamIdField.hidden = isFullscreen;
-      steamInstallDirField.hidden = isFullscreen;
+      const processless = kind.value === "playnite_fullscreen" || kind.value === "desktop";
+      fullscreen.hidden = !processless;
+      fullscreenTimeout.disabled = !processless;
+      pathField.hidden = processless;
+      path.disabled = processless;
+      path.required = !processless;
+      steamIdField.hidden = processless;
+      steamInstallDirField.hidden = processless;
+      sharedLaunchOptions.hidden = kind.value === "application";
+      directory.disabled = kind.value === "application";
       path.placeholder =
         kind.value === "executable"
           ? "/opt/games/example"
@@ -1749,65 +2198,48 @@ namespace Amaterasu {
     };
     kind.addEventListener("change", showKind);
     form.append(
-      el("div", "form-grid", field("Name", name), field("Launch type", kind)),
-      field("Description", description),
-      field("Tags", tags, "Separate tags with commas."),
-      field(
-        "Display output override",
-        displayOutput,
-        "Leave empty to inherit the next display selection. This is separate from the command output file.",
-      ),
-      field(
-        "Virtual screen request",
-        virtualScreen,
-        "Inherit the host setting or explicitly request or avoid a virtual screen.",
-      ),
-      field(
-        "Virtual display mode",
-        virtualDisplayMode,
-        "Inherit the host mode or explicitly disable, use per-client, or share a virtual display.",
-      ),
-      field(
-        "Virtual display layout",
-        virtualDisplayLayout,
-        "Inherit the host layout or select how virtual displays are arranged.",
-      ),
-      field("Command output", outputMode, "Use default discards command output without saving an output value."),
-      outputFile,
-      rawPreparation,
-      field(
-        "Skip global preparation commands",
-        excludeGlobalPreparation,
-        "Do not run the host-wide preparation commands for this application.",
-      ),
-      pathField,
-      field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
-      ...frameLimiterFields,
-      ...refreshRateOptionFields,
-      field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null/empty to inherit the next scope; global-only keys are rejected."),
-      field(
-        "10-bit SDR preference",
-        prefer10BitSdr,
-        "Inherit the next setting scope, or set an explicit preference for this application.",
-      ),
-      field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),
-      audioSink.controls,
-      virtualSink.controls,
-      field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."),
-      field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."),
-      field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."),
-      field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."),
-      field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."),
-      field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
-      ...inputCompatibilityFields,
-      ...advancedInput.fields,
-      ...softwareEncoder.fields,
-      ...nvencSettingsFields,
-      steamIdField,
-      steamInstallDirField,
-      fullscreen,
-      executable,
+      catalogEditorSection("Identity", "Name and describe this application in your library.",
+        field("Name", name), field("Description", description),
+        field("Tags", tags, "Separate tags with commas.")),
+      catalogEditorSection("Launch", "Choose how the host starts and tracks the application.",
+        field("Launch type", kind), pathField, steamIdField, steamInstallDirField, fullscreen, sharedLaunchOptions, executable,
+        field("Command output", outputMode, "Use default discards command output without saving an output value."),
+        outputFile, rawPreparation,
+        field("Skip global preparation commands", excludeGlobalPreparation,
+          "Do not run the host-wide preparation commands for this application.")),
+      catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.",
+        field("Display output override", displayOutput,
+          "Leave empty to inherit the next display selection. This is separate from the command output file."),
+        field("Virtual screen request", virtualScreen,
+          "Inherit the host setting or explicitly request or avoid a virtual screen."),
+        field("Virtual display mode", virtualDisplayMode,
+          "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."),
+        field("Virtual display layout", virtualDisplayLayout,
+          "Inherit the host layout or select how virtual displays are arranged."),
+        ...refreshRateOptionFields,
+        field("Display and adapter policy (JSON)", displayPolicy,
+          "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."),
+        field("10-bit SDR preference", prefer10BitSdr,
+          "Inherit the next setting scope, or set an explicit preference for this application.")),
+      catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.",
+        field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
+        ...frameLimiterFields,
+        field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),
+        audioSink.controls, virtualSink.controls,
+        field("Capture audio without changing default outputs", captureOnly,
+          "Inherit the host setting, enable capture only, or allow Windows default-output routing.")),
+      catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.",
+        field("Back button timeout (milliseconds)", backButtonTimeout,
+          "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."),
+        field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."),
+        field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."),
+        field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."),
+        field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
+        ...inputCompatibilityFields, ...advancedInput.fields),
+      catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.",
+        ...softwareEncoder.fields, ...nvencSettingsFields),
     );
+    revealInvalidEditorControls(form);
     showKind();
     return form;
   }

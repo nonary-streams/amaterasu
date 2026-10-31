@@ -568,11 +568,10 @@ namespace Amaterasu {
     const text = (name: string) => String(data.get(name) ?? "").trim();
     const output = parseApplicationOutput(data);
     const rawPreparation = parseRawPreparation(String(data.get("prep_cmd") ?? "[]"));
-    const kind = text("kind") === "executable"
-      ? "executable"
-      : text("kind") === "playnite_fullscreen"
-        ? "playnite_fullscreen"
-        : "application";
+    const requestedKind = text("kind");
+    if (requestedKind && !["application", "executable", "playnite_fullscreen", "desktop"].includes(requestedKind))
+      throw new Error("Choose a supported launch type before saving.");
+    const kind = (requestedKind || "application") as "application" | "executable" | "playnite_fullscreen" | "desktop";
     const fecPercentage = parseFecOverride(text("fec_percentage"));
     const streamAudio = parseStreamAudioOverride(text("stream_audio"));
     const audioSink = parseAudioSinkOverride(text("audio_sink_mode") || "inherit", String(data.get("audio_sink_id") ?? ""));
@@ -599,8 +598,8 @@ namespace Amaterasu {
     const prefer10BitSdr = parsePrefer10BitSdrOverride(
       String(data.get("prefer_10bit_sdr") ?? ""),
     );
-    const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
-    const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
+    const steamId = kind === "playnite_fullscreen" || kind === "desktop" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
+    const steamInstallDir = kind === "playnite_fullscreen" || kind === "desktop" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
     const configOverrides =
       fecPercentage === null &&
       streamAudio === null &&
@@ -635,11 +634,13 @@ namespace Amaterasu {
           };
     const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
     const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];
-    const preparation = kind === "executable" ? parsePreparation(text("preparation")) : [];
+    const preparation = kind !== "application" ? parsePreparation(text("preparation")) : [];
     if (preparation.length + rawPreparation.length > 8)
       throw new Error("An application can contain at most 8 preparation steps.");
-    const launch: Launch = kind === "playnite_fullscreen"
-      ? { kind, exit_timeout_seconds: parseExitTimeout(text("fullscreen_exit_timeout_seconds")) ?? 10 }
+    const launch: Launch = kind === "playnite_fullscreen" || kind === "desktop"
+      ? { kind, exit_timeout_seconds: parseExitTimeout(text("fullscreen_exit_timeout_seconds")) ?? 10,
+          ...(text("working_directory") ? { working_directory: text("working_directory") } : {}),
+          ...(preparation.length ? { preparation } : {}) }
       : kind === "application"
         ? { kind, path: text("path") }
         : {
@@ -731,6 +732,8 @@ namespace Amaterasu {
         return `Playnite game ${entry.launch.game_id}`;
       case "playnite_fullscreen":
         return "Playnite Fullscreen";
+      case "desktop":
+        return "Desktop session";
     }
   }
 

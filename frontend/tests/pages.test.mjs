@@ -31,6 +31,10 @@ class FakeElement {
     this.append(...children);
   }
 
+  hasChildNodes() {
+    return this.children.length > 0;
+  }
+
   addEventListener(event, listener) {
     this.listeners.set(event, listener);
   }
@@ -55,7 +59,7 @@ class FakeElement {
 }
 
 const pageTestContext = createPageContext();
-for (const source of ["src/types.ts", "src/model.ts", "src/ui.ts", "src/pages.ts"]) {
+for (const source of ["src/types.ts", "src/model.ts", "src/ui.ts", "src/session_history.ts", "src/session_timeline.ts", "src/live_streams.ts", "src/pages.ts"]) {
   vm.runInContext(
     ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
@@ -64,19 +68,32 @@ for (const source of ["src/types.ts", "src/model.ts", "src/ui.ts", "src/pages.ts
   );
   if (source === "src/ui.ts") {
     vm.runInContext(
-      "Object.assign(globalThis, Amaterasu); globalThis.renderHostMetricsDashboard = () => {}",
+      "Object.assign(globalThis, Amaterasu); globalThis.renderHostMetricsDashboard = () => {}; globalThis.renderHostLogs = () => {}; Amaterasu.renderManagedStreamControls = () => {}",
       pageTestContext,
     );
   }
+  if (source === "src/session_history.ts" || source === "src/session_timeline.ts") vm.runInContext("Object.assign(globalThis, Amaterasu)", pageTestContext);
 }
 
 function createPageContext() {
   const timers = new Map();
+  const visibilityListeners = new Set();
+  const observers = new Set();
   let nextTimer = 0;
   return vm.createContext({
     document: {
+      body: {},
+      visibilityState: "visible",
       createElement: (tagName) => new FakeElement(tagName),
+      createElementNS: (_namespace, tagName) => new FakeElement(tagName),
       createTextNode: (text) => text,
+      addEventListener: (_event, listener) => visibilityListeners.add(listener),
+      removeEventListener: (_event, listener) => visibilityListeners.delete(listener),
+    },
+    MutationObserver: class {
+      constructor(callback) { this.callback = callback; }
+      observe() { observers.add(this); }
+      disconnect() { observers.delete(this); }
     },
     window: {
       setTimeout(callback, delay) {
@@ -89,12 +106,57 @@ function createPageContext() {
       },
     },
     timers,
+    visibilityListeners,
+    observers,
     Error,
     TextEncoder,
   });
 }
 
 const pages = pageTestContext.Amaterasu;
+
+test("diagnostic page filtering searches messages, targets and fields without changing records", () => {
+  const records = [
+    { sequence: 1, level: "info", target: "capture", message: "Started", fields: { output: "HDMI-A-1" } },
+    { sequence: 2, level: "error", target: "encoder", message: "Failed", fields: { reason: "Timeout" } },
+  ];
+  assert.deepEqual(Array.from(pages.filterDiagnosticPage(records, " HDMI-a-1 ", "")).map((item) => item.sequence), [1]);
+  assert.deepEqual(Array.from(pages.filterDiagnosticPage(records, "TIMEOUT", "error")).map((item) => item.sequence), [2]);
+  assert.deepEqual(Array.from(pages.filterDiagnosticPage(records, "timeout", "info")), []);
+  assert.equal(records.length, 2);
+});
+
+function cleanupOverview(t, content) {
+  t.after(() => {
+    content.setConnected(false);
+    for (const observer of pageTestContext.observers) observer.callback();
+  });
+}
+
+test("overview reports partial service failures and only offers permitted actions", async (t) => {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  cleanupOverview(t, content);
+  const navigated = [];
+  const api = {
+    allows: (scope) => scope === "catalog.read",
+    post: async (route) => {
+      if (route === "catalog/list") return { entries: [], next_cursor: null };
+      throw new Error("Not available to this account");
+    },
+  };
+  pages.renderOverview({ content, api, navigate: (page) => navigated.push(page), notify() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(content.textContent, /Some information is unavailable/);
+  assert.match(content.textContent, /Not available to this account/);
+  const descendants = (node) => [node, ...node.children.flatMap((child) =>
+    child instanceof FakeElement ? descendants(child) : [])];
+  const actions = descendants(content).filter((node) => node.className === "button quick-action");
+  assert.equal(actions.length, 1);
+  assert.match(actions[0].textContent, /Library/);
+  actions[0].click();
+  assert.deepEqual(navigated, ["catalog"]);
+});
 
 function historyStatus(overrides = {}) {
   return {
@@ -123,6 +185,114 @@ function historyStatus(overrides = {}) {
     },
   };
 }
+
+function liveStatus(count = 0) {
+  return { ok: true, epoch: "a".repeat(32), sampled_at_ms: "1000", sampled_at_unix_ms: "1700000000000",
+    sessions: Array.from({ length: count }, (_, index) => ({ session_id: `stream-${index}`, started_at_unix: 1700000000,
+      device_name: "Client", codec: "hevc", width: 1920, height: 1080, target_fps: 60,
+      target_bitrate_kbps: 10000, frames_sent: "1", bytes_sent: "2", sequence_gaps: "0" })) };
+}
+
+test("overview presents reported stream activity without treating it as client delivery", async (t) => {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  cleanupOverview(t, content);
+  const navigated = [];
+  pages.renderOverview({ content, navigate: (page) => navigated.push(page), notify() {}, api: {
+    allows: (scope) => scope === "session.read",
+    async post(route) {
+      if (route === "live-streams/status") return liveStatus(2);
+      if (route === "history/history_status") return historyStatus({ active_streams: 0, pending_activities: 1,
+        enabled: false, effective_enabled: false, degraded: true });
+      throw new Error("Other service unavailable");
+    },
+  } });
+  await waitFor(() => content.textContent.includes("2 active streams reported"), "reported activity");
+  assert.match(content.textContent, /1 pending launch/);
+  assert.match(content.textContent, /Launch tracking is degraded/);
+  assert.match(content.textContent, /Client media delivery is not verified/);
+  assert.match(content.textContent, /Host measurements require configuration.read and diagnostics.read/);
+  findButton(content, "View sessions").click();
+  assert.deepEqual(navigated, ["sessions"]);
+});
+
+test("overview keeps live activity available when history is unavailable", async (t) => {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  cleanupOverview(t, content);
+  pages.renderOverview({ content, navigate() {}, notify() {}, api: {
+    allows: (scope) => scope === "session.read",
+    async post(route) {
+      if (route === "live-streams/status") return liveStatus(1);
+      if (route === "history/history_status") return historyStatus({ available: false, configuration_ready: false, active_streams: 0 });
+      throw new Error("Other service unavailable");
+    },
+  } });
+  await waitFor(() => content.textContent.includes("Pending launch tracking is unavailable"), "unavailable history");
+  assert.match(content.textContent, /1 active stream reported/);
+  assert.doesNotMatch(content.textContent, /No active streams reported/);
+});
+
+test("overview ignores an older activity response after refresh", async (t) => {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  cleanupOverview(t, content);
+  const pending = [];
+  pages.renderOverview({ content, navigate() {}, notify() {}, api: {
+    allows: (scope) => scope === "session.read",
+    async post(route) {
+      if (route === "live-streams/status") return new Promise((resolve) => pending.push(resolve));
+      throw new Error("Other service unavailable");
+    },
+  } });
+  findButton(content, "Refresh").click();
+  assert.equal(pending.length, 2);
+  pending[1](liveStatus(0));
+  await waitFor(() => content.textContent.includes("No active streams reported"), "fresh activity");
+  pending[0](liveStatus(2));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.doesNotMatch(content.textContent, /2 active streams/);
+});
+
+test("overview polls while visible, ignores hidden responses, and cleans up on navigation", async (t) => {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  cleanupOverview(t, content);
+  const pending = [];
+  pages.renderOverview({ content, navigate() {}, notify() {}, api: {
+    allows: (scope) => scope === "session.read",
+    async post(route) {
+      if (route === "live-streams/status") return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+      if (route === "history/history_status") return historyStatus();
+      throw new Error("Other service unavailable");
+    },
+  } });
+  const action = findButton(content, "View sessions");
+  pending[0].resolve(liveStatus(1));
+  await waitFor(() => pageTestContext.timers.size === 1, "scheduled activity refresh");
+  const [timerId, timer] = [...pageTestContext.timers][0];
+  assert.equal(timer.delay, 10_000);
+  pageTestContext.timers.delete(timerId);
+  timer.callback();
+  assert.equal(pending.length, 2);
+  pageTestContext.document.visibilityState = "hidden";
+  for (const listener of pageTestContext.visibilityListeners) listener();
+  pending[1].resolve(liveStatus(0));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(content.textContent, /1 active stream reported/);
+  assert.equal(pageTestContext.timers.size, 0);
+  pageTestContext.document.visibilityState = "visible";
+  for (const listener of pageTestContext.visibilityListeners) listener();
+  assert.equal(pending.length, 3);
+  pending[2].reject(new Error("offline"));
+  await waitFor(() => content.textContent.includes("Live stream status is unavailable"), "unavailable live status");
+  assert.doesNotMatch(content.textContent, /No active streams reported/);
+  assert.equal(findButton(content, "View sessions"), action);
+  content.setConnected(false);
+  for (const observer of pageTestContext.observers) observer.callback();
+  assert.equal(pageTestContext.timers.size, 0);
+  assert.equal(pageTestContext.visibilityListeners.size, 0);
+});
 
 test("history runtime status reports readiness, deferred settings, failures and retention", () => {
   const parse = pages.parseHistoryRuntimeStatus;
@@ -600,6 +770,8 @@ test("recorded session pages reject malformed signed rows before exposing delete
     { ...valid, sessions: [{ ...historySummary("stored"), session_id: "bad\nkey" }] },
     { ...valid, sessions: [{ ...historySummary("stored"), ended_at_unix: "yesterday" }] },
     { ...valid, sessions: [{ ...historySummary("stored"), app_name: null }] },
+    { ...valid, sessions: [{ ...historySummary("stored"), device_name: null }] },
+    { ...valid, sessions: [historySummary("stored"), historySummary("stored")] },
     { ...valid, next_offset: 0 },
   ]) assert.throws(() => pages.parseHistoryListReply(reply, 0));
 });
@@ -867,6 +1039,48 @@ test("recorded detail readback rejects mismatched and malformed signed replies",
   ]) assert.throws(() => pages.parseHistoryDetailReply(reply, "first"));
 });
 
+test("full history loading preserves an engaged recent view until the user applies it", async () => {
+  let finishOpen;
+  const samples = Array.from({length:55},(_,index)=>({session_id:"stored",recorded_at_unix:100+index,
+    frames_sent:index,bytes_sent:index*100,dropped_frames:0,actual_fps:60,actual_bitrate_kbps:1000,encode_latency_ms:null}));
+  const first = historyDetail("stored");
+  first.detail.sample_count = 55;
+  first.detail.samples_truncated = true;
+  const api = {allows:()=>false, async post(route,payload) {
+    if(route === "session/list") return {sessions:[],next_offset:null};
+    if(route === "history/history_status") return historyStatus();
+    if(route === "history/list_sessions") return {ok:true,sessions:[historySummary("stored")],next_offset:null};
+    if(route === "history/session_detail") return first;
+    if(route === "history/timeline_open") return new Promise((resolve)=>{finishOpen=resolve;});
+    if(route === "history/timeline_page") {
+      if(payload.kind === "events") return {ok:true,session_id:"stored",kind:"events",total:1,
+        entries:first.detail.events,next_cursor:null};
+      const start = payload.cursor.after_id === null ? 0 : Number(payload.cursor.after_id);
+      const entries = samples.slice(start,start+32);
+      const end = start+entries.length;
+      return {ok:true,session_id:"stored",kind:"samples",total:55,entries,
+        next_cursor:end===55 ? null : {...payload.cursor,after_id:String(end)}};
+    }
+    throw new Error(`Unexpected route ${route}`);
+  }};
+  const content = new FakeElement("main"); content.setConnected(true);
+  pages.renderSessions({content,api,notify(){},navigate(){}});
+  await waitFor(()=>!!findAll(content,(node)=>node.tagName === "button" && node.textContent === "Details").length,"history list");
+  findAll(content,(node)=>node.tagName === "button" && node.textContent === "Details")[0].click();
+  await waitFor(()=>!!finishOpen && content.textContent.includes("History for stored"),"recent snapshot and full loading");
+  const view = findAll(content,(node)=>node.className === "panel recorded-session-detail")[0];
+  view.listeners.get("pointerdown")();
+  finishOpen({ok:true,session:historySummary("stored"),
+    samples:{total:55,cursor:{session_id:"stored",kind:"samples",first_id:"1",last_id:"55",after_id:null,total:55}},
+    events:{total:1,cursor:{session_id:"stored",kind:"events",first_id:"100",last_id:"100",after_id:null,total:1}}});
+  await waitFor(()=>content.textContent.includes("Full retained history is ready"),"full history ready");
+  assert.match(content.textContent,/1 of 55 samples/);
+  findButton(content,"Show full retained history").click();
+  assert.match(content.textContent,/55 of 55 samples/);
+  assert.ok(findButton(content,"Download retained history (JSON)"));
+  assert.match(content.textContent,/Samples 1–50 of 55/);
+});
+
 test("recorded detail keeps the latest selection after older success or failure and reads again after remount", async () => {
   const pending = [];
   const api = {
@@ -1076,12 +1290,75 @@ test("diagnostics ignores stale recent-session replies after refresh", async () 
   assert.doesNotMatch(content.textContent, /Cancelled/);
 });
 
-test("diagnostics ignores older page replies and errors after refresh", async () => {
+function journalPage(after, sequences, latest, overrides = {}) {
+  return {
+    ok: true,
+    records: sequences.map((sequence) => ({ sequence, level: "info", target: "capture", message: `record ${sequence}`, fields: {} })),
+    next_cursor: sequences.at(-1) ?? after,
+    has_more: (sequences.at(-1) ?? after) < latest,
+    latest_sequence: latest,
+    oldest_sequence: latest ? 1 : null,
+    dropped_total: 0,
+    resync_required: false,
+    ...overrides,
+  };
+}
+
+test("diagnostic snapshot searches every retained page and stops at the original endpoint", async () => {
+  const calls = [];
+  const api = { async post(route, { after, limit }) {
+    assert.equal(route, "diagnostics/query");
+    assert.equal(limit, 4);
+    calls.push(after);
+    return after === 0 ? journalPage(0, [1, 2, 3, 4], 6) : journalPage(4, [5, 6, 7, 8], 8);
+  } };
+  const snapshot = await pages.readDiagnosticSnapshot(api, () => true);
+  assert.deepEqual(calls, [0, 4]);
+  assert.deepEqual(Array.from(snapshot.records, (record) => record.sequence), [1, 2, 3, 4, 5, 6]);
+  assert.equal(snapshot.latestSequence, 6);
+  assert.equal(snapshot.incomplete, false);
+  assert.equal(pages.filterDiagnosticPage(snapshot.records, "record 6", "").length, 1);
+  assert.match(pages.formatDiagnosticRecords(snapshot.records), /#6 \[info\] capture: record 6/);
+});
+
+test("diagnostic snapshots report retention and concurrent eviction accurately", async () => {
+  const replies = [
+    journalPage(0, [3, 4, 5, 6], 8, { oldest_sequence: 3, dropped_total: 2, resync_required: true }),
+    journalPage(6, [8, 9], 9, { oldest_sequence: 8, dropped_total: 7, resync_required: true }),
+  ];
+  const snapshot = await pages.readDiagnosticSnapshot({ async post() { return replies.shift(); } }, () => true);
+  assert.equal(snapshot.droppedTotal, 2);
+  assert.equal(snapshot.incomplete, true);
+  assert.deepEqual(Array.from(snapshot.records, (record) => record.sequence), [3, 4, 5, 6, 8]);
+  const retained = await pages.readDiagnosticSnapshot({ async post() {
+    return journalPage(0, [3, 4], 4, { oldest_sequence: 3, dropped_total: 2, resync_required: true });
+  } }, () => true);
+  assert.equal(retained.incomplete, false);
+  assert.equal(retained.droppedTotal, 2);
+});
+
+test("diagnostic snapshots stop at journal capacity and reject stalled cursors", async () => {
+  let calls = 0;
+  const full = await pages.readDiagnosticSnapshot({ async post(_route, { after }) {
+    calls++;
+    return journalPage(after, Array.from({ length: 4 }, (_, i) => after + i + 1), 128);
+  } }, () => true);
+  assert.equal(calls, 32);
+  assert.equal(full.records.length, 128);
+  assert.equal(full.incomplete, false);
+  await assert.rejects(pages.readDiagnosticSnapshot({ async post() {
+    return journalPage(0, [], 1);
+  } }, () => true), /did not advance/);
+  const cancelled = await pages.readDiagnosticSnapshot({ async post() { return journalPage(0, [1], 1); } }, () => false);
+  assert.equal(cancelled, null);
+});
+
+test("diagnostics ignores older snapshot replies and errors after refresh", async () => {
   const pending = [];
   const content = new FakeElement("main");
   content.setConnected(true);
   pages.renderDiagnostics({ content, notify() {}, navigate() {}, api: {
-    allows: () => true,
+    allows: (scope) => scope === "diagnostics.read",
     async post(route, payload) {
       if (route === "diagnostics/counters") return { ok: true, counters: { reads: 1 } };
       if (route === "diagnostics/query")
@@ -1090,9 +1367,7 @@ test("diagnostics ignores older page replies and errors after refresh", async ()
     },
   } });
   pending[0].resolve(diagnosticReply(0, "first", { has_more: true, latest_sequence: 2 }));
-  await waitFor(() => findButton(content, "Next →"), "next diagnostics page");
-  findButton(content, "Next →").click();
-  await waitFor(() => pending.length === 2, "pending second page");
+  await waitFor(() => pending.length === 2, "pending second snapshot page");
   findButton(content, "Refresh").click();
   await waitFor(() => pending.length === 3, "pending refresh");
   pending[2].resolve(diagnosticReply(0, "fresh"));
@@ -1101,7 +1376,7 @@ test("diagnostics ignores older page replies and errors after refresh", async ()
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.match(content.textContent, /fresh/);
   assert.doesNotMatch(content.textContent, /stale/);
-  assert.match(content.textContent, /Page 1/);
+  assert.match(content.textContent, /1 of 1 retained records/);
   findButton(content, "Refresh").click();
   findButton(content, "Refresh").click();
   await waitFor(() => pending.length === 5, "overlapping refreshes");
@@ -1113,35 +1388,56 @@ test("diagnostics ignores older page replies and errors after refresh", async ()
   assert.doesNotMatch(content.textContent, /old request failed/);
 });
 
-test("diagnostics resync clears back navigation into evicted records", async () => {
-  const pending = [];
+test("diagnostics navigates filtered records and resets selection when filters change", async () => {
   const content = new FakeElement("main");
   content.setConnected(true);
   pages.renderDiagnostics({ content, notify() {}, navigate() {}, api: {
-    allows: () => true,
-    async post(route, payload) {
+    allows: (scope) => scope === "diagnostics.read",
+    async post(route, payload = {}) {
       if (route === "diagnostics/counters") return { ok: true, counters: {} };
-      if (route === "diagnostics/query")
-        return new Promise((resolve) => pending.push({ after: payload.after, resolve }));
+      if (route === "diagnostics/query") return journalPage(payload.after, [1, 2, 3], 3);
       throw new Error(`Unexpected route ${route}`);
     },
   } });
-  pending[0].resolve(diagnosticReply(0, "old", { has_more: true, latest_sequence: 5 }));
-  await waitFor(() => findButton(content, "Next →"), "next diagnostics page");
-  findButton(content, "Next →").click();
-  await waitFor(() => pending.length === 2, "next query");
-  pending[1].resolve(diagnosticReply(1, "retained", {
-    records: [{ sequence: 5, level: "info", target: "capture", message: "retained", fields: {} }],
-    next_cursor: 5,
-    latest_sequence: 5,
-    oldest_sequence: 5,
-    dropped_total: 4,
-    resync_required: true,
-  }));
-  await waitFor(() => content.textContent.includes("retained"), "resynced records");
-  assert.match(content.textContent, /Page 1/);
-  assert.match(content.textContent, /Older records were removed/);
-  assert.equal(findButton(content, "← Previous").disabled, true);
+  await waitFor(() => content.textContent.includes("record 3"), "diagnostics records");
+  const descendants = (node) => [node, ...node.children.flatMap((child) =>
+    child instanceof FakeElement ? descendants(child) : [])];
+  const filter = descendants(content).find((node) => node.name === "diagnostics_filter");
+  const navigation = descendants(content).find((node) => node.className === "diagnostics-match-navigation");
+  assert.equal(navigation.hidden, true);
+  filter.value = "record";
+  filter.listeners.get("input")();
+  assert.equal(navigation.hidden, false);
+  assert.match(navigation.textContent, /Match 1 of 3/);
+  findButton(content, "Next match").click();
+  assert.match(navigation.textContent, /Match 2 of 3/);
+  let prevented = false;
+  filter.listeners.get("keydown")({ key: "Enter", shiftKey: true, isComposing: false, preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.match(navigation.textContent, /Match 1 of 3/);
+  findButton(content, "Previous match").click();
+  assert.match(navigation.textContent, /Match 3 of 3/);
+  filter.value = "no match";
+  filter.listeners.get("input")();
+  assert.match(navigation.textContent, /No matches/);
+  assert.equal(findButton(content, "Next match").disabled, true);
+  filter.value = "";
+  filter.listeners.get("input")();
+  assert.equal(navigation.hidden, true);
+});
+
+test("diagnostics retains records when counters are unavailable", async () => {
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  pages.renderDiagnostics({ content, notify() {}, navigate() {}, api: {
+    allows: (scope) => scope === "diagnostics.read",
+    async post(route) {
+      if (route === "diagnostics/counters") throw new Error("Counters unavailable");
+      return diagnosticReply(0, "record available");
+    },
+  } });
+  await waitFor(() => content.textContent.includes("record available"), "records without counters");
+  assert.match(content.textContent, /Counters unavailable/);
 });
 
 test("operator can stop managed launches but cannot terminate raw processes", async () => {
@@ -1160,4 +1456,130 @@ test("operator can stop managed launches but cannot terminate raw processes", as
   await waitFor(() => findButton(content, "Stop") && findButton(content, "Terminate"), "application controls");
   assert.equal(findButton(content, "Stop").disabled, false);
   assert.equal(findButton(content, "Terminate").disabled, true);
+});
+
+test("nearby history cards load and apply complete member snapshots without losing engagement", async () => {
+  const newer = {...historySummary("new"),app_name:"Same game",started_at_unix:300,ended_at_unix:400,duration_seconds:100};
+  const older = {...historySummary("old"),app_name:"Same game",started_at_unix:100,ended_at_unix:180,duration_seconds:80};
+  const first=historyDetail("new"); first.detail.session=newer;
+  const second=historyDetail("old"); second.detail.session=older; second.detail.sample_count=33; second.detail.samples_truncated=true;
+  const samples=Array.from({length:33},(_,index)=>({...second.detail.samples[0],recorded_at_unix:100+index,frames_sent:index}));
+  let finishOpen;
+  const calls=[];
+  const api={allows:()=>false,async post(route,payload) {
+    calls.push([route,payload]);
+    if(route === "session/list") return {sessions:[],next_offset:null};
+    if(route === "history/history_status") return historyStatus();
+    if(route === "history/list_sessions") return {ok:true,sessions:[newer,older],next_offset:null};
+    if(route === "history/session_detail") return payload.session_id === "new" ? first : second;
+    if(route === "history/timeline_open") return new Promise((resolve)=>{finishOpen=resolve;});
+    if(route === "history/timeline_page") {
+      const {kind,cursor}=payload;
+      if(kind === "events") return {ok:true,session_id:"old",kind,total:1,entries:second.detail.events,next_cursor:null};
+      const start=cursor.after_id === null ? 0 : Number(cursor.after_id);
+      const end=Math.min(33,start+payload.limit);
+      return {ok:true,session_id:"old",kind,total:33,entries:samples.slice(start,end),
+        next_cursor:end===33 ? null : {...cursor,after_id:String(end)}};
+    }
+    throw new Error(`Unexpected route ${route}`);
+  }};
+  const content=new FakeElement("main"); content.setConnected(true);
+  pages.renderSessions({content,api,notify(){},navigate(){}});
+  await waitFor(()=>content.textContent.includes("2 nearby streams"),"grouped history card");
+  const card=findAll(content,(node)=>node.className === "history-card")[0];
+  findAll(card,(node)=>node.tagName === "button" && node.textContent === "Details")[0].click();
+  await waitFor(()=>!!finishOpen && content.textContent.includes("History for Same game"),"grouped recent history");
+  assert.match(content.textContent,/2 of 34 samples/);
+  assert.match(content.textContent,/reconnect is not confirmed/);
+  const view=findAll(content,(node)=>node.className === "panel recorded-session-detail")[0];
+  view.listeners.get("pointerdown")();
+  finishOpen({ok:true,session:older,
+    samples:{total:33,cursor:{session_id:"old",kind:"samples",first_id:"1",last_id:"33",after_id:null,total:33}},
+    events:{total:1,cursor:{session_id:"old",kind:"events",first_id:"100",last_id:"100",after_id:null,total:1}}});
+  await waitFor(()=>content.textContent.includes("Full retained history is ready for all streams"),"group snapshots ready");
+  assert.match(content.textContent,/2 of 34 samples/);
+  findButton(content,"Show full retained history").click();
+  assert.match(content.textContent,/34 of 34 samples/);
+  assert.equal(calls.filter(([route])=>route === "history/timeline_open").length,1);
+  assert.equal(findAll(card,(node)=>node.tagName === "button" && node.textContent === "Delete").length,2);
+});
+
+test("oversized grouped history keeps recent snapshots and does not start a full download", async () => {
+  const newer={...historySummary("new"),app_name:"Same game",started_at_unix:300,ended_at_unix:400};
+  const older={...historySummary("old"),app_name:"Same game",started_at_unix:100,ended_at_unix:180};
+  const api={allows:()=>false,async post(route,payload) {
+    if(route === "session/list") return {sessions:[],next_offset:null};
+    if(route === "history/history_status") return historyStatus();
+    if(route === "history/list_sessions") return {ok:true,sessions:[newer,older],next_offset:null};
+    if(route === "history/session_detail") {
+      const reply=historyDetail(payload.session_id); reply.detail.session=payload.session_id === "new" ? newer : older;
+      if(payload.session_id === "old") { reply.detail.sample_count=25001; reply.detail.samples_truncated=true; }
+      return reply;
+    }
+    throw new Error(`Unexpected route ${route}`);
+  }};
+  const content=new FakeElement("main");content.setConnected(true);
+  pages.renderSessions({content,api,notify(){},navigate(){}});
+  await waitFor(()=>content.textContent.includes("2 nearby streams"),"grouped card");
+  findAll(content,(node)=>node.className === "history-card")[0].children.find((node)=>node?.className === "actions").children[0].click();
+  await waitFor(()=>content.textContent.includes("This group exceeds the browser limit"),"bounded group notice");
+  assert.match(content.textContent,/2 of 25002 samples/);
+  assert.match(content.textContent,/open an individual stream/i);
+});
+
+test("late grouped history reads cannot replace a newer individual selection", async () => {
+  const newer={...historySummary("new"),app_name:"Same game",started_at_unix:300,ended_at_unix:400};
+  const older={...historySummary("old"),app_name:"Same game",started_at_unix:100,ended_at_unix:180};
+  const pending=[]; let calls=0;
+  const api={allows:()=>false,async post(route,payload) {
+    if(route === "session/list") return {sessions:[],next_offset:null};
+    if(route === "history/history_status") return historyStatus();
+    if(route === "history/list_sessions") return {ok:true,sessions:[newer,older],next_offset:null};
+    if(route === "history/session_detail") {
+      const reply=historyDetail(payload.session_id); reply.detail.session=payload.session_id === "new" ? newer : older;
+      if(++calls<=2) return new Promise((resolve)=>pending.push(()=>resolve(reply)));
+      return reply;
+    }
+    throw new Error(`Unexpected route ${route}`);
+  }};
+  const content=new FakeElement("main");content.setConnected(true);
+  pages.renderSessions({content,api,notify(){},navigate(){}});
+  await waitFor(()=>content.textContent.includes("2 nearby streams"),"grouped card");
+  const card=findAll(content,(node)=>node.className === "history-card")[0];
+  const details=findAll(card,(node)=>node.tagName === "button" && node.textContent === "Details");
+  details[0].click();
+  await waitFor(()=>pending.length===2,"group member requests");
+  details[1].click();
+  await waitFor(()=>content.textContent.includes("History for Same game") && content.textContent.includes("1 of 1 samples"),"individual selection");
+  pending.forEach((resolve)=>resolve());
+  await new Promise((resolve)=>setTimeout(resolve,0));
+  const view=findAll(content,(node)=>node.className === "panel recorded-session-detail")[0];
+  assert.match(view.textContent,/1 of 1 samples/);
+  assert.doesNotMatch(view.textContent,/nearby streams/);
+});
+
+test("a failed grouped full-history read leaves the recent member snapshots visible", async () => {
+  const newer={...historySummary("new"),app_name:"Same game",started_at_unix:300,ended_at_unix:400};
+  const older={...historySummary("old"),app_name:"Same game",started_at_unix:100,ended_at_unix:180};
+  const api={allows:()=>false,async post(route,payload) {
+    if(route === "session/list") return {sessions:[],next_offset:null};
+    if(route === "history/history_status") return historyStatus();
+    if(route === "history/list_sessions") return {ok:true,sessions:[newer,older],next_offset:null};
+    if(route === "history/session_detail") {
+      const reply=historyDetail(payload.session_id);reply.detail.session=payload.session_id === "new" ? newer : older;
+      if(payload.session_id === "old") { reply.detail.sample_count=33;reply.detail.samples_truncated=true; }
+      return reply;
+    }
+    if(route === "history/timeline_open") throw new Error("history_changed");
+    throw new Error(`Unexpected route ${route}`);
+  }};
+  const content=new FakeElement("main");content.setConnected(true);
+  pages.renderSessions({content,api,notify(){},navigate(){}});
+  await waitFor(()=>content.textContent.includes("2 nearby streams"),"grouped card");
+  const card=findAll(content,(node)=>node.className === "history-card")[0];
+  findAll(card,(node)=>node.tagName === "button" && node.textContent === "Details")[0].click();
+  await waitFor(()=>content.textContent.includes("no partial full-history result was applied"),"group failure");
+  assert.match(content.textContent,/2 of 34 samples/);
+  assert.ok(findButton(content,"Download returned history (JSON)"));
+  assert.ok(findButton(content,"Try again"));
 });

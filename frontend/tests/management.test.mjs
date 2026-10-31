@@ -99,7 +99,7 @@ function loadManagement() {
       context,
     );
     if (source === "src/ui.ts")
-      vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
+      vm.runInContext("Object.assign(globalThis, Amaterasu); globalThis.createPairedClientEditor = () => async () => {};", context);
   }
   return {
     module: context.Amaterasu,

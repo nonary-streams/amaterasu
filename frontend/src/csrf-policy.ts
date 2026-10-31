@@ -82,10 +82,10 @@ namespace Amaterasu {
     return saved;
   }
 
-  export function renderCsrfPolicy(context: PageContext): void {
+  export function renderCsrfPolicy(context: PageContext, container: HTMLElement = context.content): void {
     const area = el("div");
     let generation = 0;
-    context.content.append(area);
+    container.append(area);
     async function load(): Promise<void> {
       const request = ++generation;
       area.replaceChildren(el("p", "muted", "Loading CSRF origin policy…"));

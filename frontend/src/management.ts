@@ -156,6 +156,13 @@ namespace Amaterasu {
 
   export function renderHostManagement(context: PageContext): void {
     const pairingArea = el("div");
+    const pairedClientsArea = el("div");
+    const drafts = context.registerDraftGuard ? trackDrafts(pairedClientsArea) : null;
+    let clientSaveBusy = false;
+    if (drafts) context.registerDraftGuard?.(() => clientSaveBusy || drafts.isDirty(), drafts.dispose);
+    const loadPairedClients = createPairedClientEditor(context, pairedClientsArea, () => drafts, (busy) => {
+      clientSaveBusy = busy;
+    });
     const captureArea = el("div");
     const hostArea = el("div");
     const sessionArea = el("div");
@@ -171,16 +178,22 @@ namespace Amaterasu {
         "Review pending device access and the status reported by this host.",
         button("Refresh all", () => {
           void loadPairings();
+          if (context.api.allows("pairing.admin")) {
+            if (clientSaveBusy) context.notify("Wait for the client save to finish before refreshing.");
+            else if (!drafts?.isDirty() || window.confirm("Reload paired clients and discard unsaved client changes?"))
+              void loadPairedClients();
+          }
           void loadHost();
           void loadSessions();
           void loadRuntime();
         }),
       ),
       panel("Pending device pairing", pairingArea),
+      pairedClientsArea,
       panel("KDE desktop capture consent", captureArea),
       panel("Host listeners", hostArea),
       panel("Streaming status", runtimeArea),
-      panel("Management sessions", sessionArea),
+      panel("Session coordination", sessionArea),
     );
 
     async function loadPairings(notice?: string): Promise<void> {
@@ -321,10 +334,10 @@ namespace Amaterasu {
     async function loadSessions(): Promise<void> {
       const request = ++sessionRequest;
       if (!context.api.allows("session.read")) {
-        sessionArea.replaceChildren(el("p", "muted", "Management session status requires session.read permission."));
+        sessionArea.replaceChildren(el("p", "muted", "Session coordination requires session.read permission."));
         return;
       }
-      sessionArea.replaceChildren(el("p", "muted", "Loading management sessions…"));
+      sessionArea.replaceChildren(el("p", "muted", "Loading session coordination…"));
       try {
         const reply = parseSessionStatus(await context.api.post<unknown>("session/list", { limit: 16 }));
         if (!context.content.isConnected || request !== sessionRequest) return;
@@ -337,7 +350,7 @@ namespace Amaterasu {
         sessionArea.replaceChildren(
           rows.length
             ? table(["Session", "State", "Leases", "Outcome"], rows)
-            : empty("No management sessions", "Sessions created through the management API will appear here."),
+            : empty("No coordination sessions", "Sessions created through the session API will appear here."),
           reply.next_offset === null
             ? el("p", "muted", `Showing ${reply.sessions.length} session${reply.sessions.length === 1 ? "" : "s"}.`)
             : el("p", "muted", `Showing the first ${reply.sessions.length} sessions; more are available.`),
@@ -372,6 +385,8 @@ namespace Amaterasu {
     }
 
     void loadPairings();
+    if (context.api.allows("pairing.admin")) void loadPairedClients();
+    else pairedClientsArea.append(panel("Paired clients", el("p", "muted", "This account does not have permission to manage paired clients.")));
     renderCaptureConsent(context, captureArea);
     void loadHost();
     void loadSessions();

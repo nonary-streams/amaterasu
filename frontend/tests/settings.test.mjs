@@ -34,6 +34,16 @@ const parse = context.Amaterasu.parseSteamExclusions;
 const ordinary = (value) => JSON.parse(JSON.stringify(value));
 const diagnosticsResult = (status) => ({ status, error: null });
 
+test("settings search matches labels, descriptions, category and keys case insensitively", () => {
+  const matches = context.Amaterasu.settingsSearchMatches;
+  assert.equal(matches(" FEC_PERCENTAGE ", "Streaming", "Moonlight host", "Repair percentage", "fec_percentage"), true);
+  assert.equal(matches("timeout", "Devices", "Controller", "Back button timeout"), true);
+  assert.equal(matches("streaming", "Streaming", "Encoder", "Quality"), true);
+  assert.equal(matches("missing", "Streaming", "Encoder", "Quality"), false);
+  assert.equal(matches("  ", "Anything"), true);
+});
+
+
 test("display policy editor keeps platform-specific inheritance and scoped static-count overrides", () => {
   const parseDisplayPolicy = context.Amaterasu.parseDisplayPolicyOverrideMap;
   assert.deepEqual(ordinary(parseDisplayPolicy("", "global")).dd_virtual_display_permanent_count, null);
@@ -549,7 +559,7 @@ test("host logging form refreshes its revision after an ambiguous persisted save
     },
   } });
   await new Promise(setImmediate);
-  const hostLoggingArea = content.children[3];
+  const hostLoggingArea = find(content, (node) => node.className === "settings-area-logging");
   const originalForm = find(hostLoggingArea, (node) => node.tagName === "form");
   assert.match(hostLoggingArea.textContent, /Revision 6/);
   originalForm.fire("submit", { preventDefault() {} });
@@ -1069,7 +1079,7 @@ test("history form keeps retention controls visible and saves them while recordi
     },
   } });
   await new Promise(setImmediate);
-  const historyArea = content.children[9];
+  const historyArea = find(content, (node) => node.className === "settings-area-history");
   const form = find(historyArea, (node) => node.tagName === "form");
   assert.ok(form);
   const enabled = find(form, (node) => node.name === "session_history_enabled");
@@ -1678,7 +1688,7 @@ test("input form confirms cleanup-pending save, then reloads after a revision co
     },
   });
   await new Promise(setImmediate);
-  const inputArea = content.children[8];
+  const inputArea = find(content, (node) => node.className === "settings-area-input");
   const oldForm = find(inputArea, (node) => node.tagName === "form");
   assert.ok(oldForm);
   assert.equal(find(oldForm, (node) => node.name === "input_ds4_back_as_touchpad_click").checked, false);
@@ -1811,7 +1821,7 @@ test("recent-games UI preserves the provider's 10000 Playnite range", () => {
   const playniteSettingsUi = settingsSource.slice(
     settingsSource.indexOf("async function loadPlaynite(): Promise<void>"),
     settingsSource.indexOf(
-      "async function loadPairing(): Promise<void>",
+      "async function loadHistorySettings(): Promise<void>",
     ),
   );
 
@@ -1958,6 +1968,63 @@ test("paired-client input overrides preserve explicit false and allow inherited 
     const invalid = { ...client, config_overrides: { [key]: "false" } };
     assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(invalid)), [key]);
   }
+});
+
+test("paired-client reconciliation combines independent changes and detects competing edits", () => {
+  const merge = context.Amaterasu.mergePairingOverrides;
+  const original = { fec_percentage: 20, controller: true, sw_preset: "", keybindings: [1, 2] };
+  const local = { fec_percentage: 35, controller: false, sw_preset: "", keybindings: [1, 2] };
+  const latest = { fec_percentage: 20, controller: true, sw_preset: "", keybindings: [2, 1], max_bitrate: 0 };
+  assert.deepEqual(ordinary(merge(original, local, latest)), { values: {
+    fec_percentage: 35, controller: false, sw_preset: "", keybindings: [2, 1], max_bitrate: 0,
+  }, conflicts: [] });
+  const clash = merge(original, local, { ...latest, fec_percentage: 40, controller: false });
+  assert.deepEqual(ordinary(clash.conflicts), ["fec_percentage"]);
+  const reset = merge({ fec_percentage: 20 }, {}, { fec_percentage: 20, stream_audio: false });
+  assert.deepEqual(ordinary(reset), { values: { stream_audio: false }, conflicts: [] });
+  assert.deepEqual(ordinary(merge({}, { controller: false }, { controller: false })),
+    { values: { controller: false }, conflicts: [] });
+});
+
+test("device removal requires a revision and confirms only the selected certificate disappeared", async () => {
+  const current = pairedClients();
+  const removed = { ...current, revision: 8, clients: [current.clients[1]] };
+  const calls = [];
+  const api = { async post(route, body) {
+    calls.push(route);
+    if (route === "pairing/unpair") {
+      assert.deepEqual(ordinary(body), { certificate_id: "a".repeat(64), expected_revision: 7 });
+      return { ok: true };
+    }
+    assert.equal(route, "pairing/list_clients");
+    return removed;
+  } };
+  assert.deepEqual(ordinary(await context.Amaterasu.removePairedClient(api, current, "a".repeat(64))), removed);
+  assert.deepEqual(calls, ["pairing/unpair", "pairing/list_clients"]);
+  await assert.rejects(context.Amaterasu.removePairedClient(api, current, "c".repeat(64)), /invalid/);
+  assert.deepEqual(calls, ["pairing/unpair", "pairing/list_clients"]);
+});
+
+test("device removal refuses uncertain or unrelated readback and never retries the mutation", async () => {
+  const current = pairedClients();
+  for (const readback of [
+    { ...current, revision: 8 },
+    { ...current, revision: 9, clients: [current.clients[1]] },
+    { ...current, revision: 8, clients: [{ ...current.clients[1], name: "changed elsewhere" }] },
+  ]) {
+    const calls = [];
+    await assert.rejects(context.Amaterasu.removePairedClient({ async post(route) {
+      calls.push(route);
+      return route === "pairing/unpair" ? { ok: true } : readback;
+    } }, current, "a".repeat(64)), /could not be confirmed/);
+    assert.deepEqual(calls, ["pairing/unpair", "pairing/list_clients"]);
+  }
+  const calls = [];
+  await assert.rejects(context.Amaterasu.removePairedClient({ async post(route) {
+    calls.push(route);
+    throw new Error("uncertain connection");
+  } }, current, "a".repeat(64)), /uncertain connection/);
+  assert.deepEqual(calls, ["pairing/unpair"]);
 });
 
 test("paired-client editor preserves hidden overrides and confirms complete signed readback", async () => {
@@ -2121,7 +2188,7 @@ test("paired-client loads discard old list or input status after refresh", async
   assert.equal(await pending, null);
 });
 
-test("paired-client form preserves hidden fields, reloads conflict, and blocks unknown fields", async () => {
+test("paired-client form preserves drafts on conflict and blocks unknown fields after reload", async () => {
   class Element {
     constructor(tagName) {
       this.tagName = tagName;
@@ -2139,6 +2206,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
       for (const child of children) {
         if (child == null) continue;
         this.children.push(child);
+        if (typeof child === "object") child.parent = this;
         child?.setConnected?.(this.isConnected);
       }
     }
@@ -2146,6 +2214,10 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
       for (const child of this.children) child?.setConnected?.(false);
       this.children = [];
       this.append(...children);
+    }
+    remove() {
+      if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this);
+      this.setConnected(false);
     }
     addEventListener(name, callback) { this.listeners.set(name, callback); }
     setAttribute(name, value) { this.attributes.set(name, value); }
@@ -2171,6 +2243,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   const dom = vm.createContext({
     TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) },
+    window: { confirm: () => true },
   });
   for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
@@ -2198,6 +2271,16 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
       async post(route, body) {
         if (route === "pairing/list_clients") return stored;
         if (route === "input/status") throw new Error("input offline");
+        if (route === "pairing/unpair") {
+          if (body.certificate_id === "b".repeat(64)) {
+            assert.equal(body.expected_revision, 10);
+            throw new ApiError("revision_conflict");
+          }
+          assert.equal(body.certificate_id, "a".repeat(64));
+          assert.equal(body.expected_revision, 9);
+          stored = { ...stored, revision: 10, clients: [stored.clients[1]] };
+          return { ok: true };
+        }
         if (route === "pairing/update_client_config_overrides") {
           updates += 1;
           if (updates === 2) {
@@ -2236,7 +2319,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
     },
   });
   await new Promise(setImmediate);
-  const pairingArea = content.children[13];
+  const pairingArea = find(content, (node) => node.className === "settings-area-pairing");
   const fec = find(pairingArea, (node) => node.name === `fec_${"a".repeat(64)}`);
   const ds4BackClick = find(pairingArea, (node) => node.name === "ds4_back_as_touchpad_click");
   const save = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
@@ -2252,7 +2335,7 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   await new Promise(setImmediate);
   assert.equal(updates, 0);
   keybindings.value = "[]";
-  assert.match(pairingArea.textContent, /Input and software encoding preferences/);
+  assert.match(pairingArea.textContent, /Advanced input and encoding/);
   const presetMode = find(pairingArea, (node) => node.name === "sw_preset_mode");
   const presetValue = find(pairingArea, (node) => node.name === "sw_preset_value");
   assert.equal(presetMode.value, "value");
@@ -2269,6 +2352,19 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   find(pairingArea, (node) => node.name === "min_threads").value = "2";
   assert.equal(find(pairingArea, (node) => node.name === "encoder_backend").value, "software");
   fec.value = "35";
+  const otherClientFec = find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`);
+  otherClientFec.value = "42";
+  const clientSearch = find(pairingArea, (node) => node.name === "client_search");
+  const firstCard = find(pairingArea, (node) => node.className === "client-settings-card" && node.textContent.includes("Living room"));
+  const otherCard = find(pairingArea, (node) => node.className === "client-settings-card" && node.textContent.startsWith("Desk"));
+  clientSearch.value = "desk";
+  clientSearch.fire("input");
+  assert.equal(firstCard.hidden, true);
+  assert.equal(otherCard.hidden, false);
+  assert.equal(otherClientFec.value, "42");
+  clientSearch.value = "";
+  clientSearch.fire("input");
+  assert.equal(firstCard.hidden, false);
   find(pairingArea, (node) => node.name === "native_pen_touch").value = "true";
   find(pairingArea, (node) => node.name === "keybindings").value = "[]";
   for (const [key, value] of Object.entries({high_resolution_scrolling: "false", always_send_scancodes: "false", key_rightalt_to_key_win: "true", key_repeat_delay: "0", key_repeat_frequency: "0"}))
@@ -2277,6 +2373,8 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   await new Promise(setImmediate);
   assert.equal(updates, 1);
   assert.match(pairingArea.textContent, /Revision 8/);
+  assert.equal(find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`), otherClientFec);
+  assert.equal(otherClientFec.value, "42", "saving one client must preserve another client's draft");
   assert.match(notices.at(-1), /Stored overrides confirmed.*Active stream application is not confirmed/);
   assert.equal(find(pairingArea, (node) => node.name === "sw_preset_mode").value, "value");
   assert.equal(find(pairingArea, (node) => node.name === "sw_preset_value").value, "");
@@ -2290,11 +2388,35 @@ test("paired-client form preserves hidden fields, reloads conflict, and blocks u
   freshSave.fire("click");
   await new Promise(setImmediate);
   assert.equal(secondSubmittedRevision, 8);
+  assert.match(pairingArea.textContent, /Revision 8/);
+  assert.match(pairingArea.textContent, /Your edits are still here/);
+  assert.equal(otherClientFec.value, "42");
+  assert.equal(freshSave.disabled, true);
+  find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Reload paired clients").fire("click");
+  await new Promise(setImmediate);
   assert.match(pairingArea.textContent, /Revision 9/);
-  assert.match(notices.at(-1), /changed elsewhere/);
   const blocked = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
   assert.equal(blocked.disabled, true);
   assert.match(pairingArea.textContent, /cannot preserve \(future_policy\)/);
+  const remainingDraft = find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`);
+  remainingDraft.value = "42";
+  const remove = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Remove device");
+  assert.ok(remove, "paired client should expose removal even when its overrides are unsupported");
+  remove.fire("click");
+  await new Promise(setImmediate);
+  assert.equal(find(pairingArea, (node) => node.name === `fec_${"a".repeat(64)}`), null);
+  assert.equal(find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`), remainingDraft);
+  assert.equal(remainingDraft.value, "42");
+  assert.match(pairingArea.textContent, /Revision 10/);
+  assert.match(pairingArea.textContent, /1 of 1 paired clients/);
+  const remainingRemove = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Remove device");
+  remainingRemove.fire("click");
+  await new Promise(setImmediate);
+  assert.equal(remainingDraft.value, "42");
+  assert.equal(remainingRemove.disabled, true);
+  assert.match(pairingArea.textContent, /Paired clients changed elsewhere/);
+  assert.match(pairingArea.textContent, /Your edits are still here/);
+  assert.ok(find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Reload paired clients"));
 });
 
 function nvhttpHostSettings(revision = 8) {
@@ -2843,7 +2965,7 @@ test("Moonlight host form reloads its revision and listener status after a persi
     },
   });
   await new Promise(setImmediate);
-  const hostArea = content.children[4];
+  const hostArea = find(content, (node) => node.className === "settings-area-host");
   const oldForm = find(hostArea, (node) => node.tagName === "form");
   assert.ok(oldForm);
   const upnp = find(oldForm, (node) => node.name === "upnp");
@@ -3243,10 +3365,29 @@ test("Steam form reloads normalized Linux settings and explains the enabled poli
     },
   });
   await new Promise(setImmediate);
-  const steamArea = content.children[5];
+  const steamArea = find(content, (node) => node.className === "settings-area-steam");
   const oldForm = find(steamArea, (node) => node.tagName === "form");
   assert.ok(oldForm);
-  find(oldForm, (node) => node.name === "steam_enabled").checked = false;
+  const enabled = find(oldForm, (node) => node.name === "steam_enabled");
+  enabled.checked = false;
+  assert.equal(steamArea.hidden, true);
+  find(content, (node) => node.tagName === "button" && node.textContent === "Integrations").fire("click");
+  assert.equal(steamArea.hidden, false);
+  find(content, (node) => node.tagName === "button" && node.textContent === "General").fire("click");
+  assert.equal(steamArea.hidden, true);
+  const search = find(content, (node) => node.name === "settings_search");
+  search.value = "Steam";
+  search.fire("input");
+  assert.equal(steamArea.hidden, false);
+  assert.equal(enabled.checked, false, "category navigation and search must preserve the draft");
+  search.value = "no such configuration section";
+  search.fire("input");
+  assert.equal(steamArea.hidden, true);
+  assert.equal(find(content, (node) => node.className === "muted settings-no-results").hidden, false);
+  search.value = "";
+  search.fire("input");
+  find(content, (node) => node.tagName === "button" && node.textContent === "Integrations").fire("click");
+  assert.equal(find(steamArea, (node) => node.name === "steam_enabled"), enabled);
   oldForm.fire("submit", { preventDefault() {} });
   await new Promise(setImmediate);
   assert.equal(oldForm.isConnected, false);

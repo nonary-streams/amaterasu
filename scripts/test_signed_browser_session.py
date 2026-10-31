@@ -22,15 +22,17 @@ import select
 import shutil
 import signal
 import socket
+import sqlite3
 import ssl
 import subprocess
 import tempfile
 import threading
 import time
+import zipfile
 
 from test_component_updates import CARGO, WORKSPACE, run
 from test_host_service import Console
-from test_management_api import stop_console
+from test_management_api import solid_portrait_png, stop_console
 from test_management_origin_policy import SERVICE, ready
 from test_platform_modules import PlatformHarness, configure_steam_fixture
 
@@ -69,6 +71,13 @@ def identity(directory):
 
 def configure_host(harness):
     configure_steam_fixture(harness)
+    steam_root = harness.directory / "steam-library"
+    steam = steam_root / "steam"
+    steam.write_text("#!/bin/sh\nexit 0\n")
+    steam.chmod(0o700)
+    artwork = steam_root / "appcache/librarycache"
+    artwork.mkdir(parents=True)
+    (artwork / "730_library_600x900.png").write_bytes(solid_portrait_png())
     state = harness.root / "data/state"
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     files, spki = identity(state / "management-tls")
@@ -83,6 +92,9 @@ def configure_host(harness):
         "tls_private_key_path": "__AMATERASU_WORKER_STATE_ROOT__/management-tls/" + files["key"].name,
     })
     bootstrap["policy"]["settings"]["amaterasu.nvhttp"]["enabled"] = False
+    # The isolated browser fixture seeds its own pairing identity; management
+    # HTTPS still uses the independent loopback certificate above.
+    bootstrap["policy"]["settings"]["amaterasu.pairing"]["host_configuration"] = False
     path.write_text(json.dumps(bootstrap))
     return files["cert"], spki, f"https://127.0.0.1:{port}"
 
@@ -128,13 +140,14 @@ class OwnedBrowser:
 
     marker_name = b"AMATERASU_SIGNED_BROWSER_FIXTURE"
 
-    def __init__(self, directory, executable, spki, reuse_profile=False):
+    def __init__(self, directory, executable, spki, reuse_profile=False, extra_args=()):
         self.directory = directory
         self.directory.mkdir(mode=0o700, exist_ok=reuse_profile)
         self.profile = directory / "profile"
         self.profile.mkdir(mode=0o700, exist_ok=reuse_profile)
         self.executable = executable
         self.spki = spki
+        self.extra_args = tuple(extra_args)
         self.child = None
         self.descriptors = {}
         self.marker = secrets.token_hex(32).encode("ascii")
@@ -222,7 +235,7 @@ class OwnedBrowser:
             "--disable-sync", "--password-store=basic", "--disable-breakpad",
             "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
             "--ignore-certificate-errors-spki-list=" + self.spki,
-            "--user-data-dir=" + str(self.profile), "about:blank",
+            "--user-data-dir=" + str(self.profile), *self.extra_args, "about:blank",
         ], env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=self.errors, start_new_session=True)
         root = Path(f"/proc/{self.child.pid}")
@@ -408,10 +421,59 @@ def exercise(directory, executable):
     try:
         console = Console(harness)
         worker_ready(console)
+        console.send({"op": "log", "level": 2, "target": "browser-test", "message": "prior support marker username=fixturealice source=192.0.2.13:1234 password=fixture-private-secret user_name=\"fixture private name\""})
+        assert console.receive().get("kind") == "ok", "prior support record was rejected"
+        stop_console(console)
+        console.close()
+        # The isolated host has initialized this database and is stopped. Seed
+        # a bounded, synthetic history to exercise the production read route.
+        history_database = harness.root / "data" / "state" / "session-history" / "history.db"
+        assert history_database.exists(), "private history fixture database is unavailable"
+        with sqlite3.connect(history_database) as database:
+            database.execute(
+                "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("signed-history-fixture", "sunshine-modern", "Fixture client", "Fixture device",
+                 "Fixture game", 1920, 1080, 60, 18000, "hevc", 90, 500, 410),
+            )
+            database.executemany(
+                "INSERT INTO samples (session_id,recorded_at_unix,frames_sent,bytes_sent,dropped_frames,actual_fps,actual_bitrate_kbps,encode_latency_ms) VALUES (?,?,?,?,?,?,?,?)",
+                [("signed-history-fixture", 100 + index * 10, index * 60, index * 10000,
+                  index, 60.0, 8000.0, 4.2 if index == 32 else None) for index in range(33)],
+            )
+            database.execute("INSERT INTO events (session_id,recorded_at_unix,event_type,payload) VALUES (?,?,?,?)",
+                ("signed-history-fixture", 490, "stream_stopped", '{"state":"stopped"}'))
+            database.executemany(
+                "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [("signed-group-old", "sunshine-modern", "Group client", "Group device",
+                  "", 1920, 1080, 60, 18000, "hevc", 850, 950, 100),
+                 ("signed-group-new", "sunshine-modern", "Group client", "Group device",
+                  "", 1920, 1080, 60, 18000, "hevc", 1000, 1100, 100)],
+            )
+            database.executemany(
+                "INSERT INTO samples (session_id,recorded_at_unix,frames_sent,bytes_sent,dropped_frames,actual_fps,actual_bitrate_kbps,encode_latency_ms) VALUES (?,?,?,?,?,?,?,?)",
+                [(session_id, start + index * 10, index * 60, index * 10000, 0, 60.0, 8000.0, None)
+                 for session_id, start in [("signed-group-old", 860), ("signed-group-new", 1010)]
+                 for index in range(2)],
+            )
+        console = Console(harness)
+        worker_ready(console)
+        console.send({"op": "log", "level": 2, "target": "browser-test", "message": "signed browser host log marker"})
+        assert console.receive().get("kind") == "ok", "fixture log record was rejected"
         assert ready(console)["revision"] == 0
         assert console.request("amaterasu.authentication/1", {
             "action": "setup", "username": "browser-administrator", "password": "private-browser-test-password",
         }).get("ok"), "private administrator setup failed"
+        fixtures = WORKSPACE / "modules/pairing/tests/fixtures"
+        pairing_identity = console.request("amaterasu.pairing/1", {
+            "action": "import_identity", "certificate_pem": (fixtures / "host-cert.pem").read_text(),
+            "private_key_pem": (fixtures / "host-key.pem").read_text(),
+        })
+        assert pairing_identity.get("ok"), "private pairing identity could not be imported"
+        imported = console.request("amaterasu.pairing/1", {
+            "action": "import_client", "client_id": "signed-browser-fixture", "name": "Browser test device",
+            "certificate_pem": (WORKSPACE / "modules/pairing/tests/fixtures/client-cert.pem").read_text(),
+        })
+        assert imported.get("ok"), "private paired-device fixture could not be imported"
         # Independently verify the host's actual certificate and loopback IP SAN.
         context = ssl.create_default_context(cafile=str(certificate))
         with socket.create_connection(("127.0.0.1", int(origin.rsplit(":", 1)[1])), timeout=4) as raw:
@@ -430,9 +492,39 @@ def exercise(directory, executable):
         browser = OwnedBrowser(directory / "remembered-browser", executable, spki)
         debugger = browser.start()
         driver = BrowserDriver()
+        download_directory = directory / "browser-downloads"
+        download_directory.mkdir()
         saved = driver.phase("initial", debugger=debugger, origin=origin, rejected_origin=probe.origin,
             profile=str(browser.profile), spki=spki,
-            username="browser-administrator", password="private-browser-test-password")
+            username="browser-administrator", password="private-browser-test-password",
+            download_directory=str(download_directory))
+        bundle = download_directory / "amaterasu-support-logs.zip"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and (not bundle.exists() or list(download_directory.glob("*.crdownload"))):
+            time.sleep(0.05)
+        assert bundle.exists(), "browser support bundle was not downloaded"
+        with zipfile.ZipFile(bundle) as archive:
+            text = "\n".join(archive.read(name).decode("utf-8") for name in archive.namelist())
+        assert "prior support marker" in text and "signed browser host log marker" in text, "support bundle omitted retained sessions"
+        assert all(value not in text for value in ["fixturealice", "192.0.2.13", "fixture-private-secret", "fixture private name"]), "support bundle exposed fixture identifiers"
+        history_export = download_directory / "amaterasu-session-history.json"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and (not history_export.exists() or list(download_directory.glob("*.crdownload"))):
+            time.sleep(0.05)
+        assert history_export.exists(), "browser session history was not downloaded"
+        exported = json.loads(history_export.read_text())
+        assert exported["format"] == "amaterasu-session-history/1", "session export format is invalid"
+        assert exported["scope"] == "retained_snapshot" and exported["detail"]["sample_count"] == 33 and len(exported["detail"]["samples"]) == 33, "session export omitted retained samples"
+        assert not exported["detail"]["samples_truncated"] and exported["detail"]["samples"][-1]["encode_latency_ms"] == 4.2, "session export changed recorded samples"
+        driver.phase("log_follow_start")
+        console.send({"op": "log", "level": 2, "target": "browser-test", "message": "signed live follow marker"})
+        assert console.receive().get("kind") == "ok", "live log record was rejected"
+        driver.phase("log_follow_updated")
+        console.send({"op": "log", "level": 2, "target": "browser-test", "message": "signed paused follow marker"})
+        assert console.receive().get("kind") == "ok", "paused log record was rejected"
+        driver.phase("log_follow_resume")
+        paired = console.request("amaterasu.pairing/1", {"action": "list_clients"})
+        assert paired.get("ok") and paired.get("clients") == [], "browser removal was not durable"
         previous = sessions(console)
         assert len(previous) == 1 and previous[0]["remember_me"], "UI remembered login did not create one native session"
         driver.phase("refresh")
@@ -506,7 +598,7 @@ def main():
         run("npm", "--prefix", WORKSPACE / "frontend", "run", "build")
     with tempfile.TemporaryDirectory(prefix="amaterasu-signed-browser-") as temporary:
         exercise(Path(temporary), executable)
-    print("Passed: actual Chromium with signed native HTTPS/frontend, remembered UI login/reload and cold-process restoration from the persistent cookie, HttpOnly cookie secrecy, exact CSRF checks, native refresh/revocation, UI CAS/stale editor, host restart and peer signout; SPKI-key exception negative control and owned browser abort cleanup.")
+    print("Passed: actual Chromium with signed native HTTPS/frontend, remembered UI login/reload and cold-process restoration from the persistent cookie, HttpOnly cookie secrecy, exact CSRF checks, native refresh/revocation, scoped token creation/use/revocation, session-only administration and peer-session revocation after refresh, UI CAS/stale editor, host restart and peer signout; SPKI-key exception negative control and owned browser abort cleanup.")
     print("Unqualified: installed CA/service TLS provisioning, physical remote browsers, Windows/macOS and game-visible streaming.")
 
 

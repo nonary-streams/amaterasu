@@ -8,42 +8,71 @@ namespace Amaterasu {
     host: "Host & devices",
     catalog: "Library",
     settings: "Settings",
+    integrations: "Integrations",
     updates: "Modules & UI",
     sessions: "Sessions",
     applications: "Applications",
     steam: "Steam",
     diagnostics: "Diagnostics",
     accounts: "Accounts",
+    tokens: "API tokens",
+    maintenance: "Maintenance",
   };
   const pageIcons: Record<Page, string> = {
-    updates: "+",
-    host: "⌂",
-    overview: "▦",
-    catalog: "⊞",
-    settings: "≡",
-    sessions: "⇄",
-    applications: "□",
-    steam: "◇",
-    diagnostics: "⌁",
-    accounts: "♙",
+    overview: "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",
+    host: "M4 5h16v11H4z M8 20h8 M12 16v4",
+    catalog: "M4 4h7v7H4z M13 4h7v7h-7z M4 13h7v7H4z M13 13h7v7h-7z",
+    integrations: "M8 3v5 M16 3v5 M6 8h12v3a6 6 0 0 1-12 0z M12 17v4",
+    settings: "M4 6h16 M4 12h16 M4 18h16 M8 4v4 M16 10v4 M10 16v4",
+    updates: "M12 3v12 M8 11l4 4 4-4 M4 17v3h16v-3",
+    sessions: "M4 8h14 M15 5l3 3-3 3 M20 16H6 M9 13l-3 3 3 3",
+    applications: "M4 5h16v14H4z M4 9h16 M8 7h.01",
+    steam: "M12 3a9 9 0 1 1-8.5 12 M3 12l6 3 M9 15a2 2 0 1 0 4 0 2 2 0 0 0-4 0 M13 14l3-4 M18 8a2 2 0 1 1-4 0 2 2 0 0 1 4 0",
+    diagnostics: "M3 12h4l2-6 4 12 2-6h6",
+    maintenance: "M14 4a5 5 0 0 0-6 6L3 15l3 3 5-5a5 5 0 0 0 6-6l-3 3-3-3z",
+    tokens: "M8 14a4 4 0 1 1 3.5-6H21v4h-3v3h-3v-3h-3.5A4 4 0 0 1 8 14z M7 10h.01",
+    accounts: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M4 20a8 8 0 0 1 16 0",
   };
+
+  function navigationIcon(page: Page): SVGSVGElement {
+    const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    icon.setAttribute("viewBox", "0 0 24 24");
+    icon.setAttribute("class", "nav-icon");
+    icon.setAttribute("aria-hidden", "true");
+    icon.setAttribute("fill", "none");
+    icon.setAttribute("stroke", "currentColor");
+    icon.setAttribute("stroke-width", "1.7");
+    icon.setAttribute("stroke-linecap", "round");
+    icon.setAttribute("stroke-linejoin", "round");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", pageIcons[page]);
+    icon.append(path);
+    return icon;
+  }
+
+  const navigationGroups: { label: string; pages: Page[] }[] = [
+    { label: "HOST", pages: ["overview", "host", "sessions", "diagnostics"] },
+    { label: "LIBRARY", pages: ["catalog", "applications", "steam"] },
+    { label: "SYSTEM", pages: ["settings", "integrations", "updates", "accounts", "tokens", "maintenance"] },
+  ];
 
   const corePages = new Map<Page, (context: PageContext) => void>([
     ["overview", renderOverview], ["host", renderHostManagement], ["catalog", renderCatalog],
-    ["settings", renderSettings], ["updates", renderUpdates], ["sessions", renderSessions],
+    ["settings", renderSettings], ["integrations", renderIntegrations], ["updates", renderUpdates], ["sessions", renderSessions],
     ["applications", renderApplications], ["steam", renderSteam], ["diagnostics", renderDiagnostics],
-    ["accounts", renderAccounts],
+    ["accounts", renderAccounts], ["tokens", renderTokens], ["maintenance", renderMaintenance],
   ]);
 
   const pageScopes: Partial<Record<Page, string>> = {
     host: "configuration.read", catalog: "catalog.read", settings: "configuration.read",
-    updates: "configuration.read", sessions: "session.read", applications: "application.read",
+    integrations: "configuration.read", updates: "configuration.read", sessions: "session.read", applications: "application.read",
     steam: "steam.read", diagnostics: "diagnostics.read", accounts: "account.self",
   };
 
   class Application {
     private readonly api: Api;
     private readonly root: HTMLElement;
+    private readonly theme: ThemeController;
     private signedIn = false;
     private content = el("main");
     private navigation = new Map<string, HTMLButtonElement>();
@@ -52,9 +81,12 @@ namespace Amaterasu {
     private notification = el("div");
     private notificationTimer = 0;
     private restorationGeneration = 0;
+    private displayedPage: string | null = null;
+    private draftGuard: { isDirty: () => boolean; dispose: () => void } | null = null;
 
     constructor() {
       this.root = document.getElementById("app")!;
+      this.theme = new ThemeController();
       document
         .querySelector(".skip-link")
         ?.addEventListener("click", (event) => {
@@ -76,8 +108,20 @@ namespace Amaterasu {
           this.loginScreen();
         }
       };
-      window.addEventListener("hashchange", () => {
-        if (this.signedIn) this.renderPage(this.currentPage());
+      window.addEventListener("hashchange", (event) => {
+        if (this.signedIn) this.renderRequestedPage(event.oldURL);
+      });
+      window.addEventListener("beforeunload", (event) => {
+        if (this.signedIn && this.draftGuard?.isDirty()) {
+          event.preventDefault();
+          event.returnValue = "";
+        }
+      });
+      window.addEventListener("resize", () => {
+        if (window.innerWidth > 800) {
+          this.root.querySelector(".shell")?.classList.remove("menu-open");
+          this.root.querySelector(".menu-toggle")?.setAttribute("aria-expanded", "false");
+        }
       });
       window.addEventListener("pagehide", () => this.api.suspend());
       window.addEventListener("pageshow", (event) => {
@@ -103,6 +147,8 @@ namespace Amaterasu {
     }
 
     private sessionRestoringScreen(): void {
+      this.releaseDraftGuard();
+      this.displayedPage = null;
       this.signedIn = false;
       const main = el("main", "login-layout");
       main.id = "main";
@@ -136,22 +182,55 @@ namespace Amaterasu {
     }
 
     private currentPage(): string {
-      const value = location.hash.slice(1);
+      const fragment = location.hash.slice(1);
+      const value = fragment.startsWith("catalog?") ? "catalog" : fragment;
       const core = Object.hasOwn(pageNames, value) && this.pageAvailable(value as Page);
-      return core || (value.startsWith("extension/") && this.extensionIds.has(value.slice(10))) ? value : "overview";
+      const settingsCategory = value.startsWith("settings/") &&
+        ["general", "streaming", "integrations", "devices", "access"].includes(value.slice(9)) &&
+        this.pageAvailable("settings");
+      return core || settingsCategory || (value.startsWith("extension/") && this.extensionIds.has(value.slice(10))) ? value : "overview";
     }
 
     private pageAvailable(page: Page): boolean {
+      if (page === "tokens") return this.api.role === "administrator" && this.api.allows("tokens.manage");
+      if (page === "maintenance") return this.api.role === "administrator" && this.api.allows("configuration.write");
       const scope = pageScopes[page];
-      return !scope || this.api.allows(scope) || (page === "accounts" && this.api.allows("configuration.write"));
+      return !scope || this.api.allows(scope) || (page === "diagnostics" && this.api.allows("host-logs.read")) || (page === "accounts" && this.api.allows("configuration.write"));
+    }
+
+    private releaseDraftGuard(): void {
+      this.draftGuard?.dispose();
+      this.draftGuard = null;
+    }
+
+    private mayLeaveDraft(): boolean {
+      return !this.draftGuard?.isDirty() || window.confirm("Discard your unsaved changes?");
+    }
+
+    private renderRequestedPage(previousUrl?: string): void {
+      const page = this.currentPage();
+      if (page === this.displayedPage) return;
+      if (!this.mayLeaveDraft()) {
+        if (this.displayedPage) {
+          const previous = new URL(location.href);
+          const previousFragment = previousUrl ? new URL(previousUrl).hash.slice(1) : "";
+          previous.hash = previousFragment === this.displayedPage ||
+            (this.displayedPage === "catalog" && previousFragment.startsWith("catalog?"))
+            ? previousFragment : this.displayedPage;
+          history.replaceState(history.state, "", previous);
+        }
+        return;
+      }
+      this.renderPage(page);
     }
 
     private navigate(page: string): void {
-      if (location.hash === `#${page}`) this.renderPage(page);
-      else location.hash = page;
+      if (page !== this.displayedPage) location.hash = page;
     }
 
     private loginScreen(): void {
+      this.releaseDraftGuard();
+      this.displayedPage = null;
       this.signedIn = false;
       this.extensions.reset();
       this.extensionIds.clear();
@@ -319,24 +398,26 @@ namespace Amaterasu {
       this.navigation.clear();
       const shell = el("div", "shell");
       const sidebar = el("aside", "sidebar");
-      const nav = el("nav", "navigation");
-      setLocalizedAttribute(nav, "aria-label", "Main navigation");
-      for (const page of corePages.keys()) {
-        if (!this.pageAvailable(page)) continue;
-        const icon = el("span", "nav-icon", pageIcons[page]);
-        icon.setAttribute("aria-hidden", "true");
-        const item = button(
-          pageNames[page],
-          () => {
-            shell.classList.remove("menu-open");
-            menu.setAttribute("aria-expanded", "false");
+      const navigationContainer = el("div", "navigation-container");
+      const closeMenu = () => {
+        shell.classList.remove("menu-open");
+        menu.setAttribute("aria-expanded", "false");
+      };
+      for (const group of navigationGroups) {
+        const pages = group.pages.filter((page) => this.pageAvailable(page));
+        if (pages.length === 0) continue;
+        const nav = el("nav", "navigation");
+        setLocalizedAttribute(nav, "aria-label", group.label);
+        for (const page of pages) {
+          const item = button(pageNames[page], () => {
+            closeMenu();
             this.navigate(page);
-          },
-          "nav-item",
-        );
-        item.prepend(icon);
-        nav.append(item);
-        this.navigation.set(page, item);
+          }, "nav-item");
+          item.prepend(navigationIcon(page));
+          nav.append(item);
+          this.navigation.set(page, item);
+        }
+        navigationContainer.append(el("p", "nav-heading", group.label), nav);
       }
       const extensionsNav = el("nav", "navigation");
       setLocalizedAttribute(extensionsNav, "aria-label", "Extensions");
@@ -356,7 +437,7 @@ namespace Amaterasu {
           this.navigation.set(page, item);
         }
         extensionsHeading.hidden = entries.length === 0;
-        if (location.hash.startsWith("#extension/")) this.renderPage(this.currentPage());
+        if (location.hash.startsWith("#extension/")) this.renderRequestedPage();
       }).catch(() => {
         if (this.signedIn && shell.isConnected) {
           extensionsHeading.textContent = "Extensions unavailable";
@@ -365,31 +446,48 @@ namespace Amaterasu {
       });
       sidebar.append(
         this.brand(),
-        el("p", "nav-heading", "WORKSPACE"),
-        nav,
-        extensionsHeading,
-        extensionsNav,
-        el(
-          "div",
-          "sidebar-bottom",
-          badge("Development preview"),
-          el("p", "muted", "Local management console"),
-          el("small", "muted", "Streaming features are in progress."),
-        ),
+        el("div", "sidebar-navigation", navigationContainer, extensionsHeading, extensionsNav,
+          mountLocaleSelector(this.api)),
+        el("div", "sidebar-bottom", this.theme.mount(), el("strong", "", "Host console"),
+          el("p", "muted", "Manage this host and its devices")),
       );
       const menu = button(
         "☰",
         () => {
           const open = shell.classList.toggle("menu-open");
           menu.setAttribute("aria-expanded", String(open));
+          if (open) sidebar.querySelector<HTMLButtonElement>(".nav-item")?.focus();
         },
         "menu-toggle",
       );
       setLocalizedAttribute(menu, "aria-label", "Toggle navigation");
       menu.setAttribute("aria-expanded", "false");
+      sidebar.id = "main-navigation";
+      menu.setAttribute("aria-controls", sidebar.id);
+      const scrim = button("Close navigation", () => { closeMenu(); menu.focus(); }, "nav-scrim");
+      shell.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && shell.classList.contains("menu-open")) {
+          closeMenu();
+          menu.focus();
+        } else if (event.key === "Tab" && shell.classList.contains("menu-open")) {
+          const controls = Array.from(sidebar.querySelectorAll<HTMLElement>(
+            "button:not(:disabled), select:not(:disabled), a[href]",
+          )).filter((control) => control.getClientRects().length > 0);
+          const first = controls[0];
+          const last = controls.at(-1);
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last?.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first?.focus();
+          }
+        }
+      });
       const logout = button(
         "Sign out",
         () => {
+          if (!this.mayLeaveDraft()) return;
           logout.disabled = true;
           void this.api.logout().then(() => {
             clearTimeout(this.notificationTimer);
@@ -435,7 +533,6 @@ namespace Amaterasu {
             this.api.subject.slice(0, 1).toUpperCase(),
           ),
           el("span", "account-name", appTextLiteral(this.api.subject)),
-          mountLocaleSelector(this.api),
           logout,
         ),
       );
@@ -447,6 +544,7 @@ namespace Amaterasu {
       this.content.tabIndex = -1;
       shell.append(
         sidebar,
+        scrim,
         el("div", "workspace", top, this.content),
         this.notification,
       );
@@ -455,6 +553,12 @@ namespace Amaterasu {
     }
 
     private renderPage(page: string): void {
+      this.releaseDraftGuard();
+      this.displayedPage = page;
+      clearTimeout(this.notificationTimer);
+      this.notification.hidden = true;
+      this.root.querySelector(".shell")?.classList.remove("menu-open");
+      this.root.querySelector(".menu-toggle")?.setAttribute("aria-expanded", "false");
       this.extensions.dispose();
       const fresh = el("main", "content");
       fresh.id = "main";
@@ -462,8 +566,9 @@ namespace Amaterasu {
       this.content.replaceWith(fresh);
       this.content = fresh;
       for (const [name, item] of this.navigation) {
-        item.classList.toggle("selected", name === page);
-        if (name === page) item.setAttribute("aria-current", "page");
+        const selected = name === page || (name === "settings" && page.startsWith("settings/"));
+        item.classList.toggle("selected", selected);
+        if (selected) item.setAttribute("aria-current", "page");
         else item.removeAttribute("aria-current");
       }
       const context: PageContext = {
@@ -471,6 +576,19 @@ namespace Amaterasu {
         content: fresh,
         notify: (message) => this.notify(message),
         navigate: (page) => this.navigate(page),
+        ...(page.startsWith("settings/") ? { initialSettingsCategory: page.slice(9) as SettingsCategory } : {}),
+        replaceSettingsCategory: (category) => {
+          if (!fresh.isConnected || !(this.displayedPage === "settings" || this.displayedPage?.startsWith("settings/"))) return;
+          const next = `settings/${category}`;
+          const address = new URL(location.href);
+          address.hash = next;
+          history.replaceState(history.state, "", address);
+          this.displayedPage = next;
+        },
+        registerDraftGuard: (isDirty, dispose) => {
+          if (fresh.isConnected) this.draftGuard = { isDirty, dispose };
+          else dispose();
+        },
       };
       if (page.startsWith("extension/")) {
         fresh.append(el("p", "muted", "Loading extension…"));
@@ -479,7 +597,7 @@ namespace Amaterasu {
         });
         setLocalizedPageTitle("Extension");
       } else {
-        const corePage = page as Page;
+        const corePage = (page.startsWith("settings/") ? "settings" : page) as Page;
         const renderer = corePages.get(corePage);
         if (!renderer) return;
         renderer(context);

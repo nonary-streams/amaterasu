@@ -77,11 +77,19 @@ browser API calls.
   authenticated shell appears and when the browser returns the page from its
   back/forward cache. Administrator sessions silently rotate their access and
   refresh pair as needed for requests while the tab remains open.
-  First-run instructions explain that initial credentials must be created through
-  the trusted local console. There is no browser password bootstrap.
-- Overview shows actual responses from catalog, sessions, applications, and Steam.
+  First-run enrollment can create the first administrator in the browser using
+  the enrollment code shown locally on the host.
+- Overview shows actual responses from catalog, sessions, applications, and Steam,
+  host-reported stream activity, and measured host vitals when enabled and permitted.
+  Active stream counts come from the stream owner and refresh every 10 seconds
+  while the page is visible. Pending launches come from the history tracker and
+  can be unavailable independently. Service responses and activity do not confirm
+  client media delivery.
   Missing authority or failed services appear unavailable. Counts ending in `+`
   are bounded page counts, not invented global totals.
+- Integrations shows the reported status of Steam, Lutris, and Playnite and links
+  to their settings. Provider availability is based on the host's status reply,
+  not inferred from library counts.
 - Host & devices shows pending pairing requests, allows an administrator with
   `pairing.admin` to submit a four-digit device PIN, and reports host listeners,
   streaming history health, and management sessions using their existing read
@@ -92,8 +100,17 @@ browser API calls.
 - Catalog list/search with revision-bound next/previous pagination, including empty
   search pages with valid continuations. Create, edit, and delete use expected
   catalog revisions; conflicts require refresh and are never retried silently.
+  Search includes launch targets and linked sources. Selection persists across pages
+  at the same revision; Space toggles an item, Shift with an arrow extends a visible
+  range, and Escape clears selection. Desktop and Playnite Fullscreen edits preserve
+  their process-less launch settings and preparation steps.
+  Global name and known-source sorting first scans the matching catalog into a compact
+  revision-bound index, then loads only visible full entries. This can take time for
+  large libraries. Entries without source metadata are grouped as Other; provider
+  provenance is not currently available for all entries.
   Application/executable paths, literal JSON argument arrays, description and tags
-  are editable. Catalog operations do not launch applications.
+  are editable. Editing catalog metadata does not launch applications; the separate
+  Launch action is available to accounts with launch authority.
   Command output uses an unset/value choice so empty strings and the literal
   `null` remain distinct from an omitted destination. Saved text is not trimmed;
   relative paths and environment references are retained for launch-time
@@ -101,6 +118,8 @@ browser API calls.
   as bounded, validated hidden metadata without changing their command text.
   The destination covers application, preparation, and detached commands;
   externally provider-owned game output is not routed through this setting.
+- Settings search matches labels, hints and keys across loaded categories while preserving
+  the original editor forms, save actions and unsaved values.
 - Settings forms use the registered schema's boolean, integer, decimal, string,
   enum, list, and object fields; updates include expected revision. List and object
   values use JSON editors, with server-side nested validation. Empty/unregistered
@@ -110,6 +129,10 @@ browser API calls.
   information and listener ports; the HTTPS port is five below the HTTP port.
   Steam settings control bounded discovery and catalog synchronization, with
   provider status and opaque artwork readback.
+- Paired-device removal requires confirmation, uses a revision-checked write, and
+  confirms the remaining client list without discarding other device drafts. When
+  a save or removal conflicts, reviewing the latest revision preserves compatible
+  drafts; competing edits are shown and remain unsaved until resolved.
 - Management access and CSRF origin exception forms share the management policy
   revision and confirm durable readback after saving. CSRF exceptions default to
   none; default/null and an explicit empty list remain distinct. Exact trusted
@@ -117,13 +140,52 @@ browser API calls.
   access policy, authentication and route scopes still required.
 - Session pagination, stop requests, and explicit finish-stop actions. No client
   connection or streaming state is fabricated.
-- Sessions shows signed history runtime status independently from recorded session
-  listing: configuration readiness, effective recording, storage failures, counts,
+- Sessions allows an authorized operator to stop the current NVHTTP-managed
+  launch after confirmation. The request is bound to the observed launch and
+  reconnect state; it ends the associated application as well as the stream.
+  Admission is followed by cleanup readback, with a retry for failed cleanup.
+  Streams owned outside NVHTTP are not controlled by this action.
+- Sessions shows per-stream host-side performance cards for active streams
+  even when history recording is disabled. Live rates come from successive host
+  counter snapshots and remain in the browser; no rate is invented for the first
+  reading. When available, the cards show recent recorded samples immediately,
+  then load retained samples within the configured point and time limits. They use
+  row identities to update the bounded window and preserve the selected chart range
+  across refreshes. Combined charts append only live intervals that begin after
+  the captured recorded data, with separate line styles; live-only and recorded-only
+  views are also available. A failed longer-history read leaves the live view available.
+  Host telemetry and stream-data failures are independent. The charts do not report
+  client delivery. Adjacent recorded streams with matching client, device, application and protocol
+  and a gap of at most two minutes are grouped on the current page as possible
+  reconnects. Group charts keep stream segments separate, member actions remain
+  individual, and grouped JSON preserves each member's snapshot. Signed history
+  runtime status is shown independently from the recorded session listing:
+  configuration readiness, effective recording, storage failures, counts,
   and the most recent retention result. Status can be refreshed without hiding the
-  session list when its request fails.
+  session list when its request fails. Recorded-session details chart returned
+  host-side rates, sequence-gap counters, and measured encoder latency where present;
+  range filters and a JSON download operate on a captured retained snapshot. Recent
+  data is shown while full history loads; changed or excessively large snapshots
+  leave the recent view available with an explanation. Local transport
+  acceptance does not establish client delivery.
 - Process inventory and termination with confirmation, plus explicit status refresh.
 - Steam provider refresh, discovery pages, partial-scan warnings, and scan status.
-- Diagnostic records, bounded journal pagination, retention warnings, and counters.
+- Diagnostics provides search, match navigation and export for the current
+  host log when `host-logs.read` is granted. A level filter and search narrow
+  the preview; search and the plain-text download use the full retained current-session snapshot.
+  A separate sanitized support bundle includes retained sessions from the current log
+  location, with size limits and truncation notices; review it before sharing. The separate
+  caller-scoped journal has its own search, copy, export and retention warnings.
+  The host log follows new bytes every five seconds while visible, can be paused,
+  and keeps the displayed snapshot stable while searching, selecting text or
+  reading away from the end. Show latest applies accumulated updates.
+- Maintenance shows signed-in sessions to authorized administrators and can revoke
+  another session with readback. It reports only available account and expiry
+  information; device names and last activity are not recorded.
+- API tokens lets administrator sessions with `tokens.manage` select named
+  permissions and an expiry, create and revoke browser-issued credentials, and
+  copy the secret once. It does not display native-caller or legacy tokens, and
+  never stores the secret in browser storage. An uncertain issuance is not retried.
 - Modules & UI reads verified publisher catalogs with `configuration.read`, separating
   approved, revoked, and currently available choices. A separate status request
   shows persisted native package selection phases and the host-reported package
@@ -188,6 +250,13 @@ inline event handlers. The bundle works without inline scripts or styles.
 
 The UI uses semantic forms, labels, headings, tables, native confirmation dialogs,
 keyboard-visible focus, status/alert regions, a skip link, and responsive navigation.
+Light, dark, and system appearance choices are stored as a non-secret local browser
+preference. Library application editors, Settings, Accounts, and paired-client
+editors warn before navigating away from changed values. Settings refresh is
+blocked while edits are pending. A failed or conflicting paired-client save keeps
+all client drafts visible and disables further saves until an explicit reload;
+that reload discards those drafts after confirmation. These protections do not
+replace server revision checks or guarantee recovery after authentication loss.
 Reduced-motion preferences disable transitions. Error and empty states reflect
 actual API outcomes.
 
@@ -201,5 +270,6 @@ HTTP protocol limitations are documented by their respective READMEs.
 
 Tests exercise literal argument handling, invalid form values, safe numeric
 editing, non-exact page counts, bearer transport/clearing, single-flight refresh,
-token rotation, logout revocation and domain conflict handling. Browser visual and
-end-to-end checks run against the real signed frontend and management host.
+token rotation, logout revocation and domain conflict handling. The signed-host browser gate exercises authentication and selected management
+workflows; fixture-based visual checks do not qualify installed-service or remote
+browser behavior.

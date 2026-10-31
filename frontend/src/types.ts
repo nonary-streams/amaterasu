@@ -4,12 +4,17 @@ namespace Amaterasu {
     | "host"
     | "catalog"
     | "settings"
+    | "integrations"
     | "updates"
     | "sessions"
     | "applications"
     | "steam"
     | "diagnostics"
-    | "accounts";
+    | "accounts"
+    | "tokens"
+    | "maintenance";
+  export type SettingsCategory = "general" | "streaming" | "integrations" | "devices" | "access";
+  export type PageRoute = Page | `settings/${SettingsCategory}`;
   export type Payload = Record<string, unknown>;
   export interface LoginReply {
     ok: boolean;
@@ -33,7 +38,8 @@ namespace Amaterasu {
         preparation?: PreparationStep[];
       }
     | { kind: "playnite"; game_id: string; exit_timeout_seconds: number }
-    | { kind: "playnite_fullscreen"; exit_timeout_seconds: number };
+    | { kind: "playnite_fullscreen" | "desktop"; exit_timeout_seconds: number;
+        working_directory?: string | null; preparation?: PreparationStep[] };
   export interface PreparationStep {
     run: PreparationCommand;
     undo?: PreparationCommand | null;
@@ -504,7 +510,7 @@ namespace Amaterasu {
         dropped_frames: number;
         actual_fps: number;
         actual_bitrate_kbps: number;
-        encode_latency_ms: number | null;
+        encode_latency_ms?: number | null;
       }[];
       events: {
         session_id: string;
@@ -574,11 +580,17 @@ namespace Amaterasu {
     has_more: boolean;
     resync_required: boolean;
     next_cursor: number;
+    latest_sequence: number;
+    oldest_sequence: number | null;
+    dropped_total: number;
   }
   export interface PageContext {
     api: Api;
     content: HTMLElement;
     notify: (message: TextValue) => void;
-    navigate: (page: Page) => void;
+    navigate: (page: PageRoute) => void;
+    initialSettingsCategory?: SettingsCategory;
+    replaceSettingsCategory?: (category: SettingsCategory) => void;
+    registerDraftGuard?: (isDirty: () => boolean, dispose: () => void) => void;
   }
 }

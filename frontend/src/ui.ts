@@ -82,7 +82,6 @@ namespace Amaterasu {
       el(
         "div",
         "",
-        el("p", "eyebrow", "HOST CONSOLE"),
         el("h1", "", title),
         el("p", "muted", description),
       ),
@@ -125,6 +124,62 @@ namespace Amaterasu {
   }
   export function panel(title: TextValue, ...children: Child[]): HTMLElement {
     return el("section", "panel", el("h2", "", title), ...children);
+  }
+
+  type DraftControl = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+  export type DraftSnapshot = Map<DraftControl, string>;
+
+  export interface DraftTracker {
+    isDirty: (scope?: HTMLElement) => boolean;
+    capture: (scope: HTMLElement) => DraftSnapshot;
+    markSaved: (snapshot: DraftSnapshot) => void;
+    dispose: () => void;
+  }
+
+  // Baselines are held only in memory. A captured baseline represents what was
+  // submitted, so edits made while a save is in flight remain unsaved.
+  export function trackDrafts(root: HTMLElement, onChange: (dirty: boolean) => void = () => {}): DraftTracker {
+    const baselines: DraftSnapshot = new Map();
+    const signature = (control: DraftControl): string =>
+      control instanceof HTMLInputElement && (control.type === "checkbox" || control.type === "radio")
+        ? `${control.checked}:${control.value}`
+        : control.value;
+    const controls = (): DraftControl[] => Array.from(root.querySelectorAll<DraftControl>("input, textarea, select"))
+      .filter((control) => !(control instanceof HTMLInputElement && control.type === "hidden") &&
+        !control.hasAttribute("data-draft-ignore"));
+    const synchronize = (): void => {
+      for (const control of baselines.keys()) if (!root.contains(control)) baselines.delete(control);
+      for (const control of controls()) if (!baselines.has(control)) baselines.set(control, signature(control));
+    };
+    const dirty = (scope?: HTMLElement): boolean => {
+      synchronize();
+      return [...baselines].some(([control, baseline]) =>
+        (!scope || scope.contains(control)) && signature(control) !== baseline);
+    };
+    const changed = (): void => onChange(dirty());
+    root.addEventListener("input", changed);
+    root.addEventListener("change", changed);
+    const observer = new MutationObserver(changed);
+    observer.observe(root, { childList: true, subtree: true });
+    synchronize();
+    return {
+      isDirty: dirty,
+      capture: (scope) => {
+        synchronize();
+        return new Map([...baselines.keys()].filter((control) => scope.contains(control))
+          .map((control) => [control, signature(control)]));
+      },
+      markSaved: (snapshot) => {
+        for (const [control, value] of snapshot) if (root.contains(control)) baselines.set(control, value);
+        changed();
+      },
+      dispose: () => {
+        observer.disconnect();
+        root.removeEventListener("input", changed);
+        root.removeEventListener("change", changed);
+        baselines.clear();
+      },
+    };
   }
 
   export async function runAction(

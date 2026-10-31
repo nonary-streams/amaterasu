@@ -284,16 +284,45 @@ namespace Amaterasu {
     context: PageContext,
     container: HTMLElement,
     sessionHistoryContainer?: HTMLElement,
+    view: "full" | "overview" = "full",
   ): void {
     dashboardCleanup.get(container)?.();
     let requestGeneration = 0;
+    let initializationGeneration = 0;
     let timer: number | undefined;
     let disposed = false;
     let observer: MutationObserver | undefined;
     let settings: RealtimeSettings = realtimeDefaults;
+    let settingsLoaded = false;
+    const canReadHost = typeof context.api.allows !== "function" || context.api.allows("diagnostics.read");
+    const canReadLive = typeof context.api.allows !== "function" || context.api.allows("session.read");
+    const canReadSettings = typeof context.api.allows !== "function" || context.api.allows("configuration.read");
     const area = el("div");
+    const activeArea = el("div");
+    const activeList = el("div", "live-session-list");
+    const activeNote = el("p", "muted");
+    const activePanel = panel("Active streaming sessions", activeNote, activeList);
+    const liveTracker = new Amaterasu.LiveStreamTracker();
+    let activeEpoch: string | null = null;
+    interface ActiveCardState {
+      card: LiveSessionCard;
+      session: HistorySessionSummary;
+      liveDetail: NonNullable<HistoryDetailReply["detail"]>;
+      recordedDetail: NonNullable<HistoryDetailReply["detail"]> | null;
+      snapshot: LiveSampleSnapshot | null;
+      historyNote: string;
+      rounded: boolean;
+      lastAttempt: number;
+    }
+    const activeCards = new Map<string, ActiveCardState>();
+    let loadingLiveHistory = false;
+    let liveHistoryPending = false;
     const status = el("p", "muted", "Loading live host metrics…");
-    container.replaceChildren(button("Refresh host metrics", () => void refresh()), area, status);
+    const preferenceNotice = el("p", "muted");
+    container.replaceChildren(
+      el("div", "host-metrics-toolbar", status, button("Refresh host metrics", () => void refresh())),
+      preferenceNotice, area, activeArea,
+    );
 
     const cleanup = (): void => {
       if (disposed) return;
@@ -308,13 +337,14 @@ namespace Amaterasu {
     dashboardCleanup.set(container, cleanup);
 
     function applyVisibility(): void {
-      if (disposed || !container.isConnected) return;
+      if (disposed || !container.isConnected || !settingsLoaded) return;
       if (sessionHistoryContainer)
         sessionHistoryContainer.hidden = !settings.show_session_history;
       if (!settings.enabled) {
         renderDisabledState();
         return;
       }
+      if (view === "overview" && !settings.show_host_stats) return;
       if (settings.pause_when_hidden && document.visibilityState !== "visible") {
         if (timer !== undefined) window.clearTimeout(timer);
         timer = undefined;
@@ -324,27 +354,44 @@ namespace Amaterasu {
     }
 
     async function refresh(): Promise<void> {
+      if (timer !== undefined) window.clearTimeout(timer);
       timer = undefined;
       const request = ++requestGeneration;
-      if (disposed || !container.isConnected) return;
+      if (disposed || !container.isConnected || !settingsLoaded) return;
       if (!settings.enabled) {
         renderDisabledState();
         return;
       }
+      if (view === "overview" && !settings.show_host_stats) return;
       if (settings.pause_when_hidden && document.visibilityState !== "visible") return;
+      const current = () => !disposed && container.isConnected && request === requestGeneration &&
+        !(settings.pause_when_hidden && document.visibilityState !== "visible");
+      await Promise.all([refreshHost(current), refreshActive(current)]);
+      if (current()) schedule();
+    }
+
+    async function refreshHost(current: () => boolean): Promise<void> {
+      if (!canReadHost) {
+        if (current()) {
+          hostMetricsSetLocalizedTextContent(status, "Host telemetry is unavailable for this account.");
+          area.replaceChildren();
+        }
+        return;
+      }
       try {
         const result = parseHostStatsReply(await context.api.post<unknown>("host-metrics/stats"));
-        if (disposed || !container.isConnected || request !== requestGeneration ||
-            settings.pause_when_hidden && document.visibilityState !== "visible") return;
+        if (!current()) return;
         const panels: HTMLElement[] = [];
-        if (settings.show_host_stats)
-          panels.push(renderHostStats(result));
-        if (settings.show_host_charts)
+        if (settings.show_host_stats) {
+          if (!result.available)
+            panels.push(panel("Host vitals", el("p", "muted", "Host telemetry is unavailable on this platform.")));
+          else if (result.sampled_at_unix_ms === null)
+            panels.push(panel("Host vitals", el("p", "muted", "Waiting for the first measured host sample.")));
+          else
+            panels.push(renderHostStats(result));
+        }
+        if (view === "full" && settings.show_host_charts)
           panels.push(renderHostCharts(result.samples));
-        if (settings.show_active_sessions)
-          panels.push(await renderActiveSessions(context));
-        if (disposed || !container.isConnected || request !== requestGeneration ||
-            settings.pause_when_hidden && document.visibilityState !== "visible") return;
         area.replaceChildren(...panels);
         const locale =
           typeof Amaterasu.activeIntlLocale === "function"
@@ -356,19 +403,46 @@ namespace Amaterasu {
             : `Measured ${result.platform} host values at ${new Date(result.sampled_at_unix_ms).toLocaleTimeString(locale)}. Missing sensors are shown as unavailable.`
           : `Host telemetry is unsupported on this platform (${result.platform}); no sample values were invented.`;
       } catch (error) {
-        if (!disposed && container.isConnected && request === requestGeneration)
+        if (current()) {
+          hostMetricsSetLocalizedTextContent(status, "Host metrics could not be refreshed.");
           area.replaceChildren(errorPanel(error));
+        }
       }
-      schedule();
+    }
+
+    async function refreshActive(current: () => boolean): Promise<void> {
+      if (view !== "full" || !settings.show_active_sessions) {
+        clearActiveSessions();
+        return;
+      }
+      if (!canReadLive) {
+        clearActiveSessions();
+        if (current()) activeArea.replaceChildren(panel("Active streaming sessions", el("p", "muted", "Live stream status is unavailable for this account.")));
+        return;
+      }
+      if (activeArea.firstElementChild === activePanel) activeNote.textContent = "Refreshing active stream samples…";
+      try {
+        const snapshot = Amaterasu.parseLiveStreamSnapshot(await context.api.post<unknown>("live-streams/status"));
+        if (!current()) return;
+        if (activeEpoch !== snapshot.epoch) { clearActiveSessions(); activeEpoch = snapshot.epoch; }
+        const observed = liveTracker.update(snapshot, settings.history_retention_seconds, settings.max_history_points);
+        updateActiveSessions(observed);
+      } catch (error) {
+        if (!current()) return;
+        clearActiveSessions();
+        activeArea.replaceChildren(panel("Active streaming sessions", errorPanel(error)));
+      }
     }
 
     function schedule(): void {
-      if (disposed || !container.isConnected || !settings.enabled || timer !== undefined) return;
+      if (disposed || !container.isConnected || !settingsLoaded || !settings.enabled || timer !== undefined ||
+          (view === "overview" && !settings.show_host_stats)) return;
       if (settings.pause_when_hidden && document.visibilityState !== "visible") return;
       timer = window.setTimeout(() => void refresh(), settings.poll_interval_ms);
     }
 
     function renderDisabledState(): void {
+      clearActiveSessions();
       area.replaceChildren(empty(
         "Real-time statistics are disabled",
         "Enable collection in Settings to show live host telemetry.",
@@ -376,20 +450,163 @@ namespace Amaterasu {
       hostMetricsSetLocalizedTextContent(status, "Sampling is disabled.");
     }
 
+    function clearActiveSessions(): void {
+      activeCards.clear();
+      liveTracker.clear();
+      activeEpoch = null;
+      activeList.replaceChildren();
+      activeArea.replaceChildren();
+    }
+
+    function updateActiveSessions(result: Map<string, {detail: NonNullable<HistoryDetailReply["detail"]>; rounded: boolean}>): void {
+      if (activeArea.firstElementChild !== activePanel) activeArea.replaceChildren(activePanel);
+      const remaining = new Set(result.keys());
+      for (const [id, state] of activeCards) {
+        if (!remaining.has(id)) { state.card.element.remove(); activeCards.delete(id); }
+      }
+      [...result.values()].forEach(({ detail, rounded }, index) => {
+        const session = detail.session;
+        let state = activeCards.get(session.session_id);
+        if (!state) {
+          state = { card:Amaterasu.createLiveSessionCard(), session, liveDetail:detail, recordedDetail:null,
+            snapshot:null, historyNote:"", rounded, lastAttempt:0 };
+          activeCards.set(session.session_id, state);
+        } else {
+          if (state.session.started_at_unix !== session.started_at_unix) { state.snapshot = null; state.recordedDetail = null; }
+          state.session = session;
+          state.liveDetail = detail;
+          state.rounded = rounded;
+        }
+        renderActiveCard(state);
+        if (activeList.children[index] !== state.card.element)
+          activeList.insertBefore(state.card.element, activeList.children[index] ?? null);
+      });
+      activeNote.textContent = result.size ? `${result.size} active ${result.size === 1 ? "stream" : "streams"} reported by the host.` : "No active streams reported.";
+      refreshLiveHistory();
+    }
+
+    function renderActiveCard(state: ActiveCardState): void {
+      const show = (recorded: NonNullable<HistoryDetailReply["detail"]> | null): void =>
+        state.card.update(state.session, state.liveDetail, recorded, state.historyNote, state.rounded,
+          settings.history_retention_seconds, settings.max_history_points);
+      if (!state.recordedDetail) {
+        show(null);
+        return;
+      }
+      if (!state.snapshot) {
+        show({ ...state.recordedDetail, session:state.session });
+        return;
+      }
+      const newest = state.snapshot.samples.length
+        ? Math.max(...state.snapshot.samples.map((sample) => sample.recorded_at_unix)) : 0;
+      const samples = state.snapshot.samples.filter((sample) =>
+        sample.recorded_at_unix >= newest - settings.history_retention_seconds);
+      const count = Math.max(state.recordedDetail.sample_count, samples.length);
+      show({ ...state.recordedDetail, session:state.session,
+        samples, sample_count:count, samples_truncated:samples.length < count });
+    }
+
+    function refreshLiveHistory(): void {
+      if (loadingLiveHistory) { liveHistoryPending = true; return; }
+      const now = Date.now();
+      const states = [...activeCards.values()].filter((state) => now - state.lastAttempt >= 1000);
+      if (!states.length) return;
+      for (const state of states) state.lastAttempt = now;
+      loadingLiveHistory = true;
+      liveHistoryPending = false;
+      const current = (state: ActiveCardState) => !disposed && container.isConnected && settings.enabled &&
+        activeCards.get(state.session.session_id) === state &&
+        !(settings.pause_when_hidden && document.visibilityState !== "visible");
+      async function refresh(): Promise<void> {
+        let unavailable = "";
+        try {
+          const runtime = Amaterasu.parseHistoryRuntimeStatus(await context.api.post<unknown>("history/history_status"));
+          if (!runtime.available || !runtime.configuration_ready) unavailable = "Recorded history is unavailable; charts use live observations in this browser.";
+          else if (!runtime.effective_enabled) unavailable = "History recording is disabled; charts use live observations in this browser.";
+        } catch { unavailable = "Recorded history is unavailable; charts use live observations in this browser."; }
+        if (unavailable) {
+          for (const state of states) if (current(state)) {
+            state.recordedDetail = null;
+            state.snapshot = null;
+            state.historyNote = unavailable;
+            renderActiveCard(state);
+          }
+          return;
+        }
+        let next = 0;
+        async function worker(): Promise<void> {
+          while (next < states.length) {
+            const state = states[next++]!;
+            if (!current(state)) continue;
+            try {
+              const detail = Amaterasu.parseHistoryDetailReply(await context.api.post<unknown>("history/session_detail", {
+                session_id:state.session.session_id,
+              }), state.session.session_id).detail!;
+              if (!current(state)) continue;
+              if (detail.session.started_at_unix !== state.session.started_at_unix || detail.session.ended_at_unix !== null)
+                throw new Error("Recorded history does not match the active stream.");
+              state.recordedDetail = detail;
+              if (!state.snapshot) { state.historyNote = "Loading longer history…"; renderActiveCard(state); }
+              try {
+                const snapshot = await Amaterasu.loadLiveSampleSnapshot(context.api, state.session.session_id,
+                  settings.max_history_points, state.snapshot, () => current(state));
+                if (!current(state) || !snapshot) continue;
+                if (snapshot.session.started_at_unix !== state.session.started_at_unix || snapshot.session.ended_at_unix !== null)
+                  throw new Error("Recorded history does not match the active stream.");
+                state.snapshot = snapshot;
+                state.historyNote = "";
+              } catch {
+                if (!current(state)) continue;
+                state.snapshot = null;
+                state.historyNote = "Longer history is unavailable; showing recent recorded samples. It will be retried.";
+              }
+            } catch {
+              if (!current(state)) continue;
+              state.recordedDetail = null;
+              state.snapshot = null;
+              state.historyNote = "Recorded history is unavailable; charts use live observations in this browser.";
+            }
+            if (current(state)) renderActiveCard(state);
+          }
+        }
+        await Promise.all(Array.from({length:Math.min(4, states.length)}, () => worker()));
+      }
+      void refresh().finally(() => {
+        loadingLiveHistory = false;
+        if (liveHistoryPending && !disposed) refreshLiveHistory();
+      });
+    }
+
     async function initialize(): Promise<void> {
+      const request = ++initializationGeneration;
+      hostMetricsSetLocalizedTextContent(status, "Loading live host metrics…");
+      if (!canReadSettings) {
+        settingsLoaded = true;
+        preferenceNotice.textContent = "Display preferences are unavailable for this account; the live view uses defaults.";
+        applyVisibility();
+        return;
+      }
       try {
         const loaded = await loadRealtimeSettings(context.api);
-        if (disposed || !container.isConnected) return;
+        if (disposed || !container.isConnected || request !== initializationGeneration) return;
         settings = loaded.settings;
+        settingsLoaded = true;
         if (sessionHistoryContainer)
           sessionHistoryContainer.hidden = !settings.show_session_history;
         if (!settings.enabled) {
           renderDisabledState();
           return;
         }
+        if (view === "overview" && !settings.show_host_stats) {
+          hostMetricsSetLocalizedTextContent(status, "Host statistics are hidden in your settings.");
+          return;
+        }
         applyVisibility();
       } catch (error) {
-        if (!disposed && container.isConnected) area.replaceChildren(errorPanel(error));
+        if (!disposed && container.isConnected && request === initializationGeneration) {
+          hostMetricsSetLocalizedTextContent(status, "Host metrics settings are unavailable.");
+          area.replaceChildren(errorPanel(error, initialize));
+        }
       }
     }
 
@@ -408,20 +625,29 @@ namespace Amaterasu {
     const bytes = (used: number | null, total: number | null): string =>
       used === null || total === null ? "Unavailable" : `${formatBytes(used)} / ${formatBytes(total)}`;
     const rate = (value: number | null): string => value === null ? "Unavailable" : `${(value / 1_000_000).toFixed(2)} Mbit/s`;
-    return panel("Current host metrics", table(["Metric", "Measured value"], [
-      ["CPU utilization", percent(host.cpu_percent)],
-      ["CPU temperature", temperature(host.cpu_temp_c)],
-      ["Memory used / total", bytes(host.ram_used_bytes, host.ram_total_bytes)],
-      ["GPU utilization", percent(host.gpu_percent)],
-      ["GPU encoder utilization", percent(host.gpu_encoder_percent)],
-      ["GPU temperature", temperature(host.gpu_temp_c)],
-      ["Video memory used / total", bytes(host.vram_used_bytes, host.vram_total_bytes)],
-      ["Network receive", rate(host.net_rx_bps)],
-      ["Network transmit", rate(host.net_tx_bps)],
-    ]));
+    const memoryPercent = (used: number | null, total: number | null): number | null =>
+      used === null || total === null || total === 0 ? null : used * 100 / total;
+    const vital = (label: string, value: number | null, detail: string): HTMLElement =>
+      el("div", "host-vital", el("span", "muted", label),
+        el("strong", value === null ? "host-vital-unavailable" : "", hostMetricsTextLiteral(percent(value))),
+        el("small", "muted", hostMetricsTextLiteral(detail)));
+    const supporting = (label: string, value: string): HTMLElement =>
+      el("div", "host-metric-detail", el("span", "muted", label), el("strong", "", hostMetricsTextLiteral(value)));
+    return panel("Host vitals",
+      el("div", "host-vital-grid",
+        vital("CPU", host.cpu_percent, temperature(host.cpu_temp_c)),
+        vital("GPU", host.gpu_percent, temperature(host.gpu_temp_c)),
+        vital("Memory", memoryPercent(host.ram_used_bytes, host.ram_total_bytes), bytes(host.ram_used_bytes, host.ram_total_bytes)),
+        vital("Video memory", memoryPercent(host.vram_used_bytes, host.vram_total_bytes), bytes(host.vram_used_bytes, host.vram_total_bytes))),
+      el("div", "host-metric-details",
+        supporting("Encoder utilization", percent(host.gpu_encoder_percent)),
+        supporting("Network receive", rate(host.net_rx_bps)),
+        supporting("Network transmit", rate(host.net_tx_bps))));
   }
 
   function renderHostCharts(samples: HostSample[]): HTMLElement {
+    if (samples.length === 0)
+      return panel("Recent host charts", empty("No samples yet", "Measured history appears as the host collects samples."));
     const charts = [
       { label: "CPU utilization", values: samples.map((sample) => sample.host.cpu_percent), maximum: 100 },
       { label: "GPU utilization", values: samples.map((sample) => sample.host.gpu_percent), maximum: 100 },
@@ -430,15 +656,19 @@ namespace Amaterasu {
         const total = sample.host.ram_total_bytes;
         return used === null || total === null || total === 0 ? null : used * 100 / total;
       }), maximum: 100 },
+      { label: "Video memory use", values: samples.map((sample) => {
+        const used = sample.host.vram_used_bytes;
+        const total = sample.host.vram_total_bytes;
+        return used === null || total === null || total === 0 ? null : used * 100 / total;
+      }), maximum: 100 },
       { label: "Network receive", values: samples.map((sample) => sample.host.net_rx_bps === null ? null : sample.host.net_rx_bps / 1_000_000), maximum: Math.max(10, ...samples.map((sample) => (sample.host.net_rx_bps ?? 0) / 1_000_000)) },
+      { label: "Network transmit", values: samples.map((sample) => sample.host.net_tx_bps === null ? null : sample.host.net_tx_bps / 1_000_000), maximum: Math.max(10, ...samples.map((sample) => (sample.host.net_tx_bps ?? 0) / 1_000_000)) },
     ];
     const graphics = charts.map((chart) => {
       const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
       svg.setAttribute("viewBox", "0 0 320 84");
       svg.setAttribute("width", "320");
       svg.setAttribute("height", "84");
-      svg.style.width = "100%";
-      svg.style.height = "84px";
       svg.setAttribute("role", "img");
       if (typeof Amaterasu.setLocalizedAttributeTemplate === "function") {
         Amaterasu.setLocalizedAttributeTemplate(
@@ -491,51 +721,18 @@ namespace Amaterasu {
           svg.append(line);
         }
       }
-      return el("div", "host-metric-chart-card", el("strong", "", chart.label), svg,
-        el("small", "muted", hostMetricsTextLiteral(`${chart.values.filter((value) => value !== null).length} measured points`)));
+      const unit = chart.label.startsWith("Network") ? "Mbit/s" : "%";
+      const lastValue = chart.values.at(-1);
+      const latest = lastValue == null ? "Unavailable" : `${lastValue.toFixed(1)} ${unit}`;
+      return el("div", "host-metric-chart-card",
+        el("div", "host-metric-chart-heading", el("strong", "", chart.label),
+          el("span", "", hostMetricsTextLiteral(latest))), svg,
+        el("small", "muted", hostMetricsTextLiteral(
+          `${chart.values.filter((value) => value !== null).length} measured points · scale 0–${chart.maximum.toFixed(1)} ${unit}`,
+        )));
     });
     const grid = el("div", "host-metric-chart-grid", ...graphics);
-    grid.style.display = "grid";
-    grid.style.gridTemplateColumns = "repeat(auto-fit, minmax(240px, 1fr))";
-    grid.style.gap = "12px";
     return panel("Recent host charts", grid);
-  }
-
-  async function renderActiveSessions(context: PageContext): Promise<HTMLElement> {
-    try {
-      const status = await context.api.post<unknown>("history/history_status");
-      if (!status || typeof status !== "object" || Array.isArray(status) ||
-          (status as Record<string, unknown>).ok !== true)
-        throw new Error("Session history availability is unavailable.");
-      const runtime = status as Record<string, unknown>;
-      if (runtime.effective_enabled !== true)
-        return panel("Active streaming sessions",
-          el("p", "muted", "Active stream metadata is unavailable while session history recording is disabled."));
-    } catch (error) {
-      return panel("Active streaming sessions", errorPanel(error));
-    }
-    const value = await context.api.post<unknown>("history/active_sessions", { limit: 16, offset: 0 });
-    if (!value || typeof value !== "object" || Array.isArray(value) ||
-        (value as Record<string, unknown>).ok !== true || !Array.isArray((value as Record<string, unknown>).sessions))
-      throw new Error("Active session metrics reply is invalid.");
-    const sessions = (value as { sessions: unknown[] }).sessions;
-    if (sessions.length > 16) throw new Error("Active session metrics reply exceeds its limit.");
-    const rows = sessions.map((entry) => {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry))
-        throw new Error("Active session row is invalid.");
-      const session = entry as Record<string, unknown>;
-      const sessionId = session.session_id;
-      const appName = session.app_name;
-      const clientName = session.client_name;
-      const protocol = session.protocol;
-      if (typeof sessionId !== "string" || typeof appName !== "string" ||
-          typeof clientName !== "string" || typeof protocol !== "string")
-        throw new Error("Active session row is invalid.");
-      return [appName || sessionId, clientName || protocol, protocol];
-    });
-    return panel("Active streaming sessions",
-      rows.length ? table(["Application / session", "Client", "Protocol"], rows) :
-        empty("No active streams", "Active stream metadata appears here while session history is enabled."));
   }
 
   function formatBytes(value: number): string {

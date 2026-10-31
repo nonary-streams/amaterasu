@@ -1487,6 +1487,37 @@ namespace Amaterasu {
     return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== null && value !== undefined));
   }
 
+  export interface PairingOverrideMerge {
+    values: Record<string, unknown>;
+    conflicts: string[];
+  }
+
+  // A missing override means inherit; preserve that distinction from false,
+  // zero, empty strings, and explicit values while comparing revisions.
+  export function mergePairingOverrides(
+    original: Record<string, unknown>,
+    local: Record<string, unknown>,
+    latest: Record<string, unknown>,
+  ): PairingOverrideMerge {
+    const values: Record<string, unknown> = { ...latest };
+    const conflicts: string[] = [];
+    const keys = new Set([...Object.keys(original), ...Object.keys(local), ...Object.keys(latest)]);
+    const equalAt = (left: Record<string, unknown>, right: Record<string, unknown>, key: string): boolean =>
+      Object.hasOwn(left, key) === Object.hasOwn(right, key) &&
+      (!Object.hasOwn(left, key) || sameConfigurationValue(left[key], right[key]));
+    for (const key of keys) {
+      const localChanged = !equalAt(original, local, key);
+      const remoteChanged = !equalAt(original, latest, key);
+      if (localChanged && remoteChanged && !equalAt(local, latest, key)) {
+        conflicts.push(key);
+      } else if (localChanged) {
+        if (Object.hasOwn(local, key)) values[key] = local[key];
+        else delete values[key];
+      }
+    }
+    return { values, conflicts };
+  }
+
   export async function savePairingClientOverrides(
     api: Pick<Api, "post">,
     current: PairingClients,
@@ -1523,6 +1554,32 @@ namespace Amaterasu {
     const saved = parsePairingClientsReply(await api.post<unknown>("pairing/list_clients"));
     if (!confirms(saved))
       throw new Error("Paired client overrides could not be confirmed after saving. Refresh and check current values.");
+    return saved;
+  }
+
+  export async function removePairedClient(
+    api: Pick<Api, "post">,
+    current: PairingClients,
+    certificateId: string,
+  ): Promise<PairingClients> {
+    if (!current.clients.some((client) => client.certificate_id === certificateId) ||
+        !Number.isSafeInteger(current.revision) || current.revision >= Number.MAX_SAFE_INTEGER)
+      throw new Error("Paired client or settings revision is invalid.");
+    const response = await api.post<unknown>("pairing/unpair", {
+      certificate_id: certificateId,
+      expected_revision: current.revision,
+    });
+    if (!response || typeof response !== "object" || Array.isArray(response) ||
+        (response as Record<string, unknown>).ok !== true)
+      throw new Error("Device removal response was not confirmed.");
+    const saved = parsePairingClientsReply(await api.post<unknown>("pairing/list_clients"));
+    const remaining = current.clients.filter((client) => client.certificate_id !== certificateId);
+    if (saved.revision !== current.revision + 1 || saved.clients.length !== remaining.length ||
+        !remaining.every((before) => {
+          const after = saved.clients.find((client) => client.certificate_id === before.certificate_id);
+          return after !== undefined && sameConfigurationValue(before, after);
+        }))
+      throw new Error("Device removal could not be confirmed. Reload paired clients before trying again.");
     return saved;
   }
 
@@ -2447,69 +2504,798 @@ namespace Amaterasu {
     return `Steam discovery enabled · ${scanState} · ${status.game_count} games · ${warningCount}.`;
   }
 
-  export function renderSettings(context: PageContext): void {
-    const area = el("div");
-    const registeredLoads = new RegisteredConfigurationLoadGate();
-    const authArea = el("div");
-    const authLoads = new AuthTokenSettingsLoadGate();
-    const hostLoggingArea = el("div");
-    const hostLoggingLoads = new HostLoggingLoadGate();
-    const hostArea = el("div");
-    const hostLoads = new NvhttpSettingsLoadGate();
-    const pipewireArea = el("div");
-    const steamArea = el("div");
-    const steamLoads = new ImportSettingsLoadGate<SteamSettings>();
-    const lutrisArea = el("div");
-    const lutrisLoads = new ImportSettingsLoadGate<{ settings: LutrisSettings; runtime: LutrisStatus }>();
-    const playniteArea = el("div");
-    const playniteLoads = new PlayniteSettingsLoadGate();
-    const inputArea = el("div");
-    const inputLoads = new InputPolicyLoadGate();
-    const historyArea = el("div");
-    const metricsArea = el("div");
-    const updaterArea = el("div");
-    const systemTrayArea = el("div");
-    const historyLoads = new HistorySettingsLoadGate();
-    const pairingArea = el("div");
+  type PairingEditorControl = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+  interface PairingControlState {
+    name: string;
+    tag: string;
+    type: string;
+    value: string;
+    checked: boolean | null;
+  }
+  interface PairingEditorRow {
+    client: PairingClient;
+    card: HTMLElement;
+    readOverrides: () => Record<string, unknown>;
+    baseline: () => PairingControlState[];
+    setBaseline: (states: PairingControlState[]) => void;
+  }
+  interface PairingRebaseSource {
+    settings: PairingClients;
+    rows: PairingEditorRow[];
+    search: HTMLInputElement;
+    errorArea: HTMLElement;
+  }
+
+  function pairingEditorControls(card: HTMLElement): PairingEditorControl[] {
+    if (typeof card.querySelectorAll !== "function") return [];
+    return Array.from(card.querySelectorAll<PairingEditorControl>("input, textarea, select"))
+      .filter((control) => control.type !== "hidden" && !control.hasAttribute("data-draft-ignore"));
+  }
+
+  function pairingControlStates(card: HTMLElement): PairingControlState[] {
+    return pairingEditorControls(card).map((control) => {
+      if ("validity" in control && control.validity.badInput)
+        throw new Error("Correct the incomplete number before reviewing the latest device settings.");
+      return {
+        name: control.name, tag: control.tagName, type: control.type, value: control.value,
+        checked: control.tagName === "INPUT" && (control.type === "checkbox" || control.type === "radio")
+          ? (control as HTMLInputElement).checked : null,
+      };
+    });
+  }
+
+  function pairingRowHasDraft(row: PairingEditorRow, tracker: DraftTracker | null): boolean {
+    if (tracker?.isDirty(row.card)) return true;
+    const current = pairingControlStates(row.card);
+    const baseline = row.baseline();
+    return current.length !== baseline.length || current.some((state, index) =>
+      !pairingStateShapeMatches(state, baseline[index]!) ||
+      pairingStateSignature(state) !== pairingStateSignature(baseline[index]!));
+  }
+
+  function pairingStateSignature(state: PairingControlState): string {
+    return state.checked === null ? state.value : `${state.checked}:${state.value}`;
+  }
+
+  function pairingStateShapeMatches(left: PairingControlState, right: PairingControlState): boolean {
+    return left.name === right.name && left.tag === right.tag && left.type === right.type &&
+      (left.checked === null) === (right.checked === null);
+  }
+
+  function pairingRebaseValue(value: unknown, present: boolean): string {
+    if (!present) return "inherit";
+    const text = JSON.stringify(value) ?? "inherit";
+    return text.length > 160 ? `${text.slice(0, 157)}…` : text;
+  }
+
+  export function createPairedClientEditor(
+    context: PageContext,
+    pairingArea: HTMLElement,
+    draftTracker: () => DraftTracker | null = () => null,
+    onSaveBusy: (busy: boolean) => void = () => {},
+  ): () => Promise<void> {
     const pairingLoads = new PairingClientsLoadGate();
+    async function loadPairing(rebase?: PairingRebaseSource): Promise<void> {
+      if (!rebase) pairingArea.replaceChildren(el("p", "muted", "Loading paired clients…"));
+      try {
+        const loaded = await pairingLoads.read(context.api);
+        if (loaded === null) return;
+        let { settings } = loaded;
+        const { inputStatus } = loaded;
+        if (!context.content.isConnected) return;
+        let displayedClients = settings.clients;
+        if (rebase) {
+          if (settings.revision < rebase.settings.revision)
+            throw new Error("The host returned an older pairing revision; your drafts remain unchanged.");
+          const mergedClients = new Map<string, PairingClient>();
+          for (const oldRow of rebase.rows) {
+            const original = rebase.settings.clients.find((client) => client.certificate_id === oldRow.client.certificate_id);
+            const latest = settings.clients.find((client) => client.certificate_id === oldRow.client.certificate_id);
+            if (!original) throw new Error("A device no longer has its original revision; your drafts remain unchanged.");
+            if (!latest) {
+              if (pairingRowHasDraft(oldRow, draftTracker()))
+                throw new Error(`${original.name} was removed elsewhere and has unsaved edits. Copy or review them before reloading.`);
+              continue;
+            }
+            if (latest.client_id !== original.client_id || latest.paired_at !== original.paired_at)
+              throw new Error(`${original.name} was replaced elsewhere. Your drafts remain unchanged.`);
+            if (unsupportedPairingOverrideFields(original).length || unsupportedPairingOverrideFields(latest).length) {
+              if (pairingRowHasDraft(oldRow, draftTracker()))
+                throw new Error(`${original.name} has settings this editor cannot safely reconcile. Your drafts remain unchanged.`);
+              mergedClients.set(latest.certificate_id, latest);
+              continue;
+            }
+            const base = canonicalPairingOverrides(original.config_overrides ?? {});
+            const local = oldRow.readOverrides();
+            const remote = canonicalPairingOverrides(latest.config_overrides ?? {});
+            const merged = mergePairingOverrides(base, local, remote);
+            if (merged.conflicts.length) {
+              const details = merged.conflicts.map((key) =>
+                `${key}: yours ${pairingRebaseValue(local[key], Object.hasOwn(local, key))}, latest ${pairingRebaseValue(remote[key], Object.hasOwn(remote, key))}`).join("; ");
+              throw new Error(`${original.name} has conflicting changes: ${details}. Your drafts remain unchanged. Enter the latest values and review again, then reapply any changes you still want.`);
+            }
+            mergedClients.set(latest.certificate_id, { ...latest, config_overrides: merged.values });
+          }
+          displayedClients = settings.clients.map((client) => mergedClients.get(client.certificate_id) ?? client);
+        }
+        if (settings.clients.length === 0) {
+          pairingArea.replaceChildren(
+            panel(
+              "Paired client overrides",
+              empty("No paired clients", "Pair a Moonlight client before setting client-specific streaming values."),
+              badge(settingsTextLiteral(`Revision ${settings.revision}`)),
+            ),
+          );
+          return;
+        }
+        const revisionBadge = badge(settingsTextLiteral(`Revision ${settings.revision}`));
+        const clientSaveControls: { control: HTMLButtonElement; allowed: boolean }[] = [];
+        let clientSaveInProgress = false;
+        let clientReloadRequired = false;
+        function reviewLatestAction(): HTMLElement {
+          const errors = el("div");
+          const review = button("Review latest and keep drafts", () => {
+            void runAction(review, errors, async () => {
+              if (clientSaveInProgress) return;
+              clientSaveInProgress = true;
+              onSaveBusy(true);
+              try {
+                await loadPairing({ settings, rows, search: clientSearch, errorArea: errors });
+              } finally {
+                clientSaveInProgress = false;
+                onSaveBusy(false);
+              }
+            });
+          });
+          return el("div", "client-rebase-actions", review, errors);
+        }
+        const buildClientRow = (client: PairingClient): PairingEditorRow => {
+          const fec = input(
+            `fec_${client.certificate_id}`,
+            String(client.config_overrides?.fec_percentage ?? ""),
+            "number",
+          );
+          fec.min = "1";
+          fec.max = "255";
+          fec.step = "1";
+          fec.placeholder = "Inherit";
+          settingsClientOverrideAttribute(fec, "FEC percentage", client.name);
+          const backButtonTimeout = input(
+            `back_button_timeout_${client.certificate_id}`,
+            client.config_overrides?.back_button_timeout?.toString() ?? "",
+            "number",
+          );
+          backButtonTimeout.min = String(-0x8000_0000);
+          backButtonTimeout.max = String(0x7fff_ffff);
+          backButtonTimeout.step = "1";
+          backButtonTimeout.placeholder = "Inherit";
+          settingsClientOverrideAttribute(
+            backButtonTimeout,
+            "Back button timeout (milliseconds)",
+            client.name,
+          );
+          const controller = sparseInputOverrideSelect(
+            "controller",
+            client.config_overrides?.controller,
+            "Controller input",
+          );
+          const gamepadChoices = inputGamepadProfileChoices(
+            client.config_overrides?.gamepad ?? "",
+            inputStatus?.supported_profiles ?? ["auto"],
+            inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])],
+          );
+          const gamepad = el("select");
+          settingsClientOverrideAttribute(gamepad, "Gamepad profile", client.name);
+          const inheritGamepad = el("option", "", "Inherit");
+          inheritGamepad.value = "";
+          gamepad.append(inheritGamepad);
+          for (const choice of gamepadChoices) {
+            const option = el("option", "", settingsTextLiteral(choice.label));
+            option.value = choice.value;
+            gamepad.append(option);
+          }
+          gamepad.value = client.config_overrides?.gamepad ?? "";
+          const keyboard = sparseInputOverrideSelect(
+            "keyboard",
+            client.config_overrides?.keyboard,
+            "Keyboard input",
+          );
+          settingsClientOverrideAttribute(keyboard, "Keyboard input", client.name);
+          const mouse = sparseInputOverrideSelect(
+            "mouse",
+            client.config_overrides?.mouse,
+            "Mouse input",
+          );
+          settingsClientOverrideAttribute(mouse, "Mouse input", client.name);
+          const nativePenTouch = sparseInputOverrideSelect(
+            "native_pen_touch",
+            client.config_overrides?.native_pen_touch,
+            "Native pen and touch policy",
+          );
+          settingsClientOverrideAttribute(
+            nativePenTouch,
+            "Native pen and touch policy",
+            client.name,
+          );
+          const ds4BackAsTouchpadClick = sparseInputOverrideSelect(
+            "ds4_back_as_touchpad_click", client.config_overrides?.ds4_back_as_touchpad_click,
+          );
+          settingsClientOverrideAttribute(
+            ds4BackAsTouchpadClick,
+            "DS4 Back as touchpad click",
+            client.name,
+          );
+          const motionAsDs4 = sparseInputOverrideSelect("motion_as_ds4", client.config_overrides?.motion_as_ds4);
+          settingsClientOverrideAttribute(motionAsDs4, "Motion selects DS4", client.name);
+          const touchpadAsDs4 = sparseInputOverrideSelect("touchpad_as_ds4", client.config_overrides?.touchpad_as_ds4);
+          settingsClientOverrideAttribute(touchpadAsDs4, "Touchpad selects DS4", client.name);
+          const ds5InputtinoRandomizeMac = sparseInputOverrideSelect(
+            "ds5_inputtino_randomize_mac", client.config_overrides?.ds5_inputtino_randomize_mac,
+          );
+          settingsClientOverrideAttribute(ds5InputtinoRandomizeMac, "DS5 random MAC", client.name);
+          const protonDualsenseCompatibility = sparseInputOverrideSelect(
+            "proton_dualsense_compatibility", client.config_overrides?.proton_dualsense_compatibility,
+          );
+          settingsClientOverrideAttribute(
+            protonDualsenseCompatibility,
+            "Proton DualSense compatibility",
+            client.name,
+          );
+          const advancedInput = advancedInputOverrideControls(client.config_overrides);
+          const softwareEncoder = softwareEncoderOverrideControls(client.config_overrides);
+          const nvencSettings = nvencSettingsOverrideControls(client.config_overrides);
+          const streamAudio = el("select");
+          settingsClientOverrideAttribute(streamAudio, "Audio streaming", client.name);
+          const audioChoices: Array<[string, string]> = [
+            ["", "Inherit"],
+            ["true", "Enabled"],
+            ["false", "Disabled"],
+          ];
+          for (const [value, label] of audioChoices) {
+            const option = el("option", "", label);
+            option.value = value;
+            streamAudio.append(option);
+          }
+          streamAudio.value = client.config_overrides?.stream_audio === undefined
+            ? ""
+            : String(client.config_overrides.stream_audio);
+          const audioSinkMode = el("select");
+          settingsClientOverrideAttribute(audioSinkMode, "Audio capture endpoint", client.name);
+          for (const [value, label] of [
+            ["inherit", "Inherit application/host"],
+            ["automatic", "Automatic/default endpoint"],
+            ["specific", "Specific endpoint ID"],
+          ]) {
+            const option = el("option", "", label);
+            option.value = value ?? "";
+            audioSinkMode.append(option);
+          }
+          const currentAudioSink = client.config_overrides?.audio_sink;
+          audioSinkMode.value = currentAudioSink === undefined ? "inherit" : currentAudioSink === "" ? "automatic" : "specific";
+          const audioSinkId = input(`audio_sink_${client.certificate_id}`, currentAudioSink ?? "");
+          audioSinkId.maxLength = 4096;
+          audioSinkId.placeholder = "Exact endpoint ID";
+          settingsClientOverrideAttribute(audioSinkId, "Specific endpoint ID", client.name);
+          const updateAudioSink = () => { audioSinkId.disabled = audioSinkMode.value !== "specific"; };
+          audioSinkMode.addEventListener("change", updateAudioSink);
+          updateAudioSink();
+          const virtualSinkMode = el("select");
+          settingsClientOverrideAttribute(virtualSinkMode, "Virtual audio sink", client.name);
+          for (const [value, label] of [
+            ["inherit", "Inherit application/host"],
+            ["automatic", "Clear inherited virtual sink"],
+            ["specific", "Specific virtual sink selector"],
+          ]) {
+            const option = el("option", "", label);
+            option.value = value ?? "";
+            virtualSinkMode.append(option);
+          }
+          const currentVirtualSink = client.config_overrides?.virtual_sink;
+          virtualSinkMode.value = currentVirtualSink === undefined ? "inherit" : currentVirtualSink === "" ? "automatic" : "specific";
+          const virtualSinkSelector = input(`virtual_sink_${client.certificate_id}`, currentVirtualSink ?? "");
+          virtualSinkSelector.maxLength = 4096;
+          virtualSinkSelector.placeholder = "Exact ID or device name";
+          settingsClientOverrideAttribute(virtualSinkSelector, "Virtual sink ID or name", client.name);
+          const updateVirtualSink = () => { virtualSinkSelector.disabled = virtualSinkMode.value !== "specific"; };
+          virtualSinkMode.addEventListener("change", updateVirtualSink);
+          updateVirtualSink();
+          const captureOnly = el("select");
+          settingsClientOverrideAttribute(
+            captureOnly,
+            "Capture audio without changing default outputs",
+            client.name,
+          );
+          for (const [value, label] of [
+            ["", "Inherit"],
+            ["true", "Capture without routing"],
+            ["false", "Allow default-output routing"],
+          ]) {
+            const option = el("option", "", label);
+            option.value = value ?? "";
+            captureOnly.append(option);
+          }
+          captureOnly.value = client.config_overrides?.audio_sink_capture_only === undefined
+            ? ""
+            : String(client.config_overrides.audio_sink_capture_only);
+          const capture = sparseCaptureOverrideSelect(client.config_overrides?.capture);
+          const displayPolicy = el("textarea");
+          displayPolicy.rows = 12;
+          displayPolicy.spellcheck = false;
+          displayPolicy.value = JSON.stringify(client.config_overrides?.display_policy ?? {}, null, 2);
+          const status = el("div");
+          const unsupported = unsupportedPairingOverrideFields(client);
+          const readValues = () => ({
+            ...advancedInput.read(),
+            ...softwareEncoder.read(),
+            ...nvencSettings.read(),
+            ...parseClientFecOverride(fec.value),
+            back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeout.value),
+            stream_audio: parseStreamAudioOverride(streamAudio.value),
+            audio_sink: parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
+            virtual_sink: parseVirtualSinkOverride(virtualSinkMode.value, virtualSinkSelector.value),
+            audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(captureOnly.value),
+            capture: parseClientCaptureOverride(capture.value),
+            display_policy: parseDisplayPolicyOverrideMap(displayPolicy.value, "client"),
+            controller: parseInputBooleanOverride(controller.value, "Controller input"),
+            gamepad: parseGamepadProfileOverride(
+              gamepad.value,
+              inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])],
+            ),
+            keyboard: parseInputBooleanOverride(keyboard.value, "Keyboard input"),
+            mouse: parseInputBooleanOverride(mouse.value, "Mouse input"),
+            native_pen_touch: parseInputBooleanOverride(nativePenTouch.value, "Native pen/touch preference"),
+            ds4_back_as_touchpad_click: parseInputBooleanOverride(
+              ds4BackAsTouchpadClick.value, "DS4 Back as touchpad click preference",
+            ),
+            motion_as_ds4: parseInputBooleanOverride(motionAsDs4.value, "Motion selects DS4 preference"),
+            touchpad_as_ds4: parseInputBooleanOverride(touchpadAsDs4.value, "Touchpad selects DS4 preference"),
+            ds5_inputtino_randomize_mac: parseInputBooleanOverride(
+              ds5InputtinoRandomizeMac.value, "DS5 random MAC preference",
+            ),
+            proton_dualsense_compatibility: parseInputBooleanOverride(
+              protonDualsenseCompatibility.value, "Proton DualSense compatibility",
+            ),
+          });
+          const save = button(
+            "Save",
+            () => {
+              void runAction(save, status, async () => {
+                if (clientSaveInProgress || clientReloadRequired) return;
+                clientSaveInProgress = true;
+                onSaveBusy(true);
+                for (const item of clientSaveControls) item.control.disabled = true;
+                pairingLoads.invalidate();
+                let saveStarted = false;
+                try {
+                  const values = readValues();
+                  const submittedControls = pairingControlStates(clientCard);
+                  const submittedDraft = draftTracker()?.capture(clientCard);
+                  saveStarted = true;
+                  settings = await savePairingClientOverrides(context.api, settings, client.certificate_id, values);
+                  baselineControls = submittedControls;
+                  if (submittedDraft) draftTracker()?.markSaved(submittedDraft);
+                  revisionBadge.textContent = `Revision ${settings.revision}`;
+                  context.notify(`Stored overrides confirmed for ${client.name}. Active stream application is not confirmed.`);
+                } catch (error) {
+                  if (saveStarted) {
+                    clientReloadRequired = true;
+                    const reload = button("Reload paired clients", () => {
+                      if (draftTracker()?.isDirty(pairingArea) &&
+                          !window.confirm("Reload paired clients and discard unsaved client changes?")) return;
+                      void loadPairing();
+                    });
+                    const notice = el("div", "notice error",
+                      el("strong", "", error instanceof ApiError && error.code === "revision_conflict"
+                        ? "Paired clients changed elsewhere"
+                        : "Client save could not be confirmed"),
+                      el("p", "", "Your edits are still here. Review the latest settings to keep non-conflicting drafts, or reload and discard unsaved client changes."),
+                      reviewLatestAction(), reload);
+                    notice.setAttribute("role", "alert");
+                    status.replaceChildren(notice);
+                    return;
+                  }
+                  throw error;
+                } finally {
+                  clientSaveInProgress = false;
+                  onSaveBusy(false);
+                  for (const item of clientSaveControls) item.control.disabled = !item.allowed || clientReloadRequired;
+                }
+              }).finally(() => {
+                if (clientReloadRequired) save.disabled = true;
+              });
+            },
+            "primary",
+          );
+          save.disabled = !context.api.allows("pairing.admin") || unsupported.length > 0;
+          clientSaveControls.push({ control: save, allowed: !save.disabled });
+          if (unsupported.length > 0)
+            status.textContent = `Save unavailable: this client has stored overrides this editor cannot preserve (${unsupported.join(", ")}).`;
+          const remove = button("Remove device", () => {
+            if (remove.disabled || clientSaveInProgress || clientReloadRequired) return;
+            if (!window.confirm(`Remove ${client.name}? This device will need to pair again. Unsaved changes for this device will be discarded.`)) return;
+            void runAction(remove, status, async () => {
+              clientSaveInProgress = true;
+              onSaveBusy(true);
+              for (const item of clientSaveControls) item.control.disabled = true;
+              pairingLoads.invalidate();
+              try {
+                settings = await removePairedClient(context.api, settings, client.certificate_id);
+                if (!context.content.isConnected) return;
+                clientCard.remove();
+                const index = rows.findIndex((row) => row.client.certificate_id === client.certificate_id);
+                if (index !== -1) rows.splice(index, 1);
+                revisionBadge.textContent = `Revision ${settings.revision}`;
+                filterClients();
+                context.notify(`${client.name} was removed from paired devices. Existing stream termination is not confirmed.`);
+              } catch (error) {
+                if (!context.content.isConnected) return;
+                clientReloadRequired = true;
+                const reload = button("Reload paired clients", () => {
+                  if (draftTracker()?.isDirty(pairingArea) &&
+                      !window.confirm("Reload paired clients and discard unsaved client changes?")) return;
+                  void loadPairing();
+                });
+                const notice = el("div", "notice error",
+                  el("strong", "", error instanceof ApiError && error.code === "revision_conflict"
+                    ? "Paired clients changed elsewhere" : "Device removal could not be confirmed"),
+                  el("p", "", "Your edits are still here. Review the latest settings to keep non-conflicting drafts, or reload and discard unsaved client changes."),
+                  reviewLatestAction(), reload);
+                notice.setAttribute("role", "alert");
+                status.replaceChildren(notice);
+              } finally {
+                clientSaveInProgress = false;
+                onSaveBusy(false);
+                for (const item of clientSaveControls) item.control.disabled = !item.allowed || clientReloadRequired;
+              }
+            }).finally(() => {
+              if (clientReloadRequired) remove.disabled = true;
+            });
+          }, "danger");
+          remove.disabled = !context.api.allows("pairing.admin");
+          clientSaveControls.push({ control: remove, allowed: !remove.disabled });
+          const identity = el(
+            "summary", "client-settings-summary",
+            el("span", "client-settings-name", settingsTextLiteral(client.name)),
+            el("small", "muted", settingsTextLiteral(`${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`)),
+          );
+          const audioSettings = el("details", "client-settings-group",
+            el("summary", "", "Audio"),
+            el("div", "form-grid",
+              field("Audio streaming", streamAudio),
+              field("Audio capture endpoint", audioSinkMode),
+              field("Specific endpoint ID", audioSinkId),
+              field("Virtual audio sink", virtualSinkMode),
+              field("Virtual sink ID or name", virtualSinkSelector),
+              field("Capture audio without changing default outputs", captureOnly)));
+          const inputSettings = el("details", "client-settings-group",
+            el("summary", "", "Input"),
+            el("div", "form-grid",
+              field("Controller input", controller),
+              field("Gamepad profile", gamepad),
+              field("Keyboard input", keyboard),
+              field("Mouse input", mouse),
+              field("Native pen and touch", nativePenTouch),
+              field("DS4 Back as touchpad click", ds4BackAsTouchpadClick),
+              field("Motion selects DS4", motionAsDs4),
+              field("Touchpad selects DS4", touchpadAsDs4),
+              field("DS5 random MAC", ds5InputtinoRandomizeMac),
+              field("Proton DualSense compatibility", protonDualsenseCompatibility)));
+          const advancedSettings = el("details", "client-settings-group",
+            el("summary", "", "Advanced input and encoding"),
+            el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields));
+          const clientCard = el("details", "client-settings-card", identity,
+            el("div", "client-settings-body",
+              el("p", "muted", "Blank values inherit the application or host setting."),
+              el("div", "form-grid",
+                field("FEC percentage", fec),
+                field("Back button timeout (milliseconds)", backButtonTimeout, "Use -1 to disable the timeout."),
+                field("Capture provider", capture)),
+              field("Display and adapter policy (JSON)", displayPolicy,
+                "Sparse per-client overrides. Use null or empty values to inherit; global-only keys are rejected."),
+              audioSettings, inputSettings, advancedSettings,
+              el("div", "client-settings-save", save, remove, status)));
+          let baselineControls = pairingControlStates(clientCard);
+          return {
+            client, card: clientCard,
+            readOverrides: () => canonicalPairingOverrides({ ...client.config_overrides, ...readValues() }),
+            baseline: () => baselineControls,
+            setBaseline: (states) => { baselineControls = states; },
+          };
+        };
+        const rows = displayedClients.map(buildClientRow);
+        const originalControlCount = clientSaveControls.length;
+        const shadowRows = rebase ? settings.clients.map(buildClientRow) : [];
+        clientSaveControls.splice(originalControlCount);
+        const rebaseBaselines: DraftSnapshot = new Map();
+        if (rebase) {
+          for (const row of rows) {
+            const shadow = shadowRows.find((candidate) => candidate.client.certificate_id === row.client.certificate_id);
+            if (!shadow) throw new Error("A device changed while reviewing its settings.");
+            const latestStates = pairingControlStates(shadow.card);
+            const controls = pairingEditorControls(row.card);
+            const currentStates = pairingControlStates(row.card);
+            if (latestStates.length !== controls.length || currentStates.length !== controls.length)
+              throw new Error("The device editor changed shape; your drafts remain unchanged.");
+            const oldRow = rebase.rows.find((candidate) => candidate.client.certificate_id === row.client.certificate_id);
+            if (oldRow) {
+              const oldStates = pairingControlStates(oldRow.card);
+              const oldBaseline = oldRow.baseline();
+              if (oldStates.length !== controls.length || oldBaseline.length !== controls.length)
+                throw new Error("The device editor changed shape; your drafts remain unchanged.");
+              for (let index = 0; index < controls.length; index++) {
+                const control = controls[index]!;
+                const before = oldBaseline[index]!;
+                const local = oldStates[index]!;
+                const latest = latestStates[index]!;
+                if (!pairingStateShapeMatches(before, local) || !pairingStateShapeMatches(before, latest))
+                  throw new Error("The device editor changed shape; your drafts remain unchanged.");
+                if (pairingStateSignature(before) !== pairingStateSignature(local)) {
+                  control.value = local.value;
+                  if (local.checked !== null) (control as HTMLInputElement).checked = local.checked;
+                  if (control.value !== local.value)
+                    throw new Error("A selected device setting is no longer available; your drafts remain unchanged.");
+                  control.dispatchEvent(new Event("change"));
+                }
+              }
+              if (!unsupportedPairingOverrideFields(row.client).length &&
+                  !sameConfigurationValue(row.readOverrides(), canonicalPairingOverrides(row.client.config_overrides ?? {})))
+                throw new Error(`${row.client.name} has interdependent edits that need review. Your drafts remain unchanged.`);
+              (row.card as HTMLDetailsElement).open = (oldRow.card as HTMLDetailsElement).open;
+              const oldDetails = oldRow.card.querySelectorAll<HTMLDetailsElement>("details");
+              const newDetails = row.card.querySelectorAll<HTMLDetailsElement>("details");
+              if (oldDetails.length === newDetails.length)
+                oldDetails.forEach((detail, index) => { newDetails[index]!.open = detail.open; });
+            }
+            row.setBaseline(latestStates);
+            controls.forEach((control, index) => rebaseBaselines.set(control, pairingStateSignature(latestStates[index]!)));
+          }
+        }
+        const clientSearch = input("client_search", "", "search");
+        clientSearch.setAttribute("data-draft-ignore", "");
+        clientSearch.placeholder = "Search clients";
+        if (rebase) clientSearch.value = rebase.search.value;
+        const searchSummary = el("p", "muted client-search-summary");
+        searchSummary.setAttribute("role", "status");
+        const noMatches = el("p", "muted client-search-empty", "No paired clients match this search.");
+        function filterClients(): void {
+          const query = clientSearch.value.trim().toLocaleLowerCase();
+          let visible = 0;
+          for (const { client, card } of rows) {
+            const identity = `${client.name} ${client.client_id} ${client.certificate_id}`.toLocaleLowerCase();
+            card.hidden = !!query && !identity.includes(query);
+            if (!card.hidden) visible++;
+          }
+          searchSummary.textContent = `${visible} of ${rows.length} paired clients`;
+          noMatches.hidden = visible !== 0;
+          noMatches.textContent = rows.length === 0 ? "No paired clients remain." : "No paired clients match this search.";
+        }
+        clientSearch.addEventListener("input", filterClients);
+        filterClients();
+        pairingArea.replaceChildren(
+          panel(
+            "Paired client overrides",
+            el("p", "muted", "Open a client to review its streaming overrides. Saves confirm the stored pairing revision; input preferences apply when the next stream acquires its input lease."),
+            el("div", "client-search", field("Search paired clients", clientSearch), searchSummary),
+            noMatches,
+            el("div", "client-settings-list", ...rows.map(({ card }) => card)),
+            el("div", "actions", revisionBadge),
+          ),
+        );
+        if (rebase) {
+          draftTracker()?.markSaved(rebaseBaselines);
+          context.notify("Latest paired devices loaded. Your non-conflicting edits are still unsaved.");
+        }
+      } catch (error) {
+        if (context.content.isConnected) {
+          if (rebase) rebase.errorArea.replaceChildren(errorPanel(error));
+          else pairingArea.replaceChildren(errorPanel(error, loadPairing));
+        }
+      }
+    }
+    return () => loadPairing();
+  }
+
+  export function settingsSearchMatches(query: string, ...parts: string[]): boolean {
+    const needle = query.trim().toLocaleLowerCase();
+    return !needle || parts.join(" ").toLocaleLowerCase().includes(needle);
+  }
+
+  export function renderSettings(context: PageContext): void {
+    const area = el("div", "settings-area-registered");
+    const registeredLoads = new RegisteredConfigurationLoadGate();
+    const authArea = el("div", "settings-area-auth");
+    const authLoads = new AuthTokenSettingsLoadGate();
+    const hostLoggingArea = el("div", "settings-area-logging");
+    const hostLoggingLoads = new HostLoggingLoadGate();
+    const hostArea = el("div", "settings-area-host");
+    const hostLoads = new NvhttpSettingsLoadGate();
+    const pipewireArea = el("div", "settings-area-pipewire");
+    const steamArea = el("div", "settings-area-steam");
+    const steamLoads = new ImportSettingsLoadGate<SteamSettings>();
+    const lutrisArea = el("div", "settings-area-lutris");
+    const lutrisLoads = new ImportSettingsLoadGate<{ settings: LutrisSettings; runtime: LutrisStatus }>();
+    const playniteArea = el("div", "settings-area-playnite");
+    const playniteLoads = new PlayniteSettingsLoadGate();
+    const inputArea = el("div", "settings-area-input");
+    const inputLoads = new InputPolicyLoadGate();
+    const historyArea = el("div", "settings-area-history");
+    const metricsArea = el("div", "settings-area-metrics");
+    const updaterArea = el("div", "settings-area-updater");
+    const systemTrayArea = el("div", "settings-area-tray");
+    const historyLoads = new HistorySettingsLoadGate();
+    const pairingArea = el("div", "settings-area-pairing");
+    let drafts: DraftTracker | null = null;
+    let clientSaveBusy = false;
+    const updateDraftStatus = () => {
+      const dirty = drafts?.isDirty() ?? false;
+      refreshSettings.disabled = dirty || clientSaveBusy;
+      dirtyNotice.hidden = !dirty && !clientSaveBusy;
+      settingsSetLocalizedTextContent(dirtyNotice, clientSaveBusy ? "Saving changes…" : "Unsaved changes");
+    };
+    const loadPairing = createPairedClientEditor(context, pairingArea, () => drafts, (busy) => {
+      clientSaveBusy = busy;
+      updateDraftStatus();
+    });
+    const managementArea = el("div", "settings-area-management");
+    const csrfArea = el("div", "settings-area-csrf");
+    const categories = [
+      { id: "general", label: "General", description: "Host logging, updates, and registered settings.", areas: [area, hostLoggingArea, updaterArea, systemTrayArea] },
+      { id: "streaming", label: "Streaming", description: "Configure the host, capture, input, and session reporting.", areas: [hostArea, pipewireArea, inputArea, historyArea, metricsArea] },
+      { id: "integrations", label: "Integrations", description: "Manage application providers and library imports.", areas: [steamArea, lutrisArea, playniteArea] },
+      { id: "devices", label: "Devices", description: "Manage paired client settings.", areas: [pairingArea] },
+      { id: "access", label: "Access & security", description: "Configure session lifetimes and management access.", areas: [authArea, managementArea, csrfArea] },
+    ];
+    let selectedCategory = context.initialSettingsCategory ?? categories[0]!.id;
+    const categoryContent = el("div", "settings-content");
+    const categoryHeading = el("h2");
+    const categoryDescription = el("p", "muted");
+    const categoryStatus = el("div", "settings-category-heading", categoryHeading, categoryDescription);
+    categoryStatus.setAttribute("aria-live", "polite");
+    const noResults = el("p", "muted settings-no-results", "No settings match your search.");
+    noResults.hidden = true;
+    const search = input("settings_search", "", "search");
+    search.placeholder = "Search settings";
+    search.setAttribute("aria-label", "Search settings");
+    const categoryPicker = el("select");
+    categoryPicker.setAttribute("aria-label", "Settings category");
+    const categoryNavigation = el("nav", "settings-nav");
+    categoryNavigation.setAttribute("aria-label", "Settings categories");
+    const categoryButtons = new Map<string, HTMLButtonElement>();
+    const searchOpenedDetails = new Set<HTMLDetailsElement>();
+    categoryContent.append(categoryStatus, noResults);
+    for (const category of categories) {
+      const option = el("option", "", category.label);
+      option.value = category.id;
+      categoryPicker.append(option);
+      const item = button(category.label, () => selectCategory(category.id), "settings-nav-item");
+      categoryButtons.set(category.id, item);
+      categoryNavigation.append(item);
+      categoryContent.append(...category.areas);
+    }
+    function selectCategory(id: string): void {
+      if (!categories.some((category) => category.id === id)) return;
+      selectedCategory = id;
+      context.replaceSettingsCategory?.(id as SettingsCategory);
+      search.value = "";
+      updateCategoryDisplay();
+    }
+    function restoreSearchDisclosures(): void {
+      for (const details of searchOpenedDetails) details.open = false;
+      searchOpenedDetails.clear();
+    }
+    function showFieldInSearch(field: HTMLElement): void {
+      let parent = field.parentElement;
+      while (parent && parent !== categoryContent) {
+        if (parent.tagName === "DETAILS") {
+          const details = parent as HTMLDetailsElement;
+          if (!details.open && !details.hidden) {
+            details.open = true;
+            searchOpenedDetails.add(details);
+          }
+        }
+        parent = parent.parentElement;
+      }
+    }
+    function updateCategoryDisplay(): void {
+      const query = search.value.trim().toLocaleLowerCase();
+      const selected = categories.find((category) => category.id === selectedCategory) ?? categories[0]!;
+      categoryPicker.value = selected.id;
+      restoreSearchDisclosures();
+      let matches = 0;
+      for (const category of categories) {
+        for (const area of category.areas) {
+          // Fields stay in their original forms so saves and unsaved drafts retain their semantics.
+          const fields = typeof area.querySelectorAll === "function"
+            ? Array.from(area.querySelectorAll<HTMLElement>(".field")) : [];
+          let fieldMatches = 0;
+          for (const wrapper of fields) {
+            const controls = Array.from(wrapper.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("input, select, textarea"));
+            if (controls.length && controls.every((control) => control.hasAttribute("data-draft-ignore"))) continue;
+            const panelTitle = wrapper.closest(".panel")?.querySelector("h2")?.textContent ?? "";
+            const matched = !query || settingsSearchMatches(query, category.label, panelTitle,
+              wrapper.textContent ?? "", ...controls.map((control) => control.name));
+            if (query && !matched) wrapper.setAttribute("data-settings-search-hidden", "");
+            else wrapper.removeAttribute("data-settings-search-hidden");
+            if (query && matched) {
+              fieldMatches++;
+              showFieldInSearch(wrapper);
+            }
+          }
+          const title = typeof area.querySelector === "function" ? area.querySelector(".panel > h2")?.textContent ?? "" : "";
+          const visible = query
+            ? fieldMatches > 0 || settingsSearchMatches(query, category.label, title) ||
+              (!fields.length && settingsSearchMatches(query, area.textContent ?? ""))
+            : category.id === selected.id;
+          area.hidden = !visible;
+          if (visible) matches++;
+        }
+        const item = categoryButtons.get(category.id)!;
+        item.className = `button settings-nav-item${!query && category.id === selected.id ? " selected" : ""}`;
+        item.setAttribute("aria-current", !query && category.id === selected.id ? "page" : "false");
+      }
+      settingsSetLocalizedTextContent(categoryHeading, query ? "Search results" : selected.label);
+      settingsSetLocalizedTextContent(categoryDescription, query
+        ? "Matching settings are shown across categories. Saving an editor also saves its hidden fields and unsaved changes."
+        : selected.description);
+      noResults.hidden = !query || matches !== 0;
+    }
+    // Native validation may find a required field that search has temporarily hidden.
+    // Reveal its original category before the browser tries to focus it.
+    categoryContent.addEventListener("invalid", (event) => {
+      if (!search.value.trim()) return;
+      const target = event.target as HTMLElement | null;
+      const category = categories.find((candidate) => candidate.areas.some((area) => target && area.contains(target)));
+      if (!category || !target) return;
+      selectCategory(category.id);
+      showFieldInSearch(target);
+      searchOpenedDetails.clear();
+    }, true);
+    search.addEventListener("input", updateCategoryDisplay);
+    categoryPicker.addEventListener("change", () => selectCategory(categoryPicker.value));
+    const settingsNavigation = el("div", "settings-navigation", field("Category", categoryPicker), categoryNavigation);
+    const refreshSettings = button("Refresh", () => {
+      void load();
+      void loadAuth();
+      void loadHostLogging();
+      void loadHost();
+      void loadPipewireChooser();
+      void loadSteam();
+      void loadLutris();
+      void loadPlaynite();
+      void loadInput();
+      void loadHistorySettings();
+      renderHostMetricsSettings(context, metricsArea);
+      renderUpdaterSettings(context, updaterArea);
+      renderSystemTraySettings(context, systemTrayArea);
+      void loadPairing();
+    });
+    const dirtyNotice = badge("Unsaved changes", "accent");
+    dirtyNotice.hidden = true;
+    dirtyNotice.setAttribute("role", "status");
     context.content.append(
-      sectionHeading(
-        "Settings",
-        "Edit host options and values registered for this management console.",
-        button("Refresh", () => {
-          void load();
-          void loadAuth();
-          void loadHostLogging();
-          void loadHost();
-          void loadPipewireChooser();
-          void loadSteam();
-          void loadLutris();
-          void loadPlaynite();
-          void loadInput();
-          void loadHistorySettings();
-          renderHostMetricsSettings(context, metricsArea);
-          renderUpdaterSettings(context, updaterArea);
-          renderSystemTraySettings(context, systemTrayArea);
-          void loadPairing();
-        }),
-      ),
-      area,
-      authArea,
-      hostLoggingArea,
-      hostArea,
-      steamArea,
-      lutrisArea,
-      playniteArea,
-      inputArea,
-      historyArea,
-      metricsArea,
-      updaterArea,
-      systemTrayArea,
-      pairingArea,
-      pipewireArea,
+      sectionHeading("Settings", "Configure your host, streaming, integrations, and access.", refreshSettings),
+      el("div", "settings-tools", search, dirtyNotice),
+      el("div", "settings-layout", settingsNavigation, categoryContent),
     );
-    renderManagementPolicy(context);
-    renderCsrfPolicy(context);
+    if (context.registerDraftGuard) {
+      drafts = trackDrafts(categoryContent, updateDraftStatus);
+      context.registerDraftGuard(() => clientSaveBusy || (drafts?.isDirty() ?? false), drafts.dispose);
+    }
+    renderManagementPolicy(context, managementArea);
+    renderCsrfPolicy(context, csrfArea);
+    updateCategoryDisplay();
+    if (typeof MutationObserver !== "undefined") {
+      const observer = new MutationObserver(() => {
+        if (!context.content.isConnected) {
+          observer.disconnect();
+        } else if (search.value.trim()) {
+          updateCategoryDisplay();
+        }
+      });
+      for (const category of categories)
+        for (const item of category.areas)
+          observer.observe(item, { childList: true, subtree: true, characterData: true });
+    }
     let pipewireGeneration = 0;
     let pipewireOperation = 0;
     async function loadPipewireChooser(): Promise<void> {
@@ -3367,278 +4153,6 @@ namespace Amaterasu {
       } catch (error) {
         if (context.content.isConnected)
           playniteArea.replaceChildren(errorPanel(error, loadPlaynite));
-      }
-    }
-    async function loadPairing(): Promise<void> {
-      pairingArea.replaceChildren(el("p", "muted", "Loading paired clients…"));
-      try {
-        const loaded = await pairingLoads.read(context.api);
-        if (loaded === null) return;
-        const { settings, inputStatus } = loaded;
-        if (!context.content.isConnected) return;
-        if (settings.clients.length === 0) {
-          pairingArea.replaceChildren(
-            panel(
-              "Paired client overrides",
-              empty("No paired clients", "Pair a Moonlight client before setting client-specific streaming values."),
-              badge(settingsTextLiteral(`Revision ${settings.revision}`)),
-            ),
-          );
-          return;
-        }
-        const rows = settings.clients.map((client) => {
-          const fec = input(
-            `fec_${client.certificate_id}`,
-            String(client.config_overrides?.fec_percentage ?? ""),
-            "number",
-          );
-          fec.min = "1";
-          fec.max = "255";
-          fec.step = "1";
-          fec.placeholder = "Inherit";
-          settingsClientOverrideAttribute(fec, "FEC percentage", client.name);
-          const backButtonTimeout = input(
-            `back_button_timeout_${client.certificate_id}`,
-            client.config_overrides?.back_button_timeout?.toString() ?? "",
-            "number",
-          );
-          backButtonTimeout.min = String(-0x8000_0000);
-          backButtonTimeout.max = String(0x7fff_ffff);
-          backButtonTimeout.step = "1";
-          backButtonTimeout.placeholder = "Inherit";
-          settingsClientOverrideAttribute(
-            backButtonTimeout,
-            "Back button timeout (milliseconds)",
-            client.name,
-          );
-          const controller = sparseInputOverrideSelect(
-            "controller",
-            client.config_overrides?.controller,
-            "Controller input",
-          );
-          const gamepadChoices = inputGamepadProfileChoices(
-            client.config_overrides?.gamepad ?? "",
-            inputStatus?.supported_profiles ?? ["auto"],
-            inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])],
-          );
-          const gamepad = el("select");
-          settingsClientOverrideAttribute(gamepad, "Gamepad profile", client.name);
-          const inheritGamepad = el("option", "", "Inherit");
-          inheritGamepad.value = "";
-          gamepad.append(inheritGamepad);
-          for (const choice of gamepadChoices) {
-            const option = el("option", "", settingsTextLiteral(choice.label));
-            option.value = choice.value;
-            gamepad.append(option);
-          }
-          gamepad.value = client.config_overrides?.gamepad ?? "";
-          const keyboard = sparseInputOverrideSelect(
-            "keyboard",
-            client.config_overrides?.keyboard,
-            "Keyboard input",
-          );
-          settingsClientOverrideAttribute(keyboard, "Keyboard input", client.name);
-          const mouse = sparseInputOverrideSelect(
-            "mouse",
-            client.config_overrides?.mouse,
-            "Mouse input",
-          );
-          settingsClientOverrideAttribute(mouse, "Mouse input", client.name);
-          const nativePenTouch = sparseInputOverrideSelect(
-            "native_pen_touch",
-            client.config_overrides?.native_pen_touch,
-            "Native pen and touch policy",
-          );
-          settingsClientOverrideAttribute(
-            nativePenTouch,
-            "Native pen and touch policy",
-            client.name,
-          );
-          const ds4BackAsTouchpadClick = sparseInputOverrideSelect(
-            "ds4_back_as_touchpad_click", client.config_overrides?.ds4_back_as_touchpad_click,
-          );
-          settingsClientOverrideAttribute(
-            ds4BackAsTouchpadClick,
-            "DS4 Back as touchpad click",
-            client.name,
-          );
-          const motionAsDs4 = sparseInputOverrideSelect("motion_as_ds4", client.config_overrides?.motion_as_ds4);
-          settingsClientOverrideAttribute(motionAsDs4, "Motion selects DS4", client.name);
-          const touchpadAsDs4 = sparseInputOverrideSelect("touchpad_as_ds4", client.config_overrides?.touchpad_as_ds4);
-          settingsClientOverrideAttribute(touchpadAsDs4, "Touchpad selects DS4", client.name);
-          const ds5InputtinoRandomizeMac = sparseInputOverrideSelect(
-            "ds5_inputtino_randomize_mac", client.config_overrides?.ds5_inputtino_randomize_mac,
-          );
-          settingsClientOverrideAttribute(ds5InputtinoRandomizeMac, "DS5 random MAC", client.name);
-          const protonDualsenseCompatibility = sparseInputOverrideSelect(
-            "proton_dualsense_compatibility", client.config_overrides?.proton_dualsense_compatibility,
-          );
-          settingsClientOverrideAttribute(
-            protonDualsenseCompatibility,
-            "Proton DualSense compatibility",
-            client.name,
-          );
-          const advancedInput = advancedInputOverrideControls(client.config_overrides);
-          const softwareEncoder = softwareEncoderOverrideControls(client.config_overrides);
-          const nvencSettings = nvencSettingsOverrideControls(client.config_overrides);
-          const streamAudio = el("select");
-          settingsClientOverrideAttribute(streamAudio, "Audio streaming", client.name);
-          const audioChoices: Array<[string, string]> = [
-            ["", "Inherit"],
-            ["true", "Enabled"],
-            ["false", "Disabled"],
-          ];
-          for (const [value, label] of audioChoices) {
-            const option = el("option", "", label);
-            option.value = value;
-            streamAudio.append(option);
-          }
-          streamAudio.value = client.config_overrides?.stream_audio === undefined
-            ? ""
-            : String(client.config_overrides.stream_audio);
-          const audioSinkMode = el("select");
-          settingsClientOverrideAttribute(audioSinkMode, "Audio capture endpoint", client.name);
-          for (const [value, label] of [
-            ["inherit", "Inherit application/host"],
-            ["automatic", "Automatic/default endpoint"],
-            ["specific", "Specific endpoint ID"],
-          ]) {
-            const option = el("option", "", label);
-            option.value = value ?? "";
-            audioSinkMode.append(option);
-          }
-          const currentAudioSink = client.config_overrides?.audio_sink;
-          audioSinkMode.value = currentAudioSink === undefined ? "inherit" : currentAudioSink === "" ? "automatic" : "specific";
-          const audioSinkId = input(`audio_sink_${client.certificate_id}`, currentAudioSink ?? "");
-          audioSinkId.maxLength = 4096;
-          audioSinkId.placeholder = "Exact endpoint ID";
-          settingsClientOverrideAttribute(audioSinkId, "Specific endpoint ID", client.name);
-          const updateAudioSink = () => { audioSinkId.disabled = audioSinkMode.value !== "specific"; };
-          audioSinkMode.addEventListener("change", updateAudioSink);
-          updateAudioSink();
-          const virtualSinkMode = el("select");
-          settingsClientOverrideAttribute(virtualSinkMode, "Virtual audio sink", client.name);
-          for (const [value, label] of [
-            ["inherit", "Inherit application/host"],
-            ["automatic", "Clear inherited virtual sink"],
-            ["specific", "Specific virtual sink selector"],
-          ]) {
-            const option = el("option", "", label);
-            option.value = value ?? "";
-            virtualSinkMode.append(option);
-          }
-          const currentVirtualSink = client.config_overrides?.virtual_sink;
-          virtualSinkMode.value = currentVirtualSink === undefined ? "inherit" : currentVirtualSink === "" ? "automatic" : "specific";
-          const virtualSinkSelector = input(`virtual_sink_${client.certificate_id}`, currentVirtualSink ?? "");
-          virtualSinkSelector.maxLength = 4096;
-          virtualSinkSelector.placeholder = "Exact ID or device name";
-          settingsClientOverrideAttribute(virtualSinkSelector, "Virtual sink ID or name", client.name);
-          const updateVirtualSink = () => { virtualSinkSelector.disabled = virtualSinkMode.value !== "specific"; };
-          virtualSinkMode.addEventListener("change", updateVirtualSink);
-          updateVirtualSink();
-          const captureOnly = el("select");
-          settingsClientOverrideAttribute(
-            captureOnly,
-            "Capture audio without changing default outputs",
-            client.name,
-          );
-          for (const [value, label] of [
-            ["", "Inherit"],
-            ["true", "Capture without routing"],
-            ["false", "Allow default-output routing"],
-          ]) {
-            const option = el("option", "", label);
-            option.value = value ?? "";
-            captureOnly.append(option);
-          }
-          captureOnly.value = client.config_overrides?.audio_sink_capture_only === undefined
-            ? ""
-            : String(client.config_overrides.audio_sink_capture_only);
-          const capture = sparseCaptureOverrideSelect(client.config_overrides?.capture);
-          const displayPolicy = el("textarea");
-          displayPolicy.rows = 12;
-          displayPolicy.spellcheck = false;
-          displayPolicy.value = JSON.stringify(client.config_overrides?.display_policy ?? {}, null, 2);
-          const status = el("div");
-          const unsupported = unsupportedPairingOverrideFields(client);
-          const save = button(
-            "Save",
-            () => runAction(save, status, async () => {
-              pairingLoads.invalidate();
-              let saveStarted = false;
-              try {
-                const values = {
-                  ...advancedInput.read(),
-                  ...softwareEncoder.read(),
-                  ...nvencSettings.read(),
-                  ...parseClientFecOverride(fec.value),
-                  back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeout.value),
-                  stream_audio: parseStreamAudioOverride(streamAudio.value),
-                  audio_sink: parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
-                  virtual_sink: parseVirtualSinkOverride(virtualSinkMode.value, virtualSinkSelector.value),
-                  audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(captureOnly.value),
-                  capture: parseClientCaptureOverride(capture.value),
-                  display_policy: parseDisplayPolicyOverrideMap(displayPolicy.value, "client"),
-                  controller: parseInputBooleanOverride(controller.value, "Controller input"),
-                  gamepad: parseGamepadProfileOverride(
-                    gamepad.value,
-                    inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])],
-                  ),
-                  keyboard: parseInputBooleanOverride(keyboard.value, "Keyboard input"),
-                  mouse: parseInputBooleanOverride(mouse.value, "Mouse input"),
-                  native_pen_touch: parseInputBooleanOverride(nativePenTouch.value, "Native pen/touch preference"),
-                  ds4_back_as_touchpad_click: parseInputBooleanOverride(
-                    ds4BackAsTouchpadClick.value, "DS4 Back as touchpad click preference",
-                  ),
-                  motion_as_ds4: parseInputBooleanOverride(motionAsDs4.value, "Motion selects DS4 preference"),
-                  touchpad_as_ds4: parseInputBooleanOverride(touchpadAsDs4.value, "Touchpad selects DS4 preference"),
-                  ds5_inputtino_randomize_mac: parseInputBooleanOverride(
-                    ds5InputtinoRandomizeMac.value, "DS5 random MAC preference",
-                  ),
-                  proton_dualsense_compatibility: parseInputBooleanOverride(
-                    protonDualsenseCompatibility.value, "Proton DualSense compatibility",
-                  ),
-                };
-                saveStarted = true;
-                await savePairingClientOverrides(context.api, settings, client.certificate_id, values);
-                await loadPairing();
-                context.notify(`Stored overrides confirmed for ${client.name}. Active stream application is not confirmed.`);
-              } catch (error) {
-                if (saveStarted) {
-                  await loadPairing();
-                  context.notify(error instanceof ApiError && error.code === "revision_conflict"
-                    ? settingsTextMessage("Paired clients changed elsewhere. Review the refreshed overrides before saving again.")
-                    : settingsTextMessage("Paired client override save could not be confirmed. Review the refreshed values before saving again."));
-                  return;
-                }
-                throw error;
-              }
-            }),
-            "primary",
-          );
-          save.disabled = !context.api.allows("pairing.admin") || unsupported.length > 0;
-          if (unsupported.length > 0)
-            status.textContent = `Save unavailable: this client has stored overrides this editor cannot preserve (${unsupported.join(", ")}).`;
-          const identity = el(
-            "div",
-            "",
-            el("strong", "", settingsTextLiteral(client.name)),
-            el("small", "muted", settingsTextLiteral(`${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`)),
-          );
-          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, capture, field("Display and adapter policy (JSON)", displayPolicy, "Sparse per-client overrides. Use null/empty to inherit the application or host value; global-only keys are rejected."), controller, gamepad, keyboard, mouse, nativePenTouch, ds4BackAsTouchpadClick, motionAsDs4, touchpadAsDs4, ds5InputtinoRandomizeMac, protonDualsenseCompatibility, el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields), el("div", "", save, status)];
-        });
-        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Capture provider", "Controller", "Gamepad", "Keyboard", "Mouse", "Native pen/touch", "DS4 Back as touchpad click", "Motion selects DS4", "Touchpad selects DS4", "DS5 random MAC", "Proton DualSense compatibility", "Input and software encoding preferences", ""], rows);
-        pairingArea.replaceChildren(
-          panel(
-            "Paired client overrides",
-            el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save confirms the stored pairing revision. Input preferences apply when the next stream acquires its input lease."),
-            tableView,
-            el("div", "actions", badge(settingsTextLiteral(`Revision ${settings.revision}`))),
-          ),
-        );
-      } catch (error) {
-        if (context.content.isConnected)
-          pairingArea.replaceChildren(errorPanel(error, loadPairing));
       }
     }
     async function loadHistorySettings(): Promise<void> {
