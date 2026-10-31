@@ -25,6 +25,8 @@ fn session_borrowers(target: &Value, foreign: bool) -> Value {
 struct Harness {
     broker: Rc<RefCell<Broker>>,
     coordinator: Option<Coordinator>,
+    retire_automatically: bool,
+    fresh_domain: bool,
     settings: LifecycleSettings,
     root: PathBuf,
     request_sequence: u64,
@@ -119,10 +121,14 @@ impl Harness {
                 "describe_resource_control",
                 "verify_resource_control",
                 "validate_resource_control",
-                "verify_control_settlement"
+                "verify_control_settlement",
+                "lookup_stream_closure"
             ]);
-            configuration["settings"][COORDINATOR]["operation_grants"]["settings"] =
-                json!(["verify_resource_control", "verify_control_settlement"]);
+            configuration["settings"][COORDINATOR]["operation_grants"]["settings"] = json!([
+                "verify_resource_control",
+                "verify_control_settlement",
+                "lookup_stream_closure"
+            ]);
             let method_ref = |name: &str| json!({"service":"example.display/2","method":name,"interface_major":2,"interface_minor":0,"schema_revision":1});
             configuration["settings"][COORDINATOR]["consumer_requirements"] = json!({"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]});
             configuration["settings"][COORDINATOR]["participants"] = json!([{"provider":"display","contract_version":2,"plan_method":method_ref("resource_plan"),"callback_method":method_ref("lifecycle_callback"),"status_method":method_ref("lifecycle_status"),"binding_validate_method":method_ref("binding_validate"),"settings_revision":"one","settings":{},"capabilities":[],"cleanup_methods":[method_ref("lifecycle_callback")]}]);
@@ -206,6 +212,8 @@ impl Harness {
         let mut harness = Self {
             broker,
             coordinator: None,
+            retire_automatically: false,
+            fresh_domain: false,
             settings,
             root,
             request_sequence: 0,
@@ -256,6 +264,9 @@ impl Harness {
         coordinator
             .advance(&mut |command| Ok(self.broker.borrow_mut().dispatch(COORDINATOR, command)))
             .unwrap();
+        if self.retire_automatically {
+            coordinator.retire_ended_sessions_if_idle().unwrap();
+        }
         let polled = self
             .broker
             .borrow_mut()
@@ -333,7 +344,14 @@ impl Harness {
                     } else {
                         json!([])
                     };
-                    let plan = json!({"plan_id":if finalize {"finalize-plan"} else {"session-plan"},"revision":1,"resources":[resource],"mutation_domains":[{"domain":"topology","expected_revision":1,"borrowers":session_borrowers(&args["target"], self.foreign_borrower),"access":if finalize || release {"exclusive"} else {"read"}}],"required_capabilities":[],"constraints":{},"obligations":obligations,"affected_consumers":[],"consumer_change":"live","candidate_constraint":constraint,"allowed_degradation":[]});
+                    let mut plan = json!({"plan_id":if finalize {"finalize-plan"} else {"session-plan"},"revision":1,"resources":[resource],"mutation_domains":[{"domain":"topology","expected_revision":1,"borrowers":session_borrowers(&args["target"], self.foreign_borrower),"access":if finalize || release {"exclusive"} else {"read"}}],"required_capabilities":[],"constraints":{},"obligations":obligations,"affected_consumers":[],"consumer_change":"live","candidate_constraint":constraint,"allowed_degradation":[]});
+                    if args["phase"] == "session.prepare" && self.fresh_domain {
+                        plan["resources"][0]["resource_id"] = json!("output-next");
+                        plan["resources"][0]["mutation_domains"] = json!(["topology-next"]);
+                        plan["mutation_domains"][0]["domain"] = json!("topology-next");
+                        plan["obligations"][0]["mutation_domain"] = json!("topology-next");
+                        plan["obligations"][0]["resource_id"] = json!("output-next");
+                    }
                     if stream && self.simulate_stage_refresh {
                         self.stage_refresh_done = false;
                         self.stage_refresh_request = None;
@@ -388,7 +406,15 @@ impl Harness {
                             .unwrap()["arguments"]["target"]
                             .clone()
                     };
-                    let initial = json!({"output_id":"screen-output","capability":"display/output","schema":schema,"producer":"display","producer_service":"example.display/2","origin":origin,"resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":"topology","mutation_domains":["topology"]},"domain_observations":[{"domain":"topology","revision":1,"borrowers":session_borrowers(&args["target"], self.foreign_borrower),"complete":true}],"data":if self.provider_invalid {json!("invalid")} else {json!({"ready":true,"configured":false,"snapshot_id":null})}});
+                    let mut initial = json!({"output_id":"screen-output","capability":"display/output","schema":schema,"producer":"display","producer_service":"example.display/2","origin":origin,"resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":"topology","mutation_domains":["topology"]},"domain_observations":[{"domain":"topology","revision":1,"borrowers":session_borrowers(&args["target"], self.foreign_borrower),"complete":true}],"data":if self.provider_invalid {json!("invalid")} else {json!({"ready":true,"configured":false,"snapshot_id":null})}});
+                    if args["phase"] == "session.prepare" && self.fresh_domain {
+                        initial["output_id"] = json!("screen-output-next");
+                        initial["resource"]["resource_id"] = json!("output-next");
+                        initial["resource"]["incarnation"] = json!("native-next");
+                        initial["resource"]["mutation_domain"] = json!("topology-next");
+                        initial["resource"]["mutation_domains"] = json!(["topology-next"]);
+                        initial["domain_observations"][0]["domain"] = json!("topology-next");
+                    }
                     let output = if args["phase"] == "stream.prepare" {
                         self.staged_output.clone().unwrap_or(initial)
                     } else {
@@ -848,6 +874,47 @@ impl Drop for Harness {
     }
 }
 
+fn stream_closure_query(tuple: &Value, strong: bool) -> Value {
+    let request: amaterasu_module_sdk::extension_api::ResourceControlRequest =
+        serde_json::from_value(tuple["request"].clone()).unwrap();
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&request).unwrap())
+    );
+    let mut query = json!({"operation":"lookup_stream_closure", "target":request.target, "resource_generation":1, "resource_id":request.proposal.resource.resource_id, "incarnation":request.proposal.resource.incarnation, "operation_id":request.operation_id, "request_digest":digest});
+    if strong {
+        query["require_retirement_safe"] = json!(true);
+    }
+    query
+}
+
+fn check_stream_closure(harness: &mut Harness, tuple: &Value) {
+    let strong = stream_closure_query(tuple, true);
+    let result = harness.call("display", strong.clone());
+    assert_eq!(result["status"], "closed", "strong closure: {result}");
+    assert_eq!(result["retirement_safe"], true);
+    for field in [
+        "target",
+        "resource_generation",
+        "resource_id",
+        "incarnation",
+        "operation_id",
+        "request_digest",
+    ] {
+        assert_eq!(
+            result[field], strong[field],
+            "mismatched closure field {field}"
+        );
+    }
+    let legacy = harness.call("display", stream_closure_query(tuple, false));
+    assert_eq!(legacy["status"], "closed", "legacy closure: {legacy}");
+    assert!(legacy.get("retirement_safe").is_none());
+    let mut forged = strong.clone();
+    forged["operation_id"] = json!("forged-operation");
+    assert_eq!(harness.call("display", forged)["status"], "rejected");
+    assert_eq!(harness.call("settings", strong)["status"], "rejected");
+}
+
 fn check_settlement_history(harness: &mut Harness, tuples: &[Value]) {
     for original in tuples {
         let mut query = original.clone();
@@ -951,6 +1018,21 @@ fn composed_restore_and_close(last_cycle: usize) {
             );
         }
         let stream = prepared["target"].clone();
+        let active_journal: Value =
+            serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap())
+                .unwrap();
+        let configure = active_journal["control_settlements"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["settlement"]["request"]["target"] == stream)
+            .expect("active configure")["settlement"]
+            .clone();
+        assert_eq!(
+            harness.call("display", stream_closure_query(&configure, true))["status"],
+            "rejected",
+            "an active stream is not closed"
+        );
         let pause_id = format!("pause.{cycle}");
         let pause = harness.call(
             "transport",
@@ -995,6 +1077,20 @@ fn composed_restore_and_close(last_cycle: usize) {
                 historical_tuples.push(record["settlement"].clone());
             }
             check_settlement_history(&mut harness, &historical_tuples);
+            let legacy = harness.call(
+                "display",
+                stream_closure_query(&historical_tuples[0], false),
+            );
+            assert_eq!(
+                legacy["status"], "closed",
+                "live release historical lookup: {legacy}"
+            );
+            assert!(legacy.get("retirement_safe").is_none());
+            assert_eq!(
+                harness.call("display", stream_closure_query(&historical_tuples[0], true))["status"],
+                "rejected",
+                "uncheckpointed stream must not attest retirement safety"
+            );
         }
         let proof = journal["composed_releases"]["proofs"]
             .as_array()
@@ -1034,10 +1130,9 @@ fn composed_restore_and_close(last_cycle: usize) {
             .zip(owner.iter())
             .all(|(dependent, owner)| dependent < owner)
     );
-    let end = harness.call(
-        "transport",
-        json!({"operation":"end_session","operation_id":"session.end","target":session}),
-    );
+    let end_request =
+        json!({"operation":"end_session","operation_id":"session.end","target":session});
+    let end = harness.call("transport", end_request.clone());
     assert_eq!(end["status"], "pending", "{end}");
     check_settlement_history(&mut harness, &historical_tuples);
     let app = harness.call(
@@ -1069,6 +1164,47 @@ fn composed_restore_and_close(last_cycle: usize) {
     );
     check_settlement_history(&mut harness, &historical_tuples);
     check_closed_effects_rejected(&mut harness, &historical_tuples);
+    // Exercise the candidate scheduler hook after Coordinator::advance without
+    // activating it in the production module.
+    harness.retire_automatically = true;
+    let lookup = harness.call(
+        "transport",
+        json!({"operation":"lookup","operation_id":"session.end"}),
+    );
+    assert_eq!(lookup, ended);
+    let retired: Value =
+        serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap()).unwrap();
+    assert!(
+        retired["sessions"].as_object().unwrap().is_empty(),
+        "completed session must be retired"
+    );
+    check_stream_closure(&mut harness, &historical_tuples[0]);
+    let retry = harness.call("transport", end_request.clone());
+    assert_eq!(
+        retry, ended,
+        "exact End retry must retain the completed receipt"
+    );
+    let lookup = harness.call(
+        "transport",
+        json!({"operation":"lookup","operation_id":"session.end"}),
+    );
+    assert_eq!(lookup, ended, "lookup must retain the completed receipt");
+    let forged = harness.call(
+        "transport",
+        json!({"operation":"end_session","operation_id":"session.end","target":null}),
+    );
+    assert_eq!(
+        forged["status"], "rejected",
+        "changed request must be fenced: {forged}"
+    );
+    let foreign = harness.call(
+        "capture",
+        json!({"operation":"lookup","operation_id":"session.end"}),
+    );
+    assert_ne!(
+        foreign["status"], "succeeded",
+        "foreign caller must not receive the receipt: {foreign}"
+    );
     let calls = harness.events.len();
     harness.coordinator.take();
     harness.start();
@@ -1076,11 +1212,54 @@ fn composed_restore_and_close(last_cycle: usize) {
         "transport",
         json!({"operation":"lookup","operation_id":"session.end"}),
     );
-    assert_eq!(recovered["status"], "succeeded", "{recovered}");
+    assert_eq!(recovered, ended, "lookup must survive reopening");
+    assert_eq!(
+        harness.call("transport", end_request),
+        ended,
+        "exact End retry must survive reopening"
+    );
+    let forged = harness.call(
+        "transport",
+        json!({"operation":"end_session","operation_id":"session.end","target":null}),
+    );
+    assert_eq!(
+        forged["status"], "rejected",
+        "changed request after reopening: {forged}"
+    );
+    let foreign = harness.call(
+        "capture",
+        json!({"operation":"lookup","operation_id":"session.end"}),
+    );
+    assert_ne!(
+        foreign["status"], "succeeded",
+        "foreign caller after reopening: {foreign}"
+    );
     check_settlement_history(&mut harness, &historical_tuples);
     check_closed_effects_rejected(&mut harness, &historical_tuples);
+    check_stream_closure(&mut harness, &historical_tuples[0]);
     assert_eq!(harness.events.len(), calls);
     assert!(!harness.native_live);
+    harness.fresh_domain = true;
+    let next = harness.call("transport", json!({"operation":"prepare","operation_id":"next.prepare","application_ref":{"kind":"application","app_id":"next"}}));
+    assert_eq!(
+        next["status"], "pending",
+        "new session after retirement: {next}"
+    );
+    let mut next_ready = Value::Null;
+    for _ in 0..160 {
+        next_ready = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"next.prepare"}),
+        );
+        if next_ready["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(
+        next_ready["status"], "succeeded",
+        "new session after retirement: {next_ready}"
+    );
+    assert_ne!(next_ready["target"]["session_id"], session["session_id"]);
 }
 
 #[test]
