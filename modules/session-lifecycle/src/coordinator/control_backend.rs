@@ -330,6 +330,47 @@ impl Backend<'_> {
     }
 }
 
+/// Authenticate the stage input against the immutable root or the exact
+/// completed release of the preceding stage of that root.
+fn stage_input_is_authenticated(
+    journal: &Journal,
+    root: &ResourceOutput,
+    stage: &super::composition::StagedOutputRefinement,
+) -> bool {
+    let mut previous = None;
+    let mut found = false;
+    for candidate in journal.composition.staged_outputs() {
+        if candidate == stage {
+            found = true;
+            break;
+        }
+        if candidate.after.producer == root.producer
+            && candidate.after.output_id == root.output_id
+            && candidate.after.origin == root.origin
+        {
+            previous = Some(candidate);
+        }
+    }
+    found
+        && match (previous, &stage.prior_release_admission) {
+            (None, None) => stage.before == *root,
+            (Some(previous), Some(admission)) => prior_release_matches(
+                admission,
+                &stage.before,
+                journal.verified_released_output(&previous.target),
+            ),
+            _ => false,
+        }
+}
+
+fn prior_release_matches(
+    admission: &str,
+    before: &ResourceOutput,
+    verified: Option<(&str, &ResourceOutput)>,
+) -> bool {
+    verified.is_some_and(|(id, output)| id == admission && output == before)
+}
+
 impl Backend<'_> {
     fn resolve_control(
         &mut self,
@@ -414,7 +455,7 @@ impl Backend<'_> {
                 journal
                     .composition
                     .staged_for(&work.target, owner, &input.output.output_id)?;
-            if stage.before != input.output
+            if !stage_input_is_authenticated(journal, &input.output, stage)
                 || (work.phase == LifecyclePhase::StreamPrepare
                     && stage.transition_id != work.transition_id)
             {
@@ -1027,6 +1068,31 @@ mod tests {
         assert!(ensure_control_operation_unfenced(&restored, "other-owner", "effect").is_ok());
         drop(coordinator);
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn resumed_stage_requires_exact_verified_release_output_and_admission() {
+        let root = super::super::finalize_selection::tests::fixture()
+            .input
+            .output;
+        let mut released = root.clone();
+        released.resource.revision += 1;
+        assert!(prior_release_matches(
+            "release",
+            &released,
+            Some(("release", &released))
+        ));
+        assert!(!prior_release_matches("release", &released, None));
+        assert!(!prior_release_matches(
+            "other",
+            &released,
+            Some(("release", &released))
+        ));
+        assert!(!prior_release_matches(
+            "release",
+            &root,
+            Some(("release", &released))
+        ));
     }
 
     #[test]
