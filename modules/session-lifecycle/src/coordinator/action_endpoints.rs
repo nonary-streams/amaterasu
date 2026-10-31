@@ -1017,6 +1017,13 @@ mod tests {
         let execute = json!({"service":"display/1","method":"execute","interface_major":1,"interface_minor":0,"schema_revision":1});
         let auth = json!({"operation":"authorize_action","operation_id":"op-transition","action_id":"display/remove","target":target,"plan_digest":digest(&plan).unwrap(),"plan":plan,"source":{"caller":"transport","initiator":"user"},"provider":"display","execute_method":execute});
         let service = coordinator.settings.action_service.clone();
+        let mut stale_plan = auth.clone();
+        stale_plan["plan"]["constraints"]["selected_settings_revision"] = json!("other");
+        stale_plan["plan_digest"] = json!(digest(&stale_plan["plan"]).unwrap());
+        assert_eq!(
+            coordinator.action_operation(&service, "service", &stale_plan)["reason"],
+            "provider_settings_revision_mismatch"
+        );
         let issued = coordinator.action_operation(&service, "service", &auth);
         assert_eq!(issued["status"], "succeeded");
         let mut request = json!({"operation":"consume_action_permit","operation_id":"op-transition","action_id":"display/remove","target":target,"plan_digest":auth["plan_digest"],"permit":issued["permit"]});
@@ -1058,6 +1065,36 @@ mod tests {
         verify["operation"] = json!("verify_action_effect");
         verify["provider"] = json!("display");
         verify["execute_method"] = execute;
+        let mut changed = coordinator.shared.borrow().value.clone();
+        changed
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .streams
+            .get_mut("stream")
+            .unwrap()
+            .provider_settings
+            .get_mut("display")
+            .unwrap()
+            .revision = "changed".into();
+        save(&coordinator.shared, changed).unwrap();
+        assert_eq!(
+            coordinator.action_operation("display", "display", &verify)["status"],
+            "rejected"
+        );
+        let mut restored = coordinator.shared.borrow().value.clone();
+        restored
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .streams
+            .get_mut("stream")
+            .unwrap()
+            .provider_settings
+            .get_mut("display")
+            .unwrap()
+            .revision = "rev".into();
+        save(&coordinator.shared, restored).unwrap();
         assert_eq!(
             coordinator.action_operation("display", "display", &verify)["status"],
             "succeeded"
@@ -1108,6 +1145,144 @@ mod tests {
         assert!(
             coordinator.shared.borrow().value.sessions["session"].streams["resumed"].phase
                 == StreamPhase::Active
+        );
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn target_metadata_is_provider_scoped_and_uses_stream_snapshot() {
+        use crate::adapter::{MethodSettings, ParticipantSettings};
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-action-metadata-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut coordinator = Coordinator::open(&root.join("journal")).unwrap();
+        let method = |name: &str| MethodSettings {
+            service: "display/1".into(),
+            method: name.into(),
+            interface_major: 1,
+            interface_minor: 0,
+            schema_revision: 1,
+        };
+        coordinator.settings.participants.push(ParticipantSettings {
+            provider: "display".into(),
+            plan_method: method("plan"),
+            callback_method: method("callback"),
+            status_method: method("status"),
+            binding_validate_method: None,
+            capabilities: Default::default(),
+            cleanup_methods: vec![],
+            settings_revision: "installed".into(),
+            settings: json!({}),
+        });
+        let mut state = coordinator.shared.borrow().value.clone();
+        let epoch = state.host_epoch.clone();
+        let candidate: amaterasu_extension_api::CaptureBinding=serde_json::from_value(json!({"capture_provider":"capture", "selector_schema":"selector/1", "selector":{}, "resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"actual-seat","mutation_domain":"domain","mutation_domains":["domain"]},"mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":1,"generation":4})).unwrap();
+        let mut streams = std::collections::BTreeMap::new();
+        streams.insert(
+            "stream".into(),
+            super::super::StreamRecord {
+                generation: 4,
+                phase: StreamPhase::Active,
+                candidate: Some(candidate),
+                required: Default::default(),
+                acknowledgements: Default::default(),
+                retirements: Default::default(),
+                binding_owner: "display".into(),
+                preparation_transition: String::new(),
+                provider_settings: [(
+                    "display".into(),
+                    super::super::settings_snapshot::FrozenSettings {
+                        settings: json!({}),
+                        revision: "stream-rev".into(),
+                    },
+                )]
+                .into(),
+            },
+        );
+        state.authority.snapshot.domains.insert(
+            "domain".into(),
+            crate::planning::DomainState {
+                revision: 6,
+                borrowers: [("stream".into(), 4)].into(),
+            },
+        );
+        state
+            .authority
+            .domain_owners
+            .insert("domain".into(), "display".into());
+        state.sessions.insert(
+            "session".into(),
+            SessionRecord {
+                host_epoch: epoch.clone(),
+                id: "session".into(),
+                generation: 3,
+                phase: SessionPhase::Ready,
+                owner: Principal {
+                    caller: "transport".into(),
+                    initiator: "user".into(),
+                },
+                delegates: Default::default(),
+                application_ref: json!({}),
+                application: None,
+                application_operation_id: None,
+                admission_ids: Default::default(),
+                provider_settings: [(
+                    "display".into(),
+                    super::super::settings_snapshot::FrozenSettings {
+                        settings: json!({}),
+                        revision: "session-rev".into(),
+                    },
+                )]
+                .into(),
+                required_consumers: None,
+                settings_revision: "request-rev".into(),
+                application_retired: false,
+                streams,
+                obligations: vec![],
+            },
+        );
+        save(&coordinator.shared, state).unwrap();
+        let request = json!({"operation":"describe_action_target","target":{"kind":"session","host_epoch":epoch,"session_id":"session","expected_generation":3},"operation_id":"op","action_id":"display/remove"});
+        let described = coordinator.describe_action_target("display", &request);
+        assert_eq!(described["status"], "succeeded");
+        assert_eq!(described["execution_domain"], "actual-seat");
+        assert_eq!(described["settings_revision"], "stream-rev");
+        assert_eq!(
+            described["mutation_domains"]["domain"]["borrowers"]["stream"],
+            4
+        );
+        assert_eq!(
+            coordinator.describe_action_target("foreign", &request)["status"],
+            "rejected"
+        );
+        let mut stale = request.clone();
+        stale["target"]["expected_generation"] = json!(2);
+        assert_eq!(
+            coordinator.describe_action_target("display", &stale)["status"],
+            "rejected"
+        );
+        let mut state = coordinator.shared.borrow().value.clone();
+        state
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .streams
+            .get_mut("stream")
+            .unwrap()
+            .provider_settings
+            .clear();
+        save(&coordinator.shared, state).unwrap();
+        assert_eq!(
+            coordinator.describe_action_target("display", &request)["reason"],
+            "settings_snapshot_missing"
         );
         drop(coordinator);
         std::fs::remove_dir_all(root).unwrap();
