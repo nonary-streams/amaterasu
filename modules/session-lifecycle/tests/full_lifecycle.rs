@@ -455,3 +455,44 @@ impl Drop for Harness {
         std::fs::remove_dir_all(&self.root).unwrap();
     }
 }
+
+#[test]
+#[ignore = "long-running 130-session journal retention qualification"]
+fn completed_sessions_roll_over_without_replaying_creation() {
+    let mut harness = Harness::with_provider(true);
+    for sequence in 0..130 {
+        let prefix = format!("roll-{sequence}");
+        let prepare = format!("{prefix}.prepare");
+        let accepted = harness.call("transport", json!({"operation":"prepare","operation_id":prepare,"application_ref":{"kind":"application","app_id":"app"}}));
+        assert_eq!(
+            accepted["status"], "pending",
+            "session {sequence}: {accepted}"
+        );
+        let ready = harness.settled("transport", &prepare);
+        assert_eq!(ready["status"], "succeeded", "session {sequence}: {ready}");
+        let target = ready["target"].clone();
+        let bind = harness.call("transport", json!({"operation":"bind_application","operation_id":format!("{prefix}.bind"),"target":target,"launch_id":sequence + 1,"application_operation_id":format!("{prefix}.launch")}));
+        assert_eq!(bind["status"], "succeeded", "session {sequence}: {bind}");
+        let end_id = format!("{prefix}.end");
+        let end = harness.call(
+            "transport",
+            json!({"operation":"end_session","operation_id":end_id,"target":target}),
+        );
+        assert_eq!(end["status"], "pending", "session {sequence}: {end}");
+        let retire_id = format!("{prefix}.retire");
+        let retire = harness.call(
+            "transport",
+            json!({"operation":"application_retired","operation_id":retire_id,"target":target}),
+        );
+        assert_eq!(retire["status"], "pending", "session {sequence}: {retire}");
+        assert_eq!(
+            harness.settled("transport", &retire_id)["status"],
+            "succeeded"
+        );
+        assert_eq!(harness.settled("transport", &end_id)["status"], "succeeded");
+    }
+    let replay = harness.call("transport", json!({"operation":"prepare","operation_id":"roll-0.prepare","application_ref":{"kind":"application","app_id":"app"}}));
+    assert_eq!(replay["reason"], "receipt_expired", "{replay}");
+    let snapshot = harness.call("transport", json!({"operation":"snapshot"}));
+    assert!(snapshot["sessions"].as_array().unwrap().len() < 128);
+}
